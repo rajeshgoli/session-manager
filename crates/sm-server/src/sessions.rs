@@ -1100,6 +1100,10 @@ impl SessionStore {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
+        let claimed_provider_resume_ids = sessions
+            .iter()
+            .filter_map(|session| json_text(session.get("provider_resume_id")))
+            .collect::<BTreeSet<_>>();
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(CoreClearOutcome::NotFound);
         };
@@ -1120,6 +1124,20 @@ impl SessionStore {
         } else {
             "/clear"
         };
+        let codex_cli_clear_binding = (provider == "codex").then(|| -> Result<_> {
+            let record = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
+            let mut excluded_ids = claimed_provider_resume_ids;
+            excluded_ids.extend(codex_cli_existing_session_ids(
+                &record,
+                &self.codex_sessions_root,
+            ));
+            Ok((
+                record,
+                excluded_ids,
+                OffsetDateTime::now_utc().unix_timestamp_nanos(),
+            ))
+        });
+        let codex_cli_clear_binding = codex_cli_clear_binding.transpose()?;
         let prompt = request
             .prompt
             .as_deref()
@@ -1136,6 +1154,23 @@ impl SessionStore {
         )?;
         if !delivered {
             return Err(anyhow::anyhow!("tmux session is not running"));
+        }
+        if let Some((record, excluded_ids, launched_at_ns)) = codex_cli_clear_binding {
+            if let Some(provider_resume_id) = wait_for_codex_cli_provider_resume_id(
+                &record,
+                &self.codex_sessions_root,
+                &excluded_ids,
+                launched_at_ns,
+                CODEX_CLI_SESSION_BIND_TIMEOUT,
+            ) {
+                session.insert(
+                    "provider_resume_id".to_owned(),
+                    Value::String(provider_resume_id.clone()),
+                );
+                self.append_seat_session(session_id, &provider, &provider_resume_id, None);
+            } else {
+                eprintln!("failed to discover replacement Codex thread for seat {session_id}");
+            }
         }
         let now = now_rfc3339();
         reset_session_after_clear(session, &now);

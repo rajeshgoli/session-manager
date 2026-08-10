@@ -16,6 +16,7 @@ use sha2::Sha256;
 use sm_server::btw::BtwStore;
 use sm_server::config::RustShadowConfig;
 use sm_server::queue::{QueueAdmissionPolicy, RetainedQueueStore};
+use sm_server::seat_sessions::SeatSessionStore;
 use sm_server::{
     config::{
         AppArtifactsConfig, AppConfig, BugReportsConfig, CodexEventsConfig, CodexForkLaunchConfig,
@@ -14126,6 +14127,144 @@ async fn runtime_core_rejects_review_when_session_is_busy() {
         "runtime:/review review after stale dispatch clear",
     )
     .await;
+}
+
+#[tokio::test]
+async fn runtime_core_clear_rebinds_plain_codex_provider_session_chain() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_short_temp_dir("sm-rust-codex-clear-rebind");
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-codex-clear-rebind-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app_with_codex_composer(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "clearcodex",
+            "name": "clear-codex",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "codex"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let now = time::OffsetDateTime::now_utc();
+    let sessions_root = state_file.with_extension("codex-home").join("sessions");
+    let day_dir = sessions_root
+        .join(format!("{:04}", now.year()))
+        .join(format!("{:02}", now.month() as u8))
+        .join(format!("{:02}", now.day()));
+    fs::create_dir_all(&day_dir).unwrap();
+    let write_rollout = |path: &PathBuf, id: &str, timestamp: time::OffsetDateTime| {
+        fs::write(
+            path,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": id,
+                        "cwd": working_dir.display().to_string(),
+                        "timestamp": timestamp
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap()
+                    }
+                })
+            ),
+        )
+        .unwrap();
+    };
+    write_rollout(
+        &day_dir.join("rollout-old-thread.jsonl"),
+        "old-thread",
+        now - time::Duration::seconds(1),
+    );
+
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "clearcodex")
+        .unwrap();
+    session["parent_session_id"] = json!("operator-parent");
+    session["provider_resume_id"] = json!("old-thread");
+    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    SeatSessionStore::for_state_file(&state_file)
+        .append("clearcodex", "codex", "old-thread", None)
+        .unwrap();
+
+    let new_rollout = day_dir.join("rollout-new-thread.jsonl");
+    let new_working_dir = working_dir.clone();
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(250));
+        fs::write(
+            new_rollout,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "new-thread",
+                        "cwd": new_working_dir.display().to_string(),
+                        "timestamp": (time::OffsetDateTime::now_utc()
+                            + time::Duration::seconds(1))
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap()
+                    }
+                })
+            ),
+        )
+        .unwrap();
+    });
+
+    let (status, payload) = post_json(
+        app,
+        "/sessions/clearcodex/clear",
+        json!({ "prompt": "continue in the replacement thread" }),
+    )
+    .await;
+    writer.join().unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({ "status": "cleared", "session_id": "clearcodex" })
+    );
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "clearcodex")
+        .unwrap();
+    assert_eq!(session["provider_resume_id"], "new-thread");
+
+    let connection = Connection::open(state_file.with_extension("usage.db")).unwrap();
+    let provider_session_ids = connection
+        .prepare(
+            "SELECT provider_session_id FROM seat_sessions WHERE seat_id = 'clearcodex' ORDER BY provider_session_id",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(provider_session_ids, vec!["new-thread", "old-thread"]);
 }
 
 #[tokio::test]
