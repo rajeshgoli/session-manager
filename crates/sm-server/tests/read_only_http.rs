@@ -13897,7 +13897,7 @@ async fn runtime_core_rejects_review_when_session_is_busy() {
             .as_nanos()
     );
     let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+    let app = runtime_app_with_codex_composer(&state_file, &log_dir, &tmux_socket);
 
     let (status, _payload) = post_json(
         app.clone(),
@@ -15978,6 +15978,19 @@ fn runtime_app(state_file: &PathBuf, log_dir: &PathBuf, tmux_socket: &str) -> ax
         log_dir,
         tmux_socket,
         r#"/bin/sh -lc 'while IFS= read -r line; do printf "argv:%s\nids:%s:%s:%s\nruntime:%s\n" "$*" "$SESSION_MANAGER_ID" "$CLAUDE_SESSION_MANAGER_ID" "$ENABLE_TOOL_SEARCH" "$line"; done' runtime-sh"#,
+    )
+}
+
+fn runtime_app_with_codex_composer(
+    state_file: &PathBuf,
+    log_dir: &PathBuf,
+    tmux_socket: &str,
+) -> axum::Router {
+    runtime_app_with_command(
+        state_file,
+        log_dir,
+        tmux_socket,
+        r#"/bin/sh -lc 'printf "› "; while IFS= read -r line; do printf "\nargv:%s\nids:%s:%s:%s\nruntime:%s\n› " "$*" "$SESSION_MANAGER_ID" "$CLAUDE_SESSION_MANAGER_ID" "$ENABLE_TOOL_SEARCH" "$line"; done' runtime-sh"#,
     )
 }
 
