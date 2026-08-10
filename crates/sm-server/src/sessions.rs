@@ -58,6 +58,7 @@ pub struct SessionStore {
     /// message queue on a timer, so a message queued without a runtime waits for
     /// an unrelated request to happen to flush it.
     delivery_runtime: Option<TmuxRuntime>,
+    codex_fork_handoff_monitors: Arc<Mutex<BTreeSet<String>>>,
 }
 
 impl SessionStore {
@@ -75,6 +76,7 @@ impl SessionStore {
             queue_store: None,
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
+            codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -129,6 +131,7 @@ impl SessionStore {
             queue_store: None,
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
+            codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
 
@@ -1803,33 +1806,242 @@ impl SessionStore {
         session_id: &str,
         request: HandoffRequest,
     ) -> Result<HandoffOutcome> {
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        if request.requester_session_id.trim() != session_id {
-            return Ok(HandoffOutcome::Error(
-                "sm handoff is self-directed only - requester must equal target session".to_owned(),
-            ));
-        }
-        let Some(session) = session_object_mut(sessions, session_id) else {
-            return Ok(HandoffOutcome::Error(format!(
-                "Session {session_id} not found"
-            )));
+        let monitor = {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            if request.requester_session_id.trim() != session_id {
+                return Ok(HandoffOutcome::Error(
+                    "sm handoff is self-directed only - requester must equal target session"
+                        .to_owned(),
+                ));
+            }
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(HandoffOutcome::Error(format!(
+                    "Session {session_id} not found"
+                )));
+            };
+            let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
+            if provider == "codex-app" {
+                return Ok(HandoffOutcome::Error(
+                    "sm handoff is not supported for codex-app sessions".to_owned(),
+                ));
+            }
+
+            let monitor = if provider == "codex-fork" {
+                let runtime = self.delivery_runtime.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("codex-fork handoff requires the tmux runtime")
+                })?;
+                let spec = codex_fork_spec_for_session_raw(session_id, session)?;
+                let artifacts = runtime
+                    .codex_fork_runtime_artifacts(&spec)?
+                    .ok_or_else(|| anyhow::anyhow!("codex-fork runtime artifacts unavailable"))?;
+                let offset = fs::metadata(&artifacts.event_stream_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                session.insert("pending_handoff_event_offset".to_owned(), json!(offset));
+                Some((artifacts.event_stream_path, offset))
+            } else {
+                None
+            };
+            session.insert(
+                "pending_handoff_path".to_owned(),
+                Value::String(request.file_path.clone()),
+            );
+            self.write_raw_json_value(&state)?;
+            monitor
         };
-        let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
-        if provider == "codex-app" {
-            return Ok(HandoffOutcome::Error(
-                "sm handoff is not supported for codex-app sessions".to_owned(),
-            ));
+
+        if let Some((event_stream_path, offset)) = monitor {
+            self.start_codex_fork_handoff_monitor(
+                session_id.to_owned(),
+                event_stream_path,
+                offset,
+            )?;
         }
-        session.insert(
-            "pending_handoff_path".to_owned(),
-            Value::String(request.file_path.clone()),
-        );
-        self.write_raw_json_value(&state)?;
         Ok(HandoffOutcome::Recorded(HandoffResult {
             status: "recorded".to_owned(),
         }))
+    }
+
+    pub fn recover_pending_codex_fork_handoffs(&self) -> Result<usize> {
+        let state = self.load_raw_json_value()?;
+        let Some(sessions) = state.get("sessions").and_then(Value::as_array) else {
+            return Ok(0);
+        };
+        let Some(runtime) = self.delivery_runtime.as_ref() else {
+            return Ok(0);
+        };
+        let mut recovered = 0;
+        for session in sessions.iter().filter_map(Value::as_object) {
+            let Some(session_id) = json_text(session.get("id")) else {
+                continue;
+            };
+            if json_text(session.get("provider")).as_deref() != Some("codex-fork")
+                || json_text(session.get("pending_handoff_path")).is_none()
+            {
+                continue;
+            }
+            let Some(offset) = session
+                .get("pending_handoff_event_offset")
+                .and_then(Value::as_u64)
+            else {
+                continue;
+            };
+            let spec = codex_fork_spec_for_session_raw(&session_id, session)?;
+            let Some(artifacts) = runtime.codex_fork_runtime_artifacts(&spec)? else {
+                continue;
+            };
+            self.start_codex_fork_handoff_monitor(session_id, artifacts.event_stream_path, offset)?;
+            recovered += 1;
+        }
+        Ok(recovered)
+    }
+
+    fn start_codex_fork_handoff_monitor(
+        &self,
+        session_id: String,
+        event_stream_path: PathBuf,
+        initial_offset: u64,
+    ) -> Result<()> {
+        {
+            let mut monitors = self
+                .codex_fork_handoff_monitors
+                .lock()
+                .map_err(|_| anyhow::anyhow!("codex-fork handoff monitor lock poisoned"))?;
+            if !monitors.insert(session_id.clone()) {
+                return Ok(());
+            }
+        }
+
+        let store = self.clone();
+        let monitor_session_id = session_id.clone();
+        let spawn_result = thread::Builder::new()
+            .name(format!(
+                "sm-codex-fork-handoff-{}",
+                sanitize_path_component(&session_id)
+            ))
+            .spawn(move || {
+                store.monitor_codex_fork_handoff(
+                    &monitor_session_id,
+                    &event_stream_path,
+                    initial_offset,
+                );
+                if let Ok(mut monitors) = store.codex_fork_handoff_monitors.lock() {
+                    monitors.remove(&monitor_session_id);
+                }
+            });
+        if let Err(error) = spawn_result {
+            if let Ok(mut monitors) = self.codex_fork_handoff_monitors.lock() {
+                monitors.remove(&session_id);
+            }
+            return Err(error).with_context(|| "failed to start codex-fork handoff monitor");
+        }
+        Ok(())
+    }
+
+    fn monitor_codex_fork_handoff(
+        &self,
+        session_id: &str,
+        event_stream_path: &Path,
+        initial_offset: u64,
+    ) {
+        let mut offset = initial_offset;
+        let mut buffer = String::new();
+        loop {
+            match self.codex_fork_handoff_is_pending(session_id) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => return,
+            }
+            if let Ok(chunk) = read_file_from_offset(event_stream_path, &mut offset) {
+                for line in split_complete_event_lines(&mut buffer, &chunk) {
+                    if codex_fork_event_is_turn_complete(&line) {
+                        let _ = self.execute_pending_codex_fork_handoff(session_id);
+                        return;
+                    }
+                }
+            }
+            thread::sleep(CODEX_FORK_EVENT_MONITOR_POLL);
+        }
+    }
+
+    fn codex_fork_handoff_is_pending(&self, session_id: &str) -> Result<bool> {
+        let state = self.load_raw_json_value()?;
+        Ok(raw_session_object(&state, session_id)
+            .and_then(|session| json_text(session.get("pending_handoff_path")))
+            .is_some())
+    }
+
+    fn execute_pending_codex_fork_handoff(&self, session_id: &str) -> Result<bool> {
+        let (file_path, tmux_session, socket_name) = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            let Some(session) = raw_session_object(&state, session_id) else {
+                return Ok(false);
+            };
+            let Some(file_path) = json_text(session.get("pending_handoff_path")) else {
+                return Ok(false);
+            };
+            (
+                file_path,
+                json_text(session.get("tmux_session"))
+                    .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?,
+                json_text(session.get("tmux_socket_name")),
+            )
+        };
+
+        let result = (|| {
+            if !Path::new(&file_path).is_file() {
+                anyhow::bail!("handoff file not found: {file_path}");
+            }
+            let runtime = self
+                .delivery_runtime
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("codex-fork handoff requires the tmux runtime"))?
+                .for_socket_name(socket_name.as_deref());
+            let prompt = format!("Read {file_path} and continue from where you left off.");
+            if !runtime.clear_session(&tmux_session, "/new", Some(&prompt), false)? {
+                anyhow::bail!("tmux session is not running");
+            }
+            Ok(())
+        })();
+
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(false);
+        };
+        match result {
+            Ok(()) => {
+                session.insert(
+                    "last_handoff_path".to_owned(),
+                    Value::String(file_path.clone()),
+                );
+                if json_text(session.get("pending_handoff_path")).as_deref()
+                    == Some(file_path.as_str())
+                {
+                    session.insert("pending_handoff_path".to_owned(), Value::Null);
+                    session.insert("pending_handoff_event_offset".to_owned(), Value::Null);
+                }
+                let now = now_rfc3339();
+                reset_session_after_clear(session, &now);
+                session.insert("status".to_owned(), Value::String("running".to_owned()));
+                clear_codex_fork_control_degraded_raw(session);
+                clear_codex_fork_handoff_error_raw(session);
+                self.cancel_context_monitor_alerts(session_id)?;
+                self.write_raw_json_value(&state)?;
+                Ok(true)
+            }
+            Err(error) => {
+                session.insert(
+                    "error_message".to_owned(),
+                    Value::String(format!("codex_fork_handoff_failed: {error}")),
+                );
+                self.write_raw_json_value(&state)?;
+                Ok(false)
+            }
+        }
     }
 
     pub fn list_agent_registrations(&self) -> Result<Vec<AgentRegistrationResponse>> {
@@ -3124,6 +3336,20 @@ pub(crate) fn codex_fork_status_for_event_line(line: &str) -> Option<&'static st
     let event = serde_json::from_str::<Value>(raw).ok()?;
     let event = event.as_object()?;
     codex_fork_status_for_event(event)
+}
+
+fn codex_fork_event_is_turn_complete(line: &str) -> bool {
+    let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
+        return false;
+    };
+    let Some(event) = event.as_object() else {
+        return false;
+    };
+    codex_fork_event_type(event)
+        .map(|event_type| {
+            normalize_codex_fork_event_type(&event_type.replace('/', "_")) == "turn_complete"
+        })
+        .unwrap_or(false)
 }
 
 fn codex_fork_status_for_event(event: &Map<String, Value>) -> Option<&'static str> {
@@ -4942,6 +5168,15 @@ fn clear_codex_fork_control_degraded_raw(session: &mut Map<String, Value>) {
         .as_deref()
         .is_some_and(|message| message.starts_with("codex_fork_control_degraded:"));
     if is_degraded_error {
+        session.insert("error_message".to_owned(), Value::Null);
+    }
+}
+
+fn clear_codex_fork_handoff_error_raw(session: &mut Map<String, Value>) {
+    let is_handoff_error = json_text(session.get("error_message"))
+        .as_deref()
+        .is_some_and(|message| message.starts_with("codex_fork_handoff_failed:"));
+    if is_handoff_error {
         session.insert("error_message".to_owned(), Value::Null);
     }
 }
@@ -7952,6 +8187,324 @@ mod tests {
             store.get_session("codex001").unwrap().unwrap().status,
             "running"
         );
+    }
+
+    #[test]
+    fn codex_fork_handoff_executes_after_turn_complete() {
+        let Some(fixture) = CodexForkHandoffFixture::new("execute") else {
+            return;
+        };
+        let store = fixture.store();
+
+        assert!(matches!(
+            store
+                .schedule_handoff(
+                    "codex001",
+                    HandoffRequest {
+                        requester_session_id: "codex001".to_owned(),
+                        file_path: fixture.handoff_path.display().to_string(),
+                    },
+                )
+                .unwrap(),
+            HandoffOutcome::Recorded(_)
+        ));
+        let state = store.load_raw_json_value().unwrap();
+        assert!(raw_session_object(&state, "codex001")
+            .unwrap()
+            .get("pending_handoff_event_offset")
+            .and_then(Value::as_u64)
+            .is_some());
+
+        fixture.append_turn_complete();
+        fixture.wait_for_handoff(&store);
+
+        let session = store.get_session("codex001").unwrap().unwrap();
+        assert_eq!(session.id, "codex001");
+        assert_eq!(session.friendly_name.as_deref(), Some("stable-agent"));
+        assert_eq!(
+            session.last_handoff_path.as_deref(),
+            Some(fixture.handoff_path.to_str().unwrap())
+        );
+        assert_eq!(session.provider_resume_id.as_deref(), Some("old-thread"));
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"thread/started","payload":{"thread":{"id":"new-thread"}}}"#,
+            )
+            .unwrap();
+        let session = store.get_session("codex001").unwrap().unwrap();
+        assert_eq!(session.id, "codex001");
+        assert_eq!(session.friendly_name.as_deref(), Some("stable-agent"));
+        assert_eq!(session.provider_resume_id.as_deref(), Some("new-thread"));
+        let state = store.load_raw_json_value().unwrap();
+        let session = raw_session_object(&state, "codex001").unwrap();
+        assert!(json_text(session.get("pending_handoff_path")).is_none());
+        assert!(json_text(session.get("pending_handoff_event_offset")).is_none());
+        let output = fixture.capture_pane();
+        let compact_output = output
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        let expected = format!(
+            "received:Read{}andcontinuefromwhereyouleftoff.",
+            fixture.handoff_path.display()
+        );
+        assert!(compact_output.contains(&expected), "{output}");
+    }
+
+    #[test]
+    fn codex_fork_handoff_recovery_replays_from_persisted_offset() {
+        let Some(fixture) = CodexForkHandoffFixture::new("recovery") else {
+            return;
+        };
+        let state = fixture.store().load_raw_json_value().unwrap();
+        let mut state = state;
+        let session =
+            session_object_mut(ensure_sessions_array_mut(&mut state).unwrap(), "codex001").unwrap();
+        session.insert(
+            "pending_handoff_path".to_owned(),
+            Value::String(fixture.handoff_path.display().to_string()),
+        );
+        session.insert("pending_handoff_event_offset".to_owned(), json!(0));
+        fs::write(
+            &fixture.state_file,
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+        fixture.append_turn_complete();
+
+        let restarted = fixture.store();
+        assert_eq!(restarted.recover_pending_codex_fork_handoffs().unwrap(), 1);
+        fixture.wait_for_handoff(&restarted);
+
+        assert_eq!(
+            restarted
+                .get_session("codex001")
+                .unwrap()
+                .unwrap()
+                .last_handoff_path
+                .as_deref(),
+            Some(fixture.handoff_path.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn codex_fork_handoff_failure_keeps_pending_path() {
+        let Some(fixture) = CodexForkHandoffFixture::new("failure") else {
+            return;
+        };
+        let store = fixture.store();
+        store
+            .schedule_handoff(
+                "codex001",
+                HandoffRequest {
+                    requester_session_id: "codex001".to_owned(),
+                    file_path: fixture.handoff_path.display().to_string(),
+                },
+            )
+            .unwrap();
+        fixture.kill_tmux();
+        fixture.append_turn_complete();
+        fixture.wait_for_handoff_error(&store);
+
+        let state = store.load_raw_json_value().unwrap();
+        let session = raw_session_object(&state, "codex001").unwrap();
+        assert_eq!(
+            json_text(session.get("pending_handoff_path")).as_deref(),
+            Some(fixture.handoff_path.to_str().unwrap())
+        );
+        assert!(json_text(session.get("last_handoff_path")).is_none());
+        assert!(json_text(session.get("error_message"))
+            .unwrap()
+            .contains("codex_fork_handoff_failed: tmux session is not running"));
+
+        fixture.start_tmux();
+        assert!(store
+            .execute_pending_codex_fork_handoff("codex001")
+            .unwrap());
+        let state = store.load_raw_json_value().unwrap();
+        let session = raw_session_object(&state, "codex001").unwrap();
+        assert!(json_text(session.get("pending_handoff_path")).is_none());
+        assert!(json_text(session.get("error_message")).is_none());
+    }
+
+    struct CodexForkHandoffFixture {
+        state_file: PathBuf,
+        event_stream_path: PathBuf,
+        handoff_path: PathBuf,
+        tmux_socket: String,
+        tmux_session: String,
+    }
+
+    impl CodexForkHandoffFixture {
+        fn new(label: &str) -> Option<Self> {
+            if !Command::new("tmux")
+                .arg("-V")
+                .output()
+                .ok()?
+                .status
+                .success()
+            {
+                return None;
+            }
+            let state_file = unique_temp_path(&format!("handoff-{label}"));
+            let fixture_dir = state_file.with_extension("dir");
+            fs::create_dir_all(&fixture_dir).unwrap();
+            let log_file = fixture_dir.join("codex001.log");
+            let handoff_path = fixture_dir.join("handoff.md");
+            fs::write(&log_file, "").unwrap();
+            fs::write(&handoff_path, "durable handoff body").unwrap();
+            let tmux_socket = format!("sm-handoff-{}-{}", std::process::id(), label);
+            let tmux_session = "codex-fork-handoff".to_owned();
+            start_codex_fork_handoff_tmux(&tmux_socket, &tmux_session);
+
+            fs::write(
+                &state_file,
+                json!({
+                    "sessions": [{
+                        "id": "codex001",
+                        "name": "codex-codex001",
+                        "provider": "codex-fork",
+                        "working_dir": fixture_dir.display().to_string(),
+                        "tmux_session": tmux_session,
+                        "tmux_socket_name": tmux_socket,
+                        "log_file": log_file.display().to_string(),
+                        "status": "running",
+                        "friendly_name": "stable-agent",
+                        "provider_resume_id": "old-thread",
+                        "created_at": "2026-06-01T00:00:00Z",
+                        "last_activity": "2026-06-01T00:01:00Z"
+                    }]
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default());
+            let store =
+                SessionStore::new_with_legacy_fallback(state_file.clone(), state_file.clone())
+                    .with_delivery_runtime(Some(runtime.clone()));
+            let state = store.load_raw_json_value().unwrap();
+            let session = raw_session_object(&state, "codex001").unwrap();
+            let spec = codex_fork_spec_for_session_raw("codex001", session).unwrap();
+            let event_stream_path = runtime
+                .codex_fork_runtime_artifacts(&spec)
+                .unwrap()
+                .unwrap()
+                .event_stream_path;
+            fs::write(&event_stream_path, "").unwrap();
+            Some(Self {
+                state_file,
+                event_stream_path,
+                handoff_path,
+                tmux_socket,
+                tmux_session,
+            })
+        }
+
+        fn store(&self) -> SessionStore {
+            SessionStore::new_with_legacy_fallback(self.state_file.clone(), self.state_file.clone())
+                .with_delivery_runtime(Some(TmuxRuntime::from_config(
+                    &crate::config::RustCoreConfig::default(),
+                )))
+        }
+
+        fn append_turn_complete(&self) {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&self.event_stream_path)
+                .unwrap();
+            writeln!(
+                file,
+                r#"{{"event_type":"turn_complete","payload":{{"turn_id":"turn-1"}}}}"#
+            )
+            .unwrap();
+        }
+
+        fn wait_for_handoff(&self, store: &SessionStore) {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                if store
+                    .get_session("codex001")
+                    .unwrap()
+                    .and_then(|session| session.last_handoff_path)
+                    .is_some()
+                {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "handoff did not complete; state={} pane={:?}",
+                    fs::read_to_string(&self.state_file).unwrap_or_default(),
+                    self.capture_pane()
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        fn capture_pane(&self) -> String {
+            let output = Command::new("tmux")
+                .args([
+                    "-L",
+                    &self.tmux_socket,
+                    "capture-pane",
+                    "-p",
+                    "-t",
+                    &self.tmux_session,
+                ])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).to_string()
+        }
+
+        fn kill_tmux(&self) {
+            let status = Command::new("tmux")
+                .args(["-L", &self.tmux_socket, "kill-server"])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
+        fn start_tmux(&self) {
+            start_codex_fork_handoff_tmux(&self.tmux_socket, &self.tmux_session);
+        }
+
+        fn wait_for_handoff_error(&self, store: &SessionStore) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let state = store.load_raw_json_value().unwrap();
+                let session = raw_session_object(&state, "codex001").unwrap();
+                if json_text(session.get("error_message"))
+                    .is_some_and(|message| message.starts_with("codex_fork_handoff_failed:"))
+                {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "handoff failure was not recorded; state={}",
+                    fs::read_to_string(&self.state_file).unwrap_or_default()
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    impl Drop for CodexForkHandoffFixture {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["-L", &self.tmux_socket, "kill-server"])
+                .status();
+            let _ = fs::remove_file(&self.state_file);
+            let _ = fs::remove_dir_all(self.state_file.with_extension("dir"));
+        }
+    }
+
+    fn start_codex_fork_handoff_tmux(socket: &str, session: &str) {
+        let command = r#"/bin/sh -lc 'while IFS= read -r line; do printf "received:%s\n› Ready\n" "$line"; done' handoff-shell"#;
+        let status = Command::new("tmux")
+            .args(["-L", socket, "new-session", "-d", "-s", session, command])
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]

@@ -487,7 +487,16 @@ impl TmuxRuntime {
         let _ = self.wait_for_prompt(tmux_session, Duration::from_secs_f64(3.0));
 
         self.send_text_then_enter(tmux_session, clear_command)?;
-        let _ = self.wait_for_prompt(tmux_session, Duration::from_secs_f64(5.0));
+        if clear_command == "/new" {
+            // Codex redraws and reinitializes its composer after `/new`. Its
+            // full-screen prompt is not the bare `>` recognized by Claude's
+            // prompt waiter. Let the old frame begin clearing, then wait for
+            // the new composer row before pasting the continuation prompt.
+            thread::sleep(Duration::from_secs(1));
+            let _ = self.wait_for_codex_composer(tmux_session, Duration::from_secs(10));
+        } else {
+            let _ = self.wait_for_prompt(tmux_session, Duration::from_secs_f64(5.0));
+        }
 
         if let Some(prompt) = prompt.map(str::trim).filter(|value| !value.is_empty()) {
             self.send_text_then_enter(tmux_session, prompt)?;
@@ -668,6 +677,22 @@ impl TmuxRuntime {
         let deadline = Instant::now() + timeout;
         loop {
             if self.capture_pane_last_line(tmux_session).as_deref() == Some(">") {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn wait_for_codex_composer(&self, tmux_session: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self
+                .capture_pane_text(tmux_session)
+                .is_some_and(|text| text.lines().any(|line| line.trim_start().starts_with('›')))
+            {
                 return true;
             }
             if Instant::now() >= deadline {

@@ -378,6 +378,9 @@ impl AppState {
                     .runtime_enabled
                     .then(|| TmuxRuntime::from_app_config(&config)),
             );
+        if let Err(error) = session_store.recover_pending_codex_fork_handoffs() {
+            eprintln!("codex-fork handoff recovery failed: {error:#}");
+        }
         let mut mobile_terminal_secret = [0u8; 32];
         OsRng.fill_bytes(&mut mobile_terminal_secret);
         let (tmux_client_event_tx, _) = broadcast::channel(128);
