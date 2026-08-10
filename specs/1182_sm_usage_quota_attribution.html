@@ -745,6 +745,22 @@ CREATE TABLE scan_offsets (
   scanned_at    TEXT NOT NULL
 );
 
+-- Codex reports tokenUsage.total as a CUMULATIVE per-thread figure, so a delta
+-- needs the previous total. Without this, a scanner resuming at a byte offset
+-- either re-adds the thread's entire lifetime or loses the first delta.
+CREATE TABLE codex_thread_cursor (
+  thread_id            TEXT PRIMARY KEY,
+  artifact_path        TEXT NOT NULL,
+  last_seq             INTEGER NOT NULL,   -- event seq the totals below were taken at
+  last_input_tokens    INTEGER NOT NULL,
+  last_cached_input    INTEGER NOT NULL,
+  last_cache_write     INTEGER NOT NULL,
+  last_output_tokens   INTEGER NOT NULL,
+  last_reasoning       INTEGER NOT NULL,
+  last_total_tokens    INTEGER NOT NULL,
+  updated_at           TEXT NOT NULL
+);
+
 -- Exactly ONE row per accepted message, holding its full reversible
 -- contribution. Aggregating this table IS the rollup rebuild, so it must never
 -- contain two rows for the same real message. Lookup keys live in
@@ -760,6 +776,8 @@ CREATE TABLE message_ledger (
   seat_id      TEXT NOT NULL,
   account_key  TEXT NOT NULL,
   project_key  TEXT NOT NULL,
+  source_ref   TEXT NOT NULL,       -- Claude session uuid | Codex thread id; rebuilds cursors
+  source_seq   INTEGER,             -- Codex event seq; NULL for Claude
   bucket_ts    TEXT NOT NULL,       -- the message's own minute; NOT a window
   model        TEXT NOT NULL,
   effort       TEXT,
@@ -1021,6 +1039,20 @@ is a three-step transaction:</p>
   solely to keep that impossible: one message, one row, many names for it.</p>
 </blockquote>
 
+<h4>Cumulative sources need a persisted baseline</h4>
+<blockquote>
+  <p>Codex reports <code>tokenUsage.total</code> as a running lifetime figure per thread, so a
+  contribution is the <em>difference</em> between consecutive observations. A scanner that resumes at a
+  saved byte offset has no in-memory predecessor for the first event it reads: it either treats the whole
+  cumulative figure as one delta — adding the thread's entire history a second time — or skips the event
+  and loses real usage. Neither is detectable downstream, because both produce plausible numbers.</p>
+  <p><code>codex_thread_cursor</code> persists the last observed totals per thread alongside the event
+  <code>seq</code> they came from, and ledger rows carry <code>source_ref</code>/<code>source_seq</code> so
+  the cursor can be rebuilt from the ledger if it is ever lost. Claude needs none of this — its transcript
+  reports per-message usage, not a running total — which is exactly why the asymmetry has to be written
+  down rather than assumed.</p>
+</blockquote>
+
 <p><code>seat_tokens</code> is therefore a <strong>materialised rollup, not a source of truth</strong>. Any
 bucket can be rebuilt by re-aggregating <code>message_ledger</code> over
 <code>(account_key, window_kind, window_start, bucket_ts)</code>, which is the recovery path when the two
@@ -1167,8 +1199,10 @@ trustworthy.</p>
 <div class="eq">
 units(seat, w, m) = Σ<sub>b</sub> tokens[m][b] × bucket_ratio[b]&nbsp;&nbsp;<em>(bucket-weighted, per model, quota-metered only)</em><br>
 <br>
-<strong>PREMIUM TERM — exact, both modes, never fitted</strong>&nbsp;&nbsp;<em>(scoped plans only; D.3)</em><br>
-&nbsp;&nbsp;premium_pts(w)&nbsp;&nbsp;&nbsp;&nbsp;= weekly_scoped_pct × r<br>
+<strong>PREMIUM TERM — per window; never fitted</strong>&nbsp;&nbsp;<em>(scoped plans only; D.3)</em><br>
+&nbsp;&nbsp;w = weekly_all&nbsp;&nbsp;&nbsp;&nbsp;→ premium_pts = weekly_scoped_pct × r&nbsp;&nbsp;<em>(convert to pool points)</em><br>
+&nbsp;&nbsp;w = weekly_scoped&nbsp;→ premium_pts = weekly_scoped_pct&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<em>(already in scoped-cap points)</em><br>
+&nbsp;&nbsp;w = session_5h&nbsp;&nbsp;&nbsp;→ <em>no exact term exists; fit/apportion all families</em><br>
 &nbsp;&nbsp;burn<sub>prem</sub>(seat)&nbsp;&nbsp;= premium_pts(w) × units<sub>prem</sub>(seat) / Σ<sub>seats</sub> units<sub>prem</sub><br>
 <br>
 <strong>FITTED</strong> — absolute conversion over the remaining families<br>
@@ -1183,6 +1217,31 @@ units(seat, w, m) = Σ<sub>b</sub> tokens[m][b] × bucket_ratio[b]&nbsp;&nbsp;<e
 &nbsp;&nbsp;burn(seat, w)&nbsp;&nbsp;&nbsp;&nbsp;= burn<sub>prem</sub>(seat) + burn<sub>rest</sub>(seat)<br>
 &nbsp;&nbsp;residual(w)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= <code>unknown</code>; seat figures flagged possibly-inflated
 </div>
+
+<blockquote>
+  <p><strong>The conversion factor <code>r</code> belongs to exactly one window.</strong>
+  <code>weekly_scoped_pct × r</code> expresses premium burn in <em>overall-pool</em> points, so it is
+  correct for <code>weekly_all</code> and wrong everywhere else. Applied to <code>weekly_scoped</code> it
+  makes the seat values sum to <code>r × account_burn</code> instead of the scoped percentage — every
+  premium seat under-reported by half. Applied to <code>session_5h</code> it imports seven days of premium
+  burn into a five-hour window and simultaneously drops the premium family from that window's fit. There
+  is no scoped 5-hour meter, so the 5-hour window has no exact term at all and every family is fitted or
+  apportioned there.</p>
+  <p>Note that in the <code>weekly_scoped</code> window every unit is premium by definition, so that report
+  contains only premium seats and their values sum to <code>weekly_scoped_pct</code>.</p>
+</blockquote>
+
+<blockquote>
+  <p><strong>"Exact" describes the family total, not the per-seat split.</strong> The measured premium
+  contribution is distributed across <em>locally observed</em> premium seats, so premium usage from a
+  browser or another machine is silently pushed onto visible seats and never reaches the C.7a residual —
+  the same coverage failure, confined to one family. Estimate premium coverage the same way as the general
+  case (D.4): intervals with zero local premium units but a moving scoped meter measure unobserved premium
+  burn directly, and that amount is reserved as premium residual before apportioning the rest. Where it
+  cannot be estimated — too few such intervals, or premium off-machine use concurrent with fleet activity
+  — label the premium per-seat split <code>proportional</code> and possibly inflated rather than presenting
+  it as absolute. The family total stays exact either way; only its division is in question.</p>
+</blockquote>
 
 <blockquote>
   <p><strong>The premium term is exact in both modes and must never be fitted.</strong> D.3 deliberately
@@ -1598,6 +1657,7 @@ scout        (22e0f1) | codex-fork | running   | luna  | 0.1% wk</code></pre>
   <tr><td>Coverage above 1.0 — observed tokens predict more burn than reported</td><td>A double-count or a stale weight, not a provider error. Clamp the residual at zero, flag the window, and re-check the ingest invariants in C.2a before trusting the fit</td></tr>
   <tr><td>Weights still <code>prior</code> when a report is requested</td><td>Fall back to proportional shares; print <code>residual: unknown</code> and mark seat figures as possibly inflated. Never print a computed residual from prior weights</td></tr>
   <tr><td>Premium work continues on credits after the scoped cap</td><td>Mark those rows <code>credit_metered</code>, exclude from the quota apportionment, report separately as spend</td></tr>
+  <tr><td>Codex thread cursor missing after a crash or rebuild</td><td>Rebuild it from the ledger's <code>source_ref</code>/<code>source_seq</code> high-water mark before scanning that thread. Never treat a cumulative total as a delta because no baseline is present</td></tr>
   <tr><td>Rollup disagrees with <code>message_ledger</code></td><td>The ledger wins. Re-aggregate the affected <code>(account, window, bucket)</code> from it; this is why the rollup index exists</td></tr>
   <tr><td><code>usage.db</code> corrupt</td><td>Rebuild from artefacts. Everything is a cache of on-disk truth except <code>account_timeline</code> and <code>model_weights</code>, which must be backed up</td></tr>
 </table>
