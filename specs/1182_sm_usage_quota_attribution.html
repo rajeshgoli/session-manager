@@ -712,15 +712,35 @@ CREATE TABLE scan_offsets (
   scanned_at    TEXT NOT NULL
 );
 
--- Dedupe register, window-scoped so it can be pruned.
-CREATE TABLE seen_messages (
+-- Per-message ledger. Dedupe register AND the reversal record: it holds the
+-- FULL contribution each accepted message made, so a later scan that finds a
+-- preferred copy can subtract the old one. seat_tokens is a rollup of this.
+CREATE TABLE message_ledger (
   dedupe_key   TEXT PRIMARY KEY,     -- hash(message_id, request_id)
   message_id   TEXT NOT NULL,
+  request_id   TEXT,
   is_sidechain INTEGER NOT NULL,
-  total_tokens INTEGER NOT NULL,
-  window_start TEXT NOT NULL
+  has_speed    INTEGER NOT NULL,     -- tiebreak input for should_replace
+  total_tokens INTEGER NOT NULL,     -- tiebreak input for should_replace
+  -- everything below is the reversible contribution
+  seat_id      TEXT NOT NULL,
+  account_key  TEXT NOT NULL,
+  project_key  TEXT NOT NULL,
+  window_kind  TEXT NOT NULL,
+  window_start TEXT NOT NULL,
+  bucket_ts    TEXT NOT NULL,
+  model        TEXT NOT NULL,
+  effort       TEXT,
+  input_tokens      INTEGER NOT NULL DEFAULT 0,
+  output_tokens     INTEGER NOT NULL DEFAULT 0,
+  reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
+  cache_write_5m    INTEGER NOT NULL DEFAULT 0,
+  cache_write_1h    INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  recorded_at  TEXT NOT NULL
 );
-CREATE INDEX idx_seen_msgid ON seen_messages(message_id);
+CREATE INDEX idx_ledger_msgid  ON message_ledger(message_id);
+CREATE INDEX idx_ledger_rollup ON message_ledger(account_key, window_kind, window_start, bucket_ts);
 
 -- Immutable snapshot of what a seat was, so history stays readable after the
 -- seat is renamed, reparented, or dropped from sessions.json. One row per seat
@@ -844,6 +864,35 @@ should_replace(cand, prev):
 one that matters: preferring the non-sidechain copy regardless of token count is exactly what
 prevents subagent cache-read inflation from being counted.</p>
 
+<h4>Replacement must reverse the earlier contribution</h4>
+<blockquote>
+  <p>Scanning is incremental, so the two copies of a message frequently arrive in
+  <em>different scans</em> — a subagent file is often read before the parent file is next appended to.
+  By the time the preferred copy shows up, the inferior one has already been aggregated. A dedupe
+  register that stores only a hash and a token total cannot undo that: it does not know which seat,
+  model, window, or bucket the earlier contribution landed in. The inflated cache-read numbers would
+  survive, or worse, be counted <em>alongside</em> the replacement.</p>
+</blockquote>
+
+<p>So <code>message_ledger</code> stores the full contribution of every accepted message, and replacement
+is a three-step transaction:</p>
+
+<ol>
+  <li>Look up the incumbent row by <code>dedupe_key</code>, falling back to the loose key as above.</li>
+  <li>If <code>should_replace</code> is true, <strong>subtract the incumbent's stored buckets</strong> from its
+  <code>seat_tokens</code> row (which may be a different seat, model, or bucket than the newcomer's), then
+  add the newcomer's, then overwrite the ledger row. If false, discard the newcomer and change nothing.</li>
+  <li>Commit both writes together. A crash between them would leave a rollup that no longer matches the
+  ledger.</li>
+</ol>
+
+<p><code>seat_tokens</code> is therefore a <strong>materialised rollup, not a source of truth</strong>. Any
+bucket can be rebuilt by re-aggregating <code>message_ledger</code> over
+<code>(account_key, window_kind, window_start, bucket_ts)</code>, which is the recovery path when the two
+disagree and the reason the rollup index exists. Codex thread totals need the same treatment for a
+different reason: <code>tokenUsage.total</code> is cumulative, so a re-read of the same thread must diff
+against the last recorded total rather than add to it.</p>
+
 <h3>C.4 Sidechain → parent seat</h3>
 <p>Subagent lines carry <code>isSidechain: true</code>, an <code>agentId</code>, and the same
 <code>sessionId</code> as the parent. Because attribution maps <code>sessionId</code> → seat, subagent usage
@@ -912,15 +961,28 @@ first; every other seat is blocked only by <code>weekly_all</code> (A.1). So the
 has is:</p>
 
 <div class="eq">
-headroom(seat) = 100 − weekly_all_pct&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if the seat's model is not scoped<br>
-headroom(seat) = min(100 − weekly_all_pct, 100 − weekly_scoped_pct)&nbsp;&nbsp; if it is
+<em>Both operands must be in pool units before they can be compared.</em><br>
+<br>
+headroom(seat) = 100 − weekly_all_pct&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; if the seat's model is not scoped<br>
+headroom(seat) = min(100 − weekly_all_pct, <strong>r ×</strong> (100 − weekly_scoped_pct))&nbsp;&nbsp; if it is
 </div>
 
-<p>These diverge in practice. An account at <code>weekly_all 8%</code> / <code>weekly_scoped 7%</code> has
-92 points of headroom for a Sonnet seat and 93 for a premium seat — but run premium-only and the scoped
-meter climbs twice as fast per point of pool, so it hits 100% with roughly half the pool untouched. At
-that moment the account reads "50% used" while premium seats can no longer run for free. Surfacing only
-<code>weekly_all</code> would show an orchestrator ample headroom that its own seats cannot reach.</p>
+<blockquote>
+  <p><strong>The two percentages are denominated in different caps and cannot be compared raw.</strong>
+  <code>weekly_all_pct</code> is a fraction of the pool <code>C</code>; <code>weekly_scoped_pct</code> is a
+  fraction of the scoped cap <code>r·C</code>. Multiplying the scoped remainder by <code>r</code> converts it
+  into pool units. Skipping that conversion roughly doubles the reported premium runway — the single
+  most consequential arithmetic error available in this design, because it inflates exactly the number an
+  orchestrator uses to decide whether to launch more premium seats.</p>
+</blockquote>
+
+<p>These diverge sharply in practice. An account at <code>weekly_all 8%</code> / <code>weekly_scoped 7%</code>
+has <strong>92</strong> pool points of headroom for a Sonnet seat but only
+<strong>0.50 × 93 = 46.5</strong> for a premium seat — half as much, not marginally more. Run
+premium-only and the scoped meter climbs twice as fast per point of pool, so it reaches 100% with roughly
+half the pool untouched: the account reads "50% used" while premium seats can no longer run for free.
+Surfacing <code>weekly_all</code> alone, or taking an unscaled minimum, would show an orchestrator ample
+headroom its own seats cannot reach.</p>
 
 <p>With <code>--include-children</code>, sum over descendants using the existing preorder walk
 (<code>collect_descendants_preorder</code>, <code>sessions.rs:5906-5928</code>), then compute the share once
@@ -1360,8 +1422,11 @@ ready</strong>. Do not merge to <code>main</code>, do not deploy, do not enable 
 <p>The only additional discipline required now is <strong>retention</strong>: do not prune
 <code>burn_samples</code> or <code>seat_tokens</code> on a short horizon. They are small — a year of
 minute buckets across a few hundred seats is tens of megabytes — and they are the entire dataset any
-later analysis would want. Prune <code>seen_messages</code> instead, which is the only table that grows
-without analytical value.</p>
+later analysis would want. <code>message_ledger</code> is the one table worth pruning: it exists to make replacement
+reversible, and once a window has closed and its artefacts will not be rescanned, nothing can replace
+those messages. Drop ledger rows for windows closed longer than a grace period — a fortnight is
+generous — after confirming the rollup matches. The rollups themselves are the analytical record and
+stay.</p>
 
 <h3>J.2 Questions the data will already answer</h3>
 <ul>
