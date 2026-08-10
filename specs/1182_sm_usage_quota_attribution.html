@@ -692,16 +692,33 @@ CREATE TABLE seat_tokens (
 CREATE INDEX idx_seat_tokens_fit ON seat_tokens(account_key, window_kind, bucket_ts);
 
 -- Fitted per-model weights, versioned so a bad fit can be rolled back.
+-- A weight converts tokens into PERCENTAGE POINTS OF A SPECIFIC CAP, so the
+-- same model carries a different coefficient in the 5-hour window than in the
+-- weekly one, and a different one again after a cap change. Window kind and
+-- fit segment are therefore part of the key, not metadata.
 CREATE TABLE model_weights (
   account_key   TEXT NOT NULL,
+  window_kind   TEXT NOT NULL,       -- 'session_5h' | 'weekly_all' | 'weekly_scoped' | 'codex_300' | ...
+  segment_id    TEXT NOT NULL,       -- cap regime; new segment on any cap change (D.4)
   model         TEXT NOT NULL,
-  weight        REAL NOT NULL,       -- quota units per input-token equivalent
+  weight        REAL NOT NULL,       -- percentage points of THIS window's cap per unit token
   source        TEXT NOT NULL,       -- 'prior' | 'fitted'
   n_samples     INTEGER NOT NULL,
   condition_num REAL,
   residual_rms  REAL,
   fitted_at     TEXT NOT NULL,
-  PRIMARY KEY (account_key, model, fitted_at)
+  PRIMARY KEY (account_key, window_kind, segment_id, model, fitted_at)
+);
+
+-- Cap regimes. A promo, plan change, or provider adjustment closes one and
+-- opens the next; weights never cross a boundary.
+CREATE TABLE fit_segments (
+  segment_id  TEXT PRIMARY KEY,
+  account_key TEXT NOT NULL,
+  window_kind TEXT NOT NULL,
+  from_ts     TEXT NOT NULL,
+  to_ts       TEXT,
+  reason      TEXT              -- 'initial' | 'promo_start' | 'promo_end' | 'tier_change' | 'burn_decreased'
 );
 
 -- Incremental scan checkpoints.
@@ -728,9 +745,7 @@ CREATE TABLE message_ledger (
   seat_id      TEXT NOT NULL,
   account_key  TEXT NOT NULL,
   project_key  TEXT NOT NULL,
-  window_kind  TEXT NOT NULL,
-  window_start TEXT NOT NULL,
-  bucket_ts    TEXT NOT NULL,
+  bucket_ts    TEXT NOT NULL,       -- the message's own minute; NOT a window
   model        TEXT NOT NULL,
   effort       TEXT,
   input_tokens      INTEGER NOT NULL DEFAULT 0,  -- UNCACHED input only; see C.2a
@@ -743,7 +758,18 @@ CREATE TABLE message_ledger (
   recorded_at  TEXT NOT NULL
 );
 CREATE INDEX idx_ledger_msgid  ON message_ledger(message_id);
-CREATE INDEX idx_ledger_rollup ON message_ledger(account_key, window_kind, window_start, bucket_ts);
+CREATE INDEX idx_ledger_rollup ON message_ledger(account_key, bucket_ts);
+
+-- A message belongs to EVERY window open at its timestamp - the 5-hour window,
+-- the overall week, and for premium models the scoped week - so window
+-- membership is many-per-message and cannot live on the identity row.
+CREATE TABLE message_window (
+  msg_id       INTEGER NOT NULL REFERENCES message_ledger(msg_id) ON DELETE CASCADE,
+  window_kind  TEXT NOT NULL,
+  window_start TEXT NOT NULL,
+  PRIMARY KEY (msg_id, window_kind, window_start)
+);
+CREATE INDEX idx_mw_rollup ON message_window(window_kind, window_start);
 
 -- Many lookup keys point AT one ledger row. Never the reverse: an alias holds
 -- no tokens, so no rebuild can double-count through it.
@@ -893,7 +919,8 @@ on new entry E:
           reverse ledger[msg_id] from the rollup      # see below
           overwrite ledger[msg_id] with E
           apply E to the rollup
-      # both alias keys already point at msg_id; leave them
+      alias[key_exact] = msg_id       # ALWAYS - E's exact key may be new
+      alias[key_loose] = msg_id
   else:
       msg_id = insert ONE ledger row for E
       alias[key_exact] = msg_id
@@ -933,6 +960,15 @@ is a three-step transaction:</p>
   <li>Commit all writes together. A crash between them would leave a rollup that no longer matches the
   ledger.</li>
 </ol>
+
+<blockquote>
+  <p><strong>Upsert the candidate's exact alias on every accepted match, including a loose one.</strong>
+  A loose match happens precisely when the candidate's <code>requestId</code> differs from the incumbent's
+  — so its exact key is, by construction, not yet registered. Leave it unregistered and the next sighting
+  of that same copy misses the exact key, and now also skips the loose fallback because sidechain-ness
+  matches the row it just replaced. It inserts a second contribution and the double-count returns. Write
+  both keys every time.</p>
+</blockquote>
 
 <blockquote>
   <p><strong>Both lookup keys point at one row; neither owns a copy of the contribution.</strong> Writing
@@ -997,8 +1033,18 @@ refuses to guess in the same situation.</p>
 <ol>
   <li><code>account_key</code> = the <code>account_timeline</code> row covering <code>(provider, timestamp)</code>.</li>
   <li><code>window_start</code> = derived per window by walking back from the observed <code>resets_at</code> by the window length. Claude's reset plus a known 5 h / 7 d length fixes the boundaries exactly; Codex supplies <code>windowDurationMins</code> directly.</li>
-  <li>Accumulate into <code>seat_tokens</code> at minute granularity so buckets align with <code>burn_samples</code> for the fit.</li>
+  <li><strong>Record one <code>message_window</code> row per window the message falls inside</strong> — typically the 5-hour window and the overall week, plus the scoped week when the model is the scoped one. A message is not "in" a single window; it is simultaneously spending against every window that is open when it lands.</li>
+  <li>Accumulate into <code>seat_tokens</code> per window at minute granularity, so buckets align with <code>burn_samples</code> for the fit.</li>
 </ol>
+
+<blockquote>
+  <p><strong>Window membership is many-per-message, which is why it is a join table rather than a column.</strong>
+  Putting <code>window_kind</code> on the identity row forces a choice: record one window and the message
+  vanishes from every other report and fit, or write a row per window and break the one-row-per-message
+  invariant that makes the alias table and the rebuild correct. Neither is acceptable, so identity and
+  window membership are stored separately. Reversal then subtracts the contribution from <em>every</em>
+  mapped window, not just one.</p>
+</blockquote>
 
 <p>Messages whose <code>sessionId</code> maps to no seat accumulate under the reserved seat id
 <code>unassigned</code>.</p>
@@ -1043,12 +1089,32 @@ drifts downward means work is escaping the fleet, and every attributed number is
 trustworthy.</p>
 
 <h3>C.8 Report</h3>
+<p>There are two modes, and which one applies depends on whether the weights for
+<em>that window and cap segment</em> have converged. They must not be mixed.</p>
+
 <div class="eq">
-units(seat, w)&nbsp;&nbsp;&nbsp;= Σ<sub>m,b</sub> tokens[m][b] × weight[m] × bucket_ratio[b]<br>
-account_units(w) = Σ over all seats incl. <code>unassigned</code><br>
-share(seat, w)&nbsp;&nbsp;&nbsp;= units(seat, w) / account_units(w)<br>
-burn(seat, w)&nbsp;&nbsp;&nbsp;&nbsp;= latest burn_samples.percent for (account, w) × share(seat, w)
+units(seat, w, m) = Σ<sub>b</sub> tokens[m][b] × bucket_ratio[b]<br>
+<br>
+<strong>FITTED</strong> — absolute conversion; the shortfall is real and reserved<br>
+&nbsp;&nbsp;burn(seat, w)&nbsp;&nbsp;= Σ<sub>m</sub> weight[account, w, segment, m] × units(seat, w, m)<br>
+&nbsp;&nbsp;residual(w)&nbsp;&nbsp;&nbsp;= max(0, account_burn(w) − Σ<sub>all seats</sub> burn(seat, w))<br>
+&nbsp;&nbsp;→ Σ seats + unassigned + residual = account_burn&nbsp;&nbsp;<em>by construction</em><br>
+<br>
+<strong>PRIOR</strong> — proportional fallback; residual is not computable<br>
+&nbsp;&nbsp;burn(seat, w)&nbsp;&nbsp;= account_burn(w) × units(seat, w) / Σ<sub>all seats</sub> units(w)<br>
+&nbsp;&nbsp;residual(w)&nbsp;&nbsp;&nbsp;= <code>unknown</code>, and seat figures are flagged possibly-inflated
 </div>
+
+<blockquote>
+  <p><strong>Do not normalise once the fit has converged.</strong> Scaling observed units to 100% and
+  multiplying by the whole account burn silently redistributes the residual across visible seats — which
+  is exactly the failure C.7a exists to prevent, reintroduced one section later. The proportional formula
+  is the pre-convergence fallback only, and it is the reason the residual reads <code>unknown</code> in
+  that state rather than zero.</p>
+  <p>Select the weight by <code>(account, window_kind, segment_id, model)</code>. A weight is denominated
+  in percentage points of one specific cap, so applying a weekly coefficient to a 5-hour report — or a
+  pre-promo coefficient after a promo — produces a confidently wrong number.</p>
+</blockquote>
 
 <p><strong>Report the binding limit, not just the biggest number.</strong> A seat on the scoped premium
 model is blocked by whichever of <code>weekly_all</code> and <code>weekly_scoped</code> reaches 100%
@@ -1198,9 +1264,14 @@ better-conditioned system over the sub-premium models alone.</p>
 where Δunits<sub>m,i</sub> = Σ<sub>b</sub> tokens[m][b] in (t<sub>i</sub>, t<sub>i+1</sub>] × bucket_ratio[b]
 </div>
 
+<p><strong>Run one fit per <code>(account, window_kind, segment)</code>.</strong> A weight converts tokens
+into percentage points of a particular cap, and the 5-hour cap and the weekly cap are different sizes,
+so the same token delta moves them by different amounts. One blended fit across windows would be
+meaningless in both.</p>
+
 <p>Procedure:</p>
 <ol>
-  <li>Bucket <code>seat_tokens</code> by minute; align to burn samples by timestamp.</li>
+  <li>Bucket <code>seat_tokens</code> by minute; align to burn samples by timestamp, within one window kind and one cap segment.</li>
   <li>Coalesce consecutive intervals until Δburn ≥ 1 percentage point, so quantisation noise does not dominate.</li>
   <li>Solve non-negative least squares for <code>w</code>, ridge-regularised toward the D.1/D.2 prior.</li>
   <li>Record condition number and residual RMS in <code>model_weights</code>.</li>
