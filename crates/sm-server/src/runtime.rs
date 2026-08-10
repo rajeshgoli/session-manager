@@ -486,8 +486,32 @@ impl TmuxRuntime {
         self.send_key(tmux_session, "Escape")?;
         let _ = self.wait_for_prompt(tmux_session, Duration::from_secs_f64(3.0));
 
+        let pre_reset_pane = (clear_command == "/new")
+            .then(|| self.capture_pane_text(tmux_session))
+            .flatten();
         self.send_text_then_enter(tmux_session, clear_command)?;
-        let _ = self.wait_for_prompt(tmux_session, Duration::from_secs_f64(5.0));
+        if clear_command == "/new" {
+            // Codex redraws and reinitializes its composer after `/new`. Its
+            // full-screen prompt is not the bare `>` recognized by Claude's
+            // prompt waiter. Require both a changed frame and a composer at the
+            // live cursor row so transcript prompts cannot satisfy readiness.
+            while !self.wait_for_codex_composer(
+                tmux_session,
+                pre_reset_pane.as_deref(),
+                Duration::from_secs(10),
+            ) {
+                // `/new` has already destroyed the prior turn, so returning to
+                // the event monitor here would deadlock the handoff: no old
+                // turn remains to emit another completion. Keep the input lock
+                // and retry readiness until the new composer appears, unless
+                // the tmux session itself has gone away.
+                if !self.session_exists(tmux_session)? {
+                    return Ok(false);
+                }
+            }
+        } else {
+            let _ = self.wait_for_prompt(tmux_session, Duration::from_secs_f64(5.0));
+        }
 
         if let Some(prompt) = prompt.map(str::trim).filter(|value| !value.is_empty()) {
             self.send_text_then_enter(tmux_session, prompt)?;
@@ -675,6 +699,44 @@ impl TmuxRuntime {
             }
             thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    fn wait_for_codex_composer(
+        &self,
+        tmux_session: &str,
+        pre_reset_pane: Option<&str>,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.codex_composer_is_ready(tmux_session, pre_reset_pane) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn codex_composer_is_ready(&self, tmux_session: &str, pre_reset_pane: Option<&str>) -> bool {
+        let cursor = match self
+            .tmux_command(["display-message", "-p", "-t", tmux_session, "#{cursor_y}"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<usize>()
+                .ok(),
+            _ => None,
+        };
+        let Some(cursor) = cursor else {
+            return false;
+        };
+        self.capture_pane_text(tmux_session)
+            .is_some_and(|text| codex_composer_after_reset(&text, cursor, pre_reset_pane))
     }
 
     pub fn capture_pane_text(&self, tmux_session: &str) -> Option<String> {
@@ -929,6 +991,14 @@ impl TmuxRuntime {
             + (line_count.saturating_sub(1) as f64) * self.send_keys_settle_per_extra_line_ms;
         duration_from_millis((base + extra).clamp(base, max_delay))
     }
+}
+
+fn codex_composer_after_reset(pane: &str, cursor_y: usize, pre_reset_pane: Option<&str>) -> bool {
+    pre_reset_pane != Some(pane)
+        && pane
+            .lines()
+            .nth(cursor_y)
+            .is_some_and(|line| line.trim_start().starts_with('›'))
 }
 
 fn split_send_text_chunks(text: &str, max_chunk_chars: usize) -> Vec<&str> {
@@ -1496,6 +1566,16 @@ mod tests {
         assert!(clear_enter < post_clear_wait);
         assert!(post_clear_wait < prompt_text);
         assert!(prompt_text < prompt_enter);
+    }
+
+    #[test]
+    fn codex_composer_readiness_requires_the_cursor_row() {
+        let pane = "› stale transcript prompt\nWorking\n\n› live composer\n\nmodel status\n";
+
+        assert!(!codex_composer_after_reset(pane, 1, None));
+        assert!(codex_composer_after_reset(pane, 3, None));
+        assert!(!codex_composer_after_reset(pane, 5, None));
+        assert!(!codex_composer_after_reset(pane, 3, Some(pane)));
     }
 
     #[test]
