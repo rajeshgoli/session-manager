@@ -3,6 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashMap,
     env, fs,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Condvar, Mutex, OnceLock, Weak},
@@ -545,6 +546,7 @@ impl TmuxRuntime {
             self.send_text_then_enter(tmux_session, prompt)?;
             if let Some((event_stream_path, initial_event_offset)) = codex_prompt_confirmation {
                 let mut retry_at = Instant::now() + Duration::from_secs(2);
+                let confirmation_deadline = Instant::now() + Duration::from_secs(30);
                 loop {
                     if codex_event_stream_has_user_turn(
                         event_stream_path,
@@ -555,6 +557,12 @@ impl TmuxRuntime {
                     }
                     if !self.session_exists(tmux_session)? {
                         return Ok(false);
+                    }
+                    if Instant::now() >= confirmation_deadline {
+                        anyhow::bail!(
+                            "timed out confirming Codex handoff prompt in {}",
+                            event_stream_path.display()
+                        );
                     }
                     if Instant::now() >= retry_at {
                         self.send_key(tmux_session, "Enter")?;
@@ -1050,21 +1058,27 @@ fn codex_composer_after_reset(pane: &str, cursor_y: usize, pre_reset_pane: Optio
 }
 
 fn codex_event_stream_has_user_turn(path: &Path, initial_offset: u64, prompt: &str) -> bool {
-    let Ok(content) = fs::read(path) else {
+    let Ok(mut file) = fs::OpenOptions::new().read(true).open(path) else {
         return false;
     };
-    let Ok(offset) = usize::try_from(initial_offset) else {
+    let read_offset = initial_offset.saturating_sub(1);
+    if file.seek(SeekFrom::Start(read_offset)).is_err() {
         return false;
-    };
-    let Some(mut start) = (offset <= content.len()).then_some(offset) else {
+    }
+    let mut content = Vec::new();
+    if file.read_to_end(&mut content).is_err() {
         return false;
-    };
-    if start > 0 && content.get(start - 1) != Some(&b'\n') {
-        let Some(relative_newline) = content[start..].iter().position(|byte| *byte == b'\n') else {
+    }
+    let start = if initial_offset == 0 {
+        0
+    } else if content.first() == Some(&b'\n') {
+        1
+    } else {
+        let Some(relative_newline) = content.iter().position(|byte| *byte == b'\n') else {
             return false;
         };
-        start += relative_newline + 1;
-    }
+        relative_newline + 1
+    };
     let Ok(content) = std::str::from_utf8(&content[start..]) else {
         return false;
     };
