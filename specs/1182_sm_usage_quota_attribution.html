@@ -258,6 +258,7 @@ observations rather than one comparison.</p>
   <tr><td>Premium family's share of burn</td><td><strong>Exact</strong></td><td>Scoped meter × the published 50% sub-cap ratio</td></tr>
   <tr><td>Sub-premium family weights</td><td>Fitted</td><td>Regression on the overall series with the premium term substituted out; price prior until converged</td></tr>
   <tr><td>Per-seat burn %</td><td>Derived</td><td>Product of the above</td></tr>
+  <tr><td>Coverage — the share of account burn visible locally at all</td><td>Measured once weights are fitted; <code>unknown</code> before</td><td>Account burn minus what the observed tokens predict (C.7a)</td></tr>
 </table>
 </div>
 
@@ -712,11 +713,12 @@ CREATE TABLE scan_offsets (
   scanned_at    TEXT NOT NULL
 );
 
--- Per-message ledger. Dedupe register AND the reversal record: it holds the
--- FULL contribution each accepted message made, so a later scan that finds a
--- preferred copy can subtract the old one. seat_tokens is a rollup of this.
+-- Exactly ONE row per accepted message, holding its full reversible
+-- contribution. Aggregating this table IS the rollup rebuild, so it must never
+-- contain two rows for the same real message. Lookup keys live in
+-- message_alias, never here.
 CREATE TABLE message_ledger (
-  dedupe_key   TEXT PRIMARY KEY,     -- hash(message_id, request_id)
+  msg_id       INTEGER PRIMARY KEY AUTOINCREMENT,
   message_id   TEXT NOT NULL,
   request_id   TEXT,
   is_sidechain INTEGER NOT NULL,
@@ -731,16 +733,26 @@ CREATE TABLE message_ledger (
   bucket_ts    TEXT NOT NULL,
   model        TEXT NOT NULL,
   effort       TEXT,
-  input_tokens      INTEGER NOT NULL DEFAULT 0,
+  input_tokens      INTEGER NOT NULL DEFAULT 0,  -- UNCACHED input only; see C.2a
   output_tokens     INTEGER NOT NULL DEFAULT 0,
-  reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
+  reasoning_tokens  INTEGER NOT NULL DEFAULT 0,  -- subset of output; informational
   cache_write_5m    INTEGER NOT NULL DEFAULT 0,
   cache_write_1h    INTEGER NOT NULL DEFAULT 0,
   cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  credit_metered    INTEGER NOT NULL DEFAULT 0,  -- post-cap paid work; see D.3
   recorded_at  TEXT NOT NULL
 );
 CREATE INDEX idx_ledger_msgid  ON message_ledger(message_id);
 CREATE INDEX idx_ledger_rollup ON message_ledger(account_key, window_kind, window_start, bucket_ts);
+
+-- Many lookup keys point AT one ledger row. Never the reverse: an alias holds
+-- no tokens, so no rebuild can double-count through it.
+CREATE TABLE message_alias (
+  lookup_key TEXT PRIMARY KEY,       -- hash(message_id, request_id) | hash(message_id, NULL)
+  kind       TEXT NOT NULL,          -- 'exact' | 'loose'
+  msg_id     INTEGER NOT NULL REFERENCES message_ledger(msg_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_alias_msg ON message_alias(msg_id);
 
 -- Immutable snapshot of what a seat was, so history stays readable after the
 -- seat is renamed, reparented, or dropped from sessions.json. One row per seat
@@ -836,6 +848,34 @@ breakdown, give it weight 0. Its usage counters are zero anyway.</p>
 when the nested object exists, since they carry different weights; fall back to the flat
 <code>cache_creation_input_tokens</code> at the 5-minute rate.</p>
 
+<h3>C.2a Bucket semantics differ by provider — normalise at ingest</h3>
+
+<blockquote>
+  <p><strong>Claude's buckets are disjoint; Codex's are nested.</strong> Loading both the same way
+  double-counts every cached Codex token, at both the full input weight and the cache-read weight.
+  Since Codex traffic is overwhelmingly cached — the A.6 sample is 1,701,731,072 cached out of
+  1,722,233,031 input, over 98% — this would not be a rounding error. It would dominate the fitted
+  weights and every seat share derived from them.</p>
+</blockquote>
+
+<div class="tw">
+<table>
+  <tr><th>Provider</th><th>Relationship</th><th>Store as</th></tr>
+  <tr><td>Claude</td><td><code>input_tokens</code>, <code>cache_creation_input_tokens</code>, <code>cache_read_input_tokens</code> are <strong>disjoint</strong> — <code>input_tokens</code> is uncached input only</td><td>Verbatim</td></tr>
+  <tr><td>Codex</td><td><code>cachedInputTokens</code> ⊆ <code>inputTokens</code>, and <code>reasoningOutputTokens</code> ⊆ <code>outputTokens</code>. Confirmed by the identity <code>inputTokens + outputTokens = totalTokens</code></td><td><code>input_tokens = inputTokens − cachedInputTokens</code>; <code>cache_read_tokens = cachedInputTokens</code>; <code>output_tokens = outputTokens</code>; <code>reasoning_tokens</code> informational only</td></tr>
+</table>
+</div>
+
+<p>The invariant to assert at ingest, for both providers: the stored buckets are mutually exclusive and
+their sum equals the message's total billable tokens. Anything else silently inflates a family's weight.</p>
+
+<p><code>cacheWriteInputTokens</code> is <strong>0 in every one of the 442 local Codex streams</strong>, so
+whether it also nests inside <code>inputTokens</code> cannot be determined from this data and does not
+currently matter. When a non-zero value first appears, the same identity settles it: if
+<code>inputTokens + outputTokens</code> still equals <code>totalTokens</code>, cache-write is nested and
+must also be subtracted out of the uncached-input figure. Assert the identity on ingest so the day it
+breaks is the day you find out, rather than a quarter later.</p>
+
 <h3>C.3 Dedupe — the correctness-critical step</h3>
 <p>The same assistant message appears in several files after resume, fork, and subagent runs. A
 subagent transcript <em>replays parent messages with new <code>requestId</code>s and inflated
@@ -845,13 +885,19 @@ subagent transcript <em>replays parent messages with new <code>requestId</code>s
 key_loose = hash(message.id, NULL)
 
 on new entry E:
-  existing = lookup(key_exact)
-  if not existing and sidechain-ness differs for this message.id:
-      existing = lookup(key_loose)          # sidechain replay of a parent message
-  if existing:
-      replace only if should_replace(E, existing)
+  msg_id = alias[key_exact]
+  if msg_id is null and sidechain-ness differs for this message.id:
+      msg_id = alias[key_loose]           # sidechain replay of a parent message
+  if msg_id is not null:
+      if should_replace(E, ledger[msg_id]):
+          reverse ledger[msg_id] from the rollup      # see below
+          overwrite ledger[msg_id] with E
+          apply E to the rollup
+      # both alias keys already point at msg_id; leave them
   else:
-      insert E under both keys
+      msg_id = insert ONE ledger row for E
+      alias[key_exact] = msg_id
+      alias[key_loose] = msg_id           # two keys, one row
 
 should_replace(cand, prev):
   if cand.isSidechain != prev.isSidechain:
@@ -878,13 +924,23 @@ prevents subagent cache-read inflation from being counted.</p>
 is a three-step transaction:</p>
 
 <ol>
-  <li>Look up the incumbent row by <code>dedupe_key</code>, falling back to the loose key as above.</li>
+  <li>Resolve <code>msg_id</code> through <code>message_alias</code> — exact key first, loose key only on a
+  sidechain mismatch.</li>
   <li>If <code>should_replace</code> is true, <strong>subtract the incumbent's stored buckets</strong> from its
   <code>seat_tokens</code> row (which may be a different seat, model, or bucket than the newcomer's), then
-  add the newcomer's, then overwrite the ledger row. If false, discard the newcomer and change nothing.</li>
-  <li>Commit both writes together. A crash between them would leave a rollup that no longer matches the
+  add the newcomer's, then overwrite the single ledger row in place. If false, discard the newcomer and
+  change nothing.</li>
+  <li>Commit all writes together. A crash between them would leave a rollup that no longer matches the
   ledger.</li>
 </ol>
+
+<blockquote>
+  <p><strong>Both lookup keys point at one row; neither owns a copy of the contribution.</strong> Writing
+  the message under both an exact and a loose key as two ledger rows would double every accepted message
+  in any rebuild, and replacing only the matched row would leave the other stale — reintroducing the
+  inflation this design exists to prevent, in a form that looks like clean data. The alias table exists
+  solely to keep that impossible: one message, one row, many names for it.</p>
+</blockquote>
 
 <p><code>seat_tokens</code> is therefore a <strong>materialised rollup, not a source of truth</strong>. Any
 bucket can be rebuilt by re-aggregating <code>message_ledger</code> over
@@ -946,6 +1002,45 @@ refuses to guess in the same situation.</p>
 
 <p>Messages whose <code>sessionId</code> maps to no seat accumulate under the reserved seat id
 <code>unassigned</code>.</p>
+
+<h3>C.7a Coverage — burn that has no local tokens at all</h3>
+
+<blockquote>
+  <p><code>unassigned</code> and <code>unobserved</code> are different problems, and only the first is
+  solved by scanning harder. <code>unassigned</code> is usage that <em>is</em> on disk but maps to no seat.
+  <strong><code>unobserved</code> is burn with no local artefact whatsoever</strong> — the account used from
+  another machine, from claude.ai in a browser, or from a transcript since deleted. Normalising shares
+  over observed tokens alone forces them to sum to 100%, which silently redistributes that invisible burn
+  across the seats that <em>are</em> visible, inflating every one of them while the reported
+  <code>unassigned</code> gap sits at zero and looks reassuring.</p>
+</blockquote>
+
+<p>Once weights are fitted they convert units to burn points absolutely, not just proportionally, which
+makes the shortfall measurable:</p>
+
+<div class="eq">
+predicted_burn&nbsp;= Σ<sub>m</sub> w<sub>m</sub> · units<sub>m</sub>&nbsp;&nbsp; over every observed message in the window<br>
+residual_burn&nbsp;&nbsp;= max(0, account_burn − predicted_burn)&nbsp;&nbsp; ← the unobserved remainder<br>
+coverage&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;= predicted_burn / account_burn
+</div>
+
+<p>Seats are then reported in absolute burn points rather than as a normalised share, and the three parts
+add up to the account figure by construction:</p>
+
+<div class="eq">
+Σ known seats&nbsp;&nbsp;+&nbsp;&nbsp;unassigned&nbsp;&nbsp;+&nbsp;&nbsp;residual&nbsp;&nbsp;=&nbsp;&nbsp;account_burn
+</div>
+
+<p><strong>Before the fit converges this cannot be computed honestly.</strong> With prior weights the
+unit-to-burn conversion is a guess, so the residual would be an artefact of the prior rather than a
+measurement. In that state, fall back to proportional shares, report <code>residual</code> as
+<code>unknown</code> rather than as a number, and mark known-seat figures as possibly inflated by
+invisible usage. Reporting <code>unknown</code> is the honest output here; a confident zero is not.</p>
+
+<p>Coverage is worth surfacing in its own right. It answers "how much of this account's burn can
+<code>sm</code> actually see", which is the health metric for the whole feature — a coverage figure that
+drifts downward means work is escaping the fleet, and every attributed number is quietly getting less
+trustworthy.</p>
 
 <h3>C.8 Report</h3>
 <div class="eq">
@@ -1077,6 +1172,17 @@ tokens get over- or under-penalised. They get neither: their share of the pool i
 first-party numbers and a published constant. Any premium seat's own burn is then that 3.5 points
 apportioned by its share of premium tokens, which is a within-family split where model weight cancels
 entirely.</p>
+
+<blockquote>
+  <p><strong>Apportion only over tokens that actually consumed quota.</strong> Once the scoped meter reaches
+  100% and extra usage is enabled, premium work continues on <em>paid credits</em> and stops drawing on the
+  capped pool. Those post-cap tokens are still in the ledger, so dividing the fixed pool contribution over
+  every premium token in the window would let credit-funded work claim quota burn that earlier seats
+  actually caused — penalising the seat that ran first for the spending of the seat that ran after.</p>
+  <p>Split the window at the exhaustion marker: mark ledger rows written after the scoped meter hits 100%
+  as <code>credit_metered</code>, exclude them from the within-family quota apportionment, and report them
+  separately as spend. They cost real money and belong in the report — just not in this denominator.</p>
+</blockquote>
 
 <p>It also strengthens the fit for everything else. Substituting the premium term out of the overall
 equation removes one unknown <em>and</em> the family with the widest price spread, leaving a
@@ -1226,6 +1332,11 @@ scout        (22e0f1) | codex-fork | running   | luna  | 0.1% wk</code></pre>
   <tr><td>Clock skew between message timestamps and poll times</td><td>Half-open intervals with recorded uncertainty; a message inside an uncertainty window attributes to the earlier account and is flagged</td></tr>
   <tr><td>Codex <code>rate_limits</code> never arrives</td><td>Report Codex token totals without a percentage; log once per session</td></tr>
   <tr><td>Exhaustion event seen</td><td>Write <code>window_ledger.exhausted = 1</code>; hold the last percentage rather than decaying it; use as a fit anchor</td></tr>
+  <tr><td>Coverage below 1.0 — observed tokens predict less burn than the account reports</td><td>Expected whenever the account is used off-machine. Report the shortfall as <code>residual</code>; do not redistribute it across known seats</td></tr>
+  <tr><td>Coverage above 1.0 — observed tokens predict more burn than reported</td><td>A double-count or a stale weight, not a provider error. Clamp the residual at zero, flag the window, and re-check the ingest invariants in C.2a before trusting the fit</td></tr>
+  <tr><td>Weights still <code>prior</code> when a report is requested</td><td>Fall back to proportional shares; print <code>residual: unknown</code> and mark seat figures as possibly inflated. Never print a computed residual from prior weights</td></tr>
+  <tr><td>Premium work continues on credits after the scoped cap</td><td>Mark those rows <code>credit_metered</code>, exclude from the quota apportionment, report separately as spend</td></tr>
+  <tr><td>Rollup disagrees with <code>message_ledger</code></td><td>The ledger wins. Re-aggregate the affected <code>(account, window, bucket)</code> from it; this is why the rollup index exists</td></tr>
   <tr><td><code>usage.db</code> corrupt</td><td>Rebuild from artefacts. Everything is a cache of on-disk truth except <code>account_timeline</code> and <code>model_weights</code>, which must be backed up</td></tr>
 </table>
 </div>
@@ -1293,6 +1404,7 @@ number the design labels as fitted. They are listed with what it would take to c
   <tr><td>The true Sol-to-Luna ratio. Base price says 25×; practice suggests nearer 100×.</td><td>The fit measures the combined rate-and-volume effect directly. The only requirement is not hard-coding either number, which D.2 already avoids.</td></tr>
   <tr><td>Does <code>claude --resume</code> mint a new session UUID?</td><td><code>seat_sessions</code> is append-only and correct either way — a same-file resume simply produces no new row. Closable with a single probe if it ever matters.</td></tr>
   <tr><td>Exact <code>error</code> string on a Claude usage-limit 429.</td><td>Matching is on <code>apiErrorStatus == 429</code>; the string is informational. <em>Owner can help opportunistically:</em> paste the transcript entry next time a limit is hit — this account has never recorded one.</td></tr>
+  <tr><td>Does Codex's <code>cacheWriteInputTokens</code> nest inside <code>inputTokens</code>?</td><td>Moot today — it is 0 in every one of the 442 local streams, so nothing depends on the answer. The ingest assertion in C.2a turns the first non-zero value into a loud failure rather than a silent miscount.</td></tr>
   <tr><td>OTEL attribute set on <code>claude_code.token.usage</code>.</td><td>Belongs to the future dashboard (J), not this build. Closable by enabling telemetry and inspecting one export.</td></tr>
   <tr><td>Published per-model consumption multipliers.</td><td>Confirmed absent: Anthropic states only that the premium model "uses [your limits] faster", with no coefficient, across every source checked. Third-party 5×/10× figures appear to be back-of-envelope from list prices and should be discarded rather than used. This is precisely why the fit exists. A support ticket is the only remaining avenue and is not worth blocking on.</td></tr>
 </table>
