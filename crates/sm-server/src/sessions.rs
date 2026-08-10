@@ -3156,7 +3156,10 @@ fn codex_fork_status_for_event(event: &Map<String, Value>) -> Option<&'static st
         | "exec_command_end" => Some("running"),
         "item_completed" => codex_fork_item_completed_status(event),
         "error" if codex_fork_error_will_retry(event) => Some("running"),
-        "error" | "shutdown" => Some("stopped"),
+        // A non-retry error terminates the current turn, not the Codex process.
+        // The same thread can accept another turn and publish later status events.
+        "error" => Some("idle"),
+        "shutdown" => Some("stopped"),
         "shutdown_complete" | "stream_error" | "thread_started" | "thread_name_updated" => None,
         other if other.ends_with("_begin") => Some("running"),
         _ => None,
@@ -7870,7 +7873,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_fork_retry_error_events_are_not_terminal() {
+    fn codex_fork_turn_errors_are_not_terminal() {
         let retry = json!({
             "event_type": "error",
             "payload": {
@@ -7883,17 +7886,72 @@ mod tests {
         let retry_event = retry.as_object().unwrap();
         assert_eq!(codex_fork_status_for_event(retry_event), Some("running"));
 
-        let terminal = json!({
+        let non_retry = json!({
             "event_type": "error",
             "payload": {
                 "willRetry": false,
                 "error": {
-                    "message": "Selected model is at capacity."
+                    "message": "This content was flagged for possible cybersecurity risk.",
+                    "codexErrorInfo": "cyberPolicy"
                 }
             }
         });
-        let terminal_event = terminal.as_object().unwrap();
-        assert_eq!(codex_fork_status_for_event(terminal_event), Some("stopped"));
+        let non_retry_event = non_retry.as_object().unwrap();
+        assert_eq!(codex_fork_status_for_event(non_retry_event), Some("idle"));
+
+        let shutdown = json!({ "event_type": "shutdown", "payload": {} });
+        assert_eq!(
+            codex_fork_status_for_event(shutdown.as_object().unwrap()),
+            Some("stopped")
+        );
+    }
+
+    #[test]
+    fn codex_fork_monitor_survives_non_retry_error_and_observes_later_activity() {
+        let state_file = unique_temp_path("codex-error-lifecycle");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"error","payload":{"willRetry":false,"error":{"message":"This content was flagged for possible cybersecurity risk.","codexErrorInfo":"cyberPolicy"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().status,
+            "idle"
+        );
+        assert!(store
+            .codex_fork_monitor_should_continue("codex001")
+            .unwrap());
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"thread/status/changed","payload":{"status":{"type":"active"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().status,
+            "running"
+        );
     }
 
     #[test]
