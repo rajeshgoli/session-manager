@@ -1865,37 +1865,60 @@ impl SessionStore {
     }
 
     pub fn recover_pending_codex_fork_handoffs(&self) -> Result<usize> {
-        let state = self.load_raw_json_value()?;
-        let Some(sessions) = state.get("sessions").and_then(Value::as_array) else {
-            return Ok(0);
-        };
         let Some(runtime) = self.delivery_runtime.as_ref() else {
             return Ok(0);
         };
-        let mut recovered = 0;
-        for session in sessions.iter().filter_map(Value::as_object) {
-            let Some(session_id) = json_text(session.get("id")) else {
-                continue;
+        let monitors = {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let Some(sessions) = state.get_mut("sessions").and_then(Value::as_array_mut) else {
+                return Ok(0);
             };
-            if json_text(session.get("provider")).as_deref() != Some("codex-fork")
-                || json_text(session.get("pending_handoff_path")).is_none()
-            {
-                continue;
+            let mut monitors = Vec::new();
+            let mut changed = false;
+            for session in sessions.iter_mut().filter_map(Value::as_object_mut) {
+                let Some(session_id) = json_text(session.get("id")) else {
+                    continue;
+                };
+                if json_text(session.get("provider")).as_deref() != Some("codex-fork")
+                    || json_text(session.get("pending_handoff_path")).is_none()
+                {
+                    continue;
+                }
+                let spec = codex_fork_spec_for_session_raw(&session_id, session)?;
+                let Some(artifacts) = runtime.codex_fork_runtime_artifacts(&spec)? else {
+                    continue;
+                };
+                let offset = match session
+                    .get("pending_handoff_event_offset")
+                    .and_then(Value::as_u64)
+                {
+                    Some(offset) => offset,
+                    None => {
+                        let offset = fs::metadata(&artifacts.event_stream_path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0);
+                        session.insert("pending_handoff_event_offset".to_owned(), json!(offset));
+                        changed = true;
+                        offset
+                    }
+                };
+                monitors.push((session_id, artifacts.event_stream_path, offset));
             }
-            let Some(offset) = session
-                .get("pending_handoff_event_offset")
-                .and_then(Value::as_u64)
-            else {
-                continue;
-            };
-            let spec = codex_fork_spec_for_session_raw(&session_id, session)?;
-            let Some(artifacts) = runtime.codex_fork_runtime_artifacts(&spec)? else {
-                continue;
-            };
-            self.start_codex_fork_handoff_monitor(session_id, artifacts.event_stream_path, offset)?;
-            recovered += 1;
+            if changed {
+                self.write_raw_json_value(&state)?;
+            }
+            monitors
+        };
+
+        for (session_id, event_stream_path, offset) in &monitors {
+            self.start_codex_fork_handoff_monitor(
+                session_id.clone(),
+                event_stream_path.clone(),
+                *offset,
+            )?;
         }
-        Ok(recovered)
+        Ok(monitors.len())
     }
 
     fn start_codex_fork_handoff_monitor(
@@ -1956,8 +1979,12 @@ impl SessionStore {
             if let Ok(chunk) = read_file_from_offset(event_stream_path, &mut offset) {
                 for line in split_complete_event_lines(&mut buffer, &chunk) {
                     if codex_fork_event_is_turn_complete(&line) {
-                        let _ = self.execute_pending_codex_fork_handoff(session_id);
-                        return;
+                        if self
+                            .execute_pending_codex_fork_handoff(session_id)
+                            .is_ok_and(|completed| completed)
+                        {
+                            return;
+                        }
                     }
                 }
             }
@@ -8319,13 +8346,48 @@ mod tests {
             .contains("codex_fork_handoff_failed: tmux session is not running"));
 
         fixture.start_tmux();
-        assert!(store
-            .execute_pending_codex_fork_handoff("codex001")
-            .unwrap());
+        fixture.append_turn_complete();
+        fixture.wait_for_handoff(&store);
         let state = store.load_raw_json_value().unwrap();
         let session = raw_session_object(&state, "codex001").unwrap();
         assert!(json_text(session.get("pending_handoff_path")).is_none());
         assert!(json_text(session.get("error_message")).is_none());
+    }
+
+    #[test]
+    fn codex_fork_handoff_recovery_initializes_legacy_offset_at_stream_end() {
+        let Some(fixture) = CodexForkHandoffFixture::new("legacy-offset") else {
+            return;
+        };
+        fixture.append_turn_complete();
+        let historical_stream_len = fs::metadata(&fixture.event_stream_path).unwrap().len();
+        let mut state = fixture.store().load_raw_json_value().unwrap();
+        let session =
+            session_object_mut(ensure_sessions_array_mut(&mut state).unwrap(), "codex001").unwrap();
+        session.insert(
+            "pending_handoff_path".to_owned(),
+            Value::String(fixture.handoff_path.display().to_string()),
+        );
+        fs::write(
+            &fixture.state_file,
+            serde_json::to_vec_pretty(&state).unwrap(),
+        )
+        .unwrap();
+
+        let restarted = fixture.store();
+        assert_eq!(restarted.recover_pending_codex_fork_handoffs().unwrap(), 1);
+        let state = restarted.load_raw_json_value().unwrap();
+        let session = raw_session_object(&state, "codex001").unwrap();
+        assert_eq!(
+            session
+                .get("pending_handoff_event_offset")
+                .and_then(Value::as_u64),
+            Some(historical_stream_len)
+        );
+        assert!(json_text(session.get("last_handoff_path")).is_none());
+
+        fixture.append_turn_complete();
+        fixture.wait_for_handoff(&restarted);
     }
 
     struct CodexForkHandoffFixture {
@@ -8499,7 +8561,7 @@ mod tests {
     }
 
     fn start_codex_fork_handoff_tmux(socket: &str, session: &str) {
-        let command = r#"/bin/sh -lc 'while IFS= read -r line; do printf "received:%s\n› Ready\n" "$line"; done' handoff-shell"#;
+        let command = r#"/bin/sh -lc 'printf "› "; while IFS= read -r line; do printf "received:%s\n› " "$line"; done' handoff-shell"#;
         let status = Command::new("tmux")
             .args(["-L", socket, "new-session", "-d", "-s", session, command])
             .status()

@@ -689,10 +689,7 @@ impl TmuxRuntime {
     fn wait_for_codex_composer(&self, tmux_session: &str, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         loop {
-            if self
-                .capture_pane_text(tmux_session)
-                .is_some_and(|text| text.lines().any(|line| line.trim_start().starts_with('›')))
-            {
+            if self.codex_composer_is_ready(tmux_session) {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -700,6 +697,26 @@ impl TmuxRuntime {
             }
             thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    fn codex_composer_is_ready(&self, tmux_session: &str) -> bool {
+        let cursor = match self
+            .tmux_command(["display-message", "-p", "-t", tmux_session, "#{cursor_y}"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<usize>()
+                .ok(),
+            _ => None,
+        };
+        let Some(cursor) = cursor else {
+            return false;
+        };
+        self.capture_pane_text(tmux_session)
+            .is_some_and(|text| codex_composer_at_cursor(&text, cursor))
     }
 
     pub fn capture_pane_text(&self, tmux_session: &str) -> Option<String> {
@@ -954,6 +971,12 @@ impl TmuxRuntime {
             + (line_count.saturating_sub(1) as f64) * self.send_keys_settle_per_extra_line_ms;
         duration_from_millis((base + extra).clamp(base, max_delay))
     }
+}
+
+fn codex_composer_at_cursor(pane: &str, cursor_y: usize) -> bool {
+    pane.lines()
+        .nth(cursor_y)
+        .is_some_and(|line| line.trim_start().starts_with('›'))
 }
 
 fn split_send_text_chunks(text: &str, max_chunk_chars: usize) -> Vec<&str> {
@@ -1521,6 +1544,15 @@ mod tests {
         assert!(clear_enter < post_clear_wait);
         assert!(post_clear_wait < prompt_text);
         assert!(prompt_text < prompt_enter);
+    }
+
+    #[test]
+    fn codex_composer_readiness_requires_the_cursor_row() {
+        let pane = "› stale transcript prompt\nWorking\n\n› live composer\n\nmodel status\n";
+
+        assert!(!codex_composer_at_cursor(pane, 1));
+        assert!(codex_composer_at_cursor(pane, 3));
+        assert!(!codex_composer_at_cursor(pane, 5));
     }
 
     #[test]
