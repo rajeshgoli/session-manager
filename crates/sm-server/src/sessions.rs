@@ -109,6 +109,23 @@ impl SessionStore {
         self
     }
 
+    fn append_seat_session(
+        &self,
+        seat_id: &str,
+        provider: &str,
+        provider_session_id: &str,
+        artifact_path: Option<&str>,
+    ) {
+        if let Err(error) =
+            self.seat_session_store
+                .append(seat_id, provider, provider_session_id, artifact_path)
+        {
+            eprintln!(
+                "usage ledger failed to append provider session {provider_session_id} for seat {seat_id}: {error:#}"
+            );
+        }
+    }
+
     /// Drop context alerts this session raised about context it no longer has.
     /// An undelivered warning describes the discarded cycle, so delivering it
     /// after a clear tells the monitor about a problem that no longer exists.
@@ -302,12 +319,7 @@ impl SessionStore {
             None
         };
         if let Some(provider_resume_id) = provider_resume_id.as_deref() {
-            self.seat_session_store.append(
-                session_id,
-                &provider,
-                provider_resume_id,
-                transcript_path,
-            )?;
+            self.append_seat_session(session_id, &provider, provider_resume_id, transcript_path);
         }
         if normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped" {
             return Ok(false);
@@ -652,12 +664,7 @@ impl SessionStore {
         }
         if record.provider == "codex" {
             if let Some(provider_resume_id) = record.provider_resume_id.as_deref() {
-                self.seat_session_store.append(
-                    &record.id,
-                    &record.provider,
-                    provider_resume_id,
-                    None,
-                )?;
+                self.append_seat_session(&record.id, &record.provider, provider_resume_id, None);
             }
         }
         if let Some(artifacts) = codex_fork_artifacts {
@@ -1301,12 +1308,12 @@ impl SessionStore {
         let restored = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
         self.write_raw_json_value(&state)?;
         if let Some(provider_resume_id) = provider_resume_id_for_restore(&restored) {
-            self.seat_session_store.append(
+            self.append_seat_session(
                 &restored.id,
                 &restored.provider,
                 &provider_resume_id,
                 restored.transcript_path.as_deref(),
-            )?;
+            );
         }
         if let Some(artifacts) = codex_fork_artifacts {
             self.start_codex_fork_event_monitor(restored.id.clone(), artifacts.event_stream_path)?;
@@ -3099,12 +3106,12 @@ impl SessionStore {
 
         let mut changed = false;
         if let Some(provider_resume_id) = codex_fork_provider_resume_id(event) {
-            self.seat_session_store.append(
+            self.append_seat_session(
                 session_id,
                 &provider,
                 &provider_resume_id,
                 artifact_path.and_then(Path::to_str),
-            )?;
+            );
             if json_text(session.get("provider_resume_id")).as_deref()
                 != Some(provider_resume_id.as_str())
             {

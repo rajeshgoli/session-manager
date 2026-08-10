@@ -8032,6 +8032,48 @@ async fn claude_stop_hooks_append_distinct_provider_sessions_without_losing_the_
 }
 
 #[tokio::test]
+async fn claude_stop_hook_survives_an_unwritable_usage_database() {
+    let state_file = write_session_fixture();
+    fs::create_dir_all(state_file.with_extension("usage.db")).unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = post_json(
+        app,
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "run12345",
+            "sm_last_message": "turn complete despite ledger failure",
+            "transcript_path": "/tmp/provider-session-after-failure.jsonl"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok" }));
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    assert_eq!(session["status"], "idle");
+    assert_eq!(
+        session["last_action_summary"],
+        "turn complete despite ledger failure"
+    );
+    assert_eq!(
+        session["transcript_path"],
+        "/tmp/provider-session-after-failure.jsonl"
+    );
+    assert_eq!(
+        session["provider_resume_id"],
+        "provider-session-after-failure"
+    );
+}
+
+#[tokio::test]
 async fn claude_stop_hook_retries_local_transcript_metadata_read() {
     let state_file = write_session_fixture();
     let transcript_path = unique_temp_path().with_extension("jsonl");
