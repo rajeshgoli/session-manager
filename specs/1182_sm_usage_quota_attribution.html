@@ -408,7 +408,7 @@ premium model may consume, not a separate pool. Consequences:</p>
 
 <ul>
   <li><strong>Exhausting the scoped meter does not stop work.</strong> The user is offered two paths — continue on paid usage credits, or switch models and keep working against the remaining overall pool. Shipped UI copy: <em>"You've reached your Fable 5 limit"</em>, <em>"Buy more to keep using Fable 5, or switch models to keep working."</em>, and even a runway hint, <em>"try /model opus [N] more runway"</em>.</li>
-  <li><strong>Exhausting the overall pool does stop everything</strong>, and any unused scoped headroom is moot — it was never a balance, only an unused fraction of a ceiling.</li>
+  <li><strong>Exhausting the overall pool stops everything only when extra usage is disabled.</strong> With <code>extra_usage.is_enabled</code> true — as on this account, with a $148.85 monthly ceiling — reaching 100% spills into paid credits exactly as the scoped cap does, so seats keep working and their continued output is credit-metered rather than blocked. Treating overall exhaustion as an unconditional hard stop would report every non-premium seat as blocked while it is visibly still running, and would keep classifying its post-cap work as quota usage. Any unused scoped headroom is moot either way: it was never a balance, only an unused fraction of a ceiling.</li>
   <li>Therefore the <strong>binding limit is model-dependent</strong>: a premium seat is blocked by whichever of the two meters hits 100% first; every other seat is blocked only by <code>weekly_all</code>. The report must say which one binds (C.8).</li>
 </ul>
 
@@ -680,6 +680,7 @@ CREATE TABLE seat_tokens (
   bucket_ts          TEXT NOT NULL,   -- minute bucket, for delta alignment with burn_samples
   model              TEXT NOT NULL,   -- resolved, never 'unset'
   effort             TEXT,            -- Codex reasoning effort, when known
+  credit_metered     INTEGER NOT NULL DEFAULT 0,  -- MUST be a rollup dimension; see C.2b
   input_tokens       INTEGER NOT NULL DEFAULT 0,
   output_tokens      INTEGER NOT NULL DEFAULT 0,
   reasoning_tokens   INTEGER NOT NULL DEFAULT 0,  -- SUBSET of output_tokens. Never add to the weight sum.
@@ -688,7 +689,7 @@ CREATE TABLE seat_tokens (
   cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
   message_count      INTEGER NOT NULL DEFAULT 0,
   updated_at         TEXT NOT NULL,
-  PRIMARY KEY (seat_id, account_key, window_kind, window_start, bucket_ts, model)
+  PRIMARY KEY (seat_id, account_key, window_kind, window_start, bucket_ts, model, credit_metered)
 );
 CREATE INDEX idx_seat_tokens_fit ON seat_tokens(account_key, window_kind, bucket_ts);
 
@@ -874,6 +875,34 @@ breakdown, give it weight 0. Its usage counters are zero anyway.</p>
 <code>usage.cache_creation.ephemeral_5m_input_tokens</code> and <code>ephemeral_1h_input_tokens</code>
 when the nested object exists, since they carry different weights; fall back to the flat
 <code>cache_creation_input_tokens</code> at the 5-minute rate.</p>
+
+<h3>C.2b Quota-metered versus credit-metered</h3>
+
+<p>Not every token a seat spends draws on quota. Some are paid for with credits and move no meter at all.
+The distinction has to be decided once at ingest and then carried everywhere, because a token that costs
+money but consumes no quota belongs in a spend report and must stay out of every quota calculation.</p>
+
+<p>A message is <strong>credit-metered</strong> when either holds at its timestamp:</p>
+<ol>
+  <li><strong>Plan exclusion.</strong> The plan never includes that model in quota — on Pro and Standard Team the premium model runs purely on credits (A.1). Every one of its messages is credit-metered from the outset, regardless of meter state.</li>
+  <li><strong>Post-exhaustion spill.</strong> The meter that would have governed it already reads 100% and <code>extra_usage.is_enabled</code> is true, so work continued on credits.</li>
+</ol>
+
+<p>Everything else is quota-metered. The flag lives on <code>message_ledger</code>, is a
+<strong>dimension of the <code>seat_tokens</code> rollup and part of its primary key</strong>, and propagates
+from there:</p>
+
+<ul>
+  <li><strong>The fit excludes credit-metered rows entirely</strong> (D.4). They consumed no quota, so including them tells the regression that tokens moved the meter less than they did, dragging every fitted weight downward after any exhaustion event.</li>
+  <li><strong>The within-family premium apportionment excludes them</strong> (D.3), so credit-funded work cannot claim quota burn that earlier seats caused.</li>
+  <li><strong>Reports show them separately as spend</strong>, never folded into a burn percentage.</li>
+</ul>
+
+<blockquote>
+  <p>Dropping the flag during materialisation is the failure to watch for: the ledger would be right, every
+  rollup consumer would be wrong, and nothing would look broken. If <code>credit_metered</code> is not in
+  the rollup key, paid tokens silently rejoin the quota arithmetic.</p>
+</blockquote>
 
 <h3>C.2a Bucket semantics differ by provider — normalise at ingest</h3>
 
@@ -1175,6 +1204,11 @@ half the pool untouched: the account reads "50% used" while premium seats can no
 Surfacing <code>weekly_all</code> alone, or taking an unscaled minimum, would show an orchestrator ample
 headroom its own seats cannot reach.</p>
 
+<p><strong>Headroom means "free headroom", not "can it run at all".</strong> With extra usage enabled a seat
+at 0 headroom keeps working on credits (A.1, C.2b) — so report exhaustion as a switch from quota to spend,
+not as a stop. An orchestrator deciding whether to expand lanes needs both facts: no quota left, and work
+continuing at a price.</p>
+
 <p>With <code>--include-children</code>, sum over descendants using the existing preorder walk
 (<code>collect_descendants_preorder</code>, <code>sessions.rs:5906-5928</code>), then compute the share once
 on the aggregate. <code>--since-reset</code> restricts to the current window; without it the report also
@@ -1301,7 +1335,7 @@ meaningless in both.</p>
 
 <p>Procedure:</p>
 <ol>
-  <li>Bucket <code>seat_tokens</code> by minute; align to burn samples by timestamp, within one window kind and one cap segment.</li>
+  <li>Bucket <code>seat_tokens</code> by minute; align to burn samples by timestamp, within one window kind and one cap segment. <strong>Filter to <code>credit_metered = 0</code></strong> — paid tokens moved no meter, so feeding them to the regression understates every weight (C.2b).</li>
   <li>Coalesce consecutive intervals until Δburn ≥ 1 percentage point, so quantisation noise does not dominate.</li>
   <li>Solve non-negative least squares for <code>w</code>, ridge-regularised toward the D.1/D.2 prior.</li>
   <li>Record condition number and residual RMS in <code>model_weights</code>.</li>
@@ -1463,8 +1497,9 @@ scout        (22e0f1) | codex-fork | running   | luna  | 0.1% wk</code></pre>
   <tr><td>Weight fit ill-conditioned</td><td>Hold the prior; label output <code>prior</code>; surface the condition number in <code>--json</code></td></tr>
   <tr><td>Overall cap changes mid-window (promo starts/ends, plan change, provider adjustment)</td><td>Close the current fit segment and open a new one; discard any Δ straddling the boundary. Detect via promo notice, <code>organizationRateLimitTier</code> change, or a burn percentage that decreases without a reset</td></tr>
   <tr><td>Scoped model changes (premium slot re-pointed, or plan differs)</td><td>Read <code>scope.model.display_name</code> per sample; never assume the premium family. If the scoped model changes, close the segment</td></tr>
-  <tr><td>Plan has no premium inclusion (Pro, Standard Team)</td><td>No sub-cap exists; the exact premium derivation does not apply. Fall back to fitting that family like any other</td></tr>
-  <tr><td>Scoped meter at 100% while overall has headroom</td><td>Expected, not an error. Report the seat as blocked-on-scoped with the overall headroom shown separately, since switching models or paying credits both unblock it</td></tr>
+  <tr><td>Plan has no premium inclusion (Pro, Standard Team)</td><td>No sub-cap exists, so the D.3 derivation does not apply — but do <strong>not</strong> fall back to fitting that family like any other. Its tokens consume no quota at all, so a regression would hand them a spurious coefficient whenever they correlate with other activity, misattributing capped burn to premium seats. Mark the family <code>credit_metered</code> from the outset (C.2b) and exclude it from the quota regression; report it as spend</td></tr>
+  <tr><td>Scoped meter at 100% while overall has headroom</td><td>Expected, not an error. Report the seat as out-of-free-quota on the scoped meter with overall headroom shown separately, since switching models or paying credits both keep it working</td></tr>
+  <tr><td>Overall meter at 100%</td><td>A hard stop only when <code>extra_usage.is_enabled</code> is false. When it is true, seats keep running and their output is <code>credit_metered</code> — report spend, not blocked</td></tr>
   <tr><td>Account switch mid-window</td><td>Each account's window tracked independently; a seat can hold burn on two accounts in one calendar week</td></tr>
   <tr><td>New account, no history</td><td>Burn is measured, so account-level reporting works immediately. <strong>Absolute weights do not carry over</strong> — they are percentage points of one account's cap, and a different plan, promo, or tier makes them wrong. Transfer only the dimensionless model-to-model ratios as a prior shape; the new account fits its own absolute scale. Until it does, that account reports proportionally with <code>residual: unknown</code></td></tr>
   <tr><td>Messages predate the first account poll (fresh install, or rebuilt <code>usage.db</code>)</td><td>Attribute to a bootstrap interval flagged <code>is_assumed</code>, report affected windows as <code>partial</code>, and exclude those intervals from the fit (C.7b)</td></tr>
