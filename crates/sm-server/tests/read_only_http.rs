@@ -7963,6 +7963,75 @@ async fn claude_stop_hook_reads_local_transcript_metadata_when_not_inlined() {
 }
 
 #[tokio::test]
+async fn claude_stop_hooks_append_distinct_provider_sessions_without_losing_the_first() {
+    let state_file = write_session_fixture();
+    let usage_db_path = state_file.with_extension("usage.db");
+    let transcript_dir = unique_temp_path();
+    fs::create_dir_all(&transcript_dir).unwrap();
+    let first_transcript = transcript_dir.join("provider-session-first.jsonl");
+    let second_transcript = transcript_dir.join("provider-session-second.jsonl");
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    for transcript_path in [&first_transcript, &second_transcript] {
+        let (status, payload) = post_json(
+            app.clone(),
+            "/hooks/claude",
+            json!({
+                "hook_event_name": "Stop",
+                "session_manager_id": "run12345",
+                "sm_last_message": "turn complete",
+                "sm_native_title": "Session chain fixture",
+                "sm_transcript_mtime_ns": 424242_i64,
+                "transcript_path": transcript_path.display().to_string()
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload, json!({ "status": "ok" }));
+    }
+
+    let connection = Connection::open(&usage_db_path).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT provider_session_id, artifact_path FROM seat_sessions WHERE seat_id = 'run12345' ORDER BY provider_session_id",
+        )
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "provider-session-first".to_owned(),
+                first_transcript.display().to_string(),
+            ),
+            (
+                "provider-session-second".to_owned(),
+                second_transcript.display().to_string(),
+            ),
+        ]
+    );
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    assert_eq!(
+        session["transcript_path"],
+        second_transcript.display().to_string()
+    );
+    assert_eq!(session["provider_resume_id"], "provider-session-second");
+}
+
+#[tokio::test]
 async fn claude_stop_hook_retries_local_transcript_metadata_read() {
     let state_file = write_session_fixture();
     let transcript_path = unique_temp_path().with_extension("jsonl");

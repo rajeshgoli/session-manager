@@ -29,6 +29,7 @@ use crate::queue::{
 use crate::{
     config::{CodexReviewConfig, ContextMonitorConfig},
     runtime::{TmuxRuntime, TmuxSessionSpec},
+    seat_sessions::SeatSessionStore,
 };
 
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
@@ -59,6 +60,7 @@ pub struct SessionStore {
     /// an unrelated request to happen to flush it.
     delivery_runtime: Option<TmuxRuntime>,
     codex_fork_handoff_monitors: Arc<Mutex<BTreeSet<String>>>,
+    seat_session_store: SeatSessionStore,
 }
 
 impl SessionStore {
@@ -68,6 +70,7 @@ impl SessionStore {
         } else {
             None
         };
+        let seat_session_store = SeatSessionStore::for_state_file(&state_file);
         Self {
             state_file,
             legacy_state_file,
@@ -77,6 +80,7 @@ impl SessionStore {
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
+            seat_session_store,
         }
     }
 
@@ -123,6 +127,7 @@ impl SessionStore {
 
     #[cfg(test)]
     fn new_with_legacy_fallback(state_file: PathBuf, legacy_state_file: PathBuf) -> Self {
+        let seat_session_store = SeatSessionStore::for_state_file(&state_file);
         Self {
             state_file,
             legacy_state_file: Some(legacy_state_file),
@@ -132,6 +137,7 @@ impl SessionStore {
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
+            seat_session_store,
         }
     }
 
@@ -276,6 +282,20 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(false);
         };
+        let provider = json_text(session.get("provider")).unwrap_or_else(|| "claude".to_owned());
+        let provider_resume_id = if provider == "claude" {
+            transcript_path.and_then(provider_resume_id_from_transcript_path)
+        } else {
+            None
+        };
+        if let Some(provider_resume_id) = provider_resume_id.as_deref() {
+            self.seat_session_store.append(
+                session_id,
+                &provider,
+                provider_resume_id,
+                transcript_path,
+            )?;
+        }
         if normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped" {
             return Ok(false);
         }
@@ -324,12 +344,11 @@ impl SessionStore {
                 "transcript_path".to_owned(),
                 Value::String(transcript_path.to_owned()),
             );
-            let provider =
-                json_text(session.get("provider")).unwrap_or_else(|| "claude".to_owned());
-            if provider == "claude" {
-                if let Some(resume_id) = provider_resume_id_from_transcript_path(transcript_path) {
-                    session.insert("provider_resume_id".to_owned(), Value::String(resume_id));
-                }
+            if let Some(provider_resume_id) = provider_resume_id {
+                session.insert(
+                    "provider_resume_id".to_owned(),
+                    Value::String(provider_resume_id),
+                );
             }
         }
         if let Some(native_title) = native_title {
@@ -617,6 +636,16 @@ impl SessionStore {
         if let Err(error) = self.write_raw_json_value(&state) {
             let _ = runtime.kill_session(&record.tmux_session);
             return Err(error);
+        }
+        if record.provider == "codex" {
+            if let Some(provider_resume_id) = record.provider_resume_id.as_deref() {
+                self.seat_session_store.append(
+                    &record.id,
+                    &record.provider,
+                    provider_resume_id,
+                    None,
+                )?;
+            }
         }
         if let Some(artifacts) = codex_fork_artifacts {
             self.start_codex_fork_event_monitor(record.id.clone(), artifacts.event_stream_path)?;
@@ -1258,6 +1287,14 @@ impl SessionStore {
         }
         let restored = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
         self.write_raw_json_value(&state)?;
+        if let Some(provider_resume_id) = provider_resume_id_for_restore(&restored) {
+            self.seat_session_store.append(
+                &restored.id,
+                &restored.provider,
+                &provider_resume_id,
+                restored.transcript_path.as_deref(),
+            )?;
+        }
         if let Some(artifacts) = codex_fork_artifacts {
             self.start_codex_fork_event_monitor(restored.id.clone(), artifacts.event_stream_path)?;
         }
@@ -2973,7 +3010,11 @@ impl SessionStore {
 
             if let Ok(chunk) = read_file_from_offset(&event_stream_path, &mut offset) {
                 for line in split_complete_event_lines(&mut buffer, &chunk) {
-                    let _ = self.apply_codex_fork_event_line(&session_id, &line);
+                    let _ = self.apply_codex_fork_event_line_with_artifact(
+                        &session_id,
+                        &line,
+                        Some(&event_stream_path),
+                    );
                 }
             }
             thread::sleep(CODEX_FORK_EVENT_MONITOR_POLL);
@@ -3006,7 +3047,17 @@ impl SessionStore {
         Ok(normalized_status(&status) != "stopped")
     }
 
+    #[cfg(test)]
     fn apply_codex_fork_event_line(&self, session_id: &str, line: &str) -> Result<()> {
+        self.apply_codex_fork_event_line_with_artifact(session_id, line, None)
+    }
+
+    fn apply_codex_fork_event_line_with_artifact(
+        &self,
+        session_id: &str,
+        line: &str,
+        artifact_path: Option<&Path>,
+    ) -> Result<()> {
         let raw = line.trim();
         if raw.is_empty() {
             return Ok(());
@@ -3035,6 +3086,12 @@ impl SessionStore {
 
         let mut changed = false;
         if let Some(provider_resume_id) = codex_fork_provider_resume_id(event) {
+            self.seat_session_store.append(
+                session_id,
+                &provider,
+                &provider_resume_id,
+                artifact_path.and_then(Path::to_str),
+            )?;
             if json_text(session.get("provider_resume_id")).as_deref()
                 != Some(provider_resume_id.as_str())
             {
@@ -8232,6 +8289,73 @@ mod tests {
         assert_eq!(
             store.get_session("codex001").unwrap().unwrap().status,
             "running"
+        );
+    }
+
+    #[test]
+    fn codex_fork_thread_identity_events_append_the_provider_session_chain() {
+        let state_file = unique_temp_path("codex-session-chain");
+        let usage_db_path = state_file.with_extension("usage.db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"thread/started","payload":{"thread":{"id":"thread-before-handoff"}}}"#,
+            )
+            .unwrap();
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"thread/started","payload":{"thread":{"id":"thread-after-handoff"}}}"#,
+            )
+            .unwrap();
+
+        let connection = rusqlite::Connection::open(usage_db_path).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT provider, provider_session_id FROM seat_sessions WHERE seat_id = 'codex001' ORDER BY provider_session_id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("codex-fork".to_owned(), "thread-after-handoff".to_owned()),
+                ("codex-fork".to_owned(), "thread-before-handoff".to_owned()),
+            ]
+        );
+        assert_eq!(
+            store
+                .get_session("codex001")
+                .unwrap()
+                .unwrap()
+                .provider_resume_id
+                .as_deref(),
+            Some("thread-after-handoff")
         );
     }
 
