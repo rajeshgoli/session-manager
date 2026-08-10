@@ -330,8 +330,9 @@ observations rather than one comparison.</p>
 <blockquote>
   <p><strong>Phase 4 is optional for a useful v1.</strong> Everything through Phase 3 — measured account
   burn, per-seat token attribution, the exact premium decomposition, per-account subtree rollups — works
-  without any fitted weight. Phase 5 can ship reading proportional shares with
-  <code>residual: unknown</code> and weights labelled <code>prior</code>, which is honest and answers the
+  without any fitted weight. Phase 5 can ship in <strong>PRIOR</strong> mode (C.8) — the exact
+  premium term plus a prior-weighted proportional split of the remainder, with
+  <code>residual: unknown</code> — which is honest, correctly model-weighted, and answers the
   orchestrator's question well enough to act on. The fitted path buys absolute burn and a real coverage
   figure, and it carries most of this design's remaining complexity: segment keying, the unobserved-burn
   intercept, provider-lag alignment, and credit-metered filtering. Build it when the proportional report
