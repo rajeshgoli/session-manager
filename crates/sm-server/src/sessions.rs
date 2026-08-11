@@ -123,6 +123,11 @@ impl SessionStore {
         store
     }
 
+    pub fn with_usage_db_path(mut self, db_path: PathBuf) -> Self {
+        self.seat_session_store = SeatSessionStore::new(db_path);
+        self
+    }
+
     pub fn with_context_monitor_config(mut self, config: ContextMonitorConfig) -> Self {
         self.context_monitor = config;
         self

@@ -1,4 +1,10 @@
-use std::{net::SocketAddr, path::PathBuf, sync::atomic::Ordering, thread, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{atomic::Ordering, Arc},
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -8,6 +14,7 @@ use sm_server::{
     queue::{QueueAdmissionPolicy, QueueRecoverySummary, RetainedQueueStore},
     sessions::expand_home,
     studio_ssh,
+    usage_identity::IdentityPoller,
 };
 use tokio::net::TcpListener;
 
@@ -40,6 +47,12 @@ async fn main() -> Result<()> {
     let address: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
         .with_context(|| format!("invalid listen address {}:{}", args.host, args.port))?;
+    if config.usage.enabled && config.usage.poll_interval_secs == 0 {
+        anyhow::bail!("usage.poll_interval_secs must be > 0 when usage is enabled");
+    }
+    if config.usage.enabled && config.usage.db_path.trim().is_empty() {
+        anyhow::bail!("usage.db_path must not be empty when usage is enabled");
+    }
     // After the address is parsed so a bad --host/--port is caught too, but
     // before binding, so this can run while the old server still holds the port.
     if args.check_config {
@@ -92,6 +105,38 @@ async fn main() -> Result<()> {
             eprintln!("usage ledger session reconciliation failed: {error:#}");
         }
     });
+
+    if state.config().usage.enabled {
+        let poll_interval = state.config().usage.poll_interval_secs;
+        let poller = Arc::new(IdentityPoller::new(
+            expand_home(&state.config().usage.db_path),
+            expand_home("~/.claude.json"),
+            expand_home("~/.codex/auth.json"),
+        )?);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(poll_interval));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let poller = poller.clone();
+                match tokio::task::spawn_blocking(move || {
+                    poller.poll_once(time::OffsetDateTime::now_utc())
+                })
+                .await
+                {
+                    Ok(errors) => {
+                        for (provider, error) in errors {
+                            eprintln!(
+                                "{} account identity poll failed: {error:#}",
+                                provider.as_str()
+                            );
+                        }
+                    }
+                    Err(error) => eprintln!("account identity poll task failed: {error}"),
+                }
+            }
+        });
+    }
 
     // Repair the Studio SSH LaunchAgents toward the desired state every 30s while
     // the toggle is on. launchctl is synchronous, so run it on a blocking thread.

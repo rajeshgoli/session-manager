@@ -27,6 +27,7 @@ use sm_server::{
     http::{router, AppState, GitHubReviewComment, GitHubReviewMatch, GitHubReviewPoster},
     runtime::TmuxRuntime,
     sessions::{SendCoreInputRequest, SessionStore},
+    usage_identity::UsageIdentityStore,
 };
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -8044,6 +8045,55 @@ async fn claude_stop_hooks_append_distinct_provider_sessions_without_losing_the_
         second_transcript.display().to_string()
     );
     assert_eq!(session["provider_resume_id"], "provider-session-second");
+}
+
+#[tokio::test]
+async fn custom_usage_database_contains_identity_and_session_chain_tables() {
+    let state_file = write_session_fixture();
+    let default_sibling = state_file.with_extension("usage.db");
+    let usage_db_path = unique_temp_path().with_extension("custom-usage.db");
+    UsageIdentityStore::new(&usage_db_path).unwrap();
+    let mut config = config_with_state_file(&state_file);
+    config.usage.enabled = true;
+    config.usage.db_path = usage_db_path.display().to_string();
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(
+        app,
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "run12345",
+            "transcript_path": "/tmp/custom-usage-thread.jsonl"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok" }));
+
+    let connection = Connection::open(usage_db_path).unwrap();
+    let tables = connection
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('accounts', 'account_timeline', 'seat_sessions') ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        tables,
+        vec!["account_timeline", "accounts", "seat_sessions"]
+    );
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'run12345' AND provider_session_id = 'custom-usage-thread'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    assert!(!default_sibling.exists());
 }
 
 #[tokio::test]

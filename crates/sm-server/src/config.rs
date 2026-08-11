@@ -26,6 +26,7 @@ pub struct AppConfig {
     pub sm_send: SmSendConfig,
     pub tool_logging: ToolLoggingConfig,
     pub context_monitor: ContextMonitorConfig,
+    pub usage: UsageConfig,
     pub codex_rollout: CodexRolloutConfig,
     pub codex_requests: CodexRequestsConfig,
     pub codex_events: CodexEventsConfig,
@@ -58,6 +59,7 @@ impl Default for AppConfig {
             sm_send: SmSendConfig::default(),
             tool_logging: ToolLoggingConfig::default(),
             context_monitor: ContextMonitorConfig::default(),
+            usage: UsageConfig::default(),
             codex_rollout: CodexRolloutConfig::default(),
             codex_requests: CodexRequestsConfig::default(),
             codex_events: CodexEventsConfig::default(),
@@ -833,6 +835,36 @@ fn default_context_critical_percentage() -> f64 {
     65.0
 }
 
+/// Phase-one account identity polling. The feature stays disabled unless the
+/// owner opts in through config; later usage phases extend this same section.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_usage_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    #[serde(default = "default_usage_db_path")]
+    pub db_path: String,
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_secs: default_usage_poll_interval_secs(),
+            db_path: default_usage_db_path(),
+        }
+    }
+}
+
+fn default_usage_poll_interval_secs() -> u64 {
+    30
+}
+
+fn default_usage_db_path() -> String {
+    "~/.local/share/claude-sessions/usage.db".to_owned()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CodexRolloutConfig {
     #[serde(
@@ -1118,6 +1150,8 @@ struct RawConfig {
     #[serde(default)]
     context_monitor: ContextMonitorConfig,
     #[serde(default)]
+    usage: UsageConfig,
+    #[serde(default)]
     codex_rollout: CodexRolloutConfig,
     #[serde(default)]
     codex_requests: Option<RawCodexRequestsConfig>,
@@ -1223,6 +1257,7 @@ impl From<RawConfig> for AppConfig {
             sm_send: raw.sm_send,
             tool_logging: raw.tool_logging,
             context_monitor: raw.context_monitor,
+            usage: raw.usage,
             codex_rollout: raw.codex_rollout,
             codex_requests,
             codex_events,
@@ -1863,6 +1898,36 @@ tool_logging:
         let config = AppConfig::from(raw);
 
         assert_eq!(config.tool_logging.db_path, "/tmp/custom-tool-usage.db");
+    }
+
+    #[test]
+    fn raw_config_reads_usage_identity_settings() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+usage:
+  enabled: true
+  poll_interval_secs: 45
+  db_path: /tmp/custom-usage.db
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert!(config.usage.enabled);
+        assert_eq!(config.usage.poll_interval_secs, 45);
+        assert_eq!(config.usage.db_path, "/tmp/custom-usage.db");
+    }
+
+    #[test]
+    fn usage_identity_is_disabled_by_default() {
+        let config = AppConfig::from(RawConfig::default());
+
+        assert!(!config.usage.enabled);
+        assert_eq!(config.usage.poll_interval_secs, 30);
+        assert_eq!(
+            config.usage.db_path,
+            "~/.local/share/claude-sessions/usage.db"
+        );
     }
 
     #[test]
