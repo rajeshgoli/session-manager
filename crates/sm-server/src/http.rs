@@ -424,6 +424,9 @@ impl AppState {
         if let Err(error) = session_store.recover_pending_codex_fork_handoffs() {
             eprintln!("codex-fork handoff recovery failed: {error:#}");
         }
+        if let Err(error) = session_store.recover_pending_claude_handoffs() {
+            eprintln!("Claude handoff recovery failed: {error:#}");
+        }
         if let Err(error) = session_store.recover_codex_fork_event_monitors() {
             eprintln!("codex-fork event monitor recovery failed: {error:#}");
         }
@@ -1451,7 +1454,7 @@ async fn claude_hook(
                 native_title_mtime_ns = metadata.mtime_ns;
             }
         }
-        state.session_store.apply_claude_stop_hook(
+        let stop_applied = state.session_store.apply_claude_stop_hook(
             &session_id,
             last_message,
             native_title,
@@ -1460,6 +1463,14 @@ async fn claude_hook(
             Some(&received_at),
             emitted_at,
         )?;
+        if stop_applied {
+            if let Err(error) = state
+                .session_store
+                .start_pending_claude_handoff(&session_id)
+            {
+                eprintln!("failed to start Claude handoff for {session_id}: {error:#}");
+            }
+        }
     }
 
     Ok(Json(json!({ "status": "ok" })).into_response())

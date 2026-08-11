@@ -71,6 +71,15 @@ pub struct TmuxRuntime {
     send_keys_max_chunk_chars: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConditionalClearOutcome {
+    Cleared,
+    IdlePromptNotReady,
+    PostClearPreconditionFailed,
+    PreconditionFailed,
+    SessionMissing,
+}
+
 #[derive(Debug, Clone)]
 pub struct TmuxSessionSpec {
     pub session_id: String,
@@ -479,6 +488,48 @@ impl TmuxRuntime {
         self.clear_session_inner(tmux_session, clear_command, prompt, wake_completed, None)
     }
 
+    pub(crate) fn clear_claude_session_if<P, C, S>(
+        &self,
+        tmux_session: &str,
+        prompt: &str,
+        precondition: P,
+        commit_clear: C,
+        commit_prompt: S,
+    ) -> Result<ConditionalClearOutcome>
+    where
+        P: FnOnce() -> Result<bool>,
+        C: FnOnce(&mut dyn FnMut() -> Result<()>) -> Result<bool>,
+        S: FnOnce(&mut dyn FnMut() -> Result<()>) -> Result<bool>,
+    {
+        let _guard = self.lock_session_input(tmux_session)?;
+        if !self.session_exists(tmux_session)? {
+            return Ok(ConditionalClearOutcome::SessionMissing);
+        }
+        if !precondition()? {
+            return Ok(ConditionalClearOutcome::PreconditionFailed);
+        }
+        if !self.wait_for_prompt(tmux_session, Duration::from_secs_f64(3.0)) {
+            return Ok(ConditionalClearOutcome::IdlePromptNotReady);
+        }
+        let Some(pre_clear_pane) = self.capture_pane_text(tmux_session) else {
+            return Ok(ConditionalClearOutcome::IdlePromptNotReady);
+        };
+        let mut send_clear = || self.send_text_then_enter(tmux_session, "/clear");
+        if !commit_clear(&mut send_clear)? {
+            return Ok(ConditionalClearOutcome::PreconditionFailed);
+        }
+
+        if !self.wait_for_fresh_prompt(tmux_session, &pre_clear_pane, Duration::from_secs_f64(5.0))
+        {
+            bail!("Claude handoff timed out waiting for /clear to finish");
+        }
+        let mut send_prompt = || self.send_text_then_enter(tmux_session, prompt);
+        if !commit_prompt(&mut send_prompt)? {
+            return Ok(ConditionalClearOutcome::PostClearPreconditionFailed);
+        }
+        Ok(ConditionalClearOutcome::Cleared)
+    }
+
     pub fn clear_codex_session_confirming_prompt(
         &self,
         tmux_session: &str,
@@ -757,6 +808,26 @@ impl TmuxRuntime {
         }
     }
 
+    fn wait_for_fresh_prompt(
+        &self,
+        tmux_session: &str,
+        previous_pane: &str,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.capture_pane_text(tmux_session).is_some_and(|pane| {
+                pane != previous_pane && pane_last_line(&pane).as_deref() == Some(">")
+            }) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn wait_for_codex_composer(
         &self,
         tmux_session: &str,
@@ -890,11 +961,7 @@ impl TmuxRuntime {
 
     fn capture_pane_last_line(&self, tmux_session: &str) -> Option<String> {
         let text = self.capture_pane_text(tmux_session)?;
-        text.trim_end_matches('\n')
-            .split('\n')
-            .last()
-            .map(str::trim)
-            .map(ToOwned::to_owned)
+        pane_last_line(&text)
     }
 
     fn run_tmux<'a>(&self, args: impl IntoIterator<Item = &'a str>) -> Result<()> {
@@ -1187,6 +1254,14 @@ fn shell_quote(value: &str) -> String {
         return "''".to_owned();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn pane_last_line(text: &str) -> Option<String> {
+    text.trim_end_matches('\n')
+        .split('\n')
+        .last()
+        .map(str::trim)
+        .map(ToOwned::to_owned)
 }
 
 fn command_parts(command: &str, args: &[String]) -> Vec<String> {
@@ -1667,6 +1742,115 @@ mod tests {
     }
 
     #[test]
+    fn conditional_claude_clear_revalidates_before_touching_the_pane() {
+        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            send_keys_settle_ms: Some(0.0),
+            send_keys_settle_max_ms: Some(0.0),
+            ..RustCoreConfig::default()
+        });
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        let checks = std::cell::Cell::new(0);
+        let outcome = runtime
+            .clear_claude_session_if(
+                "sm-test",
+                "handoff prompt",
+                || {
+                    checks.set(checks.get() + 1);
+                    Ok(true)
+                },
+                |_send_clear| {
+                    checks.set(checks.get() + 1);
+                    Ok(false)
+                },
+                |_send_prompt| unreachable!("prompt submission must not be reached"),
+            )
+            .unwrap();
+
+        assert_eq!(outcome, ConditionalClearOutcome::PreconditionFailed);
+        assert_eq!(checks.get(), 2);
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(!log.contains("send-keys -t sm-test -l -- /clear"));
+        assert!(!log.contains("handoff prompt"));
+    }
+
+    #[test]
+    fn conditional_claude_clear_keeps_the_prompt_when_redraw_never_finishes() {
+        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary_with_stuck_clear();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            send_keys_settle_ms: Some(0.0),
+            send_keys_settle_max_ms: Some(0.0),
+            ..RustCoreConfig::default()
+        });
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        let error = runtime
+            .clear_claude_session_if(
+                "sm-test",
+                "handoff prompt",
+                || Ok(true),
+                |send_clear| {
+                    send_clear()?;
+                    Ok(true)
+                },
+                |send_prompt| {
+                    send_prompt()?;
+                    Ok(true)
+                },
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("timed out waiting for /clear to finish"));
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("send-keys -t sm-test -l -- /clear"));
+        assert!(!log.contains("handoff prompt"));
+    }
+
+    #[test]
+    fn conditional_claude_clear_revalidates_before_submitting_the_prompt() {
+        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary_with_fresh_clear();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            send_keys_settle_ms: Some(0.0),
+            send_keys_settle_max_ms: Some(0.0),
+            ..RustCoreConfig::default()
+        });
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        let outcome = runtime
+            .clear_claude_session_if(
+                "sm-test",
+                "handoff prompt",
+                || Ok(true),
+                |send_clear| {
+                    send_clear()?;
+                    Ok(true)
+                },
+                |_send_prompt| Ok(false),
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ConditionalClearOutcome::PostClearPreconditionFailed
+        );
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("send-keys -t sm-test -l -- /clear"));
+        assert!(!log.contains("handoff prompt"));
+    }
+
+    #[test]
+    fn fresh_prompt_wait_rejects_the_unchanged_pre_clear_prompt() {
+        let (tmux_binary, _log_path, _temp_dir) = fake_tmux_binary();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        assert!(!runtime.wait_for_fresh_prompt("sm-test", "ready\n>\n", Duration::ZERO,));
+    }
+
+    #[test]
     fn codex_composer_readiness_requires_the_cursor_row() {
         let pane = "› stale transcript prompt\nWorking\n\n› live composer\n\nmodel status\n";
 
@@ -1778,6 +1962,72 @@ esac
 "#,
                 log_path.display(),
                 if has_session { 0 } else { 1 }
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux_binary, permissions).unwrap();
+        (tmux_binary, log_path, temp_dir)
+    }
+
+    fn fake_tmux_binary_with_stuck_clear() -> (PathBuf, PathBuf, PathBuf) {
+        let (tmux_binary, log_path, temp_dir) = fake_tmux_binary();
+        fs::write(
+            &tmux_binary,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> "{}"
+case "$1" in
+  has-session) exit 0 ;;
+  display-message) echo 0; exit 0 ;;
+  capture-pane)
+    if grep -q 'send-keys -t sm-test -l -- /clear' "{}"; then
+      printf 'clearing\n'
+    else
+      printf 'ready\n>\n'
+    fi
+    exit 0
+    ;;
+  show-options) exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+                log_path.display(),
+                log_path.display(),
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux_binary, permissions).unwrap();
+        (tmux_binary, log_path, temp_dir)
+    }
+
+    fn fake_tmux_binary_with_fresh_clear() -> (PathBuf, PathBuf, PathBuf) {
+        let (tmux_binary, log_path, temp_dir) = fake_tmux_binary();
+        fs::write(
+            &tmux_binary,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> "{}"
+case "$1" in
+  has-session) exit 0 ;;
+  display-message) echo 0; exit 0 ;;
+  capture-pane)
+    if grep -q 'send-keys -t sm-test -l -- /clear' "{}"; then
+      printf 'cleared\n>\n'
+    else
+      printf 'ready\n>\n'
+    fi
+    exit 0
+    ;;
+  show-options) exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+                log_path.display(),
+                log_path.display(),
             ),
         )
         .unwrap();
