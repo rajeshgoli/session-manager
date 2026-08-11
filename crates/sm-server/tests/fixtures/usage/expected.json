@@ -1,0 +1,41 @@
+{
+  "accepted_messages": 4,
+  "message_ids": ["msg-parent", "msg-shared", "msg-resume", "codex:codex-thread-1:2"],
+  "aliases": {
+    "exact": 5,
+    "loose": 4,
+    "total": 9
+  },
+  "dedupe": {
+    "msg-shared": {
+      "accepted_request_id": "claude-request-shared",
+      "accepted_is_sidechain": false,
+      "accepted_total_tokens": 330,
+      "rejected_replay_request_id": "claude-request-replay",
+      "rejected_replay_cache_read_input_tokens": 800
+    }
+  },
+  "normalized_tokens": {
+    "claude": {
+      "input": 350,
+      "output": 80,
+      "cache_creation": 15,
+      "cache_read": 135,
+      "total": 580
+    },
+    "codex": {
+      "input": 30,
+      "output": 30,
+      "cache_read": 90,
+      "reasoning": 10,
+      "total": 150
+    },
+    "all": {
+      "billable_total": 730
+    }
+  },
+  "ignored": {
+    "compaction_markers": 1,
+    "sidechain_replays": 1
+  }
+}

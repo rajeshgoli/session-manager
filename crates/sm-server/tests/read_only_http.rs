@@ -7628,6 +7628,7 @@ async fn context_usage_hook_records_claude_rate_limits_in_the_configured_usage_d
                 external_id: "claude-test-account".to_owned(),
                 label: None,
                 plan_tier: None,
+                extra_usage_enabled: Some(true),
             }),
             now - time::Duration::minutes(1),
             None,

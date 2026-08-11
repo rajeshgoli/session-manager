@@ -151,6 +151,26 @@ impl SeatSessionStore {
         Ok(claims)
     }
 
+    pub fn provider_sessions_missing_artifacts(&self, provider: &str) -> Result<BTreeSet<String>> {
+        let connection = self.open()?;
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT DISTINCT provider_session_id
+                FROM seat_sessions
+                WHERE provider = ?1
+                  AND (artifact_path IS NULL OR TRIM(artifact_path) = '')
+                "#,
+            )
+            .context("failed to prepare missing usage artifact query")?;
+        let sessions = statement
+            .query_map([provider], |row| row.get(0))
+            .context("failed to query missing usage artifacts")?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .context("failed to read missing usage artifacts")?;
+        Ok(sessions)
+    }
+
     fn open(&self) -> Result<Connection> {
         if let Some(parent) = self.db_path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {

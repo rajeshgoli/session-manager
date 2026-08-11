@@ -442,6 +442,7 @@ fn parse_claude_cached_usage(value: &Value) -> Result<Option<ClaudeCachedUsage>>
             external_id: account_id,
             label: None,
             plan_tier: None,
+            extra_usage_enabled: None,
         },
         observed_at,
         windows,
@@ -565,6 +566,7 @@ mod tests {
             external_id: external_id.to_owned(),
             label: None,
             plan_tier: None,
+            extra_usage_enabled: None,
         };
         UsageIdentityStore::new(db_path)
             .unwrap()

@@ -38,6 +38,7 @@ pub struct AccountIdentity {
     pub external_id: String,
     pub label: Option<String>,
     pub plan_tier: Option<String>,
+    pub extra_usage_enabled: Option<bool>,
 }
 
 impl AccountIdentity {
@@ -107,6 +108,7 @@ impl UsageIdentityStore {
               external_id   TEXT NOT NULL,
               label         TEXT,
               plan_tier     TEXT,
+              extra_usage_enabled INTEGER,
               first_seen    TEXT NOT NULL,
               last_seen     TEXT NOT NULL
             );
@@ -127,6 +129,19 @@ impl UsageIdentityStore {
             "#,
         )
         .context("failed to initialize usage identity schema")?;
+        let account_columns = conn
+            .prepare("PRAGMA table_info(accounts)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if !account_columns
+            .iter()
+            .any(|column| column == "extra_usage_enabled")
+        {
+            conn.execute(
+                "ALTER TABLE accounts ADD COLUMN extra_usage_enabled INTEGER",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -260,11 +275,13 @@ impl UsageIdentityStore {
         tx.execute(
             r#"
             INSERT INTO accounts (
-              account_key, provider, external_id, label, plan_tier, first_seen, last_seen
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+              account_key, provider, external_id, label, plan_tier, extra_usage_enabled,
+              first_seen, last_seen
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
             ON CONFLICT(account_key) DO UPDATE SET
               label = COALESCE(excluded.label, accounts.label),
               plan_tier = COALESCE(excluded.plan_tier, accounts.plan_tier),
+              extra_usage_enabled = COALESCE(excluded.extra_usage_enabled, accounts.extra_usage_enabled),
               last_seen = MAX(accounts.last_seen, excluded.last_seen)
             "#,
             params![
@@ -273,6 +290,7 @@ impl UsageIdentityStore {
                 &identity.external_id,
                 identity.label.as_deref(),
                 identity.plan_tier.as_deref(),
+                identity.extra_usage_enabled,
                 observed_ts,
             ],
         )?;
@@ -397,11 +415,13 @@ fn upsert_account(
     tx.execute(
         r#"
         INSERT INTO accounts (
-          account_key, provider, external_id, label, plan_tier, first_seen, last_seen
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+          account_key, provider, external_id, label, plan_tier, extra_usage_enabled,
+          first_seen, last_seen
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
         ON CONFLICT(account_key) DO UPDATE SET
           label = COALESCE(excluded.label, accounts.label),
           plan_tier = COALESCE(excluded.plan_tier, accounts.plan_tier),
+          extra_usage_enabled = COALESCE(excluded.extra_usage_enabled, accounts.extra_usage_enabled),
           last_seen = excluded.last_seen
         "#,
         params![
@@ -410,6 +430,7 @@ fn upsert_account(
             &identity.external_id,
             identity.label.as_deref(),
             identity.plan_tier.as_deref(),
+            identity.extra_usage_enabled,
             observed_ts,
         ],
     )?;
@@ -547,6 +568,7 @@ pub fn read_claude_identity(path: &Path) -> Result<Option<AccountIdentity>> {
         external_id,
         label: json_string(account, "emailAddress"),
         plan_tier: json_string(account, "organizationRateLimitTier"),
+        extra_usage_enabled: account.get("hasExtraUsageEnabled").and_then(Value::as_bool),
     }))
 }
 
@@ -590,6 +612,7 @@ pub fn read_codex_identity(path: &Path) -> Result<Option<AccountIdentity>> {
                 .and_then(|auth| json_string(auth, "chatgpt_plan_type"))
                 .or_else(|| json_string(claims, "https://api.openai.com/auth.chatgpt_plan_type"))
         }),
+        extra_usage_enabled: None,
     }))
 }
 
@@ -750,6 +773,7 @@ mod tests {
             external_id: external_id.to_owned(),
             label: None,
             plan_tier: None,
+            extra_usage_enabled: None,
         }
     }
 
@@ -774,6 +798,49 @@ mod tests {
     }
 
     #[test]
+    fn existing_accounts_schema_adds_extra_usage_without_losing_rows() {
+        let dir = TestDir::new("extra-usage-migration");
+        let db_path = dir.0.join("usage.db");
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE accounts (
+                  account_key TEXT PRIMARY KEY,
+                  provider TEXT NOT NULL,
+                  external_id TEXT NOT NULL,
+                  label TEXT,
+                  plan_tier TEXT,
+                  first_seen TEXT NOT NULL,
+                  last_seen TEXT NOT NULL
+                );
+                INSERT INTO accounts VALUES (
+                  'claude:existing', 'claude', 'existing', NULL, 'max',
+                  '2026-08-10T00:00:00Z', '2026-08-10T00:00:00Z'
+                );
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        UsageIdentityStore::new(&db_path).unwrap();
+
+        let connection = Connection::open(db_path).unwrap();
+        let columns = connection
+            .prepare("PRAGMA table_info(accounts)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "extra_usage_enabled"));
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
     fn parses_claude_and_codex_stable_identity_surfaces() {
         let dir = TestDir::new("parse");
         let claude_path = dir.0.join("claude.json");
@@ -786,6 +853,7 @@ mod tests {
         assert_eq!(claude.account_key(), "claude:claude-uuid");
         assert_eq!(claude.label.as_deref(), Some("c@example.com"));
         assert_eq!(claude.plan_tier.as_deref(), Some("default_claude_max_20x"));
+        assert_eq!(claude.extra_usage_enabled, Some(true));
 
         let claims = URL_SAFE_NO_PAD.encode(
             br#"{"email":"x@example.com","https://api.openai.com/auth":{"chatgpt_plan_type":"pro"}}"#,
