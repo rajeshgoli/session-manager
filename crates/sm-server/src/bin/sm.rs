@@ -126,8 +126,10 @@ struct UsageArgs {
     agent: Option<String>,
     #[arg(long)]
     include_children: bool,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "history")]
     since_reset: bool,
+    #[arg(long, conflicts_with = "since_reset")]
+    history: bool,
     #[arg(long)]
     account: bool,
     #[arg(long)]
@@ -2588,7 +2590,7 @@ fn run_usage(client: &ApiClient, args: UsageArgs) -> Result<()> {
     if args.include_children {
         query.push("include_children=true");
     }
-    if args.since_reset {
+    if args.since_reset || !args.history {
         query.push("since_reset=true");
     }
     if args.by_model {
@@ -2625,19 +2627,50 @@ fn usage_uses_account_view(args: &UsageArgs, current_session_id: Option<&str>) -
     args.account || (args.agent.is_none() && current_session_id.is_none())
 }
 
+fn print_usage_decision(payload: &Value) {
+    let decision = &payload["decision"];
+    match decision["status"].as_str().unwrap_or("non_actionable") {
+        "actionable" => {}
+        "partial" => println!("PARTIAL · some current quota meters are not decision-grade"),
+        _ => println!("NON-ACTIONABLE · no fresh quota meter is available"),
+    }
+    for reason in decision["reasons"].as_array().into_iter().flatten() {
+        if let Some(reason) = reason.as_str() {
+            println!("  {reason}");
+        }
+    }
+    for guidance in decision["refresh_guidance"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(guidance) = guidance.as_str() {
+            println!("  refresh: {guidance}");
+        }
+    }
+}
+
 fn print_usage_report(payload: &Value) {
     if let Some(target) = payload.get("target").filter(|target| !target.is_null()) {
         let id = target["seat_id"].as_str().unwrap_or("unknown");
         let name = target["friendly_name"].as_str().unwrap_or(id);
         let descendants = target["descendant_count"].as_u64().unwrap_or(0);
+        let available_descendants = target["available_descendant_count"]
+            .as_u64()
+            .unwrap_or(descendants);
         if descendants > 0 {
             println!("{name} ({id}) · {descendants} descendants · prior weights");
+        } else if available_descendants > 0 {
+            println!(
+                "{name} ({id}) · {available_descendants} descendants excluded · prior weights"
+            );
         } else {
             println!("{name} ({id}) · prior weights");
         }
     } else {
         println!("account usage · prior weights");
     }
+    print_usage_decision(payload);
     let accounts = payload["accounts"].as_array().cloned().unwrap_or_default();
     if accounts.is_empty() {
         println!("No usage data");
@@ -2653,7 +2686,11 @@ fn print_usage_report(payload: &Value) {
                 || {
                     let last = window["last_known_percent"].as_f64().unwrap_or(0.0);
                     let age_minutes = window["sample_age_seconds"].as_i64().unwrap_or(0) / 60;
-                    format!("unknown (last {last:.1}%, {age_minutes}m ago)")
+                    if window["current"].as_bool().unwrap_or(false) {
+                        format!(">={last:.1}% ({age_minutes}m old sample)")
+                    } else {
+                        format!("unknown (last {last:.1}%, {age_minutes}m ago)")
+                    }
                 },
                 |percent| format!("{percent:.1}%"),
             );
@@ -2663,11 +2700,18 @@ fn print_usage_report(payload: &Value) {
             let child_percent = window["children_percent"]
                 .as_f64()
                 .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1}%"));
-            let headroom = window["free_headroom_points"]
-                .as_f64()
-                .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1} pts"));
-            let stale = if window["stale"].as_bool().unwrap_or(true) {
-                " · stale"
+            let headroom = window["free_headroom_points"].as_f64().map_or_else(
+                || {
+                    window["free_headroom_upper_bound_points"]
+                        .as_f64()
+                        .map_or_else(|| "unknown".to_owned(), |value| format!("<={value:.1} pts"))
+                },
+                |value| format!("{value:.1} pts"),
+            );
+            let freshness = if window["freshness"].as_str() == Some("stale") {
+                " · bounds only"
+            } else if window["freshness"].as_str() == Some("expired") {
+                " · closed"
             } else {
                 ""
             };
@@ -2684,26 +2728,28 @@ fn print_usage_report(payload: &Value) {
                 .is_some_and(|target| !target.is_null())
             {
                 println!(
-                    "  {kind:<22} self {self_percent:>7} · children {child_percent:>7} · account {account_usage} · free {headroom}{binding}{stale}"
+                    "  {kind:<22} self {self_percent:>7} · children {child_percent:>7} · account {account_usage} · free {headroom}{binding}{freshness}"
                 );
             } else {
-                println!("  {kind:<22} account {account_usage} · free {headroom}{binding}{stale}");
-                let seats = window["seats"].as_array().cloned().unwrap_or_default();
-                if !seats.is_empty() {
-                    let values = seats
-                        .iter()
-                        .map(|seat| {
-                            let id = seat["seat_id"].as_str().unwrap_or("unknown");
-                            let name = seat["friendly_name"].as_str().unwrap_or(id);
-                            let burn = seat["burn_percent"].as_f64().map_or_else(
-                                || "unknown".to_owned(),
-                                |value| format!("{value:.1}%"),
-                            );
-                            format!("{name} {burn}")
-                        })
-                        .collect::<Vec<_>>();
-                    println!("    seats: {}", values.join(" · "));
-                }
+                println!(
+                    "  {kind:<22} account {account_usage} · free {headroom}{binding}{freshness}"
+                );
+            }
+            let seats = window["seats"].as_array().cloned().unwrap_or_default();
+            for seat in seats {
+                let id = seat["seat_id"].as_str().unwrap_or("unknown");
+                let name = seat["friendly_name"].as_str().unwrap_or(id);
+                let identity = if name == id {
+                    id.to_owned()
+                } else {
+                    format!("{name} ({id})")
+                };
+                let burn = seat["burn_percent"].as_f64().map_or_else(
+                    || "burn unknown".to_owned(),
+                    |value| format!("burn {value:.1}%"),
+                );
+                let tokens = format_usage_tokens(seat["total_tokens"].as_i64().unwrap_or(0));
+                println!("    seat {identity} · {burn} · {tokens} tokens");
             }
             let credit_tokens = window["credit_tokens"].as_i64().unwrap_or(0);
             if credit_tokens > 0 {
@@ -2730,13 +2776,61 @@ fn print_usage_report(payload: &Value) {
                     model["weight_source"].as_str().unwrap_or("prior"),
                 );
             }
+            if let Some(projection) = window.get("projection").filter(|value| !value.is_null()) {
+                let days = projection["horizon_seconds"].as_i64().unwrap_or(0) as f64 / 86_400.0;
+                let rate = projection["burn_rate_points_per_day"]
+                    .as_f64()
+                    .unwrap_or(0.0);
+                let projected = projection["projected_account_percent_at_reset"]
+                    .as_f64()
+                    .unwrap_or(0.0);
+                let projected_free = projection["projected_free_headroom_points"]
+                    .as_f64()
+                    .unwrap_or(0.0);
+                println!(
+                    "    projection (low confidence): {rate:.1} pts/day · {projected:.1}% at reset in {days:.1}d · projected free {projected_free:.1} pts"
+                );
+                let additional_seats = projection["additional_seats"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                if additional_seats.is_empty() {
+                    println!("      additional seats unavailable · no observed model baseline");
+                }
+                for seat in additional_seats {
+                    let model = seat["model"].as_str().unwrap_or("unknown");
+                    let baseline = seat["baseline_seats"].as_u64().unwrap_or(0);
+                    let equivalents = seat["additional_seat_equivalents"].as_f64().unwrap_or(0.0);
+                    println!(
+                        "      {model}: {equivalents:.1} additional seat equivalents · conservative baseline {baseline}"
+                    );
+                }
+            }
+            let residual_lower = window["residual_lower_bound_percent"]
+                .as_f64()
+                .unwrap_or(0.0);
+            let residual_upper = window["residual_upper_bound_percent"]
+                .as_f64()
+                .unwrap_or(window["last_known_percent"].as_f64().unwrap_or(0.0));
+            println!(
+                "    residual: unknown ({residual_lower:.1}..{residual_upper:.1} pts) · seat burn may be inflated"
+            );
         }
     }
-    println!("\nresidual: unknown · seat figures may include invisible usage");
     for warning in payload["warnings"].as_array().into_iter().flatten() {
         if let Some(warning) = warning.as_str() {
             println!("warning: {warning}");
         }
+    }
+}
+
+fn format_usage_tokens(tokens: i64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
     }
 }
 
@@ -4383,6 +4477,7 @@ mod tests {
         assert_eq!(args.agent.as_deref(), Some("worker"));
         assert!(args.include_children);
         assert!(args.since_reset);
+        assert!(!args.history);
         assert!(!args.account);
         assert!(args.by_model);
         assert!(args.json);
@@ -4393,6 +4488,14 @@ mod tests {
         };
         assert!(account.account);
         assert!(account.agent.is_none());
+
+        let history = Cli::try_parse_from(["sm", "usage", "worker", "--history"]).unwrap();
+        let Command::Usage(history) = history.command else {
+            panic!("expected usage command");
+        };
+        assert!(history.history);
+        assert!(!history.since_reset);
+        assert!(Cli::try_parse_from(["sm", "usage", "--history", "--since-reset"]).is_err());
 
         let children = Cli::try_parse_from(["sm", "children", "root", "--usage"]).unwrap();
         let Command::Children(children) = children.command else {
@@ -4408,6 +4511,7 @@ mod tests {
             agent: None,
             include_children: false,
             since_reset: false,
+            history: false,
             account: false,
             by_model: false,
             json: false,
@@ -4429,6 +4533,32 @@ mod tests {
         env::remove_var("SESSION_MANAGER_ID");
         env::remove_var("CLAUDE_SESSION_MANAGER_ID");
         let (client, server) = start_lookup_server([(
+            "/usage/accounts?since_reset=true",
+            200,
+            r#"{"mode":"prior","accounts":[],"warnings":[],"residual":null}"#,
+        )]);
+        let args = UsageArgs {
+            agent: None,
+            include_children: false,
+            since_reset: false,
+            history: false,
+            account: false,
+            by_model: false,
+            json: false,
+        };
+
+        run_usage(&client, args).unwrap();
+
+        assert_eq!(server.join().unwrap(), ["/usage/accounts?since_reset=true"]);
+    }
+
+    #[test]
+    fn usage_history_explicitly_requests_closed_windows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
+        env::remove_var("SESSION_MANAGER_ID");
+        env::remove_var("CLAUDE_SESSION_MANAGER_ID");
+        let (client, server) = start_lookup_server([(
             "/usage/accounts",
             200,
             r#"{"mode":"prior","accounts":[],"warnings":[],"residual":null}"#,
@@ -4437,6 +4567,7 @@ mod tests {
             agent: None,
             include_children: false,
             since_reset: false,
+            history: true,
             account: false,
             by_model: false,
             json: false,
@@ -4445,6 +4576,13 @@ mod tests {
         run_usage(&client, args).unwrap();
 
         assert_eq!(server.join().unwrap(), ["/usage/accounts"]);
+    }
+
+    #[test]
+    fn usage_token_totals_use_compact_readable_units() {
+        assert_eq!(format_usage_tokens(999), "999");
+        assert_eq!(format_usage_tokens(12_345), "12.3k");
+        assert_eq!(format_usage_tokens(2_345_678), "2.3m");
     }
 
     #[test]

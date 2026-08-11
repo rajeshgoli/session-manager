@@ -7853,6 +7853,23 @@ async fn usage_routes_preserve_exact_account_burn_and_optionally_include_childre
     assert_eq!(own["accounts"][0]["windows"][0]["total_percent"], 20.0);
     assert_eq!(own["accounts"][0]["label"], "primary");
     assert_eq!(own["target"]["usage_cap_fraction"], 0.5);
+    assert_eq!(own["target"]["descendant_count"], 0);
+    assert_eq!(own["target"]["available_descendant_count"], 1);
+    assert_eq!(
+        own["accounts"][0]["windows"][0]["seats"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        own["accounts"][0]["windows"][0]["seats"][0]["seat_id"],
+        "parent01"
+    );
+    assert_eq!(
+        own["accounts"][0]["windows"][0]["seats"][0]["total_tokens"],
+        100
+    );
     assert_eq!(
         own["accounts"][0]["windows"][0]["cap_consumed_percent"],
         40.0
@@ -7865,6 +7882,14 @@ async fn usage_routes_preserve_exact_account_burn_and_optionally_include_childre
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(subtree["target"]["descendant_count"], 1);
+    assert_eq!(subtree["target"]["available_descendant_count"], 1);
+    assert_eq!(
+        subtree["accounts"][0]["windows"][0]["seats"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(
         subtree["accounts"][0]["windows"][0]["account_percent"],
         40.0

@@ -12,6 +12,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const STALE_AFTER_SECONDS: i64 = 600;
+const MIN_PROJECTION_ELAPSED_SECONDS: i64 = 3600;
 const DEFAULT_PREMIUM_CAP_RATIO: f64 = 0.5;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -28,11 +29,13 @@ pub struct UsageReportTarget {
     pub usage_cap_fraction: Option<f64>,
     pub self_seats: BTreeSet<String>,
     pub child_seats: BTreeSet<String>,
+    pub available_descendant_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UsageReport {
     pub mode: &'static str,
+    pub decision: UsageDecisionSummary,
     pub residual: Option<f64>,
     pub possibly_inflated: bool,
     pub generated_at: String,
@@ -47,8 +50,18 @@ pub struct UsageReportTargetView {
     pub seat_id: String,
     pub friendly_name: Option<String>,
     pub descendant_count: usize,
+    pub available_descendant_count: usize,
     pub account_key: Option<String>,
     pub usage_cap_fraction: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageDecisionSummary {
+    pub status: &'static str,
+    pub fresh_current_windows: usize,
+    pub stale_current_windows: usize,
+    pub reasons: Vec<String>,
+    pub refresh_guidance: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +83,8 @@ pub struct UsageWindowReport {
     pub account_percent: Option<f64>,
     pub last_known_percent: f64,
     pub sample_age_seconds: Option<i64>,
+    pub current: bool,
+    pub freshness: &'static str,
     pub stale: bool,
     pub weight_source: &'static str,
     pub residual: Option<f64>,
@@ -79,9 +94,15 @@ pub struct UsageWindowReport {
     pub total_percent: Option<f64>,
     pub cap_consumed_percent: Option<f64>,
     pub free_headroom_points: Option<f64>,
+    pub account_lower_bound_percent: Option<f64>,
+    pub free_headroom_upper_bound_points: Option<f64>,
     pub binding_for_scoped_seats: Option<bool>,
     pub binding_for_other_seats: Option<bool>,
     pub credit_tokens: i64,
+    pub residual_lower_bound_percent: f64,
+    pub residual_upper_bound_percent: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projection: Option<UsageProjection>,
     pub seats: Vec<UsageSeatShare>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<UsageModelShare>,
@@ -94,7 +115,30 @@ pub struct UsageSeatShare {
     pub burn_percent: Option<f64>,
     pub share: Option<f64>,
     pub weighted_units: f64,
+    pub total_tokens: i64,
     pub credit_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageProjection {
+    pub method: &'static str,
+    pub confidence: &'static str,
+    pub assumptions: Vec<&'static str>,
+    pub elapsed_seconds: i64,
+    pub horizon_seconds: i64,
+    pub burn_rate_points_per_day: f64,
+    pub projected_account_percent_at_reset: f64,
+    pub projected_free_headroom_points: f64,
+    pub seat_projection_status: &'static str,
+    pub additional_seats: Vec<UsageAdditionalSeatProjection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UsageAdditionalSeatProjection {
+    pub model: String,
+    pub baseline_seats: usize,
+    pub burn_points_per_seat_per_day: f64,
+    pub additional_seat_equivalents: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -213,9 +257,11 @@ impl UsageReportStore {
             });
             mark_binding_limits(&mut account.windows);
         }
+        let decision = usage_decision_summary(&accounts);
 
         Ok(UsageReport {
             mode: "prior",
+            decision,
             residual: None,
             possibly_inflated: true,
             generated_at: now.format(&Rfc3339)?,
@@ -223,6 +269,7 @@ impl UsageReportStore {
                 seat_id: target.seat_id.clone(),
                 friendly_name: target.friendly_name.clone(),
                 descendant_count: target.child_seats.len(),
+                available_descendant_count: target.available_descendant_count,
                 account_key: target.account_key.clone(),
                 usage_cap_fraction: target.usage_cap_fraction,
             }),
@@ -525,7 +572,9 @@ fn build_window_report(
             .unwrap_or(true);
     let mut weighted = Vec::new();
     let mut credit_by_seat = BTreeMap::<String, i64>::new();
+    let mut tokens_by_seat = BTreeMap::<String, i64>::new();
     for row in rows {
+        *tokens_by_seat.entry(row.seat_id.clone()).or_default() += row.tokens.total();
         if row.credit_metered {
             *credit_by_seat.entry(row.seat_id.clone()).or_default() += row.tokens.total();
             continue;
@@ -601,6 +650,12 @@ fn build_window_report(
 
     let mut seat_ids = burn_by_seat.keys().cloned().collect::<BTreeSet<_>>();
     seat_ids.extend(credit_by_seat.keys().cloned());
+    seat_ids.extend(tokens_by_seat.keys().cloned());
+    if let Some(target) = target {
+        seat_ids.retain(|seat_id| {
+            target.self_seats.contains(seat_id) || target.child_seats.contains(seat_id)
+        });
+    }
     let mut seats = seat_ids
         .into_iter()
         .map(|seat_id| {
@@ -608,6 +663,7 @@ fn build_window_report(
             UsageSeatShare {
                 friendly_name: names.get(&seat_id).cloned().flatten(),
                 weighted_units: units_by_seat.get(&seat_id).copied().unwrap_or(0.0),
+                total_tokens: tokens_by_seat.get(&seat_id).copied().unwrap_or(0),
                 credit_tokens: credit_by_seat.get(&seat_id).copied().unwrap_or(0),
                 share: (!stale).then_some(if window.percent > 0.0 {
                     burn_percent / window.percent
@@ -627,11 +683,14 @@ fn build_window_report(
             .then_with(|| left.seat_id.cmp(&right.seat_id))
     });
 
+    let projection = build_projection(window, stale, is_scoped, premium_cap_ratio, &burn_by_model);
     let models = if by_model {
         burn_by_model
             .into_iter()
             .filter(|((seat_id, _), _)| {
-                target.is_none_or(|target| target.self_seats.contains(seat_id))
+                target.is_none_or(|target| {
+                    target.self_seats.contains(seat_id) || target.child_seats.contains(seat_id)
+                })
             })
             .map(|((seat_id, model), (burn_percent, weighted_units))| {
                 let weight_source =
@@ -687,6 +746,14 @@ fn build_window_report(
         account_percent: (!stale).then_some(window.percent),
         last_known_percent: window.percent,
         sample_age_seconds,
+        current: !reset_elapsed,
+        freshness: if reset_elapsed {
+            "expired"
+        } else if stale {
+            "stale"
+        } else {
+            "fresh"
+        },
         stale,
         weight_source: "prior",
         residual: None,
@@ -700,12 +767,100 @@ fn build_window_report(
         } else {
             (100.0 - window.percent).max(0.0)
         }),
+        account_lower_bound_percent: (!reset_elapsed).then_some(window.percent),
+        free_headroom_upper_bound_points: (!reset_elapsed).then_some(if is_scoped {
+            premium_cap_ratio * (100.0 - window.percent).max(0.0)
+        } else {
+            (100.0 - window.percent).max(0.0)
+        }),
         binding_for_scoped_seats: (!stale).then_some(false),
         binding_for_other_seats: (!stale).then_some(false),
         credit_tokens: credit_by_seat.values().sum(),
+        residual_lower_bound_percent: 0.0,
+        residual_upper_bound_percent: window.percent.max(0.0),
+        projection,
         seats,
         models,
     }
+}
+
+fn build_projection(
+    window: &BurnWindow,
+    stale: bool,
+    is_scoped: bool,
+    premium_cap_ratio: f64,
+    burn_by_model: &BTreeMap<(String, String), (f64, f64)>,
+) -> Option<UsageProjection> {
+    let weekly = window.window_kind == "weekly_all"
+        || window.window_kind == "weekly_scoped"
+        || window.window_kind.contains("10080");
+    if stale || !weekly {
+        return None;
+    }
+    let started_at = parse_timestamp(&window.window_start)?;
+    let observed_at = parse_timestamp(&window.observed_at)?;
+    let resets_at = parse_timestamp(&window.resets_at)?;
+    let elapsed_seconds = (observed_at - started_at).whole_seconds();
+    let horizon_seconds = (resets_at - observed_at).whole_seconds();
+    if elapsed_seconds < MIN_PROJECTION_ELAPSED_SECONDS || horizon_seconds <= 0 {
+        return None;
+    }
+
+    let burn_rate_per_second = window.percent.max(0.0) / elapsed_seconds as f64;
+    let projected_account_percent_at_reset =
+        window.percent + burn_rate_per_second * horizon_seconds as f64;
+    let projected_raw_headroom = (100.0 - projected_account_percent_at_reset).max(0.0);
+    let projected_free_headroom_points = if is_scoped {
+        premium_cap_ratio * projected_raw_headroom
+    } else {
+        projected_raw_headroom
+    };
+
+    let mut model_seats = BTreeMap::<String, BTreeMap<String, f64>>::new();
+    for ((seat_id, model), (burn_percent, _)) in burn_by_model {
+        if seat_id == "unassigned" || *burn_percent <= 0.0 {
+            continue;
+        }
+        model_seats
+            .entry(model.clone())
+            .or_default()
+            .insert(seat_id.clone(), *burn_percent);
+    }
+    let additional_seats = model_seats
+        .into_iter()
+        .filter_map(|(model, seats)| {
+            let conservative_burn = seats.values().copied().max_by(f64::total_cmp)?;
+            let burn_per_second = conservative_burn / elapsed_seconds as f64;
+            let candidate_remaining_burn = burn_per_second * horizon_seconds as f64;
+            (candidate_remaining_burn > 0.0).then_some(UsageAdditionalSeatProjection {
+                model,
+                baseline_seats: seats.len(),
+                burn_points_per_seat_per_day: burn_per_second * 86_400.0,
+                additional_seat_equivalents: projected_raw_headroom / candidate_remaining_burn,
+            })
+        })
+        .collect::<Vec<UsageAdditionalSeatProjection>>();
+
+    Some(UsageProjection {
+        method: "linear_current_window_conservative_model_max",
+        confidence: "low_conservative",
+        assumptions: vec![
+            "current-window account burn continues linearly until reset",
+            "candidate capacity uses the highest observed same-model seat burn",
+            "prior attribution may include invisible usage and biases capacity downward",
+        ],
+        elapsed_seconds,
+        horizon_seconds,
+        burn_rate_points_per_day: burn_rate_per_second * 86_400.0,
+        projected_account_percent_at_reset,
+        projected_free_headroom_points,
+        seat_projection_status: if additional_seats.is_empty() {
+            "no_observed_model_baseline"
+        } else {
+            "available"
+        },
+        additional_seats,
+    })
 }
 
 fn mark_binding_limits(windows: &mut [UsageWindowReport]) {
@@ -743,6 +898,62 @@ fn mark_binding_limits(windows: &mut [UsageWindowReport]) {
                 windows[index].binding_for_scoped_seats = Some(true);
             }
         }
+    }
+}
+
+fn usage_decision_summary(accounts: &[UsageAccountReport]) -> UsageDecisionSummary {
+    let fresh_current_windows = accounts
+        .iter()
+        .flat_map(|account| &account.windows)
+        .filter(|window| window.current && !window.stale)
+        .count();
+    let stale_current_windows = accounts
+        .iter()
+        .flat_map(|account| &account.windows)
+        .filter(|window| window.current && window.stale)
+        .count();
+    let status = match (fresh_current_windows, stale_current_windows) {
+        (0, _) => "non_actionable",
+        (_, 0) => "actionable",
+        _ => "partial",
+    };
+    let mut reasons = Vec::new();
+    if fresh_current_windows == 0 && stale_current_windows == 0 {
+        reasons.push("No current quota window is available".to_owned());
+    } else if stale_current_windows > 0 {
+        reasons.push(format!(
+            "{stale_current_windows} current quota meter(s) are older than {} minutes; only bounds are safe and projections are suppressed",
+            STALE_AFTER_SECONDS / 60
+        ));
+    }
+    if fresh_current_windows == 0 && stale_current_windows > 0 {
+        reasons.push("No fresh quota meter is available for a spawn decision".to_owned());
+    }
+
+    let mut refresh_guidance = BTreeSet::new();
+    for account in accounts {
+        let needs_refresh = account
+            .windows
+            .iter()
+            .any(|window| window.current && window.stale);
+        if !needs_refresh {
+            continue;
+        }
+        refresh_guidance.insert(match account.provider.as_str() {
+            "claude" => "Claude refreshes when its next status-line payload includes rate limits; sm usage cannot force an account refresh".to_owned(),
+            "codex" => "Codex refreshes when an attached provider emits its next rate-limit event; sm usage cannot force an account refresh".to_owned(),
+            provider => format!(
+                "{provider} has no on-demand usage refresh path in Session Manager"
+            ),
+        });
+    }
+
+    UsageDecisionSummary {
+        status,
+        fresh_current_windows,
+        stale_current_windows,
+        reasons,
+        refresh_guidance: refresh_guidance.into_iter().collect(),
     }
 }
 
@@ -1033,6 +1244,8 @@ mod tests {
             account_percent: Some(0.0),
             last_known_percent: 0.0,
             sample_age_seconds: Some(0),
+            current: true,
+            freshness: "fresh",
             stale: false,
             weight_source: "prior",
             residual: None,
@@ -1042,9 +1255,14 @@ mod tests {
             total_percent: Some(0.0),
             cap_consumed_percent: None,
             free_headroom_points: Some(headroom),
+            account_lower_bound_percent: Some(0.0),
+            free_headroom_upper_bound_points: Some(headroom),
             binding_for_scoped_seats: Some(false),
             binding_for_other_seats: Some(false),
             credit_tokens: 0,
+            residual_lower_bound_percent: 0.0,
+            residual_upper_bound_percent: 0.0,
+            projection: None,
             seats: Vec::new(),
             models: Vec::new(),
         };
@@ -1091,6 +1309,7 @@ mod tests {
             usage_cap_fraction: Some(0.5),
             self_seats: BTreeSet::from(["seat-a".to_owned()]),
             child_seats: BTreeSet::new(),
+            available_descendant_count: 0,
         };
         let report = build_window_report(
             &window,
@@ -1109,6 +1328,13 @@ mod tests {
         assert_eq!(report.account_percent, None);
         assert_eq!(report.last_known_percent, 34.0);
         assert_eq!(report.sample_age_seconds, Some(660));
+        assert!(report.current);
+        assert_eq!(report.freshness, "stale");
+        assert_eq!(report.account_lower_bound_percent, Some(34.0));
+        assert_eq!(report.free_headroom_upper_bound_points, Some(66.0));
+        assert_eq!(report.residual_lower_bound_percent, 0.0);
+        assert_eq!(report.residual_upper_bound_percent, 34.0);
+        assert!(report.projection.is_none());
         assert_eq!(report.self_percent, None);
         assert_eq!(report.children_percent, None);
         assert_eq!(report.total_percent, None);
@@ -1118,6 +1344,7 @@ mod tests {
         assert_eq!(report.binding_for_other_seats, None);
         assert_eq!(report.seats[0].burn_percent, None);
         assert_eq!(report.seats[0].share, None);
+        assert_eq!(report.seats[0].total_tokens, 10);
         assert_eq!(report.models[0].burn_percent, None);
     }
 
@@ -1150,6 +1377,10 @@ mod tests {
         );
 
         assert!(report.stale);
+        assert!(!report.current);
+        assert_eq!(report.freshness, "expired");
+        assert_eq!(report.account_lower_bound_percent, None);
+        assert_eq!(report.free_headroom_upper_bound_points, None);
         assert_eq!(report.account_percent, None);
         assert_eq!(report.last_known_percent, 21.0);
         assert_eq!(report.sample_age_seconds, Some(30));
@@ -1186,6 +1417,7 @@ mod tests {
             usage_cap_fraction: None,
             self_seats: BTreeSet::from(["target".to_owned()]),
             child_seats: BTreeSet::new(),
+            available_descendant_count: 0,
         };
         let mut warnings = BTreeSet::new();
         let report = build_window_report(
@@ -1203,6 +1435,112 @@ mod tests {
 
         assert_eq!(report.models.len(), 1);
         assert_eq!(report.models[0].seat_id, "target");
+        assert_eq!(report.seats.len(), 1);
+        assert_eq!(report.seats[0].seat_id, "target");
+        assert_eq!(report.seats[0].total_tokens, 10);
+    }
+
+    #[test]
+    fn fresh_weekly_window_projects_existing_pace_and_model_seat_equivalents() {
+        let window = BurnWindow {
+            id: 1,
+            account_key: "codex:a".to_owned(),
+            window_kind: "codex_10080".to_owned(),
+            window_scope: None,
+            window_start: "2026-08-10T00:00:00Z".to_owned(),
+            percent: 10.0,
+            resets_at: "2026-08-17T00:00:00Z".to_owned(),
+            observed_at: "2026-08-11T00:00:00Z".to_owned(),
+        };
+        let rows = vec![WindowRow {
+            seat_id: "luna-seat".to_owned(),
+            model: "gpt-5.6-luna".to_owned(),
+            credit_metered: false,
+            tokens: TokenCounts {
+                input: 100,
+                ..TokenCounts::default()
+            },
+        }];
+        let mut warnings = BTreeSet::new();
+
+        let report = build_window_report(
+            &window,
+            "codex",
+            &rows,
+            None,
+            None,
+            &BTreeMap::new(),
+            false,
+            DEFAULT_PREMIUM_CAP_RATIO,
+            OffsetDateTime::parse("2026-08-11T00:00:00Z", &Rfc3339).unwrap(),
+            &mut warnings,
+        );
+
+        let projection = report.projection.unwrap();
+        assert_eq!(projection.confidence, "low_conservative");
+        assert_eq!(projection.assumptions.len(), 3);
+        assert_eq!(projection.seat_projection_status, "available");
+        assert_eq!(projection.elapsed_seconds, 86_400);
+        assert_eq!(projection.horizon_seconds, 6 * 86_400);
+        assert_eq!(projection.burn_rate_points_per_day, 10.0);
+        assert_eq!(projection.projected_account_percent_at_reset, 70.0);
+        assert_eq!(projection.projected_free_headroom_points, 30.0);
+        assert_eq!(projection.additional_seats.len(), 1);
+        assert_eq!(projection.additional_seats[0].model, "gpt-5.6-luna");
+        assert_eq!(projection.additional_seats[0].baseline_seats, 1);
+        assert_eq!(
+            projection.additional_seats[0].additional_seat_equivalents,
+            0.5
+        );
+    }
+
+    #[test]
+    fn stale_current_meter_marks_report_non_actionable_with_refresh_guidance() {
+        let now = OffsetDateTime::parse("2026-08-11T01:00:00Z", &Rfc3339).unwrap();
+        let window = BurnWindow {
+            id: 1,
+            account_key: "codex:a".to_owned(),
+            window_kind: "codex_10080".to_owned(),
+            window_scope: None,
+            window_start: "2026-08-10T00:00:00Z".to_owned(),
+            percent: 12.0,
+            resets_at: "2026-08-17T00:00:00Z".to_owned(),
+            observed_at: "2026-08-11T00:49:00Z".to_owned(),
+        };
+        let mut warnings = BTreeSet::new();
+        let report = build_window_report(
+            &window,
+            "codex",
+            &[],
+            None,
+            None,
+            &BTreeMap::new(),
+            false,
+            DEFAULT_PREMIUM_CAP_RATIO,
+            now,
+            &mut warnings,
+        );
+        let accounts = vec![UsageAccountReport {
+            account_key: "codex:a".to_owned(),
+            label: None,
+            provider: "codex".to_owned(),
+            plan_tier: Some("pro".to_owned()),
+            windows: vec![report],
+        }];
+
+        let decision = usage_decision_summary(&accounts);
+
+        assert_eq!(decision.status, "non_actionable");
+        assert_eq!(decision.fresh_current_windows, 0);
+        assert_eq!(decision.stale_current_windows, 1);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("older than 10 minutes")));
+        assert!(decision
+            .refresh_guidance
+            .iter()
+            .any(|guidance| guidance.contains("cannot force")));
     }
 
     #[test]
