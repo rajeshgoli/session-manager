@@ -2801,13 +2801,13 @@ mod tests {
                                 "reasoning_output_tokens": 10,
                                 "total_tokens": 150
                             },
-                            "rate_limits": {
-                                "limit_id": "codex",
-                                "primary": {
-                                    "used_percent": 25,
-                                    "window_minutes": 300,
-                                    "resets_at": reset
-                                }
+                        },
+                        "rate_limits": {
+                            "limit_id": "codex",
+                            "primary": {
+                                "used_percent": 25,
+                                "window_minutes": 300,
+                                "resets_at": reset
                             }
                         }
                     }
@@ -2835,16 +2835,17 @@ mod tests {
 
         store.scan(&[]).unwrap();
 
-        let (percent, source): (f64, String) = Connection::open(&db_path)
+        let (percent, source, observed_at): (f64, String, String) = Connection::open(&db_path)
             .unwrap()
             .query_row(
-                "SELECT percent, source FROM burn_samples WHERE source = 'codex_event' ORDER BY id DESC LIMIT 1",
+                "SELECT percent, source, observed_at FROM burn_samples WHERE source = 'codex_event' ORDER BY id DESC LIMIT 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(percent, 25.0);
         assert_eq!(source, "codex_event");
+        assert_eq!(observed_at, "2026-08-10T16:20:00.000000000Z");
     }
 
     #[test]

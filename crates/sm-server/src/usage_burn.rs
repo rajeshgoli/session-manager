@@ -178,6 +178,7 @@ impl UsageBurnStore {
             return Ok(0);
         }
         let observed_at = json_string(event, "ts")
+            .or_else(|| json_string(event, "timestamp"))
             .as_deref()
             .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
             .unwrap_or(received_at);
