@@ -14,6 +14,9 @@ use crate::usage_identity::{Provider, UsageIdentityStore};
 const USAGE_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_WINDOW_MINUTES: i64 = 300;
 const WEEKLY_WINDOW_MINUTES: i64 = 10_080;
+const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
+    "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z"
+);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BurnWindowSample {
@@ -498,7 +501,10 @@ fn json_f64(value: Option<&Value>) -> Option<f64> {
 }
 
 fn format_timestamp(value: OffsetDateTime) -> Result<String> {
-    value.format(&Rfc3339).context("failed to format timestamp")
+    value
+        .to_offset(time::UtcOffset::UTC)
+        .format(DB_TIMESTAMP_FORMAT)
+        .context("failed to format timestamp")
 }
 
 #[cfg(test)]
@@ -700,6 +706,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(latest.0, 40.0);
-        assert_eq!(latest.1, "2026-08-17T16:00:00Z");
+        assert_eq!(latest.1, "2026-08-17T16:00:00.000000000Z");
+    }
+
+    #[test]
+    fn codex_sparse_merge_orders_same_second_samples_chronologically() {
+        let db_path = temp_db("codex-same-second");
+        seed_account(
+            &db_path,
+            Provider::Codex,
+            "codex-account",
+            "2026-08-10T12:00:00Z",
+        );
+        let store = UsageBurnStore::new(&db_path).unwrap();
+        for (timestamp, percent) in [
+            ("2026-08-10T12:01:00Z", 10),
+            ("2026-08-10T12:01:00.900Z", 20),
+        ] {
+            let event = json!({
+                "event_type": "account/rateLimits/updated",
+                "ts": timestamp,
+                "payload": {"rateLimits": {
+                    "limitId": "codex",
+                    "primary": {
+                        "usedPercent": percent,
+                        "windowDurationMins": 300,
+                        "resetsAt": 1786381200_i64
+                    }
+                }}
+            });
+            assert_eq!(
+                store
+                    .record_codex_event(event.as_object().unwrap(), at(timestamp))
+                    .unwrap(),
+                1
+            );
+        }
+        let reset_only = json!({
+            "event_type": "account/rateLimits/updated",
+            "ts": "2026-08-10T12:01:00.950Z",
+            "payload": {"rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                    "windowDurationMins": 300,
+                    "resetsAt": 1786384800_i64
+                }
+            }}
+        });
+        assert_eq!(
+            store
+                .record_codex_event(
+                    reset_only.as_object().unwrap(),
+                    at("2026-08-10T12:01:00.950Z"),
+                )
+                .unwrap(),
+            1
+        );
+
+        let latest: (f64, String) = Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT percent, observed_at FROM burn_samples ORDER BY observed_at DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(latest.0, 20.0);
+        assert_eq!(latest.1, "2026-08-10T12:01:00.950000000Z");
     }
 }
