@@ -7963,6 +7963,132 @@ async fn claude_stop_hook_reads_local_transcript_metadata_when_not_inlined() {
 }
 
 #[tokio::test]
+async fn claude_stop_hooks_append_distinct_provider_sessions_without_losing_the_first() {
+    let state_file = write_session_fixture();
+    let usage_db_path = state_file.with_extension("usage.db");
+    let transcript_dir = unique_temp_path();
+    fs::create_dir_all(&transcript_dir).unwrap();
+    let first_transcript = transcript_dir.join("provider-session-first.jsonl");
+    let second_transcript = transcript_dir.join("provider-session-second.jsonl");
+    let legacy_transcript = transcript_dir.join("provider-session-before-deployment.jsonl");
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    session["provider_resume_id"] = json!("provider-session-before-deployment");
+    session["transcript_path"] = json!(legacy_transcript.display().to_string());
+    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    for transcript_path in [&first_transcript, &second_transcript] {
+        let (status, payload) = post_json(
+            app.clone(),
+            "/hooks/claude",
+            json!({
+                "hook_event_name": "Stop",
+                "session_manager_id": "run12345",
+                "sm_last_message": "turn complete",
+                "sm_native_title": "Session chain fixture",
+                "sm_transcript_mtime_ns": 424242_i64,
+                "transcript_path": transcript_path.display().to_string()
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload, json!({ "status": "ok" }));
+    }
+
+    let connection = Connection::open(&usage_db_path).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT provider_session_id, artifact_path FROM seat_sessions WHERE seat_id = 'run12345' ORDER BY provider_session_id",
+        )
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "provider-session-before-deployment".to_owned(),
+                legacy_transcript.display().to_string(),
+            ),
+            (
+                "provider-session-first".to_owned(),
+                first_transcript.display().to_string(),
+            ),
+            (
+                "provider-session-second".to_owned(),
+                second_transcript.display().to_string(),
+            ),
+        ]
+    );
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    assert_eq!(
+        session["transcript_path"],
+        second_transcript.display().to_string()
+    );
+    assert_eq!(session["provider_resume_id"], "provider-session-second");
+}
+
+#[tokio::test]
+async fn claude_stop_hook_survives_an_unwritable_usage_database() {
+    let state_file = write_session_fixture();
+    fs::create_dir_all(state_file.with_extension("usage.db")).unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = post_json(
+        app,
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "run12345",
+            "sm_last_message": "turn complete despite ledger failure",
+            "transcript_path": "/tmp/provider-session-after-failure.jsonl"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok" }));
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    assert_eq!(session["status"], "idle");
+    assert_eq!(
+        session["last_action_summary"],
+        "turn complete despite ledger failure"
+    );
+    assert_eq!(
+        session["transcript_path"],
+        "/tmp/provider-session-after-failure.jsonl"
+    );
+    assert_eq!(
+        session["provider_resume_id"],
+        "provider-session-after-failure"
+    );
+}
+
+#[tokio::test]
 async fn claude_stop_hook_retries_local_transcript_metadata_read() {
     let state_file = write_session_fixture();
     let transcript_path = unique_temp_path().with_extension("jsonl");
@@ -14018,6 +14144,211 @@ async fn runtime_core_rejects_review_when_session_is_busy() {
 }
 
 #[tokio::test]
+async fn runtime_core_delayed_initial_codex_binding_updates_session_chain() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_short_temp_dir("sm-rust-codex-create-bind");
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-codex-create-bind-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app_with_codex_composer(&state_file, &log_dir, &tmux_socket);
+    let now = time::OffsetDateTime::now_utc();
+    let sessions_root = state_file.with_extension("codex-home").join("sessions");
+    let day_dir = sessions_root
+        .join(format!("{:04}", now.year()))
+        .join(format!("{:02}", now.month() as u8))
+        .join(format!("{:02}", now.day()));
+    fs::create_dir_all(&day_dir).unwrap();
+    let rollout_path = day_dir.join("rollout-delayed-create-thread.jsonl");
+    let rollout_working_dir = working_dir.clone();
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(1_200));
+        fs::write(
+            rollout_path,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "delayed-create-thread",
+                        "cwd": rollout_working_dir.display().to_string(),
+                        "timestamp": (time::OffsetDateTime::now_utc()
+                            + time::Duration::seconds(1))
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap()
+                    }
+                })
+            ),
+        )
+        .unwrap();
+    });
+
+    let (status, payload) = post_json(
+        app,
+        "/sessions",
+        json!({
+            "id": "createcodex",
+            "name": "create-codex",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "codex"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["provider_resume_id"].is_null());
+    writer.join().unwrap();
+
+    let mut bound = false;
+    for _ in 0..30 {
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        bound = state["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == "createcodex")
+            .is_some_and(|session| session["provider_resume_id"] == "delayed-create-thread");
+        if bound {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        bound,
+        "deferred creation binding did not update the session"
+    );
+    let count: i64 = Connection::open(state_file.with_extension("usage.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'createcodex' AND provider_session_id = 'delayed-create-thread'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn runtime_core_clear_rebinds_plain_codex_provider_session_chain() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_short_temp_dir("sm-rust-codex-clear-rebind");
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-codex-clear-rebind-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app_with_codex_composer(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "clearcodex",
+            "name": "clear-codex",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "codex"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let now = time::OffsetDateTime::now_utc();
+    let sessions_root = state_file.with_extension("codex-home").join("sessions");
+    let day_dir = sessions_root
+        .join(format!("{:04}", now.year()))
+        .join(format!("{:02}", now.month() as u8))
+        .join(format!("{:02}", now.day()));
+    fs::create_dir_all(&day_dir).unwrap();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "clearcodex")
+        .unwrap();
+    session["parent_session_id"] = json!("operator-parent");
+    session["provider_resume_id"] = json!("old-thread");
+    session["created_at"] = json!("2026-07-01T12:00:00Z");
+    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    let new_rollout = day_dir.join("rollout-new-thread.jsonl");
+    let new_working_dir = working_dir.clone();
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(250));
+        fs::write(
+            new_rollout,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "new-thread",
+                        "cwd": new_working_dir.display().to_string(),
+                        "timestamp": (time::OffsetDateTime::now_utc()
+                            + time::Duration::seconds(1))
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap()
+                    }
+                })
+            ),
+        )
+        .unwrap();
+    });
+
+    let (status, payload) = post_json(
+        app,
+        "/sessions/clearcodex/clear",
+        json!({ "prompt": "continue in the replacement thread" }),
+    )
+    .await;
+    writer.join().unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({ "status": "cleared", "session_id": "clearcodex" })
+    );
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "clearcodex")
+        .unwrap();
+    assert_eq!(session["provider_resume_id"], "new-thread");
+
+    let connection = Connection::open(state_file.with_extension("usage.db")).unwrap();
+    let provider_session_ids = connection
+        .prepare(
+            "SELECT provider_session_id FROM seat_sessions WHERE seat_id = 'clearcodex' ORDER BY provider_session_id",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(provider_session_ids, vec!["new-thread", "old-thread"]);
+}
+
+#[tokio::test]
 async fn runtime_core_spawns_codex_review_child() {
     if !tmux_available() {
         return;
@@ -14262,6 +14593,15 @@ while true; do sleep 1; done
     assert!(output_text.contains("ids:runtimefork:runtimefork:false"));
     let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
     assert_eq!(state["sessions"][0]["reasoning_effort"], "ultra");
+    let connection = Connection::open(state_file.with_extension("usage.db")).unwrap();
+    let provider_session_id: String = connection
+        .query_row(
+            "SELECT provider_session_id FROM seat_sessions WHERE seat_id = 'runtimefork'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(provider_session_id, "provider-thread-123");
     let mut lifecycle_status = String::new();
     for _ in 0..30 {
         let (_, session) = get_json(app.clone(), "/sessions/runtimefork").await;
@@ -16032,6 +16372,7 @@ fn runtime_app_with_command(
                     .display()
                     .to_string(),
             ),
+            transcript_root: None,
         },
         ..AppConfig::default()
     }))

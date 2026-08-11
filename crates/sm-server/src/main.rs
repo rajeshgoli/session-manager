@@ -79,6 +79,19 @@ async fn main() -> Result<()> {
     }
 
     let state = AppState::new(config);
+    // Capture the artifact boundary before serving. The background scan may run
+    // alongside live creates, but it must not attribute their new artifacts
+    // against this startup snapshot of the seat registry.
+    let reconciliation_cutoff_ns = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let reconciliation_snapshot = state
+        .prepare_seat_session_reconciliation(reconciliation_cutoff_ns)
+        .context("failed to snapshot sessions for usage ledger reconciliation")?;
+    let reconciliation_state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = reconciliation_state.reconcile_seat_sessions(reconciliation_snapshot) {
+            eprintln!("usage ledger session reconciliation failed: {error:#}");
+        }
+    });
 
     // Repair the Studio SSH LaunchAgents toward the desired state every 30s while
     // the toggle is on. launchctl is synchronous, so run it on a blocking thread.
@@ -93,7 +106,8 @@ async fn main() -> Result<()> {
             // enforced too (a stray enable that raced a disable gets corrected).
             let desired = studio_ssh_flag.load(Ordering::SeqCst);
             let config = studio_ssh_config.clone();
-            match tokio::task::spawn_blocking(move || studio_ssh::reconcile(&config, desired)).await {
+            match tokio::task::spawn_blocking(move || studio_ssh::reconcile(&config, desired)).await
+            {
                 Ok(status) if status.status == "error" => {
                     eprintln!("studio-ssh reconcile error: {:?}", status.error);
                 }
