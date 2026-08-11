@@ -110,20 +110,22 @@ use crate::queue::{
     ScheduledReminder,
 };
 use crate::runtime::TmuxRuntime;
+#[cfg(test)]
+use crate::sessions::codex_fork_legacy_event_stream_path_from_log_file;
 use crate::sessions::{
-    claude_hook_gate, codex_fork_status_for_event_line, expand_home, is_primary_node,
-    submit_codex_fork_btw, AgentRegistrationResponse, AgentStatusRequest, ArmStopNotifyOutcome,
-    ArmStopNotifyRequest, ChildSessionResponse, ClaudeHookGate, ClearSessionRequest,
-    ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest, ContextSnapshotResponse,
-    ContextUsageEvent, ContextUsageOutcome, CoreClearOutcome, CoreInputBatchResponse,
-    CoreInputBatchResult, CoreRestoreOutcome, CoreRetireOutcome, CoreReviewOutcome,
-    CreateCoreSessionRequest, HandoffOutcome, HandoffRequest, MaintainerMutationOutcome,
-    RegistryMutationOutcome, RoleRegistrationRequest, SeatSessionReconciliationSnapshot,
-    SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
-    SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
-    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
-    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
-    UpdateSessionMetadataRequest,
+    claude_hook_gate, codex_fork_newest_event_stream_path, codex_fork_status_for_event_line,
+    expand_home, is_primary_node, submit_codex_fork_btw, AgentRegistrationResponse,
+    AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest, ChildSessionResponse,
+    ClaudeHookGate, ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome,
+    ContextMonitorRequest, ContextSnapshotResponse, ContextUsageEvent, ContextUsageOutcome,
+    CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
+    CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
+    MaintainerMutationOutcome, RegistryMutationOutcome, RoleRegistrationRequest,
+    SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest, SendCoreInputRequest,
+    SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
+    SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest, SubagentStartOutcome,
+    SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest, TaskCompleteOutcome,
+    TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
 };
 
 use crate::studio_ssh::{self, StudioSshStatus};
@@ -9296,38 +9298,6 @@ fn codex_fork_event_stream_path_for_session(
                 &artifacts.event_stream_path,
             )
         })
-}
-
-fn codex_fork_legacy_event_stream_path_from_log_file(log_file: &StdPath) -> Option<PathBuf> {
-    let stem = log_file.file_stem()?.to_str()?.trim();
-    if stem.is_empty() {
-        return None;
-    }
-    Some(log_file.with_file_name(format!("{stem}.codex-fork.events.jsonl")))
-}
-
-fn codex_fork_newest_event_stream_path(
-    _session_id: &str,
-    log_file: &StdPath,
-    derived_path: &StdPath,
-) -> PathBuf {
-    let mut candidates = Vec::new();
-    candidates.push(derived_path.to_path_buf());
-    if let Some(legacy_path) = codex_fork_legacy_event_stream_path_from_log_file(log_file) {
-        candidates.push(legacy_path);
-    }
-
-    candidates
-        .iter()
-        .filter_map(|path| {
-            path.metadata()
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .map(|modified| (modified, path))
-        })
-        .max_by_key(|(modified, _)| *modified)
-        .map(|(_, path)| path.to_path_buf())
-        .unwrap_or_else(|| derived_path.to_path_buf())
 }
 
 #[cfg(test)]

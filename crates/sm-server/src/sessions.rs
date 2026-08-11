@@ -7528,11 +7528,12 @@ fn codex_fork_event_stream_path(session: &SessionRecord, runtime: &TmuxRuntime) 
     if session.provider != "codex-fork" {
         return None;
     }
+    let log_file = session.log_file.as_deref().map(expand_home)?;
     let spec = TmuxSessionSpec {
         session_id: session.id.clone(),
         tmux_session: session.tmux_session.clone(),
         working_dir: session.working_dir.clone(),
-        log_file: session.log_file.as_deref().map(expand_home)?,
+        log_file: log_file.clone(),
         provider: session.provider.clone(),
         initial_message: None,
         model: session.model.clone(),
@@ -7542,7 +7543,45 @@ fn codex_fork_event_stream_path(session: &SessionRecord, runtime: &TmuxRuntime) 
         .codex_fork_runtime_artifacts(&spec)
         .ok()
         .flatten()
-        .map(|artifacts| artifacts.event_stream_path)
+        .map(|artifacts| {
+            codex_fork_newest_event_stream_path(
+                &session.id,
+                &log_file,
+                &artifacts.event_stream_path,
+            )
+        })
+}
+
+pub(crate) fn codex_fork_legacy_event_stream_path_from_log_file(
+    log_file: &Path,
+) -> Option<PathBuf> {
+    let stem = log_file.file_stem()?.to_str()?.trim();
+    if stem.is_empty() {
+        return None;
+    }
+    Some(log_file.with_file_name(format!("{stem}.codex-fork.events.jsonl")))
+}
+
+pub(crate) fn codex_fork_newest_event_stream_path(
+    _session_id: &str,
+    log_file: &Path,
+    derived_path: &Path,
+) -> PathBuf {
+    let mut candidates = vec![derived_path.to_path_buf()];
+    if let Some(legacy_path) = codex_fork_legacy_event_stream_path_from_log_file(log_file) {
+        candidates.push(legacy_path);
+    }
+    candidates
+        .iter()
+        .filter_map(|path| {
+            path.metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(|modified| (modified, path))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path.to_path_buf())
+        .unwrap_or_else(|| derived_path.to_path_buf())
 }
 
 fn session_lifetime_overlaps(
@@ -10857,13 +10896,24 @@ mod tests {
                 None,
             )
             .unwrap();
-        fixture.append_rate_limit(12.0);
+        let legacy_event_stream =
+            codex_fork_legacy_event_stream_path_from_log_file(&fixture.log_file).unwrap();
+        fs::write(&legacy_event_stream, "").unwrap();
+        fixture.append_rate_limit_to(&legacy_event_stream, 12.0);
+        assert_eq!(
+            codex_fork_newest_event_stream_path(
+                "codex001",
+                &fixture.log_file,
+                &fixture.event_stream_path,
+            ),
+            legacy_event_stream
+        );
 
         let restarted = fixture
             .store()
             .with_usage_burn_store(UsageBurnStore::new(&usage_db_path).unwrap());
         assert_eq!(restarted.recover_codex_fork_event_monitors().unwrap(), 1);
-        fixture.append_rate_limit(27.0);
+        fixture.append_rate_limit_to(&legacy_event_stream, 27.0);
 
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -10890,6 +10940,7 @@ mod tests {
         state_file: PathBuf,
         event_stream_path: PathBuf,
         handoff_path: PathBuf,
+        log_file: PathBuf,
         tmux_socket: String,
         tmux_session: String,
     }
@@ -10954,6 +11005,7 @@ mod tests {
                 state_file,
                 event_stream_path,
                 handoff_path,
+                log_file,
                 tmux_socket,
                 tmux_session,
             })
@@ -10978,10 +11030,10 @@ mod tests {
             .unwrap();
         }
 
-        fn append_rate_limit(&self, percent: f64) {
+        fn append_rate_limit_to(&self, event_stream_path: &Path, percent: f64) {
             let mut file = fs::OpenOptions::new()
                 .append(true)
-                .open(&self.event_stream_path)
+                .open(event_stream_path)
                 .unwrap();
             writeln!(
                 file,
