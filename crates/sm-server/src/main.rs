@@ -79,9 +79,12 @@ async fn main() -> Result<()> {
     }
 
     let state = AppState::new(config);
-    if let Err(error) = state.reconcile_current_seat_sessions() {
-        eprintln!("usage ledger session reconciliation failed: {error:#}");
-    }
+    let reconciliation_state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = reconciliation_state.reconcile_current_seat_sessions() {
+            eprintln!("usage ledger session reconciliation failed: {error:#}");
+        }
+    });
 
     // Repair the Studio SSH LaunchAgents toward the desired state every 30s while
     // the toggle is on. launchctl is synchronous, so run it on a blocking thread.

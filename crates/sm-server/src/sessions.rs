@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex, Weak},
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
 };
@@ -29,7 +29,7 @@ use crate::queue::{
 use crate::{
     config::{CodexReviewConfig, ContextMonitorConfig},
     runtime::{TmuxRuntime, TmuxSessionSpec},
-    seat_sessions::SeatSessionStore,
+    seat_sessions::{SeatSessionIdentity, SeatSessionStore},
 };
 
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
@@ -62,7 +62,27 @@ pub struct SessionStore {
     /// an unrelated request to happen to flush it.
     delivery_runtime: Option<TmuxRuntime>,
     codex_fork_handoff_monitors: Arc<Mutex<BTreeSet<String>>>,
+    clear_operation_locks: Arc<Mutex<BTreeMap<String, Weak<SessionClearLock>>>>,
     seat_session_store: SeatSessionStore,
+}
+
+#[derive(Debug)]
+struct SessionClearLock {
+    held: Mutex<bool>,
+    available: Condvar,
+}
+
+struct SessionClearGuard {
+    lock: Arc<SessionClearLock>,
+}
+
+impl Drop for SessionClearGuard {
+    fn drop(&mut self) {
+        if let Ok(mut held) = self.lock.held.lock() {
+            *held = false;
+            self.lock.available.notify_one();
+        }
+    }
 }
 
 impl SessionStore {
@@ -82,6 +102,7 @@ impl SessionStore {
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
+            clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
         }
     }
@@ -171,18 +192,34 @@ impl SessionStore {
     }
 
     pub fn reconcile_current_seat_sessions(&self) -> Result<()> {
-        for session in self.load_snapshot()?.into_sessions() {
-            let provider_resume_id = provider_resume_id_for_restore(&session);
-            if let Some(provider_resume_id) = provider_resume_id {
-                self.append_seat_session(
-                    &session.id,
-                    &session.provider,
-                    &provider_resume_id,
-                    session.transcript_path.as_deref(),
-                );
+        let sessions = self
+            .load_snapshot()?
+            .into_sessions()
+            .into_iter()
+            .filter_map(|session| {
+                provider_resume_id_for_restore(&session).map(|provider_session_id| {
+                    SeatSessionIdentity {
+                        seat_id: session.id,
+                        provider: session.provider,
+                        provider_session_id,
+                        artifact_path: session.transcript_path,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for attempt in 0..=SEAT_SESSION_RETRY_ATTEMPTS {
+            match self.seat_session_store.append_batch(&sessions) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if usage_ledger_error_is_transient(&error)
+                        && attempt < SEAT_SESSION_RETRY_ATTEMPTS =>
+                {
+                    thread::sleep(SEAT_SESSION_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
             }
         }
-        Ok(())
+        unreachable!("bounded reconciliation loop always returns")
     }
 
     /// Drop context alerts this session raised about context it no longer has.
@@ -226,6 +263,7 @@ impl SessionStore {
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
+            clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
         }
     }
@@ -1195,6 +1233,7 @@ impl SessionStore {
         request: ClearSessionRequest,
         runtime: &TmuxRuntime,
     ) -> Result<CoreClearOutcome> {
+        let _clear_guard = self.lock_clear_operation(session_id)?;
         let prompt = request
             .prompt
             .as_deref()
@@ -1390,6 +1429,39 @@ impl SessionStore {
             status: "cleared".to_owned(),
             session_id: session_id.to_owned(),
         }))
+    }
+
+    fn lock_clear_operation(&self, session_id: &str) -> Result<SessionClearGuard> {
+        let lock = {
+            let mut locks = self
+                .clear_operation_locks
+                .lock()
+                .map_err(|_| anyhow::anyhow!("clear operation lock registry poisoned"))?;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(SessionClearLock {
+                    held: Mutex::new(false),
+                    available: Condvar::new(),
+                });
+                locks.insert(session_id.to_owned(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let mut held = lock
+            .held
+            .lock()
+            .map_err(|_| anyhow::anyhow!("clear operation lock poisoned"))?;
+        while *held {
+            held = lock
+                .available
+                .wait(held)
+                .map_err(|_| anyhow::anyhow!("clear operation lock poisoned"))?;
+        }
+        *held = true;
+        drop(held);
+        Ok(SessionClearGuard { lock })
     }
 
     pub fn restore_core_session(&self, session_id: &str) -> Result<Option<CoreRestoreOutcome>> {
@@ -8951,6 +9023,26 @@ mod tests {
         );
         writer.join().unwrap();
         let _ = fs::remove_file(event_stream_path);
+    }
+
+    #[test]
+    fn concurrent_clears_for_the_same_seat_are_serialized() {
+        let state_file = unique_temp_path("clear-operation-lock");
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+        let first_guard = store.lock_clear_operation("codex001").unwrap();
+        let second_store = store.clone();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let second = thread::spawn(move || {
+            let _guard = second_store.lock_clear_operation("codex001").unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        assert!(acquired_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        drop(first_guard);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        second.join().unwrap();
     }
 
     #[test]

@@ -77,6 +77,51 @@ impl SeatSessionStore {
         Ok(())
     }
 
+    pub fn append_batch(&self, sessions: &[SeatSessionIdentity]) -> Result<()> {
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction()
+            .context("failed to start seat session reconciliation")?;
+        let observed_at = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .context("failed to format seat session timestamp")?;
+        for session in sessions {
+            transaction
+                .execute(
+                    r#"
+                    INSERT OR IGNORE INTO seat_sessions (
+                        seat_id,
+                        provider,
+                        provider_session_id,
+                        artifact_path,
+                        first_seen,
+                        last_seen
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+                    "#,
+                    params![
+                        session.seat_id,
+                        session.provider,
+                        session.provider_session_id,
+                        session.artifact_path,
+                        observed_at
+                    ],
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to reconcile provider session {} for seat {}",
+                        session.provider_session_id, session.seat_id
+                    )
+                })?;
+        }
+        transaction
+            .commit()
+            .context("failed to commit seat session reconciliation")?;
+        Ok(())
+    }
+
     fn open(&self) -> Result<Connection> {
         if let Some(parent) = self.db_path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
@@ -113,6 +158,14 @@ impl SeatSessionStore {
             .context("failed to initialize seat session schema")?;
         Ok(connection)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeatSessionIdentity {
+    pub seat_id: String,
+    pub provider: String,
+    pub provider_session_id: String,
+    pub artifact_path: Option<String>,
 }
 
 fn required_text<'a>(value: &'a str, field: &str) -> Result<&'a str> {
