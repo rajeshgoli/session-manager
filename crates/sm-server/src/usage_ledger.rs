@@ -13,7 +13,10 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::usage_identity::{Provider, UsageIdentityStore};
+use crate::{
+    usage_burn::UsageBurnStore,
+    usage_identity::{Provider, UsageIdentityStore},
+};
 
 const USAGE_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
@@ -76,6 +79,7 @@ pub struct ScanSummary {
 pub struct UsageLedgerStore {
     db_path: PathBuf,
     identity_store: UsageIdentityStore,
+    burn_store: UsageBurnStore,
     model_defaults: UsageModelDefaults,
 }
 
@@ -91,6 +95,7 @@ impl UsageLedgerStore {
         let db_path = db_path.into();
         let store = Self {
             identity_store: UsageIdentityStore::new(&db_path)?,
+            burn_store: UsageBurnStore::new(&db_path)?,
             db_path,
             model_defaults,
         };
@@ -142,6 +147,13 @@ impl UsageLedgerStore {
                   artifact_path TEXT PRIMARY KEY,
                   byte_offset   INTEGER NOT NULL,
                   last_uuid     TEXT,
+                  mtime_ns      INTEGER NOT NULL,
+                  scanned_at    TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS burn_scan_offsets (
+                  artifact_path TEXT PRIMARY KEY,
+                  byte_offset   INTEGER NOT NULL,
                   mtime_ns      INTEGER NOT NULL,
                   scanned_at    TEXT NOT NULL
                 );
@@ -552,6 +564,9 @@ impl UsageLedgerStore {
         };
         let mtime_ns = file_mtime_ns(&metadata);
         let file_len = metadata.len();
+        if artifact.provider == "codex" {
+            self.scan_classic_codex_burn(artifact, file_len, mtime_ns)?;
+        }
         let connection = self.open()?;
         let saved = connection
             .query_row(
@@ -662,6 +677,72 @@ impl UsageLedgerStore {
         )?;
         tx.commit()?;
         Ok(summary)
+    }
+
+    fn scan_classic_codex_burn(
+        &self,
+        artifact: &Artifact,
+        file_len: u64,
+        mtime_ns: i64,
+    ) -> Result<()> {
+        let artifact_path = artifact.path.to_string_lossy();
+        let saved = self
+            .open()?
+            .query_row(
+                "SELECT byte_offset, mtime_ns FROM burn_scan_offsets WHERE artifact_path = ?1",
+                [artifact_path.as_ref()],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        let offset = saved
+            .map(|(offset, _)| offset)
+            .filter(|offset| *offset <= file_len)
+            .unwrap_or(0);
+        if offset == file_len && saved.is_some_and(|(_, saved_mtime)| saved_mtime == mtime_ns) {
+            return Ok(());
+        }
+
+        let mut reader = BufReader::new(fs::File::open(&artifact.path).with_context(|| {
+            format!(
+                "failed to open classic Codex burn artifact {}",
+                artifact.path.display()
+            )
+        })?);
+        reader.seek(SeekFrom::Start(offset))?;
+        let mut line_offset = offset;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let read = reader.read_until(b'\n', &mut line)?;
+            if read == 0 || line.last() != Some(&b'\n') {
+                break;
+            }
+            let value: Value = match serde_json::from_slice(&line) {
+                Ok(value) => value,
+                Err(_) => {
+                    line_offset = line_offset.saturating_add(read as u64);
+                    continue;
+                }
+            };
+            if let Some(event) = value.as_object() {
+                self.burn_store
+                    .record_codex_event(event, OffsetDateTime::now_utc())?;
+            }
+            line_offset = line_offset.saturating_add(read as u64);
+        }
+        let scanned_at = format_timestamp(OffsetDateTime::now_utc())?;
+        self.open()?.execute(
+            r#"
+            INSERT INTO burn_scan_offsets (artifact_path, byte_offset, mtime_ns, scanned_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(artifact_path) DO UPDATE SET
+              byte_offset = excluded.byte_offset,
+              mtime_ns = excluded.mtime_ns,
+              scanned_at = excluded.scanned_at
+            "#,
+            params![artifact_path.as_ref(), line_offset, mtime_ns, scanned_at],
+        )?;
+        Ok(())
     }
 
     fn ensure_bootstrap_for_artifact(&self, artifact: &Artifact, offset: u64) -> Result<()> {
@@ -2687,6 +2768,83 @@ mod tests {
         assert_eq!(normalized.cache_read, 90);
         assert_eq!(normalized.output, 30);
         assert_eq!(normalized.reasoning, 10);
+    }
+
+    #[test]
+    fn classic_codex_scan_backfills_rate_limits_after_token_offset_was_checkpointed() {
+        let dir = TestDir::new("classic-codex-burn");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Codex,
+            "account-one",
+            "pro",
+            "codex_300",
+            300,
+        );
+        let artifact = dir.0.join("rollout.jsonl");
+        let reset = at("2026-08-10T21:00:00Z").unix_timestamp();
+        fs::write(
+            &artifact,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "event_msg",
+                    "timestamp": "2026-08-10T16:20:00Z",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 120,
+                                "cached_input_tokens": 90,
+                                "output_tokens": 30,
+                                "reasoning_output_tokens": 10,
+                                "total_tokens": 150
+                            },
+                            "rate_limits": {
+                                "limit_id": "codex",
+                                "primary": {
+                                    "used_percent": 25,
+                                    "window_minutes": 300,
+                                    "resets_at": reset
+                                }
+                            }
+                        }
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        SeatSessionStore::new(&db_path)
+            .append("seat-one", "codex", "thread-one", artifact.to_str())
+            .unwrap();
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        let metadata = fs::metadata(&artifact).unwrap();
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO scan_offsets (artifact_path, byte_offset, mtime_ns, scanned_at) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    artifact.to_string_lossy().as_ref(),
+                    metadata.len(),
+                    file_mtime_ns(&metadata),
+                    "2026-08-10T16:21:00.000000000Z"
+                ],
+            )
+            .unwrap();
+
+        store.scan(&[]).unwrap();
+
+        let (percent, source): (f64, String) = Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT percent, source FROM burn_samples WHERE source = 'codex_event' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(percent, 25.0);
+        assert_eq!(source, "codex_event");
     }
 
     #[test]

@@ -196,12 +196,13 @@ impl UsageReportStore {
                 .union(&target.child_seats)
                 .collect::<BTreeSet<_>>();
             accounts.retain(|account| {
-                account.windows.iter().any(|window| {
-                    window
-                        .seats
-                        .iter()
-                        .any(|seat| target_ids.contains(&seat.seat_id))
-                })
+                target.account_key.as_deref() == Some(account.account_key.as_str())
+                    || account.windows.iter().any(|window| {
+                        window
+                            .seats
+                            .iter()
+                            .any(|seat| target_ids.contains(&seat.seat_id))
+                    })
             });
         }
         for account in &mut accounts {
@@ -550,6 +551,17 @@ fn build_window_report(
             .or_default();
         model.0 += burn;
         model.1 += units;
+    }
+    let unassigned_points = (premium_units == 0.0)
+        .then_some(premium_points)
+        .unwrap_or(0.0)
+        + (rest_units == 0.0).then_some(rest_points).unwrap_or(0.0);
+    if unassigned_points > 0.0 {
+        *burn_by_seat.entry("unassigned".to_owned()).or_default() += unassigned_points;
+        burn_by_model
+            .entry(("unassigned".to_owned(), "unassigned".to_owned()))
+            .or_default()
+            .0 += unassigned_points;
     }
 
     let mut seat_ids = burn_by_seat.keys().cloned().collect::<BTreeSet<_>>();
@@ -912,6 +924,67 @@ mod tests {
             .unwrap();
         assert_eq!(paid.burn_percent, Some(0.0));
         assert_eq!(paid.credit_tokens, 1_000);
+    }
+
+    #[test]
+    fn empty_attribution_bucket_is_assigned_to_unassigned() {
+        let window = BurnWindow {
+            id: 1,
+            account_key: "claude:a".to_owned(),
+            window_kind: "weekly_all".to_owned(),
+            window_scope: None,
+            window_start: "2026-08-10T00:00:00Z".to_owned(),
+            percent: 40.0,
+            resets_at: "2026-08-17T00:00:00Z".to_owned(),
+            observed_at: "2026-08-10T16:00:00Z".to_owned(),
+        };
+        let rows = vec![WindowRow {
+            seat_id: "seat-a".to_owned(),
+            model: "claude-sonnet-5".to_owned(),
+            credit_metered: false,
+            tokens: TokenCounts {
+                input: 10,
+                ..TokenCounts::default()
+            },
+        }];
+        let premium = PremiumContext {
+            scope: "Fable".to_owned(),
+            points: 10.0,
+        };
+        let mut warnings = BTreeSet::new();
+        let report = build_window_report(
+            &window,
+            "claude",
+            &rows,
+            Some(&premium),
+            None,
+            &BTreeMap::new(),
+            true,
+            DEFAULT_PREMIUM_CAP_RATIO,
+            OffsetDateTime::parse("2026-08-10T16:00:00Z", &Rfc3339).unwrap(),
+            &mut warnings,
+        );
+
+        let unassigned = report
+            .seats
+            .iter()
+            .find(|seat| seat.seat_id == "unassigned")
+            .unwrap();
+        assert_eq!(unassigned.burn_percent, Some(10.0));
+        assert_eq!(unassigned.share, Some(0.25));
+        assert_eq!(report.total_percent, Some(40.0));
+        assert_eq!(
+            report
+                .seats
+                .iter()
+                .filter_map(|seat| seat.burn_percent)
+                .sum::<f64>(),
+            40.0
+        );
+        assert!(report
+            .models
+            .iter()
+            .any(|model| { model.seat_id == "unassigned" && model.burn_percent == Some(10.0) }));
     }
 
     #[test]

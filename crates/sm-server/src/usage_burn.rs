@@ -181,22 +181,24 @@ impl UsageBurnStore {
             .as_deref()
             .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
             .unwrap_or(received_at);
-        let Some(attribution) = self
+        let attribution = match self
             .identity_store
             .account_at(Provider::Codex, observed_at)?
-        else {
-            return Ok(0);
+        {
+            Some(attribution) => attribution,
+            None => {
+                self.identity_store
+                    .ensure_bootstrap_interval(Provider::Codex, observed_at)?;
+                let Some(attribution) = self
+                    .identity_store
+                    .account_at(Provider::Codex, observed_at)?
+                else {
+                    return Ok(0);
+                };
+                attribution
+            }
         };
-        let rate_limits = event
-            .get("payload")
-            .and_then(Value::as_object)
-            .and_then(|payload| {
-                payload
-                    .get("rateLimits")
-                    .or_else(|| payload.get("rate_limits"))
-            })
-            .and_then(Value::as_object)
-            .or_else(|| event.get("rate_limits").and_then(Value::as_object));
+        let rate_limits = codex_rate_limits(event);
         let Some(rate_limits) = rate_limits else {
             return Ok(0);
         };
@@ -481,13 +483,41 @@ fn validate_window(window: &BurnWindowSample) -> Result<()> {
 }
 
 fn is_codex_rate_limit_event(event: &Map<String, Value>) -> bool {
+    if codex_rate_limits(event).is_none() {
+        return false;
+    }
     let event_type = json_string(event, "event_type")
         .or_else(|| json_string(event, "type"))
         .unwrap_or_default();
     matches!(
         event_type.as_str(),
         "account/rateLimits/updated" | "account_rate_limits_updated"
-    )
+    ) || (event_type == "event_msg"
+        && event
+            .get("payload")
+            .and_then(Value::as_object)
+            .and_then(|payload| json_string(payload, "type"))
+            .as_deref()
+            == Some("token_count"))
+}
+
+fn codex_rate_limits(event: &Map<String, Value>) -> Option<&Map<String, Value>> {
+    let payload = event.get("payload").and_then(Value::as_object);
+    payload
+        .and_then(|payload| {
+            payload
+                .get("rateLimits")
+                .or_else(|| payload.get("rate_limits"))
+        })
+        .and_then(Value::as_object)
+        .or_else(|| {
+            payload
+                .and_then(|payload| payload.get("info"))
+                .and_then(Value::as_object)
+                .and_then(|info| info.get("rate_limits"))
+                .and_then(Value::as_object)
+        })
+        .or_else(|| event.get("rate_limits").and_then(Value::as_object))
 }
 
 fn codex_reset_at(

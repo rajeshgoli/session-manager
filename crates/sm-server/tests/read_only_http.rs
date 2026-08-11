@@ -7739,6 +7739,18 @@ async fn usage_routes_preserve_exact_account_burn_and_optionally_include_childre
                     "status": "running",
                     "created_at": "2026-08-10T00:00:00Z",
                     "last_activity": "2026-08-10T00:00:00Z"
+                },
+                {
+                    "id": "idle0001",
+                    "name": "claude-idle0001",
+                    "friendly_name": "idle",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-idle0001",
+                    "provider": "claude",
+                    "account_key": "claude:usage-account",
+                    "status": "running",
+                    "created_at": "2026-08-10T00:00:00Z",
+                    "last_activity": "2026-08-10T00:00:00Z"
                 }
             ]
         })
@@ -7869,6 +7881,11 @@ async fn usage_routes_preserve_exact_account_burn_and_optionally_include_childre
         accounts["accounts"][0]["windows"][0]["account_percent"], 40.0,
         "account view must pass through the exact first-party burn sample"
     );
+    let (status, idle) = get_json(app.clone(), "/sessions/idle0001/usage?since_reset=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(idle["accounts"][0]["account_key"], account.account_key());
+    assert_eq!(idle["accounts"][0]["windows"][0]["self_percent"], 0.0);
+    assert_eq!(idle["accounts"][0]["windows"][0]["account_percent"], 40.0);
 
     let previous_account_key = "claude:previous-account";
     UsageIdentityStore::new(&usage_db_path)
