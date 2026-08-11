@@ -74,13 +74,13 @@ pub struct UsageWindowReport {
     pub weight_source: &'static str,
     pub residual: Option<f64>,
     pub possibly_inflated: bool,
-    pub self_percent: f64,
-    pub children_percent: f64,
-    pub total_percent: f64,
+    pub self_percent: Option<f64>,
+    pub children_percent: Option<f64>,
+    pub total_percent: Option<f64>,
     pub cap_consumed_percent: Option<f64>,
-    pub free_headroom_points: f64,
-    pub binding_for_scoped_seats: bool,
-    pub binding_for_other_seats: bool,
+    pub free_headroom_points: Option<f64>,
+    pub binding_for_scoped_seats: Option<bool>,
+    pub binding_for_other_seats: Option<bool>,
     pub credit_tokens: i64,
     pub seats: Vec<UsageSeatShare>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -91,8 +91,8 @@ pub struct UsageWindowReport {
 pub struct UsageSeatShare {
     pub seat_id: String,
     pub friendly_name: Option<String>,
-    pub burn_percent: f64,
-    pub share: f64,
+    pub burn_percent: Option<f64>,
+    pub share: Option<f64>,
     pub weighted_units: f64,
     pub credit_tokens: i64,
 }
@@ -101,7 +101,7 @@ pub struct UsageSeatShare {
 pub struct UsageModelShare {
     pub seat_id: String,
     pub model: String,
-    pub burn_percent: f64,
+    pub burn_percent: Option<f64>,
     pub weighted_units: f64,
     pub weight_source: &'static str,
 }
@@ -469,6 +469,11 @@ fn build_window_report(
     now: OffsetDateTime,
     warnings: &mut BTreeSet<String>,
 ) -> UsageWindowReport {
+    let sample_age_seconds = parse_timestamp(&window.observed_at)
+        .map(|observed_at| (now - observed_at).whole_seconds().max(0));
+    let stale = sample_age_seconds
+        .map(|age| age > STALE_AFTER_SECONDS)
+        .unwrap_or(true);
     let mut weighted = Vec::new();
     let mut credit_by_seat = BTreeMap::<String, i64>::new();
     for row in rows {
@@ -544,12 +549,12 @@ fn build_window_report(
                 friendly_name: names.get(&seat_id).cloned().flatten(),
                 weighted_units: units_by_seat.get(&seat_id).copied().unwrap_or(0.0),
                 credit_tokens: credit_by_seat.get(&seat_id).copied().unwrap_or(0),
-                share: if window.percent > 0.0 {
+                share: (!stale).then_some(if window.percent > 0.0 {
                     burn_percent / window.percent
                 } else {
                     0.0
-                },
-                burn_percent,
+                }),
+                burn_percent: (!stale).then_some(burn_percent),
                 seat_id,
             }
         })
@@ -557,7 +562,8 @@ fn build_window_report(
     seats.sort_by(|left, right| {
         right
             .burn_percent
-            .total_cmp(&left.burn_percent)
+            .unwrap_or(0.0)
+            .total_cmp(&left.burn_percent.unwrap_or(0.0))
             .then_with(|| left.seat_id.cmp(&right.seat_id))
     });
 
@@ -571,7 +577,7 @@ fn build_window_report(
                 |((seat_id, model), (burn_percent, weighted_units))| UsageModelShare {
                     seat_id,
                     model,
-                    burn_percent,
+                    burn_percent: (!stale).then_some(burn_percent),
                     weighted_units,
                     weight_source: "prior",
                 },
@@ -591,21 +597,20 @@ fn build_window_report(
     } else {
         burn_by_seat.values().sum()
     };
-    let cap_consumed_percent = target
-        .filter(|target| target.account_key.as_deref() == Some(window.account_key.as_str()))
-        .and_then(|target| target.usage_cap_fraction)
-        .filter(|fraction| *fraction > 0.0)
-        .filter(|_| {
-            window.window_kind == "weekly_all"
-                || window.window_kind == "codex_10080"
-                || window.window_kind.contains("10080")
-        })
-        .map(|fraction| total_percent / fraction);
-    let sample_age_seconds = parse_timestamp(&window.observed_at)
-        .map(|observed_at| (now - observed_at).whole_seconds().max(0));
-    let stale = sample_age_seconds
-        .map(|age| age > STALE_AFTER_SECONDS)
-        .unwrap_or(true);
+    let cap_consumed_percent = if stale {
+        None
+    } else {
+        target
+            .filter(|target| target.account_key.as_deref() == Some(window.account_key.as_str()))
+            .and_then(|target| target.usage_cap_fraction)
+            .filter(|fraction| *fraction > 0.0)
+            .filter(|_| {
+                window.window_kind == "weekly_all"
+                    || window.window_kind == "codex_10080"
+                    || window.window_kind.contains("10080")
+            })
+            .map(|fraction| total_percent / fraction)
+    };
 
     UsageWindowReport {
         window_kind: window.window_kind.clone(),
@@ -620,17 +625,17 @@ fn build_window_report(
         weight_source: "prior",
         residual: None,
         possibly_inflated: true,
-        self_percent,
-        children_percent,
-        total_percent,
+        self_percent: (!stale).then_some(self_percent),
+        children_percent: (!stale).then_some(children_percent),
+        total_percent: (!stale).then_some(total_percent),
         cap_consumed_percent,
-        free_headroom_points: if is_scoped {
+        free_headroom_points: (!stale).then_some(if is_scoped {
             PREMIUM_CAP_RATIO * (100.0 - window.percent).max(0.0)
         } else {
             (100.0 - window.percent).max(0.0)
-        },
-        binding_for_scoped_seats: false,
-        binding_for_other_seats: false,
+        }),
+        binding_for_scoped_seats: (!stale).then_some(false),
+        binding_for_other_seats: (!stale).then_some(false),
         credit_tokens: credit_by_seat.values().sum(),
         seats,
         models,
@@ -641,32 +646,35 @@ fn mark_binding_limits(windows: &mut [UsageWindowReport]) {
     let overall = windows
         .iter()
         .enumerate()
-        .filter(|(_, window)| window.window_kind == "weekly_all")
+        .filter(|(_, window)| !window.stale && window.window_kind == "weekly_all")
         .map(|(index, window)| (index, window.window_start.clone()))
         .collect::<Vec<_>>();
     for (overall_index, window_start) in overall {
-        windows[overall_index].binding_for_other_seats = true;
+        windows[overall_index].binding_for_other_seats = Some(true);
         let scoped_index = windows.iter().position(|window| {
-            window.window_kind == "weekly_scoped" && window.window_start == window_start
+            !window.stale
+                && window.window_kind == "weekly_scoped"
+                && window.window_start == window_start
         });
         match scoped_index {
             Some(scoped_index)
                 if windows[scoped_index].free_headroom_points
                     <= windows[overall_index].free_headroom_points =>
             {
-                windows[scoped_index].binding_for_scoped_seats = true;
+                windows[scoped_index].binding_for_scoped_seats = Some(true);
             }
-            _ => windows[overall_index].binding_for_scoped_seats = true,
+            _ => windows[overall_index].binding_for_scoped_seats = Some(true),
         }
     }
     for index in 0..windows.len() {
-        if windows[index].window_kind == "weekly_scoped" {
+        if !windows[index].stale && windows[index].window_kind == "weekly_scoped" {
             let has_overall = windows.iter().any(|window| {
-                window.window_kind == "weekly_all"
+                !window.stale
+                    && window.window_kind == "weekly_all"
                     && window.window_start == windows[index].window_start
             });
             if !has_overall {
-                windows[index].binding_for_scoped_seats = true;
+                windows[index].binding_for_scoped_seats = Some(true);
             }
         }
     }
@@ -694,7 +702,7 @@ fn weighted_units(provider: &str, model: &str, tokens: &TokenCounts) -> (f64, bo
         } else {
             None
         }
-    } else if model.contains("gpt-5.6-sol") || model == "gpt-5.5" {
+    } else if model == "gpt-5.6-sol" || model == "gpt-5.5" {
         Some((5.0, 30.0, 5.0, 5.0, 0.5))
     } else if model.contains("gpt-5.6-terra") {
         Some((2.0, 12.0, 2.0, 2.0, 0.25))
@@ -748,6 +756,9 @@ mod tests {
         let (unknown, present) = weighted_units("claude", "future-model", &tokens);
         assert!(!present);
         assert_eq!(unknown, 24.0);
+        let (sol_wm, present) = weighted_units("codex", "gpt-5.6-sol-wm", &tokens);
+        assert!(!present);
+        assert_eq!(sol_wm, 24.0);
     }
 
     #[test]
@@ -795,7 +806,7 @@ mod tests {
             None,
             &BTreeMap::new(),
             true,
-            OffsetDateTime::UNIX_EPOCH,
+            OffsetDateTime::parse("2026-08-10T16:00:00Z", &Rfc3339).unwrap(),
             &mut warnings,
         );
         assert_eq!(report.seats.len(), 2);
@@ -803,13 +814,22 @@ mod tests {
             (report
                 .seats
                 .iter()
-                .map(|seat| seat.burn_percent)
+                .filter_map(|seat| seat.burn_percent)
                 .sum::<f64>()
                 - 20.0)
                 .abs()
                 < 1e-9
         );
-        assert!((report.seats.iter().map(|seat| seat.share).sum::<f64>() - 1.0).abs() < 1e-9);
+        assert!(
+            (report
+                .seats
+                .iter()
+                .filter_map(|seat| seat.share)
+                .sum::<f64>()
+                - 1.0)
+                .abs()
+                < 1e-9
+        );
         assert!(report.residual.is_none());
         assert!(report.possibly_inflated);
     }
@@ -855,20 +875,20 @@ mod tests {
             None,
             &BTreeMap::new(),
             false,
-            OffsetDateTime::UNIX_EPOCH,
+            OffsetDateTime::parse("2026-08-10T16:00:00Z", &Rfc3339).unwrap(),
             &mut warnings,
         );
 
         assert_eq!(report.credit_tokens, 1_000);
         assert_eq!(report.seats.len(), 2);
         assert_eq!(report.seats[0].seat_id, "quota-seat");
-        assert_eq!(report.seats[0].burn_percent, 25.0);
+        assert_eq!(report.seats[0].burn_percent, Some(25.0));
         let paid = report
             .seats
             .iter()
             .find(|seat| seat.seat_id == "paid-seat")
             .unwrap();
-        assert_eq!(paid.burn_percent, 0.0);
+        assert_eq!(paid.burn_percent, Some(0.0));
         assert_eq!(paid.credit_tokens, 1_000);
     }
 
@@ -887,13 +907,13 @@ mod tests {
             weight_source: "prior",
             residual: None,
             possibly_inflated: true,
-            self_percent: 0.0,
-            children_percent: 0.0,
-            total_percent: 0.0,
+            self_percent: Some(0.0),
+            children_percent: Some(0.0),
+            total_percent: Some(0.0),
             cap_consumed_percent: None,
-            free_headroom_points: headroom,
-            binding_for_scoped_seats: false,
-            binding_for_other_seats: false,
+            free_headroom_points: Some(headroom),
+            binding_for_scoped_seats: Some(false),
+            binding_for_other_seats: Some(false),
             credit_tokens: 0,
             seats: Vec::new(),
             models: Vec::new(),
@@ -905,10 +925,10 @@ mod tests {
 
         mark_binding_limits(&mut windows);
 
-        assert!(windows[0].binding_for_other_seats);
-        assert!(!windows[0].binding_for_scoped_seats);
-        assert!(windows[1].binding_for_scoped_seats);
-        assert!(!windows[1].binding_for_other_seats);
+        assert_eq!(windows[0].binding_for_other_seats, Some(true));
+        assert_eq!(windows[0].binding_for_scoped_seats, Some(false));
+        assert_eq!(windows[1].binding_for_scoped_seats, Some(true));
+        assert_eq!(windows[1].binding_for_other_seats, Some(false));
     }
 
     #[test]
@@ -925,14 +945,31 @@ mod tests {
         };
         let now = OffsetDateTime::parse("2026-08-10T16:11:00Z", &Rfc3339).unwrap();
         let mut warnings = BTreeSet::new();
+        let rows = vec![WindowRow {
+            seat_id: "seat-a".to_owned(),
+            model: "claude-sonnet-5".to_owned(),
+            credit_metered: false,
+            tokens: TokenCounts {
+                input: 10,
+                ..TokenCounts::default()
+            },
+        }];
+        let target = UsageReportTarget {
+            seat_id: "seat-a".to_owned(),
+            friendly_name: None,
+            account_key: Some("claude:a".to_owned()),
+            usage_cap_fraction: Some(0.5),
+            self_seats: BTreeSet::from(["seat-a".to_owned()]),
+            child_seats: BTreeSet::new(),
+        };
         let report = build_window_report(
             &window,
             "claude",
-            &[],
+            &rows,
             None,
-            None,
+            Some(&target),
             &BTreeMap::new(),
-            false,
+            true,
             now,
             &mut warnings,
         );
@@ -941,6 +978,16 @@ mod tests {
         assert_eq!(report.account_percent, None);
         assert_eq!(report.last_known_percent, 34.0);
         assert_eq!(report.sample_age_seconds, Some(660));
+        assert_eq!(report.self_percent, None);
+        assert_eq!(report.children_percent, None);
+        assert_eq!(report.total_percent, None);
+        assert_eq!(report.cap_consumed_percent, None);
+        assert_eq!(report.free_headroom_points, None);
+        assert_eq!(report.binding_for_scoped_seats, None);
+        assert_eq!(report.binding_for_other_seats, None);
+        assert_eq!(report.seats[0].burn_percent, None);
+        assert_eq!(report.seats[0].share, None);
+        assert_eq!(report.models[0].burn_percent, None);
     }
 
     #[test]
@@ -984,7 +1031,7 @@ mod tests {
             Some(&target),
             &BTreeMap::new(),
             true,
-            OffsetDateTime::UNIX_EPOCH,
+            OffsetDateTime::parse("2026-08-10T16:00:00Z", &Rfc3339).unwrap(),
             &mut warnings,
         );
 

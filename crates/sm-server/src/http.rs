@@ -2915,7 +2915,7 @@ fn current_weekly_usage_percent(report: &crate::usage_report::UsageReport) -> Op
                     || window.window_kind == "codex_10080"
                     || window.window_kind.contains("10080"))
         })
-        .map(|window| window.total_percent)
+        .filter_map(|window| window.total_percent)
         .max_by(f64::total_cmp)
 }
 

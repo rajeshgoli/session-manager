@@ -2643,9 +2643,15 @@ fn print_usage_report(payload: &Value) {
                 },
                 |percent| format!("{percent:.1}%"),
             );
-            let self_percent = window["self_percent"].as_f64().unwrap_or(0.0);
-            let child_percent = window["children_percent"].as_f64().unwrap_or(0.0);
-            let headroom = window["free_headroom_points"].as_f64().unwrap_or(0.0);
+            let self_percent = window["self_percent"]
+                .as_f64()
+                .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1}%"));
+            let child_percent = window["children_percent"]
+                .as_f64()
+                .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1}%"));
+            let headroom = window["free_headroom_points"]
+                .as_f64()
+                .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1} pts"));
             let stale = if window["stale"].as_bool().unwrap_or(true) {
                 " · stale"
             } else {
@@ -2664,12 +2670,10 @@ fn print_usage_report(payload: &Value) {
                 .is_some_and(|target| !target.is_null())
             {
                 println!(
-                    "  {kind:<22} self {self_percent:>6.1}% · children {child_percent:>6.1}% · account {account_usage} · free {headroom:.1} pts{binding}{stale}"
+                    "  {kind:<22} self {self_percent:>7} · children {child_percent:>7} · account {account_usage} · free {headroom}{binding}{stale}"
                 );
             } else {
-                println!(
-                    "  {kind:<22} account {account_usage} · free {headroom:.1} pts{binding}{stale}"
-                );
+                println!("  {kind:<22} account {account_usage} · free {headroom}{binding}{stale}");
                 let seats = window["seats"].as_array().cloned().unwrap_or_default();
                 if !seats.is_empty() {
                     let values = seats
@@ -2677,8 +2681,11 @@ fn print_usage_report(payload: &Value) {
                         .map(|seat| {
                             let id = seat["seat_id"].as_str().unwrap_or("unknown");
                             let name = seat["friendly_name"].as_str().unwrap_or(id);
-                            let burn = seat["burn_percent"].as_f64().unwrap_or(0.0);
-                            format!("{name} {burn:.1}%")
+                            let burn = seat["burn_percent"].as_f64().map_or_else(
+                                || "unknown".to_owned(),
+                                |value| format!("{value:.1}%"),
+                            );
+                            format!("{name} {burn}")
                         })
                         .collect::<Vec<_>>();
                     println!("    seats: {}", values.join(" · "));
@@ -2699,11 +2706,13 @@ fn print_usage_report(payload: &Value) {
                 );
             }
             for model in window["models"].as_array().into_iter().flatten() {
+                let burn = model["burn_percent"]
+                    .as_f64()
+                    .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1}%"));
                 println!(
-                    "    {} · {} · {:.1}% · prior",
+                    "    {} · {} · {burn} · prior",
                     model["seat_id"].as_str().unwrap_or("unknown"),
                     model["model"].as_str().unwrap_or("unknown"),
-                    model["burn_percent"].as_f64().unwrap_or(0.0)
                 );
             }
         }

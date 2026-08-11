@@ -114,12 +114,13 @@ async fn main() -> Result<()> {
             expand_home("~/.claude.json"),
             expand_home("~/.codex/auth.json"),
         )?);
+        let identity_poller = poller.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(poll_interval));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                let poller = poller.clone();
+                let poller = identity_poller.clone();
                 match tokio::task::spawn_blocking(move || {
                     poller.poll_once(time::OffsetDateTime::now_utc())
                 })
@@ -138,15 +139,32 @@ async fn main() -> Result<()> {
             }
         });
         let usage_state = state.clone();
+        let scan_poller = poller;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(scan_interval));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
                 let scan_state = usage_state.clone();
-                match tokio::task::spawn_blocking(move || scan_state.scan_usage_ledger()).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => eprintln!("usage token ledger scan failed: {error:#}"),
+                let poller = scan_poller.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let identity_errors = poller.poll_once(time::OffsetDateTime::now_utc());
+                    let scan = scan_state.scan_usage_ledger();
+                    (identity_errors, scan)
+                })
+                .await
+                {
+                    Ok((identity_errors, scan)) => {
+                        for (provider, error) in identity_errors {
+                            eprintln!(
+                                "{} account identity pre-scan poll failed: {error:#}",
+                                provider.as_str()
+                            );
+                        }
+                        if let Err(error) = scan {
+                            eprintln!("usage token ledger scan failed: {error:#}");
+                        }
+                    }
                     Err(error) => eprintln!("usage token ledger task failed: {error}"),
                 }
             }
