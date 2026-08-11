@@ -843,8 +843,20 @@ pub struct UsageConfig {
     pub enabled: bool,
     #[serde(default = "default_usage_poll_interval_secs")]
     pub poll_interval_secs: u64,
+    #[serde(default = "default_usage_scan_interval_secs")]
+    pub scan_interval_secs: u64,
+    #[serde(default = "default_usage_premium_cap_ratio")]
+    pub premium_cap_ratio: f64,
     #[serde(default = "default_usage_db_path")]
     pub db_path: String,
+    #[serde(default)]
+    pub accounts: Vec<UsageAccountConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct UsageAccountConfig {
+    pub key: String,
+    pub label: String,
 }
 
 impl Default for UsageConfig {
@@ -852,13 +864,24 @@ impl Default for UsageConfig {
         Self {
             enabled: false,
             poll_interval_secs: default_usage_poll_interval_secs(),
+            scan_interval_secs: default_usage_scan_interval_secs(),
+            premium_cap_ratio: default_usage_premium_cap_ratio(),
             db_path: default_usage_db_path(),
+            accounts: Vec::new(),
         }
     }
 }
 
 fn default_usage_poll_interval_secs() -> u64 {
     30
+}
+
+fn default_usage_scan_interval_secs() -> u64 {
+    60
+}
+
+fn default_usage_premium_cap_ratio() -> f64 {
+    0.5
 }
 
 fn default_usage_db_path() -> String {
@@ -1907,7 +1930,12 @@ tool_logging:
 usage:
   enabled: true
   poll_interval_secs: 45
+  scan_interval_secs: 75
+  premium_cap_ratio: 0.4
   db_path: /tmp/custom-usage.db
+  accounts:
+    - key: claude:account-one
+      label: primary
 "#,
         )
         .unwrap();
@@ -1915,7 +1943,16 @@ usage:
 
         assert!(config.usage.enabled);
         assert_eq!(config.usage.poll_interval_secs, 45);
+        assert_eq!(config.usage.scan_interval_secs, 75);
+        assert_eq!(config.usage.premium_cap_ratio, 0.4);
         assert_eq!(config.usage.db_path, "/tmp/custom-usage.db");
+        assert_eq!(
+            config.usage.accounts,
+            vec![UsageAccountConfig {
+                key: "claude:account-one".to_owned(),
+                label: "primary".to_owned(),
+            }]
+        );
     }
 
     #[test]
@@ -1924,6 +1961,9 @@ usage:
 
         assert!(!config.usage.enabled);
         assert_eq!(config.usage.poll_interval_secs, 30);
+        assert_eq!(config.usage.scan_interval_secs, 60);
+        assert_eq!(config.usage.premium_cap_ratio, 0.5);
+        assert!(config.usage.accounts.is_empty());
         assert_eq!(
             config.usage.db_path,
             "~/.local/share/claude-sessions/usage.db"

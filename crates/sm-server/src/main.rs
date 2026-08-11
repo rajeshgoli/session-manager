@@ -53,6 +53,13 @@ async fn main() -> Result<()> {
     if config.usage.enabled && config.usage.db_path.trim().is_empty() {
         anyhow::bail!("usage.db_path must not be empty when usage is enabled");
     }
+    if config.usage.enabled
+        && (!config.usage.premium_cap_ratio.is_finite()
+            || config.usage.premium_cap_ratio <= 0.0
+            || config.usage.premium_cap_ratio > 1.0)
+    {
+        anyhow::bail!("usage.premium_cap_ratio must be greater than 0 and at most 1");
+    }
     // After the address is parsed so a bad --host/--port is caught too, but
     // before binding, so this can run while the old server still holds the port.
     if args.check_config {
@@ -107,19 +114,20 @@ async fn main() -> Result<()> {
     });
 
     if state.config().usage.enabled {
-        let poll_interval = state.config().usage.poll_interval_secs;
-        let usage_state = state.clone();
+        let poll_interval = state.config().usage.poll_interval_secs.max(1);
+        let scan_interval = state.config().usage.scan_interval_secs.max(1);
         let poller = Arc::new(IdentityPoller::new(
             expand_home(&state.config().usage.db_path),
             expand_home("~/.claude.json"),
             expand_home("~/.codex/auth.json"),
         )?);
+        let identity_poller = poller.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(poll_interval));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
-                let poller = poller.clone();
+                let poller = identity_poller.clone();
                 match tokio::task::spawn_blocking(move || {
                     poller.poll_once(time::OffsetDateTime::now_utc())
                 })
@@ -132,18 +140,39 @@ async fn main() -> Result<()> {
                                 provider.as_str()
                             );
                         }
-                        let scan_state = usage_state.clone();
-                        match tokio::task::spawn_blocking(move || scan_state.scan_usage_ledger())
-                            .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(error)) => {
-                                eprintln!("usage token ledger scan failed: {error:#}")
-                            }
-                            Err(error) => eprintln!("usage token ledger task failed: {error}"),
-                        }
                     }
                     Err(error) => eprintln!("account identity poll task failed: {error}"),
+                }
+            }
+        });
+        let usage_state = state.clone();
+        let scan_poller = poller;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(scan_interval));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let scan_state = usage_state.clone();
+                let poller = scan_poller.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let identity_errors = poller.poll_once(time::OffsetDateTime::now_utc());
+                    let scan = scan_state.scan_usage_ledger();
+                    (identity_errors, scan)
+                })
+                .await
+                {
+                    Ok((identity_errors, scan)) => {
+                        for (provider, error) in identity_errors {
+                            eprintln!(
+                                "{} account identity pre-scan poll failed: {error:#}",
+                                provider.as_str()
+                            );
+                        }
+                        if let Err(error) = scan {
+                            eprintln!("usage token ledger scan failed: {error:#}");
+                        }
+                    }
+                    Err(error) => eprintln!("usage token ledger task failed: {error}"),
                 }
             }
         });

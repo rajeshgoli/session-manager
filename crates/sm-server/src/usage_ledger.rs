@@ -269,6 +269,7 @@ impl UsageLedgerStore {
             .iter()
             .map(|seat| (seat.seat_id.clone(), seat.clone()))
             .collect::<BTreeMap<_, _>>();
+        self.rebind_provisional_messages(&bindings, &seat_meta)?;
         let artifacts = expand_artifacts(&bindings);
         let mut summary = ScanSummary::default();
         let mut errors = Vec::new();
@@ -365,6 +366,55 @@ impl UsageLedgerStore {
                 seats.push(persisted);
             }
         }
+        Ok(())
+    }
+
+    fn rebind_provisional_messages(
+        &self,
+        bindings: &[ArtifactBinding],
+        seat_meta: &BTreeMap<String, UsageSeatMetadata>,
+    ) -> Result<()> {
+        let mut connection = self.open()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for binding in bindings
+            .iter()
+            .filter(|binding| binding.seat_id != "unassigned")
+        {
+            let Some(metadata) = seat_meta.get(&binding.seat_id) else {
+                continue;
+            };
+            let account_prefix = match binding.provider.as_str() {
+                "claude" => "claude:%",
+                "codex" | "codex-fork" => "codex:%",
+                _ => continue,
+            };
+            let msg_ids = tx
+                .prepare(
+                    r#"
+                    SELECT msg_id
+                    FROM message_ledger
+                    WHERE seat_id = 'unassigned'
+                      AND source_ref = ?1
+                      AND account_key LIKE ?2
+                    ORDER BY msg_id
+                    "#,
+                )?
+                .query_map(
+                    params![binding.provider_session_id, account_prefix],
+                    |row| row.get::<_, i64>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for msg_id in msg_ids {
+                let incumbent = load_contribution(&tx, msg_id)?;
+                reverse_contribution(&tx, msg_id, &incumbent)?;
+                let mut rebound = incumbent;
+                rebound.seat_id = binding.seat_id.clone();
+                rebound.project_key = metadata.project_key.clone();
+                overwrite_contribution(&tx, msg_id, &rebound)?;
+                materialize_contribution(&tx, msg_id, &rebound)?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -519,6 +569,9 @@ impl UsageLedgerStore {
         }
 
         self.ensure_bootstrap_for_artifact(artifact, offset)?;
+        let artifact_project_key = matches!(artifact.provider.as_str(), "codex" | "codex-fork")
+            .then(|| codex_artifact_project_key(&artifact.path))
+            .flatten();
 
         let mut connection = self.open()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -569,7 +622,14 @@ impl UsageLedgerStore {
                         .map(String::as_str),
                 )?
                 .map(|event| {
-                    self.process_codex_event(&tx, artifact, event, seat_by_source, seat_meta)
+                    self.process_codex_event(
+                        &tx,
+                        artifact,
+                        event,
+                        seat_by_source,
+                        seat_meta,
+                        artifact_project_key.as_deref(),
+                    )
                 })
                 .transpose()?
                 .flatten(),
@@ -686,6 +746,7 @@ impl UsageLedgerStore {
         event: CodexEvent,
         seat_by_source: &BTreeMap<(String, String), String>,
         seat_meta: &BTreeMap<String, UsageSeatMetadata>,
+        artifact_project_key: Option<&str>,
     ) -> Result<Option<IngestOutcome>> {
         match event {
             CodexEvent::Settings {
@@ -753,6 +814,7 @@ impl UsageLedgerStore {
                 };
                 let project_key = seat
                     .map(|seat| seat.project_key.clone())
+                    .or_else(|| artifact_project_key.map(ToOwned::to_owned))
                     .unwrap_or_else(|| "unassigned".to_owned());
                 let credit_metered = credit_metered(tx, &account_key, &model, timestamp)?;
                 let contribution = Contribution {
@@ -850,6 +912,53 @@ fn expand_artifacts(bindings: &[ArtifactBinding]) -> Vec<Artifact> {
             provider_session_ids,
         })
         .collect()
+}
+
+fn codex_artifact_project_key(path: &Path) -> Option<String> {
+    let reader = BufReader::new(fs::File::open(path).ok()?);
+    for line in reader.lines().take(100).flatten() {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let payload = value.get("payload").and_then(Value::as_object);
+        let settings = payload
+            .and_then(|payload| payload.get("threadSettings"))
+            .and_then(Value::as_object);
+        let cwd = value
+            .get("cwd")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                payload
+                    .and_then(|payload| payload.get("cwd"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                payload
+                    .and_then(|payload| payload.get("workingDirectory"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                payload
+                    .and_then(|payload| payload.get("working_dir"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                settings
+                    .and_then(|settings| settings.get("cwd"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                settings
+                    .and_then(|settings| settings.get("workingDirectory"))
+                    .and_then(Value::as_str)
+            })
+            .map(str::trim)
+            .filter(|cwd| !cwd.is_empty());
+        if let Some(cwd) = cwd {
+            return Some(UsageSeatMetadata::resolve_project_key(cwd));
+        }
+    }
+    None
 }
 
 fn claude_sibling_artifacts(path: &Path, session_id: &str) -> Vec<PathBuf> {
@@ -3195,6 +3304,128 @@ mod tests {
                 "persisted-launch-model".to_owned(),
                 "/retired/repo/.git".to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn definitive_binding_reattributes_checkpointed_provisional_messages() {
+        let dir = TestDir::new("rebind-provisional");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Codex,
+            "codex-account",
+            "pro",
+            "codex_300",
+            300,
+        );
+        let artifact = dir.0.join("codex.jsonl");
+        fs::write(
+            &artifact,
+            "{\"event_type\":\"thread/tokenUsage/updated\",\"seq\":1,\"ts\":\"2026-08-10T16:00:00Z\",\"payload\":{\"threadId\":\"thread-one\",\"tokenUsage\":{\"total\":{\"inputTokens\":80,\"cachedInputTokens\":60,\"cacheWriteInputTokens\":0,\"outputTokens\":20,\"reasoningOutputTokens\":5,\"totalTokens\":100}}}}\n",
+        )
+        .unwrap();
+        let sessions = SeatSessionStore::new(&db_path);
+        sessions
+            .append("unassigned", "codex-fork", "thread-one", artifact.to_str())
+            .unwrap();
+        let store = UsageLedgerStore::with_model_defaults(
+            &db_path,
+            UsageModelDefaults {
+                codex_fork: Some("gpt-5.6-terra".to_owned()),
+                ..UsageModelDefaults::default()
+            },
+        )
+        .unwrap();
+        store.scan(&[]).unwrap();
+
+        sessions
+            .append("seat-one", "codex-fork", "thread-one", artifact.to_str())
+            .unwrap();
+        let seat = UsageSeatMetadata {
+            seat_id: "seat-one".to_owned(),
+            friendly_name: Some("owner".to_owned()),
+            provider: "codex-fork".to_owned(),
+            model: Some("gpt-5.6-terra".to_owned()),
+            effort: None,
+            working_dir: "/repo".to_owned(),
+            parent_seat_id: None,
+            root_seat_id: Some("seat-one".to_owned()),
+            project_key: "/repo/.git".to_owned(),
+        };
+        assert_eq!(store.scan(&[seat]).unwrap(), ScanSummary::default());
+
+        let connection = Connection::open(db_path).unwrap();
+        let ledger: (String, String) = connection
+            .query_row(
+                "SELECT seat_id, project_key FROM message_ledger",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ledger, ("seat-one".to_owned(), "/repo/.git".to_owned()));
+        let rollups = connection
+            .prepare(
+                r#"
+                SELECT seat_id,
+                       input_tokens + output_tokens + cache_write_5m
+                         + cache_write_1h + cache_read_tokens
+                FROM seat_tokens
+                ORDER BY seat_id
+                "#,
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rollups, vec![("seat-one".to_owned(), 100)]);
+    }
+
+    #[test]
+    fn unassigned_codex_artifact_preserves_project_from_rollout_cwd() {
+        let dir = TestDir::new("unassigned-codex-project");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Codex,
+            "codex-account",
+            "pro",
+            "codex_300",
+            300,
+        );
+        let project = dir.0.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let artifact = dir.0.join("rollout.jsonl");
+        fs::write(
+            &artifact,
+            format!(
+                "not-json\n{}\n{}\n{}\n",
+                json!({"type": "session_meta", "payload": {"cwd": project}}),
+                json!({"type": "turn_context", "timestamp": "2026-08-10T15:59:59Z", "payload": {"model": "gpt-5.6-terra", "effort": "high"}}),
+                json!({"type": "event_msg", "timestamp": "2026-08-10T16:00:00Z", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 80, "cached_input_tokens": 60, "output_tokens": 20, "reasoning_output_tokens": 5, "total_tokens": 100}}}})
+            ),
+        )
+        .unwrap();
+        SeatSessionStore::new(&db_path)
+            .append("unassigned", "codex-fork", "thread-one", artifact.to_str())
+            .unwrap();
+
+        UsageLedgerStore::new(&db_path).unwrap().scan(&[]).unwrap();
+        let connection = Connection::open(db_path).unwrap();
+        let (seat_id, project_key): (String, String) = connection
+            .query_row(
+                "SELECT seat_id, project_key FROM message_ledger",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(seat_id, "unassigned");
+        assert_eq!(
+            project_key,
+            UsageSeatMetadata::resolve_project_key(project.to_str().unwrap())
         );
     }
 
