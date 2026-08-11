@@ -9,7 +9,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde_json::{Map, Value};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::usage_identity::{Provider, UsageIdentityStore};
+use crate::usage_identity::{AccountIdentity, Provider, UsageIdentityStore};
 
 const USAGE_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_WINDOW_MINUTES: i64 = 300;
@@ -159,8 +159,10 @@ impl UsageBurnStore {
         let Some(snapshot) = parse_claude_cached_usage(&value)? else {
             return Ok(0);
         };
+        self.identity_store
+            .ensure_account(&snapshot.identity, snapshot.observed_at)?;
         self.record_for_account(
-            &snapshot.account_key,
+            &snapshot.identity.account_key(),
             &snapshot.windows,
             "claude_json",
             snapshot.observed_at,
@@ -341,7 +343,7 @@ fn insert_windows(
 
 #[derive(Debug, Clone)]
 struct ClaudeCachedUsage {
-    account_key: String,
+    identity: AccountIdentity,
     observed_at: OffsetDateTime,
     windows: Vec<BurnWindowSample>,
 }
@@ -435,7 +437,12 @@ fn parse_claude_cached_usage(value: &Value) -> Result<Option<ClaudeCachedUsage>>
         }
     }
     Ok(Some(ClaudeCachedUsage {
-        account_key: format!("claude:{account_id}"),
+        identity: AccountIdentity {
+            provider: Provider::Claude,
+            external_id: account_id,
+            label: None,
+            plan_tier: None,
+        },
         observed_at,
         windows,
     }))
@@ -624,6 +631,57 @@ mod tests {
         assert_eq!(rows[2].1.as_deref(), Some("Fable"));
         assert!(rows.iter().all(|row| row.3 == "claude_json"));
         assert!(rows.iter().all(|row| row.4.starts_with("2026-08-10T")));
+    }
+
+    #[test]
+    fn claude_cache_registers_its_stale_account_without_reopening_the_timeline() {
+        let db_path = temp_db("claude-stale-account");
+        seed_account(
+            &db_path,
+            Provider::Claude,
+            "current-account",
+            "2026-08-10T12:00:00Z",
+        );
+        let cache_path = db_path.with_extension("claude.json");
+        fs::write(
+            &cache_path,
+            json!({
+                "oauthAccount": {"accountUuid": "current-account"},
+                "cachedUsageUtilization": {
+                    "fetchedAtMs": 1786361400000_i64,
+                    "accountUuid": "previous-account",
+                    "utilization": {
+                        "five_hour": {
+                            "utilization": 23,
+                            "resets_at": "2026-08-10T17:00:00Z"
+                        }
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = UsageBurnStore::new(&db_path).unwrap();
+
+        assert_eq!(store.record_claude_json_file(&cache_path).unwrap(), 1);
+
+        let connection = Connection::open(db_path).unwrap();
+        let burn_account: String = connection
+            .query_row(
+                "SELECT account_key FROM burn_samples WHERE source = 'claude_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(burn_account, "claude:previous-account");
+        let timeline_accounts = connection
+            .prepare("SELECT account_key FROM account_timeline ORDER BY from_ts")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(timeline_accounts, vec!["claude:current-account"]);
     }
 
     #[test]

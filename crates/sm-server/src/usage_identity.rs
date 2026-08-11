@@ -243,6 +243,43 @@ impl UsageIdentityStore {
         Ok(outcome)
     }
 
+    /// Register account metadata without changing the provider's active timeline.
+    ///
+    /// Cached usage can carry the final sample for an account that was replaced
+    /// before the cache was read. That account must exist for burn-sample foreign
+    /// keys, but it must not become the current account again.
+    pub fn ensure_account(
+        &self,
+        identity: &AccountIdentity,
+        observed_at: OffsetDateTime,
+    ) -> Result<()> {
+        identity.validate()?;
+        let mut conn = self.open()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let observed_ts = format_timestamp(observed_at)?;
+        tx.execute(
+            r#"
+            INSERT INTO accounts (
+              account_key, provider, external_id, label, plan_tier, first_seen, last_seen
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            ON CONFLICT(account_key) DO UPDATE SET
+              label = COALESCE(excluded.label, accounts.label),
+              plan_tier = COALESCE(excluded.plan_tier, accounts.plan_tier),
+              last_seen = MAX(accounts.last_seen, excluded.last_seen)
+            "#,
+            params![
+                identity.account_key(),
+                identity.provider.as_str(),
+                &identity.external_id,
+                identity.label.as_deref(),
+                identity.plan_tier.as_deref(),
+                observed_ts,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Backfill the assumed interval required when open windows contain messages
     /// older than the first identity poll. This may be called after the scanner
     /// discovers the true earliest timestamp; it always uses the account from the
