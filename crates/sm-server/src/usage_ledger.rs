@@ -492,6 +492,9 @@ impl UsageLedgerStore {
             if read == 0 {
                 break;
             }
+            if line.last() != Some(&b'\n') {
+                break;
+            }
             let source_seq = i64::try_from(line_offset).unwrap_or(i64::MAX);
             line_offset = line_offset.saturating_add(read as u64);
             let outcome = match artifact.provider.as_str() {
@@ -1866,6 +1869,7 @@ fn credit_metered(
             SELECT window_kind, window_scope, percent
             FROM burn_samples
             WHERE account_key = ?1 AND observed_at <= ?2
+              AND window_start <= ?2 AND ?2 < resets_at
             ORDER BY observed_at DESC, id DESC
             "#,
         )?
@@ -2559,24 +2563,26 @@ mod tests {
         let transcript = dir.0.join("session-one.jsonl");
         fs::write(
             &transcript,
-            json!({
-                "timestamp": message_at.format(&Rfc3339).unwrap(),
-                "sessionId": "session-one",
-                "requestId": "request-one",
-                "cwd": "/repo",
-                "version": "1.0.0",
-                "message": {
-                    "id": "message-one",
-                    "model": "claude-sonnet-5",
-                    "usage": {
-                        "input_tokens": 10,
-                        "output_tokens": 5,
-                        "cache_creation_input_tokens": 0,
-                        "cache_read_input_tokens": 0
+            format!(
+                "{}\n",
+                json!({
+                    "timestamp": message_at.format(&Rfc3339).unwrap(),
+                    "sessionId": "session-one",
+                    "requestId": "request-one",
+                    "cwd": "/repo",
+                    "version": "1.0.0",
+                    "message": {
+                        "id": "message-one",
+                        "model": "claude-sonnet-5",
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 5,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0
+                        }
                     }
-                }
-            })
-            .to_string(),
+                })
+            ),
         )
         .unwrap();
         SeatSessionStore::new(&db_path)
@@ -2945,6 +2951,55 @@ mod tests {
     }
 
     #[test]
+    fn exhaustion_from_a_closed_window_does_not_mark_new_window_tokens_as_credits() {
+        let dir = TestDir::new("closed-exhaustion-window");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Claude,
+            "account-one",
+            "max",
+            "session_5h",
+            300,
+        );
+        UsageBurnStore::new(&db_path)
+            .unwrap()
+            .record_for_account(
+                "claude:account-one",
+                &[BurnWindowSample {
+                    window_kind: "session_5h".to_owned(),
+                    window_scope: None,
+                    duration_minutes: 300,
+                    percent: 100.0,
+                    resets_at: at("2026-08-10T16:00:00Z"),
+                    severity: Some("exhausted".to_owned()),
+                    is_active: Some(true),
+                }],
+                "test-closed-exhausted-window",
+                at("2026-08-10T15:30:00Z"),
+            )
+            .unwrap();
+        UsageLedgerStore::new(&db_path).unwrap();
+        let mut connection = Connection::open(db_path).unwrap();
+        let tx = connection.transaction().unwrap();
+
+        assert!(credit_metered(
+            &tx,
+            "claude:account-one",
+            "claude-sonnet-5",
+            at("2026-08-10T15:45:00Z")
+        )
+        .unwrap());
+        assert!(!credit_metered(
+            &tx,
+            "claude:account-one",
+            "claude-sonnet-5",
+            at("2026-08-10T16:30:00Z")
+        )
+        .unwrap());
+    }
+
+    #[test]
     fn scan_does_not_checkpoint_valid_messages_before_identity_exists() {
         let dir = TestDir::new("no-identity");
         let db_path = dir.0.join("usage.db");
@@ -2974,6 +3029,95 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM scan_offsets", [], |row| row.get(0))
             .unwrap();
         assert_eq!(offset_count, 0);
+    }
+
+    #[test]
+    fn scan_retries_an_unterminated_jsonl_tail_after_the_writer_finishes_it() {
+        let dir = TestDir::new("unterminated-tail");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Claude,
+            "account-one",
+            "max",
+            "session_5h",
+            300,
+        );
+        let transcript = dir.0.join("session-one.jsonl");
+        let line = json!({
+            "timestamp": "2026-08-10T16:30:00Z",
+            "sessionId": "session-one",
+            "requestId": "request-one",
+            "cwd": "/repo",
+            "version": "1.0.0",
+            "message": {
+                "id": "message-one",
+                "model": "claude-sonnet-5",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                }
+            }
+        })
+        .to_string();
+        let split = line.len() / 2;
+        fs::write(&transcript, &line.as_bytes()[..split]).unwrap();
+        SeatSessionStore::new(&db_path)
+            .append("seat-one", "claude", "session-one", transcript.to_str())
+            .unwrap();
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        let seat = UsageSeatMetadata {
+            seat_id: "seat-one".to_owned(),
+            friendly_name: None,
+            provider: "claude".to_owned(),
+            model: Some("claude-sonnet-5".to_owned()),
+            effort: None,
+            working_dir: "/repo".to_owned(),
+            parent_seat_id: None,
+            root_seat_id: Some("seat-one".to_owned()),
+            project_key: "/repo".to_owned(),
+        };
+
+        store.scan(std::slice::from_ref(&seat)).unwrap();
+        let connection = Connection::open(&db_path).unwrap();
+        let (messages, offset): (i64, i64) = connection
+            .query_row(
+                r#"
+                SELECT
+                  (SELECT COUNT(*) FROM message_ledger),
+                  (SELECT byte_offset FROM scan_offsets WHERE artifact_path = ?1)
+                "#,
+                [transcript.to_string_lossy().as_ref()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((messages, offset), (0, 0));
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(&line.as_bytes()[split..]).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
+
+        store.scan(&[seat]).unwrap();
+        let connection = Connection::open(&db_path).unwrap();
+        let (messages, offset): (i64, i64) = connection
+            .query_row(
+                r#"
+                SELECT
+                  (SELECT COUNT(*) FROM message_ledger),
+                  (SELECT byte_offset FROM scan_offsets WHERE artifact_path = ?1)
+                "#,
+                [transcript.to_string_lossy().as_ref()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(messages, 1);
+        assert_eq!(offset as u64, fs::metadata(transcript).unwrap().len());
     }
 
     #[test]
