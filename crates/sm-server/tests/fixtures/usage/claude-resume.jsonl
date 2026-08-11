@@ -1,0 +1,1 @@
+{"type":"assistant","timestamp":"2026-08-10T16:10:00Z","sessionId":"claude-session-resume","requestId":"claude-request-resume","cwd":"/redacted/project","version":"1.0.0","id":"event-resume","message":{"id":"msg-resume","model":"claude-opus-4-20250514","usage":{"input_tokens":50,"output_tokens":10,"cache_creation_input_tokens":5,"cache_read_input_tokens":15},"content":null}}

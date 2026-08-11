@@ -31,6 +31,7 @@ use crate::{
     runtime::{TmuxRuntime, TmuxSessionSpec},
     seat_sessions::{SeatSessionIdentity, SeatSessionStore},
     usage_burn::UsageBurnStore,
+    usage_ledger::{ScanSummary, UsageLedgerStore, UsageSeatMetadata},
 };
 
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
@@ -68,6 +69,8 @@ pub struct SessionStore {
     clear_operation_locks: Arc<Mutex<BTreeMap<String, Weak<SessionClearLock>>>>,
     seat_session_store: SeatSessionStore,
     usage_burn_store: Option<UsageBurnStore>,
+    usage_ledger_store: Option<UsageLedgerStore>,
+    usage_project_keys: Arc<Mutex<BTreeMap<String, (String, String)>>>,
 }
 
 #[derive(Debug)]
@@ -116,6 +119,8 @@ impl SessionStore {
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
             usage_burn_store: None,
+            usage_ledger_store: None,
+            usage_project_keys: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -134,6 +139,101 @@ impl SessionStore {
     pub fn with_usage_burn_store(mut self, store: UsageBurnStore) -> Self {
         self.usage_burn_store = Some(store);
         self
+    }
+
+    pub fn with_usage_ledger_store(mut self, store: UsageLedgerStore) -> Self {
+        self.usage_ledger_store = Some(store);
+        self
+    }
+
+    pub fn scan_usage_ledger(&self) -> Result<ScanSummary> {
+        let Some(store) = self.usage_ledger_store.as_ref() else {
+            return Ok(ScanSummary::default());
+        };
+        let records = self.load_snapshot()?.into_sessions();
+        self.repair_current_codex_usage_artifacts(&records)?;
+        let by_id = records
+            .iter()
+            .map(|record| (record.id.as_str(), record))
+            .collect::<BTreeMap<_, _>>();
+        let mut project_keys = self
+            .usage_project_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seats = records
+            .iter()
+            .map(|record| {
+                let project_key = project_keys
+                    .get(&record.id)
+                    .filter(|(working_dir, _)| working_dir == &record.working_dir)
+                    .map(|(_, project_key)| project_key.clone())
+                    .unwrap_or_else(|| {
+                        let project_key =
+                            UsageSeatMetadata::resolve_project_key(&record.working_dir);
+                        project_keys.insert(
+                            record.id.clone(),
+                            (record.working_dir.clone(), project_key.clone()),
+                        );
+                        project_key
+                    });
+                UsageSeatMetadata {
+                    seat_id: record.id.clone(),
+                    friendly_name: record.cached_display_name(),
+                    provider: record.provider.clone(),
+                    model: record.model.clone(),
+                    effort: record.reasoning_effort.clone(),
+                    working_dir: record.working_dir.clone(),
+                    parent_seat_id: record.parent_session_id.clone(),
+                    root_seat_id: Some(root_seat_id(record, &by_id)),
+                    project_key,
+                }
+            })
+            .collect::<Vec<_>>();
+        project_keys.retain(|seat_id, _| by_id.contains_key(seat_id.as_str()));
+        drop(project_keys);
+        store.scan(&seats)
+    }
+
+    fn repair_current_codex_usage_artifacts(&self, records: &[SessionRecord]) -> Result<()> {
+        let missing = self
+            .seat_session_store
+            .provider_sessions_missing_artifacts("codex")?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let current = records
+            .iter()
+            .filter(|record| record.provider == "codex")
+            .filter_map(|record| {
+                provider_resume_id_for_restore(record).and_then(|provider_session_id| {
+                    missing
+                        .contains(&provider_session_id)
+                        .then_some((record, provider_session_id))
+                })
+            })
+            .collect::<Vec<_>>();
+        if current.is_empty() {
+            return Ok(());
+        }
+        let ids = current
+            .iter()
+            .map(|(_, provider_session_id)| provider_session_id.clone())
+            .collect::<BTreeSet<_>>();
+        let paths = codex_cli_artifact_paths(&self.codex_sessions_root, &ids);
+        let repairs = current
+            .into_iter()
+            .filter_map(|(record, provider_session_id)| {
+                paths
+                    .get(&provider_session_id)
+                    .map(|path| SeatSessionIdentity {
+                        seat_id: record.id.clone(),
+                        provider: "codex".to_owned(),
+                        provider_session_id,
+                        artifact_path: Some(resolve_path_lossy(path.clone())),
+                    })
+            })
+            .collect::<Vec<_>>();
+        self.seat_session_store.append_batch(&repairs)
     }
 
     pub fn record_claude_statusline_burn(&self, event: &ContextUsageEvent) -> Result<usize> {
@@ -433,6 +533,8 @@ impl SessionStore {
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
             usage_burn_store: None,
+            usage_ledger_store: None,
+            usage_project_keys: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -7994,6 +8096,22 @@ pub struct SessionRecord {
     pub pending_adoption_proposals: Vec<AdoptionProposalResponse>,
 }
 
+fn root_seat_id(record: &SessionRecord, records: &BTreeMap<&str, &SessionRecord>) -> String {
+    let mut current = record;
+    let mut visited = BTreeSet::new();
+    visited.insert(current.id.as_str());
+    while let Some(parent_id) = current.parent_session_id.as_deref() {
+        if !visited.insert(parent_id) {
+            break;
+        }
+        let Some(parent) = records.get(parent_id) else {
+            break;
+        };
+        current = parent;
+    }
+    current.id.clone()
+}
+
 impl SessionRecord {
     fn is_stopped(&self) -> bool {
         normalized_status(&self.status) == "stopped"
@@ -10039,6 +10157,83 @@ mod tests {
     }
 
     #[test]
+    fn usage_scan_repairs_a_late_classic_codex_artifact_without_restart() {
+        let temp_dir = unique_temp_path("usage-late-codex-artifact");
+        let state_file = temp_dir.join("sessions.json");
+        let usage_db_path = state_file.with_extension("usage.db");
+        let working_dir = temp_dir.join("repo");
+        let sessions_root = temp_dir.join("codex-home").join("sessions");
+        let day_dir = sessions_root.join("2026").join("08").join("10");
+        fs::create_dir_all(&working_dir).unwrap();
+        fs::create_dir_all(&day_dir).unwrap();
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex",
+                    "provider_resume_id": "late-thread",
+                    "working_dir": working_dir.display().to_string(),
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-08-10T16:00:00Z",
+                    "last_activity": "2026-08-10T16:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+        store.codex_sessions_root = sessions_root;
+        store.append_seat_session("codex001", "codex", "late-thread", None);
+        assert_eq!(
+            store
+                .seat_session_store
+                .provider_sessions_missing_artifacts("codex")
+                .unwrap(),
+            BTreeSet::from(["late-thread".to_owned()])
+        );
+
+        let rollout_path = day_dir.join("rollout-late-thread.jsonl");
+        fs::write(
+            &rollout_path,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session_meta",
+                    "timestamp": "2026-08-10T16:00:00Z",
+                    "payload": {
+                        "id": "late-thread",
+                        "cwd": working_dir.display().to_string(),
+                        "timestamp": "2026-08-10T16:00:00Z"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let records = store.load_snapshot().unwrap().into_sessions();
+        store
+            .repair_current_codex_usage_artifacts(&records)
+            .unwrap();
+
+        assert!(store
+            .seat_session_store
+            .provider_sessions_missing_artifacts("codex")
+            .unwrap()
+            .is_empty());
+        let repaired: String = Connection::open(usage_db_path)
+            .unwrap()
+            .query_row(
+                "SELECT artifact_path FROM seat_sessions WHERE provider_session_id = 'late-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repaired, resolve_path_lossy(rollout_path));
+    }
+
+    #[test]
     fn codex_fork_identity_event_releases_session_lock_before_ledger_write() {
         let state_file = unique_temp_path("codex-event-ledger-lock");
         let usage_db_path = state_file.with_extension("usage.db");
@@ -11873,6 +12068,7 @@ mod tests {
                     external_id: "codex-test-account".to_owned(),
                     label: None,
                     plan_tier: Some("pro".to_owned()),
+                    extra_usage_enabled: None,
                 }),
                 observed_at - TimeDuration::minutes(1),
                 None,

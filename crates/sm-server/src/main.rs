@@ -108,6 +108,7 @@ async fn main() -> Result<()> {
 
     if state.config().usage.enabled {
         let poll_interval = state.config().usage.poll_interval_secs;
+        let usage_state = state.clone();
         let poller = Arc::new(IdentityPoller::new(
             expand_home(&state.config().usage.db_path),
             expand_home("~/.claude.json"),
@@ -130,6 +131,16 @@ async fn main() -> Result<()> {
                                 "{} account identity poll failed: {error:#}",
                                 provider.as_str()
                             );
+                        }
+                        let scan_state = usage_state.clone();
+                        match tokio::task::spawn_blocking(move || scan_state.scan_usage_ledger())
+                            .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                eprintln!("usage token ledger scan failed: {error:#}")
+                            }
+                            Err(error) => eprintln!("usage token ledger task failed: {error}"),
                         }
                     }
                     Err(error) => eprintln!("account identity poll task failed: {error}"),

@@ -1,0 +1,2 @@
+{"event_type":"thread/settings/updated","seq":1,"ts":"2026-08-10T16:19:59Z","payload":{"threadId":"codex-thread-1","threadSettings":{"model":"gpt-5.1-codex","effort":"high"}}}
+{"event_type":"thread/tokenUsage/updated","seq":2,"ts":"2026-08-10T16:20:00Z","payload":{"threadId":"codex-thread-1","turnId":"codex-request-1","tokenUsage":{"total":{"inputTokens":120,"cachedInputTokens":90,"cacheWriteInputTokens":0,"outputTokens":30,"reasoningOutputTokens":10,"totalTokens":150}}}}

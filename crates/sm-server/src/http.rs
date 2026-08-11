@@ -132,6 +132,7 @@ use crate::tool_usage::{
     log_tool_usage_to_path, ToolCallRow, ToolUsageEvent,
 };
 use crate::usage_burn::UsageBurnStore;
+use crate::usage_ledger::{ScanSummary, UsageLedgerStore, UsageModelDefaults};
 
 const SESSION_COOKIE_NAME: &str = "sm_auth";
 const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
@@ -390,6 +391,17 @@ impl AppState {
                 Ok(store) => session_store = session_store.with_usage_burn_store(store),
                 Err(error) => eprintln!("usage burn store initialization failed: {error:#}"),
             }
+            match UsageLedgerStore::with_model_defaults(
+                expand_home(&config.usage.db_path),
+                UsageModelDefaults {
+                    claude: config.claude.default_model.clone(),
+                    codex: config.codex.default_model.clone(),
+                    codex_fork: config.codex_fork.default_model.clone(),
+                },
+            ) {
+                Ok(store) => session_store = session_store.with_usage_ledger_store(store),
+                Err(error) => eprintln!("usage token ledger initialization failed: {error:#}"),
+            }
         }
         if let Err(error) = session_store.recover_pending_codex_fork_handoffs() {
             eprintln!("codex-fork handoff recovery failed: {error:#}");
@@ -451,6 +463,10 @@ impl AppState {
         snapshot: SeatSessionReconciliationSnapshot,
     ) -> anyhow::Result<()> {
         self.session_store.reconcile_seat_sessions(snapshot)
+    }
+
+    pub fn scan_usage_ledger(&self) -> anyhow::Result<ScanSummary> {
+        self.session_store.scan_usage_ledger()
     }
 }
 
