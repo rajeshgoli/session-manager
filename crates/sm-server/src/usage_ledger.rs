@@ -2278,7 +2278,7 @@ fn scoped_model_at(
     .map_err(Into::into)
 }
 
-fn plan_excludes_premium(plan_tier: &str) -> bool {
+pub(crate) fn plan_excludes_premium(plan_tier: &str) -> bool {
     let plan = plan_tier.to_ascii_lowercase();
     plan == "pro" || plan.contains("standard_team") || plan.contains("team_standard")
 }

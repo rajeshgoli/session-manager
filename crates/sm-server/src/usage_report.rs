@@ -10,6 +10,8 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+use crate::usage_ledger::plan_excludes_premium;
+
 const DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const STALE_AFTER_SECONDS: i64 = 600;
 const MIN_PROJECTION_ELAPSED_SECONDS: i64 = 3600;
@@ -491,17 +493,6 @@ fn select_windows(
         });
         if let Some(window) = current.into_iter().next() {
             selected.push(window);
-        } else if since_reset {
-            let mut latest = group.clone();
-            latest.sort_by(|left, right| {
-                right
-                    .observed_at
-                    .cmp(&left.observed_at)
-                    .then_with(|| right.id.cmp(&left.id))
-            });
-            if let Some(window) = latest.into_iter().next() {
-                selected.push(window);
-            }
         }
         if !since_reset {
             let mut closed = group
@@ -1007,7 +998,7 @@ fn usage_decision_summary(accounts: &[UsageAccountReport]) -> UsageDecisionSumma
             && (account
                 .plan_tier
                 .as_deref()
-                .is_some_and(|tier| tier.to_ascii_lowercase().contains("max"))
+                .is_some_and(|tier| !plan_excludes_premium(tier))
                 || account
                     .windows
                     .iter()
@@ -1888,6 +1879,64 @@ mod tests {
     }
 
     #[test]
+    fn premium_inclusive_claude_plan_requires_a_scoped_weekly_meter() {
+        let now = OffsetDateTime::parse("2026-08-11T01:00:00Z", &Rfc3339).unwrap();
+        let mut warnings = BTreeSet::new();
+        let build = |kind: &str, start: &str, reset: &str, warnings: &mut BTreeSet<String>| {
+            build_window_report(
+                &BurnWindow {
+                    id: 1,
+                    account_key: "claude:team".to_owned(),
+                    window_kind: kind.to_owned(),
+                    window_scope: None,
+                    window_start: start.to_owned(),
+                    percent: 2.0,
+                    resets_at: reset.to_owned(),
+                    observed_at: "2026-08-11T01:00:00Z".to_owned(),
+                },
+                "claude",
+                &[],
+                None,
+                None,
+                &BTreeMap::new(),
+                false,
+                DEFAULT_PREMIUM_CAP_RATIO,
+                now,
+                warnings,
+            )
+        };
+        let accounts = vec![UsageAccountReport {
+            account_key: "claude:team".to_owned(),
+            label: None,
+            provider: "claude".to_owned(),
+            plan_tier: Some("team_premium".to_owned()),
+            active: true,
+            windows: vec![
+                build(
+                    "session_5h",
+                    "2026-08-11T00:00:00Z",
+                    "2026-08-11T05:00:00Z",
+                    &mut warnings,
+                ),
+                build(
+                    "weekly_all",
+                    "2026-08-10T00:00:00Z",
+                    "2026-08-17T00:00:00Z",
+                    &mut warnings,
+                ),
+            ],
+        }];
+
+        let decision = usage_decision_summary(&accounts);
+
+        assert_eq!(decision.status, "non_actionable");
+        assert_eq!(
+            decision.missing_current_windows,
+            ["claude:team:weekly_scoped"]
+        );
+    }
+
+    #[test]
     fn rolling_resets_select_one_current_snapshot_and_three_closed_windows() {
         let window = |id: i64, start: &str, reset: &str, observed: &str| BurnWindow {
             id,
@@ -1942,6 +1991,9 @@ mod tests {
         let current = select_windows(&windows, true, now);
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].id, 2);
+
+        let expired_only = select_windows(&windows[2..], true, now);
+        assert!(expired_only.is_empty());
 
         let history = select_windows(&windows, false, now);
         assert_eq!(
