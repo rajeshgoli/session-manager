@@ -421,6 +421,10 @@ impl AppState {
     pub fn config(&self) -> &AppConfig {
         &self.config
     }
+
+    pub fn reconcile_current_seat_sessions(&self) -> anyhow::Result<()> {
+        self.session_store.reconcile_current_seat_sessions()
+    }
 }
 
 #[derive(Debug, Deserialize)]

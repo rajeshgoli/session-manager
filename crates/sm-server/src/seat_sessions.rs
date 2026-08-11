@@ -8,6 +8,7 @@ use rusqlite::{params, Connection};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const DEFAULT_USAGE_DB_PATH: &str = "~/.local/share/claude-sessions/usage.db";
+const USAGE_DB_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Append-only mapping from an sm seat to every provider session identity it
 /// has used. The rest of the usage ledger can consume this chain without
@@ -88,7 +89,7 @@ impl SeatSessionStore {
         let connection = Connection::open(&self.db_path)
             .with_context(|| format!("failed to open usage database {}", self.db_path.display()))?;
         connection
-            .busy_timeout(Duration::from_secs(5))
+            .busy_timeout(USAGE_DB_BUSY_TIMEOUT)
             .context("failed to configure usage database busy timeout")?;
         connection
             .pragma_update(None, "journal_mode", "WAL")

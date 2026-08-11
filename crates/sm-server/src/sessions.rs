@@ -42,6 +42,8 @@ const CODEX_CLI_SESSION_BIND_POLL: Duration = Duration::from_millis(50);
 const CODEX_FORK_THREAD_STARTED_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_FORK_EVENT_MONITOR_POLL: Duration = Duration::from_millis(250);
 const CODEX_FORK_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+const SEAT_SESSION_RETRY_ATTEMPTS: usize = 20;
+const SEAT_SESSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 static STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -116,14 +118,71 @@ impl SessionStore {
         provider_session_id: &str,
         artifact_path: Option<&str>,
     ) {
-        if let Err(error) =
+        let Err(error) =
             self.seat_session_store
                 .append(seat_id, provider, provider_session_id, artifact_path)
-        {
-            eprintln!(
-                "usage ledger failed to append provider session {provider_session_id} for seat {seat_id}: {error:#}"
-            );
+        else {
+            return;
+        };
+        eprintln!(
+            "usage ledger failed to append provider session {provider_session_id} for seat {seat_id}: {error:#}"
+        );
+        if !usage_ledger_error_is_transient(&error) {
+            return;
         }
+
+        let store = self.seat_session_store.clone();
+        let seat_id = seat_id.to_owned();
+        let provider = provider.to_owned();
+        let provider_session_id = provider_session_id.to_owned();
+        let artifact_path = artifact_path.map(ToOwned::to_owned);
+        let thread_name = format!(
+            "sm-seat-session-retry-{}",
+            sanitize_path_component(&seat_id)
+        );
+        if let Err(error) = thread::Builder::new().name(thread_name).spawn(move || {
+            for attempt in 1..=SEAT_SESSION_RETRY_ATTEMPTS {
+                thread::sleep(SEAT_SESSION_RETRY_DELAY);
+                match store.append(
+                    &seat_id,
+                    &provider,
+                    &provider_session_id,
+                    artifact_path.as_deref(),
+                ) {
+                    Ok(()) => return,
+                    Err(error) if usage_ledger_error_is_transient(&error) => {
+                        if attempt == SEAT_SESSION_RETRY_ATTEMPTS {
+                            eprintln!(
+                                "usage ledger exhausted retries for provider session {provider_session_id} on seat {seat_id}: {error:#}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "usage ledger retry failed permanently for provider session {provider_session_id} on seat {seat_id}: {error:#}"
+                        );
+                        return;
+                    }
+                }
+            }
+        }) {
+            eprintln!("failed to start usage ledger retry thread: {error}");
+        }
+    }
+
+    pub fn reconcile_current_seat_sessions(&self) -> Result<()> {
+        for session in self.load_snapshot()?.into_sessions() {
+            let provider_resume_id = provider_resume_id_for_restore(&session);
+            if let Some(provider_resume_id) = provider_resume_id {
+                self.append_seat_session(
+                    &session.id,
+                    &session.provider,
+                    &provider_resume_id,
+                    session.transcript_path.as_deref(),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Drop context alerts this session raised about context it no longer has.
@@ -3260,19 +3319,12 @@ impl SessionStore {
         }
 
         let mut changed = false;
-        if let Some(provider_resume_id) = codex_fork_provider_resume_id(event) {
-            self.append_seat_session(
-                session_id,
-                &provider,
-                &provider_resume_id,
-                artifact_path.and_then(Path::to_str),
-            );
-            if json_text(session.get("provider_resume_id")).as_deref()
-                != Some(provider_resume_id.as_str())
-            {
+        let provider_resume_id = codex_fork_provider_resume_id(event);
+        if let Some(provider_resume_id) = provider_resume_id.as_deref() {
+            if json_text(session.get("provider_resume_id")).as_deref() != Some(provider_resume_id) {
                 session.insert(
                     "provider_resume_id".to_owned(),
-                    Value::String(provider_resume_id),
+                    Value::String(provider_resume_id.to_owned()),
                 );
                 changed = true;
             }
@@ -3371,6 +3423,15 @@ impl SessionStore {
 
         if changed {
             self.write_raw_json_value(&state)?;
+        }
+        drop(_guard);
+        if let Some(provider_resume_id) = provider_resume_id {
+            self.append_seat_session(
+                session_id,
+                &provider,
+                &provider_resume_id,
+                artifact_path.and_then(Path::to_str),
+            );
         }
         Ok(())
     }
@@ -3510,6 +3571,24 @@ fn wait_for_codex_fork_provider_resume_id(
     timeout: Duration,
 ) -> Result<String> {
     wait_for_codex_fork_provider_resume_id_after_offset(event_stream_path, 0, timeout)
+}
+
+fn usage_ledger_error_is_transient(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    rusqlite::Error::SqliteFailure(code, _)
+                        if matches!(
+                            code.code,
+                            rusqlite::ErrorCode::DatabaseBusy
+                                | rusqlite::ErrorCode::DatabaseLocked
+                        )
+                )
+            })
+    })
 }
 
 fn wait_for_codex_fork_provider_resume_id_after_offset(
@@ -8603,6 +8682,146 @@ mod tests {
                 .provider_resume_id
                 .as_deref(),
             Some("thread-after-handoff")
+        );
+    }
+
+    #[test]
+    fn transient_seat_session_append_is_retried_after_the_writer_unlocks() {
+        let state_file = unique_temp_path("seat-session-retry");
+        let usage_db_path = state_file.with_extension("usage.db");
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+        store
+            .seat_session_store
+            .append("seed", "codex", "seed-thread", None)
+            .unwrap();
+        let connection = rusqlite::Connection::open(&usage_db_path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        store.append_seat_session("codex001", "codex", "retry-thread", None);
+        connection.execute_batch("ROLLBACK").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let count: i64 = rusqlite::Connection::open(&usage_db_path)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'codex001' AND provider_session_id = 'retry-thread'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if count == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "transient usage ledger append was not retried"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn startup_reconciliation_restores_a_missing_current_codex_identity() {
+        let state_file = unique_temp_path("seat-session-reconcile");
+        let usage_db_path = state_file.with_extension("usage.db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex",
+                    "provider_resume_id": "persisted-thread",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+
+        store.reconcile_current_seat_sessions().unwrap();
+
+        let count: i64 = rusqlite::Connection::open(usage_db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'codex001' AND provider_session_id = 'persisted-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn codex_fork_identity_event_releases_session_lock_before_ledger_write() {
+        let state_file = unique_temp_path("codex-event-ledger-lock");
+        let usage_db_path = state_file.with_extension("usage.db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+        store
+            .seat_session_store
+            .append("seed", "codex-fork", "seed-thread", None)
+            .unwrap();
+        let connection = rusqlite::Connection::open(usage_db_path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let event_store = store.clone();
+        let event = thread::spawn(move || {
+            event_store.apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"thread/started","payload":{"thread":{"id":"new-thread"}}}"#,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if store
+                .get_session("codex001")
+                .unwrap()
+                .and_then(|session| session.provider_resume_id)
+                .as_deref()
+                == Some("new-thread")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fork identity state remained behind the blocked usage ledger"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let started = Instant::now();
+        assert!(store
+            .apply_claude_pre_tool_use_hook("codex001", Some("Read"))
+            .unwrap());
+        let mutation_elapsed = started.elapsed();
+
+        connection.execute_batch("ROLLBACK").unwrap();
+        event.join().unwrap().unwrap();
+        assert!(
+            mutation_elapsed < Duration::from_secs(1),
+            "the global session lock remained held during the fork ledger wait"
         );
     }
 
