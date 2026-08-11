@@ -2835,6 +2835,34 @@ impl SessionStore {
         Ok(monitors.len())
     }
 
+    pub fn recover_codex_fork_event_monitors(&self) -> Result<usize> {
+        let Some(runtime) = self.delivery_runtime.as_ref() else {
+            return Ok(0);
+        };
+        let monitors = self
+            .load_snapshot()?
+            .into_sessions()
+            .into_iter()
+            .filter(|session| {
+                session.provider == "codex-fork"
+                    && is_primary_node(&session.node)
+                    && normalized_status(&session.status) != "stopped"
+            })
+            .filter_map(|session| {
+                codex_fork_event_stream_path(&session, runtime)
+                    .map(|event_stream_path| (session.id, event_stream_path))
+            })
+            .collect::<Vec<_>>();
+
+        for (session_id, event_stream_path) in &monitors {
+            self.start_codex_fork_event_monitor_from_current_end(
+                session_id.clone(),
+                event_stream_path.clone(),
+            )?;
+        }
+        Ok(monitors.len())
+    }
+
     fn start_codex_fork_handoff_monitor(
         &self,
         session_id: String,
@@ -10806,6 +10834,58 @@ mod tests {
         fixture.wait_for_handoff(&restarted);
     }
 
+    #[test]
+    fn codex_fork_event_monitor_recovery_records_only_new_rate_limits() {
+        let Some(fixture) = CodexForkHandoffFixture::new("event-monitor-recovery") else {
+            return;
+        };
+        let usage_db_path = fixture.state_file.with_extension("usage.db");
+        let observed_at = OffsetDateTime::now_utc();
+        UsageIdentityStore::new(&usage_db_path)
+            .unwrap()
+            .record_observation(
+                Provider::Codex,
+                Some(&AccountIdentity {
+                    provider: Provider::Codex,
+                    external_id: "codex-restart-account".to_owned(),
+                    label: None,
+                    plan_tier: Some("pro".to_owned()),
+                    extra_usage_enabled: None,
+                }),
+                observed_at - TimeDuration::minutes(1),
+                None,
+                None,
+            )
+            .unwrap();
+        fixture.append_rate_limit(12.0);
+
+        let restarted = fixture
+            .store()
+            .with_usage_burn_store(UsageBurnStore::new(&usage_db_path).unwrap());
+        assert_eq!(restarted.recover_codex_fork_event_monitors().unwrap(), 1);
+        fixture.append_rate_limit(27.0);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let samples = Connection::open(&usage_db_path)
+                .unwrap()
+                .prepare("SELECT percent FROM burn_samples ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get::<_, f64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            if samples == vec![27.0] {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "recovered event monitor did not ingest the new sample: {samples:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     struct CodexForkHandoffFixture {
         state_file: PathBuf,
         event_stream_path: PathBuf,
@@ -10894,6 +10974,32 @@ mod tests {
             writeln!(
                 file,
                 r#"{{"event_type":"turn_complete","payload":{{"turn_id":"turn-1"}}}}"#
+            )
+            .unwrap();
+        }
+
+        fn append_rate_limit(&self, percent: f64) {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&self.event_stream_path)
+                .unwrap();
+            writeln!(
+                file,
+                "{}",
+                json!({
+                    "event_type": "account/rateLimits/updated",
+                    "payload": {"rateLimits": {
+                        "limitId": "codex",
+                        "primary": {
+                            "usedPercent": percent,
+                            "windowDurationMins": 300,
+                            "resetsAt": (OffsetDateTime::now_utc()
+                                + TimeDuration::minutes(300))
+                                .unix_timestamp()
+                        },
+                        "secondary": null
+                    }}
+                })
             )
             .unwrap();
         }
