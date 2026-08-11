@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -120,6 +121,19 @@ impl SeatSessionStore {
             .commit()
             .context("failed to commit seat session reconciliation")?;
         Ok(())
+    }
+
+    pub fn claimed_provider_sessions(&self) -> Result<BTreeSet<(String, String)>> {
+        let connection = self.open()?;
+        let mut statement = connection
+            .prepare("SELECT provider, provider_session_id FROM seat_sessions")
+            .context("failed to prepare seat session claim query")?;
+        let claims = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .context("failed to query claimed provider sessions")?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .context("failed to read claimed provider sessions")?;
+        Ok(claims)
     }
 
     fn open(&self) -> Result<Connection> {
