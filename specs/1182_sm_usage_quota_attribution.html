@@ -1614,12 +1614,14 @@ dormant.</p>
   <p><strong>Decision safety.</strong> A current sample older than ten minutes is not silently discarded:
   its consumed percentage remains a lower bound and its free headroom remains an upper bound, while the
   report is marked non-actionable and projections are suppressed. Refresh remains provider-event driven;
-  <code>sm usage</code> does not claim to force either provider to poll.</p>
+  <code>sm usage</code> does not claim to force either provider to poll. A partial provider payload is also
+  non-actionable when a required short or weekly limiting meter is absent.</p>
   <p>Fresh weekly windows may show a low-confidence linear projection. Existing account burn continues at
-  its current-window rate; model capacity uses the highest observed same-model seat rate, so prior-mode
-  invisible usage biases capacity downward rather than creating optimistic seats. The JSON response names
-  these assumptions. With prior weights, residual is bounded as zero through measured account burn and is
-  never presented as measured.</p>
+  its current-window rate; model capacity uses the highest observed same-model seat rate over that seat's
+  own active interval after at least one hour of evidence, so prior-mode invisible usage biases capacity
+  downward rather than creating optimistic seats. Premium-model capacity appears only under the scoped
+  meter, never the looser overall meter. The JSON response names these assumptions. With prior weights,
+  residual is bounded as zero through measured account burn and is never presented as measured.</p>
 </blockquote>
 
 <pre><code>$ sm usage 320 --include-children

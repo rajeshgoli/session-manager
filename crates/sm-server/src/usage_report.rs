@@ -60,6 +60,7 @@ pub struct UsageDecisionSummary {
     pub status: &'static str,
     pub fresh_current_windows: usize,
     pub stale_current_windows: usize,
+    pub missing_current_windows: Vec<String>,
     pub reasons: Vec<String>,
     pub refresh_guidance: Vec<String>,
 }
@@ -334,7 +335,15 @@ struct WindowRow {
     seat_id: String,
     model: String,
     credit_metered: bool,
+    first_bucket_ts: Option<String>,
     tokens: TokenCounts,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ModelBurn {
+    burn_percent: f64,
+    weighted_units: f64,
+    first_bucket_ts: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -486,7 +495,7 @@ fn load_window_rows(connection: &Connection, window: &BurnWindow) -> Result<Vec<
     let mut statement = connection.prepare(
         r#"
         SELECT seat_id, model, credit_metered,
-               SUM(input_tokens), SUM(output_tokens), SUM(cache_write_5m),
+               MIN(bucket_ts), SUM(input_tokens), SUM(output_tokens), SUM(cache_write_5m),
                SUM(cache_write_1h), SUM(cache_read_tokens)
         FROM seat_tokens
         WHERE account_key = ?1 AND window_kind = ?2 AND window_start = ?3
@@ -502,12 +511,13 @@ fn load_window_rows(connection: &Connection, window: &BurnWindow) -> Result<Vec<
                     seat_id: row.get(0)?,
                     model: row.get(1)?,
                     credit_metered: row.get(2)?,
+                    first_bucket_ts: row.get(3)?,
                     tokens: TokenCounts {
-                        input: row.get(3)?,
-                        output: row.get(4)?,
-                        cache_write_5m: row.get(5)?,
-                        cache_write_1h: row.get(6)?,
-                        cache_read: row.get(7)?,
+                        input: row.get(4)?,
+                        output: row.get(5)?,
+                        cache_write_5m: row.get(6)?,
+                        cache_write_1h: row.get(7)?,
+                        cache_read: row.get(8)?,
                     },
                 })
             },
@@ -617,7 +627,7 @@ fn build_window_report(
 
     let mut burn_by_seat = BTreeMap::<String, f64>::new();
     let mut units_by_seat = BTreeMap::<String, f64>::new();
-    let mut burn_by_model = BTreeMap::<(String, String), (f64, f64)>::new();
+    let mut burn_by_model = BTreeMap::<(String, String), ModelBurn>::new();
     for (row, units) in weighted {
         let premium_row =
             premium.is_some_and(|premium| model_matches_scope(&row.model, &premium.scope));
@@ -633,8 +643,15 @@ fn build_window_report(
         let model = burn_by_model
             .entry((row.seat_id.clone(), row.model.clone()))
             .or_default();
-        model.0 += burn;
-        model.1 += units;
+        model.burn_percent += burn;
+        model.weighted_units += units;
+        if model.first_bucket_ts.as_ref().is_none_or(|current| {
+            row.first_bucket_ts
+                .as_ref()
+                .is_some_and(|candidate| candidate < current)
+        }) {
+            model.first_bucket_ts = row.first_bucket_ts.clone();
+        }
     }
     let unassigned_points = (premium_units == 0.0)
         .then_some(premium_points)
@@ -645,7 +662,7 @@ fn build_window_report(
         burn_by_model
             .entry(("unassigned".to_owned(), "unassigned".to_owned()))
             .or_default()
-            .0 += unassigned_points;
+            .burn_percent += unassigned_points;
     }
 
     let mut seat_ids = burn_by_seat.keys().cloned().collect::<BTreeSet<_>>();
@@ -683,7 +700,18 @@ fn build_window_report(
             .then_with(|| left.seat_id.cmp(&right.seat_id))
     });
 
-    let projection = build_projection(window, stale, is_scoped, premium_cap_ratio, &burn_by_model);
+    let projection = build_projection(
+        window,
+        stale,
+        is_scoped,
+        premium_cap_ratio,
+        if window.window_kind == "weekly_all" {
+            premium.map(|premium| premium.scope.as_str())
+        } else {
+            None
+        },
+        &burn_by_model,
+    );
     let models = if by_model {
         burn_by_model
             .into_iter()
@@ -692,7 +720,7 @@ fn build_window_report(
                     target.self_seats.contains(seat_id) || target.child_seats.contains(seat_id)
                 })
             })
-            .map(|((seat_id, model), (burn_percent, weighted_units))| {
+            .map(|((seat_id, model), burn)| {
                 let weight_source =
                     if premium.is_some_and(|premium| model_matches_scope(&model, &premium.scope)) {
                         "assumed-ratio"
@@ -702,8 +730,8 @@ fn build_window_report(
                 UsageModelShare {
                     seat_id,
                     model,
-                    burn_percent: (!stale).then_some(burn_percent),
-                    weighted_units,
+                    burn_percent: (!stale).then_some(burn.burn_percent),
+                    weighted_units: burn.weighted_units,
                     weight_source,
                 }
             })
@@ -789,7 +817,8 @@ fn build_projection(
     stale: bool,
     is_scoped: bool,
     premium_cap_ratio: f64,
-    burn_by_model: &BTreeMap<(String, String), (f64, f64)>,
+    excluded_model_scope: Option<&str>,
+    burn_by_model: &BTreeMap<(String, String), ModelBurn>,
 ) -> Option<UsageProjection> {
     let weekly = window.window_kind == "weekly_all"
         || window.window_kind == "weekly_scoped"
@@ -816,25 +845,41 @@ fn build_projection(
         projected_raw_headroom
     };
 
-    let mut model_seats = BTreeMap::<String, BTreeMap<String, f64>>::new();
-    for ((seat_id, model), (burn_percent, _)) in burn_by_model {
-        if seat_id == "unassigned" || *burn_percent <= 0.0 {
+    let mut model_seats = BTreeMap::<String, BTreeMap<String, (f64, String)>>::new();
+    for ((seat_id, model), burn) in burn_by_model {
+        if seat_id == "unassigned"
+            || burn.burn_percent <= 0.0
+            || excluded_model_scope.is_some_and(|scope| model_matches_scope(model, scope))
+        {
             continue;
         }
+        let Some(first_bucket_ts) = burn.first_bucket_ts.clone() else {
+            continue;
+        };
         model_seats
             .entry(model.clone())
             .or_default()
-            .insert(seat_id.clone(), *burn_percent);
+            .insert(seat_id.clone(), (burn.burn_percent, first_bucket_ts));
     }
     let additional_seats = model_seats
         .into_iter()
         .filter_map(|(model, seats)| {
-            let conservative_burn = seats.values().copied().max_by(f64::total_cmp)?;
-            let burn_per_second = conservative_burn / elapsed_seconds as f64;
+            let eligible_rates = seats
+                .values()
+                .filter_map(|(burn_percent, first_bucket_ts)| {
+                    let first_bucket_at = parse_timestamp(first_bucket_ts)?;
+                    let active_started_at = first_bucket_at.max(started_at);
+                    let active_seconds = (observed_at - active_started_at).whole_seconds();
+                    (active_seconds >= MIN_PROJECTION_ELAPSED_SECONDS)
+                        .then_some(*burn_percent / active_seconds as f64)
+                })
+                .collect::<Vec<_>>();
+            let baseline_seats = eligible_rates.len();
+            let burn_per_second = eligible_rates.into_iter().max_by(f64::total_cmp)?;
             let candidate_remaining_burn = burn_per_second * horizon_seconds as f64;
             (candidate_remaining_burn > 0.0).then_some(UsageAdditionalSeatProjection {
                 model,
-                baseline_seats: seats.len(),
+                baseline_seats,
                 burn_points_per_seat_per_day: burn_per_second * 86_400.0,
                 additional_seat_equivalents: projected_raw_headroom / candidate_remaining_burn,
             })
@@ -846,7 +891,7 @@ fn build_projection(
         confidence: "low_conservative",
         assumptions: vec![
             "current-window account burn continues linearly until reset",
-            "candidate capacity uses the highest observed same-model seat burn",
+            "candidate capacity uses the highest same-model seat rate over each seat's active interval after one hour",
             "prior attribution may include invisible usage and biases capacity downward",
         ],
         elapsed_seconds,
@@ -912,10 +957,54 @@ fn usage_decision_summary(accounts: &[UsageAccountReport]) -> UsageDecisionSumma
         .flat_map(|account| &account.windows)
         .filter(|window| window.current && window.stale)
         .count();
-    let status = match (fresh_current_windows, stale_current_windows) {
-        (0, _) => "non_actionable",
-        (_, 0) => "actionable",
-        _ => "partial",
+    let mut missing_current_windows = Vec::new();
+    let mut accounts_needing_refresh = BTreeSet::new();
+    for account in accounts {
+        if !account.windows.iter().any(|window| window.current) {
+            continue;
+        }
+        let mut required = match account.provider.as_str() {
+            "claude" => vec![("session_5h", false), ("weekly_all", false)],
+            "codex" => vec![("codex_300", false), ("codex_10080", false)],
+            _ => Vec::new(),
+        };
+        let scoped_expected = account.provider == "claude"
+            && (account
+                .plan_tier
+                .as_deref()
+                .is_some_and(|tier| tier.to_ascii_lowercase().contains("max"))
+                || account
+                    .windows
+                    .iter()
+                    .any(|window| window.window_kind == "weekly_scoped"));
+        if scoped_expected {
+            required.push(("weekly_scoped", true));
+        }
+        for (kind, scoped) in required {
+            let present = account.windows.iter().any(|window| {
+                window.current
+                    && window.window_kind == kind
+                    && (window.window_scope.is_some() == scoped)
+            });
+            if !present {
+                missing_current_windows.push(format!("{}:{kind}", account.account_key));
+                accounts_needing_refresh.insert(account.account_key.clone());
+            }
+        }
+        if account
+            .windows
+            .iter()
+            .any(|window| window.current && window.stale)
+        {
+            accounts_needing_refresh.insert(account.account_key.clone());
+        }
+    }
+    let status = if !missing_current_windows.is_empty() || fresh_current_windows == 0 {
+        "non_actionable"
+    } else if stale_current_windows == 0 {
+        "actionable"
+    } else {
+        "partial"
     };
     let mut reasons = Vec::new();
     if fresh_current_windows == 0 && stale_current_windows == 0 {
@@ -929,13 +1018,16 @@ fn usage_decision_summary(accounts: &[UsageAccountReport]) -> UsageDecisionSumma
     if fresh_current_windows == 0 && stale_current_windows > 0 {
         reasons.push("No fresh quota meter is available for a spawn decision".to_owned());
     }
+    if !missing_current_windows.is_empty() {
+        reasons.push(format!(
+            "Missing current limiting meter(s): {}",
+            missing_current_windows.join(", ")
+        ));
+    }
 
     let mut refresh_guidance = BTreeSet::new();
     for account in accounts {
-        let needs_refresh = account
-            .windows
-            .iter()
-            .any(|window| window.current && window.stale);
+        let needs_refresh = accounts_needing_refresh.contains(&account.account_key);
         if !needs_refresh {
             continue;
         }
@@ -952,6 +1044,7 @@ fn usage_decision_summary(accounts: &[UsageAccountReport]) -> UsageDecisionSumma
         status,
         fresh_current_windows,
         stale_current_windows,
+        missing_current_windows,
         reasons,
         refresh_guidance: refresh_guidance.into_iter().collect(),
     }
@@ -1055,6 +1148,7 @@ mod tests {
                 seat_id: "seat-a".to_owned(),
                 model: "claude-fable-5".to_owned(),
                 credit_metered: false,
+                first_bucket_ts: None,
                 tokens: TokenCounts {
                     input: 10,
                     ..TokenCounts::default()
@@ -1064,6 +1158,7 @@ mod tests {
                 seat_id: "seat-b".to_owned(),
                 model: "claude-sonnet-5".to_owned(),
                 credit_metered: false,
+                first_bucket_ts: None,
                 tokens: TokenCounts {
                     input: 10,
                     ..TokenCounts::default()
@@ -1130,6 +1225,7 @@ mod tests {
                 seat_id: "quota-seat".to_owned(),
                 model: "claude-sonnet-5".to_owned(),
                 credit_metered: false,
+                first_bucket_ts: None,
                 tokens: TokenCounts {
                     input: 100,
                     ..TokenCounts::default()
@@ -1139,6 +1235,7 @@ mod tests {
                 seat_id: "paid-seat".to_owned(),
                 model: "claude-fable-5".to_owned(),
                 credit_metered: true,
+                first_bucket_ts: None,
                 tokens: TokenCounts {
                     input: 1_000,
                     ..TokenCounts::default()
@@ -1188,6 +1285,7 @@ mod tests {
             seat_id: "seat-a".to_owned(),
             model: "claude-sonnet-5".to_owned(),
             credit_metered: false,
+            first_bucket_ts: None,
             tokens: TokenCounts {
                 input: 10,
                 ..TokenCounts::default()
@@ -1297,6 +1395,7 @@ mod tests {
             seat_id: "seat-a".to_owned(),
             model: "claude-sonnet-5".to_owned(),
             credit_metered: false,
+            first_bucket_ts: None,
             tokens: TokenCounts {
                 input: 10,
                 ..TokenCounts::default()
@@ -1404,6 +1503,7 @@ mod tests {
                 seat_id: seat_id.to_owned(),
                 model: "claude-sonnet-5".to_owned(),
                 credit_metered: false,
+                first_bucket_ts: None,
                 tokens: TokenCounts {
                     input: 10,
                     ..TokenCounts::default()
@@ -1456,6 +1556,7 @@ mod tests {
             seat_id: "luna-seat".to_owned(),
             model: "gpt-5.6-luna".to_owned(),
             credit_metered: false,
+            first_bucket_ts: Some("2026-08-10T00:00:00Z".to_owned()),
             tokens: TokenCounts {
                 input: 100,
                 ..TokenCounts::default()
@@ -1492,6 +1593,89 @@ mod tests {
             projection.additional_seats[0].additional_seat_equivalents,
             0.5
         );
+    }
+
+    #[test]
+    fn premium_models_are_excluded_from_overall_seat_capacity_projection() {
+        let window = BurnWindow {
+            id: 1,
+            account_key: "claude:a".to_owned(),
+            window_kind: "weekly_all".to_owned(),
+            window_scope: None,
+            window_start: "2026-08-10T00:00:00Z".to_owned(),
+            percent: 10.0,
+            resets_at: "2026-08-17T00:00:00Z".to_owned(),
+            observed_at: "2026-08-11T00:00:00Z".to_owned(),
+        };
+        let burn_by_model = BTreeMap::from([
+            (
+                ("premium-seat".to_owned(), "claude-fable-5".to_owned()),
+                ModelBurn {
+                    burn_percent: 5.0,
+                    weighted_units: 10.0,
+                    first_bucket_ts: Some("2026-08-10T00:00:00Z".to_owned()),
+                },
+            ),
+            (
+                ("standard-seat".to_owned(), "claude-sonnet-5".to_owned()),
+                ModelBurn {
+                    burn_percent: 5.0,
+                    weighted_units: 10.0,
+                    first_bucket_ts: Some("2026-08-10T00:00:00Z".to_owned()),
+                },
+            ),
+        ]);
+
+        let projection = build_projection(
+            &window,
+            false,
+            false,
+            DEFAULT_PREMIUM_CAP_RATIO,
+            Some("Fable"),
+            &burn_by_model,
+        )
+        .unwrap();
+
+        assert_eq!(projection.additional_seats.len(), 1);
+        assert_eq!(projection.additional_seats[0].model, "claude-sonnet-5");
+    }
+
+    #[test]
+    fn short_lived_seat_is_not_used_as_a_capacity_baseline() {
+        let window = BurnWindow {
+            id: 1,
+            account_key: "codex:a".to_owned(),
+            window_kind: "codex_10080".to_owned(),
+            window_scope: None,
+            window_start: "2026-08-10T00:00:00Z".to_owned(),
+            percent: 10.0,
+            resets_at: "2026-08-17T00:00:00Z".to_owned(),
+            observed_at: "2026-08-11T00:00:00Z".to_owned(),
+        };
+        let burn_by_model = BTreeMap::from([(
+            ("new-seat".to_owned(), "gpt-5.6-luna".to_owned()),
+            ModelBurn {
+                burn_percent: 10.0,
+                weighted_units: 10.0,
+                first_bucket_ts: Some("2026-08-10T23:30:00Z".to_owned()),
+            },
+        )]);
+
+        let projection = build_projection(
+            &window,
+            false,
+            false,
+            DEFAULT_PREMIUM_CAP_RATIO,
+            None,
+            &burn_by_model,
+        )
+        .unwrap();
+
+        assert_eq!(
+            projection.seat_projection_status,
+            "no_observed_model_baseline"
+        );
+        assert!(projection.additional_seats.is_empty());
     }
 
     #[test]
@@ -1533,6 +1717,7 @@ mod tests {
         assert_eq!(decision.status, "non_actionable");
         assert_eq!(decision.fresh_current_windows, 0);
         assert_eq!(decision.stale_current_windows, 1);
+        assert_eq!(decision.missing_current_windows, ["codex:a:codex_300"]);
         assert!(decision
             .reasons
             .iter()
@@ -1541,6 +1726,51 @@ mod tests {
             .refresh_guidance
             .iter()
             .any(|guidance| guidance.contains("cannot force")));
+    }
+
+    #[test]
+    fn fresh_partial_provider_payload_is_non_actionable_when_weekly_meter_is_missing() {
+        let now = OffsetDateTime::parse("2026-08-11T01:00:00Z", &Rfc3339).unwrap();
+        let window = BurnWindow {
+            id: 1,
+            account_key: "codex:a".to_owned(),
+            window_kind: "codex_300".to_owned(),
+            window_scope: None,
+            window_start: "2026-08-11T00:00:00Z".to_owned(),
+            percent: 2.0,
+            resets_at: "2026-08-11T05:00:00Z".to_owned(),
+            observed_at: "2026-08-11T01:00:00Z".to_owned(),
+        };
+        let mut warnings = BTreeSet::new();
+        let report = build_window_report(
+            &window,
+            "codex",
+            &[],
+            None,
+            None,
+            &BTreeMap::new(),
+            false,
+            DEFAULT_PREMIUM_CAP_RATIO,
+            now,
+            &mut warnings,
+        );
+        let accounts = vec![UsageAccountReport {
+            account_key: "codex:a".to_owned(),
+            label: None,
+            provider: "codex".to_owned(),
+            plan_tier: Some("pro".to_owned()),
+            windows: vec![report],
+        }];
+
+        let decision = usage_decision_summary(&accounts);
+
+        assert_eq!(decision.status, "non_actionable");
+        assert_eq!(decision.fresh_current_windows, 1);
+        assert_eq!(decision.missing_current_windows, ["codex:a:codex_10080"]);
+        assert!(decision
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("Missing current limiting meter")));
     }
 
     #[test]
