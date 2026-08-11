@@ -827,6 +827,21 @@ impl SessionStore {
         log_dir: Option<PathBuf>,
         runtime: &TmuxRuntime,
     ) -> Result<SessionRecord> {
+        let codex_cli_working_dir = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            let sessions = state
+                .get("sessions")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let (provider, working_dir) = core_session_provider_and_working_dir(sessions, &request);
+            (provider == "codex").then_some(working_dir)
+        };
+        let codex_cli_binding_guard = codex_cli_working_dir
+            .as_deref()
+            .map(|working_dir| self.lock_codex_cli_binding_working_dir(working_dir))
+            .transpose()?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
@@ -837,6 +852,11 @@ impl SessionStore {
             true,
             runtime.socket_name(),
         )?;
+        if record.provider == "codex"
+            && codex_cli_working_dir.as_deref() != Some(record.working_dir.as_str())
+        {
+            anyhow::bail!("session creation context changed while waiting for Codex binding");
+        }
         ensure_runtime_local_node(&record.node)?;
         let log_file = record
             .log_file
@@ -869,12 +889,12 @@ impl SessionStore {
             )
         });
         runtime.create_session(&spec)?;
-        if let Some((excluded_ids, launched_at_ns)) = codex_cli_creation_binding {
+        if let Some((excluded_ids, launched_at_ns)) = codex_cli_creation_binding.as_ref() {
             record.provider_resume_id = wait_for_codex_cli_provider_resume_id(
                 &record,
                 &self.codex_sessions_root,
-                &excluded_ids,
-                launched_at_ns,
+                excluded_ids,
+                *launched_at_ns,
                 CODEX_CLI_SESSION_BIND_TIMEOUT,
             );
         }
@@ -912,6 +932,36 @@ impl SessionStore {
                         .as_ref()
                         .and_then(|artifacts| artifacts.event_stream_path.to_str()),
                 );
+            }
+        }
+        if record.provider_resume_id.is_none() {
+            if let Some((excluded_ids, launched_at_ns)) = codex_cli_creation_binding {
+                let store = self.clone();
+                let deferred_record = record.clone();
+                let deferred_session_id = record.id.clone();
+                let spawn_result = thread::Builder::new()
+                    .name(format!(
+                        "sm-codex-create-bind-{}",
+                        sanitize_path_component(&record.id)
+                    ))
+                    .spawn(move || {
+                        let _binding_guard = codex_cli_binding_guard;
+                        if let Err(error) = store.complete_deferred_codex_cli_rebind(
+                            &deferred_session_id,
+                            &deferred_record,
+                            &excluded_ids,
+                            launched_at_ns,
+                            None,
+                            CODEX_CLI_DEFERRED_BIND_TIMEOUT,
+                        ) {
+                            eprintln!(
+                                "deferred initial Codex thread discovery failed for seat {deferred_session_id}: {error:#}"
+                            );
+                        }
+                    });
+                if let Err(error) = spawn_result {
+                    eprintln!("failed to start deferred initial Codex thread discovery: {error}");
+                }
             }
         }
         if let Some(artifacts) = codex_fork_artifacts {
@@ -1632,8 +1682,12 @@ impl SessionStore {
         &self,
         record: &SessionRecord,
     ) -> Result<SessionClearGuard> {
+        self.lock_codex_cli_binding_working_dir(&record.working_dir)
+    }
+
+    fn lock_codex_cli_binding_working_dir(&self, working_dir: &str) -> Result<SessionClearGuard> {
         let sessions_root = resolve_path_lossy(self.codex_sessions_root.clone());
-        let working_dir = resolve_path_lossy(expand_home(&record.working_dir));
+        let working_dir = resolve_path_lossy(expand_home(working_dir));
         self.lock_named_clear_operation(&format!(
             "codex-cli-binding:{sessions_root}\0{working_dir}"
         ))
@@ -3806,16 +3860,8 @@ impl SessionStore {
                 .iter()
                 .find(|value| value.get("id").and_then(Value::as_str) == Some(parent_id))
         });
-        let parent_working_dir =
-            parent_session.and_then(|value| json_text(value.get("working_dir")));
         let parent_node = parent_session.and_then(|value| json_text(value.get("node")));
-        let provider = request
-            .provider
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("claude")
-            .to_owned();
+        let (provider, working_dir) = core_session_provider_and_working_dir(sessions, request);
         let name = request
             .name
             .as_deref()
@@ -3823,14 +3869,6 @@ impl SessionStore {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("{provider}-{session_id}"));
-        let working_dir = request
-            .working_dir
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .or(parent_working_dir.as_deref())
-            .unwrap_or(".")
-            .to_owned();
         let node = request
             .node
             .as_deref()
@@ -7225,6 +7263,11 @@ fn discover_claude_transcript_path(
         .filter(|path| has_text(Some(path)))
         .map(|path| resolve_path_lossy(expand_home(path)))
         .collect::<BTreeSet<_>>();
+    let claimed_provider_session_ids = sessions
+        .iter()
+        .filter(|session| session.id != record.id && session.provider == "claude")
+        .filter_map(provider_resume_id_for_restore)
+        .collect::<BTreeSet<_>>();
     let target_time_ns = session_time_ns(record)
         .or_else(|| file_mtime_ns(expand_home(&record.log_file.clone().unwrap_or_default())).ok())
         .unwrap_or(0);
@@ -7238,6 +7281,16 @@ fn discover_claude_transcript_path(
                 continue;
             }
             let metadata = read_claude_transcript_metadata(&path).unwrap_or_default();
+            let candidate_provider_session_id = metadata
+                .session_id
+                .clone()
+                .or_else(|| provider_resume_id_from_transcript_path(&resolved_transcript));
+            if candidate_provider_session_id
+                .as_ref()
+                .is_some_and(|session_id| claimed_provider_session_ids.contains(session_id))
+            {
+                continue;
+            }
             if let Some(cwd) = metadata.cwd.as_deref() {
                 if cwd != resolved_working_dir {
                     continue;
@@ -7378,6 +7431,34 @@ fn append_log_line(path: &Path, line: &str) -> Result<()> {
     writeln!(file, "{line}")
         .with_context(|| format!("failed to append session log {}", path.display()))?;
     Ok(())
+}
+
+fn core_session_provider_and_working_dir(
+    sessions: &[Value],
+    request: &CreateCoreSessionRequest,
+) -> (String, String) {
+    let parent_working_dir = request.parent_session_id.as_deref().and_then(|parent_id| {
+        sessions
+            .iter()
+            .find(|value| value.get("id").and_then(Value::as_str) == Some(parent_id))
+            .and_then(|value| json_text(value.get("working_dir")))
+    });
+    let provider = request
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("claude")
+        .to_owned();
+    let working_dir = request
+        .working_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(parent_working_dir.as_deref())
+        .unwrap_or(".")
+        .to_owned();
+    (provider, working_dir)
 }
 
 fn core_log_file_path(state_file: &Path, log_dir: Option<&Path>, session_id: &str) -> PathBuf {
@@ -10901,6 +10982,57 @@ mod tests {
         assert_eq!(
             provider_resume_id_for_restore(&session).as_deref(),
             Some(transcript_id)
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn claude_restore_excludes_sibling_artifacts_of_a_claimed_provider_session() {
+        let temp_dir = unique_temp_path("claude-claimed-transcript-siblings");
+        let projects_root = temp_dir.join("projects");
+        let working_dir = temp_dir.join("repo");
+        let transcript_id = "49d072b4-4080-4702-9215-b6e7f04aa2c8";
+        let transcript_dir = projects_root
+            .join(claude_project_dir_name(working_dir.to_str().unwrap()))
+            .join(transcript_id);
+        let chat_path = transcript_dir.join("chat.jsonl");
+        let subagent_path = transcript_dir.join("subagents").join("agent-worker.jsonl");
+        fs::create_dir_all(subagent_path.parent().unwrap()).unwrap();
+        let transcript_line = |timestamp: &str| {
+            format!(
+                "{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": transcript_id,
+                    "cwd": working_dir.display().to_string(),
+                    "timestamp": timestamp
+                })
+            )
+        };
+        fs::write(&chat_path, transcript_line("2026-06-23T01:20:00Z")).unwrap();
+        fs::write(&subagent_path, transcript_line("2026-06-23T01:21:00Z")).unwrap();
+
+        let mut claimed = session_record("running");
+        claimed.id = "claimed1".to_owned();
+        claimed.provider = "claude".to_owned();
+        claimed.working_dir = working_dir.display().to_string();
+        claimed.transcript_path = Some(chat_path.display().to_string());
+        let mut restoring = session_record("stopped");
+        restoring.id = "restore1".to_owned();
+        restoring.provider = "claude".to_owned();
+        restoring.working_dir = working_dir.display().to_string();
+        restoring.transcript_path = None;
+        restoring.provider_resume_id = None;
+        restoring.last_activity = "2026-06-23T01:22:00Z".to_owned();
+
+        assert_eq!(
+            discover_claude_transcript_path(
+                &restoring,
+                &[restoring.clone(), claimed],
+                &[projects_root],
+            ),
+            None
         );
 
         let _ = fs::remove_dir_all(temp_dir);

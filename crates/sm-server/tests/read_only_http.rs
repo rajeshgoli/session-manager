@@ -14144,6 +14144,100 @@ async fn runtime_core_rejects_review_when_session_is_busy() {
 }
 
 #[tokio::test]
+async fn runtime_core_delayed_initial_codex_binding_updates_session_chain() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_short_temp_dir("sm-rust-codex-create-bind");
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-codex-create-bind-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app_with_codex_composer(&state_file, &log_dir, &tmux_socket);
+    let now = time::OffsetDateTime::now_utc();
+    let sessions_root = state_file.with_extension("codex-home").join("sessions");
+    let day_dir = sessions_root
+        .join(format!("{:04}", now.year()))
+        .join(format!("{:02}", now.month() as u8))
+        .join(format!("{:02}", now.day()));
+    fs::create_dir_all(&day_dir).unwrap();
+    let rollout_path = day_dir.join("rollout-delayed-create-thread.jsonl");
+    let rollout_working_dir = working_dir.clone();
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(1_200));
+        fs::write(
+            rollout_path,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "delayed-create-thread",
+                        "cwd": rollout_working_dir.display().to_string(),
+                        "timestamp": (time::OffsetDateTime::now_utc()
+                            + time::Duration::seconds(1))
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap()
+                    }
+                })
+            ),
+        )
+        .unwrap();
+    });
+
+    let (status, payload) = post_json(
+        app,
+        "/sessions",
+        json!({
+            "id": "createcodex",
+            "name": "create-codex",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "codex"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["provider_resume_id"].is_null());
+    writer.join().unwrap();
+
+    let mut bound = false;
+    for _ in 0..30 {
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        bound = state["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == "createcodex")
+            .is_some_and(|session| session["provider_resume_id"] == "delayed-create-thread");
+        if bound {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        bound,
+        "deferred creation binding did not update the session"
+    );
+    let count: i64 = Connection::open(state_file.with_extension("usage.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'createcodex' AND provider_session_id = 'delayed-create-thread'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
 async fn runtime_core_clear_rebinds_plain_codex_provider_session_chain() {
     if !tmux_available() {
         return;
