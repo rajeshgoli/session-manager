@@ -69,12 +69,14 @@ impl Default for AppConfig {
                 Vec::new(),
                 Some("sonnet".to_owned()),
                 None,
+                None,
             ),
             codex: ProviderLaunchConfig::new(
                 "codex".to_owned(),
                 Vec::new(),
                 None,
                 Some("~/.codex/session_index.jsonl".to_owned()),
+                None,
             ),
             codex_review: CodexReviewConfig::default(),
             codex_fork: CodexForkLaunchConfig::default(),
@@ -669,6 +671,7 @@ pub struct ProviderLaunchConfig {
     pub args: Vec<String>,
     pub default_model: Option<String>,
     pub session_index_path: Option<String>,
+    pub transcript_root: Option<String>,
 }
 
 impl ProviderLaunchConfig {
@@ -677,12 +680,14 @@ impl ProviderLaunchConfig {
         args: Vec<String>,
         default_model: Option<String>,
         session_index_path: Option<String>,
+        transcript_root: Option<String>,
     ) -> Self {
         Self {
             command,
             args,
             default_model,
             session_index_path,
+            transcript_root,
         }
     }
 }
@@ -693,6 +698,7 @@ impl Default for ProviderLaunchConfig {
             "claude".to_owned(),
             Vec::new(),
             Some("sonnet".to_owned()),
+            None,
             None,
         )
     }
@@ -1324,6 +1330,8 @@ struct RawProviderLaunchConfig {
     default_model: Option<String>,
     #[serde(default)]
     session_index_path: Option<String>,
+    #[serde(default)]
+    transcript_root: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -1407,6 +1415,9 @@ fn provider_launch_config(
             .as_ref()
             .and_then(|value| trimmed(&Some(value.clone())))
             .or_else(|| default_session_index_path.map(ToOwned::to_owned)),
+        raw.transcript_root
+            .as_ref()
+            .and_then(|value| trimmed(&Some(value.clone()))),
     )
 }
 
@@ -2348,6 +2359,23 @@ codex_fork:
         let config = AppConfig::from(raw);
 
         assert!(config.codex_fork.control_tmux_fallback_enabled);
+    }
+
+    #[test]
+    fn raw_config_reads_claude_transcript_root() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+claude:
+  transcript_root: "/tmp/claude-projects"
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(
+            config.claude.transcript_root.as_deref(),
+            Some("/tmp/claude-projects")
+        );
     }
 
     #[test]

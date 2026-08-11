@@ -92,6 +92,19 @@ async fn main() -> Result<()> {
     }
 
     let state = AppState::new(config);
+    // Capture the artifact boundary before serving. The background scan may run
+    // alongside live creates, but it must not attribute their new artifacts
+    // against this startup snapshot of the seat registry.
+    let reconciliation_cutoff_ns = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let reconciliation_snapshot = state
+        .prepare_seat_session_reconciliation(reconciliation_cutoff_ns)
+        .context("failed to snapshot sessions for usage ledger reconciliation")?;
+    let reconciliation_state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = reconciliation_state.reconcile_seat_sessions(reconciliation_snapshot) {
+            eprintln!("usage ledger session reconciliation failed: {error:#}");
+        }
+    });
 
     if state.config().usage.enabled {
         let poll_interval = state.config().usage.poll_interval_secs;

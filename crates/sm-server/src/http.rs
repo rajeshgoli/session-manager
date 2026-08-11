@@ -118,11 +118,12 @@ use crate::sessions::{
     ContextUsageEvent, ContextUsageOutcome, CoreClearOutcome, CoreInputBatchResponse,
     CoreInputBatchResult, CoreRestoreOutcome, CoreRetireOutcome, CoreReviewOutcome,
     CreateCoreSessionRequest, HandoffOutcome, HandoffRequest, MaintainerMutationOutcome,
-    RegistryMutationOutcome, RoleRegistrationRequest, SendCoreInputBatchRequest,
-    SendCoreInputRequest, SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore,
-    SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest,
-    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
-    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
+    RegistryMutationOutcome, RoleRegistrationRequest, SeatSessionReconciliationSnapshot,
+    SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
+    SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
+    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
+    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
+    UpdateSessionMetadataRequest,
 };
 
 use crate::studio_ssh::{self, StudioSshStatus};
@@ -371,6 +372,8 @@ impl AppState {
         let state_file = expand_home(&config.paths.state_file);
         let queue_db_path = expand_home(&config.sm_send.db_path);
         let session_store = SessionStore::new_with_queue(state_file, queue_db_path)
+            .with_codex_session_index_path(config.codex.session_index_path.as_deref())
+            .with_claude_transcript_root(config.claude.transcript_root.as_deref())
             .with_context_monitor_config(config.context_monitor.clone())
             .with_delivery_runtime(
                 config
@@ -419,6 +422,25 @@ impl AppState {
     /// Read-only access to the loaded configuration (used to launch background tasks).
     pub fn config(&self) -> &AppConfig {
         &self.config
+    }
+
+    pub fn reconcile_current_seat_sessions(&self) -> anyhow::Result<()> {
+        self.session_store.reconcile_current_seat_sessions()
+    }
+
+    pub fn prepare_seat_session_reconciliation(
+        &self,
+        artifact_cutoff_ns: i128,
+    ) -> anyhow::Result<SeatSessionReconciliationSnapshot> {
+        self.session_store
+            .prepare_seat_session_reconciliation(artifact_cutoff_ns)
+    }
+
+    pub fn reconcile_seat_sessions(
+        &self,
+        snapshot: SeatSessionReconciliationSnapshot,
+    ) -> anyhow::Result<()> {
+        self.session_store.reconcile_seat_sessions(snapshot)
     }
 }
 

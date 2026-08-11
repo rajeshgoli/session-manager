@@ -255,6 +255,9 @@ claude:
     - "--bypass-permissions"
   # Default model for spawned sessions (agent can override with --model flag)
   default_model: "sonnet"
+  # Optional Claude transcript project root; environment and default roots are
+  # also scanned for historical session chaining.
+  transcript_root: "~/.claude/projects"
 
 # Account identity timeline for sm usage. Keep disabled until the epic is ready
 # for owner-controlled activation.
