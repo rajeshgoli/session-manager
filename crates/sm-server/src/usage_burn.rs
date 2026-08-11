@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Map, Value};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -118,42 +118,7 @@ impl UsageBurnStore {
         let observed_at = format_timestamp(observed_at)?;
         let mut connection = self.open()?;
         let transaction = connection.transaction()?;
-        let mut inserted = 0;
-        for window in windows {
-            let resets_at = format_timestamp(window.resets_at)?;
-            let window_start = format_timestamp(
-                window.resets_at - time::Duration::minutes(window.duration_minutes),
-            )?;
-            inserted += transaction.execute(
-                r#"
-                INSERT INTO burn_samples (
-                  account_key, window_kind, window_scope, window_start, percent,
-                  resets_at, severity, is_active, source, observed_at
-                )
-                SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
-                WHERE NOT EXISTS (
-                  SELECT 1 FROM burn_samples
-                  WHERE account_key = ?1
-                    AND window_kind = ?2
-                    AND window_scope IS ?3
-                    AND source = ?9
-                    AND observed_at = ?10
-                )
-                "#,
-                params![
-                    account_key,
-                    window.window_kind,
-                    window.window_scope,
-                    window_start,
-                    window.percent,
-                    resets_at,
-                    window.severity,
-                    window.is_active,
-                    source,
-                    observed_at,
-                ],
-            )?;
-        }
+        let inserted = insert_windows(&transaction, account_key, windows, source, &observed_at)?;
         transaction.commit()?;
         Ok(inserted)
     }
@@ -236,16 +201,13 @@ impl UsageBurnStore {
         let limit_id = json_string(rate_limits, "limitId")
             .or_else(|| json_string(rate_limits, "limit_id"))
             .unwrap_or_else(|| "codex".to_owned());
-        let limit_name = json_string(rate_limits, "limitName")
-            .or_else(|| json_string(rate_limits, "limit_name"));
-        let scope = if limit_id == "codex" {
-            limit_name
-        } else {
-            limit_name.or(Some(limit_id))
-        };
+        let scope = (limit_id != "codex").then_some(limit_id);
         let severity = json_string(rate_limits, "rateLimitReachedType")
             .or_else(|| json_string(rate_limits, "rate_limit_reached_type"))
             .map(|_| "critical".to_owned());
+        let observed_at_text = format_timestamp(observed_at)?;
+        let mut connection = self.open()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut windows = Vec::new();
         for slot in ["primary", "secondary"] {
             let Some(update) = rate_limits.get(slot).and_then(Value::as_object) else {
@@ -268,11 +230,12 @@ impl UsageBurnStore {
                 continue;
             }
             let window_kind = format!("codex_{duration_minutes}");
-            let previous = self.latest_window(
+            let previous = latest_window(
+                &transaction,
                 &attribution.account_key,
                 &window_kind,
                 scope.as_deref(),
-                observed_at,
+                &observed_at_text,
             )?;
             let percent = percent_update.or_else(|| previous.as_ref().map(|window| window.0));
             let resets_at = reset_update.or_else(|| previous.as_ref().map(|window| window.1));
@@ -289,42 +252,91 @@ impl UsageBurnStore {
                 is_active: None,
             });
         }
-        self.record_for_account(
+        for window in &windows {
+            validate_window(window)?;
+        }
+        let inserted = insert_windows(
+            &transaction,
             &attribution.account_key,
             &windows,
             "codex_event",
-            observed_at,
-        )
+            &observed_at_text,
+        )?;
+        transaction.commit()?;
+        Ok(inserted)
     }
+}
 
-    fn latest_window(
-        &self,
-        account_key: &str,
-        window_kind: &str,
-        window_scope: Option<&str>,
-        observed_at: OffsetDateTime,
-    ) -> Result<Option<(f64, OffsetDateTime)>> {
-        let connection = self.open()?;
-        let observed_at = format_timestamp(observed_at)?;
-        let row = connection
-            .query_row(
-                r#"
-                SELECT percent, resets_at
-                FROM burn_samples
-                WHERE account_key = ?1
-                  AND window_kind = ?2
-                  AND window_scope IS ?3
-                  AND observed_at <= ?4
-                ORDER BY observed_at DESC, id DESC
-                LIMIT 1
-                "#,
-                params![account_key, window_kind, window_scope, observed_at],
-                |row| Ok((row.get::<_, f64>(0)?, row.get::<_, String>(1)?)),
+fn latest_window(
+    transaction: &Transaction<'_>,
+    account_key: &str,
+    window_kind: &str,
+    window_scope: Option<&str>,
+    observed_at: &str,
+) -> Result<Option<(f64, OffsetDateTime)>> {
+    let row = transaction
+        .query_row(
+            r#"
+            SELECT percent, resets_at
+            FROM burn_samples
+            WHERE account_key = ?1
+              AND window_kind = ?2
+              AND window_scope IS ?3
+              AND observed_at <= ?4
+            ORDER BY observed_at DESC, id DESC
+            LIMIT 1
+            "#,
+            params![account_key, window_kind, window_scope, observed_at],
+            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    row.map(|(percent, resets_at)| Ok((percent, OffsetDateTime::parse(&resets_at, &Rfc3339)?)))
+        .transpose()
+}
+
+fn insert_windows(
+    transaction: &Transaction<'_>,
+    account_key: &str,
+    windows: &[BurnWindowSample],
+    source: &str,
+    observed_at: &str,
+) -> Result<usize> {
+    let mut inserted = 0;
+    for window in windows {
+        let resets_at = format_timestamp(window.resets_at)?;
+        let window_start =
+            format_timestamp(window.resets_at - time::Duration::minutes(window.duration_minutes))?;
+        inserted += transaction.execute(
+            r#"
+            INSERT INTO burn_samples (
+              account_key, window_kind, window_scope, window_start, percent,
+              resets_at, severity, is_active, source, observed_at
             )
-            .optional()?;
-        row.map(|(percent, resets_at)| Ok((percent, OffsetDateTime::parse(&resets_at, &Rfc3339)?)))
-            .transpose()
+            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+            WHERE NOT EXISTS (
+              SELECT 1 FROM burn_samples
+              WHERE account_key = ?1
+                AND window_kind = ?2
+                AND window_scope IS ?3
+                AND source = ?9
+                AND observed_at = ?10
+            )
+            "#,
+            params![
+                account_key,
+                window.window_kind,
+                window.window_scope,
+                window_start,
+                window.percent,
+                resets_at,
+                window.severity,
+                window.is_active,
+                source,
+                observed_at,
+            ],
+        )?;
     }
+    Ok(inserted)
 }
 
 #[derive(Debug, Clone)]
@@ -511,7 +523,14 @@ fn format_timestamp(value: OffsetDateTime) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            mpsc,
+        },
+        thread,
+        time::Duration as StdDuration,
+    };
 
     use rusqlite::Connection;
     use serde_json::json;
@@ -849,5 +868,156 @@ mod tests {
             .unwrap();
         assert_eq!(delayed_percent, 10.0);
         assert_eq!(latest_percent, 30.0);
+    }
+
+    #[test]
+    fn codex_sparse_merge_waits_for_a_concurrent_writer_before_reading_history() {
+        let db_path = temp_db("codex-concurrent");
+        seed_account(
+            &db_path,
+            Provider::Codex,
+            "codex-account",
+            "2026-08-10T12:00:00Z",
+        );
+        let store = UsageBurnStore::new(&db_path).unwrap();
+        let baseline = json!({
+            "event_type": "account/rateLimits/updated",
+            "ts": "2026-08-10T12:01:00Z",
+            "payload": {"rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                    "usedPercent": 10,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1786381200_i64
+                }
+            }}
+        });
+        store
+            .record_codex_event(baseline.as_object().unwrap(), at("2026-08-10T12:01:00Z"))
+            .unwrap();
+
+        let mut blocker_connection = store.open().unwrap();
+        let blocker = blocker_connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        insert_windows(
+            &blocker,
+            "codex:codex-account",
+            &[BurnWindowSample {
+                window_kind: "codex_300".to_owned(),
+                window_scope: None,
+                duration_minutes: 300,
+                percent: 20.0,
+                resets_at: OffsetDateTime::from_unix_timestamp(1786381200).unwrap(),
+                severity: None,
+                is_active: None,
+            }],
+            "codex_event",
+            "2026-08-10T12:02:00.000000000Z",
+        )
+        .unwrap();
+
+        let reset_only = json!({
+            "event_type": "account/rateLimits/updated",
+            "ts": "2026-08-10T12:03:00Z",
+            "payload": {"rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                    "windowDurationMins": 300,
+                    "resetsAt": 1786384800_i64
+                }
+            }}
+        });
+        let (sent, received) = mpsc::channel();
+        let concurrent_store = store.clone();
+        let writer =
+            thread::spawn(move || {
+                sent.send(concurrent_store.record_codex_event(
+                    reset_only.as_object().unwrap(),
+                    at("2026-08-10T12:03:00Z"),
+                ))
+                .unwrap();
+            });
+        assert!(received.recv_timeout(StdDuration::from_millis(50)).is_err());
+        blocker.commit().unwrap();
+        assert_eq!(
+            received
+                .recv_timeout(StdDuration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        writer.join().unwrap();
+
+        let merged_percent: f64 = Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT percent FROM burn_samples WHERE observed_at = '2026-08-10T12:03:00.000000000Z'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(merged_percent, 20.0);
+    }
+
+    #[test]
+    fn codex_non_default_windows_are_keyed_by_limit_id_not_name() {
+        let db_path = temp_db("codex-limit-id");
+        seed_account(
+            &db_path,
+            Provider::Codex,
+            "codex-account",
+            "2026-08-10T12:00:00Z",
+        );
+        let store = UsageBurnStore::new(&db_path).unwrap();
+        for (timestamp, name, percent, reset) in [
+            (
+                "2026-08-10T12:01:00Z",
+                "Fable",
+                Some(10),
+                Some(1786381200_i64),
+            ),
+            ("2026-08-10T12:02:00Z", "Sol", Some(20), None),
+        ] {
+            let event = json!({
+                "event_type": "account/rateLimits/updated",
+                "ts": timestamp,
+                "payload": {"rateLimits": {
+                    "limitId": "premium",
+                    "limitName": name,
+                    "primary": {
+                        "usedPercent": percent,
+                        "windowDurationMins": 300,
+                        "resetsAt": reset
+                    }
+                }}
+            });
+            assert_eq!(
+                store
+                    .record_codex_event(event.as_object().unwrap(), at(timestamp))
+                    .unwrap(),
+                1
+            );
+        }
+
+        let connection = Connection::open(db_path).unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM burn_samples WHERE window_kind = 'codex_300'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let latest: (String, f64, String) = connection
+            .query_row(
+                "SELECT window_scope, percent, resets_at FROM burn_samples WHERE window_kind = 'codex_300' ORDER BY observed_at DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(latest.0, "premium");
+        assert_eq!(latest.1, 20.0);
+        assert_eq!(latest.2, "2026-08-10T17:00:00.000000000Z");
     }
 }
