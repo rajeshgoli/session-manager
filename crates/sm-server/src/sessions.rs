@@ -4021,8 +4021,11 @@ impl SessionStore {
 
         let mut changed = false;
         let provider_resume_id = codex_fork_provider_resume_id(event);
+        let provider_resume_id_changed = provider_resume_id.as_deref().is_some_and(|value| {
+            json_text(session.get("provider_resume_id")).as_deref() != Some(value)
+        });
         if let Some(provider_resume_id) = provider_resume_id.as_deref() {
-            if json_text(session.get("provider_resume_id")).as_deref() != Some(provider_resume_id) {
+            if provider_resume_id_changed {
                 session.insert(
                     "provider_resume_id".to_owned(),
                     Value::String(provider_resume_id.to_owned()),
@@ -4126,13 +4129,15 @@ impl SessionStore {
             self.write_raw_json_value(&state)?;
         }
         drop(_guard);
-        if let Some(provider_resume_id) = provider_resume_id {
-            self.append_seat_session(
-                session_id,
-                &provider,
-                &provider_resume_id,
-                artifact_path.and_then(Path::to_str),
-            );
+        if provider_resume_id_changed {
+            if let Some(provider_resume_id) = provider_resume_id {
+                self.append_seat_session(
+                    session_id,
+                    &provider,
+                    &provider_resume_id,
+                    artifact_path.and_then(Path::to_str),
+                );
+            }
         }
         let observed_at = OffsetDateTime::now_utc();
         if let Some(store) = self.usage_burn_store.as_ref() {
@@ -9942,6 +9947,51 @@ mod tests {
                 .as_deref(),
             Some("thread-after-handoff")
         );
+    }
+
+    #[test]
+    fn repeated_codex_session_identity_does_not_rewrite_the_provider_chain() {
+        let state_file = unique_temp_path("codex-session-chain-repeat");
+        let usage_db_path = state_file.with_extension("usage.db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "provider_resume_id": "existing-thread",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+        store
+            .seat_session_store
+            .append("codex001", "codex-fork", "existing-thread", None)
+            .unwrap();
+        let connection = rusqlite::Connection::open(usage_db_path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = Instant::now();
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"account/rateLimits/updated","session_id":"existing-thread","payload":{"rateLimits":{}}}"#,
+            )
+            .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an unchanged provider identity attempted another usage DB write"
+        );
+        connection.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]
