@@ -27,7 +27,7 @@ use sm_server::{
     http::{router, AppState, GitHubReviewComment, GitHubReviewMatch, GitHubReviewPoster},
     runtime::TmuxRuntime,
     sessions::{SendCoreInputRequest, SessionStore},
-    usage_identity::UsageIdentityStore,
+    usage_identity::{AccountIdentity, Provider, UsageIdentityStore},
 };
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -7612,6 +7612,91 @@ async fn context_usage_hook_is_served_and_records_tokens() {
     let (status, payload) = get_json(app, "/sessions/run12345").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["tokens_used"], json!(83_000));
+}
+
+#[tokio::test]
+async fn context_usage_hook_records_claude_rate_limits_in_the_configured_usage_database() {
+    let state_file = write_session_fixture();
+    let usage_db_path = unique_temp_path().with_extension("usage.db");
+    let now = time::OffsetDateTime::now_utc();
+    let identity_store = UsageIdentityStore::new(&usage_db_path).unwrap();
+    identity_store
+        .record_observation(
+            Provider::Claude,
+            Some(&AccountIdentity {
+                provider: Provider::Claude,
+                external_id: "claude-test-account".to_owned(),
+                label: None,
+                plan_tier: None,
+            }),
+            now - time::Duration::minutes(1),
+            None,
+            None,
+        )
+        .unwrap();
+    let mut config = config_with_state_file(&state_file);
+    config.usage.enabled = true;
+    config.usage.db_path = usage_db_path.display().to_string();
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(
+        app,
+        "/hooks/context-usage",
+        json!({
+            "session_id": "run12345",
+            "used_percentage": 42.0,
+            "total_input_tokens": 84_000,
+            "rate_limits": {
+                "five_hour": {
+                    "used_percentage": 12.0,
+                    "resets_at": (now + time::Duration::hours(5)).format(&time::format_description::well_known::Rfc3339).unwrap()
+                },
+                "seven_day": {
+                    "used_percentage": 34.0,
+                    "resets_at": (now + time::Duration::days(7)).format(&time::format_description::well_known::Rfc3339).unwrap()
+                }
+            },
+            "sm_hook_emitted_at": now.format(&time::format_description::well_known::Rfc3339).unwrap()
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+
+    let connection = Connection::open(usage_db_path).unwrap();
+    let rows = connection
+        .prepare(
+            "SELECT account_key, window_kind, percent, source FROM burn_samples ORDER BY window_kind",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "claude:claude-test-account".to_owned(),
+                "session_5h".to_owned(),
+                12.0,
+                "statusline".to_owned(),
+            ),
+            (
+                "claude:claude-test-account".to_owned(),
+                "weekly_all".to_owned(),
+                34.0,
+                "statusline".to_owned(),
+            ),
+        ]
+    );
 }
 
 #[tokio::test]

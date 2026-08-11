@@ -30,6 +30,7 @@ use crate::{
     config::{CodexReviewConfig, ContextMonitorConfig},
     runtime::{TmuxRuntime, TmuxSessionSpec},
     seat_sessions::{SeatSessionIdentity, SeatSessionStore},
+    usage_burn::UsageBurnStore,
 };
 
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
@@ -66,6 +67,7 @@ pub struct SessionStore {
     codex_fork_handoff_monitors: Arc<Mutex<BTreeSet<String>>>,
     clear_operation_locks: Arc<Mutex<BTreeMap<String, Weak<SessionClearLock>>>>,
     seat_session_store: SeatSessionStore,
+    usage_burn_store: Option<UsageBurnStore>,
 }
 
 #[derive(Debug)]
@@ -113,6 +115,7 @@ impl SessionStore {
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
+            usage_burn_store: None,
         }
     }
 
@@ -126,6 +129,29 @@ impl SessionStore {
     pub fn with_usage_db_path(mut self, db_path: PathBuf) -> Self {
         self.seat_session_store = SeatSessionStore::new(db_path);
         self
+    }
+
+    pub fn with_usage_burn_store(mut self, store: UsageBurnStore) -> Self {
+        self.usage_burn_store = Some(store);
+        self
+    }
+
+    pub fn record_claude_statusline_burn(&self, event: &ContextUsageEvent) -> Result<usize> {
+        let Some(store) = self.usage_burn_store.as_ref() else {
+            return Ok(0);
+        };
+        let observed_at = event
+            .emitted_at
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .unwrap_or_else(OffsetDateTime::now_utc);
+        store.record_claude_statusline(
+            observed_at,
+            event.five_hour_percent,
+            event.five_hour_resets_at.as_deref(),
+            event.seven_day_percent,
+            event.seven_day_resets_at.as_deref(),
+        )
     }
 
     pub fn with_context_monitor_config(mut self, config: ContextMonitorConfig) -> Self {
@@ -406,6 +432,7 @@ impl SessionStore {
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
+            usage_burn_store: None,
         }
     }
 
@@ -3868,6 +3895,11 @@ impl SessionStore {
                 artifact_path.and_then(Path::to_str),
             );
         }
+        if let Some(store) = self.usage_burn_store.as_ref() {
+            if let Err(error) = store.record_codex_event(event, OffsetDateTime::now_utc()) {
+                eprintln!("Codex rate-limit ingest failed for {session_id}: {error:#}");
+            }
+        }
         Ok(())
     }
 
@@ -4478,6 +4510,14 @@ pub struct ContextUsageEvent {
     pub used_percentage: Option<f64>,
     #[serde(default)]
     pub total_input_tokens: Option<i64>,
+    #[serde(default)]
+    pub five_hour_percent: Option<f64>,
+    #[serde(default)]
+    pub five_hour_resets_at: Option<String>,
+    #[serde(default)]
+    pub seven_day_percent: Option<f64>,
+    #[serde(default)]
+    pub seven_day_resets_at: Option<String>,
     /// Stamped by the producer hook before it detached its curl, so it describes
     /// when the sample was taken rather than when it arrived. Absent for hooks
     /// predating that change.
@@ -8555,6 +8595,8 @@ fn extract_provider_native_rename_name(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage_identity::{AccountIdentity, Provider, UsageIdentityStore};
+    use rusqlite::Connection;
 
     static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -11190,10 +11232,9 @@ mod tests {
     fn usage_event(session_id: &str, used_percentage: f64, tokens: i64) -> ContextUsageEvent {
         ContextUsageEvent {
             session_id: session_id.to_owned(),
-            event: None,
             used_percentage: Some(used_percentage),
             total_input_tokens: Some(tokens),
-            emitted_at: None,
+            ..ContextUsageEvent::default()
         }
     }
 
@@ -11213,9 +11254,7 @@ mod tests {
         ContextUsageEvent {
             session_id: session_id.to_owned(),
             event: Some(event.to_owned()),
-            used_percentage: None,
-            total_input_tokens: None,
-            emitted_at: None,
+            ..ContextUsageEvent::default()
         }
     }
 
@@ -11729,10 +11768,8 @@ mod tests {
                 .apply_context_usage_event(
                     &ContextUsageEvent {
                         session_id: "child001".to_owned(),
-                        event: None,
-                        used_percentage: None,
                         total_input_tokens: Some(0),
-                        emitted_at: None,
+                        ..ContextUsageEvent::default()
                     },
                     None
                 )
@@ -11803,6 +11840,87 @@ mod tests {
 
         store.apply_codex_fork_event_line("codex001", line).unwrap();
         assert!(context_monitor_messages(&store).is_empty());
+    }
+
+    #[test]
+    fn codex_rate_limit_event_records_burn_for_the_current_account() {
+        let state_file = unique_temp_path("codexburn");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let usage_db_path = state_file.with_extension("usage.db");
+        let observed_at = OffsetDateTime::now_utc();
+        UsageIdentityStore::new(&usage_db_path)
+            .unwrap()
+            .record_observation(
+                Provider::Codex,
+                Some(&AccountIdentity {
+                    provider: Provider::Codex,
+                    external_id: "codex-test-account".to_owned(),
+                    label: None,
+                    plan_tier: Some("pro".to_owned()),
+                }),
+                observed_at - TimeDuration::minutes(1),
+                None,
+                None,
+            )
+            .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file)
+            .with_usage_burn_store(UsageBurnStore::new(&usage_db_path).unwrap());
+        let event_timestamp = observed_at.format(&Rfc3339).unwrap();
+        let reset_at = (observed_at + TimeDuration::minutes(300)).unix_timestamp();
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                &json!({
+                    "event_type": "account/rateLimits/updated",
+                    "ts": event_timestamp,
+                    "payload": {"rateLimits": {
+                        "limitId": "codex",
+                        "primary": {
+                            "usedPercent": 27,
+                            "windowDurationMins": 300,
+                            "resetsAt": reset_at
+                        },
+                        "secondary": null
+                    }}
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        let row: (String, String, f64, String) = Connection::open(usage_db_path)
+            .unwrap()
+            .query_row(
+                "SELECT account_key, window_kind, percent, source FROM burn_samples",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "codex:codex-test-account".to_owned(),
+                "codex_300".to_owned(),
+                27.0,
+                "codex_event".to_owned(),
+            )
+        );
     }
 
     #[test]

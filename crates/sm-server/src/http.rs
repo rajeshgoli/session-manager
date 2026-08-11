@@ -131,6 +131,7 @@ use crate::tool_usage::{
     list_recent_codex_fork_tool_calls_from_path, list_recent_tool_calls_from_path,
     log_tool_usage_to_path, ToolCallRow, ToolUsageEvent,
 };
+use crate::usage_burn::UsageBurnStore;
 
 const SESSION_COOKIE_NAME: &str = "sm_auth";
 const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
@@ -383,6 +384,12 @@ impl AppState {
             );
         if should_use_configured_usage_db_path(&config.usage) {
             session_store = session_store.with_usage_db_path(expand_home(&config.usage.db_path));
+        }
+        if config.usage.enabled {
+            match UsageBurnStore::new(expand_home(&config.usage.db_path)) {
+                Ok(store) => session_store = session_store.with_usage_burn_store(store),
+                Err(error) => eprintln!("usage burn store initialization failed: {error:#}"),
+            }
         }
         if let Err(error) = session_store.recover_pending_codex_fork_handoffs() {
             eprintln!("codex-fork handoff recovery failed: {error:#}");
@@ -1455,6 +1462,13 @@ async fn context_usage_hook(
         "/hooks/context-usage",
     )?;
 
+    let rate_limits = payload.get("rate_limits").and_then(Value::as_object);
+    let five_hour = rate_limits
+        .and_then(|limits| limits.get("five_hour"))
+        .and_then(Value::as_object);
+    let seven_day = rate_limits
+        .and_then(|limits| limits.get("seven_day"))
+        .and_then(Value::as_object);
     let event = ContextUsageEvent {
         session_id,
         event: payload
@@ -1465,6 +1479,24 @@ async fn context_usage_hook(
             .map(ToOwned::to_owned),
         used_percentage: payload.get("used_percentage").and_then(Value::as_f64),
         total_input_tokens: payload_i64(payload.get("total_input_tokens")),
+        five_hour_percent: five_hour
+            .and_then(|window| window.get("used_percentage"))
+            .and_then(Value::as_f64)
+            .or_else(|| payload.get("five_hour_percent").and_then(Value::as_f64)),
+        five_hour_resets_at: five_hour
+            .and_then(|window| window.get("resets_at"))
+            .or_else(|| payload.get("five_hour_resets_at"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        seven_day_percent: seven_day
+            .and_then(|window| window.get("used_percentage"))
+            .and_then(Value::as_f64)
+            .or_else(|| payload.get("seven_day_percent").and_then(Value::as_f64)),
+        seven_day_resets_at: seven_day
+            .and_then(|window| window.get("resets_at"))
+            .or_else(|| payload.get("seven_day_resets_at"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         emitted_at: hook_emitted_at(&payload).map(ToOwned::to_owned),
     };
 
@@ -1476,6 +1508,11 @@ async fn context_usage_hook(
     let outcome = state
         .session_store
         .apply_context_usage_event(&event, runtime.as_ref())?;
+    if !matches!(outcome, ContextUsageOutcome::UnknownSession) {
+        if let Err(error) = state.session_store.record_claude_statusline_burn(&event) {
+            eprintln!("Claude status-line burn ingest failed: {error:#}");
+        }
+    }
 
     let mut body = json!({ "status": outcome.status() });
     match &outcome {
