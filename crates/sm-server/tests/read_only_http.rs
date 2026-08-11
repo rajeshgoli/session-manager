@@ -23,10 +23,12 @@ use sm_server::{
         ExternalAccessConfig, GoogleAuthConfig, MobileAnalyticsConfig, MobileTerminalConfig,
         MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, NodeConfig, PathsConfig,
         ProviderLaunchConfig, QueueRunnerConfig, RustCoreConfig, SmSendConfig, ToolLoggingConfig,
+        UsageAccountConfig,
     },
     http::{router, AppState, GitHubReviewComment, GitHubReviewMatch, GitHubReviewPoster},
     runtime::TmuxRuntime,
     sessions::{SendCoreInputRequest, SessionStore},
+    usage_burn::{BurnWindowSample, UsageBurnStore},
     usage_identity::{AccountIdentity, Provider, UsageIdentityStore},
 };
 #[cfg(unix)]
@@ -7698,6 +7700,179 @@ async fn context_usage_hook_records_claude_rate_limits_in_the_configured_usage_d
             ),
         ]
     );
+    let state: Value = serde_json::from_str(&fs::read_to_string(state_file).unwrap()).unwrap();
+    assert_eq!(
+        state["sessions"][0]["account_key"],
+        "claude:claude-test-account"
+    );
+}
+
+#[tokio::test]
+async fn usage_routes_preserve_exact_account_burn_and_optionally_include_children() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "parent01",
+                    "name": "claude-parent01",
+                    "friendly_name": "parent",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-parent01",
+                    "provider": "claude",
+                    "account_key": "claude:usage-account",
+                    "usage_cap_fraction": 0.5,
+                    "status": "running",
+                    "created_at": "2026-08-10T00:00:00Z",
+                    "last_activity": "2026-08-10T00:00:00Z"
+                },
+                {
+                    "id": "child001",
+                    "name": "claude-child001",
+                    "friendly_name": "child",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-child001",
+                    "provider": "claude",
+                    "parent_session_id": "parent01",
+                    "status": "running",
+                    "created_at": "2026-08-10T00:00:00Z",
+                    "last_activity": "2026-08-10T00:00:00Z"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let usage_db_path = unique_temp_path().with_extension("usage.db");
+    let now = time::OffsetDateTime::now_utc();
+    let reset = now + time::Duration::days(7);
+    let account = AccountIdentity {
+        provider: Provider::Claude,
+        external_id: "usage-account".to_owned(),
+        label: None,
+        plan_tier: Some("max".to_owned()),
+        extra_usage_enabled: Some(true),
+    };
+    UsageIdentityStore::new(&usage_db_path)
+        .unwrap()
+        .record_observation(
+            Provider::Claude,
+            Some(&account),
+            now - time::Duration::minutes(1),
+            None,
+            None,
+        )
+        .unwrap();
+    UsageBurnStore::new(&usage_db_path)
+        .unwrap()
+        .record_for_account(
+            &account.account_key(),
+            &[BurnWindowSample {
+                window_kind: "weekly_all".to_owned(),
+                window_scope: None,
+                duration_minutes: 10_080,
+                percent: 40.0,
+                resets_at: reset,
+                severity: None,
+                is_active: Some(true),
+            }],
+            "test",
+            now,
+        )
+        .unwrap();
+    let mut config = config_with_state_file(&state_file);
+    config.usage.enabled = true;
+    config.usage.db_path = usage_db_path.display().to_string();
+    config.usage.accounts = vec![UsageAccountConfig {
+        key: account.account_key(),
+        label: "primary".to_owned(),
+    }];
+    let app = router(AppState::new(config));
+
+    let connection = Connection::open(&usage_db_path).unwrap();
+    let window_start: String = connection
+        .query_row(
+            "SELECT window_start FROM burn_samples WHERE window_kind = 'weekly_all'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let observed_at = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    for (seat_id, friendly_name) in [("parent01", "parent"), ("child001", "child")] {
+        connection
+            .execute(
+                r#"
+                INSERT INTO seat_meta (
+                  seat_id, observed_at, friendly_name, provider, model,
+                  project_key, working_dir, parent_seat_id, root_seat_id
+                ) VALUES (?1, ?2, ?3, 'claude', 'claude-sonnet-5',
+                          '/repo/.git', '/repo', ?4, 'parent01')
+                "#,
+                rusqlite::params![
+                    seat_id,
+                    observed_at,
+                    friendly_name,
+                    (seat_id == "child001").then_some("parent01")
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"
+                INSERT INTO seat_tokens (
+                  seat_id, account_key, project_key, window_kind, window_start,
+                  bucket_ts, model, effort, credit_metered, input_tokens,
+                  output_tokens, reasoning_tokens, cache_write_5m,
+                  cache_write_1h, cache_read_tokens, message_count, updated_at
+                ) VALUES (?1, ?2, '/repo/.git', 'weekly_all', ?3, ?4,
+                          'claude-sonnet-5', NULL, 0, 100, 0, 0, 0, 0, 0, 1, ?4)
+                "#,
+                rusqlite::params![seat_id, account.account_key(), window_start, observed_at],
+            )
+            .unwrap();
+    }
+
+    let (status, own) = get_json(app.clone(), "/sessions/parent01/usage?since_reset=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(own["accounts"][0]["windows"][0]["account_percent"], 40.0);
+    assert_eq!(own["accounts"][0]["windows"][0]["total_percent"], 20.0);
+    assert_eq!(own["accounts"][0]["label"], "primary");
+    assert_eq!(own["target"]["usage_cap_fraction"], 0.5);
+    assert_eq!(
+        own["accounts"][0]["windows"][0]["cap_consumed_percent"],
+        40.0
+    );
+
+    let (status, subtree) = get_json(
+        app.clone(),
+        "/sessions/parent01/usage?include_children=true&since_reset=true",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(subtree["target"]["descendant_count"], 1);
+    assert_eq!(
+        subtree["accounts"][0]["windows"][0]["account_percent"],
+        40.0
+    );
+    assert_eq!(subtree["accounts"][0]["windows"][0]["total_percent"], 40.0);
+    assert_eq!(
+        subtree["accounts"][0]["windows"][0]["cap_consumed_percent"],
+        80.0
+    );
+
+    let (status, accounts) = get_json(app.clone(), "/usage/accounts?since_reset=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        accounts["accounts"][0]["windows"][0]["account_percent"], 40.0,
+        "account view must pass through the exact first-party burn sample"
+    );
+
+    let (status, children) = get_json(app, "/sessions/parent01/children?usage=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(children["children"][0]["weekly_usage_percent"], 20.0);
 }
 
 #[tokio::test]

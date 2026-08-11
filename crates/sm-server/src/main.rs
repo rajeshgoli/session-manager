@@ -107,8 +107,8 @@ async fn main() -> Result<()> {
     });
 
     if state.config().usage.enabled {
-        let poll_interval = state.config().usage.poll_interval_secs;
-        let usage_state = state.clone();
+        let poll_interval = state.config().usage.poll_interval_secs.max(1);
+        let scan_interval = state.config().usage.scan_interval_secs.max(1);
         let poller = Arc::new(IdentityPoller::new(
             expand_home(&state.config().usage.db_path),
             expand_home("~/.claude.json"),
@@ -132,18 +132,22 @@ async fn main() -> Result<()> {
                                 provider.as_str()
                             );
                         }
-                        let scan_state = usage_state.clone();
-                        match tokio::task::spawn_blocking(move || scan_state.scan_usage_ledger())
-                            .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(error)) => {
-                                eprintln!("usage token ledger scan failed: {error:#}")
-                            }
-                            Err(error) => eprintln!("usage token ledger task failed: {error}"),
-                        }
                     }
                     Err(error) => eprintln!("account identity poll task failed: {error}"),
+                }
+            }
+        });
+        let usage_state = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(scan_interval));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let scan_state = usage_state.clone();
+                match tokio::task::spawn_blocking(move || scan_state.scan_usage_ledger()).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => eprintln!("usage token ledger scan failed: {error:#}"),
+                    Err(error) => eprintln!("usage token ledger task failed: {error}"),
                 }
             }
         });

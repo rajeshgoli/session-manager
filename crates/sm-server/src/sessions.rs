@@ -31,7 +31,9 @@ use crate::{
     runtime::{TmuxRuntime, TmuxSessionSpec},
     seat_sessions::{SeatSessionIdentity, SeatSessionStore},
     usage_burn::UsageBurnStore,
+    usage_identity::{Provider as UsageProvider, UsageIdentityStore},
     usage_ledger::{ScanSummary, UsageLedgerStore, UsageSeatMetadata},
+    usage_report::{UsageReport, UsageReportOptions, UsageReportStore, UsageReportTarget},
 };
 
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
@@ -68,8 +70,10 @@ pub struct SessionStore {
     codex_fork_handoff_monitors: Arc<Mutex<BTreeSet<String>>>,
     clear_operation_locks: Arc<Mutex<BTreeMap<String, Weak<SessionClearLock>>>>,
     seat_session_store: SeatSessionStore,
+    usage_identity_store: Option<UsageIdentityStore>,
     usage_burn_store: Option<UsageBurnStore>,
     usage_ledger_store: Option<UsageLedgerStore>,
+    usage_report_store: Option<UsageReportStore>,
     usage_project_keys: Arc<Mutex<BTreeMap<String, (String, String)>>>,
 }
 
@@ -118,8 +122,10 @@ impl SessionStore {
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
+            usage_identity_store: None,
             usage_burn_store: None,
             usage_ledger_store: None,
+            usage_report_store: None,
             usage_project_keys: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -141,9 +147,69 @@ impl SessionStore {
         self
     }
 
+    pub fn with_usage_identity_store(mut self, store: UsageIdentityStore) -> Self {
+        self.usage_identity_store = Some(store);
+        self
+    }
+
     pub fn with_usage_ledger_store(mut self, store: UsageLedgerStore) -> Self {
         self.usage_ledger_store = Some(store);
         self
+    }
+
+    pub fn with_usage_report_store(mut self, store: UsageReportStore) -> Self {
+        self.usage_report_store = Some(store);
+        self
+    }
+
+    pub fn usage_report_for_session(
+        &self,
+        session_id: &str,
+        include_children: bool,
+        options: UsageReportOptions,
+    ) -> Result<Option<UsageReport>> {
+        let Some(store) = self.usage_report_store.as_ref() else {
+            return Ok(None);
+        };
+        let Some(session) = self.get_session(session_id)? else {
+            return Ok(None);
+        };
+        let all_sessions = self.load_snapshot()?.into_sessions();
+        let child_seats = if include_children {
+            let mut descendants = Vec::new();
+            let mut visited = BTreeSet::new();
+            collect_descendants_preorder(
+                &all_sessions,
+                &session.id,
+                &mut visited,
+                &mut descendants,
+            );
+            descendants
+                .into_iter()
+                .map(|descendant| descendant.id)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let target = UsageReportTarget {
+            seat_id: session.id.clone(),
+            friendly_name: session.cached_display_name(),
+            account_key: session.account_key.clone(),
+            usage_cap_fraction: session.usage_cap_fraction,
+            self_seats: BTreeSet::from([session.id]),
+            child_seats,
+        };
+        Ok(Some(store.report(Some(&target), options)?))
+    }
+
+    pub fn usage_report_for_accounts(
+        &self,
+        options: UsageReportOptions,
+    ) -> Result<Option<UsageReport>> {
+        let Some(store) = self.usage_report_store.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(store.report(None, options)?))
     }
 
     pub fn scan_usage_ledger(&self) -> Result<ScanSummary> {
@@ -245,13 +311,45 @@ impl SessionStore {
             .as_deref()
             .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
             .unwrap_or_else(OffsetDateTime::now_utc);
-        store.record_claude_statusline(
+        let recorded = store.record_claude_statusline(
             observed_at,
             event.five_hour_percent,
             event.five_hour_resets_at.as_deref(),
             event.seven_day_percent,
             event.seven_day_resets_at.as_deref(),
-        )
+        )?;
+        self.record_session_account_key(&event.session_id, UsageProvider::Claude, observed_at)?;
+        Ok(recorded)
+    }
+
+    fn record_session_account_key(
+        &self,
+        session_id: &str,
+        provider: UsageProvider,
+        observed_at: OffsetDateTime,
+    ) -> Result<()> {
+        let Some(identity_store) = self.usage_identity_store.as_ref() else {
+            return Ok(());
+        };
+        let Some(attribution) = identity_store.account_at(provider, observed_at)? else {
+            return Ok(());
+        };
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(());
+        };
+        if json_text(session.get("account_key")).as_deref()
+            == Some(attribution.account_key.as_str())
+        {
+            return Ok(());
+        }
+        session.insert(
+            "account_key".to_owned(),
+            Value::String(attribution.account_key),
+        );
+        self.write_raw_json_value(&state)
     }
 
     pub fn with_context_monitor_config(mut self, config: ContextMonitorConfig) -> Self {
@@ -532,8 +630,10 @@ impl SessionStore {
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
+            usage_identity_store: None,
             usage_burn_store: None,
             usage_ledger_store: None,
+            usage_report_store: None,
             usage_project_keys: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -3997,10 +4097,16 @@ impl SessionStore {
                 artifact_path.and_then(Path::to_str),
             );
         }
+        let observed_at = OffsetDateTime::now_utc();
         if let Some(store) = self.usage_burn_store.as_ref() {
-            if let Err(error) = store.record_codex_event(event, OffsetDateTime::now_utc()) {
+            if let Err(error) = store.record_codex_event(event, observed_at) {
                 eprintln!("Codex rate-limit ingest failed for {session_id}: {error:#}");
             }
+        }
+        if let Err(error) =
+            self.record_session_account_key(session_id, UsageProvider::Codex, observed_at)
+        {
+            eprintln!("Codex account attribution update failed for {session_id}: {error:#}");
         }
         Ok(())
     }
@@ -4063,6 +4169,8 @@ impl SessionStore {
             provider,
             model: optional_trimmed(request.model.as_deref()),
             reasoning_effort: optional_trimmed(request.reasoning_effort.as_deref()),
+            account_key: None,
+            usage_cap_fraction: None,
             log_file: Some(log_file.display().to_string()),
             provider_resume_id: None,
             transcript_path: None,
@@ -7983,6 +8091,10 @@ pub struct SessionRecord {
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     #[serde(default)]
+    pub account_key: Option<String>,
+    #[serde(default)]
+    pub usage_cap_fraction: Option<f64>,
+    #[serde(default)]
     pub log_file: Option<String>,
     #[serde(default)]
     pub provider_resume_id: Option<String>,
@@ -8210,6 +8322,8 @@ pub struct SessionResponse {
     tmux_socket_name: Option<String>,
     node: String,
     provider: Option<String>,
+    account_key: Option<String>,
+    usage_cap_fraction: Option<f64>,
     provider_resume_id: Option<String>,
     forked_from_session_id: Option<String>,
     forked_from_provider_resume_id: Option<String>,
@@ -8260,6 +8374,8 @@ impl From<SessionRecord> for SessionResponse {
             tmux_socket_name: session.tmux_socket_name,
             node: non_empty_or(session.node, "primary"),
             provider: Some(non_empty_or(session.provider, "claude")),
+            account_key: session.account_key,
+            usage_cap_fraction: session.usage_cap_fraction,
             provider_resume_id: session.provider_resume_id,
             forked_from_session_id: session.forked_from_session_id,
             forked_from_provider_resume_id: session.forked_from_provider_resume_id,
@@ -8904,6 +9020,8 @@ mod tests {
             provider: "claude".to_owned(),
             model: None,
             reasoning_effort: None,
+            account_key: None,
+            usage_cap_fraction: None,
             log_file: Some("/tmp/abc12345.log".to_owned()),
             provider_resume_id: None,
             transcript_path: None,
