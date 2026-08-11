@@ -158,6 +158,7 @@ topology_fingerprint
 apply_stage                nullable | routing_quiesced |
                            authority_committed
 apply_plan                 nullable while pending; immutable once applying
+notification_intents[]     deterministic event/recipient delivery records
 ```
 
 `apply_plan` is versioned and contains the complete retry input rather than a
@@ -174,8 +175,11 @@ queue_routing_changes[]    table/record ID, child ID, expected old target,
 The transition from `pending` to `applying` discovers these exact records once
 under the state lock and persists the plan before quiescing anything. Recovery
 uses only this plan plus expected-value checks. A route created after planning
-must derive its parent from the canonical graph and is not retroactively folded
-into the in-flight plan.
+must not escape the plan: while an `applying` request covers a child, creation
+of parent-derived wake/message metadata for that child is deferred behind the
+transaction. After `authority_committed`, deferred creation derives the new
+canonical parent. Every parent-derived route creation path must use this fence;
+direct queue-table writes are not permitted.
 
 The topology fingerprint is a canonical hash over operation kind, subject,
 target, expected parent, and sorted frozen live children. Revalidation compares
@@ -236,8 +240,11 @@ therefore a recoverable, fail-closed staged operation:
 
 1. Under the session write lock, revalidate and persist `status=applying` with
    the complete immutable plan. Parent edges remain unchanged.
-2. In one SQLite transaction, quiesce affected parent-derived wake registrations
-   and pending wake metadata. Persist `apply_stage=routing_quiesced` in JSON.
+2. In one SQLite transaction, idempotently quiesce affected parent-derived wake
+   registrations and pending wake metadata. Persist
+   `apply_stage=routing_quiesced` in JSON. A replay accepts either each plan
+   entry's recorded pre-state or its exact already-quiesced state; any third
+   state fails closed.
 3. In one atomic JSON replacement, update all parent edges and JSON-backed
    routing, and persist `apply_stage=authority_committed`. Dynamic
    task-complete and wait-monitor delivery now resolves this canonical edge.
@@ -256,7 +263,8 @@ repair; it never silently rolls authority back to a topology that may already
 have been observed.
 
 No network delivery occurs while holding the write lock. Approval and outcome
-notifications are queued after the durable state transition.
+notification intents are persisted in the same JSON transition that creates
+them, then reconciled to the queue after releasing the lock.
 
 ## Notification contract
 
@@ -270,8 +278,12 @@ Creation sends each missing agent approver an `important` message containing:
 
 Each decision notifies the initiator and remaining approvers. Rejection,
 expiration, staleness, failure, and completion send one terminal notification.
-Notification delivery failure does not undo durable request state and can be
-retried through the existing queue.
+Every intent has a deterministic key formed from request ID, event, and
+recipient. Queue insertion uses that key as its idempotency identity and marks
+the intent enqueued only after the SQLite row exists. Startup and ordinary
+request reconciliation retry unqueued intents. Notification delivery failure
+does not undo durable request state, omit the prompt, or duplicate a terminal
+event.
 
 ## HTTP API
 
