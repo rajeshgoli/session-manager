@@ -3991,7 +3991,7 @@ fn wait_for_codex_fork_provider_resume_id_after_offset(
                 let Some(event) = event.as_object() else {
                     continue;
                 };
-                if let Some(provider_resume_id) = codex_fork_provider_resume_id(event) {
+                if let Some(provider_resume_id) = extract_codex_fork_thread_started(event) {
                     return Ok(provider_resume_id);
                 }
             }
@@ -9973,7 +9973,8 @@ mod tests {
             .open(&event_stream_path)
             .unwrap()
             .write_all(
-                br#"{"event_type":"thread/started","payload":{"thread":{"id":"new-thread"}}}
+                br#"{"event_type":"turn_aborted","session_id":"old-thread","payload":{"session_id":"old-thread"}}
+{"event_type":"thread/started","payload":{"thread":{"id":"new-thread"}}}
 "#,
             )
             .unwrap();
