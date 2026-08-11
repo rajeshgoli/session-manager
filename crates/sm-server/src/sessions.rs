@@ -68,6 +68,7 @@ pub struct SessionStore {
     /// an unrelated request to happen to flush it.
     delivery_runtime: Option<TmuxRuntime>,
     codex_fork_handoff_monitors: Arc<Mutex<BTreeSet<String>>>,
+    seat_session_appends: Arc<Mutex<BTreeSet<(String, String, String)>>>,
     clear_operation_locks: Arc<Mutex<BTreeMap<String, Weak<SessionClearLock>>>>,
     seat_session_store: SeatSessionStore,
     usage_identity_store: Option<UsageIdentityStore>,
@@ -120,6 +121,7 @@ impl SessionStore {
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
+            seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
             usage_identity_store: None,
@@ -391,6 +393,20 @@ impl SessionStore {
         provider_session_id: &str,
         artifact_path: Option<&str>,
     ) {
+        let append_key = (
+            seat_id.to_owned(),
+            provider.to_owned(),
+            provider_session_id.to_owned(),
+        );
+        {
+            let Ok(mut appends) = self.seat_session_appends.lock() else {
+                eprintln!("usage ledger seat session append lock poisoned");
+                return;
+            };
+            if !appends.insert(append_key.clone()) {
+                return;
+            }
+        }
         let Err(error) =
             self.seat_session_store
                 .append(seat_id, provider, provider_session_id, artifact_path)
@@ -401,10 +417,15 @@ impl SessionStore {
             "usage ledger failed to append provider session {provider_session_id} for seat {seat_id}: {error:#}"
         );
         if !usage_ledger_error_is_transient(&error) {
+            if let Ok(mut appends) = self.seat_session_appends.lock() {
+                appends.remove(&append_key);
+            }
             return;
         }
 
         let store = self.seat_session_store.clone();
+        let appends = self.seat_session_appends.clone();
+        let retry_key = append_key.clone();
         let seat_id = seat_id.to_owned();
         let provider = provider.to_owned();
         let provider_session_id = provider_session_id.to_owned();
@@ -428,18 +449,27 @@ impl SessionStore {
                             eprintln!(
                                 "usage ledger exhausted retries for provider session {provider_session_id} on seat {seat_id}: {error:#}"
                             );
+                            if let Ok(mut appends) = appends.lock() {
+                                appends.remove(&retry_key);
+                            }
                         }
                     }
                     Err(error) => {
                         eprintln!(
                             "usage ledger retry failed permanently for provider session {provider_session_id} on seat {seat_id}: {error:#}"
                         );
+                        if let Ok(mut appends) = appends.lock() {
+                            appends.remove(&retry_key);
+                        }
                         return;
                     }
                 }
             }
         }) {
             eprintln!("failed to start usage ledger retry thread: {error}");
+            if let Ok(mut appends) = self.seat_session_appends.lock() {
+                appends.remove(&append_key);
+            }
         }
     }
 
@@ -637,6 +667,7 @@ impl SessionStore {
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
+            seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
             usage_identity_store: None,
@@ -4129,15 +4160,13 @@ impl SessionStore {
             self.write_raw_json_value(&state)?;
         }
         drop(_guard);
-        if provider_resume_id_changed {
-            if let Some(provider_resume_id) = provider_resume_id {
-                self.append_seat_session(
-                    session_id,
-                    &provider,
-                    &provider_resume_id,
-                    artifact_path.and_then(Path::to_str),
-                );
-            }
+        if let Some(provider_resume_id) = provider_resume_id {
+            self.append_seat_session(
+                session_id,
+                &provider,
+                &provider_resume_id,
+                artifact_path.and_then(Path::to_str),
+            );
         }
         let observed_at = OffsetDateTime::now_utc();
         if let Some(store) = self.usage_burn_store.as_ref() {
@@ -9975,6 +10004,12 @@ mod tests {
         store
             .seat_session_store
             .append("codex001", "codex-fork", "existing-thread", None)
+            .unwrap();
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"account/rateLimits/updated","session_id":"existing-thread","payload":{"rateLimits":{}}}"#,
+            )
             .unwrap();
         let connection = rusqlite::Connection::open(usage_db_path).unwrap();
         connection.execute_batch("BEGIN IMMEDIATE").unwrap();
