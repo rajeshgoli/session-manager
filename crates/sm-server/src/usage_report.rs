@@ -388,16 +388,49 @@ fn select_windows(
             .push(window.clone());
     }
     let mut selected = Vec::new();
-    for mut group in grouped.into_values() {
-        group.sort_by(|left, right| right.window_start.cmp(&left.window_start));
-        if since_reset {
-            group.retain(|window| {
-                parse_timestamp(&window.resets_at).is_some_and(|reset| reset > now)
+    for group in grouped.into_values() {
+        let mut current = group
+            .iter()
+            .filter(|window| parse_timestamp(&window.resets_at).is_some_and(|reset| reset > now))
+            .cloned()
+            .collect::<Vec<_>>();
+        current.sort_by(|left, right| {
+            right
+                .observed_at
+                .cmp(&left.observed_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        if let Some(window) = current.into_iter().next() {
+            selected.push(window);
+        } else if since_reset {
+            let mut latest = group.clone();
+            latest.sort_by(|left, right| {
+                right
+                    .observed_at
+                    .cmp(&left.observed_at)
+                    .then_with(|| right.id.cmp(&left.id))
             });
-        } else {
-            group.truncate(4);
+            if let Some(window) = latest.into_iter().next() {
+                selected.push(window);
+            }
         }
-        selected.extend(group);
+        if !since_reset {
+            let mut closed = group
+                .into_iter()
+                .filter(|window| {
+                    parse_timestamp(&window.resets_at).is_none_or(|reset| reset <= now)
+                })
+                .collect::<Vec<_>>();
+            closed.sort_by(|left, right| {
+                right
+                    .window_start
+                    .cmp(&left.window_start)
+                    .then_with(|| right.observed_at.cmp(&left.observed_at))
+                    .then_with(|| right.id.cmp(&left.id))
+            });
+            closed.truncate(3);
+            selected.extend(closed);
+        }
     }
     selected
 }
@@ -1134,5 +1167,68 @@ mod tests {
 
         assert_eq!(report.models.len(), 1);
         assert_eq!(report.models[0].seat_id, "target");
+    }
+
+    #[test]
+    fn rolling_resets_select_one_current_snapshot_and_three_closed_windows() {
+        let window = |id: i64, start: &str, reset: &str, observed: &str| BurnWindow {
+            id,
+            account_key: "codex:a".to_owned(),
+            window_kind: "codex_10080".to_owned(),
+            window_scope: Some("codex_bengalfox".to_owned()),
+            window_start: start.to_owned(),
+            percent: id as f64,
+            resets_at: reset.to_owned(),
+            observed_at: observed.to_owned(),
+        };
+        let windows = vec![
+            window(
+                1,
+                "2026-08-10T12:00:00Z",
+                "2026-08-17T12:00:00Z",
+                "2026-08-10T12:00:01Z",
+            ),
+            window(
+                2,
+                "2026-08-10T12:00:05Z",
+                "2026-08-17T12:00:05Z",
+                "2026-08-10T12:00:06Z",
+            ),
+            window(
+                3,
+                "2026-07-20T00:00:00Z",
+                "2026-07-27T00:00:00Z",
+                "2026-07-20T01:00:00Z",
+            ),
+            window(
+                4,
+                "2026-07-13T00:00:00Z",
+                "2026-07-20T00:00:00Z",
+                "2026-07-13T01:00:00Z",
+            ),
+            window(
+                5,
+                "2026-07-06T00:00:00Z",
+                "2026-07-13T00:00:00Z",
+                "2026-07-06T01:00:00Z",
+            ),
+            window(
+                6,
+                "2026-06-29T00:00:00Z",
+                "2026-07-06T00:00:00Z",
+                "2026-06-29T01:00:00Z",
+            ),
+        ];
+        let now = OffsetDateTime::parse("2026-08-11T00:00:00Z", &Rfc3339).unwrap();
+
+        let current = select_windows(&windows, true, now);
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].id, 2);
+
+        let history = select_windows(&windows, false, now);
+        assert_eq!(
+            history.iter().map(|window| window.id).collect::<Vec<_>>(),
+            vec![2, 3, 4, 5]
+        );
     }
 }

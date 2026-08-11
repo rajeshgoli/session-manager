@@ -21,6 +21,7 @@ use crate::{
 
 const USAGE_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const PROJECT_KEY_GIT_TIMEOUT: Duration = Duration::from_secs(1);
+const LEDGER_WRITE_BATCH_SIZE: usize = 256;
 const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
     "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z"
 );
@@ -626,7 +627,7 @@ impl UsageLedgerStore {
             .flatten();
 
         let mut connection = self.open()?;
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         ensure_codex_cursor_baselines(&tx, artifact)?;
         let mut reader = BufReader::new(fs::File::open(&artifact.path).with_context(|| {
             format!("failed to open usage artifact {}", artifact.path.display())
@@ -637,6 +638,7 @@ impl UsageLedgerStore {
             ..ScanSummary::default()
         };
         let mut line_offset = offset;
+        let mut batch_lines = 0;
         let mut line = Vec::new();
         loop {
             line.clear();
@@ -649,6 +651,7 @@ impl UsageLedgerStore {
             }
             let source_seq = i64::try_from(line_offset).unwrap_or(i64::MAX);
             line_offset = line_offset.saturating_add(read as u64);
+            batch_lines += 1;
             let outcome = match artifact.provider.as_str() {
                 "claude" => parse_claude_line(&line, &artifact.path)
                     .and_then(|parsed| {
@@ -694,24 +697,15 @@ impl UsageLedgerStore {
                     IngestOutcome::Ignored => summary.messages_ignored += 1,
                 }
             }
+            if batch_lines >= LEDGER_WRITE_BATCH_SIZE {
+                save_scan_offset(&tx, &artifact.path, line_offset, mtime_ns)?;
+                tx.commit()?;
+                tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                ensure_codex_cursor_baselines(&tx, artifact)?;
+                batch_lines = 0;
+            }
         }
-        let scanned_at = format_timestamp(OffsetDateTime::now_utc())?;
-        tx.execute(
-            r#"
-            INSERT INTO scan_offsets (artifact_path, byte_offset, last_uuid, mtime_ns, scanned_at)
-            VALUES (?1, ?2, NULL, ?3, ?4)
-            ON CONFLICT(artifact_path) DO UPDATE SET
-              byte_offset = excluded.byte_offset,
-              mtime_ns = excluded.mtime_ns,
-              scanned_at = excluded.scanned_at
-            "#,
-            params![
-                artifact.path.to_string_lossy(),
-                line_offset,
-                mtime_ns,
-                scanned_at
-            ],
-        )?;
+        save_scan_offset(&tx, &artifact.path, line_offset, mtime_ns)?;
         tx.commit()?;
         Ok(summary)
     }
@@ -970,19 +964,49 @@ impl UsageLedgerStore {
     }
 
     fn materialize_pending_windows(&self) -> Result<()> {
-        let mut connection = self.open()?;
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let ids = tx
+        let connection = self.open()?;
+        let ids = connection
             .prepare("SELECT msg_id FROM message_ledger ORDER BY msg_id")?
             .query_map([], |row| row.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for msg_id in ids {
-            let contribution = load_contribution(&tx, msg_id)?;
-            materialize_contribution(&tx, msg_id, &contribution)?;
+        drop(connection);
+        let mut connection = self.open()?;
+        for batch in ids.chunks(LEDGER_WRITE_BATCH_SIZE) {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for msg_id in batch {
+                let contribution = load_contribution(&tx, *msg_id)?;
+                materialize_contribution(&tx, *msg_id, &contribution)?;
+            }
+            tx.commit()?;
         }
-        tx.commit()?;
         Ok(())
     }
+}
+
+fn save_scan_offset(
+    transaction: &Transaction<'_>,
+    artifact_path: &Path,
+    byte_offset: u64,
+    mtime_ns: i64,
+) -> Result<()> {
+    let scanned_at = format_timestamp(OffsetDateTime::now_utc())?;
+    transaction.execute(
+        r#"
+        INSERT INTO scan_offsets (artifact_path, byte_offset, last_uuid, mtime_ns, scanned_at)
+        VALUES (?1, ?2, NULL, ?3, ?4)
+        ON CONFLICT(artifact_path) DO UPDATE SET
+          byte_offset = excluded.byte_offset,
+          mtime_ns = excluded.mtime_ns,
+          scanned_at = excluded.scanned_at
+        "#,
+        params![
+            artifact_path.to_string_lossy(),
+            byte_offset,
+            mtime_ns,
+            scanned_at
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -3967,6 +3991,58 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM scan_offsets", [], |row| row.get(0))
             .unwrap();
         assert_eq!(offset_count, 0);
+    }
+
+    #[test]
+    fn scan_commits_a_bounded_checkpoint_before_a_later_line_failure() {
+        let dir = TestDir::new("bounded-checkpoint");
+        let db_path = dir.0.join("usage.db");
+        UsageBurnStore::new(&db_path).unwrap();
+        let transcript = dir.0.join("session-one.jsonl");
+        let committed_prefix = "{}\n".repeat(LEDGER_WRITE_BATCH_SIZE);
+        let failing_message = json!({
+            "timestamp": "2026-08-10T16:30:00Z",
+            "sessionId": "session-one",
+            "requestId": "request-one",
+            "cwd": "/repo",
+            "version": "1.0.0",
+            "message": {
+                "id": "message-one",
+                "model": "claude-sonnet-5",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 5,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                }
+            }
+        });
+        fs::write(
+            &transcript,
+            format!("{committed_prefix}{failing_message}\n"),
+        )
+        .unwrap();
+        SeatSessionStore::new(&db_path)
+            .append("seat-one", "claude", "session-one", transcript.to_str())
+            .unwrap();
+
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        assert!(store.scan(&[]).is_err());
+
+        let connection = Connection::open(db_path).unwrap();
+        let (offset, messages): (i64, i64) = connection
+            .query_row(
+                r#"
+                SELECT
+                  (SELECT byte_offset FROM scan_offsets WHERE artifact_path = ?1),
+                  (SELECT COUNT(*) FROM message_ledger)
+                "#,
+                [transcript.to_string_lossy().as_ref()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(offset as usize, committed_prefix.len());
+        assert_eq!(messages, 0);
     }
 
     #[test]

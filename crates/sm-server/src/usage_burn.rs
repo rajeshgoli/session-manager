@@ -65,6 +65,12 @@ impl UsageBurnStore {
                 );
                 CREATE INDEX IF NOT EXISTS idx_burn_window
                   ON burn_samples(account_key, window_kind, observed_at);
+                CREATE INDEX IF NOT EXISTS idx_burn_window_scope_latest
+                  ON burn_samples(
+                    account_key, window_kind, window_scope, observed_at DESC, id DESC
+                  );
+                CREATE INDEX IF NOT EXISTS idx_burn_active_at
+                  ON burn_samples(account_key, observed_at, window_start, resets_at);
                 "#,
             )
             .context("failed to initialize usage burn schema")?;
