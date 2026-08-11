@@ -6,7 +6,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Arc, Condvar, Mutex, Weak},
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
@@ -28,7 +28,7 @@ use crate::queue::{
 };
 use crate::{
     config::{CodexReviewConfig, ContextMonitorConfig},
-    runtime::{TmuxRuntime, TmuxSessionSpec},
+    runtime::{ConditionalClearOutcome, TmuxRuntime, TmuxSessionSpec},
     seat_sessions::{SeatSessionIdentity, SeatSessionStore},
     usage_burn::UsageBurnStore,
     usage_identity::{Provider as UsageProvider, UsageIdentityStore},
@@ -68,6 +68,7 @@ pub struct SessionStore {
     /// an unrelated request to happen to flush it.
     delivery_runtime: Option<TmuxRuntime>,
     codex_fork_handoff_monitors: Arc<Mutex<BTreeSet<String>>>,
+    claude_handoff_workers: Arc<Mutex<BTreeSet<String>>>,
     seat_session_appends: Arc<Mutex<BTreeSet<(String, String, String)>>>,
     clear_operation_locks: Arc<Mutex<BTreeMap<String, Weak<SessionClearLock>>>>,
     seat_session_store: SeatSessionStore,
@@ -121,6 +122,7 @@ impl SessionStore {
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
+            claude_handoff_workers: Arc::new(Mutex::new(BTreeSet::new())),
             seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
@@ -664,6 +666,7 @@ impl SessionStore {
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
+            claude_handoff_workers: Arc::new(Mutex::new(BTreeSet::new())),
             seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
@@ -879,7 +882,21 @@ impl SessionStore {
 
         let now = now_rfc3339();
         if !superseded {
-            session.insert("status".to_owned(), Value::String("idle".to_owned()));
+            let reserves_handoff = provider == "claude"
+                && json_text(session.get("pending_handoff_path")).is_some()
+                && json_text(session.get("pending_handoff_recorded_at")).is_some();
+            if reserves_handoff {
+                session.insert(
+                    "claude_handoff_in_progress_at".to_owned(),
+                    Value::String(now.clone()),
+                );
+                // Keep queue delivery from treating the Stop transition as an
+                // ordinary idle prompt before the handoff owns the pane.
+                session.insert("status".to_owned(), Value::String("running".to_owned()));
+            } else {
+                session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
+                session.insert("status".to_owned(), Value::String("idle".to_owned()));
+            }
             session.insert("last_activity".to_owned(), Value::String(now.clone()));
             session.insert("activity_hook_at".to_owned(), Value::String(now.clone()));
             session.insert(
@@ -968,6 +985,7 @@ impl SessionStore {
 
         let now = now_rfc3339();
         session.insert("status".to_owned(), Value::String("running".to_owned()));
+        session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
         session.insert("last_activity".to_owned(), Value::String(now.clone()));
         session.insert("activity_hook_at".to_owned(), Value::String(now.clone()));
         session.insert("agent_task_completed_at".to_owned(), Value::Null);
@@ -1039,6 +1057,7 @@ impl SessionStore {
                 Value::String(emitted_at.to_owned())
             }),
         );
+        session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
         session.insert("agent_task_completed_at".to_owned(), Value::Null);
         self.write_raw_json_value(&state)?;
         Ok(true)
@@ -2790,6 +2809,15 @@ impl SessionStore {
                 "pending_handoff_path".to_owned(),
                 Value::String(request.file_path.clone()),
             );
+            if provider == "claude" {
+                // Also versions the Rust execution contract: older pending paths
+                // must not rotate dormant seats when the fixed server is deployed.
+                session.insert(
+                    "pending_handoff_recorded_at".to_owned(),
+                    Value::String(now_rfc3339()),
+                );
+                session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
+            }
             self.write_raw_json_value(&state)?;
             monitor
         };
@@ -2861,6 +2889,496 @@ impl SessionStore {
             )?;
         }
         Ok(monitors.len())
+    }
+
+    pub fn recover_pending_claude_handoffs(&self) -> Result<usize> {
+        if self.delivery_runtime.is_none() {
+            return Ok(0);
+        }
+        let state = self.load_raw_json_value()?;
+        let session_ids = state
+            .get("sessions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+            .filter(|session| {
+                json_text(session.get("provider")).as_deref() == Some("claude")
+                    && is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
+                    && normalized_status(&json_text(session.get("status")).unwrap_or_default())
+                        != "stopped"
+                    && json_text(session.get("pending_handoff_path")).is_some()
+                    && json_text(session.get("pending_handoff_recorded_at")).is_some()
+                    && (json_text(session.get("claude_handoff_in_progress_at")).is_some()
+                        || normalized_status(&json_text(session.get("status")).unwrap_or_default())
+                            == "idle")
+            })
+            .filter_map(|session| json_text(session.get("id")))
+            .collect::<Vec<_>>();
+
+        let mut started = 0;
+        for session_id in session_ids {
+            started += usize::from(self.start_pending_claude_handoff(&session_id)?);
+        }
+        Ok(started)
+    }
+
+    pub fn start_pending_claude_handoff(&self, session_id: &str) -> Result<bool> {
+        let reservation = {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let (reservation, state_changed) = {
+                let sessions = ensure_sessions_array_mut(&mut state)?;
+                let Some(session) = session_object_mut(sessions, session_id) else {
+                    return Ok(false);
+                };
+                let status = json_text(session.get("status")).unwrap_or_default();
+                let file_path = json_text(session.get("pending_handoff_path"));
+                let recorded_at = json_text(session.get("pending_handoff_recorded_at"));
+                let eligible = json_text(session.get("provider")).as_deref() == Some("claude")
+                    && file_path.is_some()
+                    && recorded_at.is_some()
+                    && normalized_status(&status) != "stopped"
+                    && is_primary_node(
+                        &json_text(session.get("node")).unwrap_or_else(default_node),
+                    );
+                if !eligible {
+                    (None, false)
+                } else {
+                    let (reservation_at, state_changed) = if let Some(existing) =
+                        json_text(session.get("claude_handoff_in_progress_at"))
+                    {
+                        (existing, false)
+                    } else if normalized_status(&status) == "idle" {
+                        let now = now_rfc3339();
+                        session.insert(
+                            "claude_handoff_in_progress_at".to_owned(),
+                            Value::String(now.clone()),
+                        );
+                        session.insert("status".to_owned(), Value::String("running".to_owned()));
+                        session.insert("last_activity".to_owned(), Value::String(now.clone()));
+                        (now, true)
+                    } else {
+                        return Ok(false);
+                    };
+                    (
+                        Some((file_path.unwrap(), recorded_at.unwrap(), reservation_at)),
+                        state_changed,
+                    )
+                }
+            };
+            if state_changed {
+                self.write_raw_json_value(&state)?;
+            }
+            reservation
+        };
+        let Some((file_path, recorded_at, reservation_at)) = reservation else {
+            return Ok(false);
+        };
+
+        {
+            let mut workers = self
+                .claude_handoff_workers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Claude handoff worker lock poisoned"))?;
+            if !workers.insert(session_id.to_owned()) {
+                return Ok(false);
+            }
+        }
+
+        let store = self.clone();
+        let worker_session_id = session_id.to_owned();
+        let worker_file_path = file_path.clone();
+        let worker_recorded_at = recorded_at.clone();
+        let worker_reservation_at = reservation_at.clone();
+        let spawn_result = thread::Builder::new()
+            .name(format!(
+                "sm-claude-handoff-{}",
+                sanitize_path_component(session_id)
+            ))
+            .spawn(move || {
+                if let Err(error) = store.execute_pending_claude_handoff(&worker_session_id) {
+                    eprintln!("Claude handoff execution failed for {worker_session_id}: {error:#}");
+                }
+                if let Ok(mut workers) = store.claude_handoff_workers.lock() {
+                    workers.remove(&worker_session_id);
+                }
+                match store.claude_handoff_reservation_was_replaced(
+                    &worker_session_id,
+                    &worker_file_path,
+                    &worker_recorded_at,
+                    &worker_reservation_at,
+                ) {
+                    Ok(true) => {
+                        if let Err(error) =
+                            store.start_pending_claude_handoff(&worker_session_id)
+                        {
+                            eprintln!(
+                                "Replacement Claude handoff failed to start for {worker_session_id}: {error:#}"
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => eprintln!(
+                        "Replacement Claude handoff check failed for {worker_session_id}: {error:#}"
+                    ),
+                }
+            });
+        if let Err(error) = spawn_result {
+            let mut workers = self
+                .claude_handoff_workers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Claude handoff worker lock poisoned"))?;
+            workers.remove(session_id);
+            let rollback = self.release_failed_claude_handoff_worker_reservation(
+                session_id,
+                &file_path,
+                &recorded_at,
+                &reservation_at,
+            );
+            drop(workers);
+            if let Err(rollback_error) = rollback {
+                return Err(anyhow::anyhow!(error)).context(format!(
+                    "failed to start Claude handoff worker; reservation rollback also failed: {rollback_error:#}"
+                ));
+            }
+            return Err(error).with_context(|| "failed to start Claude handoff worker");
+        }
+        Ok(true)
+    }
+
+    fn claude_handoff_reservation_was_replaced(
+        &self,
+        session_id: &str,
+        file_path: &str,
+        recorded_at: &str,
+        reservation_at: &str,
+    ) -> Result<bool> {
+        let _guard = self.write_guard()?;
+        let state = self.load_raw_json_value()?;
+        let Some(session) = raw_session_object(&state, session_id) else {
+            return Ok(false);
+        };
+        Ok(claude_handoff_reservation_replaced_raw(
+            session,
+            file_path,
+            recorded_at,
+            reservation_at,
+        ))
+    }
+
+    fn release_failed_claude_handoff_worker_reservation(
+        &self,
+        session_id: &str,
+        file_path: &str,
+        recorded_at: &str,
+        reservation_at: &str,
+    ) -> Result<bool> {
+        let released = {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(false);
+            };
+            let matches = json_text(session.get("pending_handoff_path")).as_deref()
+                == Some(file_path)
+                && json_text(session.get("pending_handoff_recorded_at")).as_deref()
+                    == Some(recorded_at)
+                && json_text(session.get("claude_handoff_in_progress_at")).as_deref()
+                    == Some(reservation_at);
+            if matches {
+                session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
+                session.insert("status".to_owned(), Value::String("idle".to_owned()));
+                session.insert(
+                    "error_message".to_owned(),
+                    Value::String(
+                        "claude_handoff_failed: failed to start handoff worker".to_owned(),
+                    ),
+                );
+                self.write_raw_json_value(&state)?;
+            }
+            matches
+        };
+        if released {
+            if let Some(runtime) = self.delivery_runtime.as_ref() {
+                let _ = self.drain_runtime_pending_messages_for_session(session_id, runtime);
+            }
+        }
+        Ok(released)
+    }
+
+    fn with_current_claude_handoff_reservation<F>(
+        &self,
+        session_id: &str,
+        file_path: &str,
+        recorded_at: &str,
+        reservation_at: &str,
+        tmux_session: &str,
+        socket_name: &Option<String>,
+        action: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        let _guard = self.write_guard()?;
+        let state = self.load_raw_json_value()?;
+        let Some(session) = raw_session_object(&state, session_id) else {
+            return Ok(false);
+        };
+        let matches = json_text(session.get("provider")).as_deref() == Some("claude")
+            && normalized_status(&json_text(session.get("status")).unwrap_or_default())
+                != "stopped"
+            && is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
+            && json_text(session.get("tmux_session")).as_deref() == Some(tmux_session)
+            && json_text(session.get("tmux_socket_name")).as_deref() == socket_name.as_deref()
+            && json_text(session.get("pending_handoff_path")).as_deref() == Some(file_path)
+            && json_text(session.get("pending_handoff_recorded_at")).as_deref()
+                == Some(recorded_at)
+            && json_text(session.get("claude_handoff_in_progress_at")).as_deref()
+                == Some(reservation_at);
+        if !matches {
+            return Ok(false);
+        }
+        action()?;
+        Ok(true)
+    }
+
+    fn execute_pending_claude_handoff(&self, session_id: &str) -> Result<bool> {
+        let _clear_guard = self.lock_clear_operation(session_id)?;
+        let (file_path, recorded_at, reservation_at, tmux_session, socket_name) = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            let Some(session) = raw_session_object(&state, session_id) else {
+                return Ok(false);
+            };
+            if json_text(session.get("provider")).as_deref() != Some("claude")
+                || normalized_status(&json_text(session.get("status")).unwrap_or_default())
+                    == "stopped"
+            {
+                return Ok(false);
+            }
+            let Some(file_path) = json_text(session.get("pending_handoff_path")) else {
+                return Ok(false);
+            };
+            let Some(recorded_at) = json_text(session.get("pending_handoff_recorded_at")) else {
+                return Ok(false);
+            };
+            let Some(reservation_at) = json_text(session.get("claude_handoff_in_progress_at"))
+            else {
+                return Ok(false);
+            };
+            (
+                file_path,
+                recorded_at,
+                reservation_at,
+                json_text(session.get("tmux_session"))
+                    .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?,
+                json_text(session.get("tmux_socket_name")),
+            )
+        };
+
+        let clear_started = Arc::new(AtomicBool::new(false));
+        let result = (|| {
+            if !Path::new(&file_path).is_file() {
+                anyhow::bail!("handoff file not found: {file_path}");
+            }
+            let runtime = self
+                .delivery_runtime
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Claude handoff requires the tmux runtime"))?
+                .for_socket_name(socket_name.as_deref());
+            let prompt = format!("Read {file_path} and continue from where you left off.");
+            let precondition_store = self.clone();
+            let precondition_session_id = session_id.to_owned();
+            let precondition_file_path = file_path.clone();
+            let precondition_recorded_at = recorded_at.clone();
+            let precondition_reservation_at = reservation_at.clone();
+            let precondition_tmux_session = tmux_session.clone();
+            let precondition_socket_name = socket_name.clone();
+            let commit_store = self.clone();
+            let commit_session_id = session_id.to_owned();
+            let commit_file_path = file_path.clone();
+            let commit_recorded_at = recorded_at.clone();
+            let commit_reservation_at = reservation_at.clone();
+            let commit_tmux_session = tmux_session.clone();
+            let commit_socket_name = socket_name.clone();
+            let commit_clear_started = clear_started.clone();
+            let prompt_store = self.clone();
+            let prompt_session_id = session_id.to_owned();
+            let prompt_file_path = file_path.clone();
+            let prompt_recorded_at = recorded_at.clone();
+            let prompt_reservation_at = reservation_at.clone();
+            let prompt_tmux_session = tmux_session.clone();
+            let prompt_socket_name = socket_name.clone();
+            runtime.clear_claude_session_if(
+                &tmux_session,
+                &prompt,
+                move || {
+                    precondition_store.with_current_claude_handoff_reservation(
+                        &precondition_session_id,
+                        &precondition_file_path,
+                        &precondition_recorded_at,
+                        &precondition_reservation_at,
+                        &precondition_tmux_session,
+                        &precondition_socket_name,
+                        || Ok(()),
+                    )
+                },
+                move |send_clear| {
+                    commit_store.with_current_claude_handoff_reservation(
+                        &commit_session_id,
+                        &commit_file_path,
+                        &commit_recorded_at,
+                        &commit_reservation_at,
+                        &commit_tmux_session,
+                        &commit_socket_name,
+                        || {
+                            // Conservatively treat an attempted send as
+                            // destructive if tmux reports an error mid-command.
+                            commit_clear_started.store(true, Ordering::Release);
+                            send_clear()
+                        },
+                    )
+                },
+                move |send_prompt| {
+                    prompt_store.with_current_claude_handoff_reservation(
+                        &prompt_session_id,
+                        &prompt_file_path,
+                        &prompt_recorded_at,
+                        &prompt_reservation_at,
+                        &prompt_tmux_session,
+                        &prompt_socket_name,
+                        send_prompt,
+                    )
+                },
+            )
+        })();
+
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(false);
+        };
+        let current_status = json_text(session.get("status")).unwrap_or_default();
+        let still_same_session = json_text(session.get("provider")).as_deref() == Some("claude")
+            && normalized_status(&current_status) != "stopped"
+            && is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
+            && json_text(session.get("tmux_session")).as_deref() == Some(tmux_session.as_str())
+            && json_text(session.get("tmux_socket_name")) == socket_name;
+        if !still_same_session {
+            return Ok(false);
+        }
+        match result {
+            Ok(ConditionalClearOutcome::Cleared) => {
+                session.insert(
+                    "last_handoff_path".to_owned(),
+                    Value::String(file_path.clone()),
+                );
+                let (cleared_pending, stopped_after_prompt) = consume_completed_claude_handoff_raw(
+                    session,
+                    &file_path,
+                    &recorded_at,
+                    &reservation_at,
+                );
+                let now = now_rfc3339();
+                reset_session_after_clear(session, &now);
+                session.insert(
+                    "status".to_owned(),
+                    Value::String(if stopped_after_prompt {
+                        "idle".to_owned()
+                    } else {
+                        "running".to_owned()
+                    }),
+                );
+                clear_claude_handoff_error_raw(session);
+                self.write_raw_json_value(&state)?;
+                drop(_guard);
+                let _ = self.cancel_context_monitor_alerts(session_id);
+                if let Some(runtime) = self.delivery_runtime.as_ref() {
+                    let _ = self.drain_runtime_pending_messages_for_session(session_id, runtime);
+                }
+                Ok(cleared_pending)
+            }
+            Ok(ConditionalClearOutcome::PostClearPreconditionFailed) => Ok(false),
+            Ok(ConditionalClearOutcome::PreconditionFailed) => {
+                let released = json_text(session.get("claude_handoff_in_progress_at")).as_deref()
+                    == Some(reservation_at.as_str());
+                if released {
+                    session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
+                    self.write_raw_json_value(&state)?;
+                }
+                drop(_guard);
+                if let Some(runtime) = self.delivery_runtime.as_ref() {
+                    let _ = self.drain_runtime_pending_messages_for_session(session_id, runtime);
+                }
+                Ok(false)
+            }
+            Ok(
+                outcome @ (ConditionalClearOutcome::IdlePromptNotReady
+                | ConditionalClearOutcome::SessionMissing),
+            ) => {
+                let still_current = json_text(session.get("pending_handoff_path")).as_deref()
+                    == Some(file_path.as_str())
+                    && json_text(session.get("pending_handoff_recorded_at")).as_deref()
+                        == Some(recorded_at.as_str())
+                    && json_text(session.get("claude_handoff_in_progress_at")).as_deref()
+                        == Some(reservation_at.as_str());
+                if still_current {
+                    session.insert("status".to_owned(), Value::String("idle".to_owned()));
+                    session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
+                    let reason = match outcome {
+                        ConditionalClearOutcome::IdlePromptNotReady => {
+                            "Claude handoff aborted because the idle prompt was not ready"
+                        }
+                        ConditionalClearOutcome::SessionMissing => "tmux session is not running",
+                        _ => unreachable!(),
+                    };
+                    session.insert(
+                        "error_message".to_owned(),
+                        Value::String(format!("claude_handoff_failed: {reason}")),
+                    );
+                    self.write_raw_json_value(&state)?;
+                }
+                drop(_guard);
+                if still_current {
+                    if let Some(runtime) = self.delivery_runtime.as_ref() {
+                        let _ =
+                            self.drain_runtime_pending_messages_for_session(session_id, runtime);
+                    }
+                }
+                Ok(false)
+            }
+            Err(error) => {
+                let still_current = json_text(session.get("pending_handoff_path")).as_deref()
+                    == Some(file_path.as_str())
+                    && json_text(session.get("pending_handoff_recorded_at")).as_deref()
+                        == Some(recorded_at.as_str())
+                    && json_text(session.get("claude_handoff_in_progress_at")).as_deref()
+                        == Some(reservation_at.as_str());
+                let failed_before_clear = !clear_started.load(Ordering::Acquire);
+                if still_current {
+                    session.insert("status".to_owned(), Value::String("idle".to_owned()));
+                    if failed_before_clear {
+                        session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
+                    }
+                    session.insert(
+                        "error_message".to_owned(),
+                        Value::String(format!("claude_handoff_failed: {error}")),
+                    );
+                    self.write_raw_json_value(&state)?;
+                }
+                drop(_guard);
+                if still_current && failed_before_clear {
+                    if let Some(runtime) = self.delivery_runtime.as_ref() {
+                        let _ =
+                            self.drain_runtime_pending_messages_for_session(session_id, runtime);
+                    }
+                }
+                Ok(false)
+            }
+        }
     }
 
     pub fn recover_codex_fork_event_monitors(&self) -> Result<usize> {
@@ -5788,6 +6306,9 @@ fn deliver_runtime_text_to_session_raw(
     let node = json_text(session.get("node")).unwrap_or_else(default_node);
     ensure_runtime_local_node(&node)?;
     let mut status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+    if claude_handoff_is_reserved_raw(session) {
+        return Ok((status, false));
+    }
     let tmux_session = json_text(session.get("tmux_session"))
         .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
     let session_socket_name = json_text(session.get("tmux_socket_name"));
@@ -5835,6 +6356,9 @@ fn deliver_urgent_runtime_text_to_session_raw(
     let node = json_text(session.get("node")).unwrap_or_else(default_node);
     ensure_runtime_local_node(&node)?;
     let mut status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+    if claude_handoff_is_reserved_raw(session) {
+        return Ok((status, false));
+    }
     let tmux_session = json_text(session.get("tmux_session"))
         .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
     let provider = json_text(session.get("provider")).unwrap_or_else(|| "claude".to_owned());
@@ -5892,6 +6416,9 @@ fn deliver_runtime_native_rename_to_session_raw(
     ensure_runtime_local_node(&node)?;
     let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
     if normalized_status(&status) == "stopped" {
+        return Ok((status, false));
+    }
+    if claude_handoff_is_reserved_raw(session) {
         return Ok((status, false));
     }
     let Some(friendly_name) = extract_provider_native_rename_name(text) else {
@@ -6283,6 +6810,73 @@ fn clear_codex_fork_handoff_error_raw(session: &mut Map<String, Value>) {
     if is_handoff_error {
         session.insert("error_message".to_owned(), Value::Null);
     }
+}
+
+fn clear_claude_handoff_error_raw(session: &mut Map<String, Value>) {
+    let is_handoff_error = json_text(session.get("error_message"))
+        .as_deref()
+        .is_some_and(|message| message.starts_with("claude_handoff_failed:"));
+    if is_handoff_error {
+        session.insert("error_message".to_owned(), Value::Null);
+    }
+}
+
+fn claude_handoff_is_reserved_raw(session: &Map<String, Value>) -> bool {
+    json_text(session.get("provider")).as_deref() == Some("claude")
+        && json_text(session.get("claude_handoff_in_progress_at")).is_some()
+}
+
+fn claude_handoff_reservation_replaced_raw(
+    session: &Map<String, Value>,
+    file_path: &str,
+    recorded_at: &str,
+    reservation_at: &str,
+) -> bool {
+    if json_text(session.get("provider")).as_deref() != Some("claude")
+        || normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped"
+        || !is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
+    {
+        return false;
+    }
+    let Some(current_file_path) = json_text(session.get("pending_handoff_path")) else {
+        return false;
+    };
+    let Some(current_recorded_at) = json_text(session.get("pending_handoff_recorded_at")) else {
+        return false;
+    };
+    let Some(current_reservation_at) = json_text(session.get("claude_handoff_in_progress_at"))
+    else {
+        return false;
+    };
+    current_file_path != file_path
+        || current_recorded_at != recorded_at
+        || current_reservation_at != reservation_at
+}
+
+fn consume_completed_claude_handoff_raw(
+    session: &mut Map<String, Value>,
+    file_path: &str,
+    recorded_at: &str,
+    reservation_at: &str,
+) -> (bool, bool) {
+    let cleared_pending = json_text(session.get("pending_handoff_path")).as_deref()
+        == Some(file_path)
+        && json_text(session.get("pending_handoff_recorded_at")).as_deref() == Some(recorded_at);
+    let stopped_after_prompt = cleared_pending
+        && json_text(session.get("claude_handoff_in_progress_at"))
+            .is_some_and(|current| current != reservation_at);
+    if cleared_pending {
+        session.insert("pending_handoff_path".to_owned(), Value::Null);
+        session.insert("pending_handoff_recorded_at".to_owned(), Value::Null);
+        // The handoff turn's own Stop may refresh this timestamp before the
+        // worker persists success. It still reserves the intent consumed here.
+        session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
+    } else if json_text(session.get("claude_handoff_in_progress_at")).as_deref()
+        == Some(reservation_at)
+    {
+        session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
+    }
+    (cleared_pending, stopped_after_prompt)
 }
 
 fn drain_pending_runtime_messages_raw(
@@ -9676,11 +10270,123 @@ mod tests {
     }
 
     #[test]
+    fn completed_claude_handoff_clears_refreshed_reservation_for_consumed_intent() {
+        let mut session = json!({
+            "pending_handoff_path": "/tmp/handoff.md",
+            "pending_handoff_recorded_at": "2026-08-11T20:00:00Z",
+            "claude_handoff_in_progress_at": "2026-08-11T20:00:02Z"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let outcome = consume_completed_claude_handoff_raw(
+            &mut session,
+            "/tmp/handoff.md",
+            "2026-08-11T20:00:00Z",
+            "2026-08-11T20:00:01Z",
+        );
+        assert_eq!(outcome, (true, true));
+        assert!(session["pending_handoff_path"].is_null());
+        assert!(session["pending_handoff_recorded_at"].is_null());
+        assert!(session["claude_handoff_in_progress_at"].is_null());
+    }
+
+    #[test]
+    fn retiring_claude_handoff_worker_detects_a_replacement_reservation() {
+        let session = json!({
+            "provider": "claude",
+            "status": "running",
+            "node": "primary",
+            "pending_handoff_path": "/tmp/replacement.md",
+            "pending_handoff_recorded_at": "2026-08-11T20:00:02Z",
+            "claude_handoff_in_progress_at": "2026-08-11T20:00:03Z"
+        });
+
+        assert!(claude_handoff_reservation_replaced_raw(
+            session.as_object().unwrap(),
+            "/tmp/original.md",
+            "2026-08-11T20:00:00Z",
+            "2026-08-11T20:00:01Z",
+        ));
+        assert!(!claude_handoff_reservation_replaced_raw(
+            session.as_object().unwrap(),
+            "/tmp/replacement.md",
+            "2026-08-11T20:00:02Z",
+            "2026-08-11T20:00:03Z",
+        ));
+    }
+
+    #[test]
+    fn failed_claude_handoff_worker_start_releases_matching_reservation() {
+        let store = store_with_running_claude_session("workerfail");
+        {
+            let mut state = store.load_raw_json_value().unwrap();
+            let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+            let session = session_object_mut(sessions, "workerfail").unwrap();
+            session.insert(
+                "pending_handoff_path".to_owned(),
+                Value::String("/tmp/workerfail-handoff.md".to_owned()),
+            );
+            session.insert(
+                "pending_handoff_recorded_at".to_owned(),
+                Value::String("2026-08-11T20:00:00Z".to_owned()),
+            );
+            session.insert(
+                "claude_handoff_in_progress_at".to_owned(),
+                Value::String("2026-08-11T20:00:01Z".to_owned()),
+            );
+            store.write_raw_json_value(&state).unwrap();
+        }
+
+        assert!(store
+            .release_failed_claude_handoff_worker_reservation(
+                "workerfail",
+                "/tmp/workerfail-handoff.md",
+                "2026-08-11T20:00:00Z",
+                "2026-08-11T20:00:01Z",
+            )
+            .unwrap());
+
+        let state = store.load_raw_json_value().unwrap();
+        let session = raw_session_object(&state, "workerfail").unwrap();
+        assert_eq!(json_text(session.get("status")).as_deref(), Some("idle"));
+        assert!(json_text(session.get("pending_handoff_path")).is_some());
+        assert!(json_text(session.get("pending_handoff_recorded_at")).is_some());
+        assert!(json_text(session.get("claude_handoff_in_progress_at")).is_none());
+        assert_eq!(
+            json_text(session.get("error_message")).as_deref(),
+            Some("claude_handoff_failed: failed to start handoff worker")
+        );
+    }
+
+    #[test]
     fn claude_user_prompt_submit_hook_marks_the_turn_running() {
         let store = store_with_running_claude_session("turnstart");
+        {
+            let mut state = store.load_raw_json_value().unwrap();
+            let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+            let session = session_object_mut(sessions, "turnstart").unwrap();
+            session.insert(
+                "pending_handoff_path".to_owned(),
+                Value::String("/tmp/turnstart-handoff.md".to_owned()),
+            );
+            session.insert(
+                "pending_handoff_recorded_at".to_owned(),
+                Value::String("2026-06-01T00:00:00Z".to_owned()),
+            );
+            store.write_raw_json_value(&state).unwrap();
+        }
         assert!(store
             .apply_claude_stop_hook("turnstart", None, None, None, None, None, None)
             .unwrap());
+        let reserved = store.load_raw_json_value().unwrap();
+        assert!(json_text(
+            raw_session_object(&reserved, "turnstart")
+                .unwrap()
+                .get("claude_handoff_in_progress_at")
+        )
+        .is_some());
         assert!(store
             .apply_claude_user_prompt_submit_hook("turnstart", None)
             .unwrap());
@@ -9690,6 +10396,13 @@ mod tests {
         assert_eq!(session.status, "running");
         assert!(session.agent_task_completed_at.is_none());
         assert_eq!(claude_hook_gate(&session), ClaudeHookGate::TurnRunning);
+        let cancelled = store.load_raw_json_value().unwrap();
+        assert!(json_text(
+            raw_session_object(&cancelled, "turnstart")
+                .unwrap()
+                .get("claude_handoff_in_progress_at")
+        )
+        .is_none());
     }
 
     #[test]

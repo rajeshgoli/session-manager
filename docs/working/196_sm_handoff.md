@@ -4,6 +4,46 @@
 **Status:** Draft (rev 4 — post-re-review)
 **Author:** Scout
 
+## Rust core parity
+
+The original implementation below describes the Python Stop-hook path. Rust
+initially ported the handoff endpoint without porting that Claude execution
+path; #1178 then added the separate codex-fork turn-complete path. Issue #1203
+closes the remaining Claude parity gap:
+
+- a non-superseded Claude `Stop` atomically reserves the seat before starting
+  a deferred, per-seat handoff worker, so queued delivery cannot enter the
+  soon-to-be-cleared context;
+- the worker serializes with other clears and pane input, revalidates the exact
+  lifecycle reservation, requires an idle prompt before `/clear` and after its
+  redraw, then injects the durable handoff prompt;
+- a newer `UserPromptSubmit` or `PreToolUse` cancels the reservation without
+  consuming the pending handoff; messages held by a successful reservation are
+  delivered only after the new handoff prompt is submitted;
+- success promotes `pending_handoff_path` to `last_handoff_path` and resets the
+  context cycle, including reconciling a reservation refreshed by the handoff
+  turn's own fast Stop and preserving that Stop's idle state; failure keeps
+  pending state and records an actionable error;
+- worker cleanup starts a replacement reservation recorded while the previous
+  handoff worker was still retiring;
+- definite pre-clear failures release the reservation and queued delivery while
+  preserving the pending intent for a later Stop or startup retry; failures
+  after `/clear` starts remain reserved because pane state is uncertain;
+- failure to create the handoff worker rolls its durable reservation back and
+  releases queued delivery;
+- post-`/clear` readiness requires a changed pane at the idle prompt, so the
+  stale pre-clear prompt cannot satisfy completion;
+- the exact lifecycle reservation is revalidated under the state guard again
+  when the handoff prompt is submitted after `/clear`;
+- startup retries post-#1203 Claude handoffs whose Stop reservation was
+  durably recorded before the server exited;
+- pre-#1203 pending records have no `pending_handoff_recorded_at` marker and are
+  deliberately not replayed during deployment. The seat must run `sm handoff`
+  again if that older intent is still wanted.
+
+The phrase "historical Claude Stop-hook workflow" in #1178 referred to this
+Python design. It did not identify an already-working Rust Claude path.
+
 ## Problem
 
 Long-running agents accumulate context until compaction fires. Compaction is expensive, lossy, and unpredictable — the agent doesn't control when it happens or what gets dropped. Agents need a way to proactively rotate their own context by writing a handoff doc and restarting with it.

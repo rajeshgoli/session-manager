@@ -13410,7 +13410,7 @@ async fn runtime_core_replays_retained_urgent_rows_with_interrupt_semantics() {
 }
 
 #[tokio::test]
-async fn runtime_core_handoff_records_without_interrupting_active_turn() {
+async fn runtime_core_claude_handoff_executes_after_stop_without_interrupting_active_turn() {
     if !tmux_available() {
         return;
     }
@@ -13431,7 +13431,7 @@ async fn runtime_core_handoff_records_without_interrupting_active_turn() {
         &state_file,
         &log_dir,
         _tmux_guard.0.as_str(),
-        r#"/bin/sh -lc 'printf ">\n"; while IFS= read -r line; do printf "runtime:%s\n>\n" "$line"; done' runtime-sh"#,
+        r#"/bin/sh -lc 'printf ">\n"; while IFS= read -r line; do if [ "$line" = "/clear" ]; then sleep 1; fi; printf "runtime:%s\n>\n" "$line"; done' runtime-sh"#,
     );
 
     let (status, _payload) = post_json(
@@ -13475,9 +13475,97 @@ async fn runtime_core_handoff_records_without_interrupting_active_turn() {
         .unwrap()
         .contains("continue from where you left off"));
 
-    let (status, payload) = get_json(app, "/sessions/runtimehandoff").await;
+    let (status, payload) = get_json(app.clone(), "/sessions/runtimehandoff").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["last_handoff_path"], Value::Null);
+    assert_eq!(
+        payload["friendly_name"],
+        Value::String("runtime-handoff".to_owned())
+    );
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "runtimehandoff",
+            "sm_hook_emitted_at": "2026-08-11T20:00:00.000000Z"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok" }));
+
+    let stopped_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let stopped_handoff = stopped_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "runtimehandoff")
+        .unwrap();
+    assert_eq!(stopped_handoff["status"], "running");
+    assert_eq!(
+        stopped_handoff["pending_handoff_path"],
+        handoff_path.display().to_string()
+    );
+    assert!(stopped_handoff["pending_handoff_recorded_at"].is_string());
+    assert!(stopped_handoff["claude_handoff_in_progress_at"].is_string());
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimehandoff/input",
+        json!({
+            "text": "queued during handoff reservation",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], false);
+
+    let handoff_output = wait_for_output_contains(
+        app.clone(),
+        "runtimehandoff",
+        &format!(
+            "runtime:Read {} and continue from where you left off.",
+            handoff_path.display()
+        ),
+    )
+    .await;
+    assert!(handoff_output["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("/clear"));
+    let queued_output = wait_for_output_contains(
+        app.clone(),
+        "runtimehandoff",
+        "runtime:queued during handoff reservation",
+    )
+    .await;
+    let queued_output = queued_output["output"].as_str().unwrap_or_default();
+    let handoff_position = queued_output
+        .find("continue from where you left off")
+        .expect("handoff prompt missing from output");
+    let queued_position = queued_output
+        .find("queued during handoff reservation")
+        .expect("queued message missing from output");
+    assert!(handoff_position < queued_position);
+
+    let mut completed = Value::Null;
+    for _ in 0..30 {
+        let (status, payload) = get_json(app.clone(), "/sessions/runtimehandoff").await;
+        assert_eq!(status, StatusCode::OK);
+        if payload["last_handoff_path"] == handoff_path.display().to_string() {
+            completed = payload;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_ne!(completed, Value::Null, "handoff metadata was not promoted");
+    assert_eq!(completed["id"], "runtimehandoff");
+    assert_eq!(completed["friendly_name"], "runtime-handoff");
+
     let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
     let runtime_handoff = raw_state["sessions"]
         .as_array()
@@ -13485,10 +13573,206 @@ async fn runtime_core_handoff_records_without_interrupting_active_turn() {
         .iter()
         .find(|session| session["id"] == "runtimehandoff")
         .unwrap();
+    assert!(runtime_handoff["pending_handoff_path"].is_null());
+    assert!(runtime_handoff["pending_handoff_recorded_at"].is_null());
+    assert!(runtime_handoff["claude_handoff_in_progress_at"].is_null());
     assert_eq!(
-        runtime_handoff["pending_handoff_path"],
+        runtime_handoff["last_handoff_path"],
         handoff_path.display().to_string()
     );
+}
+
+#[tokio::test]
+async fn runtime_core_claude_handoff_failure_retains_pending_and_restart_recovers() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-handoff-recovery-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let runtime_command = r#"/bin/sh -lc 'printf ">\n"; while IFS= read -r line; do printf "runtime:%s\n>\n" "$line"; done' runtime-sh"#;
+    let app = runtime_app_with_command(&state_file, &log_dir, &tmux_socket, runtime_command);
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "runtimehandoffrecovery",
+            "name": "runtime-handoff-recovery",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "initial recovery prompt"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    wait_for_output_contains(
+        app.clone(),
+        "runtimehandoffrecovery",
+        "runtime:initial recovery prompt",
+    )
+    .await;
+
+    let handoff_path = unique_temp_path();
+    fs::write(&handoff_path, "handoff body").unwrap();
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimehandoffrecovery/handoff",
+        json!({
+            "requester_session_id": "runtimehandoffrecovery",
+            "file_path": handoff_path.display().to_string()
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "recorded");
+    fs::remove_file(&handoff_path).unwrap();
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "runtimehandoffrecovery",
+            "sm_hook_emitted_at": "2026-08-11T20:00:00.000000Z"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok" }));
+
+    let mut failed = Value::Null;
+    for _ in 0..30 {
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        let session = state["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == "runtimehandoffrecovery")
+            .unwrap();
+        if session["error_message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("claude_handoff_failed:"))
+        {
+            failed = session.clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_ne!(failed, Value::Null, "handoff failure was not persisted");
+    assert_eq!(
+        failed["pending_handoff_path"],
+        handoff_path.display().to_string()
+    );
+    assert!(failed["last_handoff_path"].is_null());
+    assert_eq!(failed["status"], "idle");
+    assert!(failed["pending_handoff_recorded_at"].is_string());
+    assert!(failed["claude_handoff_in_progress_at"].is_null());
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/runtimehandoffrecovery/input",
+        json!({
+            "text": "delivery after pre-clear handoff failure",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    wait_for_output_contains(
+        app,
+        "runtimehandoffrecovery",
+        "runtime:delivery after pre-clear handoff failure",
+    )
+    .await;
+
+    fs::write(&handoff_path, "restored handoff body").unwrap();
+    let mut legacy_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    legacy_state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "runtimehandoffrecovery")
+        .unwrap()["pending_handoff_recorded_at"] = Value::Null;
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&legacy_state).unwrap(),
+    )
+    .unwrap();
+    let legacy_restart =
+        runtime_app_with_command(&state_file, &log_dir, &tmux_socket, runtime_command);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (status, legacy_output) = get_json(
+        legacy_restart,
+        "/sessions/runtimehandoffrecovery/output?lines=20",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!legacy_output["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("continue from where you left off"));
+
+    legacy_state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "runtimehandoffrecovery")
+        .unwrap()["pending_handoff_recorded_at"] = Value::String("2026-08-11T20:00:00Z".to_owned());
+    fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&legacy_state).unwrap(),
+    )
+    .unwrap();
+    let restarted = runtime_app_with_command(&state_file, &log_dir, &tmux_socket, runtime_command);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    wait_for_output_contains(
+        restarted.clone(),
+        "runtimehandoffrecovery",
+        &format!(
+            "runtime:Read {} and continue from where you left off.",
+            handoff_path.display()
+        ),
+    )
+    .await;
+
+    let mut recovered = Value::Null;
+    for _ in 0..30 {
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        let session = state["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == "runtimehandoffrecovery")
+            .unwrap();
+        if session["last_handoff_path"] == handoff_path.display().to_string() {
+            recovered = session.clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_ne!(
+        recovered,
+        Value::Null,
+        "restart did not recover the handoff"
+    );
+    assert!(recovered["pending_handoff_path"].is_null());
+    assert!(recovered["pending_handoff_recorded_at"].is_null());
+    assert!(recovered["claude_handoff_in_progress_at"].is_null());
+    assert!(recovered["error_message"].is_null());
+    assert_eq!(recovered["status"], "running");
 }
 
 #[tokio::test]
