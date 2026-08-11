@@ -594,6 +594,9 @@ impl UsageLedgerStore {
         seat_meta: &BTreeMap<String, UsageSeatMetadata>,
     ) -> Result<Option<IngestOutcome>> {
         let Some(account_key) = account_at(tx, Provider::Claude, parsed.timestamp)? else {
+            if predates_first_account_interval(tx, Provider::Claude, parsed.timestamp)? {
+                return Ok(None);
+            }
             bail!(
                 "Claude message {} has no account timeline attribution",
                 parsed.message_id
@@ -693,6 +696,10 @@ impl UsageLedgerStore {
                     .and_then(|(_, effort)| effort)
                     .or_else(|| seat.and_then(|seat| seat.effort.clone()));
                 let Some(account_key) = account_at(tx, Provider::Codex, timestamp)? else {
+                    if predates_first_account_interval(tx, Provider::Codex, timestamp)? {
+                        save_codex_cursor(tx, &thread_id, &artifact.path, source_seq, &totals)?;
+                        return Ok(Some(IngestOutcome::Ignored));
+                    }
                     bail!(
                         "Codex token event {thread_id}:{source_seq} has no account timeline attribution"
                     );
@@ -1838,6 +1845,23 @@ fn account_at(
     .map_err(Into::into)
 }
 
+fn predates_first_account_interval(
+    tx: &Transaction<'_>,
+    provider: Provider,
+    timestamp: OffsetDateTime,
+) -> Result<bool> {
+    let first_from = tx.query_row(
+        "SELECT MIN(from_ts) FROM account_timeline WHERE provider = ?1",
+        [provider.as_str()],
+        |row| row.get::<_, Option<String>>(0),
+    )?;
+    Ok(first_from
+        .as_deref()
+        .map(parse_timestamp)
+        .transpose()?
+        .is_some_and(|first_from| timestamp < first_from))
+}
+
 fn credit_metered(
     tx: &Transaction<'_>,
     account_key: &str,
@@ -2474,6 +2498,65 @@ mod tests {
     }
 
     #[test]
+    fn skipped_codex_history_sets_the_cumulative_baseline_before_attribution() {
+        let dir = TestDir::new("codex-pre-identity-baseline");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Codex,
+            "account-one",
+            "pro",
+            "codex_300",
+            300,
+        );
+        let artifact = dir.0.join("codex-thread.jsonl");
+        fs::write(
+            &artifact,
+            concat!(
+                "{\"event_type\":\"thread/settings/updated\",\"seq\":1,\"ts\":\"2026-08-10T13:59:59Z\",\"payload\":{\"threadId\":\"thread-one\",\"threadSettings\":{\"model\":\"gpt-5.6-terra\",\"effort\":\"high\"}}}\n",
+                "{\"event_type\":\"thread/tokenUsage/updated\",\"seq\":2,\"ts\":\"2026-08-10T14:00:00Z\",\"payload\":{\"threadId\":\"thread-one\",\"turnId\":\"old\",\"tokenUsage\":{\"total\":{\"inputTokens\":80,\"cachedInputTokens\":20,\"cacheWriteInputTokens\":0,\"outputTokens\":20,\"reasoningOutputTokens\":5,\"totalTokens\":100}}}}\n",
+                "{\"event_type\":\"thread/tokenUsage/updated\",\"seq\":3,\"ts\":\"2026-08-10T16:30:00Z\",\"payload\":{\"threadId\":\"thread-one\",\"turnId\":\"current\",\"tokenUsage\":{\"total\":{\"inputTokens\":120,\"cachedInputTokens\":30,\"cacheWriteInputTokens\":0,\"outputTokens\":30,\"reasoningOutputTokens\":8,\"totalTokens\":150}}}}\n"
+            ),
+        )
+        .unwrap();
+        SeatSessionStore::new(&db_path)
+            .append("seat-one", "codex-fork", "thread-one", artifact.to_str())
+            .unwrap();
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        store
+            .scan(&[UsageSeatMetadata {
+                seat_id: "seat-one".to_owned(),
+                friendly_name: None,
+                provider: "codex-fork".to_owned(),
+                model: None,
+                effort: None,
+                working_dir: "/repo".to_owned(),
+                parent_seat_id: None,
+                root_seat_id: Some("seat-one".to_owned()),
+                project_key: "/repo".to_owned(),
+            }])
+            .unwrap();
+
+        let connection = Connection::open(db_path).unwrap();
+        let (message_count, total_tokens): (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*), SUM(total_tokens) FROM message_ledger",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((message_count, total_tokens), (1, 50));
+        let cursor_total: i64 = connection
+            .query_row(
+                "SELECT last_total_tokens FROM codex_thread_cursor WHERE thread_id = 'thread-one'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cursor_total, 150);
+    }
+
+    #[test]
     fn window_start_is_an_exact_duration_across_dst_boundary() {
         let reset = at("2026-03-08T10:30:00Z");
         let start = derive_window_start(reset, 300).unwrap();
@@ -2538,6 +2621,7 @@ mod tests {
         let db_path = dir.0.join("usage.db");
         let account = identity(Provider::Claude, "account-one", "max");
         let observed_at = OffsetDateTime::now_utc();
+        let old_message_at = observed_at - time::Duration::hours(10);
         let message_at = observed_at - time::Duration::hours(1);
         UsageIdentityStore::new(&db_path)
             .unwrap()
@@ -2564,7 +2648,24 @@ mod tests {
         fs::write(
             &transcript,
             format!(
-                "{}\n",
+                "{}\n{}\n",
+                json!({
+                    "timestamp": old_message_at.format(&Rfc3339).unwrap(),
+                    "sessionId": "session-one",
+                    "requestId": "request-old",
+                    "cwd": "/repo",
+                    "version": "1.0.0",
+                    "message": {
+                        "id": "message-old",
+                        "model": "claude-sonnet-5",
+                        "usage": {
+                            "input_tokens": 100,
+                            "output_tokens": 50,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0
+                        }
+                    }
+                }),
                 json!({
                     "timestamp": message_at.format(&Rfc3339).unwrap(),
                     "sessionId": "session-one",
@@ -2617,6 +2718,84 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM message_ledger", [], |row| row.get(0))
             .unwrap();
         assert_eq!(ledger_count, 1);
+    }
+
+    #[test]
+    fn scanner_skips_pre_identity_history_when_no_burn_window_exists() {
+        let dir = TestDir::new("no-burn-bootstrap-boundary");
+        let db_path = dir.0.join("usage.db");
+        let account = identity(Provider::Claude, "account-one", "max");
+        UsageIdentityStore::new(&db_path)
+            .unwrap()
+            .record_observation(
+                Provider::Claude,
+                Some(&account),
+                at("2026-08-10T15:00:00Z"),
+                None,
+                None,
+            )
+            .unwrap();
+        UsageBurnStore::new(&db_path).unwrap();
+        let transcript = dir.0.join("session-one.jsonl");
+        let message = |timestamp: &str, id: &str| {
+            json!({
+                "timestamp": timestamp,
+                "sessionId": "session-one",
+                "requestId": format!("request-{id}"),
+                "cwd": "/repo",
+                "version": "1.0.0",
+                "message": {
+                    "id": format!("message-{id}"),
+                    "model": "claude-sonnet-5",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0
+                    }
+                }
+            })
+        };
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                message("2026-08-10T14:00:00Z", "old"),
+                message("2026-08-10T16:00:00Z", "current")
+            ),
+        )
+        .unwrap();
+        SeatSessionStore::new(&db_path)
+            .append("seat-one", "claude", "session-one", transcript.to_str())
+            .unwrap();
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        store
+            .scan(&[UsageSeatMetadata {
+                seat_id: "seat-one".to_owned(),
+                friendly_name: None,
+                provider: "claude".to_owned(),
+                model: None,
+                effort: None,
+                working_dir: "/repo".to_owned(),
+                parent_seat_id: None,
+                root_seat_id: Some("seat-one".to_owned()),
+                project_key: "/repo".to_owned(),
+            }])
+            .unwrap();
+
+        let connection = Connection::open(db_path).unwrap();
+        let ledger_ids = connection
+            .prepare("SELECT message_id FROM message_ledger ORDER BY message_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(ledger_ids, vec!["message-current"]);
+        let window_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM message_window", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(window_count, 0);
     }
 
     #[test]
