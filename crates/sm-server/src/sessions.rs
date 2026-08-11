@@ -3502,9 +3502,10 @@ fn wait_for_codex_fork_provider_resume_id_after_offset(
 ) -> Result<String> {
     let started = Instant::now();
     let mut offset = initial_offset;
+    let mut buffer = String::new();
     loop {
-        if let Ok(content) = read_file_from_offset(event_stream_path, &mut offset) {
-            for line in content.lines() {
+        if let Ok(chunk) = read_file_from_offset(event_stream_path, &mut offset) {
+            for line in split_complete_event_lines(&mut buffer, &chunk) {
                 let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
                     continue;
                 };
@@ -8555,6 +8556,41 @@ mod tests {
             .unwrap(),
             "new-thread"
         );
+        let _ = fs::remove_file(event_stream_path);
+    }
+
+    #[test]
+    fn codex_fork_clear_rebind_buffers_partial_events_between_polls() {
+        let event_stream_path = unique_temp_path("codex-clear-rebind-partial-events");
+        fs::write(
+            &event_stream_path,
+            r#"{"event_type":"thread/started","payload":{"thread":{"#,
+        )
+        .unwrap();
+        let writer_path = event_stream_path.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            fs::OpenOptions::new()
+                .append(true)
+                .open(writer_path)
+                .unwrap()
+                .write_all(
+                    br#""id":"new-thread"}}}
+"#,
+                )
+                .unwrap();
+        });
+
+        assert_eq!(
+            wait_for_codex_fork_provider_resume_id_after_offset(
+                &event_stream_path,
+                0,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+            "new-thread"
+        );
+        writer.join().unwrap();
         let _ = fs::remove_file(event_stream_path);
     }
 
