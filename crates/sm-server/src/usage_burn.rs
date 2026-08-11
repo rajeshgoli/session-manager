@@ -528,8 +528,9 @@ fn codex_reset_at(
     if let Some(timestamp) = json_i64(update.get("resetsAt").or_else(|| update.get("resets_at"))) {
         return OffsetDateTime::from_unix_timestamp(timestamp).ok();
     }
+    let observed_second = observed_at.replace_nanosecond(0).ok()?;
     json_i64(update.get("resets_in_seconds"))
-        .map(|seconds| observed_at + time::Duration::seconds(seconds))
+        .map(|seconds| observed_second + time::Duration::seconds(seconds))
 }
 
 fn json_string(value: &Map<String, Value>, key: &str) -> Option<String> {
@@ -823,6 +824,58 @@ mod tests {
             .unwrap();
         assert_eq!(latest.0, 40.0);
         assert_eq!(latest.1, "2026-08-17T16:00:00.000000000Z");
+    }
+
+    #[test]
+    fn codex_relative_reset_countdowns_share_a_canonical_window_boundary() {
+        let db_path = temp_db("codex-relative-reset");
+        seed_account(
+            &db_path,
+            Provider::Codex,
+            "codex-account",
+            "2026-08-10T12:00:00Z",
+        );
+        let store = UsageBurnStore::new(&db_path).unwrap();
+        for (timestamp, seconds, percent) in [
+            ("2026-08-10T12:01:00.155Z", 300, 10),
+            ("2026-08-10T12:01:01.620Z", 299, 11),
+        ] {
+            let event = json!({
+                "type": "event_msg",
+                "timestamp": timestamp,
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "limit_id": "codex",
+                        "primary": {
+                            "used_percent": percent,
+                            "window_minutes": 300,
+                            "resets_in_seconds": seconds
+                        }
+                    }
+                }
+            });
+            assert_eq!(
+                store
+                    .record_codex_event(event.as_object().unwrap(), at(timestamp))
+                    .unwrap(),
+                1
+            );
+        }
+
+        let (reset_count, start_count, reset): (i64, i64, String) = Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                r#"
+                SELECT COUNT(DISTINCT resets_at), COUNT(DISTINCT window_start), MAX(resets_at)
+                FROM burn_samples WHERE source = 'codex_event'
+                "#,
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((reset_count, start_count), (1, 1));
+        assert_eq!(reset, "2026-08-10T12:06:00.000000000Z");
     }
 
     #[test]
