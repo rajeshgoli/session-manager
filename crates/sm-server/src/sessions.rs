@@ -7465,11 +7465,13 @@ fn claude_projects_roots(configured_transcript_root: Option<&str>) -> Vec<PathBu
     {
         push(expand_home(root));
     }
-    if let Some(config_dir) = env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        push(config_dir.join("projects"));
+    if let Some(config_dirs) = env::var_os("CLAUDE_CONFIG_DIR") {
+        for config_dir in config_dirs.to_string_lossy().split(',') {
+            let config_dir = config_dir.trim();
+            if !config_dir.is_empty() {
+                push(expand_home(config_dir).join("projects"));
+            }
+        }
     }
     if let Some(xdg_config_home) = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -8495,18 +8497,23 @@ mod tests {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
         let root = unique_temp_path("claude-project-roots");
         let home = root.join("home");
-        let config_dir = root.join("claude-config");
+        let config_dir_a = root.join("claude-config-a");
+        let config_dir_b = root.join("claude-config-b");
         let xdg_dir = root.join("xdg");
         let configured = root.join("configured-projects");
         let _home = EnvVarRestore::set("HOME", &home);
-        let _config = EnvVarRestore::set("CLAUDE_CONFIG_DIR", &config_dir);
+        let _config = EnvVarRestore::set(
+            "CLAUDE_CONFIG_DIR",
+            format!("{}, {}", config_dir_a.display(), config_dir_b.display()),
+        );
         let _xdg = EnvVarRestore::set("XDG_CONFIG_HOME", &xdg_dir);
 
         assert_eq!(
             claude_projects_roots(Some(configured.to_str().unwrap())),
             vec![
                 configured,
-                config_dir.join("projects"),
+                config_dir_a.join("projects"),
+                config_dir_b.join("projects"),
                 xdg_dir.join("claude").join("projects"),
                 home.join(".claude").join("projects"),
             ]

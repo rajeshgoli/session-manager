@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const DEFAULT_USAGE_DB_PATH: &str = "~/.local/share/claude-sessions/usage.db";
@@ -46,35 +46,27 @@ impl SeatSessionStore {
             .map(str::trim)
             .filter(|value| !value.is_empty());
 
-        let connection = self.open()?;
+        let mut connection = self.open()?;
+        let transaction = connection
+            .transaction()
+            .context("failed to start seat session append")?;
         let observed_at = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .context("failed to format seat session timestamp")?;
-        connection
-            .execute(
-                r#"
-                INSERT OR IGNORE INTO seat_sessions (
-                    seat_id,
-                    provider,
-                    provider_session_id,
-                    artifact_path,
-                    first_seen,
-                    last_seen
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
-                "#,
-                params![
-                    seat_id,
-                    provider,
-                    provider_session_id,
-                    artifact_path,
-                    observed_at
-                ],
-            )
-            .with_context(|| {
-                format!(
-                    "failed to append provider session {provider_session_id} for seat {seat_id}"
-                )
-            })?;
+        append_identity(
+            &transaction,
+            seat_id,
+            provider,
+            provider_session_id,
+            artifact_path,
+            &observed_at,
+        )
+        .with_context(|| {
+            format!("failed to append provider session {provider_session_id} for seat {seat_id}")
+        })?;
+        transaction
+            .commit()
+            .context("failed to commit seat session append")?;
         Ok(())
     }
 
@@ -90,32 +82,20 @@ impl SeatSessionStore {
             .format(&Rfc3339)
             .context("failed to format seat session timestamp")?;
         for session in sessions {
-            transaction
-                .execute(
-                    r#"
-                    INSERT OR IGNORE INTO seat_sessions (
-                        seat_id,
-                        provider,
-                        provider_session_id,
-                        artifact_path,
-                        first_seen,
-                        last_seen
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?5)
-                    "#,
-                    params![
-                        session.seat_id,
-                        session.provider,
-                        session.provider_session_id,
-                        session.artifact_path,
-                        observed_at
-                    ],
+            append_identity(
+                &transaction,
+                &session.seat_id,
+                &session.provider,
+                &session.provider_session_id,
+                session.artifact_path.as_deref(),
+                &observed_at,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to reconcile provider session {} for seat {}",
+                    session.provider_session_id, session.seat_id
                 )
-                .with_context(|| {
-                    format!(
-                        "failed to reconcile provider session {} for seat {}",
-                        session.provider_session_id, session.seat_id
-                    )
-                })?;
+            })?;
             if session.artifact_path.is_some() {
                 transaction
                     .execute(
@@ -197,6 +177,56 @@ impl SeatSessionStore {
             .context("failed to initialize seat session schema")?;
         Ok(connection)
     }
+}
+
+fn append_identity(
+    transaction: &Transaction<'_>,
+    seat_id: &str,
+    provider: &str,
+    provider_session_id: &str,
+    artifact_path: Option<&str>,
+    observed_at: &str,
+) -> rusqlite::Result<()> {
+    if seat_id != "unassigned" {
+        transaction.execute(
+            r#"
+            DELETE FROM seat_sessions
+            WHERE seat_id = 'unassigned'
+              AND provider = ?1
+              AND provider_session_id = ?2
+            "#,
+            params![provider, provider_session_id],
+        )?;
+    }
+    transaction.execute(
+        r#"
+        INSERT OR IGNORE INTO seat_sessions (
+            seat_id,
+            provider,
+            provider_session_id,
+            artifact_path,
+            first_seen,
+            last_seen
+        )
+        SELECT ?1, ?2, ?3, ?4, ?5, ?5
+        WHERE ?1 != 'unassigned'
+           OR NOT EXISTS (
+                SELECT 1
+                FROM seat_sessions
+                WHERE seat_id != 'unassigned'
+                  AND provider = ?2
+                  AND provider_session_id = ?3
+           )
+        "#,
+        params![
+            seat_id,
+            provider,
+            provider_session_id,
+            artifact_path,
+            observed_at
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,6 +366,47 @@ mod tests {
                 ("existing-path".to_owned(), "/tmp/original.jsonl".to_owned(),),
                 ("missing-path".to_owned(), "/tmp/recovered.jsonl".to_owned(),),
             ]
+        );
+    }
+
+    #[test]
+    fn definitive_binding_replaces_and_blocks_provisional_unassigned_rows() {
+        let state_file = test_path("provisional-binding");
+        let db_path = state_file.with_extension("usage.db");
+        let store = SeatSessionStore::for_state_file(&state_file);
+        let provisional = SeatSessionIdentity {
+            seat_id: "unassigned".to_owned(),
+            provider: "claude".to_owned(),
+            provider_session_id: "provider-a".to_owned(),
+            artifact_path: Some("/tmp/provisional.jsonl".to_owned()),
+        };
+
+        store.append_batch(&[provisional.clone()]).unwrap();
+        store
+            .append(
+                "seat-1",
+                "claude",
+                "provider-a",
+                Some("/tmp/definitive.jsonl"),
+            )
+            .unwrap();
+        store.append_batch(&[provisional]).unwrap();
+
+        let connection = Connection::open(&db_path).unwrap();
+        let rows = connection
+            .prepare(
+                "SELECT seat_id, artifact_path FROM seat_sessions WHERE provider_session_id = 'provider-a'",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![("seat-1".to_owned(), "/tmp/definitive.jsonl".to_owned())]
         );
     }
 
