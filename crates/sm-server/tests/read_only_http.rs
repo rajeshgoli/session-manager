@@ -7777,6 +7777,23 @@ async fn usage_routes_preserve_exact_account_burn_and_optionally_include_childre
             None,
         )
         .unwrap();
+    let codex_without_windows = AccountIdentity {
+        provider: Provider::Codex,
+        external_id: "usage-codex-no-windows".to_owned(),
+        label: None,
+        plan_tier: Some("pro".to_owned()),
+        extra_usage_enabled: Some(false),
+    };
+    UsageIdentityStore::new(&usage_db_path)
+        .unwrap()
+        .record_observation(
+            Provider::Codex,
+            Some(&codex_without_windows),
+            now - time::Duration::minutes(1),
+            None,
+            None,
+        )
+        .unwrap();
     UsageBurnStore::new(&usage_db_path)
         .unwrap()
         .record_for_account(
@@ -7852,7 +7869,25 @@ async fn usage_routes_preserve_exact_account_burn_and_optionally_include_childre
     assert_eq!(own["accounts"][0]["windows"][0]["account_percent"], 40.0);
     assert_eq!(own["accounts"][0]["windows"][0]["total_percent"], 20.0);
     assert_eq!(own["accounts"][0]["label"], "primary");
+    assert_eq!(own["accounts"][0]["active"], true);
     assert_eq!(own["target"]["usage_cap_fraction"], 0.5);
+    assert_eq!(own["target"]["descendant_count"], 0);
+    assert_eq!(own["target"]["available_descendant_count"], 1);
+    assert_eq!(
+        own["accounts"][0]["windows"][0]["seats"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        own["accounts"][0]["windows"][0]["seats"][0]["seat_id"],
+        "parent01"
+    );
+    assert_eq!(
+        own["accounts"][0]["windows"][0]["seats"][0]["total_tokens"],
+        100
+    );
     assert_eq!(
         own["accounts"][0]["windows"][0]["cap_consumed_percent"],
         40.0
@@ -7865,6 +7900,14 @@ async fn usage_routes_preserve_exact_account_burn_and_optionally_include_childre
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(subtree["target"]["descendant_count"], 1);
+    assert_eq!(subtree["target"]["available_descendant_count"], 1);
+    assert_eq!(
+        subtree["accounts"][0]["windows"][0]["seats"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(
         subtree["accounts"][0]["windows"][0]["account_percent"],
         40.0
@@ -7877,10 +7920,21 @@ async fn usage_routes_preserve_exact_account_burn_and_optionally_include_childre
 
     let (status, accounts) = get_json(app.clone(), "/usage/accounts?since_reset=true").await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(accounts["decision"]["status"], "non_actionable");
+    assert_eq!(accounts["accounts"].as_array().unwrap().len(), 2);
     assert_eq!(
         accounts["accounts"][0]["windows"][0]["account_percent"], 40.0,
         "account view must pass through the exact first-party burn sample"
     );
+    assert_eq!(
+        accounts["accounts"][1]["account_key"],
+        codex_without_windows.account_key()
+    );
+    assert_eq!(accounts["accounts"][1]["active"], true);
+    assert!(accounts["accounts"][1]["windows"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     let (status, idle) = get_json(app.clone(), "/sessions/idle0001/usage?since_reset=true").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(idle["accounts"][0]["account_key"], account.account_key());

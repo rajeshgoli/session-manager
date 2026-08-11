@@ -177,15 +177,11 @@ impl SessionStore {
             return Ok(None);
         };
         let all_sessions = self.load_snapshot()?.into_sessions();
+        let mut descendants = Vec::new();
+        let mut visited = BTreeSet::new();
+        collect_descendants_preorder(&all_sessions, &session.id, &mut visited, &mut descendants);
+        let available_descendant_count = descendants.len();
         let child_seats = if include_children {
-            let mut descendants = Vec::new();
-            let mut visited = BTreeSet::new();
-            collect_descendants_preorder(
-                &all_sessions,
-                &session.id,
-                &mut visited,
-                &mut descendants,
-            );
             descendants
                 .into_iter()
                 .map(|descendant| descendant.id)
@@ -200,6 +196,7 @@ impl SessionStore {
             usage_cap_fraction: session.usage_cap_fraction,
             self_seats: BTreeSet::from([session.id]),
             child_seats,
+            available_descendant_count,
         };
         Ok(Some(store.report(Some(&target), options)?))
     }

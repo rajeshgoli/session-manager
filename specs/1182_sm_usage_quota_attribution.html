@@ -1315,9 +1315,9 @@ continuing at a price.</p>
 </blockquote>
 
 <p>The same applies to caps: a <code>usage_cap_fraction</code> is evaluated per account (decision 2), so a
-subtree spanning two accounts is measured against each independently. <code>--since-reset</code> restricts to the current window; without it the report also
-prints the last three closed windows from <code>window_ledger</code>, so historic rate sits beside current
-burn.</p>
+subtree spanning two accounts is measured against each independently. The default and compatibility
+flag <code>--since-reset</code> restrict output to the current window; <code>--history</code> also prints the
+last three closed windows from <code>window_ledger</code>.</p>
 
 <h2>D · Model weights</h2>
 
@@ -1594,7 +1594,7 @@ dormant.</p>
 <p>No denominator field, and no per-model weight field — weights are fitted state, not configuration.</p>
 
 <h3>E.2 CLI</h3>
-<pre><code>sm usage [AGENT] [--include-children] [--since-reset] [--account] [--by-model] [--json]</code></pre>
+<pre><code>sm usage [AGENT] [--include-children] [--history|--since-reset] [--account] [--by-model] [--json]</code></pre>
 
 <div class="tw">
 <table>
@@ -1602,12 +1602,29 @@ dormant.</p>
   <tr><td><em>(none)</em></td><td>Current seat, current windows</td></tr>
   <tr><td><code>AGENT</code></td><td>Named seat or session id</td></tr>
   <tr><td><code>--include-children</code></td><td>Roll up the descendant subtree</td></tr>
-  <tr><td><code>--since-reset</code></td><td>Current window only; otherwise also prints the last three closed windows</td></tr>
+  <tr><td><code>--history</code></td><td>Also print the last three closed windows; normal decision output is current-window only</td></tr>
+  <tr><td><code>--since-reset</code></td><td>Compatibility spelling for the current-window default</td></tr>
   <tr><td><code>--account</code></td><td>Account view: every seat's share, including <code>unassigned</code></td></tr>
   <tr><td><code>--by-model</code></td><td>Break the seat's own burn down by model family, with the weight source</td></tr>
   <tr><td><code>--json</code></td><td>Machine-readable; per-subcommand flag, matching existing convention</td></tr>
 </table>
 </div>
+
+<blockquote>
+  <p><strong>Decision safety.</strong> A current sample older than ten minutes is not silently discarded:
+  its consumed percentage remains a lower bound and its free headroom remains an upper bound, while the
+  report is marked non-actionable and projections are suppressed. Refresh remains provider-event driven;
+  <code>sm usage</code> does not claim to force either provider to poll. A partial provider payload is also
+  non-actionable when a required short or weekly limiting meter is absent. Open
+  <code>account_timeline</code> rows define which accounts require current meters, so an active account with
+  zero windows blocks a decision while a closed historical account does not.</p>
+  <p>Fresh weekly windows may show a low-confidence linear projection. Existing account burn continues at
+  its current-window rate; model capacity uses the highest observed same-model seat rate over that seat's
+  own active interval after at least one hour of evidence, so prior-mode invisible usage biases capacity
+  downward rather than creating optimistic seats. Premium-model capacity appears only under the scoped
+  meter, never the looser overall meter. The JSON response names these assumptions. With prior weights,
+  residual is bounded as zero through measured account burn and is never presented as measured.</p>
+</blockquote>
 
 <pre><code>$ sm usage 320 --include-children
 seat 320 (a4af4272) · model opus · 4 descendants across 2 accounts
