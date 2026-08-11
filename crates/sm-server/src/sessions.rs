@@ -2835,6 +2835,34 @@ impl SessionStore {
         Ok(monitors.len())
     }
 
+    pub fn recover_codex_fork_event_monitors(&self) -> Result<usize> {
+        let Some(runtime) = self.delivery_runtime.as_ref() else {
+            return Ok(0);
+        };
+        let monitors = self
+            .load_snapshot()?
+            .into_sessions()
+            .into_iter()
+            .filter(|session| {
+                session.provider == "codex-fork"
+                    && is_primary_node(&session.node)
+                    && normalized_status(&session.status) != "stopped"
+            })
+            .filter_map(|session| {
+                codex_fork_event_stream_path(&session, runtime)
+                    .map(|event_stream_path| (session.id, event_stream_path))
+            })
+            .collect::<Vec<_>>();
+
+        for (session_id, event_stream_path) in &monitors {
+            self.start_codex_fork_event_monitor_from_current_end(
+                session_id.clone(),
+                event_stream_path.clone(),
+            )?;
+        }
+        Ok(monitors.len())
+    }
+
     fn start_codex_fork_handoff_monitor(
         &self,
         session_id: String,
@@ -7500,11 +7528,12 @@ fn codex_fork_event_stream_path(session: &SessionRecord, runtime: &TmuxRuntime) 
     if session.provider != "codex-fork" {
         return None;
     }
+    let log_file = session.log_file.as_deref().map(expand_home)?;
     let spec = TmuxSessionSpec {
         session_id: session.id.clone(),
         tmux_session: session.tmux_session.clone(),
         working_dir: session.working_dir.clone(),
-        log_file: session.log_file.as_deref().map(expand_home)?,
+        log_file: log_file.clone(),
         provider: session.provider.clone(),
         initial_message: None,
         model: session.model.clone(),
@@ -7514,7 +7543,45 @@ fn codex_fork_event_stream_path(session: &SessionRecord, runtime: &TmuxRuntime) 
         .codex_fork_runtime_artifacts(&spec)
         .ok()
         .flatten()
-        .map(|artifacts| artifacts.event_stream_path)
+        .map(|artifacts| {
+            codex_fork_newest_event_stream_path(
+                &session.id,
+                &log_file,
+                &artifacts.event_stream_path,
+            )
+        })
+}
+
+pub(crate) fn codex_fork_legacy_event_stream_path_from_log_file(
+    log_file: &Path,
+) -> Option<PathBuf> {
+    let stem = log_file.file_stem()?.to_str()?.trim();
+    if stem.is_empty() {
+        return None;
+    }
+    Some(log_file.with_file_name(format!("{stem}.codex-fork.events.jsonl")))
+}
+
+pub(crate) fn codex_fork_newest_event_stream_path(
+    _session_id: &str,
+    log_file: &Path,
+    derived_path: &Path,
+) -> PathBuf {
+    let mut candidates = vec![derived_path.to_path_buf()];
+    if let Some(legacy_path) = codex_fork_legacy_event_stream_path_from_log_file(log_file) {
+        candidates.push(legacy_path);
+    }
+    candidates
+        .iter()
+        .filter_map(|path| {
+            path.metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(|modified| (modified, path))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path.to_path_buf())
+        .unwrap_or_else(|| derived_path.to_path_buf())
 }
 
 fn session_lifetime_overlaps(
@@ -10806,10 +10873,74 @@ mod tests {
         fixture.wait_for_handoff(&restarted);
     }
 
+    #[test]
+    fn codex_fork_event_monitor_recovery_records_only_new_rate_limits() {
+        let Some(fixture) = CodexForkHandoffFixture::new("event-monitor-recovery") else {
+            return;
+        };
+        let usage_db_path = fixture.state_file.with_extension("usage.db");
+        let observed_at = OffsetDateTime::now_utc();
+        UsageIdentityStore::new(&usage_db_path)
+            .unwrap()
+            .record_observation(
+                Provider::Codex,
+                Some(&AccountIdentity {
+                    provider: Provider::Codex,
+                    external_id: "codex-restart-account".to_owned(),
+                    label: None,
+                    plan_tier: Some("pro".to_owned()),
+                    extra_usage_enabled: None,
+                }),
+                observed_at - TimeDuration::minutes(1),
+                None,
+                None,
+            )
+            .unwrap();
+        let legacy_event_stream =
+            codex_fork_legacy_event_stream_path_from_log_file(&fixture.log_file).unwrap();
+        fs::write(&legacy_event_stream, "").unwrap();
+        fixture.append_rate_limit_to(&legacy_event_stream, 12.0);
+        assert_eq!(
+            codex_fork_newest_event_stream_path(
+                "codex001",
+                &fixture.log_file,
+                &fixture.event_stream_path,
+            ),
+            legacy_event_stream
+        );
+
+        let restarted = fixture
+            .store()
+            .with_usage_burn_store(UsageBurnStore::new(&usage_db_path).unwrap());
+        assert_eq!(restarted.recover_codex_fork_event_monitors().unwrap(), 1);
+        fixture.append_rate_limit_to(&legacy_event_stream, 27.0);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let samples = Connection::open(&usage_db_path)
+                .unwrap()
+                .prepare("SELECT percent FROM burn_samples ORDER BY id")
+                .unwrap()
+                .query_map([], |row| row.get::<_, f64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            if samples == vec![27.0] {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "recovered event monitor did not ingest the new sample: {samples:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     struct CodexForkHandoffFixture {
         state_file: PathBuf,
         event_stream_path: PathBuf,
         handoff_path: PathBuf,
+        log_file: PathBuf,
         tmux_socket: String,
         tmux_session: String,
     }
@@ -10874,6 +11005,7 @@ mod tests {
                 state_file,
                 event_stream_path,
                 handoff_path,
+                log_file,
                 tmux_socket,
                 tmux_session,
             })
@@ -10894,6 +11026,32 @@ mod tests {
             writeln!(
                 file,
                 r#"{{"event_type":"turn_complete","payload":{{"turn_id":"turn-1"}}}}"#
+            )
+            .unwrap();
+        }
+
+        fn append_rate_limit_to(&self, event_stream_path: &Path, percent: f64) {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(event_stream_path)
+                .unwrap();
+            writeln!(
+                file,
+                "{}",
+                json!({
+                    "event_type": "account/rateLimits/updated",
+                    "payload": {"rateLimits": {
+                        "limitId": "codex",
+                        "primary": {
+                            "usedPercent": percent,
+                            "windowDurationMins": 300,
+                            "resetsAt": (OffsetDateTime::now_utc()
+                                + TimeDuration::minutes(300))
+                                .unix_timestamp()
+                        },
+                        "secondary": null
+                    }}
+                })
             )
             .unwrap();
         }
