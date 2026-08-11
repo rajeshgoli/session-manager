@@ -2629,10 +2629,8 @@ fn usage_uses_account_view(args: &UsageArgs, current_session_id: Option<&str>) -
 
 fn print_usage_decision(payload: &Value) {
     let decision = &payload["decision"];
-    match decision["status"].as_str().unwrap_or("non_actionable") {
-        "actionable" => {}
-        "partial" => println!("PARTIAL · some current quota meters are not decision-grade"),
-        _ => println!("NON-ACTIONABLE · no fresh quota meter is available"),
+    if let Some(banner) = usage_decision_banner(decision) {
+        println!("{banner}");
     }
     for reason in decision["reasons"].as_array().into_iter().flatten() {
         if let Some(reason) = reason.as_str() {
@@ -2647,6 +2645,14 @@ fn print_usage_decision(payload: &Value) {
         if let Some(guidance) = guidance.as_str() {
             println!("  refresh: {guidance}");
         }
+    }
+}
+
+fn usage_decision_banner(decision: &Value) -> Option<&'static str> {
+    match decision["status"].as_str().unwrap_or("non_actionable") {
+        "actionable" => None,
+        "partial" => Some("PARTIAL · some current quota meters are not decision-grade"),
+        _ => Some("NON-ACTIONABLE · required quota picture is incomplete"),
     }
 }
 
@@ -4583,6 +4589,20 @@ mod tests {
         assert_eq!(format_usage_tokens(999), "999");
         assert_eq!(format_usage_tokens(12_345), "12.3k");
         assert_eq!(format_usage_tokens(2_345_678), "2.3m");
+    }
+
+    #[test]
+    fn non_actionable_banner_does_not_claim_fresh_partial_data_is_absent() {
+        let decision = json!({
+            "status": "non_actionable",
+            "fresh_current_windows": 1,
+            "missing_current_windows": ["codex:a:codex_10080"]
+        });
+
+        assert_eq!(
+            usage_decision_banner(&decision),
+            Some("NON-ACTIONABLE · required quota picture is incomplete")
+        );
     }
 
     #[test]

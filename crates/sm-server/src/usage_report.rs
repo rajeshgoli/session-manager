@@ -71,6 +71,7 @@ pub struct UsageAccountReport {
     pub label: Option<String>,
     pub provider: String,
     pub plan_tier: Option<String>,
+    pub active: bool,
     pub windows: Vec<UsageWindowReport>,
 }
 
@@ -206,6 +207,7 @@ impl UsageReportStore {
                         .unwrap_or("unknown")
                         .to_owned(),
                     plan_tier: None,
+                    active: false,
                 });
             let rows = load_window_rows(&connection, &window)?;
             let premium = premium_context(&window, &all_windows, self.premium_cap_ratio);
@@ -228,10 +230,27 @@ impl UsageReportStore {
                     label: self.account_labels.get(&window.account_key).cloned(),
                     provider: metadata.provider.clone(),
                     plan_tier: metadata.plan_tier.clone(),
+                    active: metadata.active,
                     windows: Vec::new(),
                 })
                 .windows
                 .push(report);
+        }
+
+        for (account_key, metadata) in &account_meta {
+            if !metadata.active {
+                continue;
+            }
+            accounts
+                .entry(account_key.clone())
+                .or_insert_with(|| UsageAccountReport {
+                    account_key: account_key.clone(),
+                    label: self.account_labels.get(account_key).cloned(),
+                    provider: metadata.provider.clone(),
+                    plan_tier: metadata.plan_tier.clone(),
+                    active: true,
+                    windows: Vec::new(),
+                });
         }
 
         let mut accounts = accounts.into_values().collect::<Vec<_>>();
@@ -301,6 +320,7 @@ impl UsageReportStore {
 struct AccountMetadata {
     provider: String,
     plan_tier: Option<String>,
+    active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -353,8 +373,20 @@ struct PremiumContext {
 }
 
 fn load_account_metadata(connection: &Connection) -> Result<BTreeMap<String, AccountMetadata>> {
-    let mut statement = connection
-        .prepare("SELECT account_key, provider, plan_tier FROM accounts ORDER BY account_key")?;
+    let mut statement = connection.prepare(
+        r#"
+        SELECT accounts.account_key, accounts.provider, accounts.plan_tier,
+               EXISTS (
+                 SELECT 1
+                 FROM account_timeline
+                 WHERE account_timeline.account_key = accounts.account_key
+                   AND account_timeline.provider = accounts.provider
+                   AND account_timeline.to_ts IS NULL
+               )
+        FROM accounts
+        ORDER BY accounts.account_key
+        "#,
+    )?;
     let values = statement
         .query_map([], |row| {
             Ok((
@@ -362,6 +394,7 @@ fn load_account_metadata(connection: &Connection) -> Result<BTreeMap<String, Acc
                 AccountMetadata {
                     provider: row.get(1)?,
                     plan_tier: row.get(2)?,
+                    active: row.get(3)?,
                 },
             ))
         })?
@@ -949,18 +982,20 @@ fn mark_binding_limits(windows: &mut [UsageWindowReport]) {
 fn usage_decision_summary(accounts: &[UsageAccountReport]) -> UsageDecisionSummary {
     let fresh_current_windows = accounts
         .iter()
+        .filter(|account| account.active)
         .flat_map(|account| &account.windows)
         .filter(|window| window.current && !window.stale)
         .count();
     let stale_current_windows = accounts
         .iter()
+        .filter(|account| account.active)
         .flat_map(|account| &account.windows)
         .filter(|window| window.current && window.stale)
         .count();
     let mut missing_current_windows = Vec::new();
     let mut accounts_needing_refresh = BTreeSet::new();
     for account in accounts {
-        if !account.windows.iter().any(|window| window.current) {
+        if !account.active {
             continue;
         }
         let mut required = match account.provider.as_str() {
@@ -1709,6 +1744,7 @@ mod tests {
             label: None,
             provider: "codex".to_owned(),
             plan_tier: Some("pro".to_owned()),
+            active: true,
             windows: vec![report],
         }];
 
@@ -1759,6 +1795,7 @@ mod tests {
             label: None,
             provider: "codex".to_owned(),
             plan_tier: Some("pro".to_owned()),
+            active: true,
             windows: vec![report],
         }];
 
@@ -1771,6 +1808,83 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("Missing current limiting meter")));
+    }
+
+    #[test]
+    fn active_account_without_windows_blocks_an_otherwise_complete_report() {
+        let now = OffsetDateTime::parse("2026-08-11T01:00:00Z", &Rfc3339).unwrap();
+        let mut warnings = BTreeSet::new();
+        let build = |kind: &str, start: &str, reset: &str, warnings: &mut BTreeSet<String>| {
+            build_window_report(
+                &BurnWindow {
+                    id: 1,
+                    account_key: "codex:a".to_owned(),
+                    window_kind: kind.to_owned(),
+                    window_scope: None,
+                    window_start: start.to_owned(),
+                    percent: 2.0,
+                    resets_at: reset.to_owned(),
+                    observed_at: "2026-08-11T01:00:00Z".to_owned(),
+                },
+                "codex",
+                &[],
+                None,
+                None,
+                &BTreeMap::new(),
+                false,
+                DEFAULT_PREMIUM_CAP_RATIO,
+                now,
+                warnings,
+            )
+        };
+        let accounts = vec![
+            UsageAccountReport {
+                account_key: "codex:a".to_owned(),
+                label: None,
+                provider: "codex".to_owned(),
+                plan_tier: Some("pro".to_owned()),
+                active: true,
+                windows: vec![
+                    build(
+                        "codex_300",
+                        "2026-08-11T00:00:00Z",
+                        "2026-08-11T05:00:00Z",
+                        &mut warnings,
+                    ),
+                    build(
+                        "codex_10080",
+                        "2026-08-10T00:00:00Z",
+                        "2026-08-17T00:00:00Z",
+                        &mut warnings,
+                    ),
+                ],
+            },
+            UsageAccountReport {
+                account_key: "claude:b".to_owned(),
+                label: None,
+                provider: "claude".to_owned(),
+                plan_tier: Some("max".to_owned()),
+                active: true,
+                windows: Vec::new(),
+            },
+        ];
+
+        let decision = usage_decision_summary(&accounts);
+
+        assert_eq!(decision.status, "non_actionable");
+        assert_eq!(decision.fresh_current_windows, 2);
+        assert_eq!(
+            decision.missing_current_windows,
+            [
+                "claude:b:session_5h",
+                "claude:b:weekly_all",
+                "claude:b:weekly_scoped"
+            ]
+        );
+        assert!(decision
+            .refresh_guidance
+            .iter()
+            .any(|guidance| guidance.starts_with("Claude refreshes")));
     }
 
     #[test]
