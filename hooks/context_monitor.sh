@@ -54,6 +54,10 @@ post_usage() {
        | {session_id: $sid,
           used_percentage: .context_window.used_percentage,
           total_input_tokens: (.context_window.total_input_tokens // 0),
+          rate_limits: {
+            five_hour: (.rate_limits.five_hour // null),
+            seven_day: (.rate_limits.seven_day // null)
+          },
           sm_hook_emitted_at: stamp}' 2>/dev/null
   ) || return 0
   [ -n "$body" ] || return 0

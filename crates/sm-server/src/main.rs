@@ -1,4 +1,10 @@
-use std::{net::SocketAddr, path::PathBuf, sync::atomic::Ordering, thread, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{atomic::Ordering, Arc},
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -8,6 +14,7 @@ use sm_server::{
     queue::{QueueAdmissionPolicy, QueueRecoverySummary, RetainedQueueStore},
     sessions::expand_home,
     studio_ssh,
+    usage_identity::IdentityPoller,
 };
 use tokio::net::TcpListener;
 
@@ -40,6 +47,19 @@ async fn main() -> Result<()> {
     let address: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
         .with_context(|| format!("invalid listen address {}:{}", args.host, args.port))?;
+    if config.usage.enabled && config.usage.poll_interval_secs == 0 {
+        anyhow::bail!("usage.poll_interval_secs must be > 0 when usage is enabled");
+    }
+    if config.usage.enabled && config.usage.db_path.trim().is_empty() {
+        anyhow::bail!("usage.db_path must not be empty when usage is enabled");
+    }
+    if config.usage.enabled
+        && (!config.usage.premium_cap_ratio.is_finite()
+            || config.usage.premium_cap_ratio <= 0.0
+            || config.usage.premium_cap_ratio > 1.0)
+    {
+        anyhow::bail!("usage.premium_cap_ratio must be greater than 0 and at most 1");
+    }
     // After the address is parsed so a bad --host/--port is caught too, but
     // before binding, so this can run while the old server still holds the port.
     if args.check_config {
@@ -79,6 +99,84 @@ async fn main() -> Result<()> {
     }
 
     let state = AppState::new(config);
+    // Capture the artifact boundary before serving. The background scan may run
+    // alongside live creates, but it must not attribute their new artifacts
+    // against this startup snapshot of the seat registry.
+    let reconciliation_cutoff_ns = time::OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let reconciliation_snapshot = state
+        .prepare_seat_session_reconciliation(reconciliation_cutoff_ns)
+        .context("failed to snapshot sessions for usage ledger reconciliation")?;
+    let reconciliation_state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Err(error) = reconciliation_state.reconcile_seat_sessions(reconciliation_snapshot) {
+            eprintln!("usage ledger session reconciliation failed: {error:#}");
+        }
+    });
+
+    if state.config().usage.enabled {
+        let poll_interval = state.config().usage.poll_interval_secs.max(1);
+        let scan_interval = state.config().usage.scan_interval_secs.max(1);
+        let poller = Arc::new(IdentityPoller::new(
+            expand_home(&state.config().usage.db_path),
+            expand_home("~/.claude.json"),
+            expand_home("~/.codex/auth.json"),
+        )?);
+        let identity_poller = poller.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(poll_interval));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let poller = identity_poller.clone();
+                match tokio::task::spawn_blocking(move || {
+                    poller.poll_once(time::OffsetDateTime::now_utc())
+                })
+                .await
+                {
+                    Ok(errors) => {
+                        for (provider, error) in errors {
+                            eprintln!(
+                                "{} account identity poll failed: {error:#}",
+                                provider.as_str()
+                            );
+                        }
+                    }
+                    Err(error) => eprintln!("account identity poll task failed: {error}"),
+                }
+            }
+        });
+        let usage_state = state.clone();
+        let scan_poller = poller;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(scan_interval));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let scan_state = usage_state.clone();
+                let poller = scan_poller.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let identity_errors = poller.poll_once(time::OffsetDateTime::now_utc());
+                    let scan = scan_state.scan_usage_ledger();
+                    (identity_errors, scan)
+                })
+                .await
+                {
+                    Ok((identity_errors, scan)) => {
+                        for (provider, error) in identity_errors {
+                            eprintln!(
+                                "{} account identity pre-scan poll failed: {error:#}",
+                                provider.as_str()
+                            );
+                        }
+                        if let Err(error) = scan {
+                            eprintln!("usage token ledger scan failed: {error:#}");
+                        }
+                    }
+                    Err(error) => eprintln!("usage token ledger task failed: {error}"),
+                }
+            }
+        });
+    }
 
     // Repair the Studio SSH LaunchAgents toward the desired state every 30s while
     // the toggle is on. launchctl is synchronous, so run it on a blocking thread.
@@ -93,7 +191,8 @@ async fn main() -> Result<()> {
             // enforced too (a stray enable that raced a disable gets corrected).
             let desired = studio_ssh_flag.load(Ordering::SeqCst);
             let config = studio_ssh_config.clone();
-            match tokio::task::spawn_blocking(move || studio_ssh::reconcile(&config, desired)).await {
+            match tokio::task::spawn_blocking(move || studio_ssh::reconcile(&config, desired)).await
+            {
                 Ok(status) if status.status == "error" => {
                     eprintln!("studio-ssh reconcile error: {:?}", status.error);
                 }

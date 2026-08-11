@@ -255,6 +255,16 @@ claude:
     - "--bypass-permissions"
   # Default model for spawned sessions (agent can override with --model flag)
   default_model: "sonnet"
+  # Optional Claude transcript project root; environment and default roots are
+  # also scanned for historical session chaining.
+  transcript_root: "~/.claude/projects"
+
+# Account identity timeline for sm usage. Keep disabled until the epic is ready
+# for owner-controlled activation.
+usage:
+  enabled: false
+  poll_interval_secs: 30
+  db_path: "~/.local/share/claude-sessions/usage.db"
 
 # Codex CLI + app-server settings
 codex:

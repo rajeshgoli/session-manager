@@ -91,7 +91,7 @@ use crate::codex_events::{list_codex_events_from_path, CodexEventsResponse};
 use crate::codex_requests::{list_codex_pending_requests_from_path, CodexPendingRequestsResponse};
 #[cfg(test)]
 use crate::config::MobileTerminalDeviceKeyConfig;
-use crate::config::{trimmed, AppConfig, MobileTerminalUserConfig, PublicNodeConfig};
+use crate::config::{trimmed, AppConfig, MobileTerminalUserConfig, PublicNodeConfig, UsageConfig};
 use crate::email::{
     extract_reply_message_body, extract_routed_session_id, extract_subject_from_raw_email,
     extract_text_from_raw_email, normalize_explicit_session_id, EmailBridge,
@@ -118,11 +118,12 @@ use crate::sessions::{
     ContextUsageEvent, ContextUsageOutcome, CoreClearOutcome, CoreInputBatchResponse,
     CoreInputBatchResult, CoreRestoreOutcome, CoreRetireOutcome, CoreReviewOutcome,
     CreateCoreSessionRequest, HandoffOutcome, HandoffRequest, MaintainerMutationOutcome,
-    RegistryMutationOutcome, RoleRegistrationRequest, SendCoreInputBatchRequest,
-    SendCoreInputRequest, SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore,
-    SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest,
-    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
-    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
+    RegistryMutationOutcome, RoleRegistrationRequest, SeatSessionReconciliationSnapshot,
+    SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
+    SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
+    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
+    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
+    UpdateSessionMetadataRequest,
 };
 
 use crate::studio_ssh::{self, StudioSshStatus};
@@ -130,6 +131,10 @@ use crate::tool_usage::{
     list_recent_codex_fork_tool_calls_from_path, list_recent_tool_calls_from_path,
     log_tool_usage_to_path, ToolCallRow, ToolUsageEvent,
 };
+use crate::usage_burn::UsageBurnStore;
+use crate::usage_identity::UsageIdentityStore;
+use crate::usage_ledger::{ScanSummary, UsageLedgerStore, UsageModelDefaults};
+use crate::usage_report::{UsageReportOptions, UsageReportStore};
 
 const SESSION_COOKIE_NAME: &str = "sm_auth";
 const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
@@ -370,8 +375,9 @@ impl AppState {
     pub fn new(config: AppConfig) -> Self {
         let state_file = expand_home(&config.paths.state_file);
         let queue_db_path = expand_home(&config.sm_send.db_path);
-        let session_store = SessionStore::new_with_queue(state_file, queue_db_path)
+        let mut session_store = SessionStore::new_with_queue(state_file, queue_db_path)
             .with_codex_session_index_path(config.codex.session_index_path.as_deref())
+            .with_claude_transcript_root(config.claude.transcript_root.as_deref())
             .with_context_monitor_config(config.context_monitor.clone())
             .with_delivery_runtime(
                 config
@@ -379,6 +385,40 @@ impl AppState {
                     .runtime_enabled
                     .then(|| TmuxRuntime::from_app_config(&config)),
             );
+        if should_use_configured_usage_db_path(&config.usage) {
+            session_store = session_store.with_usage_db_path(expand_home(&config.usage.db_path));
+        }
+        if config.usage.enabled {
+            match UsageIdentityStore::new(expand_home(&config.usage.db_path)) {
+                Ok(store) => session_store = session_store.with_usage_identity_store(store),
+                Err(error) => eprintln!("usage identity store initialization failed: {error:#}"),
+            }
+            match UsageBurnStore::new(expand_home(&config.usage.db_path)) {
+                Ok(store) => session_store = session_store.with_usage_burn_store(store),
+                Err(error) => eprintln!("usage burn store initialization failed: {error:#}"),
+            }
+            match UsageLedgerStore::with_model_defaults(
+                expand_home(&config.usage.db_path),
+                UsageModelDefaults {
+                    claude: config.claude.default_model.clone(),
+                    codex: config.codex.default_model.clone(),
+                    codex_fork: config.codex_fork.default_model.clone(),
+                },
+            ) {
+                Ok(store) => session_store = session_store.with_usage_ledger_store(store),
+                Err(error) => eprintln!("usage token ledger initialization failed: {error:#}"),
+            }
+            let report_store = UsageReportStore::new(expand_home(&config.usage.db_path))
+                .with_premium_cap_ratio(config.usage.premium_cap_ratio)
+                .with_account_labels(
+                    config
+                        .usage
+                        .accounts
+                        .iter()
+                        .map(|account| (account.key.clone(), account.label.clone())),
+                );
+            session_store = session_store.with_usage_report_store(report_store);
+        }
         if let Err(error) = session_store.recover_pending_codex_fork_handoffs() {
             eprintln!("codex-fork handoff recovery failed: {error:#}");
         }
@@ -421,6 +461,36 @@ impl AppState {
     pub fn config(&self) -> &AppConfig {
         &self.config
     }
+
+    pub fn reconcile_current_seat_sessions(&self) -> anyhow::Result<()> {
+        self.session_store.reconcile_current_seat_sessions()
+    }
+
+    pub fn prepare_seat_session_reconciliation(
+        &self,
+        artifact_cutoff_ns: i128,
+    ) -> anyhow::Result<SeatSessionReconciliationSnapshot> {
+        self.session_store
+            .prepare_seat_session_reconciliation(artifact_cutoff_ns)
+    }
+
+    pub fn reconcile_seat_sessions(
+        &self,
+        snapshot: SeatSessionReconciliationSnapshot,
+    ) -> anyhow::Result<()> {
+        self.session_store.reconcile_seat_sessions(snapshot)
+    }
+
+    pub fn scan_usage_ledger(&self) -> anyhow::Result<ScanSummary> {
+        self.session_store.scan_usage_ledger()
+    }
+}
+
+fn should_use_configured_usage_db_path(config: &UsageConfig) -> bool {
+    if config.db_path.trim().is_empty() {
+        return false;
+    }
+    config.enabled || expand_home(&config.db_path) != expand_home(&UsageConfig::default().db_path)
 }
 
 #[derive(Debug, Deserialize)]
@@ -960,6 +1030,7 @@ pub fn router(state: AppState) -> Router {
         .route("/humans/{identifier}/email", post(send_human_email))
         .route("/email/send", post(send_registered_email))
         .route(DEFAULT_EMAIL_WEBHOOK_PATH, post(inbound_email_webhook))
+        .route("/usage/accounts", get(get_account_usage))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/input-batch", post(send_session_input_batch))
         .route("/sessions/spawn", post(spawn_session))
@@ -970,6 +1041,7 @@ pub fn router(state: AppState) -> Router {
             get(get_session).patch(update_session_metadata),
         )
         .route("/sessions/{session_id}/context", get(get_session_context))
+        .route("/sessions/{session_id}/usage", get(get_session_usage))
         .route("/sessions/{session_id}/review", post(start_session_review))
         .route(
             "/sessions/{parent_session_id}/children",
@@ -1424,6 +1496,13 @@ async fn context_usage_hook(
         "/hooks/context-usage",
     )?;
 
+    let rate_limits = payload.get("rate_limits").and_then(Value::as_object);
+    let five_hour = rate_limits
+        .and_then(|limits| limits.get("five_hour"))
+        .and_then(Value::as_object);
+    let seven_day = rate_limits
+        .and_then(|limits| limits.get("seven_day"))
+        .and_then(Value::as_object);
     let event = ContextUsageEvent {
         session_id,
         event: payload
@@ -1434,6 +1513,24 @@ async fn context_usage_hook(
             .map(ToOwned::to_owned),
         used_percentage: payload.get("used_percentage").and_then(Value::as_f64),
         total_input_tokens: payload_i64(payload.get("total_input_tokens")),
+        five_hour_percent: five_hour
+            .and_then(|window| window.get("used_percentage"))
+            .and_then(Value::as_f64)
+            .or_else(|| payload.get("five_hour_percent").and_then(Value::as_f64)),
+        five_hour_resets_at: five_hour
+            .and_then(|window| window.get("resets_at"))
+            .or_else(|| payload.get("five_hour_resets_at"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        seven_day_percent: seven_day
+            .and_then(|window| window.get("used_percentage"))
+            .and_then(Value::as_f64)
+            .or_else(|| payload.get("seven_day_percent").and_then(Value::as_f64)),
+        seven_day_resets_at: seven_day
+            .and_then(|window| window.get("resets_at"))
+            .or_else(|| payload.get("seven_day_resets_at"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
         emitted_at: hook_emitted_at(&payload).map(ToOwned::to_owned),
     };
 
@@ -1445,6 +1542,11 @@ async fn context_usage_hook(
     let outcome = state
         .session_store
         .apply_context_usage_event(&event, runtime.as_ref())?;
+    if !matches!(outcome, ContextUsageOutcome::UnknownSession) {
+        if let Err(error) = state.session_store.record_claude_statusline_burn(&event) {
+            eprintln!("Claude status-line burn ingest failed: {error:#}");
+        }
+    }
 
     let mut body = json!({ "status": outcome.status() });
     match &outcome {
@@ -2710,21 +2812,114 @@ async fn list_children_sessions(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
-    let children = state
-        .session_store
-        .list_child_records(
-            &parent_session_id,
-            query.recursive,
-            query.status.as_deref(),
-            query.include_terminated,
-        )?
-        .into_iter()
-        .map(|session| child_session_response_with_live_activity(&state, session))
-        .collect::<Vec<_>>();
+    let records = state.session_store.list_child_records(
+        &parent_session_id,
+        query.recursive,
+        query.status.as_deref(),
+        query.include_terminated,
+    )?;
+    let mut children = Vec::with_capacity(records.len());
+    for session in records {
+        let session_id = session.id.clone();
+        let response = child_session_response_with_live_activity(&state, session);
+        let mut value = serde_json::to_value(response)?;
+        if query.usage {
+            let percent = state
+                .session_store
+                .usage_report_for_session(
+                    &session_id,
+                    false,
+                    UsageReportOptions {
+                        since_reset: true,
+                        by_model: false,
+                    },
+                )?
+                .as_ref()
+                .and_then(current_weekly_usage_percent);
+            value["weekly_usage_percent"] = json!(percent);
+        }
+        children.push(value);
+    }
     Ok(Json(json!({
         "parent_session_id": parent_session_id,
         "children": children,
     })))
+}
+
+async fn get_session_usage(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(query): Query<SessionUsageQuery>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    ensure_usage_reporting_enabled(&state)?;
+    if state.session_store.get_session(&session_id)?.is_none() {
+        return Err(ApiError::NotFound("Session not found"));
+    }
+    let report = state
+        .session_store
+        .usage_report_for_session(
+            &session_id,
+            query.include_children,
+            UsageReportOptions {
+                since_reset: query.since_reset,
+                by_model: query.by_model,
+            },
+        )?
+        .ok_or_else(|| ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "Usage reporting is unavailable".to_owned(),
+        })?;
+    Ok(Json(serde_json::to_value(report)?))
+}
+
+async fn get_account_usage(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<AccountUsageQuery>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    ensure_usage_reporting_enabled(&state)?;
+    let report = state
+        .session_store
+        .usage_report_for_accounts(UsageReportOptions {
+            since_reset: query.since_reset,
+            by_model: query.by_model,
+        })?
+        .ok_or_else(|| ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "Usage reporting is unavailable".to_owned(),
+        })?;
+    Ok(Json(serde_json::to_value(report)?))
+}
+
+fn ensure_usage_reporting_enabled(state: &AppState) -> Result<(), ApiError> {
+    if state.config.usage.enabled {
+        Ok(())
+    } else {
+        Err(ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "Usage reporting is disabled".to_owned(),
+        })
+    }
+}
+
+fn current_weekly_usage_percent(report: &crate::usage_report::UsageReport) -> Option<f64> {
+    let current_account = report.target.as_ref()?.account_key.as_deref()?;
+    report
+        .accounts
+        .iter()
+        .filter(|account| account.account_key == current_account)
+        .flat_map(|account| &account.windows)
+        .filter(|window| {
+            !window.stale
+                && (window.window_kind == "weekly_all"
+                    || window.window_kind == "codex_10080"
+                    || window.window_kind.contains("10080"))
+        })
+        .filter_map(|window| window.total_percent)
+        .max_by(f64::total_cmp)
 }
 
 async fn create_session(
@@ -11805,6 +12000,26 @@ struct ListChildrenQuery {
     status: Option<String>,
     #[serde(default)]
     include_terminated: bool,
+    #[serde(default)]
+    usage: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionUsageQuery {
+    #[serde(default)]
+    include_children: bool,
+    #[serde(default)]
+    since_reset: bool,
+    #[serde(default)]
+    by_model: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountUsageQuery {
+    #[serde(default)]
+    since_reset: bool,
+    #[serde(default)]
+    by_model: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -12616,6 +12831,20 @@ mod tests {
     use serde::Serialize;
     use std::{env, process};
     use tower::ServiceExt;
+
+    #[test]
+    fn usage_db_override_policy_preserves_only_disabled_default_fixtures() {
+        let disabled_default = UsageConfig::default();
+        assert!(!should_use_configured_usage_db_path(&disabled_default));
+
+        let mut enabled_default = UsageConfig::default();
+        enabled_default.enabled = true;
+        assert!(should_use_configured_usage_db_path(&enabled_default));
+
+        let mut disabled_custom = UsageConfig::default();
+        disabled_custom.db_path = "/tmp/custom-usage.db".to_owned();
+        assert!(should_use_configured_usage_db_path(&disabled_custom));
+    }
 
     #[test]
     fn codex_fork_pane_title_spinner_indicates_working() {

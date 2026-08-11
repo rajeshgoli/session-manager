@@ -26,6 +26,7 @@ pub struct AppConfig {
     pub sm_send: SmSendConfig,
     pub tool_logging: ToolLoggingConfig,
     pub context_monitor: ContextMonitorConfig,
+    pub usage: UsageConfig,
     pub codex_rollout: CodexRolloutConfig,
     pub codex_requests: CodexRequestsConfig,
     pub codex_events: CodexEventsConfig,
@@ -58,6 +59,7 @@ impl Default for AppConfig {
             sm_send: SmSendConfig::default(),
             tool_logging: ToolLoggingConfig::default(),
             context_monitor: ContextMonitorConfig::default(),
+            usage: UsageConfig::default(),
             codex_rollout: CodexRolloutConfig::default(),
             codex_requests: CodexRequestsConfig::default(),
             codex_events: CodexEventsConfig::default(),
@@ -67,12 +69,14 @@ impl Default for AppConfig {
                 Vec::new(),
                 Some("sonnet".to_owned()),
                 None,
+                None,
             ),
             codex: ProviderLaunchConfig::new(
                 "codex".to_owned(),
                 Vec::new(),
                 None,
                 Some("~/.codex/session_index.jsonl".to_owned()),
+                None,
             ),
             codex_review: CodexReviewConfig::default(),
             codex_fork: CodexForkLaunchConfig::default(),
@@ -667,6 +671,7 @@ pub struct ProviderLaunchConfig {
     pub args: Vec<String>,
     pub default_model: Option<String>,
     pub session_index_path: Option<String>,
+    pub transcript_root: Option<String>,
 }
 
 impl ProviderLaunchConfig {
@@ -675,12 +680,14 @@ impl ProviderLaunchConfig {
         args: Vec<String>,
         default_model: Option<String>,
         session_index_path: Option<String>,
+        transcript_root: Option<String>,
     ) -> Self {
         Self {
             command,
             args,
             default_model,
             session_index_path,
+            transcript_root,
         }
     }
 }
@@ -691,6 +698,7 @@ impl Default for ProviderLaunchConfig {
             "claude".to_owned(),
             Vec::new(),
             Some("sonnet".to_owned()),
+            None,
             None,
         )
     }
@@ -825,6 +833,59 @@ fn default_context_warning_percentage() -> f64 {
 
 fn default_context_critical_percentage() -> f64 {
     65.0
+}
+
+/// Phase-one account identity polling. The feature stays disabled unless the
+/// owner opts in through config; later usage phases extend this same section.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_usage_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    #[serde(default = "default_usage_scan_interval_secs")]
+    pub scan_interval_secs: u64,
+    #[serde(default = "default_usage_premium_cap_ratio")]
+    pub premium_cap_ratio: f64,
+    #[serde(default = "default_usage_db_path")]
+    pub db_path: String,
+    #[serde(default)]
+    pub accounts: Vec<UsageAccountConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct UsageAccountConfig {
+    pub key: String,
+    pub label: String,
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_secs: default_usage_poll_interval_secs(),
+            scan_interval_secs: default_usage_scan_interval_secs(),
+            premium_cap_ratio: default_usage_premium_cap_ratio(),
+            db_path: default_usage_db_path(),
+            accounts: Vec::new(),
+        }
+    }
+}
+
+fn default_usage_poll_interval_secs() -> u64 {
+    30
+}
+
+fn default_usage_scan_interval_secs() -> u64 {
+    60
+}
+
+fn default_usage_premium_cap_ratio() -> f64 {
+    0.5
+}
+
+fn default_usage_db_path() -> String {
+    "~/.local/share/claude-sessions/usage.db".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1112,6 +1173,8 @@ struct RawConfig {
     #[serde(default)]
     context_monitor: ContextMonitorConfig,
     #[serde(default)]
+    usage: UsageConfig,
+    #[serde(default)]
     codex_rollout: CodexRolloutConfig,
     #[serde(default)]
     codex_requests: Option<RawCodexRequestsConfig>,
@@ -1217,6 +1280,7 @@ impl From<RawConfig> for AppConfig {
             sm_send: raw.sm_send,
             tool_logging: raw.tool_logging,
             context_monitor: raw.context_monitor,
+            usage: raw.usage,
             codex_rollout: raw.codex_rollout,
             codex_requests,
             codex_events,
@@ -1289,6 +1353,8 @@ struct RawProviderLaunchConfig {
     default_model: Option<String>,
     #[serde(default)]
     session_index_path: Option<String>,
+    #[serde(default)]
+    transcript_root: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -1372,6 +1438,9 @@ fn provider_launch_config(
             .as_ref()
             .and_then(|value| trimmed(&Some(value.clone())))
             .or_else(|| default_session_index_path.map(ToOwned::to_owned)),
+        raw.transcript_root
+            .as_ref()
+            .and_then(|value| trimmed(&Some(value.clone()))),
     )
 }
 
@@ -1855,6 +1924,53 @@ tool_logging:
     }
 
     #[test]
+    fn raw_config_reads_usage_identity_settings() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+usage:
+  enabled: true
+  poll_interval_secs: 45
+  scan_interval_secs: 75
+  premium_cap_ratio: 0.4
+  db_path: /tmp/custom-usage.db
+  accounts:
+    - key: claude:account-one
+      label: primary
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert!(config.usage.enabled);
+        assert_eq!(config.usage.poll_interval_secs, 45);
+        assert_eq!(config.usage.scan_interval_secs, 75);
+        assert_eq!(config.usage.premium_cap_ratio, 0.4);
+        assert_eq!(config.usage.db_path, "/tmp/custom-usage.db");
+        assert_eq!(
+            config.usage.accounts,
+            vec![UsageAccountConfig {
+                key: "claude:account-one".to_owned(),
+                label: "primary".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn usage_identity_is_disabled_by_default() {
+        let config = AppConfig::from(RawConfig::default());
+
+        assert!(!config.usage.enabled);
+        assert_eq!(config.usage.poll_interval_secs, 30);
+        assert_eq!(config.usage.scan_interval_secs, 60);
+        assert_eq!(config.usage.premium_cap_ratio, 0.5);
+        assert!(config.usage.accounts.is_empty());
+        assert_eq!(
+            config.usage.db_path,
+            "~/.local/share/claude-sessions/usage.db"
+        );
+    }
+
+    #[test]
     fn raw_config_reads_codex_observability_db_path() {
         let raw: RawConfig = serde_yaml::from_str(
             r#"
@@ -2283,6 +2399,23 @@ codex_fork:
         let config = AppConfig::from(raw);
 
         assert!(config.codex_fork.control_tmux_fallback_enabled);
+    }
+
+    #[test]
+    fn raw_config_reads_claude_transcript_root() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+claude:
+  transcript_root: "/tmp/claude-projects"
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(
+            config.claude.transcript_root.as_deref(),
+            Some("/tmp/claude-projects")
+        );
     }
 
     #[test]

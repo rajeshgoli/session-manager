@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex, Weak},
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
 };
@@ -29,6 +29,11 @@ use crate::queue::{
 use crate::{
     config::{CodexReviewConfig, ContextMonitorConfig},
     runtime::{TmuxRuntime, TmuxSessionSpec},
+    seat_sessions::{SeatSessionIdentity, SeatSessionStore},
+    usage_burn::UsageBurnStore,
+    usage_identity::{Provider as UsageProvider, UsageIdentityStore},
+    usage_ledger::{ScanSummary, UsageLedgerStore, UsageSeatMetadata},
+    usage_report::{UsageReport, UsageReportOptions, UsageReportStore, UsageReportTarget},
 };
 
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
@@ -37,10 +42,13 @@ const OUTPUT_TAIL_BYTES_PER_LINE: u64 = 4096;
 const MIN_OUTPUT_TAIL_BYTES: u64 = 16 * 1024;
 const MAX_OUTPUT_TAIL_BYTES: u64 = 1024 * 1024;
 const CODEX_CLI_SESSION_BIND_TIMEOUT: Duration = Duration::from_secs(1);
+const CODEX_CLI_DEFERRED_BIND_TIMEOUT: Duration = Duration::from_secs(30);
 const CODEX_CLI_SESSION_BIND_POLL: Duration = Duration::from_millis(50);
 const CODEX_FORK_THREAD_STARTED_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_FORK_EVENT_MONITOR_POLL: Duration = Duration::from_millis(250);
 const CODEX_FORK_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+const SEAT_SESSION_RETRY_ATTEMPTS: usize = 20;
+const SEAT_SESSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 static STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -48,6 +56,7 @@ pub struct SessionStore {
     state_file: PathBuf,
     legacy_state_file: Option<PathBuf>,
     codex_sessions_root: PathBuf,
+    claude_projects_roots: Vec<PathBuf>,
     write_lock: Arc<Mutex<()>>,
     queue_store: Option<RetainedQueueStore>,
     /// Carried on the store rather than read per-request because the codex-fork
@@ -59,6 +68,38 @@ pub struct SessionStore {
     /// an unrelated request to happen to flush it.
     delivery_runtime: Option<TmuxRuntime>,
     codex_fork_handoff_monitors: Arc<Mutex<BTreeSet<String>>>,
+    clear_operation_locks: Arc<Mutex<BTreeMap<String, Weak<SessionClearLock>>>>,
+    seat_session_store: SeatSessionStore,
+    usage_identity_store: Option<UsageIdentityStore>,
+    usage_burn_store: Option<UsageBurnStore>,
+    usage_ledger_store: Option<UsageLedgerStore>,
+    usage_report_store: Option<UsageReportStore>,
+    usage_project_keys: Arc<Mutex<BTreeMap<String, (String, String)>>>,
+}
+
+#[derive(Debug)]
+pub struct SeatSessionReconciliationSnapshot {
+    records: Vec<SessionRecord>,
+    artifact_cutoff_ns: i128,
+}
+
+#[derive(Debug)]
+struct SessionClearLock {
+    held: Mutex<bool>,
+    available: Condvar,
+}
+
+struct SessionClearGuard {
+    lock: Arc<SessionClearLock>,
+}
+
+impl Drop for SessionClearGuard {
+    fn drop(&mut self) {
+        if let Ok(mut held) = self.lock.held.lock() {
+            *held = false;
+            self.lock.available.notify_one();
+        }
+    }
 }
 
 impl SessionStore {
@@ -68,15 +109,24 @@ impl SessionStore {
         } else {
             None
         };
+        let seat_session_store = SeatSessionStore::for_state_file(&state_file);
         Self {
             state_file,
             legacy_state_file,
             codex_sessions_root: expand_home("~/.codex/sessions"),
+            claude_projects_roots: claude_projects_roots(None),
             write_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
+            clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            seat_session_store,
+            usage_identity_store: None,
+            usage_burn_store: None,
+            usage_ledger_store: None,
+            usage_report_store: None,
+            usage_project_keys: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -85,6 +135,230 @@ impl SessionStore {
         store.queue_store = Some(RetainedQueueStore::new(queue_db_path));
         let _ = store.cancel_informational_context_alerts();
         store
+    }
+
+    pub fn with_usage_db_path(mut self, db_path: PathBuf) -> Self {
+        self.seat_session_store = SeatSessionStore::new(db_path);
+        self
+    }
+
+    pub fn with_usage_burn_store(mut self, store: UsageBurnStore) -> Self {
+        self.usage_burn_store = Some(store);
+        self
+    }
+
+    pub fn with_usage_identity_store(mut self, store: UsageIdentityStore) -> Self {
+        self.usage_identity_store = Some(store);
+        self
+    }
+
+    pub fn with_usage_ledger_store(mut self, store: UsageLedgerStore) -> Self {
+        self.usage_ledger_store = Some(store);
+        self
+    }
+
+    pub fn with_usage_report_store(mut self, store: UsageReportStore) -> Self {
+        self.usage_report_store = Some(store);
+        self
+    }
+
+    pub fn usage_report_for_session(
+        &self,
+        session_id: &str,
+        include_children: bool,
+        options: UsageReportOptions,
+    ) -> Result<Option<UsageReport>> {
+        let Some(store) = self.usage_report_store.as_ref() else {
+            return Ok(None);
+        };
+        let Some(session) = self.get_session(session_id)? else {
+            return Ok(None);
+        };
+        let all_sessions = self.load_snapshot()?.into_sessions();
+        let child_seats = if include_children {
+            let mut descendants = Vec::new();
+            let mut visited = BTreeSet::new();
+            collect_descendants_preorder(
+                &all_sessions,
+                &session.id,
+                &mut visited,
+                &mut descendants,
+            );
+            descendants
+                .into_iter()
+                .map(|descendant| descendant.id)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        let target = UsageReportTarget {
+            seat_id: session.id.clone(),
+            friendly_name: session.cached_display_name(),
+            account_key: session.account_key.clone(),
+            usage_cap_fraction: session.usage_cap_fraction,
+            self_seats: BTreeSet::from([session.id]),
+            child_seats,
+        };
+        Ok(Some(store.report(Some(&target), options)?))
+    }
+
+    pub fn usage_report_for_accounts(
+        &self,
+        options: UsageReportOptions,
+    ) -> Result<Option<UsageReport>> {
+        let Some(store) = self.usage_report_store.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(store.report(None, options)?))
+    }
+
+    pub fn scan_usage_ledger(&self) -> Result<ScanSummary> {
+        let Some(store) = self.usage_ledger_store.as_ref() else {
+            return Ok(ScanSummary::default());
+        };
+        let records = self.load_snapshot()?.into_sessions();
+        let observed_at = OffsetDateTime::now_utc();
+        for record in &records {
+            let provider = match record.provider.as_str() {
+                "claude" => UsageProvider::Claude,
+                "codex" | "codex-fork" => UsageProvider::Codex,
+                _ => continue,
+            };
+            self.record_session_account_key(&record.id, provider, observed_at)?;
+        }
+        self.repair_current_codex_usage_artifacts(&records)?;
+        let by_id = records
+            .iter()
+            .map(|record| (record.id.as_str(), record))
+            .collect::<BTreeMap<_, _>>();
+        let mut project_keys = self
+            .usage_project_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seats = records
+            .iter()
+            .map(|record| {
+                let project_key = project_keys
+                    .get(&record.id)
+                    .filter(|(working_dir, _)| working_dir == &record.working_dir)
+                    .map(|(_, project_key)| project_key.clone())
+                    .unwrap_or_else(|| {
+                        let project_key =
+                            UsageSeatMetadata::resolve_project_key(&record.working_dir);
+                        project_keys.insert(
+                            record.id.clone(),
+                            (record.working_dir.clone(), project_key.clone()),
+                        );
+                        project_key
+                    });
+                UsageSeatMetadata {
+                    seat_id: record.id.clone(),
+                    friendly_name: record.cached_display_name(),
+                    provider: record.provider.clone(),
+                    model: record.model.clone(),
+                    effort: record.reasoning_effort.clone(),
+                    working_dir: record.working_dir.clone(),
+                    parent_seat_id: record.parent_session_id.clone(),
+                    root_seat_id: Some(root_seat_id(record, &by_id)),
+                    project_key,
+                }
+            })
+            .collect::<Vec<_>>();
+        project_keys.retain(|seat_id, _| by_id.contains_key(seat_id.as_str()));
+        drop(project_keys);
+        store.scan(&seats)
+    }
+
+    fn repair_current_codex_usage_artifacts(&self, records: &[SessionRecord]) -> Result<()> {
+        let missing = self
+            .seat_session_store
+            .provider_sessions_missing_artifacts("codex")?;
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let current = records
+            .iter()
+            .filter(|record| record.provider == "codex")
+            .filter_map(|record| {
+                provider_resume_id_for_restore(record).and_then(|provider_session_id| {
+                    missing
+                        .contains(&provider_session_id)
+                        .then_some((record, provider_session_id))
+                })
+            })
+            .collect::<Vec<_>>();
+        if current.is_empty() {
+            return Ok(());
+        }
+        let ids = current
+            .iter()
+            .map(|(_, provider_session_id)| provider_session_id.clone())
+            .collect::<BTreeSet<_>>();
+        let paths = codex_cli_artifact_paths(&self.codex_sessions_root, &ids);
+        let repairs = current
+            .into_iter()
+            .filter_map(|(record, provider_session_id)| {
+                paths
+                    .get(&provider_session_id)
+                    .map(|path| SeatSessionIdentity {
+                        seat_id: record.id.clone(),
+                        provider: "codex".to_owned(),
+                        provider_session_id,
+                        artifact_path: Some(resolve_path_lossy(path.clone())),
+                    })
+            })
+            .collect::<Vec<_>>();
+        self.seat_session_store.append_batch(&repairs)
+    }
+
+    pub fn record_claude_statusline_burn(&self, event: &ContextUsageEvent) -> Result<usize> {
+        let Some(store) = self.usage_burn_store.as_ref() else {
+            return Ok(0);
+        };
+        let observed_at = event
+            .emitted_at
+            .as_deref()
+            .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+            .unwrap_or_else(OffsetDateTime::now_utc);
+        let recorded = store.record_claude_statusline(
+            observed_at,
+            event.five_hour_percent,
+            event.five_hour_resets_at.as_deref(),
+            event.seven_day_percent,
+            event.seven_day_resets_at.as_deref(),
+        )?;
+        self.record_session_account_key(&event.session_id, UsageProvider::Claude, observed_at)?;
+        Ok(recorded)
+    }
+
+    fn record_session_account_key(
+        &self,
+        session_id: &str,
+        provider: UsageProvider,
+        observed_at: OffsetDateTime,
+    ) -> Result<()> {
+        let Some(identity_store) = self.usage_identity_store.as_ref() else {
+            return Ok(());
+        };
+        let Some(attribution) = identity_store.account_at(provider, observed_at)? else {
+            return Ok(());
+        };
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(());
+        };
+        if json_text(session.get("account_key")).as_deref()
+            == Some(attribution.account_key.as_str())
+        {
+            return Ok(());
+        }
+        session.insert(
+            "account_key".to_owned(),
+            Value::String(attribution.account_key),
+        );
+        self.write_raw_json_value(&state)
     }
 
     pub fn with_context_monitor_config(mut self, config: ContextMonitorConfig) -> Self {
@@ -103,6 +377,222 @@ impl SessionStore {
             }
         }
         self
+    }
+
+    pub fn with_claude_transcript_root(mut self, transcript_root: Option<&str>) -> Self {
+        self.claude_projects_roots = claude_projects_roots(transcript_root);
+        self
+    }
+
+    fn append_seat_session(
+        &self,
+        seat_id: &str,
+        provider: &str,
+        provider_session_id: &str,
+        artifact_path: Option<&str>,
+    ) {
+        let Err(error) =
+            self.seat_session_store
+                .append(seat_id, provider, provider_session_id, artifact_path)
+        else {
+            return;
+        };
+        eprintln!(
+            "usage ledger failed to append provider session {provider_session_id} for seat {seat_id}: {error:#}"
+        );
+        if !usage_ledger_error_is_transient(&error) {
+            return;
+        }
+
+        let store = self.seat_session_store.clone();
+        let seat_id = seat_id.to_owned();
+        let provider = provider.to_owned();
+        let provider_session_id = provider_session_id.to_owned();
+        let artifact_path = artifact_path.map(ToOwned::to_owned);
+        let thread_name = format!(
+            "sm-seat-session-retry-{}",
+            sanitize_path_component(&seat_id)
+        );
+        if let Err(error) = thread::Builder::new().name(thread_name).spawn(move || {
+            for attempt in 1..=SEAT_SESSION_RETRY_ATTEMPTS {
+                thread::sleep(SEAT_SESSION_RETRY_DELAY);
+                match store.append(
+                    &seat_id,
+                    &provider,
+                    &provider_session_id,
+                    artifact_path.as_deref(),
+                ) {
+                    Ok(()) => return,
+                    Err(error) if usage_ledger_error_is_transient(&error) => {
+                        if attempt == SEAT_SESSION_RETRY_ATTEMPTS {
+                            eprintln!(
+                                "usage ledger exhausted retries for provider session {provider_session_id} on seat {seat_id}: {error:#}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "usage ledger retry failed permanently for provider session {provider_session_id} on seat {seat_id}: {error:#}"
+                        );
+                        return;
+                    }
+                }
+            }
+        }) {
+            eprintln!("failed to start usage ledger retry thread: {error}");
+        }
+    }
+
+    pub fn reconcile_current_seat_sessions(&self) -> Result<()> {
+        let snapshot = self.prepare_seat_session_reconciliation(i128::MAX)?;
+        self.reconcile_seat_sessions(snapshot)
+    }
+
+    #[cfg(test)]
+    fn reconcile_current_seat_sessions_through(&self, artifact_cutoff_ns: i128) -> Result<()> {
+        let snapshot = self.prepare_seat_session_reconciliation(artifact_cutoff_ns)?;
+        self.reconcile_seat_sessions(snapshot)
+    }
+
+    pub fn prepare_seat_session_reconciliation(
+        &self,
+        artifact_cutoff_ns: i128,
+    ) -> Result<SeatSessionReconciliationSnapshot> {
+        Ok(SeatSessionReconciliationSnapshot {
+            records: self.load_snapshot()?.into_sessions(),
+            artifact_cutoff_ns,
+        })
+    }
+
+    pub fn reconcile_seat_sessions(
+        &self,
+        snapshot: SeatSessionReconciliationSnapshot,
+    ) -> Result<()> {
+        let SeatSessionReconciliationSnapshot {
+            records,
+            artifact_cutoff_ns,
+        } = snapshot;
+        let mut claim_attempt = 0;
+        let mut claimed = loop {
+            match self.seat_session_store.claimed_provider_sessions() {
+                Ok(claimed) => break claimed,
+                Err(error)
+                    if usage_ledger_error_is_transient(&error)
+                        && claim_attempt < SEAT_SESSION_RETRY_ATTEMPTS =>
+                {
+                    claim_attempt += 1;
+                    thread::sleep(SEAT_SESSION_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let fork_artifact_paths = self
+            .delivery_runtime
+            .as_ref()
+            .map(|runtime| {
+                records
+                    .iter()
+                    .filter_map(|session| {
+                        codex_fork_event_stream_path(session, runtime)
+                            .map(|path| (session.id.clone(), path))
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let current_codex_ids = records
+            .iter()
+            .filter(|session| session.provider == "codex")
+            .filter_map(provider_resume_id_for_restore)
+            .collect::<BTreeSet<_>>();
+        let codex_artifact_paths =
+            codex_cli_artifact_paths(&self.codex_sessions_root, &current_codex_ids);
+        let current_identities = records
+            .iter()
+            .filter_map(|session| {
+                provider_resume_id_for_restore(session).map(|provider_session_id| {
+                    let artifact_path = fork_artifact_paths
+                        .get(&session.id)
+                        .map(|path| path.display().to_string())
+                        .or_else(|| {
+                            (session.provider == "codex")
+                                .then(|| codex_artifact_paths.get(&provider_session_id))
+                                .flatten()
+                                .map(|path| resolve_path_lossy(path.clone()))
+                        })
+                        .or_else(|| session.transcript_path.clone());
+                    SeatSessionIdentity {
+                        seat_id: session.id.clone(),
+                        provider: session.provider.clone(),
+                        provider_session_id,
+                        artifact_path,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut current_by_provider_session = BTreeMap::<_, Vec<_>>::new();
+        for identity in current_identities {
+            current_by_provider_session
+                .entry((
+                    identity.provider.clone(),
+                    identity.provider_session_id.clone(),
+                ))
+                .or_default()
+                .push(identity);
+        }
+        let mut sessions = Vec::with_capacity(current_by_provider_session.len());
+        for ((provider, provider_session_id), mut identities) in current_by_provider_session {
+            claimed.insert((provider.clone(), provider_session_id.clone()));
+            if identities.len() == 1 {
+                sessions.push(identities.pop().expect("one current identity"));
+                continue;
+            }
+            let artifact_path = identities
+                .first()
+                .and_then(|identity| identity.artifact_path.clone())
+                .filter(|path| {
+                    identities
+                        .iter()
+                        .all(|identity| identity.artifact_path.as_deref() == Some(path))
+                });
+            sessions.push(SeatSessionIdentity {
+                seat_id: "unassigned".to_owned(),
+                provider,
+                provider_session_id,
+                artifact_path,
+            });
+        }
+        sessions.extend(historical_claude_seat_sessions(
+            &records,
+            &self.claude_projects_roots,
+            artifact_cutoff_ns,
+            &mut claimed,
+        ));
+        sessions.extend(historical_codex_cli_seat_sessions(
+            &records,
+            &self.codex_sessions_root,
+            artifact_cutoff_ns,
+            &mut claimed,
+        ));
+        if let Some(runtime) = self.delivery_runtime.as_ref() {
+            sessions.extend(historical_codex_fork_seat_sessions(
+                &records,
+                runtime,
+                &mut claimed,
+            ));
+        }
+        for attempt in 0..=SEAT_SESSION_RETRY_ATTEMPTS {
+            match self.seat_session_store.append_batch(&sessions) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if usage_ledger_error_is_transient(&error)
+                        && attempt < SEAT_SESSION_RETRY_ATTEMPTS =>
+                {
+                    thread::sleep(SEAT_SESSION_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("bounded reconciliation loop always returns")
     }
 
     /// Drop context alerts this session raised about context it no longer has.
@@ -136,16 +626,31 @@ impl SessionStore {
 
     #[cfg(test)]
     fn new_with_legacy_fallback(state_file: PathBuf, legacy_state_file: PathBuf) -> Self {
+        let seat_session_store = SeatSessionStore::for_state_file(&state_file);
         Self {
             state_file,
             legacy_state_file: Some(legacy_state_file),
             codex_sessions_root: expand_home("~/.codex/sessions"),
+            claude_projects_roots: claude_projects_roots(None),
             write_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
+            clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            seat_session_store,
+            usage_identity_store: None,
+            usage_burn_store: None,
+            usage_ledger_store: None,
+            usage_report_store: None,
+            usage_project_keys: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    #[cfg(test)]
+    fn with_claude_projects_root(mut self, projects_root: PathBuf) -> Self {
+        self.claude_projects_roots = vec![projects_root];
+        self
     }
 
     pub fn list_sessions(&self, include_stopped: bool) -> Result<Vec<SessionRecord>> {
@@ -289,7 +794,39 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(false);
         };
+        let provider = json_text(session.get("provider")).unwrap_or_else(|| "claude".to_owned());
+        let mut seat_session_appends = Vec::new();
+        if provider == "claude" {
+            let previous_transcript_path = json_text(session.get("transcript_path"));
+            let previous_provider_resume_id = previous_transcript_path
+                .as_deref()
+                .and_then(provider_resume_id_from_transcript_path)
+                .or_else(|| json_text(session.get("provider_resume_id")));
+            if let Some(previous_provider_resume_id) = previous_provider_resume_id {
+                seat_session_appends.push((previous_provider_resume_id, previous_transcript_path));
+            }
+        }
+        let provider_resume_id = if provider == "claude" {
+            transcript_path.and_then(provider_resume_id_from_transcript_path)
+        } else {
+            None
+        };
+        if let Some(provider_resume_id) = provider_resume_id.as_deref() {
+            seat_session_appends.push((
+                provider_resume_id.to_owned(),
+                transcript_path.map(ToOwned::to_owned),
+            ));
+        }
         if normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped" {
+            drop(_guard);
+            for (provider_resume_id, artifact_path) in seat_session_appends {
+                self.append_seat_session(
+                    session_id,
+                    &provider,
+                    &provider_resume_id,
+                    artifact_path.as_deref(),
+                );
+            }
             return Ok(false);
         }
 
@@ -337,12 +874,11 @@ impl SessionStore {
                 "transcript_path".to_owned(),
                 Value::String(transcript_path.to_owned()),
             );
-            let provider =
-                json_text(session.get("provider")).unwrap_or_else(|| "claude".to_owned());
-            if provider == "claude" {
-                if let Some(resume_id) = provider_resume_id_from_transcript_path(transcript_path) {
-                    session.insert("provider_resume_id".to_owned(), Value::String(resume_id));
-                }
+            if let Some(provider_resume_id) = provider_resume_id {
+                session.insert(
+                    "provider_resume_id".to_owned(),
+                    Value::String(provider_resume_id),
+                );
             }
         }
         if let Some(native_title) = native_title {
@@ -371,6 +907,15 @@ impl SessionStore {
             }
         }
         self.write_raw_json_value(&state)?;
+        drop(_guard);
+        for (provider_resume_id, artifact_path) in seat_session_appends {
+            self.append_seat_session(
+                session_id,
+                &provider,
+                &provider_resume_id,
+                artifact_path.as_deref(),
+            );
+        }
         Ok(!superseded)
     }
 
@@ -556,6 +1101,21 @@ impl SessionStore {
         log_dir: Option<PathBuf>,
         runtime: &TmuxRuntime,
     ) -> Result<SessionRecord> {
+        let codex_cli_working_dir = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            let sessions = state
+                .get("sessions")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let (provider, working_dir) = core_session_provider_and_working_dir(sessions, &request);
+            (provider == "codex").then_some(working_dir)
+        };
+        let codex_cli_binding_guard = codex_cli_working_dir
+            .as_deref()
+            .map(|working_dir| self.lock_codex_cli_binding_working_dir(working_dir))
+            .transpose()?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
@@ -566,6 +1126,11 @@ impl SessionStore {
             true,
             runtime.socket_name(),
         )?;
+        if record.provider == "codex"
+            && codex_cli_working_dir.as_deref() != Some(record.working_dir.as_str())
+        {
+            anyhow::bail!("session creation context changed while waiting for Codex binding");
+        }
         ensure_runtime_local_node(&record.node)?;
         let log_file = record
             .log_file
@@ -598,12 +1163,12 @@ impl SessionStore {
             )
         });
         runtime.create_session(&spec)?;
-        if let Some((excluded_ids, launched_at_ns)) = codex_cli_creation_binding {
+        if let Some((excluded_ids, launched_at_ns)) = codex_cli_creation_binding.as_ref() {
             record.provider_resume_id = wait_for_codex_cli_provider_resume_id(
                 &record,
                 &self.codex_sessions_root,
-                &excluded_ids,
-                launched_at_ns,
+                excluded_ids,
+                *launched_at_ns,
                 CODEX_CLI_SESSION_BIND_TIMEOUT,
             );
         }
@@ -630,6 +1195,48 @@ impl SessionStore {
         if let Err(error) = self.write_raw_json_value(&state) {
             let _ = runtime.kill_session(&record.tmux_session);
             return Err(error);
+        }
+        if matches!(record.provider.as_str(), "codex" | "codex-fork") {
+            if let Some(provider_resume_id) = record.provider_resume_id.as_deref() {
+                self.append_seat_session(
+                    &record.id,
+                    &record.provider,
+                    provider_resume_id,
+                    codex_fork_artifacts
+                        .as_ref()
+                        .and_then(|artifacts| artifacts.event_stream_path.to_str()),
+                );
+            }
+        }
+        if record.provider_resume_id.is_none() {
+            if let Some((excluded_ids, launched_at_ns)) = codex_cli_creation_binding {
+                let store = self.clone();
+                let deferred_record = record.clone();
+                let deferred_session_id = record.id.clone();
+                let spawn_result = thread::Builder::new()
+                    .name(format!(
+                        "sm-codex-create-bind-{}",
+                        sanitize_path_component(&record.id)
+                    ))
+                    .spawn(move || {
+                        let _binding_guard = codex_cli_binding_guard;
+                        if let Err(error) = store.complete_deferred_codex_cli_rebind(
+                            &deferred_session_id,
+                            &deferred_record,
+                            &excluded_ids,
+                            launched_at_ns,
+                            None,
+                            CODEX_CLI_DEFERRED_BIND_TIMEOUT,
+                        ) {
+                            eprintln!(
+                                "deferred initial Codex thread discovery failed for seat {deferred_session_id}: {error:#}"
+                            );
+                        }
+                    });
+                if let Err(error) = spawn_result {
+                    eprintln!("failed to start deferred initial Codex thread discovery: {error}");
+                }
+            }
         }
         if let Some(artifacts) = codex_fork_artifacts {
             self.start_codex_fork_event_monitor(record.id.clone(), artifacts.event_stream_path)?;
@@ -1061,37 +1668,116 @@ impl SessionStore {
         request: ClearSessionRequest,
         runtime: &TmuxRuntime,
     ) -> Result<CoreClearOutcome> {
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let Some(session) = session_object_mut(sessions, session_id) else {
-            return Ok(CoreClearOutcome::NotFound);
-        };
-        if let Some(message) =
-            clear_authorization_error(session, request.requester_session_id.as_deref())
-        {
-            return Ok(CoreClearOutcome::Unauthorized(message));
-        }
-        let node = json_text(session.get("node")).unwrap_or_else(default_node);
-        ensure_runtime_local_node(&node)?;
-        let tmux_session = json_text(session.get("tmux_session"))
-            .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
-        let session_socket_name = json_text(session.get("tmux_socket_name"));
-        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
-        let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
-        let clear_command = if matches!(provider.as_str(), "codex" | "codex-fork") {
-            "/new"
-        } else {
-            "/clear"
-        };
+        let clear_guard = self.lock_clear_operation(session_id)?;
         let prompt = request
             .prompt
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-        let wake_completed =
-            json_text(session.get("completion_status")).is_some_and(|value| value == "completed");
+        let (
+            tmux_session,
+            session_socket_name,
+            provider,
+            wake_completed,
+            claimed_provider_resume_ids,
+            codex_cli_record,
+            codex_fork_spec,
+            previous_provider_resume_id,
+        ) = {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let claimed_provider_resume_ids = sessions
+                .iter()
+                .filter_map(|session| json_text(session.get("provider_resume_id")))
+                .collect::<BTreeSet<_>>();
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(CoreClearOutcome::NotFound);
+            };
+            if let Some(message) =
+                clear_authorization_error(session, request.requester_session_id.as_deref())
+            {
+                return Ok(CoreClearOutcome::Unauthorized(message));
+            }
+            let node = json_text(session.get("node")).unwrap_or_else(default_node);
+            ensure_runtime_local_node(&node)?;
+            let tmux_session = json_text(session.get("tmux_session"))
+                .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+            let session_socket_name = json_text(session.get("tmux_socket_name"));
+            let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
+            let wake_completed = json_text(session.get("completion_status"))
+                .is_some_and(|value| value == "completed");
+            let previous_provider_resume_id = json_text(session.get("provider_resume_id"));
+            let codex_cli_record = (provider == "codex")
+                .then(|| serde_json::from_value::<SessionRecord>(Value::Object(session.clone())))
+                .transpose()?;
+            let codex_fork_spec = (provider == "codex-fork")
+                .then(|| codex_fork_spec_for_session_raw(session_id, session))
+                .transpose()?;
+            (
+                tmux_session,
+                session_socket_name,
+                provider,
+                wake_completed,
+                claimed_provider_resume_ids,
+                codex_cli_record,
+                codex_fork_spec,
+                previous_provider_resume_id,
+            )
+        };
+
+        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
+        // Classic Codex rollouts are discovered by root and cwd, so that whole
+        // discovery domain must remain exclusive from the snapshot through bind.
+        let codex_cli_binding_guard = codex_cli_record
+            .as_ref()
+            .map(|record| self.lock_codex_cli_binding_operation(record))
+            .transpose()?;
+        let codex_cli_clear_binding = codex_cli_record
+            .map(|mut record| -> Result<_> {
+                let launched_at = OffsetDateTime::now_utc();
+                // `/new` writes under today's rollout directory, which may be far
+                // from the seat's original creation date.
+                record.created_at = launched_at
+                    .format(&Rfc3339)
+                    .context("failed to format Codex clear timestamp")?;
+                let mut excluded_ids = claimed_provider_resume_ids;
+                excluded_ids.extend(codex_cli_existing_session_ids(
+                    &record,
+                    &self.codex_sessions_root,
+                ));
+                Ok((record, excluded_ids, launched_at.unix_timestamp_nanos()))
+            })
+            .transpose()?;
+        let codex_fork_clear_binding = codex_fork_spec
+            .map(|spec| -> Result<_> {
+                let artifacts = session_runtime
+                    .codex_fork_runtime_artifacts(&spec)?
+                    .ok_or_else(|| anyhow::anyhow!("session {session_id} has no fork artifacts"))?;
+                let initial_offset = fs::metadata(&artifacts.event_stream_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                Ok((artifacts.event_stream_path, initial_offset))
+            })
+            .transpose()?;
+        if matches!(provider.as_str(), "codex" | "codex-fork") {
+            if let Some(previous_provider_resume_id) = previous_provider_resume_id.as_deref() {
+                self.append_seat_session(
+                    session_id,
+                    &provider,
+                    previous_provider_resume_id,
+                    codex_fork_clear_binding
+                        .as_ref()
+                        .and_then(|(event_stream_path, _)| event_stream_path.to_str()),
+                );
+            }
+        }
+        let clear_command = if matches!(provider.as_str(), "codex" | "codex-fork") {
+            "/new"
+        } else {
+            "/clear"
+        };
         let delivered = session_runtime.clear_session(
             &tmux_session,
             clear_command,
@@ -1101,14 +1787,217 @@ impl SessionStore {
         if !delivered {
             return Err(anyhow::anyhow!("tmux session is not running"));
         }
-        let now = now_rfc3339();
-        reset_session_after_clear(session, &now);
+        let replacement_provider_resume_id = if let Some((record, excluded_ids, launched_at_ns)) =
+            codex_cli_clear_binding.as_ref()
+        {
+            let provider_resume_id = wait_for_codex_cli_provider_resume_id(
+                record,
+                &self.codex_sessions_root,
+                excluded_ids,
+                *launched_at_ns,
+                CODEX_CLI_SESSION_BIND_TIMEOUT,
+            );
+            if provider_resume_id.is_none() {
+                eprintln!("failed to discover replacement Codex thread for seat {session_id}");
+            }
+            provider_resume_id.map(|provider_resume_id| (provider_resume_id, None))
+        } else if let Some((event_stream_path, initial_offset)) = codex_fork_clear_binding.as_ref()
+        {
+            match wait_for_codex_fork_provider_resume_id_after_offset(
+                event_stream_path,
+                *initial_offset,
+                CODEX_FORK_THREAD_STARTED_TIMEOUT,
+            ) {
+                Ok(provider_resume_id) => Some((
+                    provider_resume_id,
+                    event_stream_path.to_str().map(ToOwned::to_owned),
+                )),
+                Err(error) => {
+                    eprintln!(
+                            "failed to discover replacement codex-fork thread for seat {session_id}: {error:#}"
+                        );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         self.cancel_context_monitor_alerts(session_id)?;
-        self.write_raw_json_value(&state)?;
+
+        {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(CoreClearOutcome::NotFound);
+            };
+            let current_node = json_text(session.get("node")).unwrap_or_else(default_node);
+            ensure_runtime_local_node(&current_node)?;
+            let current_tmux_session = json_text(session.get("tmux_session"));
+            let current_socket_name = json_text(session.get("tmux_socket_name"));
+            let current_provider =
+                json_text(session.get("provider")).unwrap_or_else(default_provider);
+            let current_status =
+                json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+            if current_tmux_session.as_deref() != Some(tmux_session.as_str())
+                || current_socket_name != session_socket_name
+                || current_provider != provider
+            {
+                anyhow::bail!("session {session_id} changed while clear was in progress");
+            }
+            if normalized_status(&current_status) == "stopped" {
+                anyhow::bail!("session {session_id} stopped while clear was in progress");
+            }
+            if let Some((provider_resume_id, _)) = replacement_provider_resume_id.as_ref() {
+                session.insert(
+                    "provider_resume_id".to_owned(),
+                    Value::String(provider_resume_id.clone()),
+                );
+            }
+            let now = now_rfc3339();
+            reset_session_after_clear(session, &now);
+            self.write_raw_json_value(&state)?;
+        }
+        if let Some((provider_resume_id, artifact_path)) = replacement_provider_resume_id.as_ref() {
+            self.append_seat_session(
+                session_id,
+                &provider,
+                provider_resume_id,
+                artifact_path.as_deref(),
+            );
+        }
+        if replacement_provider_resume_id.is_none() {
+            if let Some((record, excluded_ids, launched_at_ns)) = codex_cli_clear_binding {
+                let store = self.clone();
+                let deferred_session_id = session_id.to_owned();
+                let expected_provider_resume_id = previous_provider_resume_id;
+                let spawn_result = thread::Builder::new()
+                    .name(format!(
+                        "sm-codex-clear-rebind-{}",
+                        sanitize_path_component(session_id)
+                    ))
+                    .spawn(move || {
+                        let _clear_guard = clear_guard;
+                        let _binding_guard = codex_cli_binding_guard;
+                        if let Err(error) = store.complete_deferred_codex_cli_rebind(
+                            &deferred_session_id,
+                            &record,
+                            &excluded_ids,
+                            launched_at_ns,
+                            expected_provider_resume_id.as_deref(),
+                            CODEX_CLI_DEFERRED_BIND_TIMEOUT,
+                        ) {
+                            eprintln!(
+                                "deferred Codex thread discovery failed for seat {deferred_session_id}: {error:#}"
+                            );
+                        }
+                    });
+                if let Err(error) = spawn_result {
+                    eprintln!("failed to start deferred Codex thread discovery: {error}");
+                }
+            }
+        }
         Ok(CoreClearOutcome::Cleared(CoreClearResult {
             status: "cleared".to_owned(),
             session_id: session_id.to_owned(),
         }))
+    }
+
+    fn complete_deferred_codex_cli_rebind(
+        &self,
+        session_id: &str,
+        record: &SessionRecord,
+        excluded_ids: &BTreeSet<String>,
+        launched_at_ns: i128,
+        expected_provider_resume_id: Option<&str>,
+        timeout: Duration,
+    ) -> Result<bool> {
+        let Some(provider_resume_id) = wait_for_codex_cli_provider_resume_id(
+            record,
+            &self.codex_sessions_root,
+            excluded_ids,
+            launched_at_ns,
+            timeout,
+        ) else {
+            eprintln!("deferred Codex thread discovery timed out for seat {session_id}");
+            return Ok(false);
+        };
+        {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(false);
+            };
+            let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
+            let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+            if provider != "codex"
+                || normalized_status(&status) == "stopped"
+                || json_text(session.get("provider_resume_id")).as_deref()
+                    != expected_provider_resume_id
+            {
+                return Ok(false);
+            }
+            session.insert(
+                "provider_resume_id".to_owned(),
+                Value::String(provider_resume_id.clone()),
+            );
+            self.write_raw_json_value(&state)?;
+        }
+        self.append_seat_session(session_id, "codex", &provider_resume_id, None);
+        Ok(true)
+    }
+
+    fn lock_clear_operation(&self, session_id: &str) -> Result<SessionClearGuard> {
+        self.lock_named_clear_operation(session_id)
+    }
+
+    fn lock_codex_cli_binding_operation(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<SessionClearGuard> {
+        self.lock_codex_cli_binding_working_dir(&record.working_dir)
+    }
+
+    fn lock_codex_cli_binding_working_dir(&self, working_dir: &str) -> Result<SessionClearGuard> {
+        let sessions_root = resolve_path_lossy(self.codex_sessions_root.clone());
+        let working_dir = resolve_path_lossy(expand_home(working_dir));
+        self.lock_named_clear_operation(&format!(
+            "codex-cli-binding:{sessions_root}\0{working_dir}"
+        ))
+    }
+
+    fn lock_named_clear_operation(&self, operation_key: &str) -> Result<SessionClearGuard> {
+        let lock = {
+            let mut locks = self
+                .clear_operation_locks
+                .lock()
+                .map_err(|_| anyhow::anyhow!("clear operation lock registry poisoned"))?;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(operation_key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(SessionClearLock {
+                    held: Mutex::new(false),
+                    available: Condvar::new(),
+                });
+                locks.insert(operation_key.to_owned(), Arc::downgrade(&lock));
+                lock
+            }
+        };
+        let mut held = lock
+            .held
+            .lock()
+            .map_err(|_| anyhow::anyhow!("clear operation lock poisoned"))?;
+        while *held {
+            held = lock
+                .available
+                .wait(held)
+                .map_err(|_| anyhow::anyhow!("clear operation lock poisoned"))?;
+        }
+        *held = true;
+        drop(held);
+        Ok(SessionClearGuard { lock })
     }
 
     pub fn restore_core_session(&self, session_id: &str) -> Result<Option<CoreRestoreOutcome>> {
@@ -1191,7 +2080,11 @@ impl SessionStore {
                 .filter(|value| !value.is_empty())
                 .is_none()
         {
-            record.transcript_path = discover_claude_transcript_path(&record, &snapshot.sessions);
+            record.transcript_path = discover_claude_transcript_path(
+                &record,
+                &snapshot.sessions,
+                &self.claude_projects_roots,
+            );
         }
         let provider_resume_id = provider_resume_id_for_restore(&record);
         let session_runtime = runtime.for_socket_name(record.tmux_socket_name.as_deref());
@@ -1271,6 +2164,14 @@ impl SessionStore {
         }
         let restored = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
         self.write_raw_json_value(&state)?;
+        if let Some(provider_resume_id) = provider_resume_id_for_restore(&restored) {
+            self.append_seat_session(
+                &restored.id,
+                &restored.provider,
+                &provider_resume_id,
+                restored.transcript_path.as_deref(),
+            );
+        }
         if let Some(artifacts) = codex_fork_artifacts {
             self.start_codex_fork_event_monitor(restored.id.clone(), artifacts.event_stream_path)?;
         }
@@ -2013,7 +2914,14 @@ impl SessionStore {
     }
 
     fn execute_pending_codex_fork_handoff(&self, session_id: &str) -> Result<bool> {
-        let (file_path, tmux_session, socket_name, event_stream_path, event_offset) = {
+        let (
+            file_path,
+            tmux_session,
+            socket_name,
+            event_stream_path,
+            event_offset,
+            previous_provider_resume_id,
+        ) = {
             let _guard = self.write_guard()?;
             let state = self.load_raw_json_value()?;
             let Some(session) = raw_session_object(&state, session_id) else {
@@ -2040,6 +2948,7 @@ impl SessionStore {
                 json_text(session.get("tmux_socket_name")),
                 artifacts.event_stream_path,
                 event_offset,
+                json_text(session.get("provider_resume_id")),
             )
         };
 
@@ -2061,7 +2970,11 @@ impl SessionStore {
             )? {
                 anyhow::bail!("tmux session is not running");
             }
-            Ok(())
+            wait_for_codex_fork_provider_resume_id_after_offset(
+                &event_stream_path,
+                event_offset,
+                CODEX_FORK_THREAD_STARTED_TIMEOUT,
+            )
         })();
 
         let _guard = self.write_guard()?;
@@ -2071,7 +2984,11 @@ impl SessionStore {
             return Ok(false);
         };
         match result {
-            Ok(()) => {
+            Ok(provider_resume_id) => {
+                session.insert(
+                    "provider_resume_id".to_owned(),
+                    Value::String(provider_resume_id.clone()),
+                );
                 session.insert(
                     "last_handoff_path".to_owned(),
                     Value::String(file_path.clone()),
@@ -2089,6 +3006,20 @@ impl SessionStore {
                 clear_codex_fork_handoff_error_raw(session);
                 self.write_raw_json_value(&state)?;
                 drop(_guard);
+                if let Some(previous_provider_resume_id) = previous_provider_resume_id.as_deref() {
+                    self.append_seat_session(
+                        session_id,
+                        "codex-fork",
+                        previous_provider_resume_id,
+                        event_stream_path.to_str(),
+                    );
+                }
+                self.append_seat_session(
+                    session_id,
+                    "codex-fork",
+                    &provider_resume_id,
+                    event_stream_path.to_str(),
+                );
                 let _ = self.cancel_context_monitor_alerts(session_id);
                 Ok(cleared_pending)
             }
@@ -2986,7 +3917,11 @@ impl SessionStore {
 
             if let Ok(chunk) = read_file_from_offset(&event_stream_path, &mut offset) {
                 for line in split_complete_event_lines(&mut buffer, &chunk) {
-                    let _ = self.apply_codex_fork_event_line(&session_id, &line);
+                    let _ = self.apply_codex_fork_event_line_with_artifact(
+                        &session_id,
+                        &line,
+                        Some(&event_stream_path),
+                    );
                 }
             }
             thread::sleep(CODEX_FORK_EVENT_MONITOR_POLL);
@@ -3019,7 +3954,17 @@ impl SessionStore {
         Ok(normalized_status(&status) != "stopped")
     }
 
+    #[cfg(test)]
     fn apply_codex_fork_event_line(&self, session_id: &str, line: &str) -> Result<()> {
+        self.apply_codex_fork_event_line_with_artifact(session_id, line, None)
+    }
+
+    fn apply_codex_fork_event_line_with_artifact(
+        &self,
+        session_id: &str,
+        line: &str,
+        artifact_path: Option<&Path>,
+    ) -> Result<()> {
         let raw = line.trim();
         if raw.is_empty() {
             return Ok(());
@@ -3047,13 +3992,12 @@ impl SessionStore {
         }
 
         let mut changed = false;
-        if let Some(provider_resume_id) = codex_fork_provider_resume_id(event) {
-            if json_text(session.get("provider_resume_id")).as_deref()
-                != Some(provider_resume_id.as_str())
-            {
+        let provider_resume_id = codex_fork_provider_resume_id(event);
+        if let Some(provider_resume_id) = provider_resume_id.as_deref() {
+            if json_text(session.get("provider_resume_id")).as_deref() != Some(provider_resume_id) {
                 session.insert(
                     "provider_resume_id".to_owned(),
-                    Value::String(provider_resume_id),
+                    Value::String(provider_resume_id.to_owned()),
                 );
                 changed = true;
             }
@@ -3153,6 +4097,26 @@ impl SessionStore {
         if changed {
             self.write_raw_json_value(&state)?;
         }
+        drop(_guard);
+        if let Some(provider_resume_id) = provider_resume_id {
+            self.append_seat_session(
+                session_id,
+                &provider,
+                &provider_resume_id,
+                artifact_path.and_then(Path::to_str),
+            );
+        }
+        let observed_at = OffsetDateTime::now_utc();
+        if let Some(store) = self.usage_burn_store.as_ref() {
+            if let Err(error) = store.record_codex_event(event, observed_at) {
+                eprintln!("Codex rate-limit ingest failed for {session_id}: {error:#}");
+            }
+        }
+        if let Err(error) =
+            self.record_session_account_key(session_id, UsageProvider::Codex, observed_at)
+        {
+            eprintln!("Codex account attribution update failed for {session_id}: {error:#}");
+        }
         Ok(())
     }
 
@@ -3181,16 +4145,8 @@ impl SessionStore {
                 .iter()
                 .find(|value| value.get("id").and_then(Value::as_str) == Some(parent_id))
         });
-        let parent_working_dir =
-            parent_session.and_then(|value| json_text(value.get("working_dir")));
         let parent_node = parent_session.and_then(|value| json_text(value.get("node")));
-        let provider = request
-            .provider
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("claude")
-            .to_owned();
+        let (provider, working_dir) = core_session_provider_and_working_dir(sessions, request);
         let name = request
             .name
             .as_deref()
@@ -3198,14 +4154,6 @@ impl SessionStore {
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("{provider}-{session_id}"));
-        let working_dir = request
-            .working_dir
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .or(parent_working_dir.as_deref())
-            .unwrap_or(".")
-            .to_owned();
         let node = request
             .node
             .as_deref()
@@ -3230,6 +4178,8 @@ impl SessionStore {
             provider,
             model: optional_trimmed(request.model.as_deref()),
             reasoning_effort: optional_trimmed(request.reasoning_effort.as_deref()),
+            account_key: None,
+            usage_cap_fraction: None,
             log_file: Some(log_file.display().to_string()),
             provider_resume_id: None,
             transcript_path: None,
@@ -3290,24 +4240,52 @@ fn wait_for_codex_fork_provider_resume_id(
     event_stream_path: &Path,
     timeout: Duration,
 ) -> Result<String> {
+    wait_for_codex_fork_provider_resume_id_after_offset(event_stream_path, 0, timeout)
+}
+
+fn usage_ledger_error_is_transient(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<rusqlite::Error>()
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    rusqlite::Error::SqliteFailure(code, _)
+                        if matches!(
+                            code.code,
+                            rusqlite::ErrorCode::DatabaseBusy
+                                | rusqlite::ErrorCode::DatabaseLocked
+                        )
+                )
+            })
+    })
+}
+
+fn wait_for_codex_fork_provider_resume_id_after_offset(
+    event_stream_path: &Path,
+    initial_offset: u64,
+    timeout: Duration,
+) -> Result<String> {
     let started = Instant::now();
+    let mut offset = initial_offset;
+    let mut buffer = String::new();
     loop {
-        if let Ok(content) = fs::read_to_string(event_stream_path) {
-            for line in content.lines() {
+        if let Ok(chunk) = read_file_from_offset(event_stream_path, &mut offset) {
+            for line in split_complete_event_lines(&mut buffer, &chunk) {
                 let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
                     continue;
                 };
                 let Some(event) = event.as_object() else {
                     continue;
                 };
-                if let Some(provider_resume_id) = codex_fork_provider_resume_id(event) {
+                if let Some(provider_resume_id) = extract_codex_fork_thread_started(event) {
                     return Ok(provider_resume_id);
                 }
             }
         }
         if started.elapsed() >= timeout {
             anyhow::bail!(
-                "timed out waiting for codex-fork thread_started event in {}",
+                "timed out waiting for a new codex-fork thread_started event in {}",
                 event_stream_path.display()
             );
         }
@@ -3751,6 +4729,14 @@ pub struct ContextUsageEvent {
     pub used_percentage: Option<f64>,
     #[serde(default)]
     pub total_input_tokens: Option<i64>,
+    #[serde(default)]
+    pub five_hour_percent: Option<f64>,
+    #[serde(default)]
+    pub five_hour_resets_at: Option<String>,
+    #[serde(default)]
+    pub seven_day_percent: Option<f64>,
+    #[serde(default)]
+    pub seven_day_resets_at: Option<String>,
     /// Stamped by the producer hook before it detached its curl, so it describes
     /// when the sample was taken rather than when it arrived. Absent for hooks
     /// predating that change.
@@ -6035,12 +7021,55 @@ fn subagent_response_from_value(value: &Value) -> Result<SubagentResponse> {
 }
 
 fn provider_resume_id_from_transcript_path(transcript_path: &str) -> Option<String> {
-    Path::new(transcript_path)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+    claude_session_id_from_transcript(transcript_path).or_else(|| {
+        let path = Path::new(transcript_path);
+        let nested_session_dir = if path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name == "chat.jsonl")
+        {
+            path.parent()
+        } else if path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            == Some("subagents")
+        {
+            path.parent().and_then(Path::parent)
+        } else {
+            None
+        };
+        nested_session_dir
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+    })
+}
+
+fn claude_session_id_from_transcript(transcript_path: &str) -> Option<String> {
+    let file = fs::File::open(expand_home(transcript_path)).ok()?;
+    BufReader::new(file)
+        .lines()
+        .map_while(|line| line.ok())
+        .take(128)
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .find_map(|value| {
+            value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn provider_resume_id_for_restore(record: &SessionRecord) -> Option<String> {
@@ -6219,13 +7248,300 @@ fn read_codex_cli_session_metadata(path: &Path) -> Option<(String, String, Optio
 #[derive(Debug, Default)]
 struct ClaudeTranscriptMetadata {
     mtime_ns: i128,
+    session_id: Option<String>,
     started_at_ns: Option<i128>,
+    ended_at_ns: Option<i128>,
     cwd: Option<String>,
+}
+
+fn historical_claude_seat_sessions(
+    sessions: &[SessionRecord],
+    projects_roots: &[PathBuf],
+    artifact_cutoff_ns: i128,
+    claimed: &mut BTreeSet<(String, String)>,
+) -> Vec<SeatSessionIdentity> {
+    let mut project_dirs = BTreeMap::<PathBuf, BTreeSet<String>>::new();
+    for projects_root in projects_roots {
+        for session in sessions
+            .iter()
+            .filter(|session| session.provider == "claude")
+            .filter(|session| has_text(Some(&session.working_dir)))
+        {
+            project_dirs
+                .entry(projects_root.join(claude_project_dir_name(&session.working_dir)))
+                .or_default()
+                .insert(resolve_path_lossy(expand_home(&session.working_dir)));
+        }
+    }
+
+    let mut identities = Vec::new();
+    for (project_dir, project_working_dirs) in project_dirs {
+        for path in jsonl_files_recursive(&project_dir) {
+            let Ok(metadata) = read_claude_transcript_metadata(&path) else {
+                continue;
+            };
+            let Some(provider_session_id) = metadata.session_id else {
+                continue;
+            };
+            let claim = ("claude".to_owned(), provider_session_id.clone());
+            if claimed.contains(&claim) {
+                continue;
+            }
+            let artifact_start = metadata.started_at_ns.unwrap_or(metadata.mtime_ns);
+            let artifact_end = metadata.ended_at_ns.unwrap_or(metadata.mtime_ns);
+            if artifact_start > artifact_cutoff_ns {
+                continue;
+            }
+            let matching_seats = sessions
+                .iter()
+                .filter(|session| session.provider == "claude")
+                .filter(|session| {
+                    let working_dir = resolve_path_lossy(expand_home(&session.working_dir));
+                    metadata.cwd.as_deref().map_or_else(
+                        || project_working_dirs.contains(&working_dir),
+                        |cwd| cwd == working_dir,
+                    )
+                })
+                .filter(|session| session_lifetime_overlaps(session, artifact_start, artifact_end))
+                .map(|session| session.id.as_str())
+                .collect::<BTreeSet<_>>();
+            if matching_seats.is_empty() {
+                continue;
+            }
+            let seat_id = if matching_seats.len() == 1 {
+                matching_seats.into_iter().next().unwrap().to_owned()
+            } else {
+                "unassigned".to_owned()
+            };
+            claimed.insert(claim);
+            identities.push(SeatSessionIdentity {
+                seat_id,
+                provider: "claude".to_owned(),
+                provider_session_id,
+                artifact_path: Some(resolve_path_lossy(path)),
+            });
+        }
+    }
+    identities
+}
+
+fn historical_codex_cli_seat_sessions(
+    sessions: &[SessionRecord],
+    sessions_root: &Path,
+    artifact_cutoff_ns: i128,
+    claimed: &mut BTreeSet<(String, String)>,
+) -> Vec<SeatSessionIdentity> {
+    let codex_seats = sessions
+        .iter()
+        .filter(|session| session.provider == "codex")
+        .collect::<Vec<_>>();
+    if codex_seats.is_empty() {
+        return Vec::new();
+    }
+
+    let mut identities = Vec::new();
+    for path in jsonl_files_recursive(sessions_root) {
+        let Some((provider_session_id, cwd, started_at_ns)) =
+            read_codex_cli_session_metadata(&path)
+        else {
+            continue;
+        };
+        let claim = ("codex".to_owned(), provider_session_id.clone());
+        if claimed.contains(&claim) {
+            continue;
+        }
+
+        let cwd = resolve_path_lossy(expand_home(&cwd));
+        let matching_cwd_seats = codex_seats
+            .iter()
+            .copied()
+            .filter(|session| resolve_path_lossy(expand_home(&session.working_dir)) == cwd)
+            .collect::<Vec<_>>();
+        if matching_cwd_seats.is_empty() {
+            continue;
+        }
+
+        let started_at_ns = started_at_ns
+            .or_else(|| file_mtime_ns(&path).ok())
+            .unwrap_or(0);
+        if started_at_ns > artifact_cutoff_ns {
+            continue;
+        }
+        let ended_at_ns = codex_transcript_end_ns(&path, started_at_ns);
+        let matching_seats = matching_cwd_seats
+            .into_iter()
+            .filter(|session| session_lifetime_overlaps(session, started_at_ns, ended_at_ns))
+            .map(|session| session.id.as_str())
+            .collect::<BTreeSet<_>>();
+        if matching_seats.is_empty() {
+            continue;
+        }
+        let seat_id = if matching_seats.len() == 1 {
+            matching_seats.into_iter().next().unwrap().to_owned()
+        } else {
+            "unassigned".to_owned()
+        };
+        claimed.insert(claim);
+        identities.push(SeatSessionIdentity {
+            seat_id,
+            provider: "codex".to_owned(),
+            provider_session_id,
+            artifact_path: Some(resolve_path_lossy(path)),
+        });
+    }
+    identities
+}
+
+fn codex_cli_artifact_paths(
+    sessions_root: &Path,
+    provider_session_ids: &BTreeSet<String>,
+) -> BTreeMap<String, PathBuf> {
+    if provider_session_ids.is_empty() {
+        return BTreeMap::new();
+    }
+    let mut paths = BTreeMap::new();
+    for path in jsonl_files_recursive(sessions_root) {
+        let Some((provider_session_id, _, _)) = read_codex_cli_session_metadata(&path) else {
+            continue;
+        };
+        if provider_session_ids.contains(&provider_session_id) {
+            paths.entry(provider_session_id).or_insert(path);
+        }
+    }
+    paths
+}
+
+fn codex_transcript_end_ns(path: &Path, started_at_ns: i128) -> i128 {
+    let mut ended_at_ns = started_at_ns;
+    let Ok(file) = fs::File::open(path) else {
+        return ended_at_ns;
+    };
+    for line in BufReader::new(file).lines().map_while(|line| line.ok()) {
+        let Some(timestamp) = serde_json::from_str::<Value>(&line).ok().and_then(|value| {
+            value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_timestamp_ns)
+        }) else {
+            continue;
+        };
+        ended_at_ns = ended_at_ns.max(timestamp);
+    }
+    ended_at_ns
+}
+
+fn jsonl_files_recursive(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file()
+                && path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+fn historical_codex_fork_seat_sessions(
+    sessions: &[SessionRecord],
+    runtime: &TmuxRuntime,
+    claimed: &mut BTreeSet<(String, String)>,
+) -> Vec<SeatSessionIdentity> {
+    let mut identities = Vec::new();
+    for session in sessions
+        .iter()
+        .filter(|session| session.provider == "codex-fork")
+    {
+        let Some(event_stream_path) = codex_fork_event_stream_path(session, runtime) else {
+            continue;
+        };
+        let Ok(file) = fs::File::open(&event_stream_path) else {
+            continue;
+        };
+        for line in BufReader::new(file).lines().map_while(|line| line.ok()) {
+            let Some(provider_session_id) =
+                serde_json::from_str::<Value>(&line).ok().and_then(|value| {
+                    value
+                        .as_object()
+                        .and_then(extract_codex_fork_thread_started)
+                })
+            else {
+                continue;
+            };
+            let claim = ("codex-fork".to_owned(), provider_session_id.clone());
+            if !claimed.insert(claim) {
+                continue;
+            }
+            identities.push(SeatSessionIdentity {
+                seat_id: session.id.clone(),
+                provider: "codex-fork".to_owned(),
+                provider_session_id,
+                artifact_path: Some(event_stream_path.display().to_string()),
+            });
+        }
+    }
+    identities
+}
+
+fn codex_fork_event_stream_path(session: &SessionRecord, runtime: &TmuxRuntime) -> Option<PathBuf> {
+    if session.provider != "codex-fork" {
+        return None;
+    }
+    let spec = TmuxSessionSpec {
+        session_id: session.id.clone(),
+        tmux_session: session.tmux_session.clone(),
+        working_dir: session.working_dir.clone(),
+        log_file: session.log_file.as_deref().map(expand_home)?,
+        provider: session.provider.clone(),
+        initial_message: None,
+        model: session.model.clone(),
+        reasoning_effort: session.reasoning_effort.clone(),
+    };
+    runtime
+        .codex_fork_runtime_artifacts(&spec)
+        .ok()
+        .flatten()
+        .map(|artifacts| artifacts.event_stream_path)
+}
+
+fn session_lifetime_overlaps(
+    session: &SessionRecord,
+    artifact_start: i128,
+    artifact_end: i128,
+) -> bool {
+    let Some(seat_start) = parse_timestamp_ns(&session.created_at) else {
+        return false;
+    };
+    let seat_end = if normalized_status(&session.status) == "stopped" {
+        session
+            .stopped_at
+            .as_deref()
+            .and_then(parse_timestamp_ns)
+            .or_else(|| parse_timestamp_ns(&session.last_activity))
+            .unwrap_or(seat_start)
+    } else {
+        i128::MAX
+    };
+    artifact_end >= seat_start && artifact_start <= seat_end
 }
 
 fn discover_claude_transcript_path(
     record: &SessionRecord,
     sessions: &[SessionRecord],
+    projects_roots: &[PathBuf],
 ) -> Option<String> {
     if record.provider != "claude" || !has_text(Some(record.working_dir.as_str())) {
         return record.transcript_path.clone();
@@ -6234,11 +7550,6 @@ fn discover_claude_transcript_path(
         return record.transcript_path.clone();
     }
 
-    let project_dir =
-        expand_home("~/.claude/projects").join(claude_project_dir_name(&record.working_dir));
-    if !project_dir.is_dir() {
-        return None;
-    }
     let resolved_working_dir = resolve_path_lossy(expand_home(&record.working_dir));
     let claimed_paths = sessions
         .iter()
@@ -6247,49 +7558,64 @@ fn discover_claude_transcript_path(
         .filter(|path| has_text(Some(path)))
         .map(|path| resolve_path_lossy(expand_home(path)))
         .collect::<BTreeSet<_>>();
+    let claimed_provider_session_ids = sessions
+        .iter()
+        .filter(|session| session.id != record.id && session.provider == "claude")
+        .filter_map(provider_resume_id_for_restore)
+        .collect::<BTreeSet<_>>();
     let target_time_ns = session_time_ns(record)
         .or_else(|| file_mtime_ns(expand_home(&record.log_file.clone().unwrap_or_default())).ok())
         .unwrap_or(0);
 
-    let mut candidates: Vec<(i128, i128, i128, String)> = Vec::new();
-    let Ok(entries) = fs::read_dir(&project_dir) else {
-        return None;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let resolved_transcript = resolve_path_lossy(path.clone());
-        if claimed_paths.contains(&resolved_transcript) {
-            continue;
-        }
-        let metadata = read_claude_transcript_metadata(&path).unwrap_or_default();
-        if let Some(cwd) = metadata.cwd.as_deref() {
-            if cwd != resolved_working_dir {
+    let mut candidates: Vec<(bool, i128, i128, i128, String)> = Vec::new();
+    for projects_root in projects_roots {
+        let project_dir = projects_root.join(claude_project_dir_name(&record.working_dir));
+        for path in jsonl_files_recursive(&project_dir) {
+            let resolved_transcript = resolve_path_lossy(path.clone());
+            if claimed_paths.contains(&resolved_transcript) {
                 continue;
             }
+            let metadata = read_claude_transcript_metadata(&path).unwrap_or_default();
+            let candidate_provider_session_id = metadata
+                .session_id
+                .clone()
+                .or_else(|| provider_resume_id_from_transcript_path(&resolved_transcript));
+            if candidate_provider_session_id
+                .as_ref()
+                .is_some_and(|session_id| claimed_provider_session_ids.contains(session_id))
+            {
+                continue;
+            }
+            if let Some(cwd) = metadata.cwd.as_deref() {
+                if cwd != resolved_working_dir {
+                    continue;
+                }
+            }
+            let comparison_time = if metadata.mtime_ns > 0 {
+                metadata.mtime_ns
+            } else {
+                metadata.started_at_ns.unwrap_or(0)
+            };
+            let distance = (target_time_ns - comparison_time).abs();
+            let start_distance = metadata
+                .started_at_ns
+                .map(|started_at_ns| (target_time_ns - started_at_ns).abs())
+                .unwrap_or(distance);
+            candidates.push((
+                path.parent()
+                    .and_then(Path::file_name)
+                    .and_then(|value| value.to_str())
+                    == Some("subagents"),
+                distance,
+                start_distance,
+                -metadata.mtime_ns,
+                resolved_transcript,
+            ));
         }
-        let comparison_time = if metadata.mtime_ns > 0 {
-            metadata.mtime_ns
-        } else {
-            metadata.started_at_ns.unwrap_or(0)
-        };
-        let distance = (target_time_ns - comparison_time).abs();
-        let start_distance = metadata
-            .started_at_ns
-            .map(|started_at_ns| (target_time_ns - started_at_ns).abs())
-            .unwrap_or(distance);
-        candidates.push((
-            distance,
-            start_distance,
-            -metadata.mtime_ns,
-            resolved_transcript,
-        ));
     }
 
     candidates.sort();
-    candidates.into_iter().next().map(|(_, _, _, path)| path)
+    candidates.into_iter().next().map(|(_, _, _, _, path)| path)
 }
 
 fn read_claude_transcript_metadata(path: &Path) -> Result<ClaudeTranscriptMetadata> {
@@ -6310,6 +7636,30 @@ fn read_claude_transcript_metadata(path: &Path) -> Result<ClaudeTranscriptMetada
         let Some(object) = value.as_object() else {
             continue;
         };
+        if metadata.session_id.is_none() {
+            metadata.session_id = object
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+        }
+        if let Some(timestamp) = object
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_timestamp_ns)
+        {
+            metadata.started_at_ns = Some(
+                metadata
+                    .started_at_ns
+                    .map_or(timestamp, |started| started.min(timestamp)),
+            );
+            metadata.ended_at_ns = Some(
+                metadata
+                    .ended_at_ns
+                    .map_or(timestamp, |ended| ended.max(timestamp)),
+            );
+        }
         if object.get("type").and_then(Value::as_str) == Some("user") && metadata.cwd.is_none() {
             if let Some(cwd) = object
                 .get("cwd")
@@ -6319,10 +7669,6 @@ fn read_claude_transcript_metadata(path: &Path) -> Result<ClaudeTranscriptMetada
             {
                 metadata.cwd = Some(resolve_path_lossy(expand_home(cwd)));
             }
-            metadata.started_at_ns = object
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .and_then(parse_timestamp_ns);
         }
     }
     Ok(metadata)
@@ -6380,6 +7726,34 @@ fn append_log_line(path: &Path, line: &str) -> Result<()> {
     writeln!(file, "{line}")
         .with_context(|| format!("failed to append session log {}", path.display()))?;
     Ok(())
+}
+
+fn core_session_provider_and_working_dir(
+    sessions: &[Value],
+    request: &CreateCoreSessionRequest,
+) -> (String, String) {
+    let parent_working_dir = request.parent_session_id.as_deref().and_then(|parent_id| {
+        sessions
+            .iter()
+            .find(|value| value.get("id").and_then(Value::as_str) == Some(parent_id))
+            .and_then(|value| json_text(value.get("working_dir")))
+    });
+    let provider = request
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("claude")
+        .to_owned();
+    let working_dir = request
+        .working_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(parent_working_dir.as_deref())
+        .unwrap_or(".")
+        .to_owned();
+    (provider, working_dir)
 }
 
 fn core_log_file_path(state_file: &Path, log_dir: Option<&Path>, session_id: &str) -> PathBuf {
@@ -6473,6 +7847,40 @@ fn now_python_naive_iso() -> String {
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]"
         ))
         .unwrap_or_else(|_| "1970-01-01T00:00:00.000000".to_owned())
+}
+
+fn claude_projects_roots(configured_transcript_root: Option<&str>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !roots.contains(&path) {
+            roots.push(path);
+        }
+    };
+
+    if let Some(root) = configured_transcript_root
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+    {
+        push(expand_home(root));
+    }
+    if let Some(config_dirs) = env::var_os("CLAUDE_CONFIG_DIR") {
+        for config_dir in config_dirs.to_string_lossy().split(',') {
+            let config_dir = config_dir.trim();
+            if !config_dir.is_empty() {
+                push(expand_home(config_dir).join("projects"));
+            }
+        }
+    }
+    if let Some(xdg_config_home) = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        push(xdg_config_home.join("claude").join("projects"));
+    } else {
+        push(expand_home("~/.config/claude/projects"));
+    }
+    push(expand_home("~/.claude/projects"));
+    roots
 }
 
 pub fn expand_home(path: &str) -> PathBuf {
@@ -6692,6 +8100,10 @@ pub struct SessionRecord {
     #[serde(default)]
     pub reasoning_effort: Option<String>,
     #[serde(default)]
+    pub account_key: Option<String>,
+    #[serde(default)]
+    pub usage_cap_fraction: Option<f64>,
+    #[serde(default)]
     pub log_file: Option<String>,
     #[serde(default)]
     pub provider_resume_id: Option<String>,
@@ -6805,6 +8217,22 @@ pub struct SessionRecord {
     pub pending_adoption_proposals: Vec<AdoptionProposalResponse>,
 }
 
+fn root_seat_id(record: &SessionRecord, records: &BTreeMap<&str, &SessionRecord>) -> String {
+    let mut current = record;
+    let mut visited = BTreeSet::new();
+    visited.insert(current.id.as_str());
+    while let Some(parent_id) = current.parent_session_id.as_deref() {
+        if !visited.insert(parent_id) {
+            break;
+        }
+        let Some(parent) = records.get(parent_id) else {
+            break;
+        };
+        current = parent;
+    }
+    current.id.clone()
+}
+
 impl SessionRecord {
     fn is_stopped(&self) -> bool {
         normalized_status(&self.status) == "stopped"
@@ -6903,6 +8331,8 @@ pub struct SessionResponse {
     tmux_socket_name: Option<String>,
     node: String,
     provider: Option<String>,
+    account_key: Option<String>,
+    usage_cap_fraction: Option<f64>,
     provider_resume_id: Option<String>,
     forked_from_session_id: Option<String>,
     forked_from_provider_resume_id: Option<String>,
@@ -6953,6 +8383,8 @@ impl From<SessionRecord> for SessionResponse {
             tmux_socket_name: session.tmux_socket_name,
             node: non_empty_or(session.node, "primary"),
             provider: Some(non_empty_or(session.provider, "claude")),
+            account_key: session.account_key,
+            usage_cap_fraction: session.usage_cap_fraction,
             provider_resume_id: session.provider_resume_id,
             forked_from_session_id: session.forked_from_session_id,
             forked_from_provider_resume_id: session.forked_from_provider_resume_id,
@@ -7406,6 +8838,8 @@ fn extract_provider_native_rename_name(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usage_identity::{AccountIdentity, Provider, UsageIdentityStore};
+    use rusqlite::Connection;
 
     static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -7444,6 +8878,70 @@ mod tests {
         assert_eq!(expand_home("~"), home);
         assert_eq!(expand_home("~/work"), home.join("work"));
         assert_eq!(expand_home("/tmp/work"), PathBuf::from("/tmp/work"));
+    }
+
+    #[test]
+    fn claude_transcript_identity_prefers_metadata_for_nested_layouts() {
+        let root = unique_temp_path("nested-claude-transcript");
+        let transcript = root
+            .join("path-session")
+            .join("subagents")
+            .join("agent-child.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            json!({
+                "type": "user",
+                "sessionId": "metadata-session",
+                "timestamp": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            provider_resume_id_from_transcript_path(transcript.to_str().unwrap()).as_deref(),
+            Some("metadata-session")
+        );
+        assert_eq!(
+            provider_resume_id_from_transcript_path(
+                root.join("fallback-session")
+                    .join("chat.jsonl")
+                    .to_str()
+                    .unwrap()
+            )
+            .as_deref(),
+            Some("fallback-session")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_project_roots_include_config_environment_and_defaults() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let root = unique_temp_path("claude-project-roots");
+        let home = root.join("home");
+        let config_dir_a = root.join("claude-config-a");
+        let config_dir_b = root.join("claude-config-b");
+        let xdg_dir = root.join("xdg");
+        let configured = root.join("configured-projects");
+        let _home = EnvVarRestore::set("HOME", &home);
+        let _config = EnvVarRestore::set(
+            "CLAUDE_CONFIG_DIR",
+            format!("{}, {}", config_dir_a.display(), config_dir_b.display()),
+        );
+        let _xdg = EnvVarRestore::set("XDG_CONFIG_HOME", &xdg_dir);
+
+        assert_eq!(
+            claude_projects_roots(Some(configured.to_str().unwrap())),
+            vec![
+                configured,
+                config_dir_a.join("projects"),
+                config_dir_b.join("projects"),
+                xdg_dir.join("claude").join("projects"),
+                home.join(".claude").join("projects"),
+            ]
+        );
     }
 
     #[test]
@@ -7531,6 +9029,8 @@ mod tests {
             provider: "claude".to_owned(),
             model: None,
             reasoning_effort: None,
+            account_key: None,
+            usage_cap_fraction: None,
             log_file: Some("/tmp/abc12345.log".to_owned()),
             provider_resume_id: None,
             transcript_path: None,
@@ -7756,6 +9256,68 @@ mod tests {
 
         assert_eq!(session.status, "idle");
         assert_eq!(projected_activity_state(&session, &session.status), "idle");
+    }
+
+    #[test]
+    fn claude_stop_hook_releases_session_lock_before_blocked_ledger_write() {
+        let store = store_with_running_claude_session("stopledgerlock");
+        store
+            .seat_session_store
+            .append("seed", "claude", "seed-thread", None)
+            .unwrap();
+        let usage_db_path = store.state_file.with_extension("usage.db");
+        let connection = rusqlite::Connection::open(usage_db_path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let stop_store = store.clone();
+        let stop = thread::spawn(move || {
+            stop_store.apply_claude_stop_hook(
+                "stopledgerlock",
+                None,
+                None,
+                None,
+                Some("/tmp/rebound-thread.jsonl"),
+                None,
+                None,
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let persisted_before_unlock = loop {
+            if store
+                .get_session("stopledgerlock")
+                .unwrap()
+                .and_then(|session| session.transcript_path)
+                .as_deref()
+                == Some("/tmp/rebound-thread.jsonl")
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let mutation_elapsed = if persisted_before_unlock {
+            let started = Instant::now();
+            assert!(store
+                .apply_claude_pre_tool_use_hook("stopledgerlock", Some("Read"))
+                .unwrap());
+            Some(started.elapsed())
+        } else {
+            None
+        };
+
+        connection.execute_batch("ROLLBACK").unwrap();
+        assert!(stop.join().unwrap().unwrap());
+        assert!(
+            persisted_before_unlock,
+            "core Stop state remained behind the blocked usage ledger"
+        );
+        assert!(
+            mutation_elapsed.is_some_and(|elapsed| elapsed < Duration::from_secs(1)),
+            "the global session lock remained held during the usage ledger wait"
+        );
     }
 
     #[test]
@@ -8249,6 +9811,817 @@ mod tests {
     }
 
     #[test]
+    fn codex_fork_thread_identity_events_append_the_provider_session_chain() {
+        let state_file = unique_temp_path("codex-session-chain");
+        let usage_db_path = state_file.with_extension("usage.db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"thread/started","payload":{"thread":{"id":"thread-before-handoff"}}}"#,
+            )
+            .unwrap();
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"thread/started","payload":{"thread":{"id":"thread-after-handoff"}}}"#,
+            )
+            .unwrap();
+
+        let connection = rusqlite::Connection::open(usage_db_path).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT provider, provider_session_id FROM seat_sessions WHERE seat_id = 'codex001' ORDER BY provider_session_id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("codex-fork".to_owned(), "thread-after-handoff".to_owned()),
+                ("codex-fork".to_owned(), "thread-before-handoff".to_owned()),
+            ]
+        );
+        assert_eq!(
+            store
+                .get_session("codex001")
+                .unwrap()
+                .unwrap()
+                .provider_resume_id
+                .as_deref(),
+            Some("thread-after-handoff")
+        );
+    }
+
+    #[test]
+    fn transient_seat_session_append_is_retried_after_the_writer_unlocks() {
+        let state_file = unique_temp_path("seat-session-retry");
+        let usage_db_path = state_file.with_extension("usage.db");
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+        store
+            .seat_session_store
+            .append("seed", "codex", "seed-thread", None)
+            .unwrap();
+        let connection = rusqlite::Connection::open(&usage_db_path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        store.append_seat_session("codex001", "codex", "retry-thread", None);
+        connection.execute_batch("ROLLBACK").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let count: i64 = rusqlite::Connection::open(&usage_db_path)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'codex001' AND provider_session_id = 'retry-thread'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if count == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "transient usage ledger append was not retried"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn startup_reconciliation_restores_a_missing_current_codex_identity() {
+        let state_file = unique_temp_path("seat-session-reconcile");
+        let usage_db_path = state_file.with_extension("usage.db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex",
+                    "provider_resume_id": "persisted-thread",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+
+        store.reconcile_current_seat_sessions().unwrap();
+
+        let count: i64 = rusqlite::Connection::open(usage_db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'codex001' AND provider_session_id = 'persisted-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn startup_reconciliation_marks_duplicate_current_identity_unassigned() {
+        let state_file = unique_temp_path("seat-session-duplicate-current");
+        let usage_db_path = state_file.with_extension("usage.db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    {
+                        "id": "claude001",
+                        "name": "claude-claude001",
+                        "provider": "claude",
+                        "provider_resume_id": "shared-thread",
+                        "transcript_path": "/repo/one/shared-thread.jsonl",
+                        "working_dir": "/repo",
+                        "tmux_session": "claude-claude001",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00Z",
+                        "last_activity": "2026-06-01T00:01:00Z"
+                    },
+                    {
+                        "id": "claude002",
+                        "name": "claude-claude002",
+                        "provider": "claude",
+                        "provider_resume_id": "shared-thread",
+                        "transcript_path": "/repo/two/shared-thread.jsonl",
+                        "working_dir": "/repo",
+                        "tmux_session": "claude-claude002",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00Z",
+                        "last_activity": "2026-06-01T00:01:00Z"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+
+        store.reconcile_current_seat_sessions().unwrap();
+
+        let connection = rusqlite::Connection::open(usage_db_path).unwrap();
+        let rows = connection
+            .prepare(
+                "SELECT seat_id, provider, provider_session_id, artifact_path FROM seat_sessions",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "unassigned".to_owned(),
+                "claude".to_owned(),
+                "shared-thread".to_owned(),
+                None,
+            )]
+        );
+    }
+
+    #[test]
+    fn startup_reconciliation_backfills_historical_claude_identities_conservatively() {
+        let state_file = unique_temp_path("seat-session-claude-backfill");
+        let usage_db_path = state_file.with_extension("usage.db");
+        let projects_root = state_file.with_extension("claude-projects");
+        let working_dir = state_file.with_extension("repo");
+        fs::create_dir_all(&working_dir).unwrap();
+        let project_dir =
+            projects_root.join(claude_project_dir_name(working_dir.to_str().unwrap()));
+        fs::create_dir_all(&project_dir).unwrap();
+        let current_path = project_dir.join("current-thread").join("chat.jsonl");
+        let historical_path = project_dir.join("historical-thread").join("chat.jsonl");
+        let historical_sidechain_path = project_dir
+            .join("historical-thread")
+            .join("subagents")
+            .join("agent-child.jsonl");
+        let ambiguous_path = project_dir.join("ambiguous.jsonl");
+        fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(historical_sidechain_path.parent().unwrap()).unwrap();
+        let transcript = |session_id: &str, timestamp: &str| {
+            json!({
+                "type": "user",
+                "sessionId": session_id,
+                "cwd": working_dir.display().to_string(),
+                "timestamp": timestamp
+            })
+            .to_string()
+        };
+        fs::write(
+            &current_path,
+            transcript("current-thread", "2026-01-06T00:00:00Z"),
+        )
+        .unwrap();
+        fs::write(
+            &historical_path,
+            transcript("historical-thread", "2026-01-02T00:00:00Z"),
+        )
+        .unwrap();
+        fs::write(
+            &historical_sidechain_path,
+            transcript("historical-thread", "2026-01-02T00:01:00Z"),
+        )
+        .unwrap();
+        fs::write(
+            &ambiguous_path,
+            transcript("ambiguous-thread", "2026-01-04T12:00:00Z"),
+        )
+        .unwrap();
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    {
+                        "id": "seat-old",
+                        "name": "claude-seat-old",
+                        "provider": "claude",
+                        "working_dir": working_dir.display().to_string(),
+                        "tmux_session": "claude-seat-old",
+                        "status": "stopped",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "last_activity": "2026-01-05T00:00:00Z",
+                        "stopped_at": "2026-01-05T00:00:00Z"
+                    },
+                    {
+                        "id": "seat-current",
+                        "name": "claude-seat-current",
+                        "provider": "claude",
+                        "working_dir": working_dir.display().to_string(),
+                        "tmux_session": "claude-seat-current",
+                        "status": "running",
+                        "transcript_path": current_path.display().to_string(),
+                        "created_at": "2026-01-04T00:00:00Z",
+                        "last_activity": "2026-01-06T00:00:00Z"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file)
+            .with_claude_projects_root(projects_root);
+
+        store.reconcile_current_seat_sessions().unwrap();
+
+        let connection = rusqlite::Connection::open(usage_db_path).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT seat_id, provider_session_id FROM seat_sessions ORDER BY provider_session_id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("unassigned".to_owned(), "ambiguous-thread".to_owned()),
+                ("seat-current".to_owned(), "current-thread".to_owned()),
+                ("seat-old".to_owned(), "historical-thread".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_reconciliation_backfills_codex_fork_thread_history() {
+        let state_file = unique_temp_path("seat-session-fork-backfill");
+        let usage_db_path = state_file.with_extension("usage.db");
+        let log_file = state_file.with_extension("log");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "provider_resume_id": "current-thread",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "log_file": log_file.display().to_string(),
+                    "status": "running",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "last_activity": "2026-01-02T00:00:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default());
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file)
+            .with_delivery_runtime(Some(runtime.clone()));
+        let snapshot = store.load_snapshot().unwrap();
+        let record = snapshot.sessions.first().unwrap();
+        let spec = TmuxSessionSpec {
+            session_id: record.id.clone(),
+            tmux_session: record.tmux_session.clone(),
+            working_dir: record.working_dir.clone(),
+            log_file,
+            provider: record.provider.clone(),
+            initial_message: None,
+            model: None,
+            reasoning_effort: None,
+        };
+        let artifacts = runtime
+            .codex_fork_runtime_artifacts(&spec)
+            .unwrap()
+            .unwrap();
+        fs::write(
+            &artifacts.event_stream_path,
+            concat!(
+                "{\"event_type\":\"thread/started\",\"payload\":{\"thread\":{\"id\":\"historical-thread\"}}}\n",
+                "{\"event_type\":\"thread/started\",\"payload\":{\"thread\":{\"id\":\"current-thread\"}}}\n"
+            ),
+        )
+        .unwrap();
+        store.append_seat_session("codex001", "codex-fork", "current-thread", None);
+
+        store.reconcile_current_seat_sessions().unwrap();
+
+        let connection = rusqlite::Connection::open(usage_db_path).unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'codex001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let paths: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'codex001' AND artifact_path IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(paths, 2);
+    }
+
+    #[test]
+    fn startup_reconciliation_backfills_historical_codex_cli_rollouts() {
+        let temp_dir = unique_temp_path("seat-session-codex-backfill");
+        let state_file = temp_dir.join("sessions.json");
+        let working_dir = temp_dir.join("repo");
+        let sessions_root = temp_dir.join("codex-home").join("sessions");
+        let day_dir = sessions_root.join("2026").join("01").join("02");
+        fs::create_dir_all(&working_dir).unwrap();
+        fs::create_dir_all(&day_dir).unwrap();
+        let rollout = |id: &str, timestamp: &str| {
+            fs::write(
+                day_dir.join(format!("rollout-{id}.jsonl")),
+                format!(
+                    "{}\n",
+                    json!({
+                        "type": "session_meta",
+                        "timestamp": timestamp,
+                        "payload": {
+                            "id": id,
+                            "cwd": working_dir.display().to_string(),
+                            "timestamp": timestamp
+                        }
+                    })
+                ),
+            )
+            .unwrap();
+        };
+        rollout("historical-thread", "2026-01-02T00:00:00Z");
+        rollout("current-thread", "2026-01-03T00:00:00Z");
+        rollout("post-snapshot-thread", "2026-01-04T00:00:00Z");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex",
+                    "provider_resume_id": "current-thread",
+                    "working_dir": working_dir.display().to_string(),
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "last_activity": "2026-01-03T00:00:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut store =
+            SessionStore::new_with_legacy_fallback(state_file.clone(), state_file.clone());
+        store.codex_sessions_root = sessions_root;
+
+        store
+            .reconcile_current_seat_sessions_through(
+                parse_timestamp_ns("2026-01-03T12:00:00Z").unwrap(),
+            )
+            .unwrap();
+
+        let connection = rusqlite::Connection::open(state_file.with_extension("usage.db")).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT provider_session_id FROM seat_sessions WHERE seat_id = 'codex001' ORDER BY provider_session_id",
+            )
+            .unwrap();
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec!["current-thread".to_owned(), "historical-thread".to_owned()]
+        );
+        let paths: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'codex001' AND artifact_path IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(paths, 2);
+    }
+
+    #[test]
+    fn usage_scan_repairs_a_late_classic_codex_artifact_without_restart() {
+        let temp_dir = unique_temp_path("usage-late-codex-artifact");
+        let state_file = temp_dir.join("sessions.json");
+        let usage_db_path = state_file.with_extension("usage.db");
+        let working_dir = temp_dir.join("repo");
+        let sessions_root = temp_dir.join("codex-home").join("sessions");
+        let day_dir = sessions_root.join("2026").join("08").join("10");
+        fs::create_dir_all(&working_dir).unwrap();
+        fs::create_dir_all(&day_dir).unwrap();
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex",
+                    "provider_resume_id": "late-thread",
+                    "working_dir": working_dir.display().to_string(),
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-08-10T16:00:00Z",
+                    "last_activity": "2026-08-10T16:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+        store.codex_sessions_root = sessions_root;
+        store.append_seat_session("codex001", "codex", "late-thread", None);
+        assert_eq!(
+            store
+                .seat_session_store
+                .provider_sessions_missing_artifacts("codex")
+                .unwrap(),
+            BTreeSet::from(["late-thread".to_owned()])
+        );
+
+        let rollout_path = day_dir.join("rollout-late-thread.jsonl");
+        fs::write(
+            &rollout_path,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session_meta",
+                    "timestamp": "2026-08-10T16:00:00Z",
+                    "payload": {
+                        "id": "late-thread",
+                        "cwd": working_dir.display().to_string(),
+                        "timestamp": "2026-08-10T16:00:00Z"
+                    }
+                })
+            ),
+        )
+        .unwrap();
+        let records = store.load_snapshot().unwrap().into_sessions();
+        store
+            .repair_current_codex_usage_artifacts(&records)
+            .unwrap();
+
+        assert!(store
+            .seat_session_store
+            .provider_sessions_missing_artifacts("codex")
+            .unwrap()
+            .is_empty());
+        let repaired: String = Connection::open(usage_db_path)
+            .unwrap()
+            .query_row(
+                "SELECT artifact_path FROM seat_sessions WHERE provider_session_id = 'late-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repaired, resolve_path_lossy(rollout_path));
+    }
+
+    #[test]
+    fn codex_fork_identity_event_releases_session_lock_before_ledger_write() {
+        let state_file = unique_temp_path("codex-event-ledger-lock");
+        let usage_db_path = state_file.with_extension("usage.db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+        store
+            .seat_session_store
+            .append("seed", "codex-fork", "seed-thread", None)
+            .unwrap();
+        let connection = rusqlite::Connection::open(usage_db_path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let event_store = store.clone();
+        let event = thread::spawn(move || {
+            event_store.apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"thread/started","payload":{"thread":{"id":"new-thread"}}}"#,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if store
+                .get_session("codex001")
+                .unwrap()
+                .and_then(|session| session.provider_resume_id)
+                .as_deref()
+                == Some("new-thread")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fork identity state remained behind the blocked usage ledger"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let started = Instant::now();
+        assert!(store
+            .apply_claude_pre_tool_use_hook("codex001", Some("Read"))
+            .unwrap());
+        let mutation_elapsed = started.elapsed();
+
+        connection.execute_batch("ROLLBACK").unwrap();
+        event.join().unwrap().unwrap();
+        assert!(
+            mutation_elapsed < Duration::from_secs(1),
+            "the global session lock remained held during the fork ledger wait"
+        );
+    }
+
+    #[test]
+    fn codex_fork_clear_rebind_reads_only_events_after_the_clear_offset() {
+        let event_stream_path = unique_temp_path("codex-clear-rebind-events");
+        fs::write(
+            &event_stream_path,
+            r#"{"event_type":"thread/started","payload":{"thread":{"id":"old-thread"}}}
+"#,
+        )
+        .unwrap();
+        let clear_offset = fs::metadata(&event_stream_path).unwrap().len();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&event_stream_path)
+            .unwrap()
+            .write_all(
+                br#"{"event_type":"turn_aborted","session_id":"old-thread","payload":{"session_id":"old-thread"}}
+{"event_type":"thread/started","payload":{"thread":{"id":"new-thread"}}}
+"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            wait_for_codex_fork_provider_resume_id_after_offset(
+                &event_stream_path,
+                clear_offset,
+                Duration::ZERO,
+            )
+            .unwrap(),
+            "new-thread"
+        );
+        let _ = fs::remove_file(event_stream_path);
+    }
+
+    #[test]
+    fn codex_fork_clear_rebind_buffers_partial_events_between_polls() {
+        let event_stream_path = unique_temp_path("codex-clear-rebind-partial-events");
+        fs::write(
+            &event_stream_path,
+            r#"{"event_type":"thread/started","payload":{"thread":{"#,
+        )
+        .unwrap();
+        let writer_path = event_stream_path.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            fs::OpenOptions::new()
+                .append(true)
+                .open(writer_path)
+                .unwrap()
+                .write_all(
+                    br#""id":"new-thread"}}}
+"#,
+                )
+                .unwrap();
+        });
+
+        assert_eq!(
+            wait_for_codex_fork_provider_resume_id_after_offset(
+                &event_stream_path,
+                0,
+                Duration::from_secs(1),
+            )
+            .unwrap(),
+            "new-thread"
+        );
+        writer.join().unwrap();
+        let _ = fs::remove_file(event_stream_path);
+    }
+
+    #[test]
+    fn concurrent_clears_for_the_same_seat_are_serialized() {
+        let state_file = unique_temp_path("clear-operation-lock");
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+        let first_guard = store.lock_clear_operation("codex001").unwrap();
+        let second_store = store.clone();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let second = thread::spawn(move || {
+            let _guard = second_store.lock_clear_operation("codex001").unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        assert!(acquired_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        drop(first_guard);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        second.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_codex_cli_bindings_for_the_same_discovery_domain_are_serialized() {
+        let temp_dir = unique_temp_path("codex-binding-operation-lock");
+        let state_file = temp_dir.join("sessions.json");
+        let sessions_root = temp_dir.join("codex-home").join("sessions");
+        let working_dir = temp_dir.join("repo");
+        fs::create_dir_all(&sessions_root).unwrap();
+        fs::create_dir_all(&working_dir).unwrap();
+        let mut store =
+            SessionStore::new_with_legacy_fallback(state_file.clone(), state_file.clone());
+        store.codex_sessions_root = sessions_root;
+        let mut first_record = session_record("running");
+        first_record.id = "codex001".to_owned();
+        first_record.provider = "codex".to_owned();
+        first_record.working_dir = working_dir.display().to_string();
+        let mut second_record = first_record.clone();
+        second_record.id = "codex002".to_owned();
+        let mut unrelated_record = first_record.clone();
+        unrelated_record.id = "codex003".to_owned();
+        unrelated_record.working_dir = temp_dir.join("other-repo").display().to_string();
+
+        let first_guard = store
+            .lock_codex_cli_binding_operation(&first_record)
+            .unwrap();
+        let second_store = store.clone();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let second = thread::spawn(move || {
+            let _guard = second_store
+                .lock_codex_cli_binding_operation(&second_record)
+                .unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        assert!(acquired_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        let _unrelated_guard = store
+            .lock_codex_cli_binding_operation(&unrelated_record)
+            .unwrap();
+        drop(first_guard);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        second.join().unwrap();
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn codex_fork_clear_wait_does_not_hold_the_session_mutex() {
+        let Some(fixture) = CodexForkHandoffFixture::new("clear-unlocked") else {
+            return;
+        };
+        fixture.kill_tmux();
+        fixture.start_delayed_clear_tmux();
+        let mut state: Value =
+            serde_json::from_slice(&fs::read(&fixture.state_file).unwrap()).unwrap();
+        session_object_mut(ensure_sessions_array_mut(&mut state).unwrap(), "codex001")
+            .unwrap()
+            .insert(
+                "parent_session_id".to_owned(),
+                Value::String("parent01".to_owned()),
+            );
+        fs::write(&fixture.state_file, serde_json::to_vec(&state).unwrap()).unwrap();
+        let store = fixture.store();
+        let clear_store = store.clone();
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default());
+        let clear = thread::spawn(move || {
+            clear_store.clear_core_session_with_runtime(
+                "codex001",
+                ClearSessionRequest {
+                    prompt: None,
+                    requester_session_id: Some("parent01".to_owned()),
+                },
+                &runtime,
+            )
+        });
+
+        thread::sleep(Duration::from_millis(250));
+        if clear.is_finished() {
+            let pane = fixture.capture_pane();
+            let result = clear.join().unwrap();
+            panic!("clear completed before the delayed identity event: {result:?}; pane={pane:?}");
+        }
+        let started = Instant::now();
+        assert!(store
+            .apply_claude_pre_tool_use_hook("codex001", Some("Read"))
+            .unwrap());
+        let mutation_elapsed = started.elapsed();
+
+        assert!(matches!(
+            clear.join().unwrap().unwrap(),
+            CoreClearOutcome::Cleared(_)
+        ));
+        assert!(
+            mutation_elapsed < Duration::from_secs(1),
+            "the global session lock remained held during fork identity discovery"
+        );
+        assert_eq!(
+            store
+                .get_session("codex001")
+                .unwrap()
+                .unwrap()
+                .provider_resume_id
+                .as_deref(),
+            Some("new-thread")
+        );
+    }
+
+    #[test]
     fn codex_fork_handoff_executes_after_turn_complete() {
         let Some(fixture) = CodexForkHandoffFixture::new("execute") else {
             return;
@@ -8284,17 +10657,19 @@ mod tests {
             session.last_handoff_path.as_deref(),
             Some(fixture.handoff_path.to_str().unwrap())
         );
-        assert_eq!(session.provider_resume_id.as_deref(), Some("old-thread"));
-        store
-            .apply_codex_fork_event_line(
-                "codex001",
-                r#"{"event_type":"thread/started","payload":{"thread":{"id":"new-thread"}}}"#,
-            )
-            .unwrap();
-        let session = store.get_session("codex001").unwrap().unwrap();
-        assert_eq!(session.id, "codex001");
-        assert_eq!(session.friendly_name.as_deref(), Some("stable-agent"));
         assert_eq!(session.provider_resume_id.as_deref(), Some("new-thread"));
+        let connection =
+            rusqlite::Connection::open(fixture.state_file.with_extension("usage.db")).unwrap();
+        let provider_session_ids = connection
+            .prepare(
+                "SELECT provider_session_id FROM seat_sessions WHERE seat_id = 'codex001' ORDER BY provider_session_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(provider_session_ids, vec!["new-thread", "old-thread"]);
         let state = store.load_raw_json_value().unwrap();
         let session = raw_session_object(&state, "codex001").unwrap();
         assert!(json_text(session.get("pending_handoff_path")).is_none());
@@ -8344,6 +10719,15 @@ mod tests {
                 .last_handoff_path
                 .as_deref(),
             Some(fixture.handoff_path.to_str().unwrap())
+        );
+        assert_eq!(
+            restarted
+                .get_session("codex001")
+                .unwrap()
+                .unwrap()
+                .provider_resume_id
+                .as_deref(),
+            Some("new-thread")
         );
     }
 
@@ -8566,6 +10950,14 @@ mod tests {
             );
         }
 
+        fn start_delayed_clear_tmux(&self) {
+            start_codex_fork_delayed_clear_tmux(
+                &self.tmux_socket,
+                &self.tmux_session,
+                &self.event_stream_path,
+            );
+        }
+
         fn wait_for_handoff_error(&self, store: &SessionStore) {
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
@@ -8597,9 +10989,23 @@ mod tests {
     }
 
     fn start_codex_fork_handoff_tmux(socket: &str, session: &str, event_stream_path: &Path) {
-        let script = r#"event_file=$1; pending=; printf '› '; while IFS= read -r line; do if [ -n "$pending" ]; then printf '{"event_type":"op_submitted","payload":{"UserTurn":{"items":[{"type":"text","text":"%s"}]}}}\n' "$pending" >> "$event_file"; pending=; printf '\n› '; elif [ "${line#Read }" != "$line" ]; then pending=$line; printf 'received:%s\n› %s' "$line" "$line"; else printf 'received:%s\n› ' "$line"; fi; done"#;
+        let script = r#"event_file=$1; pending=; printf '› '; while IFS= read -r line; do if [ "${line%/new}" != "$line" ]; then printf '{"event_type":"thread/started","payload":{"thread":{"id":"new-thread"}}}\n' >> "$event_file"; printf 'received:%s\n› ' "$line"; elif [ -n "$pending" ]; then printf '{"event_type":"op_submitted","payload":{"UserTurn":{"items":[{"type":"text","text":"%s"}]}}}\n' "$pending" >> "$event_file"; pending=; printf '\n› '; elif [ "${line#Read }" != "$line" ]; then pending=$line; printf 'received:%s\n› %s' "$line" "$line"; else printf 'received:%s\n› ' "$line"; fi; done"#;
         let command = format!(
             "/bin/sh -lc {} handoff-shell {}",
+            shell_quote_handoff_fixture(script),
+            shell_quote_handoff_fixture(&event_stream_path.display().to_string())
+        );
+        let status = Command::new("tmux")
+            .args(["-L", socket, "new-session", "-d", "-s", session, &command])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn start_codex_fork_delayed_clear_tmux(socket: &str, session: &str, event_stream_path: &Path) {
+        let script = r#"event_file=$1; printf '› '; while IFS= read -r line; do if [ "${line%/new}" != "$line" ]; then sleep 1; printf '{"event_type":"thread/started","payload":{"thread":{"id":"new-thread"}}}\n' >> "$event_file"; printf 'received:%s\n› ' "$line"; else printf 'received:%s\n› ' "$line"; fi; done"#;
+        let command = format!(
+            "/bin/sh -lc {} clear-shell {}",
             shell_quote_handoff_fixture(script),
             shell_quote_handoff_fixture(&event_stream_path.display().to_string())
         );
@@ -8913,6 +11319,84 @@ mod tests {
     }
 
     #[test]
+    fn deferred_codex_clear_binding_captures_a_late_replacement_rollout() {
+        let temp_dir = unique_temp_path("codex-deferred-clear-binding");
+        let state_file = temp_dir.join("sessions.json");
+        let working_dir = temp_dir.join("repo");
+        let sessions_root = temp_dir.join("codex-home").join("sessions");
+        let day_dir = sessions_root.join("2026").join("07").join("28");
+        fs::create_dir_all(&working_dir).unwrap();
+        fs::create_dir_all(&day_dir).unwrap();
+        let mut record = session_record("running");
+        record.id = "codex001".to_owned();
+        record.provider = "codex".to_owned();
+        record.working_dir = working_dir.display().to_string();
+        record.provider_resume_id = Some("old-thread".to_owned());
+        record.created_at = "2026-07-28T20:00:00Z".to_owned();
+        record.last_activity = record.created_at.clone();
+        fs::write(
+            &state_file,
+            json!({"sessions": [record.clone()]}).to_string(),
+        )
+        .unwrap();
+        let mut store =
+            SessionStore::new_with_legacy_fallback(state_file.clone(), state_file.clone());
+        store.codex_sessions_root = sessions_root;
+        store.append_seat_session("codex001", "codex", "old-thread", None);
+        let rollout_path = day_dir.join("rollout-new-thread.jsonl");
+        let rollout_working_dir = working_dir.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1_200));
+            fs::write(
+                rollout_path,
+                format!(
+                    "{}\n",
+                    json!({
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "new-thread",
+                            "cwd": rollout_working_dir.display().to_string(),
+                            "timestamp": "2026-07-28T20:00:01Z"
+                        }
+                    })
+                ),
+            )
+            .unwrap();
+        });
+
+        assert!(store
+            .complete_deferred_codex_cli_rebind(
+                "codex001",
+                &record,
+                &BTreeSet::from(["old-thread".to_owned()]),
+                parse_timestamp_ns("2026-07-28T20:00:00Z").unwrap(),
+                Some("old-thread"),
+                Duration::from_secs(2),
+            )
+            .unwrap());
+        writer.join().unwrap();
+        assert_eq!(
+            store
+                .get_session("codex001")
+                .unwrap()
+                .unwrap()
+                .provider_resume_id
+                .as_deref(),
+            Some("new-thread")
+        );
+        let count: i64 = rusqlite::Connection::open(state_file.with_extension("usage.db"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'codex001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn claude_restore_discovers_missing_transcript_path_from_project_history() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
         let temp_dir = unique_temp_path("claude-transcript-discovery");
@@ -8954,7 +11438,11 @@ mod tests {
         session.transcript_path = None;
         session.last_activity = "2026-06-23T01:27:23Z".to_owned();
 
-        let discovered = discover_claude_transcript_path(&session, &[session.clone()]);
+        let discovered = discover_claude_transcript_path(
+            &session,
+            &[session.clone()],
+            &[home.join(".claude").join("projects")],
+        );
 
         assert_eq!(
             discovered.as_deref(),
@@ -8964,6 +11452,57 @@ mod tests {
         assert_eq!(
             provider_resume_id_for_restore(&session).as_deref(),
             Some(transcript_id)
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn claude_restore_excludes_sibling_artifacts_of_a_claimed_provider_session() {
+        let temp_dir = unique_temp_path("claude-claimed-transcript-siblings");
+        let projects_root = temp_dir.join("projects");
+        let working_dir = temp_dir.join("repo");
+        let transcript_id = "49d072b4-4080-4702-9215-b6e7f04aa2c8";
+        let transcript_dir = projects_root
+            .join(claude_project_dir_name(working_dir.to_str().unwrap()))
+            .join(transcript_id);
+        let chat_path = transcript_dir.join("chat.jsonl");
+        let subagent_path = transcript_dir.join("subagents").join("agent-worker.jsonl");
+        fs::create_dir_all(subagent_path.parent().unwrap()).unwrap();
+        let transcript_line = |timestamp: &str| {
+            format!(
+                "{}\n",
+                json!({
+                    "type": "user",
+                    "sessionId": transcript_id,
+                    "cwd": working_dir.display().to_string(),
+                    "timestamp": timestamp
+                })
+            )
+        };
+        fs::write(&chat_path, transcript_line("2026-06-23T01:20:00Z")).unwrap();
+        fs::write(&subagent_path, transcript_line("2026-06-23T01:21:00Z")).unwrap();
+
+        let mut claimed = session_record("running");
+        claimed.id = "claimed1".to_owned();
+        claimed.provider = "claude".to_owned();
+        claimed.working_dir = working_dir.display().to_string();
+        claimed.transcript_path = Some(chat_path.display().to_string());
+        let mut restoring = session_record("stopped");
+        restoring.id = "restore1".to_owned();
+        restoring.provider = "claude".to_owned();
+        restoring.working_dir = working_dir.display().to_string();
+        restoring.transcript_path = None;
+        restoring.provider_resume_id = None;
+        restoring.last_activity = "2026-06-23T01:22:00Z".to_owned();
+
+        assert_eq!(
+            discover_claude_transcript_path(
+                &restoring,
+                &[restoring.clone(), claimed],
+                &[projects_root],
+            ),
+            None
         );
 
         let _ = fs::remove_dir_all(temp_dir);
@@ -9015,10 +11554,9 @@ mod tests {
     fn usage_event(session_id: &str, used_percentage: f64, tokens: i64) -> ContextUsageEvent {
         ContextUsageEvent {
             session_id: session_id.to_owned(),
-            event: None,
             used_percentage: Some(used_percentage),
             total_input_tokens: Some(tokens),
-            emitted_at: None,
+            ..ContextUsageEvent::default()
         }
     }
 
@@ -9038,9 +11576,7 @@ mod tests {
         ContextUsageEvent {
             session_id: session_id.to_owned(),
             event: Some(event.to_owned()),
-            used_percentage: None,
-            total_input_tokens: None,
-            emitted_at: None,
+            ..ContextUsageEvent::default()
         }
     }
 
@@ -9554,10 +12090,8 @@ mod tests {
                 .apply_context_usage_event(
                     &ContextUsageEvent {
                         session_id: "child001".to_owned(),
-                        event: None,
-                        used_percentage: None,
                         total_input_tokens: Some(0),
-                        emitted_at: None,
+                        ..ContextUsageEvent::default()
                     },
                     None
                 )
@@ -9628,6 +12162,170 @@ mod tests {
 
         store.apply_codex_fork_event_line("codex001", line).unwrap();
         assert!(context_monitor_messages(&store).is_empty());
+    }
+
+    #[test]
+    fn codex_rate_limit_event_records_burn_for_the_current_account() {
+        let state_file = unique_temp_path("codexburn");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let usage_db_path = state_file.with_extension("usage.db");
+        let observed_at = OffsetDateTime::now_utc();
+        UsageIdentityStore::new(&usage_db_path)
+            .unwrap()
+            .record_observation(
+                Provider::Codex,
+                Some(&AccountIdentity {
+                    provider: Provider::Codex,
+                    external_id: "codex-test-account".to_owned(),
+                    label: None,
+                    plan_tier: Some("pro".to_owned()),
+                    extra_usage_enabled: None,
+                }),
+                observed_at - TimeDuration::minutes(1),
+                None,
+                None,
+            )
+            .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file)
+            .with_usage_burn_store(UsageBurnStore::new(&usage_db_path).unwrap());
+        let event_timestamp = observed_at.format(&Rfc3339).unwrap();
+        let reset_at = (observed_at + TimeDuration::minutes(300)).unix_timestamp();
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                &json!({
+                    "event_type": "account/rateLimits/updated",
+                    "ts": event_timestamp,
+                    "payload": {"rateLimits": {
+                        "limitId": "codex",
+                        "primary": {
+                            "usedPercent": 27,
+                            "windowDurationMins": 300,
+                            "resetsAt": reset_at
+                        },
+                        "secondary": null
+                    }}
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        let row: (String, String, f64, String) = Connection::open(usage_db_path)
+            .unwrap()
+            .query_row(
+                "SELECT account_key, window_kind, percent, source FROM burn_samples",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                "codex:codex-test-account".to_owned(),
+                "codex_300".to_owned(),
+                27.0,
+                "codex_event".to_owned(),
+            )
+        );
+    }
+
+    #[test]
+    fn usage_scan_persists_current_accounts_for_idle_seats() {
+        let state_file = unique_temp_path("codexscanaccount");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    {
+                        "id": "codex001",
+                        "name": "codex-codex001",
+                        "provider": "codex",
+                        "working_dir": "/repo",
+                        "tmux_session": "codex-codex001",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00",
+                        "last_activity": "2026-06-01T00:01:00"
+                    },
+                    {
+                        "id": "claude001",
+                        "name": "claude-claude001",
+                        "provider": "claude",
+                        "working_dir": "/repo",
+                        "tmux_session": "claude-claude001",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00",
+                        "last_activity": "2026-06-01T00:01:00"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let usage_db_path = state_file.with_extension("usage.db");
+        let observed_at = OffsetDateTime::now_utc();
+        let identity_store = UsageIdentityStore::new(&usage_db_path).unwrap();
+        identity_store
+            .record_observation(
+                Provider::Codex,
+                Some(&AccountIdentity {
+                    provider: Provider::Codex,
+                    external_id: "idle-account".to_owned(),
+                    label: None,
+                    plan_tier: Some("pro".to_owned()),
+                    extra_usage_enabled: None,
+                }),
+                observed_at - TimeDuration::minutes(1),
+                None,
+                None,
+            )
+            .unwrap();
+        identity_store
+            .record_observation(
+                Provider::Claude,
+                Some(&AccountIdentity {
+                    provider: Provider::Claude,
+                    external_id: "idle-account".to_owned(),
+                    label: None,
+                    plan_tier: Some("max".to_owned()),
+                    extra_usage_enabled: None,
+                }),
+                observed_at - TimeDuration::minutes(1),
+                None,
+                None,
+            )
+            .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file)
+            .with_usage_db_path(usage_db_path.clone())
+            .with_usage_identity_store(identity_store)
+            .with_usage_ledger_store(UsageLedgerStore::new(&usage_db_path).unwrap());
+
+        store.scan_usage_ledger().unwrap();
+
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().account_key,
+            Some("codex:idle-account".to_owned())
+        );
+        assert_eq!(
+            store.get_session("claude001").unwrap().unwrap().account_key,
+            Some("claude:idle-account".to_owned())
+        );
     }
 
     #[test]

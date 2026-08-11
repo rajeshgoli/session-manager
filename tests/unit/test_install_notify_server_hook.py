@@ -8,6 +8,7 @@ duplicates, no widening of the file mode.
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -64,6 +65,58 @@ def test_installs_every_hook_script(tmp_path):
         installed = tmp_path / ".claude" / "hooks" / script
         assert installed.is_file()
         assert os.access(installed, os.X_OK)
+
+
+def test_context_monitor_forwards_rate_limit_windows(tmp_path):
+    capture = tmp_path / "posted.json"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        """#!/bin/bash
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-d" ]; then
+    shift
+    printf '%s' "$1" > "$CAPTURE"
+    exit 0
+  fi
+  shift
+done
+exit 1
+"""
+    )
+    fake_curl.chmod(0o755)
+    payload = {
+        "context_window": {"used_percentage": 41.5, "total_input_tokens": 83000},
+        "rate_limits": {
+            "five_hour": {"used_percentage": 12, "resets_at": "2026-08-10T20:00:00Z"},
+            "seven_day": {"used_percentage": 34, "resets_at": "2026-08-16T16:00:00Z"},
+        },
+    }
+
+    subprocess.run(
+        ["bash", str(REPO_ROOT / "hooks" / "context_monitor.sh")],
+        input=json.dumps(payload),
+        env={
+            **os.environ,
+            "HOME": str(tmp_path),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "CAPTURE": str(capture),
+            "CLAUDE_SESSION_MANAGER_ID": "seat-123",
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    for _ in range(50):
+        if capture.exists():
+            break
+        time.sleep(0.02)
+
+    posted = json.loads(capture.read_text())
+    assert posted["session_id"] == "seat-123"
+    assert posted["rate_limits"]["five_hour"] == payload["rate_limits"]["five_hour"]
+    assert posted["rate_limits"]["seven_day"] == payload["rate_limits"]["seven_day"]
 
 
 def test_registers_all_events_and_takes_over_status_line(tmp_path):

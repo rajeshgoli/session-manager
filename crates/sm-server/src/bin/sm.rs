@@ -40,6 +40,7 @@ enum Command {
     Send(SendArgs),
     #[command(alias = "btw")]
     What(WhatArgs),
+    Usage(UsageArgs),
     Remind(RemindArgs),
     Wait(WaitArgs),
     Spawn(SpawnArgs),
@@ -121,6 +122,21 @@ struct WhatArgs {
 }
 
 #[derive(Args)]
+struct UsageArgs {
+    agent: Option<String>,
+    #[arg(long)]
+    include_children: bool,
+    #[arg(long)]
+    since_reset: bool,
+    #[arg(long)]
+    account: bool,
+    #[arg(long)]
+    by_model: bool,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
 struct RemindArgs {
     #[arg(long)]
     recurring: bool,
@@ -190,6 +206,8 @@ struct ChildrenArgs {
     status: Option<String>,
     #[arg(long)]
     json: bool,
+    #[arg(long)]
+    usage: bool,
 }
 
 #[derive(Args)]
@@ -723,6 +741,7 @@ fn run() -> Result<()> {
             }
         }
         Command::What(args) => run_what(&client, args)?,
+        Command::Usage(args) => run_usage(&client, args)?,
         Command::Remind(args) => run_remind(&client, args)?,
         Command::Output(args) => print_output(&client, &args.session_id, args.lines)?,
         Command::Tail(args) => print_tail(&client, &args.session_id, args.lines, args.raw)?,
@@ -743,6 +762,9 @@ fn run() -> Result<()> {
             }
             if args.terminated {
                 query.push("include_terminated=true".to_owned());
+            }
+            if args.usage {
+                query.push("usage=true".to_owned());
             }
             if let Some(status) = args.status {
                 query.push(format!("status={status}"));
@@ -2553,6 +2575,165 @@ fn run_what(client: &ApiClient, args: WhatArgs) -> Result<()> {
     }
 }
 
+fn run_usage(client: &ApiClient, args: UsageArgs) -> Result<()> {
+    if args.account && (args.agent.is_some() || args.include_children) {
+        bail!("--account is mutually exclusive with AGENT and --include-children");
+    }
+    let mut query = Vec::new();
+    if args.include_children {
+        query.push("include_children=true");
+    }
+    if args.since_reset {
+        query.push("since_reset=true");
+    }
+    if args.by_model {
+        query.push("by_model=true");
+    }
+    let query = if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", query.join("&"))
+    };
+    let payload = if args.account {
+        client.get_json(&format!("/usage/accounts{query}"))?
+    } else {
+        let target = match args.agent {
+            Some(identifier) => lookup_identifier_exact(client, &identifier)?
+                .ok_or_else(|| anyhow!("No agent named '{identifier}' is reachable."))?,
+            None => current_session_id()?,
+        };
+        client.get_json(&format!(
+            "/sessions/{}/usage{query}",
+            encode_path_segment(&target)
+        ))?
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        print_usage_report(&payload);
+    }
+    Ok(())
+}
+
+fn print_usage_report(payload: &Value) {
+    if let Some(target) = payload.get("target").filter(|target| !target.is_null()) {
+        let id = target["seat_id"].as_str().unwrap_or("unknown");
+        let name = target["friendly_name"].as_str().unwrap_or(id);
+        let descendants = target["descendant_count"].as_u64().unwrap_or(0);
+        println!("{name} ({id}) · {descendants} descendants · prior weights");
+    } else {
+        println!("account usage · prior weights");
+    }
+    let accounts = payload["accounts"].as_array().cloned().unwrap_or_default();
+    if accounts.is_empty() {
+        println!("No usage data");
+        return;
+    }
+    for account in accounts {
+        let key = account["account_key"].as_str().unwrap_or("unknown");
+        let plan = account["plan_tier"].as_str().unwrap_or("unknown tier");
+        println!("\n{key} · {plan}");
+        for window in account["windows"].as_array().into_iter().flatten() {
+            let kind = usage_window_label(window);
+            let account_usage = window["account_percent"].as_f64().map_or_else(
+                || {
+                    let last = window["last_known_percent"].as_f64().unwrap_or(0.0);
+                    let age_minutes = window["sample_age_seconds"].as_i64().unwrap_or(0) / 60;
+                    format!("unknown (last {last:.1}%, {age_minutes}m ago)")
+                },
+                |percent| format!("{percent:.1}%"),
+            );
+            let self_percent = window["self_percent"]
+                .as_f64()
+                .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1}%"));
+            let child_percent = window["children_percent"]
+                .as_f64()
+                .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1}%"));
+            let headroom = window["free_headroom_points"]
+                .as_f64()
+                .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1} pts"));
+            let stale = if window["stale"].as_bool().unwrap_or(true) {
+                " · stale"
+            } else {
+                ""
+            };
+            let binding = if window["binding_for_scoped_seats"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                " · binding for scoped seats"
+            } else {
+                ""
+            };
+            if payload
+                .get("target")
+                .is_some_and(|target| !target.is_null())
+            {
+                println!(
+                    "  {kind:<22} self {self_percent:>7} · children {child_percent:>7} · account {account_usage} · free {headroom}{binding}{stale}"
+                );
+            } else {
+                println!("  {kind:<22} account {account_usage} · free {headroom}{binding}{stale}");
+                let seats = window["seats"].as_array().cloned().unwrap_or_default();
+                if !seats.is_empty() {
+                    let values = seats
+                        .iter()
+                        .map(|seat| {
+                            let id = seat["seat_id"].as_str().unwrap_or("unknown");
+                            let name = seat["friendly_name"].as_str().unwrap_or(id);
+                            let burn = seat["burn_percent"].as_f64().map_or_else(
+                                || "unknown".to_owned(),
+                                |value| format!("{value:.1}%"),
+                            );
+                            format!("{name} {burn}")
+                        })
+                        .collect::<Vec<_>>();
+                    println!("    seats: {}", values.join(" · "));
+                }
+            }
+            let credit_tokens = window["credit_tokens"].as_i64().unwrap_or(0);
+            if credit_tokens > 0 {
+                println!("    paid usage: {credit_tokens} tokens");
+            }
+            if let (Some(cap_fraction), Some(consumed)) = (
+                payload["target"]["usage_cap_fraction"].as_f64(),
+                window["cap_consumed_percent"].as_f64(),
+            ) {
+                println!(
+                    "    cap {:.1}% of week · {:.1}% consumed",
+                    cap_fraction * 100.0,
+                    consumed
+                );
+            }
+            for model in window["models"].as_array().into_iter().flatten() {
+                let burn = model["burn_percent"]
+                    .as_f64()
+                    .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1}%"));
+                println!(
+                    "    {} · {} · {burn} · {}",
+                    model["seat_id"].as_str().unwrap_or("unknown"),
+                    model["model"].as_str().unwrap_or("unknown"),
+                    model["weight_source"].as_str().unwrap_or("prior"),
+                );
+            }
+        }
+    }
+    println!("\nresidual: unknown · seat figures may include invisible usage");
+    for warning in payload["warnings"].as_array().into_iter().flatten() {
+        if let Some(warning) = warning.as_str() {
+            println!("warning: {warning}");
+        }
+    }
+}
+
+fn usage_window_label(window: &Value) -> String {
+    let kind = window["window_kind"].as_str().unwrap_or("unknown");
+    match window["window_scope"].as_str() {
+        Some(scope) => format!("{kind} ({scope})"),
+        None => kind.to_owned(),
+    }
+}
+
 fn run_remind(client: &ApiClient, args: RemindArgs) -> Result<()> {
     if args.delay_or_action == "cancel" {
         if args.recurring || args.message_or_id.len() != 1 {
@@ -3615,7 +3796,13 @@ fn format_child_line(child: &Value) -> String {
         .or_else(|| child["activity_state"].as_str())
         .or_else(|| child["status"].as_str())
         .unwrap_or("unknown");
-    format!("{name} ({id}) | {provider} | {status}")
+    let mut line = format!("{name} ({id}) | {provider} | {status}");
+    if let Some(percent) = child["weekly_usage_percent"].as_f64() {
+        line.push_str(&format!(" | {percent:.1}% wk"));
+    } else if child.get("weekly_usage_percent").is_some() {
+        line.push_str(" | unknown wk");
+    }
+    line
 }
 
 impl ApiClient {
@@ -4162,6 +4349,66 @@ mod tests {
         assert_eq!(cancel.delay_or_action, "cancel");
         assert_eq!(cancel.message_or_id, ["abc123"]);
         assert_eq!(retired_command_message(&["remind"]), None);
+    }
+
+    #[test]
+    fn usage_and_children_usage_flags_parse_the_surface_contract() {
+        let cli = Cli::try_parse_from([
+            "sm",
+            "usage",
+            "worker",
+            "--include-children",
+            "--since-reset",
+            "--by-model",
+            "--json",
+        ])
+        .unwrap();
+        let Command::Usage(args) = cli.command else {
+            panic!("expected usage command");
+        };
+        assert_eq!(args.agent.as_deref(), Some("worker"));
+        assert!(args.include_children);
+        assert!(args.since_reset);
+        assert!(!args.account);
+        assert!(args.by_model);
+        assert!(args.json);
+
+        let account = Cli::try_parse_from(["sm", "usage", "--account"]).unwrap();
+        let Command::Usage(account) = account.command else {
+            panic!("expected account usage command");
+        };
+        assert!(account.account);
+        assert!(account.agent.is_none());
+
+        let children = Cli::try_parse_from(["sm", "children", "root", "--usage"]).unwrap();
+        let Command::Children(children) = children.command else {
+            panic!("expected children command");
+        };
+        assert!(children.usage);
+        assert_eq!(children.session_id.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn child_usage_column_formats_known_and_unknown_weekly_burn() {
+        let base = json!({
+            "id": "abc12345",
+            "friendly_name": "worker",
+            "provider": "codex-fork",
+            "status": "running"
+        });
+        let mut known = base.clone();
+        known["weekly_usage_percent"] = json!(4.25);
+        assert_eq!(
+            format_child_line(&known),
+            "worker (abc12345) | codex-fork | running | 4.2% wk"
+        );
+
+        let mut unknown = base;
+        unknown["weekly_usage_percent"] = Value::Null;
+        assert_eq!(
+            format_child_line(&unknown),
+            "worker (abc12345) | codex-fork | running | unknown wk"
+        );
     }
 
     #[test]

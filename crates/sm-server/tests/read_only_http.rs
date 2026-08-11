@@ -23,10 +23,13 @@ use sm_server::{
         ExternalAccessConfig, GoogleAuthConfig, MobileAnalyticsConfig, MobileTerminalConfig,
         MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, NodeConfig, PathsConfig,
         ProviderLaunchConfig, QueueRunnerConfig, RustCoreConfig, SmSendConfig, ToolLoggingConfig,
+        UsageAccountConfig,
     },
     http::{router, AppState, GitHubReviewComment, GitHubReviewMatch, GitHubReviewPoster},
     runtime::TmuxRuntime,
     sessions::{SendCoreInputRequest, SessionStore},
+    usage_burn::{BurnWindowSample, UsageBurnStore},
+    usage_identity::{AccountIdentity, Provider, UsageIdentityStore},
 };
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -7614,6 +7617,335 @@ async fn context_usage_hook_is_served_and_records_tokens() {
 }
 
 #[tokio::test]
+async fn context_usage_hook_records_claude_rate_limits_in_the_configured_usage_database() {
+    let state_file = write_session_fixture();
+    let usage_db_path = unique_temp_path().with_extension("usage.db");
+    let now = time::OffsetDateTime::now_utc();
+    let identity_store = UsageIdentityStore::new(&usage_db_path).unwrap();
+    identity_store
+        .record_observation(
+            Provider::Claude,
+            Some(&AccountIdentity {
+                provider: Provider::Claude,
+                external_id: "claude-test-account".to_owned(),
+                label: None,
+                plan_tier: None,
+                extra_usage_enabled: Some(true),
+            }),
+            now - time::Duration::minutes(1),
+            None,
+            None,
+        )
+        .unwrap();
+    let mut config = config_with_state_file(&state_file);
+    config.usage.enabled = true;
+    config.usage.db_path = usage_db_path.display().to_string();
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(
+        app,
+        "/hooks/context-usage",
+        json!({
+            "session_id": "run12345",
+            "used_percentage": 42.0,
+            "total_input_tokens": 84_000,
+            "rate_limits": {
+                "five_hour": {
+                    "used_percentage": 12.0,
+                    "resets_at": (now + time::Duration::hours(5)).format(&time::format_description::well_known::Rfc3339).unwrap()
+                },
+                "seven_day": {
+                    "used_percentage": 34.0,
+                    "resets_at": (now + time::Duration::days(7)).format(&time::format_description::well_known::Rfc3339).unwrap()
+                }
+            },
+            "sm_hook_emitted_at": now.format(&time::format_description::well_known::Rfc3339).unwrap()
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+
+    let connection = Connection::open(usage_db_path).unwrap();
+    let rows = connection
+        .prepare(
+            "SELECT account_key, window_kind, percent, source FROM burn_samples ORDER BY window_kind",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "claude:claude-test-account".to_owned(),
+                "session_5h".to_owned(),
+                12.0,
+                "statusline".to_owned(),
+            ),
+            (
+                "claude:claude-test-account".to_owned(),
+                "weekly_all".to_owned(),
+                34.0,
+                "statusline".to_owned(),
+            ),
+        ]
+    );
+    let state: Value = serde_json::from_str(&fs::read_to_string(state_file).unwrap()).unwrap();
+    assert_eq!(
+        state["sessions"][0]["account_key"],
+        "claude:claude-test-account"
+    );
+}
+
+#[tokio::test]
+async fn usage_routes_preserve_exact_account_burn_and_optionally_include_children() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "parent01",
+                    "name": "claude-parent01",
+                    "friendly_name": "parent",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-parent01",
+                    "provider": "claude",
+                    "account_key": "claude:usage-account",
+                    "usage_cap_fraction": 0.5,
+                    "status": "running",
+                    "created_at": "2026-08-10T00:00:00Z",
+                    "last_activity": "2026-08-10T00:00:00Z"
+                },
+                {
+                    "id": "child001",
+                    "name": "claude-child001",
+                    "friendly_name": "child",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-child001",
+                    "provider": "claude",
+                    "parent_session_id": "parent01",
+                    "account_key": "claude:usage-account",
+                    "status": "running",
+                    "created_at": "2026-08-10T00:00:00Z",
+                    "last_activity": "2026-08-10T00:00:00Z"
+                },
+                {
+                    "id": "idle0001",
+                    "name": "claude-idle0001",
+                    "friendly_name": "idle",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-idle0001",
+                    "provider": "claude",
+                    "account_key": "claude:usage-account",
+                    "status": "running",
+                    "created_at": "2026-08-10T00:00:00Z",
+                    "last_activity": "2026-08-10T00:00:00Z"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let usage_db_path = unique_temp_path().with_extension("usage.db");
+    let now = time::OffsetDateTime::now_utc();
+    let reset = now + time::Duration::days(7);
+    let account = AccountIdentity {
+        provider: Provider::Claude,
+        external_id: "usage-account".to_owned(),
+        label: None,
+        plan_tier: Some("max".to_owned()),
+        extra_usage_enabled: Some(true),
+    };
+    UsageIdentityStore::new(&usage_db_path)
+        .unwrap()
+        .record_observation(
+            Provider::Claude,
+            Some(&account),
+            now - time::Duration::minutes(1),
+            None,
+            None,
+        )
+        .unwrap();
+    UsageBurnStore::new(&usage_db_path)
+        .unwrap()
+        .record_for_account(
+            &account.account_key(),
+            &[BurnWindowSample {
+                window_kind: "weekly_all".to_owned(),
+                window_scope: None,
+                duration_minutes: 10_080,
+                percent: 40.0,
+                resets_at: reset,
+                severity: None,
+                is_active: Some(true),
+            }],
+            "test",
+            now,
+        )
+        .unwrap();
+    let mut config = config_with_state_file(&state_file);
+    config.usage.enabled = true;
+    config.usage.db_path = usage_db_path.display().to_string();
+    config.usage.accounts = vec![UsageAccountConfig {
+        key: account.account_key(),
+        label: "primary".to_owned(),
+    }];
+    let app = router(AppState::new(config));
+
+    let connection = Connection::open(&usage_db_path).unwrap();
+    let window_start: String = connection
+        .query_row(
+            "SELECT window_start FROM burn_samples WHERE window_kind = 'weekly_all'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let observed_at = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    for (seat_id, friendly_name) in [("parent01", "parent"), ("child001", "child")] {
+        connection
+            .execute(
+                r#"
+                INSERT INTO seat_meta (
+                  seat_id, observed_at, friendly_name, provider, model,
+                  project_key, working_dir, parent_seat_id, root_seat_id
+                ) VALUES (?1, ?2, ?3, 'claude', 'claude-sonnet-5',
+                          '/repo/.git', '/repo', ?4, 'parent01')
+                "#,
+                rusqlite::params![
+                    seat_id,
+                    observed_at,
+                    friendly_name,
+                    (seat_id == "child001").then_some("parent01")
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"
+                INSERT INTO seat_tokens (
+                  seat_id, account_key, project_key, window_kind, window_start,
+                  bucket_ts, model, effort, credit_metered, input_tokens,
+                  output_tokens, reasoning_tokens, cache_write_5m,
+                  cache_write_1h, cache_read_tokens, message_count, updated_at
+                ) VALUES (?1, ?2, '/repo/.git', 'weekly_all', ?3, ?4,
+                          'claude-sonnet-5', NULL, 0, 100, 0, 0, 0, 0, 0, 1, ?4)
+                "#,
+                rusqlite::params![seat_id, account.account_key(), window_start, observed_at],
+            )
+            .unwrap();
+    }
+    let (status, own) = get_json(app.clone(), "/sessions/parent01/usage?since_reset=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(own["accounts"][0]["windows"][0]["account_percent"], 40.0);
+    assert_eq!(own["accounts"][0]["windows"][0]["total_percent"], 20.0);
+    assert_eq!(own["accounts"][0]["label"], "primary");
+    assert_eq!(own["target"]["usage_cap_fraction"], 0.5);
+    assert_eq!(
+        own["accounts"][0]["windows"][0]["cap_consumed_percent"],
+        40.0
+    );
+
+    let (status, subtree) = get_json(
+        app.clone(),
+        "/sessions/parent01/usage?include_children=true&since_reset=true",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(subtree["target"]["descendant_count"], 1);
+    assert_eq!(
+        subtree["accounts"][0]["windows"][0]["account_percent"],
+        40.0
+    );
+    assert_eq!(subtree["accounts"][0]["windows"][0]["total_percent"], 40.0);
+    assert_eq!(
+        subtree["accounts"][0]["windows"][0]["cap_consumed_percent"],
+        80.0
+    );
+
+    let (status, accounts) = get_json(app.clone(), "/usage/accounts?since_reset=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        accounts["accounts"][0]["windows"][0]["account_percent"], 40.0,
+        "account view must pass through the exact first-party burn sample"
+    );
+    let (status, idle) = get_json(app.clone(), "/sessions/idle0001/usage?since_reset=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(idle["accounts"][0]["account_key"], account.account_key());
+    assert_eq!(idle["accounts"][0]["windows"][0]["self_percent"], 0.0);
+    assert_eq!(idle["accounts"][0]["windows"][0]["account_percent"], 40.0);
+
+    let previous_account_key = "claude:previous-account";
+    UsageIdentityStore::new(&usage_db_path)
+        .unwrap()
+        .ensure_account(
+            &AccountIdentity {
+                provider: Provider::Claude,
+                external_id: "previous-account".to_owned(),
+                label: None,
+                plan_tier: Some("max".to_owned()),
+                extra_usage_enabled: Some(true),
+            },
+            now,
+        )
+        .unwrap();
+    UsageBurnStore::new(&usage_db_path)
+        .unwrap()
+        .record_for_account(
+            previous_account_key,
+            &[BurnWindowSample {
+                window_kind: "weekly_all".to_owned(),
+                window_scope: None,
+                duration_minutes: 10_080,
+                percent: 80.0,
+                resets_at: reset,
+                severity: None,
+                is_active: Some(true),
+            }],
+            "test",
+            now,
+        )
+        .unwrap();
+    let previous_window_start: String = connection
+        .query_row(
+            "SELECT window_start FROM burn_samples WHERE account_key = ?1 AND window_kind = 'weekly_all'",
+            [previous_account_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"
+            INSERT INTO seat_tokens (
+              seat_id, account_key, project_key, window_kind, window_start,
+              bucket_ts, model, effort, credit_metered, input_tokens,
+              output_tokens, reasoning_tokens, cache_write_5m,
+              cache_write_1h, cache_read_tokens, message_count, updated_at
+            ) VALUES ('child001', ?1, '/repo/.git', 'weekly_all', ?2, ?3,
+                      'claude-sonnet-5', NULL, 0, 100, 0, 0, 0, 0, 0, 1, ?3)
+            "#,
+            rusqlite::params![previous_account_key, previous_window_start, observed_at],
+        )
+        .unwrap();
+
+    let (status, children) = get_json(app, "/sessions/parent01/children?usage=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(children["children"][0]["weekly_usage_percent"], 20.0);
+}
+
+#[tokio::test]
 async fn compaction_complete_returns_the_handoff_path_for_reinjection() {
     // post_compact_recovery.sh reads the path off this response rather than from
     // /sessions/{id}: that route sits behind Google auth, which a hook on a
@@ -7960,6 +8292,181 @@ async fn claude_stop_hook_reads_local_transcript_metadata_when_not_inlined() {
         session["native_title_source_mtime_ns"]
     );
     assert!(session["native_title_updated_at_ns"].as_i64().unwrap() > 0);
+}
+
+#[tokio::test]
+async fn claude_stop_hooks_append_distinct_provider_sessions_without_losing_the_first() {
+    let state_file = write_session_fixture();
+    let usage_db_path = state_file.with_extension("usage.db");
+    let transcript_dir = unique_temp_path();
+    fs::create_dir_all(&transcript_dir).unwrap();
+    let first_transcript = transcript_dir.join("provider-session-first.jsonl");
+    let second_transcript = transcript_dir.join("provider-session-second.jsonl");
+    let legacy_transcript = transcript_dir.join("provider-session-before-deployment.jsonl");
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    session["provider_resume_id"] = json!("provider-session-before-deployment");
+    session["transcript_path"] = json!(legacy_transcript.display().to_string());
+    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    for transcript_path in [&first_transcript, &second_transcript] {
+        let (status, payload) = post_json(
+            app.clone(),
+            "/hooks/claude",
+            json!({
+                "hook_event_name": "Stop",
+                "session_manager_id": "run12345",
+                "sm_last_message": "turn complete",
+                "sm_native_title": "Session chain fixture",
+                "sm_transcript_mtime_ns": 424242_i64,
+                "transcript_path": transcript_path.display().to_string()
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload, json!({ "status": "ok" }));
+    }
+
+    let connection = Connection::open(&usage_db_path).unwrap();
+    let mut statement = connection
+        .prepare(
+            "SELECT provider_session_id, artifact_path FROM seat_sessions WHERE seat_id = 'run12345' ORDER BY provider_session_id",
+        )
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "provider-session-before-deployment".to_owned(),
+                legacy_transcript.display().to_string(),
+            ),
+            (
+                "provider-session-first".to_owned(),
+                first_transcript.display().to_string(),
+            ),
+            (
+                "provider-session-second".to_owned(),
+                second_transcript.display().to_string(),
+            ),
+        ]
+    );
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    assert_eq!(
+        session["transcript_path"],
+        second_transcript.display().to_string()
+    );
+    assert_eq!(session["provider_resume_id"], "provider-session-second");
+}
+
+#[tokio::test]
+async fn custom_usage_database_contains_identity_and_session_chain_tables() {
+    let state_file = write_session_fixture();
+    let default_sibling = state_file.with_extension("usage.db");
+    let usage_db_path = unique_temp_path().with_extension("custom-usage.db");
+    UsageIdentityStore::new(&usage_db_path).unwrap();
+    let mut config = config_with_state_file(&state_file);
+    config.usage.enabled = true;
+    config.usage.db_path = usage_db_path.display().to_string();
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(
+        app,
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "run12345",
+            "transcript_path": "/tmp/custom-usage-thread.jsonl"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok" }));
+
+    let connection = Connection::open(usage_db_path).unwrap();
+    let tables = connection
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('accounts', 'account_timeline', 'seat_sessions') ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        tables,
+        vec!["account_timeline", "accounts", "seat_sessions"]
+    );
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'run12345' AND provider_session_id = 'custom-usage-thread'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    assert!(!default_sibling.exists());
+}
+
+#[tokio::test]
+async fn claude_stop_hook_survives_an_unwritable_usage_database() {
+    let state_file = write_session_fixture();
+    fs::create_dir_all(state_file.with_extension("usage.db")).unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = post_json(
+        app,
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "run12345",
+            "sm_last_message": "turn complete despite ledger failure",
+            "transcript_path": "/tmp/provider-session-after-failure.jsonl"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok" }));
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    assert_eq!(session["status"], "idle");
+    assert_eq!(
+        session["last_action_summary"],
+        "turn complete despite ledger failure"
+    );
+    assert_eq!(
+        session["transcript_path"],
+        "/tmp/provider-session-after-failure.jsonl"
+    );
+    assert_eq!(
+        session["provider_resume_id"],
+        "provider-session-after-failure"
+    );
 }
 
 #[tokio::test]
@@ -14018,6 +14525,211 @@ async fn runtime_core_rejects_review_when_session_is_busy() {
 }
 
 #[tokio::test]
+async fn runtime_core_delayed_initial_codex_binding_updates_session_chain() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_short_temp_dir("sm-rust-codex-create-bind");
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-codex-create-bind-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app_with_codex_composer(&state_file, &log_dir, &tmux_socket);
+    let now = time::OffsetDateTime::now_utc();
+    let sessions_root = state_file.with_extension("codex-home").join("sessions");
+    let day_dir = sessions_root
+        .join(format!("{:04}", now.year()))
+        .join(format!("{:02}", now.month() as u8))
+        .join(format!("{:02}", now.day()));
+    fs::create_dir_all(&day_dir).unwrap();
+    let rollout_path = day_dir.join("rollout-delayed-create-thread.jsonl");
+    let rollout_working_dir = working_dir.clone();
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(1_200));
+        fs::write(
+            rollout_path,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "delayed-create-thread",
+                        "cwd": rollout_working_dir.display().to_string(),
+                        "timestamp": (time::OffsetDateTime::now_utc()
+                            + time::Duration::seconds(1))
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap()
+                    }
+                })
+            ),
+        )
+        .unwrap();
+    });
+
+    let (status, payload) = post_json(
+        app,
+        "/sessions",
+        json!({
+            "id": "createcodex",
+            "name": "create-codex",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "codex"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["provider_resume_id"].is_null());
+    writer.join().unwrap();
+
+    let mut bound = false;
+    for _ in 0..30 {
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        bound = state["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == "createcodex")
+            .is_some_and(|session| session["provider_resume_id"] == "delayed-create-thread");
+        if bound {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        bound,
+        "deferred creation binding did not update the session"
+    );
+    let count: i64 = Connection::open(state_file.with_extension("usage.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'createcodex' AND provider_session_id = 'delayed-create-thread'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn runtime_core_clear_rebinds_plain_codex_provider_session_chain() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_short_temp_dir("sm-rust-codex-clear-rebind");
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-codex-clear-rebind-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app_with_codex_composer(&state_file, &log_dir, &tmux_socket);
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "clearcodex",
+            "name": "clear-codex",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "codex"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let now = time::OffsetDateTime::now_utc();
+    let sessions_root = state_file.with_extension("codex-home").join("sessions");
+    let day_dir = sessions_root
+        .join(format!("{:04}", now.year()))
+        .join(format!("{:02}", now.month() as u8))
+        .join(format!("{:02}", now.day()));
+    fs::create_dir_all(&day_dir).unwrap();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "clearcodex")
+        .unwrap();
+    session["parent_session_id"] = json!("operator-parent");
+    session["provider_resume_id"] = json!("old-thread");
+    session["created_at"] = json!("2026-07-01T12:00:00Z");
+    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    let new_rollout = day_dir.join("rollout-new-thread.jsonl");
+    let new_working_dir = working_dir.clone();
+    let writer = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(250));
+        fs::write(
+            new_rollout,
+            format!(
+                "{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "new-thread",
+                        "cwd": new_working_dir.display().to_string(),
+                        "timestamp": (time::OffsetDateTime::now_utc()
+                            + time::Duration::seconds(1))
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .unwrap()
+                    }
+                })
+            ),
+        )
+        .unwrap();
+    });
+
+    let (status, payload) = post_json(
+        app,
+        "/sessions/clearcodex/clear",
+        json!({ "prompt": "continue in the replacement thread" }),
+    )
+    .await;
+    writer.join().unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({ "status": "cleared", "session_id": "clearcodex" })
+    );
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "clearcodex")
+        .unwrap();
+    assert_eq!(session["provider_resume_id"], "new-thread");
+
+    let connection = Connection::open(state_file.with_extension("usage.db")).unwrap();
+    let provider_session_ids = connection
+        .prepare(
+            "SELECT provider_session_id FROM seat_sessions WHERE seat_id = 'clearcodex' ORDER BY provider_session_id",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(provider_session_ids, vec!["new-thread", "old-thread"]);
+}
+
+#[tokio::test]
 async fn runtime_core_spawns_codex_review_child() {
     if !tmux_available() {
         return;
@@ -14262,6 +14974,15 @@ while true; do sleep 1; done
     assert!(output_text.contains("ids:runtimefork:runtimefork:false"));
     let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
     assert_eq!(state["sessions"][0]["reasoning_effort"], "ultra");
+    let connection = Connection::open(state_file.with_extension("usage.db")).unwrap();
+    let provider_session_id: String = connection
+        .query_row(
+            "SELECT provider_session_id FROM seat_sessions WHERE seat_id = 'runtimefork'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(provider_session_id, "provider-thread-123");
     let mut lifecycle_status = String::new();
     for _ in 0..30 {
         let (_, session) = get_json(app.clone(), "/sessions/runtimefork").await;
@@ -16032,6 +16753,7 @@ fn runtime_app_with_command(
                     .display()
                     .to_string(),
             ),
+            transcript_root: None,
         },
         ..AppConfig::default()
     }))
