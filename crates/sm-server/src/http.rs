@@ -409,6 +409,7 @@ impl AppState {
                 Err(error) => eprintln!("usage token ledger initialization failed: {error:#}"),
             }
             let report_store = UsageReportStore::new(expand_home(&config.usage.db_path))
+                .with_premium_cap_ratio(config.usage.premium_cap_ratio)
                 .with_account_labels(
                     config
                         .usage
@@ -2905,9 +2906,11 @@ fn ensure_usage_reporting_enabled(state: &AppState) -> Result<(), ApiError> {
 }
 
 fn current_weekly_usage_percent(report: &crate::usage_report::UsageReport) -> Option<f64> {
+    let current_account = report.target.as_ref()?.account_key.as_deref()?;
     report
         .accounts
         .iter()
+        .filter(|account| account.account_key == current_account)
         .flat_map(|account| &account.windows)
         .filter(|window| {
             !window.stale

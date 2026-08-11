@@ -2710,9 +2710,10 @@ fn print_usage_report(payload: &Value) {
                     .as_f64()
                     .map_or_else(|| "unknown".to_owned(), |value| format!("{value:.1}%"));
                 println!(
-                    "    {} · {} · {burn} · prior",
+                    "    {} · {} · {burn} · {}",
                     model["seat_id"].as_str().unwrap_or("unknown"),
                     model["model"].as_str().unwrap_or("unknown"),
+                    model["weight_source"].as_str().unwrap_or("prior"),
                 );
             }
         }

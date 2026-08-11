@@ -53,6 +53,13 @@ async fn main() -> Result<()> {
     if config.usage.enabled && config.usage.db_path.trim().is_empty() {
         anyhow::bail!("usage.db_path must not be empty when usage is enabled");
     }
+    if config.usage.enabled
+        && (!config.usage.premium_cap_ratio.is_finite()
+            || config.usage.premium_cap_ratio <= 0.0
+            || config.usage.premium_cap_ratio > 1.0)
+    {
+        anyhow::bail!("usage.premium_cap_ratio must be greater than 0 and at most 1");
+    }
     // After the address is parsed so a bad --host/--port is caught too, but
     // before binding, so this can run while the old server still holds the port.
     if args.check_config {

@@ -12,7 +12,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const STALE_AFTER_SECONDS: i64 = 600;
-const PREMIUM_CAP_RATIO: f64 = 0.5;
+const DEFAULT_PREMIUM_CAP_RATIO: f64 = 0.5;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UsageReportOptions {
@@ -110,6 +110,7 @@ pub struct UsageModelShare {
 pub struct UsageReportStore {
     db_path: PathBuf,
     account_labels: BTreeMap<String, String>,
+    premium_cap_ratio: f64,
 }
 
 impl UsageReportStore {
@@ -117,7 +118,13 @@ impl UsageReportStore {
         Self {
             db_path: db_path.into(),
             account_labels: BTreeMap::new(),
+            premium_cap_ratio: DEFAULT_PREMIUM_CAP_RATIO,
         }
+    }
+
+    pub fn with_premium_cap_ratio(mut self, ratio: f64) -> Self {
+        self.premium_cap_ratio = ratio;
+        self
     }
 
     pub fn with_account_labels(
@@ -156,7 +163,7 @@ impl UsageReportStore {
                     plan_tier: None,
                 });
             let rows = load_window_rows(&connection, &window)?;
-            let premium = premium_context(&window, &all_windows);
+            let premium = premium_context(&window, &all_windows, self.premium_cap_ratio);
             let report = build_window_report(
                 &window,
                 &metadata.provider,
@@ -165,6 +172,7 @@ impl UsageReportStore {
                 target,
                 &names,
                 options.by_model,
+                self.premium_cap_ratio,
                 now,
                 &mut warnings,
             );
@@ -427,7 +435,11 @@ fn load_window_rows(connection: &Connection, window: &BurnWindow) -> Result<Vec<
     Ok(rows)
 }
 
-fn premium_context(window: &BurnWindow, windows: &[BurnWindow]) -> Option<PremiumContext> {
+fn premium_context(
+    window: &BurnWindow,
+    windows: &[BurnWindow],
+    premium_cap_ratio: f64,
+) -> Option<PremiumContext> {
     if window.window_kind == "weekly_scoped" {
         return window.window_scope.clone().map(|scope| PremiumContext {
             scope,
@@ -452,7 +464,7 @@ fn premium_context(window: &BurnWindow, windows: &[BurnWindow]) -> Option<Premiu
         .and_then(|scoped| {
             scoped.window_scope.clone().map(|scope| PremiumContext {
                 scope,
-                points: scoped.percent * PREMIUM_CAP_RATIO,
+                points: scoped.percent * premium_cap_ratio,
             })
         })
 }
@@ -466,6 +478,7 @@ fn build_window_report(
     target: Option<&UsageReportTarget>,
     names: &BTreeMap<String, Option<String>>,
     by_model: bool,
+    premium_cap_ratio: f64,
     now: OffsetDateTime,
     warnings: &mut BTreeSet<String>,
 ) -> UsageWindowReport {
@@ -573,15 +586,21 @@ fn build_window_report(
             .filter(|((seat_id, _), _)| {
                 target.is_none_or(|target| target.self_seats.contains(seat_id))
             })
-            .map(
-                |((seat_id, model), (burn_percent, weighted_units))| UsageModelShare {
+            .map(|((seat_id, model), (burn_percent, weighted_units))| {
+                let weight_source =
+                    if premium.is_some_and(|premium| model_matches_scope(&model, &premium.scope)) {
+                        "assumed-ratio"
+                    } else {
+                        "prior"
+                    };
+                UsageModelShare {
                     seat_id,
                     model,
                     burn_percent: (!stale).then_some(burn_percent),
                     weighted_units,
-                    weight_source: "prior",
-                },
-            )
+                    weight_source,
+                }
+            })
             .collect()
     } else {
         Vec::new()
@@ -630,7 +649,7 @@ fn build_window_report(
         total_percent: (!stale).then_some(total_percent),
         cap_consumed_percent,
         free_headroom_points: (!stale).then_some(if is_scoped {
-            PREMIUM_CAP_RATIO * (100.0 - window.percent).max(0.0)
+            premium_cap_ratio * (100.0 - window.percent).max(0.0)
         } else {
             (100.0 - window.percent).max(0.0)
         }),
@@ -806,6 +825,7 @@ mod tests {
             None,
             &BTreeMap::new(),
             true,
+            DEFAULT_PREMIUM_CAP_RATIO,
             OffsetDateTime::parse("2026-08-10T16:00:00Z", &Rfc3339).unwrap(),
             &mut warnings,
         );
@@ -832,6 +852,7 @@ mod tests {
         );
         assert!(report.residual.is_none());
         assert!(report.possibly_inflated);
+        assert_eq!(report.models[0].weight_source, "assumed-ratio");
     }
 
     #[test]
@@ -875,6 +896,7 @@ mod tests {
             None,
             &BTreeMap::new(),
             false,
+            DEFAULT_PREMIUM_CAP_RATIO,
             OffsetDateTime::parse("2026-08-10T16:00:00Z", &Rfc3339).unwrap(),
             &mut warnings,
         );
@@ -970,6 +992,7 @@ mod tests {
             Some(&target),
             &BTreeMap::new(),
             true,
+            DEFAULT_PREMIUM_CAP_RATIO,
             now,
             &mut warnings,
         );
@@ -1031,6 +1054,7 @@ mod tests {
             Some(&target),
             &BTreeMap::new(),
             true,
+            DEFAULT_PREMIUM_CAP_RATIO,
             OffsetDateTime::parse("2026-08-10T16:00:00Z", &Rfc3339).unwrap(),
             &mut warnings,
         );

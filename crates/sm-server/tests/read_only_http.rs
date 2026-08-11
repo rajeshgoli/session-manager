@@ -7735,6 +7735,7 @@ async fn usage_routes_preserve_exact_account_burn_and_optionally_include_childre
                     "tmux_session": "claude-child001",
                     "provider": "claude",
                     "parent_session_id": "parent01",
+                    "account_key": "claude:usage-account",
                     "status": "running",
                     "created_at": "2026-08-10T00:00:00Z",
                     "last_activity": "2026-08-10T00:00:00Z"
@@ -7834,7 +7835,6 @@ async fn usage_routes_preserve_exact_account_burn_and_optionally_include_childre
             )
             .unwrap();
     }
-
     let (status, own) = get_json(app.clone(), "/sessions/parent01/usage?since_reset=true").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(own["accounts"][0]["windows"][0]["account_percent"], 40.0);
@@ -7869,6 +7869,59 @@ async fn usage_routes_preserve_exact_account_burn_and_optionally_include_childre
         accounts["accounts"][0]["windows"][0]["account_percent"], 40.0,
         "account view must pass through the exact first-party burn sample"
     );
+
+    let previous_account_key = "claude:previous-account";
+    UsageIdentityStore::new(&usage_db_path)
+        .unwrap()
+        .ensure_account(
+            &AccountIdentity {
+                provider: Provider::Claude,
+                external_id: "previous-account".to_owned(),
+                label: None,
+                plan_tier: Some("max".to_owned()),
+                extra_usage_enabled: Some(true),
+            },
+            now,
+        )
+        .unwrap();
+    UsageBurnStore::new(&usage_db_path)
+        .unwrap()
+        .record_for_account(
+            previous_account_key,
+            &[BurnWindowSample {
+                window_kind: "weekly_all".to_owned(),
+                window_scope: None,
+                duration_minutes: 10_080,
+                percent: 80.0,
+                resets_at: reset,
+                severity: None,
+                is_active: Some(true),
+            }],
+            "test",
+            now,
+        )
+        .unwrap();
+    let previous_window_start: String = connection
+        .query_row(
+            "SELECT window_start FROM burn_samples WHERE account_key = ?1 AND window_kind = 'weekly_all'",
+            [previous_account_key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute(
+            r#"
+            INSERT INTO seat_tokens (
+              seat_id, account_key, project_key, window_kind, window_start,
+              bucket_ts, model, effort, credit_metered, input_tokens,
+              output_tokens, reasoning_tokens, cache_write_5m,
+              cache_write_1h, cache_read_tokens, message_count, updated_at
+            ) VALUES ('child001', ?1, '/repo/.git', 'weekly_all', ?2, ?3,
+                      'claude-sonnet-5', NULL, 0, 100, 0, 0, 0, 0, 0, 1, ?3)
+            "#,
+            rusqlite::params![previous_account_key, previous_window_start, observed_at],
+        )
+        .unwrap();
 
     let (status, children) = get_json(app, "/sessions/parent01/children?usage=true").await;
     assert_eq!(status, StatusCode::OK);
