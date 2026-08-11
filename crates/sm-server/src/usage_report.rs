@@ -998,7 +998,7 @@ fn usage_decision_summary(accounts: &[UsageAccountReport]) -> UsageDecisionSumma
             && (account
                 .plan_tier
                 .as_deref()
-                .is_some_and(|tier| !plan_excludes_premium(tier))
+                .is_none_or(|tier| !plan_excludes_premium(tier))
                 || account
                     .windows
                     .iter()
@@ -1933,6 +1933,64 @@ mod tests {
         assert_eq!(
             decision.missing_current_windows,
             ["claude:team:weekly_scoped"]
+        );
+    }
+
+    #[test]
+    fn unknown_claude_plan_requires_a_scoped_weekly_meter() {
+        let now = OffsetDateTime::parse("2026-08-11T01:00:00Z", &Rfc3339).unwrap();
+        let mut warnings = BTreeSet::new();
+        let build = |kind: &str, start: &str, reset: &str, warnings: &mut BTreeSet<String>| {
+            build_window_report(
+                &BurnWindow {
+                    id: 1,
+                    account_key: "claude:unknown".to_owned(),
+                    window_kind: kind.to_owned(),
+                    window_scope: None,
+                    window_start: start.to_owned(),
+                    percent: 2.0,
+                    resets_at: reset.to_owned(),
+                    observed_at: "2026-08-11T01:00:00Z".to_owned(),
+                },
+                "claude",
+                &[],
+                None,
+                None,
+                &BTreeMap::new(),
+                false,
+                DEFAULT_PREMIUM_CAP_RATIO,
+                now,
+                warnings,
+            )
+        };
+        let accounts = vec![UsageAccountReport {
+            account_key: "claude:unknown".to_owned(),
+            label: None,
+            provider: "claude".to_owned(),
+            plan_tier: None,
+            active: true,
+            windows: vec![
+                build(
+                    "session_5h",
+                    "2026-08-11T00:00:00Z",
+                    "2026-08-11T05:00:00Z",
+                    &mut warnings,
+                ),
+                build(
+                    "weekly_all",
+                    "2026-08-10T00:00:00Z",
+                    "2026-08-17T00:00:00Z",
+                    &mut warnings,
+                ),
+            ],
+        }];
+
+        let decision = usage_decision_summary(&accounts);
+
+        assert_eq!(decision.status, "non_actionable");
+        assert_eq!(
+            decision.missing_current_windows,
+            ["claude:unknown:weekly_scoped"]
         );
     }
 
