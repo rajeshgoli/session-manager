@@ -1357,11 +1357,16 @@ impl SessionStore {
             let current_socket_name = json_text(session.get("tmux_socket_name"));
             let current_provider =
                 json_text(session.get("provider")).unwrap_or_else(default_provider);
+            let current_status =
+                json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
             if current_tmux_session.as_deref() != Some(tmux_session.as_str())
                 || current_socket_name != session_socket_name
                 || current_provider != provider
             {
                 anyhow::bail!("session {session_id} changed while clear was in progress");
+            }
+            if normalized_status(&current_status) == "stopped" {
+                anyhow::bail!("session {session_id} stopped while clear was in progress");
             }
             if let Some((provider_resume_id, _)) = replacement_provider_resume_id.as_ref() {
                 session.insert(
