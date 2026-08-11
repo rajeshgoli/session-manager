@@ -38,6 +38,7 @@ const OUTPUT_TAIL_BYTES_PER_LINE: u64 = 4096;
 const MIN_OUTPUT_TAIL_BYTES: u64 = 16 * 1024;
 const MAX_OUTPUT_TAIL_BYTES: u64 = 1024 * 1024;
 const CODEX_CLI_SESSION_BIND_TIMEOUT: Duration = Duration::from_secs(1);
+const CODEX_CLI_DEFERRED_BIND_TIMEOUT: Duration = Duration::from_secs(30);
 const CODEX_CLI_SESSION_BIND_POLL: Duration = Duration::from_millis(50);
 const CODEX_FORK_THREAD_STARTED_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_FORK_EVENT_MONITOR_POLL: Duration = Duration::from_millis(250);
@@ -1268,7 +1269,7 @@ impl SessionStore {
         request: ClearSessionRequest,
         runtime: &TmuxRuntime,
     ) -> Result<CoreClearOutcome> {
-        let _clear_guard = self.lock_clear_operation(session_id)?;
+        let clear_guard = self.lock_clear_operation(session_id)?;
         let prompt = request
             .prompt
             .as_deref()
@@ -1382,13 +1383,13 @@ impl SessionStore {
             return Err(anyhow::anyhow!("tmux session is not running"));
         }
         let replacement_provider_resume_id = if let Some((record, excluded_ids, launched_at_ns)) =
-            codex_cli_clear_binding
+            codex_cli_clear_binding.as_ref()
         {
             let provider_resume_id = wait_for_codex_cli_provider_resume_id(
-                &record,
+                record,
                 &self.codex_sessions_root,
-                &excluded_ids,
-                launched_at_ns,
+                excluded_ids,
+                *launched_at_ns,
                 CODEX_CLI_SESSION_BIND_TIMEOUT,
             );
             if provider_resume_id.is_none() {
@@ -1452,18 +1453,93 @@ impl SessionStore {
             reset_session_after_clear(session, &now);
             self.write_raw_json_value(&state)?;
         }
-        if let Some((provider_resume_id, artifact_path)) = replacement_provider_resume_id {
+        if let Some((provider_resume_id, artifact_path)) = replacement_provider_resume_id.as_ref() {
             self.append_seat_session(
                 session_id,
                 &provider,
-                &provider_resume_id,
+                provider_resume_id,
                 artifact_path.as_deref(),
             );
+        }
+        if replacement_provider_resume_id.is_none() {
+            if let Some((record, excluded_ids, launched_at_ns)) = codex_cli_clear_binding {
+                let store = self.clone();
+                let deferred_session_id = session_id.to_owned();
+                let expected_provider_resume_id = previous_provider_resume_id;
+                let spawn_result = thread::Builder::new()
+                    .name(format!(
+                        "sm-codex-clear-rebind-{}",
+                        sanitize_path_component(session_id)
+                    ))
+                    .spawn(move || {
+                        let _clear_guard = clear_guard;
+                        if let Err(error) = store.complete_deferred_codex_cli_rebind(
+                            &deferred_session_id,
+                            &record,
+                            &excluded_ids,
+                            launched_at_ns,
+                            expected_provider_resume_id.as_deref(),
+                            CODEX_CLI_DEFERRED_BIND_TIMEOUT,
+                        ) {
+                            eprintln!(
+                                "deferred Codex thread discovery failed for seat {deferred_session_id}: {error:#}"
+                            );
+                        }
+                    });
+                if let Err(error) = spawn_result {
+                    eprintln!("failed to start deferred Codex thread discovery: {error}");
+                }
+            }
         }
         Ok(CoreClearOutcome::Cleared(CoreClearResult {
             status: "cleared".to_owned(),
             session_id: session_id.to_owned(),
         }))
+    }
+
+    fn complete_deferred_codex_cli_rebind(
+        &self,
+        session_id: &str,
+        record: &SessionRecord,
+        excluded_ids: &BTreeSet<String>,
+        launched_at_ns: i128,
+        expected_provider_resume_id: Option<&str>,
+        timeout: Duration,
+    ) -> Result<bool> {
+        let Some(provider_resume_id) = wait_for_codex_cli_provider_resume_id(
+            record,
+            &self.codex_sessions_root,
+            excluded_ids,
+            launched_at_ns,
+            timeout,
+        ) else {
+            eprintln!("deferred Codex thread discovery timed out for seat {session_id}");
+            return Ok(false);
+        };
+        {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(false);
+            };
+            let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
+            let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+            if provider != "codex"
+                || normalized_status(&status) == "stopped"
+                || json_text(session.get("provider_resume_id")).as_deref()
+                    != expected_provider_resume_id
+            {
+                return Ok(false);
+            }
+            session.insert(
+                "provider_resume_id".to_owned(),
+                Value::String(provider_resume_id.clone()),
+            );
+            self.write_raw_json_value(&state)?;
+        }
+        self.append_seat_session(session_id, "codex", &provider_resume_id, None);
+        Ok(true)
     }
 
     fn lock_clear_operation(&self, session_id: &str) -> Result<SessionClearGuard> {
@@ -2480,23 +2556,9 @@ impl SessionStore {
         };
         match result {
             Ok(provider_resume_id) => {
-                if let Some(previous_provider_resume_id) = previous_provider_resume_id.as_deref() {
-                    self.append_seat_session(
-                        session_id,
-                        "codex-fork",
-                        previous_provider_resume_id,
-                        event_stream_path.to_str(),
-                    );
-                }
-                self.append_seat_session(
-                    session_id,
-                    "codex-fork",
-                    &provider_resume_id,
-                    event_stream_path.to_str(),
-                );
                 session.insert(
                     "provider_resume_id".to_owned(),
-                    Value::String(provider_resume_id),
+                    Value::String(provider_resume_id.clone()),
                 );
                 session.insert(
                     "last_handoff_path".to_owned(),
@@ -2515,6 +2577,20 @@ impl SessionStore {
                 clear_codex_fork_handoff_error_raw(session);
                 self.write_raw_json_value(&state)?;
                 drop(_guard);
+                if let Some(previous_provider_resume_id) = previous_provider_resume_id.as_deref() {
+                    self.append_seat_session(
+                        session_id,
+                        "codex-fork",
+                        previous_provider_resume_id,
+                        event_stream_path.to_str(),
+                    );
+                }
+                self.append_seat_session(
+                    session_id,
+                    "codex-fork",
+                    &provider_resume_id,
+                    event_stream_path.to_str(),
+                );
                 let _ = self.cancel_context_monitor_alerts(session_id);
                 Ok(cleared_pending)
             }
@@ -10165,6 +10241,84 @@ mod tests {
             Some("new-id")
         );
 
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn deferred_codex_clear_binding_captures_a_late_replacement_rollout() {
+        let temp_dir = unique_temp_path("codex-deferred-clear-binding");
+        let state_file = temp_dir.join("sessions.json");
+        let working_dir = temp_dir.join("repo");
+        let sessions_root = temp_dir.join("codex-home").join("sessions");
+        let day_dir = sessions_root.join("2026").join("07").join("28");
+        fs::create_dir_all(&working_dir).unwrap();
+        fs::create_dir_all(&day_dir).unwrap();
+        let mut record = session_record("running");
+        record.id = "codex001".to_owned();
+        record.provider = "codex".to_owned();
+        record.working_dir = working_dir.display().to_string();
+        record.provider_resume_id = Some("old-thread".to_owned());
+        record.created_at = "2026-07-28T20:00:00Z".to_owned();
+        record.last_activity = record.created_at.clone();
+        fs::write(
+            &state_file,
+            json!({"sessions": [record.clone()]}).to_string(),
+        )
+        .unwrap();
+        let mut store =
+            SessionStore::new_with_legacy_fallback(state_file.clone(), state_file.clone());
+        store.codex_sessions_root = sessions_root;
+        store.append_seat_session("codex001", "codex", "old-thread", None);
+        let rollout_path = day_dir.join("rollout-new-thread.jsonl");
+        let rollout_working_dir = working_dir.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(1_200));
+            fs::write(
+                rollout_path,
+                format!(
+                    "{}\n",
+                    json!({
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "new-thread",
+                            "cwd": rollout_working_dir.display().to_string(),
+                            "timestamp": "2026-07-28T20:00:01Z"
+                        }
+                    })
+                ),
+            )
+            .unwrap();
+        });
+
+        assert!(store
+            .complete_deferred_codex_cli_rebind(
+                "codex001",
+                &record,
+                &BTreeSet::from(["old-thread".to_owned()]),
+                parse_timestamp_ns("2026-07-28T20:00:00Z").unwrap(),
+                Some("old-thread"),
+                Duration::from_secs(2),
+            )
+            .unwrap());
+        writer.join().unwrap();
+        assert_eq!(
+            store
+                .get_session("codex001")
+                .unwrap()
+                .unwrap()
+                .provider_resume_id
+                .as_deref(),
+            Some("new-thread")
+        );
+        let count: i64 = rusqlite::Connection::open(state_file.with_extension("usage.db"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'codex001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
         let _ = fs::remove_dir_all(temp_dir);
     }
 
