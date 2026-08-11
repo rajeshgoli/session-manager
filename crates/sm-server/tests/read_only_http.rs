@@ -16278,6 +16278,7 @@ fn runtime_app_with_command(
                     .display()
                     .to_string(),
             ),
+            transcript_root: None,
         },
         ..AppConfig::default()
     }))

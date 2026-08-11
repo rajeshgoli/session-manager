@@ -52,7 +52,7 @@ pub struct SessionStore {
     state_file: PathBuf,
     legacy_state_file: Option<PathBuf>,
     codex_sessions_root: PathBuf,
-    claude_projects_root: PathBuf,
+    claude_projects_roots: Vec<PathBuf>,
     write_lock: Arc<Mutex<()>>,
     queue_store: Option<RetainedQueueStore>,
     /// Carried on the store rather than read per-request because the codex-fork
@@ -105,7 +105,7 @@ impl SessionStore {
             state_file,
             legacy_state_file,
             codex_sessions_root: expand_home("~/.codex/sessions"),
-            claude_projects_root: expand_home("~/.claude/projects"),
+            claude_projects_roots: claude_projects_roots(None),
             write_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             context_monitor: ContextMonitorConfig::default(),
@@ -138,6 +138,11 @@ impl SessionStore {
                 self.codex_sessions_root = parent.join("sessions");
             }
         }
+        self
+    }
+
+    pub fn with_claude_transcript_root(mut self, transcript_root: Option<&str>) -> Self {
+        self.claude_projects_roots = claude_projects_roots(transcript_root);
         self
     }
 
@@ -289,7 +294,7 @@ impl SessionStore {
             .collect::<Vec<_>>();
         sessions.extend(historical_claude_seat_sessions(
             &records,
-            &self.claude_projects_root,
+            &self.claude_projects_roots,
             artifact_cutoff_ns,
             &mut claimed,
         ));
@@ -357,7 +362,7 @@ impl SessionStore {
             state_file,
             legacy_state_file: Some(legacy_state_file),
             codex_sessions_root: expand_home("~/.codex/sessions"),
-            claude_projects_root: expand_home("~/.claude/projects"),
+            claude_projects_roots: claude_projects_roots(None),
             write_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             context_monitor: ContextMonitorConfig::default(),
@@ -370,7 +375,7 @@ impl SessionStore {
 
     #[cfg(test)]
     fn with_claude_projects_root(mut self, projects_root: PathBuf) -> Self {
-        self.claude_projects_root = projects_root;
+        self.claude_projects_roots = vec![projects_root];
         self
     }
 
@@ -1725,7 +1730,11 @@ impl SessionStore {
                 .filter(|value| !value.is_empty())
                 .is_none()
         {
-            record.transcript_path = discover_claude_transcript_path(&record, &snapshot.sessions);
+            record.transcript_path = discover_claude_transcript_path(
+                &record,
+                &snapshot.sessions,
+                &self.claude_projects_roots,
+            );
         }
         let provider_resume_id = provider_resume_id_for_restore(&record);
         let session_runtime = runtime.for_socket_name(record.tmux_socket_name.as_deref());
@@ -6657,12 +6666,55 @@ fn subagent_response_from_value(value: &Value) -> Result<SubagentResponse> {
 }
 
 fn provider_resume_id_from_transcript_path(transcript_path: &str) -> Option<String> {
-    Path::new(transcript_path)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
+    claude_session_id_from_transcript(transcript_path).or_else(|| {
+        let path = Path::new(transcript_path);
+        let nested_session_dir = if path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name == "chat.jsonl")
+        {
+            path.parent()
+        } else if path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            == Some("subagents")
+        {
+            path.parent().and_then(Path::parent)
+        } else {
+            None
+        };
+        nested_session_dir
+            .and_then(Path::file_name)
+            .and_then(|value| value.to_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|value| value.to_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+    })
+}
+
+fn claude_session_id_from_transcript(transcript_path: &str) -> Option<String> {
+    let file = fs::File::open(expand_home(transcript_path)).ok()?;
+    BufReader::new(file)
+        .lines()
+        .map_while(|line| line.ok())
+        .take(128)
+        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+        .find_map(|value| {
+            value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
 }
 
 fn provider_resume_id_for_restore(record: &SessionRecord) -> Option<String> {
@@ -6849,32 +6901,27 @@ struct ClaudeTranscriptMetadata {
 
 fn historical_claude_seat_sessions(
     sessions: &[SessionRecord],
-    projects_root: &Path,
+    projects_roots: &[PathBuf],
     artifact_cutoff_ns: i128,
     claimed: &mut BTreeSet<(String, String)>,
 ) -> Vec<SeatSessionIdentity> {
     let mut project_dirs = BTreeMap::<PathBuf, BTreeSet<String>>::new();
-    for session in sessions
-        .iter()
-        .filter(|session| session.provider == "claude")
-        .filter(|session| has_text(Some(&session.working_dir)))
-    {
-        project_dirs
-            .entry(projects_root.join(claude_project_dir_name(&session.working_dir)))
-            .or_default()
-            .insert(resolve_path_lossy(expand_home(&session.working_dir)));
+    for projects_root in projects_roots {
+        for session in sessions
+            .iter()
+            .filter(|session| session.provider == "claude")
+            .filter(|session| has_text(Some(&session.working_dir)))
+        {
+            project_dirs
+                .entry(projects_root.join(claude_project_dir_name(&session.working_dir)))
+                .or_default()
+                .insert(resolve_path_lossy(expand_home(&session.working_dir)));
+        }
     }
 
     let mut identities = Vec::new();
     for (project_dir, project_working_dirs) in project_dirs {
-        let Ok(entries) = fs::read_dir(project_dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-                continue;
-            }
+        for path in jsonl_files_recursive(&project_dir) {
             let Ok(metadata) = read_claude_transcript_metadata(&path) else {
                 continue;
             };
@@ -7139,6 +7186,7 @@ fn session_lifetime_overlaps(
 fn discover_claude_transcript_path(
     record: &SessionRecord,
     sessions: &[SessionRecord],
+    projects_roots: &[PathBuf],
 ) -> Option<String> {
     if record.provider != "claude" || !has_text(Some(record.working_dir.as_str())) {
         return record.transcript_path.clone();
@@ -7147,11 +7195,6 @@ fn discover_claude_transcript_path(
         return record.transcript_path.clone();
     }
 
-    let project_dir =
-        expand_home("~/.claude/projects").join(claude_project_dir_name(&record.working_dir));
-    if !project_dir.is_dir() {
-        return None;
-    }
     let resolved_working_dir = resolve_path_lossy(expand_home(&record.working_dir));
     let claimed_paths = sessions
         .iter()
@@ -7164,45 +7207,45 @@ fn discover_claude_transcript_path(
         .or_else(|| file_mtime_ns(expand_home(&record.log_file.clone().unwrap_or_default())).ok())
         .unwrap_or(0);
 
-    let mut candidates: Vec<(i128, i128, i128, String)> = Vec::new();
-    let Ok(entries) = fs::read_dir(&project_dir) else {
-        return None;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-            continue;
-        }
-        let resolved_transcript = resolve_path_lossy(path.clone());
-        if claimed_paths.contains(&resolved_transcript) {
-            continue;
-        }
-        let metadata = read_claude_transcript_metadata(&path).unwrap_or_default();
-        if let Some(cwd) = metadata.cwd.as_deref() {
-            if cwd != resolved_working_dir {
+    let mut candidates: Vec<(bool, i128, i128, i128, String)> = Vec::new();
+    for projects_root in projects_roots {
+        let project_dir = projects_root.join(claude_project_dir_name(&record.working_dir));
+        for path in jsonl_files_recursive(&project_dir) {
+            let resolved_transcript = resolve_path_lossy(path.clone());
+            if claimed_paths.contains(&resolved_transcript) {
                 continue;
             }
+            let metadata = read_claude_transcript_metadata(&path).unwrap_or_default();
+            if let Some(cwd) = metadata.cwd.as_deref() {
+                if cwd != resolved_working_dir {
+                    continue;
+                }
+            }
+            let comparison_time = if metadata.mtime_ns > 0 {
+                metadata.mtime_ns
+            } else {
+                metadata.started_at_ns.unwrap_or(0)
+            };
+            let distance = (target_time_ns - comparison_time).abs();
+            let start_distance = metadata
+                .started_at_ns
+                .map(|started_at_ns| (target_time_ns - started_at_ns).abs())
+                .unwrap_or(distance);
+            candidates.push((
+                path.parent()
+                    .and_then(Path::file_name)
+                    .and_then(|value| value.to_str())
+                    == Some("subagents"),
+                distance,
+                start_distance,
+                -metadata.mtime_ns,
+                resolved_transcript,
+            ));
         }
-        let comparison_time = if metadata.mtime_ns > 0 {
-            metadata.mtime_ns
-        } else {
-            metadata.started_at_ns.unwrap_or(0)
-        };
-        let distance = (target_time_ns - comparison_time).abs();
-        let start_distance = metadata
-            .started_at_ns
-            .map(|started_at_ns| (target_time_ns - started_at_ns).abs())
-            .unwrap_or(distance);
-        candidates.push((
-            distance,
-            start_distance,
-            -metadata.mtime_ns,
-            resolved_transcript,
-        ));
     }
 
     candidates.sort();
-    candidates.into_iter().next().map(|(_, _, _, path)| path)
+    candidates.into_iter().next().map(|(_, _, _, _, path)| path)
 }
 
 fn read_claude_transcript_metadata(path: &Path) -> Result<ClaudeTranscriptMetadata> {
@@ -7406,6 +7449,38 @@ fn now_python_naive_iso() -> String {
             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]"
         ))
         .unwrap_or_else(|_| "1970-01-01T00:00:00.000000".to_owned())
+}
+
+fn claude_projects_roots(configured_transcript_root: Option<&str>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !roots.contains(&path) {
+            roots.push(path);
+        }
+    };
+
+    if let Some(root) = configured_transcript_root
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+    {
+        push(expand_home(root));
+    }
+    if let Some(config_dir) = env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        push(config_dir.join("projects"));
+    }
+    if let Some(xdg_config_home) = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        push(xdg_config_home.join("claude").join("projects"));
+    } else {
+        push(expand_home("~/.config/claude/projects"));
+    }
+    push(expand_home("~/.claude/projects"));
+    roots
 }
 
 pub fn expand_home(path: &str) -> PathBuf {
@@ -8377,6 +8452,65 @@ mod tests {
         assert_eq!(expand_home("~"), home);
         assert_eq!(expand_home("~/work"), home.join("work"));
         assert_eq!(expand_home("/tmp/work"), PathBuf::from("/tmp/work"));
+    }
+
+    #[test]
+    fn claude_transcript_identity_prefers_metadata_for_nested_layouts() {
+        let root = unique_temp_path("nested-claude-transcript");
+        let transcript = root
+            .join("path-session")
+            .join("subagents")
+            .join("agent-child.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            json!({
+                "type": "user",
+                "sessionId": "metadata-session",
+                "timestamp": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            provider_resume_id_from_transcript_path(transcript.to_str().unwrap()).as_deref(),
+            Some("metadata-session")
+        );
+        assert_eq!(
+            provider_resume_id_from_transcript_path(
+                root.join("fallback-session")
+                    .join("chat.jsonl")
+                    .to_str()
+                    .unwrap()
+            )
+            .as_deref(),
+            Some("fallback-session")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_project_roots_include_config_environment_and_defaults() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let root = unique_temp_path("claude-project-roots");
+        let home = root.join("home");
+        let config_dir = root.join("claude-config");
+        let xdg_dir = root.join("xdg");
+        let configured = root.join("configured-projects");
+        let _home = EnvVarRestore::set("HOME", &home);
+        let _config = EnvVarRestore::set("CLAUDE_CONFIG_DIR", &config_dir);
+        let _xdg = EnvVarRestore::set("XDG_CONFIG_HOME", &xdg_dir);
+
+        assert_eq!(
+            claude_projects_roots(Some(configured.to_str().unwrap())),
+            vec![
+                configured,
+                config_dir.join("projects"),
+                xdg_dir.join("claude").join("projects"),
+                home.join(".claude").join("projects"),
+            ]
+        );
     }
 
     #[test]
@@ -9393,9 +9527,15 @@ mod tests {
         let project_dir =
             projects_root.join(claude_project_dir_name(working_dir.to_str().unwrap()));
         fs::create_dir_all(&project_dir).unwrap();
-        let current_path = project_dir.join("current-thread.jsonl");
-        let historical_path = project_dir.join("historical.jsonl");
+        let current_path = project_dir.join("current-thread").join("chat.jsonl");
+        let historical_path = project_dir.join("historical-thread").join("chat.jsonl");
+        let historical_sidechain_path = project_dir
+            .join("historical-thread")
+            .join("subagents")
+            .join("agent-child.jsonl");
         let ambiguous_path = project_dir.join("ambiguous.jsonl");
+        fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(historical_sidechain_path.parent().unwrap()).unwrap();
         let transcript = |session_id: &str, timestamp: &str| {
             json!({
                 "type": "user",
@@ -9413,6 +9553,11 @@ mod tests {
         fs::write(
             &historical_path,
             transcript("historical-thread", "2026-01-02T00:00:00Z"),
+        )
+        .unwrap();
+        fs::write(
+            &historical_sidechain_path,
+            transcript("historical-thread", "2026-01-02T00:01:00Z"),
         )
         .unwrap();
         fs::write(
@@ -10668,7 +10813,11 @@ mod tests {
         session.transcript_path = None;
         session.last_activity = "2026-06-23T01:27:23Z".to_owned();
 
-        let discovered = discover_claude_transcript_path(&session, &[session.clone()]);
+        let discovered = discover_claude_transcript_path(
+            &session,
+            &[session.clone()],
+            &[home.join(".claude").join("projects")],
+        );
 
         assert_eq!(
             discovered.as_deref(),
