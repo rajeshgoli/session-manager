@@ -91,7 +91,7 @@ use crate::codex_events::{list_codex_events_from_path, CodexEventsResponse};
 use crate::codex_requests::{list_codex_pending_requests_from_path, CodexPendingRequestsResponse};
 #[cfg(test)]
 use crate::config::MobileTerminalDeviceKeyConfig;
-use crate::config::{trimmed, AppConfig, MobileTerminalUserConfig, PublicNodeConfig};
+use crate::config::{trimmed, AppConfig, MobileTerminalUserConfig, PublicNodeConfig, UsageConfig};
 use crate::email::{
     extract_reply_message_body, extract_routed_session_id, extract_subject_from_raw_email,
     extract_text_from_raw_email, normalize_explicit_session_id, EmailBridge,
@@ -381,7 +381,7 @@ impl AppState {
                     .runtime_enabled
                     .then(|| TmuxRuntime::from_app_config(&config)),
             );
-        if !config.usage.db_path.trim().is_empty() {
+        if should_use_configured_usage_db_path(&config.usage) {
             session_store = session_store.with_usage_db_path(expand_home(&config.usage.db_path));
         }
         if let Err(error) = session_store.recover_pending_codex_fork_handoffs() {
@@ -445,6 +445,13 @@ impl AppState {
     ) -> anyhow::Result<()> {
         self.session_store.reconcile_seat_sessions(snapshot)
     }
+}
+
+fn should_use_configured_usage_db_path(config: &UsageConfig) -> bool {
+    if config.db_path.trim().is_empty() {
+        return false;
+    }
+    config.enabled || expand_home(&config.db_path) != expand_home(&UsageConfig::default().db_path)
 }
 
 #[derive(Debug, Deserialize)]
@@ -12640,6 +12647,20 @@ mod tests {
     use serde::Serialize;
     use std::{env, process};
     use tower::ServiceExt;
+
+    #[test]
+    fn usage_db_override_policy_preserves_only_disabled_default_fixtures() {
+        let disabled_default = UsageConfig::default();
+        assert!(!should_use_configured_usage_db_path(&disabled_default));
+
+        let mut enabled_default = UsageConfig::default();
+        enabled_default.enabled = true;
+        assert!(should_use_configured_usage_db_path(&enabled_default));
+
+        let mut disabled_custom = UsageConfig::default();
+        disabled_custom.db_path = "/tmp/custom-usage.db".to_owned();
+        assert!(should_use_configured_usage_db_path(&disabled_custom));
+    }
 
     #[test]
     fn codex_fork_pane_title_spinner_indicates_working() {

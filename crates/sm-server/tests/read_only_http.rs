@@ -8054,6 +8054,7 @@ async fn custom_usage_database_contains_identity_and_session_chain_tables() {
     let usage_db_path = unique_temp_path().with_extension("custom-usage.db");
     UsageIdentityStore::new(&usage_db_path).unwrap();
     let mut config = config_with_state_file(&state_file);
+    config.usage.enabled = true;
     config.usage.db_path = usage_db_path.display().to_string();
     let app = router(AppState::new(config));
 
