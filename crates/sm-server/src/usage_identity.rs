@@ -11,6 +11,8 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+use crate::usage_burn::UsageBurnStore;
+
 const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
     "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z"
 );
@@ -239,6 +241,43 @@ impl UsageIdentityStore {
         }
         tx.commit()?;
         Ok(outcome)
+    }
+
+    /// Register account metadata without changing the provider's active timeline.
+    ///
+    /// Cached usage can carry the final sample for an account that was replaced
+    /// before the cache was read. That account must exist for burn-sample foreign
+    /// keys, but it must not become the current account again.
+    pub fn ensure_account(
+        &self,
+        identity: &AccountIdentity,
+        observed_at: OffsetDateTime,
+    ) -> Result<()> {
+        identity.validate()?;
+        let mut conn = self.open()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let observed_ts = format_timestamp(observed_at)?;
+        tx.execute(
+            r#"
+            INSERT INTO accounts (
+              account_key, provider, external_id, label, plan_tier, first_seen, last_seen
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            ON CONFLICT(account_key) DO UPDATE SET
+              label = COALESCE(excluded.label, accounts.label),
+              plan_tier = COALESCE(excluded.plan_tier, accounts.plan_tier),
+              last_seen = MAX(accounts.last_seen, excluded.last_seen)
+            "#,
+            params![
+                identity.account_key(),
+                identity.provider.as_str(),
+                &identity.external_id,
+                identity.label.as_deref(),
+                identity.plan_tier.as_deref(),
+                observed_ts,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Backfill the assumed interval required when open windows contain messages
@@ -577,6 +616,7 @@ fn required_json_string(value: &Value, key: &str, path: &Path) -> Result<String>
 #[derive(Debug)]
 pub struct IdentityPoller {
     store: UsageIdentityStore,
+    burn_store: UsageBurnStore,
     claude_identity_path: PathBuf,
     codex_identity_path: PathBuf,
     last_successful_poll: Mutex<BTreeMap<Provider, OffsetDateTime>>,
@@ -588,8 +628,10 @@ impl IdentityPoller {
         claude_identity_path: impl Into<PathBuf>,
         codex_identity_path: impl Into<PathBuf>,
     ) -> Result<Self> {
+        let db_path = db_path.into();
         Ok(Self {
-            store: UsageIdentityStore::new(db_path)?,
+            store: UsageIdentityStore::new(&db_path)?,
+            burn_store: UsageBurnStore::new(&db_path)?,
             claude_identity_path: claude_identity_path.into(),
             codex_identity_path: codex_identity_path.into(),
             last_successful_poll: Mutex::new(BTreeMap::new()),
@@ -605,7 +647,7 @@ impl IdentityPoller {
     /// the other provider's timeline from advancing.
     pub fn poll_once(&self, observed_at: OffsetDateTime) -> Vec<(Provider, anyhow::Error)> {
         let mut errors = Vec::new();
-        self.poll_provider(
+        let claude_polled = self.poll_provider(
             Provider::Claude,
             observed_at,
             read_claude_identity(&self.claude_identity_path),
@@ -617,6 +659,14 @@ impl IdentityPoller {
             read_codex_identity(&self.codex_identity_path),
             &mut errors,
         );
+        if claude_polled && self.claude_identity_path.exists() {
+            if let Err(error) = self
+                .burn_store
+                .record_claude_json_file(&self.claude_identity_path)
+            {
+                errors.push((Provider::Claude, error));
+            }
+        }
         errors
     }
 
@@ -626,12 +676,12 @@ impl IdentityPoller {
         observed_at: OffsetDateTime,
         identity: Result<Option<AccountIdentity>>,
         errors: &mut Vec<(Provider, anyhow::Error)>,
-    ) {
+    ) -> bool {
         let identity = match identity {
             Ok(identity) => identity,
             Err(error) => {
                 errors.push((provider, error));
-                return;
+                return false;
             }
         };
         let previous = self
@@ -652,8 +702,12 @@ impl IdentityPoller {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .insert(provider, observed_at);
+                true
             }
-            Err(error) => errors.push((provider, error)),
+            Err(error) => {
+                errors.push((provider, error));
+                false
+            }
         }
     }
 }

@@ -17,4 +17,5 @@ pub mod seat_sessions;
 pub mod sessions;
 pub mod studio_ssh;
 pub mod tool_usage;
+pub mod usage_burn;
 pub mod usage_identity;
