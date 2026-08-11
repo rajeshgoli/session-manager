@@ -3,8 +3,9 @@ use std::{
     fs,
     io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
-    process::Command,
-    time::Duration,
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
@@ -19,6 +20,7 @@ use crate::{
 };
 
 const USAGE_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const PROJECT_KEY_GIT_TIMEOUT: Duration = Duration::from_secs(1);
 const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
     "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z"
 );
@@ -46,24 +48,59 @@ pub struct UsageSeatMetadata {
 impl UsageSeatMetadata {
     pub fn resolve_project_key(working_dir: &str) -> String {
         let working_dir = expand_home(working_dir);
-        if let Ok(output) = Command::new("git")
-            .args(["-C"])
-            .arg(&working_dir)
-            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-            .output()
-        {
-            if output.status.success() {
-                if let Some(path) = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .next()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    return canonical_path(Path::new(path));
-                }
+        let mut command = Command::new("git");
+        command.args(["-C"]).arg(&working_dir).args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ]);
+        resolve_project_key_with_command(&working_dir, command, PROJECT_KEY_GIT_TIMEOUT)
+    }
+}
+
+fn resolve_project_key_with_command(
+    working_dir: &Path,
+    command: Command,
+    timeout: Duration,
+) -> String {
+    if let Some(output) = command_output_with_timeout(command, timeout) {
+        if output.status.success() {
+            if let Some(path) = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                return canonical_path(Path::new(path));
             }
         }
-        canonical_path(&working_dir)
+    }
+    canonical_path(working_dir)
+}
+
+fn command_output_with_timeout(mut command: Command, timeout: Duration) -> Option<Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let started_at = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -2974,6 +3011,20 @@ mod tests {
         let start = derive_window_start(reset, 300).unwrap();
         assert_eq!((reset - start).whole_minutes(), 300);
         assert_eq!(start, at("2026-03-08T05:30:00Z"));
+    }
+
+    #[test]
+    fn project_key_falls_back_after_a_hung_git_probe() {
+        let dir = TestDir::new("project-key-timeout");
+        let mut command = Command::new("/bin/sleep");
+        command.arg("5");
+        let started_at = Instant::now();
+
+        let project_key =
+            resolve_project_key_with_command(&dir.0, command, Duration::from_millis(50));
+
+        assert_eq!(project_key, canonical_path(&dir.0));
+        assert!(started_at.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
