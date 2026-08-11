@@ -210,6 +210,19 @@ impl SessionStore {
                 Err(error) => return Err(error),
             }
         };
+        let fork_artifact_paths = self
+            .delivery_runtime
+            .as_ref()
+            .map(|runtime| {
+                records
+                    .iter()
+                    .filter_map(|session| {
+                        codex_fork_event_stream_path(session, runtime)
+                            .map(|path| (session.id.clone(), path))
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
         let mut sessions = records
             .iter()
             .filter_map(|session| {
@@ -219,7 +232,10 @@ impl SessionStore {
                         seat_id: session.id.clone(),
                         provider: session.provider.clone(),
                         provider_session_id,
-                        artifact_path: session.transcript_path.clone(),
+                        artifact_path: fork_artifact_paths
+                            .get(&session.id)
+                            .map(|path| path.display().to_string())
+                            .or_else(|| session.transcript_path.clone()),
                     }
                 })
             })
@@ -227,6 +243,11 @@ impl SessionStore {
         sessions.extend(historical_claude_seat_sessions(
             &records,
             &self.claude_projects_root,
+            &mut claimed,
+        ));
+        sessions.extend(historical_codex_cli_seat_sessions(
+            &records,
+            &self.codex_sessions_root,
             &mut claimed,
         ));
         if let Some(runtime) = self.delivery_runtime.as_ref() {
@@ -6849,6 +6870,113 @@ fn historical_claude_seat_sessions(
     identities
 }
 
+fn historical_codex_cli_seat_sessions(
+    sessions: &[SessionRecord],
+    sessions_root: &Path,
+    claimed: &mut BTreeSet<(String, String)>,
+) -> Vec<SeatSessionIdentity> {
+    let codex_seats = sessions
+        .iter()
+        .filter(|session| session.provider == "codex")
+        .collect::<Vec<_>>();
+    if codex_seats.is_empty() {
+        return Vec::new();
+    }
+
+    let mut identities = Vec::new();
+    for path in jsonl_files_recursive(sessions_root) {
+        let Some((provider_session_id, cwd, started_at_ns)) =
+            read_codex_cli_session_metadata(&path)
+        else {
+            continue;
+        };
+        let claim = ("codex".to_owned(), provider_session_id.clone());
+        if claimed.contains(&claim) {
+            continue;
+        }
+
+        let cwd = resolve_path_lossy(expand_home(&cwd));
+        let matching_cwd_seats = codex_seats
+            .iter()
+            .copied()
+            .filter(|session| resolve_path_lossy(expand_home(&session.working_dir)) == cwd)
+            .collect::<Vec<_>>();
+        if matching_cwd_seats.is_empty() {
+            continue;
+        }
+
+        let started_at_ns = started_at_ns
+            .or_else(|| file_mtime_ns(&path).ok())
+            .unwrap_or(0);
+        let ended_at_ns = codex_transcript_end_ns(&path, started_at_ns);
+        let matching_seats = matching_cwd_seats
+            .into_iter()
+            .filter(|session| session_lifetime_overlaps(session, started_at_ns, ended_at_ns))
+            .map(|session| session.id.as_str())
+            .collect::<BTreeSet<_>>();
+        if matching_seats.is_empty() {
+            continue;
+        }
+        let seat_id = if matching_seats.len() == 1 {
+            matching_seats.into_iter().next().unwrap().to_owned()
+        } else {
+            "unassigned".to_owned()
+        };
+        claimed.insert(claim);
+        identities.push(SeatSessionIdentity {
+            seat_id,
+            provider: "codex".to_owned(),
+            provider_session_id,
+            artifact_path: Some(resolve_path_lossy(path)),
+        });
+    }
+    identities
+}
+
+fn codex_transcript_end_ns(path: &Path, started_at_ns: i128) -> i128 {
+    let mut ended_at_ns = started_at_ns;
+    let Ok(file) = fs::File::open(path) else {
+        return ended_at_ns;
+    };
+    for line in BufReader::new(file).lines().map_while(|line| line.ok()) {
+        let Some(timestamp) = serde_json::from_str::<Value>(&line).ok().and_then(|value| {
+            value
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .and_then(parse_timestamp_ns)
+        }) else {
+            continue;
+        };
+        ended_at_ns = ended_at_ns.max(timestamp);
+    }
+    ended_at_ns
+}
+
+fn jsonl_files_recursive(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file()
+                && path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
 fn historical_codex_fork_seat_sessions(
     sessions: &[SessionRecord],
     runtime: &TmuxRuntime,
@@ -6859,23 +6987,10 @@ fn historical_codex_fork_seat_sessions(
         .iter()
         .filter(|session| session.provider == "codex-fork")
     {
-        let Some(log_file) = session.log_file.as_deref().map(expand_home) else {
+        let Some(event_stream_path) = codex_fork_event_stream_path(session, runtime) else {
             continue;
         };
-        let spec = TmuxSessionSpec {
-            session_id: session.id.clone(),
-            tmux_session: session.tmux_session.clone(),
-            working_dir: session.working_dir.clone(),
-            log_file,
-            provider: session.provider.clone(),
-            initial_message: None,
-            model: session.model.clone(),
-            reasoning_effort: session.reasoning_effort.clone(),
-        };
-        let Ok(Some(artifacts)) = runtime.codex_fork_runtime_artifacts(&spec) else {
-            continue;
-        };
-        let Ok(file) = fs::File::open(&artifacts.event_stream_path) else {
+        let Ok(file) = fs::File::open(&event_stream_path) else {
             continue;
         };
         for line in BufReader::new(file).lines().map_while(|line| line.ok()) {
@@ -6896,11 +7011,32 @@ fn historical_codex_fork_seat_sessions(
                 seat_id: session.id.clone(),
                 provider: "codex-fork".to_owned(),
                 provider_session_id,
-                artifact_path: Some(artifacts.event_stream_path.display().to_string()),
+                artifact_path: Some(event_stream_path.display().to_string()),
             });
         }
     }
     identities
+}
+
+fn codex_fork_event_stream_path(session: &SessionRecord, runtime: &TmuxRuntime) -> Option<PathBuf> {
+    if session.provider != "codex-fork" {
+        return None;
+    }
+    let spec = TmuxSessionSpec {
+        session_id: session.id.clone(),
+        tmux_session: session.tmux_session.clone(),
+        working_dir: session.working_dir.clone(),
+        log_file: session.log_file.as_deref().map(expand_home)?,
+        provider: session.provider.clone(),
+        initial_message: None,
+        model: session.model.clone(),
+        reasoning_effort: session.reasoning_effort.clone(),
+    };
+    runtime
+        .codex_fork_runtime_artifacts(&spec)
+        .ok()
+        .flatten()
+        .map(|artifacts| artifacts.event_stream_path)
 }
 
 fn session_lifetime_overlaps(
@@ -9318,18 +9454,97 @@ mod tests {
             ),
         )
         .unwrap();
+        store.append_seat_session("codex001", "codex-fork", "current-thread", None);
 
         store.reconcile_current_seat_sessions().unwrap();
 
-        let count: i64 = rusqlite::Connection::open(usage_db_path)
-            .unwrap()
+        let connection = rusqlite::Connection::open(usage_db_path).unwrap();
+        let count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'codex001'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
+        let paths: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'codex001' AND artifact_path IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 2);
+        assert_eq!(paths, 2);
+    }
+
+    #[test]
+    fn startup_reconciliation_backfills_historical_codex_cli_rollouts() {
+        let temp_dir = unique_temp_path("seat-session-codex-backfill");
+        let state_file = temp_dir.join("sessions.json");
+        let working_dir = temp_dir.join("repo");
+        let sessions_root = temp_dir.join("codex-home").join("sessions");
+        let day_dir = sessions_root.join("2026").join("01").join("02");
+        fs::create_dir_all(&working_dir).unwrap();
+        fs::create_dir_all(&day_dir).unwrap();
+        let rollout = |id: &str, timestamp: &str| {
+            fs::write(
+                day_dir.join(format!("rollout-{id}.jsonl")),
+                format!(
+                    "{}\n",
+                    json!({
+                        "type": "session_meta",
+                        "timestamp": timestamp,
+                        "payload": {
+                            "id": id,
+                            "cwd": working_dir.display().to_string(),
+                            "timestamp": timestamp
+                        }
+                    })
+                ),
+            )
+            .unwrap();
+        };
+        rollout("historical-thread", "2026-01-02T00:00:00Z");
+        rollout("current-thread", "2026-01-03T00:00:00Z");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex",
+                    "provider_resume_id": "current-thread",
+                    "working_dir": working_dir.display().to_string(),
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "last_activity": "2026-01-03T00:00:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut store =
+            SessionStore::new_with_legacy_fallback(state_file.clone(), state_file.clone());
+        store.codex_sessions_root = sessions_root;
+
+        store.reconcile_current_seat_sessions().unwrap();
+
+        let connection = rusqlite::Connection::open(state_file.with_extension("usage.db")).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT provider_session_id FROM seat_sessions WHERE seat_id = 'codex001' ORDER BY provider_session_id",
+            )
+            .unwrap();
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec!["current-thread".to_owned(), "historical-thread".to_owned()]
+        );
     }
 
     #[test]

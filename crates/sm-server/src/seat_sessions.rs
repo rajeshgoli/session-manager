@@ -116,6 +116,31 @@ impl SeatSessionStore {
                         session.provider_session_id, session.seat_id
                     )
                 })?;
+            if session.artifact_path.is_some() {
+                transaction
+                    .execute(
+                        r#"
+                        UPDATE seat_sessions
+                        SET artifact_path = ?4
+                        WHERE seat_id = ?1
+                          AND provider = ?2
+                          AND provider_session_id = ?3
+                          AND artifact_path IS NULL
+                        "#,
+                        params![
+                            session.seat_id,
+                            session.provider,
+                            session.provider_session_id,
+                            session.artifact_path
+                        ],
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to repair artifact path for provider session {} on seat {}",
+                            session.provider_session_id, session.seat_id
+                        )
+                    })?;
+            }
         }
         transaction
             .commit()
@@ -254,6 +279,62 @@ mod tests {
             vec![
                 ("provider-a".to_owned(), "/tmp/a.jsonl".to_owned()),
                 ("provider-b".to_owned(), "/tmp/b.jsonl".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn append_batch_repairs_only_missing_artifact_paths() {
+        let state_file = test_path("batch-artifact-repair");
+        let db_path = state_file.with_extension("usage.db");
+        let store = SeatSessionStore::for_state_file(&state_file);
+
+        store
+            .append("seat-1", "codex-fork", "missing-path", None)
+            .unwrap();
+        store
+            .append(
+                "seat-1",
+                "codex-fork",
+                "existing-path",
+                Some("/tmp/original.jsonl"),
+            )
+            .unwrap();
+        store
+            .append_batch(&[
+                SeatSessionIdentity {
+                    seat_id: "seat-1".to_owned(),
+                    provider: "codex-fork".to_owned(),
+                    provider_session_id: "missing-path".to_owned(),
+                    artifact_path: Some("/tmp/recovered.jsonl".to_owned()),
+                },
+                SeatSessionIdentity {
+                    seat_id: "seat-1".to_owned(),
+                    provider: "codex-fork".to_owned(),
+                    provider_session_id: "existing-path".to_owned(),
+                    artifact_path: Some("/tmp/replayed.jsonl".to_owned()),
+                },
+            ])
+            .unwrap();
+
+        let connection = Connection::open(&db_path).unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT provider_session_id, artifact_path FROM seat_sessions ORDER BY provider_session_id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("existing-path".to_owned(), "/tmp/original.jsonl".to_owned(),),
+                ("missing-path".to_owned(), "/tmp/recovered.jsonl".to_owned(),),
             ]
         );
     }
