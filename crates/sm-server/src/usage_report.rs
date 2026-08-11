@@ -564,6 +564,9 @@ fn build_window_report(
     let models = if by_model {
         burn_by_model
             .into_iter()
+            .filter(|((seat_id, _), _)| {
+                target.is_none_or(|target| target.self_seats.contains(seat_id))
+            })
             .map(
                 |((seat_id, model), (burn_percent, weighted_units))| UsageModelShare {
                     seat_id,
@@ -943,5 +946,54 @@ mod tests {
         assert_eq!(report.account_percent, None);
         assert_eq!(report.last_known_percent, 34.0);
         assert_eq!(report.sample_age_seconds, Some(660));
+    }
+
+    #[test]
+    fn target_model_breakdown_excludes_other_account_seats() {
+        let window = BurnWindow {
+            id: 1,
+            account_key: "claude:a".to_owned(),
+            window_kind: "session_5h".to_owned(),
+            window_scope: None,
+            window_start: "2026-08-10T15:00:00Z".to_owned(),
+            percent: 20.0,
+            resets_at: "2026-08-10T20:00:00Z".to_owned(),
+            observed_at: "2026-08-10T16:00:00Z".to_owned(),
+        };
+        let rows = ["target", "other"]
+            .into_iter()
+            .map(|seat_id| WindowRow {
+                seat_id: seat_id.to_owned(),
+                model: "claude-sonnet-5".to_owned(),
+                credit_metered: false,
+                tokens: TokenCounts {
+                    input: 10,
+                    ..TokenCounts::default()
+                },
+            })
+            .collect::<Vec<_>>();
+        let target = UsageReportTarget {
+            seat_id: "target".to_owned(),
+            friendly_name: None,
+            account_key: None,
+            usage_cap_fraction: None,
+            self_seats: BTreeSet::from(["target".to_owned()]),
+            child_seats: BTreeSet::new(),
+        };
+        let mut warnings = BTreeSet::new();
+        let report = build_window_report(
+            &window,
+            "claude",
+            &rows,
+            None,
+            Some(&target),
+            &BTreeMap::new(),
+            true,
+            OffsetDateTime::UNIX_EPOCH,
+            &mut warnings,
+        );
+
+        assert_eq!(report.models.len(), 1);
+        assert_eq!(report.models[0].seat_id, "target");
     }
 }
