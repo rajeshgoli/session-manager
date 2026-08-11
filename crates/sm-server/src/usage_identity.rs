@@ -126,6 +126,16 @@ impl UsageIdentityStore {
               ON account_timeline(provider) WHERE to_ts IS NULL;
             CREATE INDEX IF NOT EXISTS idx_account_timeline_lookup
               ON account_timeline(provider, from_ts, to_ts);
+
+            CREATE TABLE IF NOT EXISTS account_metadata_history (
+              account_key          TEXT NOT NULL REFERENCES accounts(account_key),
+              observed_at          TEXT NOT NULL,
+              plan_tier            TEXT,
+              extra_usage_enabled  INTEGER,
+              PRIMARY KEY (account_key, observed_at)
+            );
+            CREATE INDEX IF NOT EXISTS idx_account_metadata_lookup
+              ON account_metadata_history(account_key, observed_at);
             "#,
         )
         .context("failed to initialize usage identity schema")?;
@@ -294,6 +304,7 @@ impl UsageIdentityStore {
                 observed_ts,
             ],
         )?;
+        record_account_metadata(&tx, &identity.account_key(), &observed_ts)?;
         tx.commit()?;
         Ok(())
     }
@@ -433,6 +444,28 @@ fn upsert_account(
             identity.extra_usage_enabled,
             observed_ts,
         ],
+    )?;
+    record_account_metadata(tx, &identity.account_key(), observed_ts)?;
+    Ok(())
+}
+
+fn record_account_metadata(
+    tx: &Transaction<'_>,
+    account_key: &str,
+    observed_ts: &str,
+) -> Result<()> {
+    tx.execute(
+        r#"
+        INSERT INTO account_metadata_history (
+          account_key, observed_at, plan_tier, extra_usage_enabled
+        )
+        SELECT account_key, ?2, plan_tier, extra_usage_enabled
+        FROM accounts WHERE account_key = ?1
+        ON CONFLICT(account_key, observed_at) DO UPDATE SET
+          plan_tier = excluded.plan_tier,
+          extra_usage_enabled = excluded.extra_usage_enabled
+        "#,
+        params![account_key, observed_ts],
     )?;
     Ok(())
 }
@@ -778,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_db_uses_wal_and_creates_phase_one_schema_only() {
+    fn usage_db_uses_wal_and_creates_identity_schema() {
         let dir = TestDir::new("schema");
         let db_path = dir.0.join("usage.db");
         UsageIdentityStore::new(&db_path).unwrap();
@@ -794,7 +827,10 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(tables, vec!["account_timeline", "accounts"]);
+        assert_eq!(
+            tables,
+            vec!["account_metadata_history", "account_timeline", "accounts"]
+        );
     }
 
     #[test]

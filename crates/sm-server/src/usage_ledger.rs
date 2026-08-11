@@ -249,9 +249,10 @@ impl UsageLedgerStore {
     }
 
     pub fn scan(&self, seats: &[UsageSeatMetadata]) -> Result<ScanSummary> {
-        let seats = self.resolve_seat_models(seats)?;
+        let mut seats = self.resolve_seat_models(seats)?;
         self.snapshot_seat_meta(&seats)?;
         let bindings = self.artifact_bindings()?;
+        self.extend_with_persisted_bound_seats(&mut seats, &bindings)?;
         let seat_by_source = bindings
             .iter()
             .map(|binding| {
@@ -319,6 +320,52 @@ impl UsageLedgerStore {
                 Ok(resolved)
             })
             .collect()
+    }
+
+    fn extend_with_persisted_bound_seats(
+        &self,
+        seats: &mut Vec<UsageSeatMetadata>,
+        bindings: &[ArtifactBinding],
+    ) -> Result<()> {
+        let mut known = seats
+            .iter()
+            .map(|seat| seat.seat_id.clone())
+            .collect::<BTreeSet<_>>();
+        let connection = self.open()?;
+        for seat_id in bindings.iter().map(|binding| &binding.seat_id) {
+            if !known.insert(seat_id.clone()) {
+                continue;
+            }
+            let persisted = connection
+                .query_row(
+                    r#"
+                    SELECT friendly_name, provider, model, project_key, working_dir,
+                           parent_seat_id, root_seat_id
+                    FROM seat_meta
+                    WHERE seat_id = ?1
+                    ORDER BY observed_at DESC LIMIT 1
+                    "#,
+                    [seat_id],
+                    |row| {
+                        Ok(UsageSeatMetadata {
+                            seat_id: seat_id.clone(),
+                            friendly_name: row.get(0)?,
+                            provider: row.get(1)?,
+                            model: row.get(2)?,
+                            effort: None,
+                            project_key: row.get(3)?,
+                            working_dir: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                            parent_seat_id: row.get(5)?,
+                            root_seat_id: row.get(6)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(persisted) = persisted {
+                seats.push(persisted);
+            }
+        }
+        Ok(())
     }
 
     pub fn rebuild_rollups(&self) -> Result<()> {
@@ -1868,16 +1915,17 @@ fn credit_metered(
     model: &str,
     timestamp: OffsetDateTime,
 ) -> Result<bool> {
-    let account = tx
+    let provider = tx
         .query_row(
-            "SELECT provider, plan_tier FROM accounts WHERE account_key = ?1",
+            "SELECT provider FROM accounts WHERE account_key = ?1",
             [account_key],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| row.get::<_, String>(0),
         )
         .optional()?;
-    let Some((provider, plan_tier)) = account else {
+    let Some(provider) = provider else {
         return Ok(false);
     };
+    let (plan_tier, extra_usage_enabled) = account_metadata_at(tx, account_key, timestamp)?;
     let excluded_premium = provider == "claude"
         && plan_tier.as_deref().is_some_and(plan_excludes_premium)
         && scoped_model_at(tx, account_key, timestamp)?
@@ -1915,17 +1963,52 @@ fn credit_metered(
                     .is_some_and(|scope| model_matches_scope(model, scope)))
             && percent >= 100.0
     });
-    Ok(exhausted && account_extra_usage_enabled(tx, account_key)?)
+    Ok(exhausted && extra_usage_enabled.unwrap_or(false))
 }
 
-fn account_extra_usage_enabled(tx: &Transaction<'_>, account_key: &str) -> Result<bool> {
+fn account_metadata_at(
+    tx: &Transaction<'_>,
+    account_key: &str,
+    timestamp: OffsetDateTime,
+) -> Result<(Option<String>, Option<bool>)> {
+    let timestamp = format_timestamp(timestamp)?;
+    let historical = tx
+        .query_row(
+            r#"
+            SELECT plan_tier, extra_usage_enabled
+            FROM account_metadata_history
+            WHERE account_key = ?1 AND observed_at <= ?2
+            ORDER BY observed_at DESC LIMIT 1
+            "#,
+            params![account_key, timestamp],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some(historical) = historical {
+        return Ok(historical);
+    }
+    let bootstrap = tx
+        .query_row(
+            r#"
+            SELECT plan_tier, extra_usage_enabled
+            FROM account_metadata_history
+            WHERE account_key = ?1
+            ORDER BY observed_at ASC LIMIT 1
+            "#,
+            [account_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some(bootstrap) = bootstrap {
+        return Ok(bootstrap);
+    }
     tx.query_row(
-        "SELECT COALESCE(extra_usage_enabled, 0) FROM accounts WHERE account_key = ?1",
+        "SELECT plan_tier, extra_usage_enabled FROM accounts WHERE account_key = ?1",
         [account_key],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .optional()
-    .map(|value| value.unwrap_or(false))
+    .map(|metadata| metadata.unwrap_or((None, None)))
     .map_err(Into::into)
 }
 
@@ -3049,6 +3132,73 @@ mod tests {
     }
 
     #[test]
+    fn retired_seat_artifacts_use_persisted_model_and_project_metadata() {
+        let dir = TestDir::new("retired-seat-metadata");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Codex,
+            "codex-account",
+            "pro",
+            "codex_300",
+            300,
+        );
+        let store = UsageLedgerStore::with_model_defaults(
+            &db_path,
+            UsageModelDefaults {
+                codex_fork: Some("current-config-default".to_owned()),
+                ..UsageModelDefaults::default()
+            },
+        )
+        .unwrap();
+        store
+            .scan(&[UsageSeatMetadata {
+                seat_id: "retired-seat".to_owned(),
+                friendly_name: Some("retired".to_owned()),
+                provider: "codex-fork".to_owned(),
+                model: Some("persisted-launch-model".to_owned()),
+                effort: Some("high".to_owned()),
+                working_dir: "/retired/repo".to_owned(),
+                parent_seat_id: Some("old-parent".to_owned()),
+                root_seat_id: Some("old-root".to_owned()),
+                project_key: "/retired/repo/.git".to_owned(),
+            }])
+            .unwrap();
+        let artifact = dir.0.join("retired-codex.jsonl");
+        fs::write(
+            &artifact,
+            "{\"event_type\":\"thread/tokenUsage/updated\",\"seq\":1,\"ts\":\"2026-08-10T16:00:00Z\",\"payload\":{\"threadId\":\"retired-thread\",\"tokenUsage\":{\"total\":{\"inputTokens\":80,\"cachedInputTokens\":60,\"cacheWriteInputTokens\":0,\"outputTokens\":20,\"reasoningOutputTokens\":5,\"totalTokens\":100}}}}\n",
+        )
+        .unwrap();
+        SeatSessionStore::new(&db_path)
+            .append(
+                "retired-seat",
+                "codex-fork",
+                "retired-thread",
+                artifact.to_str(),
+            )
+            .unwrap();
+
+        store.scan(&[]).unwrap();
+        let connection = Connection::open(db_path).unwrap();
+        let metadata: (String, String, String) = connection
+            .query_row(
+                "SELECT seat_id, model, project_key FROM message_ledger",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            metadata,
+            (
+                "retired-seat".to_owned(),
+                "persisted-launch-model".to_owned(),
+                "/retired/repo/.git".to_owned()
+            )
+        );
+    }
+
+    #[test]
     fn post_exhaustion_credit_flag_remains_a_separate_rollup_dimension() {
         let dir = TestDir::new("credit-metered");
         let db_path = dir.0.join("usage.db");
@@ -3127,6 +3277,104 @@ mod tests {
             .unwrap();
         assert_eq!(dimensions, vec![(false, 2, 2), (true, 2, 2)]);
         tx.commit().unwrap();
+    }
+
+    #[test]
+    fn historical_account_metadata_controls_credit_classification() {
+        let dir = TestDir::new("historical-account-metadata");
+        let db_path = dir.0.join("usage.db");
+        let store = UsageIdentityStore::new(&db_path).unwrap();
+        let mut max = identity(Provider::Claude, "account-one", "max");
+        max.extra_usage_enabled = Some(false);
+        store
+            .record_observation(
+                Provider::Claude,
+                Some(&max),
+                at("2026-08-10T15:00:00Z"),
+                None,
+                None,
+            )
+            .unwrap();
+        let mut pro = identity(Provider::Claude, "account-one", "pro");
+        pro.extra_usage_enabled = Some(false);
+        store
+            .record_observation(
+                Provider::Claude,
+                Some(&pro),
+                at("2026-08-10T17:00:00Z"),
+                Some(at("2026-08-10T15:00:00Z")),
+                None,
+            )
+            .unwrap();
+        pro.extra_usage_enabled = Some(true);
+        store
+            .record_observation(
+                Provider::Claude,
+                Some(&pro),
+                at("2026-08-10T18:00:00Z"),
+                Some(at("2026-08-10T17:00:00Z")),
+                None,
+            )
+            .unwrap();
+        let burn = UsageBurnStore::new(&db_path).unwrap();
+        burn.record_for_account(
+            "claude:account-one",
+            &[
+                BurnWindowSample {
+                    window_kind: "session_5h".to_owned(),
+                    window_scope: None,
+                    duration_minutes: 300,
+                    percent: 100.0,
+                    resets_at: at("2026-08-10T21:00:00Z"),
+                    severity: Some("exhausted".to_owned()),
+                    is_active: Some(true),
+                },
+                BurnWindowSample {
+                    window_kind: "weekly_scoped".to_owned(),
+                    window_scope: Some("claude-fable-5".to_owned()),
+                    duration_minutes: 10_080,
+                    percent: 10.0,
+                    resets_at: at("2026-08-16T16:00:00Z"),
+                    severity: None,
+                    is_active: Some(false),
+                },
+            ],
+            "test",
+            at("2026-08-10T15:30:00Z"),
+        )
+        .unwrap();
+        UsageLedgerStore::new(&db_path).unwrap();
+        let mut connection = Connection::open(db_path).unwrap();
+        let tx = connection.transaction().unwrap();
+
+        assert!(!credit_metered(
+            &tx,
+            "claude:account-one",
+            "claude-fable-5",
+            at("2026-08-10T16:30:00Z")
+        )
+        .unwrap());
+        assert!(credit_metered(
+            &tx,
+            "claude:account-one",
+            "claude-fable-5",
+            at("2026-08-10T17:30:00Z")
+        )
+        .unwrap());
+        assert!(!credit_metered(
+            &tx,
+            "claude:account-one",
+            "claude-sonnet-5",
+            at("2026-08-10T17:30:00Z")
+        )
+        .unwrap());
+        assert!(credit_metered(
+            &tx,
+            "claude:account-one",
+            "claude-sonnet-5",
+            at("2026-08-10T18:30:00Z")
+        )
+        .unwrap());
     }
 
     #[test]
