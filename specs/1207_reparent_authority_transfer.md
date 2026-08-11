@@ -90,9 +90,28 @@ request from being created.
 
 ## Authentication and consent
 
-Agent decisions use the managed caller identity from `SESSION_MANAGER_ID`, sent
-as `requester_session_id`. A managed request cannot claim another caller. An
-operator shell without that identity cannot impersonate an agent approval.
+Agent decisions require both the managed caller ID and a server-issued,
+per-runtime 256-bit credential. Session Manager injects the opaque credential as
+`SM_SESSION_CREDENTIAL` when it launches or restores a seat, stores only its
+SHA-256 verifier in session state, and rotates it on every restore. The Rust CLI
+sends the credential in `X-SM-Session-Credential`; the server derives the actor
+from the matching credential and rejects a payload whose
+`requester_session_id` disagrees. `SESSION_MANAGER_ID` alone is not
+authentication. An operator shell that merely sets another session ID cannot
+impersonate an agent approval.
+
+The same per-session credential gate applies to request creation. Credential
+material is never returned by session/list APIs, written to logs, included in
+notifications, or persisted in plaintext. Existing live sessions without a
+verifier cannot approve after deployment until Session Manager rotates a
+credential into that runtime; rollout must provide an explicit credential
+rotation path and must not fall back to trusting an ID-only payload.
+
+Session Manager agents share one operating-system account and filesystem. A
+hostile same-UID process with arbitrary process-inspection capability is outside
+this control's isolation boundary; protecting against that requires OS-level
+per-seat identities. This credential still provides server-verifiable request
+binding and prevents operator-shell and accidental cross-seat payload spoofing.
 
 Human decisions are accepted only on an authenticated operator route used by
 `sm watch`. Local-bypass watch is the supported operator-shell equivalent. A
@@ -108,7 +127,9 @@ conflicting or unauthorized decisions fail.
 
 Requests expire after 24 hours by default. Expiration and staleness are evaluated
 under the session-state write lock before every read that claims actionability
-and before every decision or apply attempt.
+and before every decision or pre-quiesce apply attempt. An `applying` request at
+or beyond `routing_quiesced` never expires; recovery must finish its immutable
+transaction.
 
 ## Durable model
 
@@ -133,7 +154,8 @@ decided_at
 applied_at
 failure_reason
 topology_fingerprint
-apply_stage                nullable | routing_staged
+apply_stage                nullable | routing_quiesced |
+                           authority_committed
 ```
 
 The topology fingerprint is a canonical hash over operation kind, subject,
