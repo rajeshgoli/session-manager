@@ -518,9 +518,11 @@ fn build_window_report(
 ) -> UsageWindowReport {
     let sample_age_seconds = parse_timestamp(&window.observed_at)
         .map(|observed_at| (now - observed_at).whole_seconds().max(0));
-    let stale = sample_age_seconds
-        .map(|age| age > STALE_AFTER_SECONDS)
-        .unwrap_or(true);
+    let reset_elapsed = parse_timestamp(&window.resets_at).is_some_and(|reset| reset <= now);
+    let stale = reset_elapsed
+        || sample_age_seconds
+            .map(|age| age > STALE_AFTER_SECONDS)
+            .unwrap_or(true);
     let mut weighted = Vec::new();
     let mut credit_by_seat = BTreeMap::<String, i64>::new();
     for row in rows {
@@ -1117,6 +1119,40 @@ mod tests {
         assert_eq!(report.seats[0].burn_percent, None);
         assert_eq!(report.seats[0].share, None);
         assert_eq!(report.models[0].burn_percent, None);
+    }
+
+    #[test]
+    fn expired_windows_are_stale_even_when_the_sample_is_recent() {
+        let window = BurnWindow {
+            id: 1,
+            account_key: "codex:a".to_owned(),
+            window_kind: "weekly_all".to_owned(),
+            window_scope: None,
+            window_start: "2026-08-04T16:00:00Z".to_owned(),
+            percent: 21.0,
+            resets_at: "2026-08-11T15:59:00Z".to_owned(),
+            observed_at: "2026-08-11T15:59:30Z".to_owned(),
+        };
+        let now = OffsetDateTime::parse("2026-08-11T16:00:00Z", &Rfc3339).unwrap();
+        let mut warnings = BTreeSet::new();
+
+        let report = build_window_report(
+            &window,
+            "codex",
+            &[],
+            None,
+            None,
+            &BTreeMap::new(),
+            false,
+            DEFAULT_PREMIUM_CAP_RATIO,
+            now,
+            &mut warnings,
+        );
+
+        assert!(report.stale);
+        assert_eq!(report.account_percent, None);
+        assert_eq!(report.last_known_percent, 21.0);
+        assert_eq!(report.sample_age_seconds, Some(30));
     }
 
     #[test]
