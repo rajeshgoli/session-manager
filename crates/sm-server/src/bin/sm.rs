@@ -2579,6 +2579,11 @@ fn run_usage(client: &ApiClient, args: UsageArgs) -> Result<()> {
     if args.account && (args.agent.is_some() || args.include_children) {
         bail!("--account is mutually exclusive with AGENT and --include-children");
     }
+    let current_session_id = optional_current_session_id();
+    let account_view = usage_uses_account_view(&args, current_session_id.as_deref());
+    if account_view && args.include_children {
+        bail!("--include-children requires AGENT or a managed session context");
+    }
     let mut query = Vec::new();
     if args.include_children {
         query.push("include_children=true");
@@ -2594,13 +2599,14 @@ fn run_usage(client: &ApiClient, args: UsageArgs) -> Result<()> {
     } else {
         format!("?{}", query.join("&"))
     };
-    let payload = if args.account {
+    let payload = if account_view {
         client.get_json(&format!("/usage/accounts{query}"))?
     } else {
         let target = match args.agent {
             Some(identifier) => lookup_identifier_exact(client, &identifier)?
                 .ok_or_else(|| anyhow!("No agent named '{identifier}' is reachable."))?,
-            None => current_session_id()?,
+            None => current_session_id
+                .ok_or_else(|| anyhow!("SESSION_MANAGER_ID is required to report status"))?,
         };
         client.get_json(&format!(
             "/sessions/{}/usage{query}",
@@ -2615,12 +2621,20 @@ fn run_usage(client: &ApiClient, args: UsageArgs) -> Result<()> {
     Ok(())
 }
 
+fn usage_uses_account_view(args: &UsageArgs, current_session_id: Option<&str>) -> bool {
+    args.account || (args.agent.is_none() && current_session_id.is_none())
+}
+
 fn print_usage_report(payload: &Value) {
     if let Some(target) = payload.get("target").filter(|target| !target.is_null()) {
         let id = target["seat_id"].as_str().unwrap_or("unknown");
         let name = target["friendly_name"].as_str().unwrap_or(id);
         let descendants = target["descendant_count"].as_u64().unwrap_or(0);
-        println!("{name} ({id}) · {descendants} descendants · prior weights");
+        if descendants > 0 {
+            println!("{name} ({id}) · {descendants} descendants · prior weights");
+        } else {
+            println!("{name} ({id}) · prior weights");
+        }
     } else {
         println!("account usage · prior weights");
     }
@@ -4386,6 +4400,51 @@ mod tests {
         };
         assert!(children.usage);
         assert_eq!(children.session_id.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn usage_defaults_to_accounts_only_without_a_managed_or_explicit_seat() {
+        let args = UsageArgs {
+            agent: None,
+            include_children: false,
+            since_reset: false,
+            account: false,
+            by_model: false,
+            json: false,
+        };
+        assert!(usage_uses_account_view(&args, None));
+        assert!(!usage_uses_account_view(&args, Some("managed-seat")));
+
+        let explicit = UsageArgs {
+            agent: Some("worker".to_owned()),
+            ..args
+        };
+        assert!(!usage_uses_account_view(&explicit, None));
+    }
+
+    #[test]
+    fn unmanaged_bare_usage_requests_the_account_endpoint() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
+        env::remove_var("SESSION_MANAGER_ID");
+        env::remove_var("CLAUDE_SESSION_MANAGER_ID");
+        let (client, server) = start_lookup_server([(
+            "/usage/accounts",
+            200,
+            r#"{"mode":"prior","accounts":[],"warnings":[],"residual":null}"#,
+        )]);
+        let args = UsageArgs {
+            agent: None,
+            include_children: false,
+            since_reset: false,
+            account: false,
+            by_model: false,
+            json: false,
+        };
+
+        run_usage(&client, args).unwrap();
+
+        assert_eq!(server.join().unwrap(), ["/usage/accounts"]);
     }
 
     #[test]
