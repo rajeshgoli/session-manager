@@ -68,6 +68,7 @@ pub struct SessionStore {
     /// an unrelated request to happen to flush it.
     delivery_runtime: Option<TmuxRuntime>,
     codex_fork_handoff_monitors: Arc<Mutex<BTreeSet<String>>>,
+    seat_session_appends: Arc<Mutex<BTreeSet<(String, String, String)>>>,
     clear_operation_locks: Arc<Mutex<BTreeMap<String, Weak<SessionClearLock>>>>,
     seat_session_store: SeatSessionStore,
     usage_identity_store: Option<UsageIdentityStore>,
@@ -120,6 +121,7 @@ impl SessionStore {
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
+            seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
             usage_identity_store: None,
@@ -391,6 +393,20 @@ impl SessionStore {
         provider_session_id: &str,
         artifact_path: Option<&str>,
     ) {
+        let append_key = (
+            seat_id.to_owned(),
+            provider.to_owned(),
+            provider_session_id.to_owned(),
+        );
+        {
+            let Ok(mut appends) = self.seat_session_appends.lock() else {
+                eprintln!("usage ledger seat session append lock poisoned");
+                return;
+            };
+            if !appends.insert(append_key.clone()) {
+                return;
+            }
+        }
         let Err(error) =
             self.seat_session_store
                 .append(seat_id, provider, provider_session_id, artifact_path)
@@ -401,10 +417,15 @@ impl SessionStore {
             "usage ledger failed to append provider session {provider_session_id} for seat {seat_id}: {error:#}"
         );
         if !usage_ledger_error_is_transient(&error) {
+            if let Ok(mut appends) = self.seat_session_appends.lock() {
+                appends.remove(&append_key);
+            }
             return;
         }
 
         let store = self.seat_session_store.clone();
+        let appends = self.seat_session_appends.clone();
+        let retry_key = append_key.clone();
         let seat_id = seat_id.to_owned();
         let provider = provider.to_owned();
         let provider_session_id = provider_session_id.to_owned();
@@ -428,18 +449,27 @@ impl SessionStore {
                             eprintln!(
                                 "usage ledger exhausted retries for provider session {provider_session_id} on seat {seat_id}: {error:#}"
                             );
+                            if let Ok(mut appends) = appends.lock() {
+                                appends.remove(&retry_key);
+                            }
                         }
                     }
                     Err(error) => {
                         eprintln!(
                             "usage ledger retry failed permanently for provider session {provider_session_id} on seat {seat_id}: {error:#}"
                         );
+                        if let Ok(mut appends) = appends.lock() {
+                            appends.remove(&retry_key);
+                        }
                         return;
                     }
                 }
             }
         }) {
             eprintln!("failed to start usage ledger retry thread: {error}");
+            if let Ok(mut appends) = self.seat_session_appends.lock() {
+                appends.remove(&append_key);
+            }
         }
     }
 
@@ -637,6 +667,7 @@ impl SessionStore {
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
+            seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
             usage_identity_store: None,
@@ -4021,8 +4052,11 @@ impl SessionStore {
 
         let mut changed = false;
         let provider_resume_id = codex_fork_provider_resume_id(event);
+        let provider_resume_id_changed = provider_resume_id.as_deref().is_some_and(|value| {
+            json_text(session.get("provider_resume_id")).as_deref() != Some(value)
+        });
         if let Some(provider_resume_id) = provider_resume_id.as_deref() {
-            if json_text(session.get("provider_resume_id")).as_deref() != Some(provider_resume_id) {
+            if provider_resume_id_changed {
                 session.insert(
                     "provider_resume_id".to_owned(),
                     Value::String(provider_resume_id.to_owned()),
@@ -9942,6 +9976,57 @@ mod tests {
                 .as_deref(),
             Some("thread-after-handoff")
         );
+    }
+
+    #[test]
+    fn repeated_codex_session_identity_does_not_rewrite_the_provider_chain() {
+        let state_file = unique_temp_path("codex-session-chain-repeat");
+        let usage_db_path = state_file.with_extension("usage.db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "provider_resume_id": "existing-thread",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+        store
+            .seat_session_store
+            .append("codex001", "codex-fork", "existing-thread", None)
+            .unwrap();
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"account/rateLimits/updated","session_id":"existing-thread","payload":{"rateLimits":{}}}"#,
+            )
+            .unwrap();
+        let connection = rusqlite::Connection::open(usage_db_path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let started = Instant::now();
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"account/rateLimits/updated","session_id":"existing-thread","payload":{"rateLimits":{}}}"#,
+            )
+            .unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an unchanged provider identity attempted another usage DB write"
+        );
+        connection.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]
