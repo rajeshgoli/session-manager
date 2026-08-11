@@ -258,25 +258,24 @@ impl UsageBurnStore {
             ) else {
                 continue;
             };
-            let has_update = update.get("usedPercent").is_some()
-                || update.get("used_percent").is_some()
-                || update.get("resetsAt").is_some()
-                || update.get("resets_at").is_some()
-                || update.get("resets_in_seconds").is_some();
-            if !has_update {
-                continue;
-            }
-            let window_kind = format!("codex_{duration_minutes}");
-            let previous =
-                self.latest_window(&attribution.account_key, &window_kind, scope.as_deref())?;
-            let percent = json_f64(
+            let percent_update = json_f64(
                 update
                     .get("usedPercent")
                     .or_else(|| update.get("used_percent")),
-            )
-            .or_else(|| previous.as_ref().map(|window| window.0));
-            let resets_at = codex_reset_at(update, observed_at)
-                .or_else(|| previous.as_ref().map(|window| window.1));
+            );
+            let reset_update = codex_reset_at(update, observed_at);
+            if percent_update.is_none() && reset_update.is_none() {
+                continue;
+            }
+            let window_kind = format!("codex_{duration_minutes}");
+            let previous = self.latest_window(
+                &attribution.account_key,
+                &window_kind,
+                scope.as_deref(),
+                observed_at,
+            )?;
+            let percent = percent_update.or_else(|| previous.as_ref().map(|window| window.0));
+            let resets_at = reset_update.or_else(|| previous.as_ref().map(|window| window.1));
             let (Some(percent), Some(resets_at)) = (percent, resets_at) else {
                 continue;
             };
@@ -303,8 +302,10 @@ impl UsageBurnStore {
         account_key: &str,
         window_kind: &str,
         window_scope: Option<&str>,
+        observed_at: OffsetDateTime,
     ) -> Result<Option<(f64, OffsetDateTime)>> {
         let connection = self.open()?;
+        let observed_at = format_timestamp(observed_at)?;
         let row = connection
             .query_row(
                 r#"
@@ -313,10 +314,11 @@ impl UsageBurnStore {
                 WHERE account_key = ?1
                   AND window_kind = ?2
                   AND window_scope IS ?3
+                  AND observed_at <= ?4
                 ORDER BY observed_at DESC, id DESC
                 LIMIT 1
                 "#,
-                params![account_key, window_kind, window_scope],
+                params![account_key, window_kind, window_scope, observed_at],
                 |row| Ok((row.get::<_, f64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
@@ -687,7 +689,11 @@ mod tests {
             "ts": "2026-08-10T12:03:00Z",
             "payload": {"rateLimits": {
                 "limitId": "codex",
-                "primary": {"windowDurationMins": 10080}
+                "primary": {
+                    "usedPercent": null,
+                    "windowDurationMins": 10080,
+                    "resetsAt": null
+                }
             }}
         });
         assert_eq!(
@@ -773,5 +779,75 @@ mod tests {
             .unwrap();
         assert_eq!(latest.0, 20.0);
         assert_eq!(latest.1, "2026-08-10T12:01:00.950000000Z");
+    }
+
+    #[test]
+    fn codex_sparse_merge_does_not_inherit_from_future_samples() {
+        let db_path = temp_db("codex-out-of-order");
+        seed_account(
+            &db_path,
+            Provider::Codex,
+            "codex-account",
+            "2026-08-10T12:00:00Z",
+        );
+        let store = UsageBurnStore::new(&db_path).unwrap();
+        for (timestamp, percent, reset) in [
+            ("2026-08-10T12:01:00Z", 10, 1786381200_i64),
+            ("2026-08-10T12:03:00Z", 30, 1786384800_i64),
+        ] {
+            let event = json!({
+                "event_type": "account/rateLimits/updated",
+                "ts": timestamp,
+                "payload": {"rateLimits": {
+                    "limitId": "codex",
+                    "primary": {
+                        "usedPercent": percent,
+                        "windowDurationMins": 300,
+                        "resetsAt": reset
+                    }
+                }}
+            });
+            assert_eq!(
+                store
+                    .record_codex_event(event.as_object().unwrap(), at(timestamp))
+                    .unwrap(),
+                1
+            );
+        }
+        let delayed = json!({
+            "event_type": "account/rateLimits/updated",
+            "ts": "2026-08-10T12:02:00Z",
+            "payload": {"rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                    "windowDurationMins": 300,
+                    "resetsAt": 1786383000_i64
+                }
+            }}
+        });
+        assert_eq!(
+            store
+                .record_codex_event(delayed.as_object().unwrap(), at("2026-08-10T12:04:00Z"))
+                .unwrap(),
+            1
+        );
+
+        let connection = Connection::open(db_path).unwrap();
+        let delayed_percent: f64 = connection
+            .query_row(
+                "SELECT percent FROM burn_samples WHERE observed_at = '2026-08-10T12:02:00.000000000Z'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let latest_percent: f64 = connection
+            .query_row(
+                "SELECT percent FROM burn_samples ORDER BY observed_at DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(delayed_percent, 10.0);
+        assert_eq!(latest_percent, 30.0);
     }
 }
