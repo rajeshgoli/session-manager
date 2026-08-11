@@ -313,19 +313,15 @@ impl SessionStore {
             return Ok(false);
         };
         let provider = json_text(session.get("provider")).unwrap_or_else(|| "claude".to_owned());
+        let mut seat_session_appends = Vec::new();
         if provider == "claude" {
             let previous_transcript_path = json_text(session.get("transcript_path"));
             let previous_provider_resume_id = previous_transcript_path
                 .as_deref()
                 .and_then(provider_resume_id_from_transcript_path)
                 .or_else(|| json_text(session.get("provider_resume_id")));
-            if let Some(previous_provider_resume_id) = previous_provider_resume_id.as_deref() {
-                self.append_seat_session(
-                    session_id,
-                    &provider,
-                    previous_provider_resume_id,
-                    previous_transcript_path.as_deref(),
-                );
+            if let Some(previous_provider_resume_id) = previous_provider_resume_id {
+                seat_session_appends.push((previous_provider_resume_id, previous_transcript_path));
             }
         }
         let provider_resume_id = if provider == "claude" {
@@ -334,9 +330,21 @@ impl SessionStore {
             None
         };
         if let Some(provider_resume_id) = provider_resume_id.as_deref() {
-            self.append_seat_session(session_id, &provider, provider_resume_id, transcript_path);
+            seat_session_appends.push((
+                provider_resume_id.to_owned(),
+                transcript_path.map(ToOwned::to_owned),
+            ));
         }
         if normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped" {
+            drop(_guard);
+            for (provider_resume_id, artifact_path) in seat_session_appends {
+                self.append_seat_session(
+                    session_id,
+                    &provider,
+                    &provider_resume_id,
+                    artifact_path.as_deref(),
+                );
+            }
             return Ok(false);
         }
 
@@ -417,6 +425,15 @@ impl SessionStore {
             }
         }
         self.write_raw_json_value(&state)?;
+        drop(_guard);
+        for (provider_resume_id, artifact_path) in seat_session_appends {
+            self.append_seat_session(
+                session_id,
+                &provider,
+                &provider_resume_id,
+                artifact_path.as_deref(),
+            );
+        }
         Ok(!superseded)
     }
 
@@ -7968,6 +7985,68 @@ mod tests {
 
         assert_eq!(session.status, "idle");
         assert_eq!(projected_activity_state(&session, &session.status), "idle");
+    }
+
+    #[test]
+    fn claude_stop_hook_releases_session_lock_before_blocked_ledger_write() {
+        let store = store_with_running_claude_session("stopledgerlock");
+        store
+            .seat_session_store
+            .append("seed", "claude", "seed-thread", None)
+            .unwrap();
+        let usage_db_path = store.state_file.with_extension("usage.db");
+        let connection = rusqlite::Connection::open(usage_db_path).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let stop_store = store.clone();
+        let stop = thread::spawn(move || {
+            stop_store.apply_claude_stop_hook(
+                "stopledgerlock",
+                None,
+                None,
+                None,
+                Some("/tmp/rebound-thread.jsonl"),
+                None,
+                None,
+            )
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let persisted_before_unlock = loop {
+            if store
+                .get_session("stopledgerlock")
+                .unwrap()
+                .and_then(|session| session.transcript_path)
+                .as_deref()
+                == Some("/tmp/rebound-thread.jsonl")
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let mutation_elapsed = if persisted_before_unlock {
+            let started = Instant::now();
+            assert!(store
+                .apply_claude_pre_tool_use_hook("stopledgerlock", Some("Read"))
+                .unwrap());
+            Some(started.elapsed())
+        } else {
+            None
+        };
+
+        connection.execute_batch("ROLLBACK").unwrap();
+        assert!(stop.join().unwrap().unwrap());
+        assert!(
+            persisted_before_unlock,
+            "core Stop state remained behind the blocked usage ledger"
+        );
+        assert!(
+            mutation_elapsed.is_some_and(|elapsed| elapsed < Duration::from_secs(1)),
+            "the global session lock remained held during the usage ledger wait"
+        );
     }
 
     #[test]
