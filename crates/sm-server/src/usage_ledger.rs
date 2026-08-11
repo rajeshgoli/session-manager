@@ -21,7 +21,7 @@ use crate::{
 
 const USAGE_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const PROJECT_KEY_GIT_TIMEOUT: Duration = Duration::from_secs(1);
-const LEDGER_WRITE_BATCH_SIZE: usize = 256;
+const LEDGER_WRITE_BATCH_SIZE: usize = 16;
 const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
     "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z"
 );
