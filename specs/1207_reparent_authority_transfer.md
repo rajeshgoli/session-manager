@@ -78,6 +78,7 @@ The operation freezes the ordered set of live direct children at request
 creation. Any change to the source parent, target edge, or frozen live-child set
 makes the request stale. Stopped children preserve historical lineage.
 
+Only the source, target, or source's live parent may initiate a tree request.
 The source and target must approve. When source has a live parent, that
 grandparent must approve because its own direct-child edge changes. A root
 source needs no extra human approval: source explicitly approves its own
@@ -156,7 +157,25 @@ failure_reason
 topology_fingerprint
 apply_stage                nullable | routing_quiesced |
                            authority_committed
+apply_plan                 nullable while pending; immutable once applying
 ```
+
+`apply_plan` is versioned and contains the complete retry input rather than a
+query that recovery would rerun:
+
+```text
+version
+edge_changes[]             session ID, expected old parent, new parent
+json_routing_changes[]     record kind/ID, expected old target, new target
+queue_routing_changes[]    table/record ID, child ID, expected old target,
+                           new target, prior active state
+```
+
+The transition from `pending` to `applying` discovers these exact records once
+under the state lock and persists the plan before quiescing anything. Recovery
+uses only this plan plus expected-value checks. A route created after planning
+must derive its parent from the canonical graph and is not retroactively folded
+into the in-flight plan.
 
 The topology fingerprint is a canonical hash over operation kind, subject,
 target, expected parent, and sorted frozen live children. Revalidation compares
@@ -179,6 +198,7 @@ Request creation and apply both reject:
 - a target already equal to the current parent;
 - cycles, including a new parent inside the subject's descendant set;
 - single-edge initiation by anyone except current or proposed parent;
+- tree initiation by anyone except source, target, or source's live parent;
 - tree promotion where target is not source's live direct child;
 - duplicate active requests whose affected edge sets overlap;
 - a topology that changed after request creation.
