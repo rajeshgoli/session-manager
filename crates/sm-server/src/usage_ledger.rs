@@ -564,8 +564,8 @@ impl UsageLedgerStore {
         };
         let mtime_ns = file_mtime_ns(&metadata);
         let file_len = metadata.len();
-        if artifact.provider == "codex" {
-            self.scan_classic_codex_burn(artifact, file_len, mtime_ns)?;
+        if matches!(artifact.provider.as_str(), "codex" | "codex-fork") {
+            self.scan_codex_burn(artifact, file_len, mtime_ns)?;
         }
         let connection = self.open()?;
         let saved = connection
@@ -679,12 +679,7 @@ impl UsageLedgerStore {
         Ok(summary)
     }
 
-    fn scan_classic_codex_burn(
-        &self,
-        artifact: &Artifact,
-        file_len: u64,
-        mtime_ns: i64,
-    ) -> Result<()> {
+    fn scan_codex_burn(&self, artifact: &Artifact, file_len: u64, mtime_ns: i64) -> Result<()> {
         let artifact_path = artifact.path.to_string_lossy();
         let saved = self
             .open()?
@@ -704,7 +699,7 @@ impl UsageLedgerStore {
 
         let mut reader = BufReader::new(fs::File::open(&artifact.path).with_context(|| {
             format!(
-                "failed to open classic Codex burn artifact {}",
+                "failed to open Codex burn artifact {}",
                 artifact.path.display()
             )
         })?);
@@ -2844,6 +2839,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(percent, 25.0);
+        assert_eq!(source, "codex_event");
+        assert_eq!(observed_at, "2026-08-10T16:20:00.000000000Z");
+    }
+
+    #[test]
+    fn codex_fork_scan_backfills_persisted_rate_limits_after_restart() {
+        let dir = TestDir::new("codex-fork-burn");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Codex,
+            "account-one",
+            "pro",
+            "codex_300",
+            300,
+        );
+        let artifact = dir.0.join("events.jsonl");
+        let reset = at("2026-08-10T21:00:00Z").unix_timestamp();
+        fs::write(
+            &artifact,
+            format!(
+                "{}\n",
+                json!({
+                    "event_type": "account/rateLimits/updated",
+                    "ts": "2026-08-10T16:20:00Z",
+                    "payload": {"rateLimits": {
+                        "limitId": "codex",
+                        "primary": {
+                            "usedPercent": 31,
+                            "windowDurationMins": 300,
+                            "resetsAt": reset
+                        }
+                    }}
+                })
+            ),
+        )
+        .unwrap();
+        SeatSessionStore::new(&db_path)
+            .append("seat-one", "codex-fork", "thread-one", artifact.to_str())
+            .unwrap();
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        let metadata = fs::metadata(&artifact).unwrap();
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO scan_offsets (artifact_path, byte_offset, mtime_ns, scanned_at) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    artifact.to_string_lossy().as_ref(),
+                    metadata.len(),
+                    file_mtime_ns(&metadata),
+                    "2026-08-10T16:21:00.000000000Z"
+                ],
+            )
+            .unwrap();
+
+        store.scan(&[]).unwrap();
+
+        let (percent, source, observed_at): (f64, String, String) = Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT percent, source, observed_at FROM burn_samples WHERE source = 'codex_event' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(percent, 31.0);
         assert_eq!(source, "codex_event");
         assert_eq!(observed_at, "2026-08-10T16:20:00.000000000Z");
     }

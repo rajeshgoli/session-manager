@@ -217,6 +217,13 @@ impl SessionStore {
             return Ok(ScanSummary::default());
         };
         let records = self.load_snapshot()?.into_sessions();
+        let observed_at = OffsetDateTime::now_utc();
+        for record in records
+            .iter()
+            .filter(|record| matches!(record.provider.as_str(), "codex" | "codex-fork"))
+        {
+            self.record_session_account_key(&record.id, UsageProvider::Codex, observed_at)?;
+        }
         self.repair_current_codex_usage_artifacts(&records)?;
         let by_id = records
             .iter()
@@ -12234,6 +12241,57 @@ mod tests {
                 27.0,
                 "codex_event".to_owned(),
             )
+        );
+    }
+
+    #[test]
+    fn usage_scan_persists_current_account_for_idle_classic_codex_seat() {
+        let state_file = unique_temp_path("codexscanaccount");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let usage_db_path = state_file.with_extension("usage.db");
+        let observed_at = OffsetDateTime::now_utc();
+        let identity_store = UsageIdentityStore::new(&usage_db_path).unwrap();
+        identity_store
+            .record_observation(
+                Provider::Codex,
+                Some(&AccountIdentity {
+                    provider: Provider::Codex,
+                    external_id: "idle-account".to_owned(),
+                    label: None,
+                    plan_tier: Some("pro".to_owned()),
+                    extra_usage_enabled: None,
+                }),
+                observed_at - TimeDuration::minutes(1),
+                None,
+                None,
+            )
+            .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file)
+            .with_usage_db_path(usage_db_path.clone())
+            .with_usage_identity_store(identity_store)
+            .with_usage_ledger_store(UsageLedgerStore::new(&usage_db_path).unwrap());
+
+        store.scan_usage_ledger().unwrap();
+
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().account_key,
+            Some("codex:idle-account".to_owned())
         );
     }
 
