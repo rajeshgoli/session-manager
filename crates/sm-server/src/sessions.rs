@@ -1404,6 +1404,12 @@ impl SessionStore {
         };
 
         let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
+        // Classic Codex rollouts are discovered by root and cwd, so that whole
+        // discovery domain must remain exclusive from the snapshot through bind.
+        let codex_cli_binding_guard = codex_cli_record
+            .as_ref()
+            .map(|record| self.lock_codex_cli_binding_operation(record))
+            .transpose()?;
         let codex_cli_clear_binding = codex_cli_record
             .map(|mut record| -> Result<_> {
                 let launched_at = OffsetDateTime::now_utc();
@@ -1548,6 +1554,7 @@ impl SessionStore {
                     ))
                     .spawn(move || {
                         let _clear_guard = clear_guard;
+                        let _binding_guard = codex_cli_binding_guard;
                         if let Err(error) = store.complete_deferred_codex_cli_rebind(
                             &deferred_session_id,
                             &record,
@@ -1618,20 +1625,35 @@ impl SessionStore {
     }
 
     fn lock_clear_operation(&self, session_id: &str) -> Result<SessionClearGuard> {
+        self.lock_named_clear_operation(session_id)
+    }
+
+    fn lock_codex_cli_binding_operation(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<SessionClearGuard> {
+        let sessions_root = resolve_path_lossy(self.codex_sessions_root.clone());
+        let working_dir = resolve_path_lossy(expand_home(&record.working_dir));
+        self.lock_named_clear_operation(&format!(
+            "codex-cli-binding:{sessions_root}\0{working_dir}"
+        ))
+    }
+
+    fn lock_named_clear_operation(&self, operation_key: &str) -> Result<SessionClearGuard> {
         let lock = {
             let mut locks = self
                 .clear_operation_locks
                 .lock()
                 .map_err(|_| anyhow::anyhow!("clear operation lock registry poisoned"))?;
             locks.retain(|_, lock| lock.strong_count() > 0);
-            if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+            if let Some(lock) = locks.get(operation_key).and_then(Weak::upgrade) {
                 lock
             } else {
                 let lock = Arc::new(SessionClearLock {
                     held: Mutex::new(false),
                     available: Condvar::new(),
                 });
-                locks.insert(session_id.to_owned(), Arc::downgrade(&lock));
+                locks.insert(operation_key.to_owned(), Arc::downgrade(&lock));
                 lock
             }
         };
@@ -9940,6 +9962,51 @@ mod tests {
         drop(first_guard);
         acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         second.join().unwrap();
+    }
+
+    #[test]
+    fn concurrent_codex_cli_bindings_for_the_same_discovery_domain_are_serialized() {
+        let temp_dir = unique_temp_path("codex-binding-operation-lock");
+        let state_file = temp_dir.join("sessions.json");
+        let sessions_root = temp_dir.join("codex-home").join("sessions");
+        let working_dir = temp_dir.join("repo");
+        fs::create_dir_all(&sessions_root).unwrap();
+        fs::create_dir_all(&working_dir).unwrap();
+        let mut store =
+            SessionStore::new_with_legacy_fallback(state_file.clone(), state_file.clone());
+        store.codex_sessions_root = sessions_root;
+        let mut first_record = session_record("running");
+        first_record.id = "codex001".to_owned();
+        first_record.provider = "codex".to_owned();
+        first_record.working_dir = working_dir.display().to_string();
+        let mut second_record = first_record.clone();
+        second_record.id = "codex002".to_owned();
+        let mut unrelated_record = first_record.clone();
+        unrelated_record.id = "codex003".to_owned();
+        unrelated_record.working_dir = temp_dir.join("other-repo").display().to_string();
+
+        let first_guard = store
+            .lock_codex_cli_binding_operation(&first_record)
+            .unwrap();
+        let second_store = store.clone();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let second = thread::spawn(move || {
+            let _guard = second_store
+                .lock_codex_cli_binding_operation(&second_record)
+                .unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+
+        assert!(acquired_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        let _unrelated_guard = store
+            .lock_codex_cli_binding_operation(&unrelated_record)
+            .unwrap();
+        drop(first_guard);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        second.join().unwrap();
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
