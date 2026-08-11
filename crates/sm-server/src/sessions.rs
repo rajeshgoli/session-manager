@@ -1195,83 +1195,109 @@ impl SessionStore {
         request: ClearSessionRequest,
         runtime: &TmuxRuntime,
     ) -> Result<CoreClearOutcome> {
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let claimed_provider_resume_ids = sessions
-            .iter()
-            .filter_map(|session| json_text(session.get("provider_resume_id")))
-            .collect::<BTreeSet<_>>();
-        let Some(session) = session_object_mut(sessions, session_id) else {
-            return Ok(CoreClearOutcome::NotFound);
-        };
-        if let Some(message) =
-            clear_authorization_error(session, request.requester_session_id.as_deref())
-        {
-            return Ok(CoreClearOutcome::Unauthorized(message));
-        }
-        let node = json_text(session.get("node")).unwrap_or_else(default_node);
-        ensure_runtime_local_node(&node)?;
-        let tmux_session = json_text(session.get("tmux_session"))
-            .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
-        let session_socket_name = json_text(session.get("tmux_socket_name"));
-        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
-        let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
-        let clear_command = if matches!(provider.as_str(), "codex" | "codex-fork") {
-            "/new"
-        } else {
-            "/clear"
-        };
-        let codex_cli_clear_binding = (provider == "codex").then(|| -> Result<_> {
-            let mut record =
-                serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
-            if let Some(previous_provider_resume_id) = record.provider_resume_id.as_deref() {
-                self.append_seat_session(session_id, &provider, previous_provider_resume_id, None);
-            }
-            let launched_at = OffsetDateTime::now_utc();
-            // `/new` writes under today's rollout directory, which may be far
-            // from the seat's original creation date.
-            record.created_at = launched_at
-                .format(&Rfc3339)
-                .context("failed to format Codex clear timestamp")?;
-            let mut excluded_ids = claimed_provider_resume_ids;
-            excluded_ids.extend(codex_cli_existing_session_ids(
-                &record,
-                &self.codex_sessions_root,
-            ));
-            Ok((record, excluded_ids, launched_at.unix_timestamp_nanos()))
-        });
-        let codex_cli_clear_binding = codex_cli_clear_binding.transpose()?;
-        let codex_fork_clear_binding = (provider == "codex-fork")
-            .then(|| -> Result<_> {
-                let spec = codex_fork_spec_for_session_raw(session_id, session)?;
-                let artifacts = session_runtime
-                    .codex_fork_runtime_artifacts(&spec)?
-                    .ok_or_else(|| anyhow::anyhow!("session {session_id} has no fork artifacts"))?;
-                if let Some(previous_provider_resume_id) =
-                    json_text(session.get("provider_resume_id"))
-                {
-                    self.append_seat_session(
-                        session_id,
-                        &provider,
-                        &previous_provider_resume_id,
-                        artifacts.event_stream_path.to_str(),
-                    );
-                }
-                let initial_offset = fs::metadata(&artifacts.event_stream_path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0);
-                Ok((artifacts.event_stream_path, initial_offset))
-            })
-            .transpose()?;
         let prompt = request
             .prompt
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
-        let wake_completed =
-            json_text(session.get("completion_status")).is_some_and(|value| value == "completed");
+        let (
+            tmux_session,
+            session_socket_name,
+            provider,
+            wake_completed,
+            claimed_provider_resume_ids,
+            codex_cli_record,
+            codex_fork_spec,
+            previous_provider_resume_id,
+        ) = {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let claimed_provider_resume_ids = sessions
+                .iter()
+                .filter_map(|session| json_text(session.get("provider_resume_id")))
+                .collect::<BTreeSet<_>>();
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(CoreClearOutcome::NotFound);
+            };
+            if let Some(message) =
+                clear_authorization_error(session, request.requester_session_id.as_deref())
+            {
+                return Ok(CoreClearOutcome::Unauthorized(message));
+            }
+            let node = json_text(session.get("node")).unwrap_or_else(default_node);
+            ensure_runtime_local_node(&node)?;
+            let tmux_session = json_text(session.get("tmux_session"))
+                .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+            let session_socket_name = json_text(session.get("tmux_socket_name"));
+            let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
+            let wake_completed = json_text(session.get("completion_status"))
+                .is_some_and(|value| value == "completed");
+            let previous_provider_resume_id = json_text(session.get("provider_resume_id"));
+            let codex_cli_record = (provider == "codex")
+                .then(|| serde_json::from_value::<SessionRecord>(Value::Object(session.clone())))
+                .transpose()?;
+            let codex_fork_spec = (provider == "codex-fork")
+                .then(|| codex_fork_spec_for_session_raw(session_id, session))
+                .transpose()?;
+            (
+                tmux_session,
+                session_socket_name,
+                provider,
+                wake_completed,
+                claimed_provider_resume_ids,
+                codex_cli_record,
+                codex_fork_spec,
+                previous_provider_resume_id,
+            )
+        };
+
+        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
+        let codex_cli_clear_binding = codex_cli_record
+            .map(|mut record| -> Result<_> {
+                let launched_at = OffsetDateTime::now_utc();
+                // `/new` writes under today's rollout directory, which may be far
+                // from the seat's original creation date.
+                record.created_at = launched_at
+                    .format(&Rfc3339)
+                    .context("failed to format Codex clear timestamp")?;
+                let mut excluded_ids = claimed_provider_resume_ids;
+                excluded_ids.extend(codex_cli_existing_session_ids(
+                    &record,
+                    &self.codex_sessions_root,
+                ));
+                Ok((record, excluded_ids, launched_at.unix_timestamp_nanos()))
+            })
+            .transpose()?;
+        let codex_fork_clear_binding = codex_fork_spec
+            .map(|spec| -> Result<_> {
+                let artifacts = session_runtime
+                    .codex_fork_runtime_artifacts(&spec)?
+                    .ok_or_else(|| anyhow::anyhow!("session {session_id} has no fork artifacts"))?;
+                let initial_offset = fs::metadata(&artifacts.event_stream_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                Ok((artifacts.event_stream_path, initial_offset))
+            })
+            .transpose()?;
+        if matches!(provider.as_str(), "codex" | "codex-fork") {
+            if let Some(previous_provider_resume_id) = previous_provider_resume_id.as_deref() {
+                self.append_seat_session(
+                    session_id,
+                    &provider,
+                    previous_provider_resume_id,
+                    codex_fork_clear_binding
+                        .as_ref()
+                        .and_then(|(event_stream_path, _)| event_stream_path.to_str()),
+                );
+            }
+        }
+        let clear_command = if matches!(provider.as_str(), "codex" | "codex-fork") {
+            "/new"
+        } else {
+            "/clear"
+        };
         let delivered = session_runtime.clear_session(
             &tmux_session,
             clear_command,
@@ -1281,50 +1307,80 @@ impl SessionStore {
         if !delivered {
             return Err(anyhow::anyhow!("tmux session is not running"));
         }
-        if let Some((record, excluded_ids, launched_at_ns)) = codex_cli_clear_binding {
-            if let Some(provider_resume_id) = wait_for_codex_cli_provider_resume_id(
+        let replacement_provider_resume_id = if let Some((record, excluded_ids, launched_at_ns)) =
+            codex_cli_clear_binding
+        {
+            let provider_resume_id = wait_for_codex_cli_provider_resume_id(
                 &record,
                 &self.codex_sessions_root,
                 &excluded_ids,
                 launched_at_ns,
                 CODEX_CLI_SESSION_BIND_TIMEOUT,
+            );
+            if provider_resume_id.is_none() {
+                eprintln!("failed to discover replacement Codex thread for seat {session_id}");
+            }
+            provider_resume_id.map(|provider_resume_id| (provider_resume_id, None))
+        } else if let Some((event_stream_path, initial_offset)) = codex_fork_clear_binding.as_ref()
+        {
+            match wait_for_codex_fork_provider_resume_id_after_offset(
+                event_stream_path,
+                *initial_offset,
+                CODEX_FORK_THREAD_STARTED_TIMEOUT,
             ) {
+                Ok(provider_resume_id) => Some((
+                    provider_resume_id,
+                    event_stream_path.to_str().map(ToOwned::to_owned),
+                )),
+                Err(error) => {
+                    eprintln!(
+                            "failed to discover replacement codex-fork thread for seat {session_id}: {error:#}"
+                        );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.cancel_context_monitor_alerts(session_id)?;
+
+        {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(CoreClearOutcome::NotFound);
+            };
+            let current_node = json_text(session.get("node")).unwrap_or_else(default_node);
+            ensure_runtime_local_node(&current_node)?;
+            let current_tmux_session = json_text(session.get("tmux_session"));
+            let current_socket_name = json_text(session.get("tmux_socket_name"));
+            let current_provider =
+                json_text(session.get("provider")).unwrap_or_else(default_provider);
+            if current_tmux_session.as_deref() != Some(tmux_session.as_str())
+                || current_socket_name != session_socket_name
+                || current_provider != provider
+            {
+                anyhow::bail!("session {session_id} changed while clear was in progress");
+            }
+            if let Some((provider_resume_id, _)) = replacement_provider_resume_id.as_ref() {
                 session.insert(
                     "provider_resume_id".to_owned(),
                     Value::String(provider_resume_id.clone()),
                 );
-                self.append_seat_session(session_id, &provider, &provider_resume_id, None);
-            } else {
-                eprintln!("failed to discover replacement Codex thread for seat {session_id}");
             }
+            let now = now_rfc3339();
+            reset_session_after_clear(session, &now);
+            self.write_raw_json_value(&state)?;
         }
-        if let Some((event_stream_path, initial_offset)) = codex_fork_clear_binding {
-            match wait_for_codex_fork_provider_resume_id_after_offset(
-                &event_stream_path,
-                initial_offset,
-                CODEX_FORK_THREAD_STARTED_TIMEOUT,
-            ) {
-                Ok(provider_resume_id) => {
-                    session.insert(
-                        "provider_resume_id".to_owned(),
-                        Value::String(provider_resume_id.clone()),
-                    );
-                    self.append_seat_session(
-                        session_id,
-                        &provider,
-                        &provider_resume_id,
-                        event_stream_path.to_str(),
-                    );
-                }
-                Err(error) => eprintln!(
-                    "failed to discover replacement codex-fork thread for seat {session_id}: {error:#}"
-                ),
-            }
+        if let Some((provider_resume_id, artifact_path)) = replacement_provider_resume_id {
+            self.append_seat_session(
+                session_id,
+                &provider,
+                &provider_resume_id,
+                artifact_path.as_deref(),
+            );
         }
-        let now = now_rfc3339();
-        reset_session_after_clear(session, &now);
-        self.cancel_context_monitor_alerts(session_id)?;
-        self.write_raw_json_value(&state)?;
         Ok(CoreClearOutcome::Cleared(CoreClearResult {
             status: "cleared".to_owned(),
             session_id: session_id.to_owned(),
@@ -8893,6 +8949,67 @@ mod tests {
     }
 
     #[test]
+    fn codex_fork_clear_wait_does_not_hold_the_session_mutex() {
+        let Some(fixture) = CodexForkHandoffFixture::new("clear-unlocked") else {
+            return;
+        };
+        fixture.kill_tmux();
+        fixture.start_delayed_clear_tmux();
+        let mut state: Value =
+            serde_json::from_slice(&fs::read(&fixture.state_file).unwrap()).unwrap();
+        session_object_mut(ensure_sessions_array_mut(&mut state).unwrap(), "codex001")
+            .unwrap()
+            .insert(
+                "parent_session_id".to_owned(),
+                Value::String("parent01".to_owned()),
+            );
+        fs::write(&fixture.state_file, serde_json::to_vec(&state).unwrap()).unwrap();
+        let store = fixture.store();
+        let clear_store = store.clone();
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default());
+        let clear = thread::spawn(move || {
+            clear_store.clear_core_session_with_runtime(
+                "codex001",
+                ClearSessionRequest {
+                    prompt: None,
+                    requester_session_id: Some("parent01".to_owned()),
+                },
+                &runtime,
+            )
+        });
+
+        thread::sleep(Duration::from_millis(250));
+        if clear.is_finished() {
+            let pane = fixture.capture_pane();
+            let result = clear.join().unwrap();
+            panic!("clear completed before the delayed identity event: {result:?}; pane={pane:?}");
+        }
+        let started = Instant::now();
+        assert!(store
+            .apply_claude_pre_tool_use_hook("codex001", Some("Read"))
+            .unwrap());
+        let mutation_elapsed = started.elapsed();
+
+        assert!(matches!(
+            clear.join().unwrap().unwrap(),
+            CoreClearOutcome::Cleared(_)
+        ));
+        assert!(
+            mutation_elapsed < Duration::from_secs(1),
+            "the global session lock remained held during fork identity discovery"
+        );
+        assert_eq!(
+            store
+                .get_session("codex001")
+                .unwrap()
+                .unwrap()
+                .provider_resume_id
+                .as_deref(),
+            Some("new-thread")
+        );
+    }
+
+    #[test]
     fn codex_fork_handoff_executes_after_turn_complete() {
         let Some(fixture) = CodexForkHandoffFixture::new("execute") else {
             return;
@@ -9221,6 +9338,14 @@ mod tests {
             );
         }
 
+        fn start_delayed_clear_tmux(&self) {
+            start_codex_fork_delayed_clear_tmux(
+                &self.tmux_socket,
+                &self.tmux_session,
+                &self.event_stream_path,
+            );
+        }
+
         fn wait_for_handoff_error(&self, store: &SessionStore) {
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
@@ -9255,6 +9380,20 @@ mod tests {
         let script = r#"event_file=$1; pending=; printf '› '; while IFS= read -r line; do if [ "${line%/new}" != "$line" ]; then printf '{"event_type":"thread/started","payload":{"thread":{"id":"new-thread"}}}\n' >> "$event_file"; printf 'received:%s\n› ' "$line"; elif [ -n "$pending" ]; then printf '{"event_type":"op_submitted","payload":{"UserTurn":{"items":[{"type":"text","text":"%s"}]}}}\n' "$pending" >> "$event_file"; pending=; printf '\n› '; elif [ "${line#Read }" != "$line" ]; then pending=$line; printf 'received:%s\n› %s' "$line" "$line"; else printf 'received:%s\n› ' "$line"; fi; done"#;
         let command = format!(
             "/bin/sh -lc {} handoff-shell {}",
+            shell_quote_handoff_fixture(script),
+            shell_quote_handoff_fixture(&event_stream_path.display().to_string())
+        );
+        let status = Command::new("tmux")
+            .args(["-L", socket, "new-session", "-d", "-s", session, &command])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    fn start_codex_fork_delayed_clear_tmux(socket: &str, session: &str, event_stream_path: &Path) {
+        let script = r#"event_file=$1; printf '› '; while IFS= read -r line; do if [ "${line%/new}" != "$line" ]; then sleep 1; printf '{"event_type":"thread/started","payload":{"thread":{"id":"new-thread"}}}\n' >> "$event_file"; printf 'received:%s\n› ' "$line"; else printf 'received:%s\n› ' "$line"; fi; done"#;
+        let command = format!(
+            "/bin/sh -lc {} clear-shell {}",
             shell_quote_handoff_fixture(script),
             shell_quote_handoff_fixture(&event_stream_path.display().to_string())
         );
