@@ -371,7 +371,7 @@ impl AppState {
     pub fn new(config: AppConfig) -> Self {
         let state_file = expand_home(&config.paths.state_file);
         let queue_db_path = expand_home(&config.sm_send.db_path);
-        let session_store = SessionStore::new_with_queue(state_file, queue_db_path)
+        let mut session_store = SessionStore::new_with_queue(state_file, queue_db_path)
             .with_codex_session_index_path(config.codex.session_index_path.as_deref())
             .with_claude_transcript_root(config.claude.transcript_root.as_deref())
             .with_context_monitor_config(config.context_monitor.clone())
@@ -381,6 +381,9 @@ impl AppState {
                     .runtime_enabled
                     .then(|| TmuxRuntime::from_app_config(&config)),
             );
+        if !config.usage.db_path.trim().is_empty() {
+            session_store = session_store.with_usage_db_path(expand_home(&config.usage.db_path));
+        }
         if let Err(error) = session_store.recover_pending_codex_fork_handoffs() {
             eprintln!("codex-fork handoff recovery failed: {error:#}");
         }

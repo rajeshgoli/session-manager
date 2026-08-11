@@ -123,6 +123,17 @@ impl SessionStore {
         store
     }
 
+    pub fn with_usage_db_path(mut self, db_path: PathBuf) -> Self {
+        // Test and fixture registries keep their derived sibling DB unless the
+        // caller selected a non-default usage path explicitly.
+        if self.state_file == expand_home(DEFAULT_SESSION_STATE_FILE)
+            || db_path != SeatSessionStore::default_db_path()
+        {
+            self.seat_session_store = SeatSessionStore::new(db_path);
+        }
+        self
+    }
+
     pub fn with_context_monitor_config(mut self, config: ContextMonitorConfig) -> Self {
         self.context_monitor = config;
         self

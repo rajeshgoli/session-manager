@@ -20,16 +20,26 @@ pub struct SeatSessionStore {
 }
 
 impl SeatSessionStore {
+    pub fn new(db_path: impl Into<PathBuf>) -> Self {
+        Self {
+            db_path: db_path.into(),
+        }
+    }
+
+    pub(crate) fn default_db_path() -> PathBuf {
+        expand_home(DEFAULT_USAGE_DB_PATH)
+    }
+
     pub fn for_state_file(state_file: &Path) -> Self {
         let default_state_file = expand_home("~/.local/share/claude-sessions/sessions.json");
         let db_path = if state_file == default_state_file {
-            expand_home(DEFAULT_USAGE_DB_PATH)
+            Self::default_db_path()
         } else {
             // Alternate registries (including tests) get an isolated ledger.
             // The default production registry still uses the spec's usage.db.
             state_file.with_extension("usage.db")
         };
-        Self { db_path }
+        Self::new(db_path)
     }
 
     pub fn append(
