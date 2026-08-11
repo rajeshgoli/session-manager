@@ -592,12 +592,7 @@ fn build_window_report(
         burn_by_seat.values().sum()
     };
     let cap_consumed_percent = target
-        .filter(|target| {
-            target
-                .account_key
-                .as_deref()
-                .is_none_or(|account_key| account_key == window.account_key)
-        })
+        .filter(|target| target.account_key.as_deref() == Some(window.account_key.as_str()))
         .and_then(|target| target.usage_cap_fraction)
         .filter(|fraction| *fraction > 0.0)
         .filter(|_| {
