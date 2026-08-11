@@ -218,11 +218,13 @@ impl SessionStore {
         };
         let records = self.load_snapshot()?.into_sessions();
         let observed_at = OffsetDateTime::now_utc();
-        for record in records
-            .iter()
-            .filter(|record| matches!(record.provider.as_str(), "codex" | "codex-fork"))
-        {
-            self.record_session_account_key(&record.id, UsageProvider::Codex, observed_at)?;
+        for record in &records {
+            let provider = match record.provider.as_str() {
+                "claude" => UsageProvider::Claude,
+                "codex" | "codex-fork" => UsageProvider::Codex,
+                _ => continue,
+            };
+            self.record_session_account_key(&record.id, provider, observed_at)?;
         }
         self.repair_current_codex_usage_artifacts(&records)?;
         let by_id = records
@@ -12245,21 +12247,33 @@ mod tests {
     }
 
     #[test]
-    fn usage_scan_persists_current_account_for_idle_classic_codex_seat() {
+    fn usage_scan_persists_current_accounts_for_idle_seats() {
         let state_file = unique_temp_path("codexscanaccount");
         fs::write(
             &state_file,
             json!({
-                "sessions": [{
-                    "id": "codex001",
-                    "name": "codex-codex001",
-                    "provider": "codex",
-                    "working_dir": "/repo",
-                    "tmux_session": "codex-codex001",
-                    "status": "running",
-                    "created_at": "2026-06-01T00:00:00",
-                    "last_activity": "2026-06-01T00:01:00"
-                }]
+                "sessions": [
+                    {
+                        "id": "codex001",
+                        "name": "codex-codex001",
+                        "provider": "codex",
+                        "working_dir": "/repo",
+                        "tmux_session": "codex-codex001",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00",
+                        "last_activity": "2026-06-01T00:01:00"
+                    },
+                    {
+                        "id": "claude001",
+                        "name": "claude-claude001",
+                        "provider": "claude",
+                        "working_dir": "/repo",
+                        "tmux_session": "claude-claude001",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00",
+                        "last_activity": "2026-06-01T00:01:00"
+                    }
+                ]
             })
             .to_string(),
         )
@@ -12282,6 +12296,21 @@ mod tests {
                 None,
             )
             .unwrap();
+        identity_store
+            .record_observation(
+                Provider::Claude,
+                Some(&AccountIdentity {
+                    provider: Provider::Claude,
+                    external_id: "idle-account".to_owned(),
+                    label: None,
+                    plan_tier: Some("max".to_owned()),
+                    extra_usage_enabled: None,
+                }),
+                observed_at - TimeDuration::minutes(1),
+                None,
+                None,
+            )
+            .unwrap();
         let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file)
             .with_usage_db_path(usage_db_path.clone())
             .with_usage_identity_store(identity_store)
@@ -12292,6 +12321,10 @@ mod tests {
         assert_eq!(
             store.get_session("codex001").unwrap().unwrap().account_key,
             Some("codex:idle-account".to_owned())
+        );
+        assert_eq!(
+            store.get_session("claude001").unwrap().unwrap().account_key,
+            Some("claude:idle-account".to_owned())
         );
     }
 

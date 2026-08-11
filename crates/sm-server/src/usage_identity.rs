@@ -309,18 +309,18 @@ impl UsageIdentityStore {
         Ok(())
     }
 
-    /// Backfill the assumed interval required when open windows contain messages
-    /// older than the first identity poll. This may be called after the scanner
-    /// discovers the true earliest timestamp; it always uses the account from the
-    /// provider's first genuinely observed timeline row.
+    /// Backfill the assumed interval required when artifacts contain messages
+    /// older than the first identity poll. The scanner prefers an open-window
+    /// boundary when burn data exists and otherwise preserves all unscanned
+    /// history; the account always comes from the first observed timeline row.
     pub fn ensure_bootstrap_interval(
         &self,
         provider: Provider,
-        earliest_open_message_at: OffsetDateTime,
+        earliest_message_at: OffsetDateTime,
     ) -> Result<bool> {
         let mut conn = self.open()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = ensure_bootstrap_interval_tx(&tx, provider, earliest_open_message_at)?;
+        let changed = ensure_bootstrap_interval_tx(&tx, provider, earliest_message_at)?;
         tx.commit()?;
         Ok(changed)
     }

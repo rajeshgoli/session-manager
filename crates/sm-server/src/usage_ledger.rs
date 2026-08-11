@@ -758,9 +758,9 @@ impl UsageLedgerStore {
             params![provider.as_str(), now],
             |row| row.get::<_, Option<String>>(0),
         )?;
-        let Some(open_from) = open_from.and_then(|value| parse_timestamp(&value).ok()) else {
-            return Ok(());
-        };
+        let open_from = open_from
+            .and_then(|value| parse_timestamp(&value).ok())
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH);
         let Some(earliest) = earliest_message_at_or_after(artifact, offset, open_from)? else {
             return Ok(());
         };
@@ -2910,7 +2910,7 @@ mod tests {
     }
 
     #[test]
-    fn skipped_codex_history_sets_the_cumulative_baseline_before_attribution() {
+    fn codex_history_is_attributed_when_no_burn_window_exists() {
         let dir = TestDir::new("codex-pre-identity-baseline");
         let db_path = dir.0.join("usage.db");
         seed_provider(
@@ -2957,7 +2957,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!((message_count, total_tokens), (1, 50));
+        assert_eq!((message_count, total_tokens), (2, 150));
         let cursor_total: i64 = connection
             .query_row(
                 "SELECT last_total_tokens FROM codex_thread_cursor WHERE thread_id = 'thread-one'",
@@ -3133,7 +3133,7 @@ mod tests {
     }
 
     #[test]
-    fn scanner_skips_pre_identity_history_when_no_burn_window_exists() {
+    fn scanner_bootstraps_identity_when_no_burn_window_exists() {
         let dir = TestDir::new("no-burn-bootstrap-boundary");
         let db_path = dir.0.join("usage.db");
         let account = identity(Provider::Claude, "account-one", "max");
@@ -3203,7 +3203,16 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        assert_eq!(ledger_ids, vec!["message-current"]);
+        assert_eq!(ledger_ids, vec!["message-current", "message-old"]);
+        let assumed: (String, String) = connection
+            .query_row(
+                "SELECT from_ts, to_ts FROM account_timeline WHERE provider = 'claude' AND is_assumed = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(assumed.0, "2026-08-10T14:00:00.000000000Z");
+        assert_eq!(assumed.1, "2026-08-10T15:00:00.000000000Z");
         let window_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM message_window", [], |row| row.get(0))
             .unwrap();
