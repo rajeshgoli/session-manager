@@ -268,11 +268,10 @@ impl SessionStore {
             .collect::<BTreeSet<_>>();
         let codex_artifact_paths =
             codex_cli_artifact_paths(&self.codex_sessions_root, &current_codex_ids);
-        let mut sessions = records
+        let current_identities = records
             .iter()
             .filter_map(|session| {
                 provider_resume_id_for_restore(session).map(|provider_session_id| {
-                    claimed.insert((session.provider.clone(), provider_session_id.clone()));
                     let artifact_path = fork_artifact_paths
                         .get(&session.id)
                         .map(|path| path.display().to_string())
@@ -292,6 +291,38 @@ impl SessionStore {
                 })
             })
             .collect::<Vec<_>>();
+        let mut current_by_provider_session = BTreeMap::<_, Vec<_>>::new();
+        for identity in current_identities {
+            current_by_provider_session
+                .entry((
+                    identity.provider.clone(),
+                    identity.provider_session_id.clone(),
+                ))
+                .or_default()
+                .push(identity);
+        }
+        let mut sessions = Vec::with_capacity(current_by_provider_session.len());
+        for ((provider, provider_session_id), mut identities) in current_by_provider_session {
+            claimed.insert((provider.clone(), provider_session_id.clone()));
+            if identities.len() == 1 {
+                sessions.push(identities.pop().expect("one current identity"));
+                continue;
+            }
+            let artifact_path = identities
+                .first()
+                .and_then(|identity| identity.artifact_path.clone())
+                .filter(|path| {
+                    identities
+                        .iter()
+                        .all(|identity| identity.artifact_path.as_deref() == Some(path))
+                });
+            sessions.push(SeatSessionIdentity {
+                seat_id: "unassigned".to_owned(),
+                provider,
+                provider_session_id,
+                artifact_path,
+            });
+        }
         sessions.extend(historical_claude_seat_sessions(
             &records,
             &self.claude_projects_roots,
@@ -9625,6 +9656,75 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn startup_reconciliation_marks_duplicate_current_identity_unassigned() {
+        let state_file = unique_temp_path("seat-session-duplicate-current");
+        let usage_db_path = state_file.with_extension("usage.db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    {
+                        "id": "claude001",
+                        "name": "claude-claude001",
+                        "provider": "claude",
+                        "provider_resume_id": "shared-thread",
+                        "transcript_path": "/repo/one/shared-thread.jsonl",
+                        "working_dir": "/repo",
+                        "tmux_session": "claude-claude001",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00Z",
+                        "last_activity": "2026-06-01T00:01:00Z"
+                    },
+                    {
+                        "id": "claude002",
+                        "name": "claude-claude002",
+                        "provider": "claude",
+                        "provider_resume_id": "shared-thread",
+                        "transcript_path": "/repo/two/shared-thread.jsonl",
+                        "working_dir": "/repo",
+                        "tmux_session": "claude-claude002",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00Z",
+                        "last_activity": "2026-06-01T00:01:00Z"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+
+        store.reconcile_current_seat_sessions().unwrap();
+
+        let connection = rusqlite::Connection::open(usage_db_path).unwrap();
+        let rows = connection
+            .prepare(
+                "SELECT seat_id, provider, provider_session_id, artifact_path FROM seat_sessions",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "unassigned".to_owned(),
+                "claude".to_owned(),
+                "shared-thread".to_owned(),
+                None,
+            )]
+        );
     }
 
     #[test]
