@@ -118,11 +118,12 @@ use crate::sessions::{
     ContextUsageEvent, ContextUsageOutcome, CoreClearOutcome, CoreInputBatchResponse,
     CoreInputBatchResult, CoreRestoreOutcome, CoreRetireOutcome, CoreReviewOutcome,
     CreateCoreSessionRequest, HandoffOutcome, HandoffRequest, MaintainerMutationOutcome,
-    RegistryMutationOutcome, RoleRegistrationRequest, SendCoreInputBatchRequest,
-    SendCoreInputRequest, SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore,
-    SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest,
-    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
-    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
+    RegistryMutationOutcome, RoleRegistrationRequest, SeatSessionReconciliationSnapshot,
+    SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
+    SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
+    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
+    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
+    UpdateSessionMetadataRequest,
 };
 
 use crate::studio_ssh::{self, StudioSshStatus};
@@ -424,6 +425,21 @@ impl AppState {
 
     pub fn reconcile_current_seat_sessions(&self) -> anyhow::Result<()> {
         self.session_store.reconcile_current_seat_sessions()
+    }
+
+    pub fn prepare_seat_session_reconciliation(
+        &self,
+        artifact_cutoff_ns: i128,
+    ) -> anyhow::Result<SeatSessionReconciliationSnapshot> {
+        self.session_store
+            .prepare_seat_session_reconciliation(artifact_cutoff_ns)
+    }
+
+    pub fn reconcile_seat_sessions(
+        &self,
+        snapshot: SeatSessionReconciliationSnapshot,
+    ) -> anyhow::Result<()> {
+        self.session_store.reconcile_seat_sessions(snapshot)
     }
 }
 

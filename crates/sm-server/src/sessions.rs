@@ -69,6 +69,12 @@ pub struct SessionStore {
 }
 
 #[derive(Debug)]
+pub struct SeatSessionReconciliationSnapshot {
+    records: Vec<SessionRecord>,
+    artifact_cutoff_ns: i128,
+}
+
+#[derive(Debug)]
 struct SessionClearLock {
     held: Mutex<bool>,
     available: Condvar,
@@ -195,7 +201,34 @@ impl SessionStore {
     }
 
     pub fn reconcile_current_seat_sessions(&self) -> Result<()> {
-        let records = self.load_snapshot()?.into_sessions();
+        let snapshot = self.prepare_seat_session_reconciliation(i128::MAX)?;
+        self.reconcile_seat_sessions(snapshot)
+    }
+
+    #[cfg(test)]
+    fn reconcile_current_seat_sessions_through(&self, artifact_cutoff_ns: i128) -> Result<()> {
+        let snapshot = self.prepare_seat_session_reconciliation(artifact_cutoff_ns)?;
+        self.reconcile_seat_sessions(snapshot)
+    }
+
+    pub fn prepare_seat_session_reconciliation(
+        &self,
+        artifact_cutoff_ns: i128,
+    ) -> Result<SeatSessionReconciliationSnapshot> {
+        Ok(SeatSessionReconciliationSnapshot {
+            records: self.load_snapshot()?.into_sessions(),
+            artifact_cutoff_ns,
+        })
+    }
+
+    pub fn reconcile_seat_sessions(
+        &self,
+        snapshot: SeatSessionReconciliationSnapshot,
+    ) -> Result<()> {
+        let SeatSessionReconciliationSnapshot {
+            records,
+            artifact_cutoff_ns,
+        } = snapshot;
         let mut claim_attempt = 0;
         let mut claimed = loop {
             match self.seat_session_store.claimed_provider_sessions() {
@@ -223,19 +256,33 @@ impl SessionStore {
                     .collect::<BTreeMap<_, _>>()
             })
             .unwrap_or_default();
+        let current_codex_ids = records
+            .iter()
+            .filter(|session| session.provider == "codex")
+            .filter_map(provider_resume_id_for_restore)
+            .collect::<BTreeSet<_>>();
+        let codex_artifact_paths =
+            codex_cli_artifact_paths(&self.codex_sessions_root, &current_codex_ids);
         let mut sessions = records
             .iter()
             .filter_map(|session| {
                 provider_resume_id_for_restore(session).map(|provider_session_id| {
                     claimed.insert((session.provider.clone(), provider_session_id.clone()));
+                    let artifact_path = fork_artifact_paths
+                        .get(&session.id)
+                        .map(|path| path.display().to_string())
+                        .or_else(|| {
+                            (session.provider == "codex")
+                                .then(|| codex_artifact_paths.get(&provider_session_id))
+                                .flatten()
+                                .map(|path| resolve_path_lossy(path.clone()))
+                        })
+                        .or_else(|| session.transcript_path.clone());
                     SeatSessionIdentity {
                         seat_id: session.id.clone(),
                         provider: session.provider.clone(),
                         provider_session_id,
-                        artifact_path: fork_artifact_paths
-                            .get(&session.id)
-                            .map(|path| path.display().to_string())
-                            .or_else(|| session.transcript_path.clone()),
+                        artifact_path,
                     }
                 })
             })
@@ -243,11 +290,13 @@ impl SessionStore {
         sessions.extend(historical_claude_seat_sessions(
             &records,
             &self.claude_projects_root,
+            artifact_cutoff_ns,
             &mut claimed,
         ));
         sessions.extend(historical_codex_cli_seat_sessions(
             &records,
             &self.codex_sessions_root,
+            artifact_cutoff_ns,
             &mut claimed,
         ));
         if let Some(runtime) = self.delivery_runtime.as_ref() {
@@ -6801,6 +6850,7 @@ struct ClaudeTranscriptMetadata {
 fn historical_claude_seat_sessions(
     sessions: &[SessionRecord],
     projects_root: &Path,
+    artifact_cutoff_ns: i128,
     claimed: &mut BTreeSet<(String, String)>,
 ) -> Vec<SeatSessionIdentity> {
     let mut project_dirs = BTreeMap::<PathBuf, BTreeSet<String>>::new();
@@ -6837,6 +6887,9 @@ fn historical_claude_seat_sessions(
             }
             let artifact_start = metadata.started_at_ns.unwrap_or(metadata.mtime_ns);
             let artifact_end = metadata.ended_at_ns.unwrap_or(metadata.mtime_ns);
+            if artifact_start > artifact_cutoff_ns {
+                continue;
+            }
             let matching_seats = sessions
                 .iter()
                 .filter(|session| session.provider == "claude")
@@ -6873,6 +6926,7 @@ fn historical_claude_seat_sessions(
 fn historical_codex_cli_seat_sessions(
     sessions: &[SessionRecord],
     sessions_root: &Path,
+    artifact_cutoff_ns: i128,
     claimed: &mut BTreeSet<(String, String)>,
 ) -> Vec<SeatSessionIdentity> {
     let codex_seats = sessions
@@ -6908,6 +6962,9 @@ fn historical_codex_cli_seat_sessions(
         let started_at_ns = started_at_ns
             .or_else(|| file_mtime_ns(&path).ok())
             .unwrap_or(0);
+        if started_at_ns > artifact_cutoff_ns {
+            continue;
+        }
         let ended_at_ns = codex_transcript_end_ns(&path, started_at_ns);
         let matching_seats = matching_cwd_seats
             .into_iter()
@@ -6931,6 +6988,25 @@ fn historical_codex_cli_seat_sessions(
         });
     }
     identities
+}
+
+fn codex_cli_artifact_paths(
+    sessions_root: &Path,
+    provider_session_ids: &BTreeSet<String>,
+) -> BTreeMap<String, PathBuf> {
+    if provider_session_ids.is_empty() {
+        return BTreeMap::new();
+    }
+    let mut paths = BTreeMap::new();
+    for path in jsonl_files_recursive(sessions_root) {
+        let Some((provider_session_id, _, _)) = read_codex_cli_session_metadata(&path) else {
+            continue;
+        };
+        if provider_session_ids.contains(&provider_session_id) {
+            paths.entry(provider_session_id).or_insert(path);
+        }
+    }
+    paths
 }
 
 fn codex_transcript_end_ns(path: &Path, started_at_ns: i128) -> i128 {
@@ -9506,6 +9582,7 @@ mod tests {
         };
         rollout("historical-thread", "2026-01-02T00:00:00Z");
         rollout("current-thread", "2026-01-03T00:00:00Z");
+        rollout("post-snapshot-thread", "2026-01-04T00:00:00Z");
         fs::write(
             &state_file,
             json!({
@@ -9528,7 +9605,11 @@ mod tests {
             SessionStore::new_with_legacy_fallback(state_file.clone(), state_file.clone());
         store.codex_sessions_root = sessions_root;
 
-        store.reconcile_current_seat_sessions().unwrap();
+        store
+            .reconcile_current_seat_sessions_through(
+                parse_timestamp_ns("2026-01-03T12:00:00Z").unwrap(),
+            )
+            .unwrap();
 
         let connection = rusqlite::Connection::open(state_file.with_extension("usage.db")).unwrap();
         let mut statement = connection
@@ -9545,6 +9626,14 @@ mod tests {
             ids,
             vec!["current-thread".to_owned(), "historical-thread".to_owned()]
         );
+        let paths: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'codex001' AND artifact_path IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(paths, 2);
     }
 
     #[test]
