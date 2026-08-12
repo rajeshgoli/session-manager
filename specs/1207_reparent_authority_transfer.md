@@ -33,6 +33,8 @@ sm reparent request <child> --to <new-parent>
 sm reparent approve <request-id>
 sm reparent reject <request-id>
 sm reparent status [request-id]
+sm reparent repair <request-id> --resume
+sm reparent repair <request-id> --rollback-precommit
 sm adopt <child>
 ```
 
@@ -148,7 +150,7 @@ required_agent_approvals
 required_human_approval    boolean
 approvals[]                actor kind/id, decision, timestamp
 status                     pending | applying | applied | rejected |
-                           stale | expired | failed
+                           stale | expired | failed | repaired
 created_at
 expires_at
 decided_at
@@ -156,9 +158,11 @@ applied_at
 failure_reason
 topology_fingerprint
 apply_stage                nullable | routing_quiesced |
-                           authority_committed
+                           authority_committed | repair_rolled_back
 apply_plan                 nullable while pending; immutable once applying
 notification_intents[]     deterministic event/recipient delivery records
+repair_history[]           actor, action, prior failure, timestamp,
+                           verified post-state fingerprint
 ```
 
 `apply_plan` is versioned and contains the complete retry input rather than a
@@ -200,7 +204,9 @@ Request creation and apply both reject:
 - empty, missing, stopped, or unsupported source/target sessions;
 - self-parenting;
 - a target already equal to the current parent;
-- cycles, including a new parent inside the subject's descendant set;
+- for single-edge requests, a new parent inside the subject's current
+  descendant set;
+- for tree requests, any cycle in the complete planned post-transaction graph;
 - single-edge initiation by anyone except current or proposed parent;
 - tree initiation by anyone except source, target, or source's live parent;
 - tree promotion where target is not source's live direct child;
@@ -210,7 +216,10 @@ Request creation and apply both reject:
 - a topology that changed after request creation.
 
 Apply revalidates all identities, liveness, topology, consent, and cycle
-conditions while holding the session-state write lock.
+conditions while holding the session-state write lock. Tree cycle validation
+first applies every planned edge replacement to an in-memory graph and then
+checks the resulting graph; it must not reject merely because the target is a
+current direct child of the source.
 
 ## Routing and authority transaction
 
@@ -279,9 +288,28 @@ not a released terminal edge. Its complete affected edge set stays reserved by
 the overlap fence, parent-derived route creation remains deferred for those
 children, and no later request may include any reserved edge. Only an
 authenticated operator repair action may either resume the immutable plan or
-verify and record a consistent replacement topology before clearing the
-quarantine. Merely rejecting, expiring, deleting, or recreating the request
-cannot release it.
+restore and verify its exact pre-commit state before clearing the quarantine.
+Merely rejecting, expiring, deleting, or recreating the request cannot release
+it.
+
+The authenticated human repair route supports exactly two audited actions:
+
+1. `resume` records a repair attempt, changes `failed` back to `applying`, and
+   retries the same immutable plan from its persisted stage. It never replans.
+2. `rollback_precommit` is accepted only from `routing_quiesced`, before
+   `authority_committed`. Under the routing fence, the server restores every
+   route to the apply plan's exact recorded pre-state, verifies all parent edges
+   still match the old topology and all runtime/JSON/SQLite routes match that
+   pre-state, then atomically records `status=repaired` and
+   `apply_stage=repair_rolled_back`. Any mismatch leaves the request failed and
+   quarantined.
+
+At or after `authority_committed`, only forward `resume` is available because
+new authority may already have been observed. A successful retry ends
+`applied`; a verified pre-commit rollback ends `repaired`. Those are the only
+transitions that release the quarantine. Each attempt appends `repair_history`
+with the authenticated human actor, action, prior failure, timestamp, and hash
+of the verified resulting graph and routing state.
 
 No network delivery occurs while holding the write lock. Approval and outcome
 notification intents are persisted in the same JSON transition that creates
@@ -317,12 +345,16 @@ POST /reparent-requests/{request_id}/approve
 POST /reparent-requests/{request_id}/reject
 POST /reparent-requests/{request_id}/human-approve
 POST /reparent-requests/{request_id}/human-reject
+POST /reparent-requests/{request_id}/repair
 ```
 
 Creation payloads carry `requester_session_id`; decision payloads carry the same
 for agent routes. Human routes ignore agent IDs and use request authentication.
 List defaults to requests involving the caller or requiring human action.
 Operator watch can list all pending human-gated requests.
+The repair route is operator-authenticated only and accepts
+`action=resume|rollback_precommit`; an agent session credential cannot invoke
+it. `sm watch` exposes the same actions with the stage-specific safety text.
 
 HTTP status conventions:
 
@@ -370,6 +402,8 @@ focused tests. No request may apply yet.
 
 Add single-edge apply, routing reconciliation, fail-closed recovery, and tests
 that direct-child retire/kill authority and supervision follow the new edge.
+This phase also implements durable repair transitions and their authenticated
+HTTP route; Phase 3 adds their CLI/watch UX.
 
 ### Phase 2 - #1211
 
@@ -396,6 +430,8 @@ PR targets `main`. Partial phases are not deployed.
   graph immediately after apply.
 - Pending and `applying` requests recover correctly after restart at every
   durable stage.
+- Post-quiesce failures retain their overlap/routing fence; only a successful
+  immutable-plan retry or verified pre-commit rollback releases it.
 - Legacy pending adoption records cannot auto-apply.
 - Rust CLI parser/dispatch and Python watch interaction tests pass.
 - Full Rust and retained Python test suites pass, or any demonstrably preexisting
