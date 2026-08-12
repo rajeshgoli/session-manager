@@ -198,6 +198,14 @@ repair_history[]           actor, action, prior failure, timestamp,
                            verified post-state fingerprint
 ```
 
+The state root also has one `reparent_apply_lease` containing request ID and
+acquisition timestamp. Pending consent requests may coexist, but only the lease
+holder may enter `applying`, quiesce routes, or commit authority. A failed
+transaction retains the lease until a retry applies it or a verified rollback
+repairs it. Authority transactions are intentionally serialized globally;
+reparenting is rare, and avoiding cross-plan cycle races is more important than
+parallel apply throughput.
+
 `apply_plan` is versioned and contains the complete retry input rather than a
 query that recovery would rerun:
 
@@ -210,9 +218,11 @@ queue_routing_changes[]    table/record ID, child ID, expected old target,
 ```
 
 The transition from `pending` to `applying` discovers these exact records once
-under the state lock and atomically persists both the plan and a durable
-topology/routing fence before quiescing anything. Recovery uses only this plan
-plus expected-value checks.
+under the state lock and atomically acquires the empty global apply lease while
+persisting both the plan and a durable topology/routing fence. If another
+request holds the lease, an approved request remains pending and ready rather
+than partially applying. Recovery uses only the persisted plan plus
+expected-value checks.
 
 While the fence covers a session, create/spawn with that session as parent,
 restore of a stopped child, explicit retire/stop, and any parent-edge mutation
@@ -317,10 +327,11 @@ retargeted during apply.
 The JSON state file and queue SQLite cannot share an ACID transaction. Apply is
 therefore a recoverable, fail-closed staged operation:
 
-1. Under the session write lock, revalidate and atomically persist
-   `status=applying`, the complete immutable plan, and its topology/routing
-   fence. Parent edges remain unchanged. Every conflicting topology mutation
-   checks this fence under the same lock.
+1. Under the session write lock, require an empty global apply lease,
+   revalidate, and atomically persist the lease, `status=applying`, the complete
+   immutable plan, and its topology/routing fence. Parent edges remain
+   unchanged. Every conflicting topology mutation checks this fence under the
+   same lock.
 2. Through the queue coordinator's routing fence, stop and remove each affected
    in-memory parent-wake task/registration. Under the session-state lock,
    atomically mark every affected retained JSON parent-wake registration
@@ -332,9 +343,13 @@ therefore a recoverable, fail-closed staged operation:
    plan entry's recorded pre-state or its exact already-quiesced state; any
    third state fails closed. On process restart, inactive JSON and SQLite rows
    cannot recreate the stopped runtime tasks.
-3. In one atomic JSON replacement, update all parent edges and JSON-backed
-   routing, and persist `apply_stage=authority_committed`. Dynamic
-   task-complete and wait-monitor delivery now resolves this canonical edge.
+3. Under the session write lock and while still holding the global lease,
+   revalidate the complete current graph and planned post-transaction graph a
+   second time. If either differs from the frozen plan or contains a cycle,
+   take the pre-commit stale/rollback path. Otherwise, in the same atomic JSON
+   replacement, update all parent edges and JSON-backed routing and persist
+   `apply_stage=authority_committed`. Dynamic task-complete and wait-monitor
+   delivery now resolves this canonical edge.
    Deferred routing intents are now eligible to resolve against the new graph;
    topology mutations remain fenced until their replay is durable.
 4. In one idempotent SQLite transaction, retarget and reactivate affected
@@ -342,8 +357,8 @@ therefore a recoverable, fail-closed staged operation:
    retained JSON registrations, then recreate their in-memory tasks with the
    new target under the routing fence, replay deferred routing intents against
    the new canonical parents, mark the JSON request `applied`, and release both
-   fences. Replay accepts an already-correct runtime registration and never
-   starts a duplicate task.
+   fences and the global apply lease. Replay accepts an already-correct runtime
+   registration and never starts a duplicate task.
 
 An interruption before step 3 exposes no new destructive authority and leaves
 old-parent routing paused rather than misdirected. An interruption after step 3
@@ -358,6 +373,11 @@ restoration fails, the request remains failed and quarantined. After authority
 commit, recovery completes the recorded transaction; it never silently rolls
 authority back to a topology that may already have been observed.
 
+The applied and stale/rollback paths clear the global lease only in the same
+final JSON replacement that records every deferred routing intent replayed.
+Failure at any stage retains the lease. Startup recovers the recorded lease
+holder before another ready request may acquire it.
+
 On startup, all `applying` reparent records are recovered through their durable
 stage before retained parent-wake tasks are recreated and before HTTP/input
 readiness. In particular, a crash after an in-memory task was stopped but before
@@ -367,7 +387,8 @@ still-active retained record.
 A `failed` request at or beyond `json_routing_quiesced` remains a durable
 quarantine, not a released terminal edge. Its complete affected edge set stays
 reserved by the overlap fence, parent-derived route creation remains deferred
-for those children, and no later request may include any reserved edge. Only an
+for those children, and its global apply lease prevents any later authority
+transaction from starting. Only an
 authenticated operator repair action may either resume the immutable plan or
 restore and verify its exact pre-commit state before clearing the quarantine.
 Merely rejecting, expiring, deleting, or recreating the request cannot release
@@ -513,6 +534,9 @@ PR targets `main`. Partial phases are not deployed.
 
 - All consent combinations, unauthorized actors, repeated decisions, expiry,
   staleness, self-parenting, and cycles have deterministic tests.
+- Ready requests apply under one durable global lease and revalidate the whole
+  planned graph immediately before commit; concurrent plans cannot jointly
+  create a cycle.
 - A regular reparent changes exactly one edge.
 - A tree promotion produces exactly the documented live graph and preserves
   stopped lineage.
