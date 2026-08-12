@@ -133,13 +133,15 @@ epic.
 Every runtime-backed create, normal restore, and recredential relaunch uses one
 durable launch coordinator. Before touching tmux, it persists a
 `session_runtime_launches` record with operation kind, session ID, frozen launch
-parameters and provider resume identity, status (`prepared | launching |
-applied | failed`), timestamps, and failure reason. It never stores the
-plaintext credential. Under the input fence, the coordinator stops any prior
-named runtime when required, generates a credential, and atomically persists
-its verifier plus `status=launching` before starting tmux. Only after the launch
-succeeds does one JSON replacement mark the session running and the launch
-applied.
+parameters and provider resume identity, an optional owning credential-rotation
+ID, status (`prepared | launching | applied | failed`), timestamps, and failure
+reason. It never stores the plaintext credential. Under the input fence, the
+coordinator stops any prior named runtime when required, generates a credential,
+and atomically persists its verifier plus `status=launching` before starting
+tmux. Only after the launch succeeds does one JSON replacement mark the session
+running and the launch applied. For `recredential`, that same replacement also
+marks the referenced `session_credential_rotations` record applied; no durable
+state may expose an applied launch with its owning rotation still relaunching.
 
 Startup completes every `prepared` or `launching` record synchronously before
 HTTP/input delivery becomes ready. Recovery kills any runtime with the frozen
@@ -298,9 +300,10 @@ Runtime creation and relaunch use a separate top-level
 `session_runtime_launches` collection. Each record stores an operation ID,
 operation kind (`create | restore | recredential`), session ID, frozen tmux and
 provider launch parameters, provider resume identity, credential verifier,
-status (`prepared | launching | applied | failed`), timestamps, and failure
-reason. The active record is the source of truth for startup recovery; neither
-it nor any other durable record contains the plaintext credential.
+optional owning credential-rotation ID, status (`prepared | launching | applied
+| failed`), timestamps, and failure reason. The active record is the source of
+truth for startup recovery; neither it nor any other durable record contains
+the plaintext credential.
 
 ## Validation
 
@@ -444,10 +447,13 @@ it.
 
 The authenticated human repair route supports exactly two audited actions:
 
-1. `resume` records a repair attempt, changes `failed` back to `applying`, and
-   continues the persisted stage. At `prequiesce_aborting` it can only finish
-   the abort; at later stages it retries the same immutable plan. It never
-   replans.
+1. `resume` is accepted only for a failed stage that still holds the global
+   lease: `prequiesce_aborting`, `json_routing_quiesced`, `routing_quiesced`, or
+   `authority_committed`. It records a repair attempt, changes `failed` back to
+   `applying`, and continues the persisted stage. At
+   `prequiesce_aborting` it can only finish the abort; at later stages it retries
+   the same immutable plan. It never replans. A completed
+   `prequiesce_aborted` request is terminal and cannot be resumed.
 2. `rollback_precommit` is accepted only from `json_routing_quiesced` or
    `routing_quiesced`, before `authority_committed`. Under the routing fence,
    the server restores every route to the apply plan's exact recorded
@@ -610,6 +616,9 @@ PR targets `main`. Partial phases are not deployed.
 - Create, normal restore, and recredential each recover a crash after tmux
   launch but before final persistence by replacing the unknowable runtime
   credential through the same durable launch coordinator.
+- A successful recredential launch marks its owning rotation applied in the
+  same JSON replacement as the session and launch; restart cannot strand a
+  relaunching rotation behind an already-applied launch.
 - Legacy pending adoption records cannot auto-apply.
 - Rust CLI parser/dispatch and Python watch interaction tests pass.
 - Full Rust and retained Python test suites pass, or any demonstrably preexisting
