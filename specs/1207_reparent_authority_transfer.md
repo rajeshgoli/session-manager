@@ -127,6 +127,12 @@ stopped resumes the recorded relaunch on startup. If resumability or readiness
 cannot be established, the old runtime remains untouched and the rotation
 fails closed. There is no force-active mode in this epic.
 
+Startup completes every `relaunching` credential rotation synchronously before
+HTTP/input delivery becomes ready. If the named tmux runtime exists, recovery
+kills it and relaunches once from the frozen provider identity; this safely
+handles a crash after launch but before the new verifier was persisted. Waiting
+rotations start background idle-proof workers only after startup recovery.
+
 Deployment does not silently relaunch the fleet. After the merged server is
 healthy, the maintainer runs `sm recredential --all-live`; the command reports
 which seats were rotated, waiting for idle, already credentialed, or failed.
@@ -321,6 +327,12 @@ quiesced, the request becomes stale. After quiescing, recovery completes the
 recorded transaction or reports a durable `failed` state requiring operator
 repair; it never silently rolls authority back to a topology that may already
 have been observed.
+
+On startup, all `applying` reparent records are recovered through their durable
+stage before retained parent-wake tasks are recreated and before HTTP/input
+readiness. In particular, a crash after an in-memory task was stopped but before
+`json_routing_quiesced` cannot briefly recreate an old-parent task from the
+still-active retained record.
 
 A `failed` request at or beyond `json_routing_quiesced` remains a durable
 quarantine, not a released terminal edge. Its complete affected edge set stays
