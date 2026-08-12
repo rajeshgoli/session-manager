@@ -1005,8 +1005,11 @@ impl SessionStore {
             return Ok(false);
         }
 
-        let (_input_guard, _guard) =
-            self.lock_session_input_then_state(&session_runtime, &rotation.tmux_session)?;
+        let (_clear_guard, _guard, _input_guard) = self.lock_credential_rotation_fences(
+            session_id,
+            &session_runtime,
+            &rotation.tmux_session,
+        )?;
         let mut state = self.load_raw_json_value()?;
         let mut rotations = session_credential_rotation_records(&state)?;
         let Some(rotation_index) = rotations
@@ -3127,6 +3130,22 @@ impl SessionStore {
 
     fn lock_clear_operation(&self, session_id: &str) -> Result<SessionClearGuard> {
         self.lock_named_clear_operation(session_id)
+    }
+
+    fn lock_credential_rotation_fences<'a>(
+        &'a self,
+        session_id: &str,
+        runtime: &TmuxRuntime,
+        tmux_session: &str,
+    ) -> Result<(
+        SessionClearGuard,
+        std::sync::MutexGuard<'a, ()>,
+        crate::runtime::SessionInputGuard,
+    )> {
+        let clear_guard = self.lock_clear_operation(session_id)?;
+        let state_guard = self.write_guard()?;
+        let input_guard = runtime.lock_session_input(tmux_session)?;
+        Ok((clear_guard, state_guard, input_guard))
     }
 
     fn lock_codex_cli_binding_operation(
@@ -5639,21 +5658,6 @@ impl SessionStore {
         self.write_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session state write lock poisoned"))
-    }
-
-    fn lock_session_input_then_state<'a>(
-        &'a self,
-        runtime: &TmuxRuntime,
-        tmux_session: &str,
-    ) -> Result<(
-        crate::runtime::SessionInputGuard,
-        std::sync::MutexGuard<'a, ()>,
-    )> {
-        // Claude handoff already holds this input fence before consulting durable
-        // state. Keep the same lock order for every operation that takes both.
-        let input_guard = runtime.lock_session_input(tmux_session)?;
-        let state_guard = self.write_guard()?;
-        Ok((input_guard, state_guard))
     }
 
     fn start_codex_fork_event_monitor(
@@ -11641,42 +11645,73 @@ mod tests {
     }
 
     #[test]
-    fn credential_rotation_waiting_for_input_does_not_hold_state_lock() {
-        let state_file = unique_temp_path("credential-rotation-lock-order");
+    fn credential_rotation_and_clear_share_one_seat_operation_fence() {
+        let state_file = unique_temp_path("credential-rotation-clear-fence");
         let store = SessionStore::new(state_file.clone());
+        let clear_guard = store.lock_clear_operation("codex001").unwrap();
         let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default());
-        let tmux_session = format!("lock-order-{}", generate_session_id());
-        let held_input = runtime.lock_session_input(&tmux_session).unwrap();
         let contender_store = store.clone();
         let contender_runtime = runtime.clone();
-        let contender_session = tmux_session.clone();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
         let contender = thread::spawn(move || {
             started_tx.send(()).unwrap();
             let _guards = contender_store
-                .lock_session_input_then_state(&contender_runtime, &contender_session)
+                .lock_credential_rotation_fences("codex001", &contender_runtime, "tmux-codex001")
                 .unwrap();
             acquired_tx.send(()).unwrap();
         });
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        thread::sleep(Duration::from_millis(50));
-
-        let state_store = store.clone();
-        let (state_tx, state_rx) = std::sync::mpsc::channel();
-        let state_writer = thread::spawn(move || {
-            let _guard = state_store.write_guard().unwrap();
-            state_tx.send(()).unwrap();
-        });
-        state_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("input waiter held the global state lock");
-        assert!(acquired_rx.try_recv().is_err());
-
-        drop(held_input);
+        assert!(acquired_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        drop(clear_guard);
         acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         contender.join().unwrap();
-        state_writer.join().unwrap();
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn credential_rotation_uses_the_send_state_then_input_lock_order() {
+        let state_file = unique_temp_path("credential-rotation-send-lock-order");
+        let store = SessionStore::new(state_file.clone());
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default());
+        let tmux_session = format!("lock-order-{}", generate_session_id());
+        let held_input = runtime.lock_session_input(&tmux_session).unwrap();
+        let send_store = store.clone();
+        let send_runtime = runtime.clone();
+        let send_session = tmux_session.clone();
+        let (send_state_tx, send_state_rx) = std::sync::mpsc::channel();
+        let (send_done_tx, send_done_rx) = std::sync::mpsc::channel();
+        let send = thread::spawn(move || {
+            let _state_guard = send_store.write_guard().unwrap();
+            send_state_tx.send(()).unwrap();
+            let _input_guard = send_runtime.lock_session_input(&send_session).unwrap();
+            send_done_tx.send(()).unwrap();
+        });
+        send_state_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let rotation_store = store.clone();
+        let rotation_runtime = runtime.clone();
+        let rotation_session = tmux_session.clone();
+        let (rotation_done_tx, rotation_done_rx) = std::sync::mpsc::channel();
+        let rotation = thread::spawn(move || {
+            let _guards = rotation_store
+                .lock_credential_rotation_fences("codex001", &rotation_runtime, &rotation_session)
+                .unwrap();
+            rotation_done_tx.send(()).unwrap();
+        });
+        assert!(rotation_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+
+        drop(held_input);
+        send_done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        rotation_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        send.join().unwrap();
+        rotation.join().unwrap();
         let _ = fs::remove_file(state_file);
     }
 
