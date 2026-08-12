@@ -205,6 +205,8 @@ Request creation and apply both reject:
 - tree initiation by anyone except source, target, or source's live parent;
 - tree promotion where target is not source's live direct child;
 - duplicate active requests whose affected edge sets overlap;
+- any request whose affected edge set overlaps a `failed` transaction that
+  reached `routing_quiesced` or later and has not been explicitly repaired;
 - a topology that changed after request creation.
 
 Apply revalidates all identities, liveness, topology, consent, and cycle
@@ -215,16 +217,20 @@ conditions while holding the session-state write lock.
 Changing only `parent_session_id` is incorrect. The following parent-derived
 state must follow the new graph:
 
-- `context_monitor_notify` when it points at the old parent;
+- `context_monitor_notify` only when its companion provenance marks the target
+  as parent-derived;
 - active parent-wake registrations in retained JSON and queue SQLite;
 - pending parent-wake metadata attached to undelivered queue messages;
 - child wait/completion monitors that captured a parent at spawn time;
 - task-complete fallback routing;
 - any additional old-parent-keyed state found by the phase audit.
 
-Explicit notification recipients that happen to equal the old parent are not
-retargeted unless their schema marks them as parent-derived. Reparenting must
-not rewrite deliberate peer-to-peer messages.
+Context-monitor state gains a companion provenance value,
+`context_monitor_notify_source = explicit | parent_derived`. New monitor writes
+must set it from the operation that chose the target. Existing records that
+lack provenance are conservatively migrated as `explicit`, even when the target
+happens to equal the old parent. Explicit notification recipients are never
+retargeted; reparenting must not rewrite deliberate peer-to-peer messages.
 
 Existing stop-notify `sender_session_id` values and provider
 `subagents[].parent_session_id` values are explicit recipients or historical
@@ -267,6 +273,15 @@ quiesced, the request becomes stale. After quiescing, recovery completes the
 recorded transaction or reports a durable `failed` state requiring operator
 repair; it never silently rolls authority back to a topology that may already
 have been observed.
+
+A `failed` request at or beyond `routing_quiesced` remains a durable quarantine,
+not a released terminal edge. Its complete affected edge set stays reserved by
+the overlap fence, parent-derived route creation remains deferred for those
+children, and no later request may include any reserved edge. Only an
+authenticated operator repair action may either resume the immutable plan or
+verify and record a consistent replacement topology before clearing the
+quarantine. Merely rejecting, expiring, deleting, or recreating the request
+cannot release it.
 
 No network delivery occurs while holding the write lock. Approval and outcome
 notification intents are persisted in the same JSON transition that creates
