@@ -121,14 +121,14 @@ use crate::sessions::{
     ContextMonitorRequest, ContextSnapshotResponse, ContextUsageEvent, ContextUsageOutcome,
     CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
     CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, CreateReparentRequest,
-    CredentialRotationOutcome, DecideReparentRequest, HandoffOutcome, HandoffRequest,
-    MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision, ReparentMutationOutcome,
-    ReparentRepairAction, RoleRegistrationRequest, SeatSessionReconciliationSnapshot,
-    SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
-    SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
-    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
-    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
-    UpdateSessionMetadataRequest,
+    CreateReparentTreeRequest, CredentialRotationOutcome, DecideReparentRequest, HandoffOutcome,
+    HandoffRequest, MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision,
+    ReparentMutationOutcome, ReparentRepairAction, RoleRegistrationRequest,
+    SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest, SendCoreInputRequest,
+    SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
+    SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest, SubagentStartOutcome,
+    SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest, TaskCompleteOutcome,
+    TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
 };
 
 use crate::studio_ssh::{self, StudioSshStatus};
@@ -1094,6 +1094,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/sessions/{session_id}/reparent-requests",
             post(create_reparent_request),
+        )
+        .route(
+            "/sessions/{session_id}/reparent-tree-requests",
+            post(create_reparent_tree_request),
         )
         .route(
             "/sessions/{session_id}/credential-rotation",
@@ -2982,6 +2986,21 @@ async fn create_reparent_request(
     )?)
 }
 
+async fn create_reparent_tree_request(
+    State(state): State<Arc<AppState>>,
+    Path(source_session_id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateReparentTreeRequest>,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(&state)?;
+    let credential = reparent_session_credential(&headers)?;
+    reparent_mutation_response(state.session_store.create_reparent_tree_request(
+        &source_session_id,
+        payload,
+        &credential,
+    )?)
+}
+
 async fn approve_reparent_request(
     State(state): State<Arc<AppState>>,
     Path(request_id): Path<String>,
@@ -3108,6 +3127,9 @@ fn reparent_mutation_response(outcome: ReparentMutationOutcome) -> Result<Respon
         }
         ReparentMutationOutcome::Updated(record) => {
             Ok(Json(serde_json::to_value(record)?).into_response())
+        }
+        ReparentMutationOutcome::Preview(preview) => {
+            Ok(Json(serde_json::to_value(preview)?).into_response())
         }
         ReparentMutationOutcome::SessionNotFound(session_id) => Err(ApiError::Status {
             status: StatusCode::NOT_FOUND,

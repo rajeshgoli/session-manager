@@ -1261,7 +1261,7 @@ impl RetainedQueueStore {
     pub fn retarget_parent_routing(
         &self,
         snapshot: &ParentRoutingSnapshot,
-        new_parent_session_id: &str,
+        new_parent_session_id: Option<&str>,
     ) -> Result<ParentRoutingRetargetResult> {
         self.with_connection(|conn| {
             with_immediate_transaction(conn, |conn| {
@@ -1275,15 +1275,24 @@ impl RetainedQueueStore {
                             && current.is_active == wake.is_active)
                             || (current.parent_session_id == wake.parent_session_id
                                 && !current.is_active)
-                            || (current.parent_session_id == new_parent_session_id
-                                && current.is_active == wake.is_active));
+                            || new_parent_session_id.is_some_and(|new_parent| {
+                                current.parent_session_id == new_parent
+                                    && current.is_active == wake.is_active
+                            }));
                     if !valid {
                         anyhow::bail!("parent wake {} changed after planning", wake.id);
                     }
-                    conn.execute(
-                        "UPDATE parent_wake_registrations SET parent_session_id = ?2, is_active = ?3 WHERE id = ?1",
-                        params![wake.id, new_parent_session_id, i64::from(wake.is_active)],
-                    )?;
+                    if let Some(new_parent) = new_parent_session_id {
+                        conn.execute(
+                            "UPDATE parent_wake_registrations SET parent_session_id = ?2, is_active = ?3 WHERE id = ?1",
+                            params![wake.id, new_parent, i64::from(wake.is_active)],
+                        )?;
+                    } else {
+                        conn.execute(
+                            "UPDATE parent_wake_registrations SET is_active = 0 WHERE id = ?1",
+                            params![wake.id],
+                        )?;
+                    }
                 }
                 for message in &snapshot.message_rows {
                     let (current_child, current_parent, delivered) =
@@ -1294,7 +1303,7 @@ impl RetainedQueueStore {
                         || (current_parent.as_deref()
                             != Some(message.parent_session_id.as_str())
                         && current_parent.is_some()
-                        && current_parent.as_deref() != Some(new_parent_session_id))
+                        && current_parent.as_deref() != new_parent_session_id)
                     {
                         anyhow::bail!("queue message {} changed after planning", message.id);
                     }
@@ -4237,10 +4246,10 @@ mod tests {
         assert_eq!(quiesced_parent, None);
 
         store
-            .retarget_parent_routing(&snapshot, "parent-new")
+            .retarget_parent_routing(&snapshot, Some("parent-new"))
             .unwrap();
         store
-            .retarget_parent_routing(&snapshot, "parent-new")
+            .retarget_parent_routing(&snapshot, Some("parent-new"))
             .unwrap();
         assert_eq!(
             store.active_parent_wake_parent("child001").unwrap(),
@@ -4262,6 +4271,45 @@ mod tests {
                 ("parent-derived wait".to_owned(), "parent-new".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn parent_routing_coordinator_clears_routes_for_a_new_root_idempotently() {
+        let db_path = unique_temp_path("parent-routing-root");
+        let store = RetainedQueueStore::new(db_path.clone());
+        store.ensure_schema().unwrap();
+        store
+            .register_parent_wake("child001", "parent-old", 600)
+            .unwrap();
+        let message_id = store
+            .enqueue_message_with_metadata(
+                "child001",
+                "parent-derived wait",
+                "important",
+                QueueMessageMetadata {
+                    parent_session_id: Some("parent-old".to_owned()),
+                    ..QueueMessageMetadata::default()
+                },
+            )
+            .unwrap();
+        let snapshot = store
+            .snapshot_parent_routing("child001", "parent-old")
+            .unwrap();
+
+        store.quiesce_parent_routing(&snapshot).unwrap();
+        store.retarget_parent_routing(&snapshot, None).unwrap();
+        store.retarget_parent_routing(&snapshot, None).unwrap();
+
+        assert_eq!(store.active_parent_wake_parent("child001").unwrap(), None);
+        let conn = Connection::open(&db_path).unwrap();
+        let parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_session_id FROM message_queue WHERE id = ?1",
+                params![message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent, None);
     }
 
     #[test]
@@ -4359,7 +4407,7 @@ mod tests {
             .unwrap()
             .is_none());
         let result = store
-            .retarget_parent_routing(&snapshot, "parent-new")
+            .retarget_parent_routing(&snapshot, Some("parent-new"))
             .unwrap();
 
         assert_eq!(result.delivered_message_rows, snapshot.message_rows);
