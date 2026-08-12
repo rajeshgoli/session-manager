@@ -365,31 +365,38 @@ def test_task_completed_row_shows_age():
     assert any("task: completed (" in row.text for row in status_rows)
 
 
-def test_pending_adoption_row_shows_proposer_and_actions():
+def test_human_gated_reparent_row_shows_exact_request_and_actions():
     rows, _, _ = build_watch_rows(
-        [
-            _session(
-                "s1",
-                "agent",
-                "/tmp/repo",
-                pending_adoption_proposals=[
+        [_session("s1", "agent", "/tmp/repo")],
+        reparent_requests=[
+            {
+                "id": "reparent123",
+                "kind": "single",
+                "subject_session_id": "s1",
+                "target_parent_session_id": "newparent",
+                "initiator_session_id": "newparent",
+                "created_at": "2026-02-21T22:58:00",
+                "expires_at": "2026-02-22T22:58:00Z",
+                "status": "pending",
+                "required_agent_approvals": ["newparent"],
+                "required_human_approval": True,
+                "approvals": [
                     {
-                        "id": "proposal123",
-                        "proposer_session_id": "em123456",
-                        "proposer_name": "em-ops",
-                        "target_session_id": "s1",
-                        "created_at": "2026-02-21T22:58:00",
-                        "status": "pending",
-                        "decided_at": None,
+                        "actor_kind": "agent",
+                        "actor_id": "newparent",
+                        "decision": "approved",
                     }
                 ],
-            )
-        ]
+            }
+        ],
     )
 
-    status_rows = [row for row in rows if row.kind == "status"]
-    assert any("adopt: pending from em-ops [em123456]" in row.text for row in status_rows)
-    assert any("[A accept / X reject]" in row.text for row in status_rows)
+    request_rows = [row for row in rows if row.kind == "reparent"]
+    assert len(request_rows) == 1
+    assert request_rows[0].request_id == "reparent123"
+    assert "single s1 -> newparent pending" in request_rows[0].text
+    assert "missing=none" in request_rows[0].text
+    assert "[A approve / X reject]" in request_rows[0].text
 
 
 def test_status_rows_follow_tree_indentation():

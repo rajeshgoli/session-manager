@@ -50,6 +50,11 @@ enum Command {
     Children(ChildrenArgs),
     Tail(TailArgs),
     Retire(SessionIdArgs),
+    Reparent(ReparentArgs),
+    #[command(name = "reparent-tree")]
+    ReparentTree(ReparentTreeArgs),
+    Adopt(AdoptArgs),
+    Recredential(RecredentialArgs),
     Restore(RestoreArgs),
     Attach(SessionIdArgs),
     Output(OutputArgs),
@@ -103,6 +108,58 @@ struct EmptyArgs {}
 #[derive(Args)]
 struct StatusArgs {
     text: Vec<String>,
+}
+
+#[derive(Args)]
+struct ReparentArgs {
+    #[command(subcommand)]
+    command: ReparentCommand,
+}
+
+#[derive(Subcommand)]
+enum ReparentCommand {
+    Request {
+        child: String,
+        #[arg(long)]
+        to: String,
+    },
+    Approve {
+        request_id: String,
+    },
+    Reject {
+        request_id: String,
+    },
+    Status {
+        request_id: Option<String>,
+    },
+    Repair {
+        request_id: String,
+        #[arg(long, conflicts_with = "rollback_precommit")]
+        resume: bool,
+        #[arg(long = "rollback-precommit", conflicts_with = "resume")]
+        rollback_precommit: bool,
+    },
+}
+
+#[derive(Args)]
+struct ReparentTreeArgs {
+    source: String,
+    #[arg(long)]
+    to: String,
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Args)]
+struct AdoptArgs {
+    child: String,
+}
+
+#[derive(Args)]
+struct RecredentialArgs {
+    session: Option<String>,
+    #[arg(long, conflicts_with = "session")]
+    all_live: bool,
 }
 
 #[derive(Args)]
@@ -796,6 +853,10 @@ fn run() -> Result<()> {
             )?;
             println!("{}", retire_response_status(&payload, &args.session_id)?);
         }
+        Command::Reparent(args) => run_reparent(&client, args)?,
+        Command::ReparentTree(args) => run_reparent_tree(&client, args)?,
+        Command::Adopt(args) => run_adopt(&client, args)?,
+        Command::Recredential(args) => run_recredential(&client, args)?,
         Command::Restore(args) => {
             restore_session(&client, args)?;
         }
@@ -2577,6 +2638,352 @@ fn run_what(client: &ApiClient, args: WhatArgs) -> Result<()> {
     }
 }
 
+fn run_reparent(client: &ApiClient, args: ReparentArgs) -> Result<()> {
+    match args.command {
+        ReparentCommand::Request { child, to } => {
+            let requester = current_session_id()?;
+            let credential = current_session_credential(&requester)?;
+            let child = resolve_required_session(client, &child)?;
+            let target = resolve_required_session(client, &to)?;
+            let record = client.post_json_with_session_credential(
+                &format!("/sessions/{child}/reparent-requests"),
+                json!({
+                    "requester_session_id": requester,
+                    "target_parent_session_id": target,
+                }),
+                &credential,
+            )?;
+            print_reparent_request_created(&record);
+        }
+        ReparentCommand::Approve { request_id } => {
+            decide_reparent_request(client, &request_id, "approve")?;
+        }
+        ReparentCommand::Reject { request_id } => {
+            decide_reparent_request(client, &request_id, "reject")?;
+        }
+        ReparentCommand::Status { request_id } => match request_id {
+            Some(request_id) => {
+                let record = get_reparent_json(
+                    client,
+                    &format!("/reparent-requests/{}", encode_path_segment(&request_id)),
+                )?;
+                print_reparent_request_detail(&record);
+            }
+            None => {
+                let payload = get_reparent_json(client, "/reparent-requests")?;
+                let records = payload["requests"].as_array().cloned().unwrap_or_default();
+                if records.is_empty() {
+                    println!("No reparent requests");
+                } else {
+                    for record in records {
+                        println!("{}", format_reparent_request_row(&record));
+                    }
+                }
+            }
+        },
+        ReparentCommand::Repair {
+            request_id,
+            resume,
+            rollback_precommit,
+        } => {
+            let action = match (resume, rollback_precommit) {
+                (true, false) => "resume",
+                (false, true) => "rollback_precommit",
+                _ => bail!("choose exactly one of --resume or --rollback-precommit"),
+            };
+            let record = client.post_json(
+                &format!(
+                    "/reparent-requests/{}/repair",
+                    encode_path_segment(&request_id)
+                ),
+                json!({ "action": action }),
+            )?;
+            print_reparent_request_detail(&record);
+        }
+    }
+    Ok(())
+}
+
+fn run_reparent_tree(client: &ApiClient, args: ReparentTreeArgs) -> Result<()> {
+    let requester = current_session_id()?;
+    let credential = current_session_credential(&requester)?;
+    let source = resolve_required_session(client, &args.source)?;
+    let target = resolve_required_session(client, &args.to)?;
+    let response = client.post_json_with_session_credential(
+        &format!("/sessions/{source}/reparent-tree-requests"),
+        json!({
+            "requester_session_id": requester,
+            "target_session_id": target,
+            "dry_run": args.dry_run,
+        }),
+        &credential,
+    )?;
+    if args.dry_run {
+        print_reparent_tree_preview(&response);
+    } else {
+        print_reparent_request_created(&response);
+    }
+    Ok(())
+}
+
+fn run_adopt(client: &ApiClient, args: AdoptArgs) -> Result<()> {
+    let requester = current_session_id()?;
+    let credential = current_session_credential(&requester)?;
+    let child = resolve_required_session(client, &args.child)?;
+    let record = client.post_json_with_session_credential(
+        &format!("/sessions/{child}/reparent-requests"),
+        json!({
+            "requester_session_id": requester,
+            "target_parent_session_id": requester,
+        }),
+        &credential,
+    )?;
+    print_reparent_request_created(&record);
+    Ok(())
+}
+
+fn run_recredential(client: &ApiClient, args: RecredentialArgs) -> Result<()> {
+    let targets = if args.all_live {
+        let payload = client.get_json("/sessions")?;
+        payload["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|session| {
+                matches!(
+                    session["status"].as_str().unwrap_or_default(),
+                    "running" | "idle" | "waiting_permission"
+                )
+            })
+            .filter_map(|session| session["id"].as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>()
+    } else {
+        let target = args
+            .session
+            .as_deref()
+            .context("session is required unless --all-live is used")?;
+        vec![resolve_required_session(client, target)?]
+    };
+    if targets.is_empty() {
+        println!("No live sessions to recredential");
+        return Ok(());
+    }
+    let mut failed = 0usize;
+    for target in targets {
+        match client.post_json(
+            &format!("/sessions/{target}/credential-rotation"),
+            json!({}),
+        ) {
+            Ok(record) => println!(
+                "{} {}",
+                target,
+                record["status"].as_str().unwrap_or("unknown")
+            ),
+            Err(error) => {
+                failed += 1;
+                eprintln!("{target} failed: {error:#}");
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} recredential request(s) failed");
+    }
+    Ok(())
+}
+
+fn decide_reparent_request(client: &ApiClient, request_id: &str, action: &str) -> Result<()> {
+    let requester = current_session_id()?;
+    let credential = current_session_credential(&requester)?;
+    let record = client.post_json_with_session_credential(
+        &format!(
+            "/reparent-requests/{}/{}",
+            encode_path_segment(request_id),
+            action
+        ),
+        json!({ "requester_session_id": requester }),
+        &credential,
+    )?;
+    print_reparent_request_detail(&record);
+    Ok(())
+}
+
+fn current_session_credential(session_id: &str) -> Result<String> {
+    env::var("SM_SESSION_CREDENTIAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .with_context(|| {
+            format!(
+                "this session has no runtime credential; ask the operator to run `sm recredential {session_id}`"
+            )
+        })
+}
+
+fn get_reparent_json(client: &ApiClient, path: &str) -> Result<Value> {
+    let Some(session_id) = optional_current_session_id() else {
+        return client.get_json(path);
+    };
+    let credential = current_session_credential(&session_id)?;
+    client.get_json_with_session_credential(path, &session_id, &credential)
+}
+
+fn resolve_required_session(client: &ApiClient, identifier: &str) -> Result<String> {
+    lookup_identifier_exact(client, identifier)?
+        .with_context(|| format!("No agent named '{identifier}' is reachable"))
+}
+
+fn print_reparent_request_created(record: &Value) {
+    println!(
+        "Reparent request {} created: {}",
+        record["id"].as_str().unwrap_or("unknown"),
+        format_reparent_request_row(record)
+    );
+}
+
+fn format_reparent_request_row(record: &Value) -> String {
+    let id = record["id"].as_str().unwrap_or("unknown");
+    let kind = record["kind"].as_str().unwrap_or("unknown");
+    let source = record["subject_session_id"].as_str().unwrap_or("unknown");
+    let target = record["target_parent_session_id"]
+        .as_str()
+        .unwrap_or("unknown");
+    let status = record["status"].as_str().unwrap_or("unknown");
+    let mut row = format!("{id} {kind} {source} -> {target} {status}");
+    if let Some(reason) = record["failure_reason"].as_str() {
+        row.push_str(&format!(" ({reason})"));
+    }
+    row
+}
+
+fn print_reparent_request_detail(record: &Value) {
+    println!("{}", format_reparent_request_row(record));
+    println!(
+        "initiator: {} · expires: {} · stage: {}",
+        record["initiator_session_id"].as_str().unwrap_or("unknown"),
+        record["expires_at"].as_str().unwrap_or("unknown"),
+        record["apply_stage"].as_str().unwrap_or("-")
+    );
+    let edges = reparent_edges_for_display(record);
+    print_reparent_edges(Some(&edges));
+    let approvals = record["approvals"].as_array().cloned().unwrap_or_default();
+    let required = record["required_agent_approvals"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for actor in required {
+        let actor = actor.as_str().unwrap_or("unknown");
+        let decision = approvals
+            .iter()
+            .find(|approval| approval["actor_kind"] == "agent" && approval["actor_id"] == actor)
+            .and_then(|approval| approval["decision"].as_str())
+            .unwrap_or("pending");
+        println!("agent approval: {actor} {decision}");
+    }
+    if record["required_human_approval"].as_bool().unwrap_or(false) {
+        let decision = approvals
+            .iter()
+            .find(|approval| approval["actor_kind"] == "human")
+            .and_then(|approval| approval["decision"].as_str())
+            .unwrap_or("pending");
+        println!("human approval: {decision}");
+    }
+}
+
+fn reparent_edges_for_display(record: &Value) -> Vec<Value> {
+    if let Some(edges) = record["apply_plan"]["edge_changes"].as_array() {
+        return edges.clone();
+    }
+    let source = record["subject_session_id"].as_str().unwrap_or("unknown");
+    let target = record["target_parent_session_id"]
+        .as_str()
+        .unwrap_or("unknown");
+    let old_parent = record["expected_parent_session_id"].as_str();
+    if record["kind"] == "tree" {
+        let mut edges = vec![
+            json!({
+                "session_id": target,
+                "expected_parent_session_id": source,
+                "new_parent_session_id": old_parent,
+            }),
+            json!({
+                "session_id": source,
+                "expected_parent_session_id": old_parent,
+                "new_parent_session_id": target,
+            }),
+        ];
+        edges.extend(
+            record["frozen_live_child_ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|child| *child != target)
+                .map(|child| {
+                    json!({
+                        "session_id": child,
+                        "expected_parent_session_id": source,
+                        "new_parent_session_id": target,
+                    })
+                }),
+        );
+        edges
+    } else {
+        vec![json!({
+            "session_id": source,
+            "expected_parent_session_id": old_parent,
+            "new_parent_session_id": target,
+        })]
+    }
+}
+
+fn print_reparent_tree_preview(preview: &Value) {
+    println!(
+        "Dry run: {} -> {}",
+        preview["source_session_id"].as_str().unwrap_or("unknown"),
+        preview["target_session_id"].as_str().unwrap_or("unknown")
+    );
+    print_reparent_edges(preview["edge_changes"].as_array());
+    for blocker in preview["blockers"].as_array().into_iter().flatten() {
+        println!("blocker: {}", blocker.as_str().unwrap_or("unknown"));
+    }
+    for actor in preview["required_agent_approvals"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        println!("agent approval: {}", actor.as_str().unwrap_or("unknown"));
+    }
+    if preview["required_human_approval"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        println!("human approval: required");
+    }
+    println!(
+        "routing changes: JSON {} · queue {}",
+        preview["json_routing_changes"]
+            .as_array()
+            .map_or(0, Vec::len),
+        preview["queue_routing_changes"]
+            .as_array()
+            .map_or(0, Vec::len)
+    );
+}
+
+fn print_reparent_edges(edges: Option<&Vec<Value>>) {
+    if let Some(edges) = edges {
+        for edge in edges {
+            println!(
+                "edge: {} {} -> {}",
+                edge["session_id"].as_str().unwrap_or("unknown"),
+                edge["expected_parent_session_id"]
+                    .as_str()
+                    .unwrap_or("root"),
+                edge["new_parent_session_id"].as_str().unwrap_or("root")
+            );
+        }
+    }
+}
+
 fn run_usage(client: &ApiClient, args: UsageArgs) -> Result<()> {
     if args.account && (args.agent.is_some() || args.include_children) {
         bail!("--account is mutually exclusive with AGENT and --include-children");
@@ -3951,8 +4358,41 @@ impl ApiClient {
         response.into_json()
     }
 
+    fn get_json_with_session_credential(
+        &self,
+        path: &str,
+        session_id: &str,
+        credential: &str,
+    ) -> Result<Value> {
+        self.request_with_headers(
+            "GET",
+            path,
+            None,
+            &[
+                ("X-SM-Session-ID", session_id),
+                ("X-SM-Session-Credential", credential),
+            ],
+        )?
+        .into_json()
+    }
+
     fn post_json(&self, path: &str, body: Value) -> Result<Value> {
         let response = self.request("POST", path, Some(body))?;
+        response.into_json()
+    }
+
+    fn post_json_with_session_credential(
+        &self,
+        path: &str,
+        body: Value,
+        credential: &str,
+    ) -> Result<Value> {
+        let response = self.request_with_headers(
+            "POST",
+            path,
+            Some(body),
+            &[("X-SM-Session-Credential", credential)],
+        )?;
         response.into_json()
     }
 
@@ -3972,8 +4412,18 @@ impl ApiClient {
     }
 
     fn request(&self, method: &str, path: &str, body: Option<Value>) -> Result<ApiResponse> {
+        self.request_with_headers(method, path, body, &[])
+    }
+
+    fn request_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> Result<ApiResponse> {
         if self.scheme == "https" {
-            return self.request_https(method, path, body);
+            return self.request_https(method, path, body, headers);
         }
         let body_bytes = match body {
             Some(value) => serde_json::to_vec(&value)?,
@@ -3982,11 +4432,14 @@ impl ApiClient {
         let full_path = format!("{}{}", self.path_prefix, path);
         let mut stream = TcpStream::connect((self.host.as_str(), self.port))
             .with_context(|| format!("failed to connect to {}", self.authority))?;
-        let request = format!(
-            "{method} {full_path} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            self.authority,
-            body_bytes.len()
+        let mut request = format!(
+            "{method} {full_path} HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            self.authority, body_bytes.len()
         );
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
         stream.write_all(request.as_bytes())?;
         stream.write_all(&body_bytes)?;
         let mut raw = Vec::new();
@@ -3994,7 +4447,13 @@ impl ApiClient {
         parse_response(&raw)
     }
 
-    fn request_https(&self, method: &str, path: &str, body: Option<Value>) -> Result<ApiResponse> {
+    fn request_https(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        headers: &[(&str, &str)],
+    ) -> Result<ApiResponse> {
         let body_bytes = match body {
             Some(value) => serde_json::to_vec(&value)?,
             None => Vec::new(),
@@ -4008,32 +4467,57 @@ impl ApiClient {
             .build()
             .into();
         let mut response = match method {
-            "GET" => agent
-                .get(&url)
-                .header("Accept", "application/json")
-                .header("Content-Type", "application/json")
-                .call(),
-            "POST" => agent
-                .post(&url)
-                .header("Accept", "application/json")
-                .header("Content-Type", "application/json")
-                .send(body_bytes.as_slice()),
-            "PUT" => agent
-                .put(&url)
-                .header("Accept", "application/json")
-                .header("Content-Type", "application/json")
-                .send(body_bytes.as_slice()),
-            "PATCH" => agent
-                .patch(&url)
-                .header("Accept", "application/json")
-                .header("Content-Type", "application/json")
-                .send(body_bytes.as_slice()),
-            "DELETE" => agent
-                .delete(&url)
-                .header("Accept", "application/json")
-                .header("Content-Type", "application/json")
-                .force_send_body()
-                .send(body_bytes.as_slice()),
+            "GET" => {
+                let mut request = agent
+                    .get(&url)
+                    .header("Accept", "application/json")
+                    .header("Content-Type", "application/json");
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
+                request.call()
+            }
+            "POST" => {
+                let mut request = agent
+                    .post(&url)
+                    .header("Accept", "application/json")
+                    .header("Content-Type", "application/json");
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
+                request.send(body_bytes.as_slice())
+            }
+            "PUT" => {
+                let mut request = agent
+                    .put(&url)
+                    .header("Accept", "application/json")
+                    .header("Content-Type", "application/json");
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
+                request.send(body_bytes.as_slice())
+            }
+            "PATCH" => {
+                let mut request = agent
+                    .patch(&url)
+                    .header("Accept", "application/json")
+                    .header("Content-Type", "application/json");
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
+                request.send(body_bytes.as_slice())
+            }
+            "DELETE" => {
+                let mut request = agent
+                    .delete(&url)
+                    .header("Accept", "application/json")
+                    .header("Content-Type", "application/json")
+                    .force_send_body();
+                for (name, value) in headers {
+                    request = request.header(*name, *value);
+                }
+                request.send(body_bytes.as_slice())
+            }
             _ => bail!("unsupported HTTP method {method}"),
         }
         .with_context(|| format!("failed to request {url}"))?;
@@ -4392,6 +4876,32 @@ mod tests {
                 stream.write_all(response.as_bytes()).unwrap();
             }
             paths
+        });
+        let client = ApiClient::parse(&format!("http://{address}")).unwrap();
+        (client, server)
+    }
+
+    fn single_request_server(
+        status: u16,
+        body: &'static str,
+    ) -> (ApiClient, thread::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut buffer = [0_u8; 8192];
+            let bytes_read = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+            let reason = if status == 200 { "OK" } else { "Error" };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            vec![request]
         });
         let client = ApiClient::parse(&format!("http://{address}")).unwrap();
         (client, server)
@@ -4780,6 +5290,91 @@ mod tests {
             assert_eq!(args.prompt.join(" "), "Summarize current work");
         }
         assert_eq!(retired_command_message(&["what", "worker"]), None);
+    }
+
+    #[test]
+    fn reparent_cli_parses_request_tree_decision_repair_and_rollout_forms() {
+        let request =
+            Cli::try_parse_from(["sm", "reparent", "request", "child", "--to", "parent"]).unwrap();
+        let Command::Reparent(request) = request.command else {
+            panic!("expected reparent command");
+        };
+        assert!(matches!(
+            request.command,
+            ReparentCommand::Request { child, to } if child == "child" && to == "parent"
+        ));
+
+        let tree = Cli::try_parse_from([
+            "sm",
+            "reparent-tree",
+            "source",
+            "--to",
+            "target",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Command::ReparentTree(tree) = tree.command else {
+            panic!("expected reparent-tree command");
+        };
+        assert_eq!(tree.source, "source");
+        assert_eq!(tree.to, "target");
+        assert!(tree.dry_run);
+
+        assert!(matches!(
+            Cli::try_parse_from(["sm", "reparent", "approve", "request1"])
+                .unwrap()
+                .command,
+            Command::Reparent(ReparentArgs {
+                command: ReparentCommand::Approve { .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "sm",
+                "reparent",
+                "repair",
+                "request1",
+                "--rollback-precommit",
+            ])
+            .unwrap()
+            .command,
+            Command::Reparent(ReparentArgs {
+                command: ReparentCommand::Repair {
+                    rollback_precommit: true,
+                    ..
+                }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["sm", "recredential", "--all-live"])
+                .unwrap()
+                .command,
+            Command::Recredential(RecredentialArgs { all_live: true, .. })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["sm", "adopt", "child"])
+                .unwrap()
+                .command,
+            Command::Adopt(AdoptArgs { child }) if child == "child"
+        ));
+    }
+
+    #[test]
+    fn session_credential_header_is_sent_without_entering_the_json_body() {
+        let (client, handle) = single_request_server(200, r#"{"id":"request1"}"#);
+
+        let response = client
+            .post_json_with_session_credential(
+                "/sessions/child/reparent-requests",
+                json!({"requester_session_id": "parent"}),
+                "opaque-secret",
+            )
+            .unwrap();
+
+        assert_eq!(response["id"], "request1");
+        let requests = handle.join().unwrap();
+        assert!(requests[0].contains("X-SM-Session-Credential: opaque-secret\r\n"));
+        assert!(!requests[0].contains("\"opaque-secret\""));
     }
 
     #[test]
