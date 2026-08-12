@@ -16532,8 +16532,9 @@ async fn reparent_request_requires_bound_credentials_and_dual_agent_consent() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(approved["status"], "pending");
-    assert_eq!(approved["ready_to_apply"], true);
+    assert_eq!(approved["status"], "applied");
+    assert_eq!(approved["apply_stage"], "applied");
+    assert_eq!(approved["ready_to_apply"], false);
     assert_eq!(approved["approvals"].as_array().unwrap().len(), 2);
 
     let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
@@ -16543,8 +16544,9 @@ async fn reparent_request_requires_bound_credentials_and_dual_agent_consent() {
         .iter()
         .find(|session| session["id"] == "child")
         .unwrap();
-    assert_eq!(child["parent_session_id"], "oldparent");
-    assert_eq!(raw_state["reparent_requests"][0]["ready_to_apply"], true);
+    assert_eq!(child["parent_session_id"], "newparent");
+    assert_eq!(raw_state["reparent_requests"][0]["status"], "applied");
+    assert_eq!(raw_state["reparent_requests"][0]["ready_to_apply"], false);
 }
 
 #[tokio::test]
@@ -16723,7 +16725,9 @@ async fn reparent_request_uses_human_gate_when_the_recorded_parent_is_not_live()
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(human_approved["ready_to_apply"], true);
+    assert_eq!(human_approved["status"], "applied");
+    assert_eq!(human_approved["apply_stage"], "applied");
+    assert_eq!(human_approved["ready_to_apply"], false);
     assert_eq!(human_approved["approvals"][1]["actor_kind"], "human");
     assert_eq!(human_approved["approvals"][1]["actor_id"], "local_bypass");
 

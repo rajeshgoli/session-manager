@@ -98,7 +98,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let state = AppState::new(config);
+    let state = AppState::try_new(config).context("failed to initialize server state")?;
     // Capture the artifact boundary before serving. The background scan may run
     // alongside live creates, but it must not attribute their new artifacts
     // against this startup snapshot of the seat registry.

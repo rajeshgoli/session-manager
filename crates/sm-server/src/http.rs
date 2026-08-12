@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
+use anyhow::Context as _;
 use axum::{
     body::{to_bytes, Body, Bytes},
     extract::{
@@ -122,11 +123,12 @@ use crate::sessions::{
     CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, CreateReparentRequest,
     CredentialRotationOutcome, DecideReparentRequest, HandoffOutcome, HandoffRequest,
     MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision, ReparentMutationOutcome,
-    RoleRegistrationRequest, SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest,
-    SendCoreInputRequest, SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore,
-    SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest,
-    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
-    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
+    ReparentRepairAction, RoleRegistrationRequest, SeatSessionReconciliationSnapshot,
+    SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
+    SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
+    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
+    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
+    UpdateSessionMetadataRequest,
 };
 
 use crate::studio_ssh::{self, StudioSshStatus};
@@ -376,6 +378,10 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: AppConfig) -> Self {
+        Self::try_new(config).expect("session manager startup recovery failed")
+    }
+
+    pub fn try_new(config: AppConfig) -> anyhow::Result<Self> {
         let state_file = expand_home(&config.paths.state_file);
         let queue_db_path = expand_home(&config.sm_send.db_path);
         let mut session_store = SessionStore::new_with_queue(state_file, queue_db_path)
@@ -422,9 +428,12 @@ impl AppState {
                 );
             session_store = session_store.with_usage_report_store(report_store);
         }
-        if let Err(error) = session_store.recover_session_runtime_launches() {
-            eprintln!("session runtime launch recovery failed: {error:#}");
-        }
+        session_store
+            .recover_session_runtime_launches()
+            .context("session runtime launch recovery failed")?;
+        session_store
+            .reconcile_reparent_requests()
+            .context("reparent authority recovery failed")?;
         if let Err(error) = session_store.recover_session_credential_rotation_workers() {
             eprintln!("session credential rotation recovery failed: {error:#}");
         }
@@ -441,7 +450,7 @@ impl AppState {
         OsRng.fill_bytes(&mut mobile_terminal_secret);
         let (tmux_client_event_tx, _) = broadcast::channel(128);
         let studio_ssh_enabled = studio_ssh::status(&config.external_access.studio_ssh).enabled;
-        Self {
+        Ok(Self {
             config,
             session_store,
             github_review_poster: Arc::new(GhCliReviewPoster),
@@ -459,7 +468,7 @@ impl AppState {
             mobile_terminal_runtime_disabled: Arc::new(AtomicBool::new(false)),
             studio_ssh_enabled: Arc::new(AtomicBool::new(studio_ssh_enabled)),
             mobile_terminal_secret,
-        }
+        })
     }
 
     pub fn with_github_review_poster(mut self, poster: Arc<dyn GitHubReviewPoster>) -> Self {
@@ -1068,6 +1077,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/reparent-requests/{request_id}/human-reject",
             post(human_reject_reparent_request),
+        )
+        .route(
+            "/reparent-requests/{request_id}/repair",
+            post(repair_reparent_request),
         )
         .route("/sessions/input-batch", post(send_session_input_batch))
         .route("/sessions/spawn", post(spawn_session))
@@ -2896,6 +2909,17 @@ async fn create_session_credential_rotation(
             status: StatusCode::UNAUTHORIZED,
             detail: "Operator authentication is required".to_owned(),
         })?;
+    if btw_db_path(&state).exists() {
+        if let Some(active) = btw_store(&state)?.active_for_target(&session_id)? {
+            return Err(ApiError::Status {
+                status: StatusCode::CONFLICT,
+                detail: format!(
+                    "session {session_id} has active sm what request {}",
+                    active.request_id
+                ),
+            });
+        }
+    }
     match state
         .session_store
         .create_session_credential_rotation(&session_id, &request_actor)?
@@ -2915,6 +2939,18 @@ async fn create_session_credential_rotation(
             status: StatusCode::CONFLICT,
             detail,
         }),
+    }
+}
+
+fn authority_mutation_error(error: anyhow::Error) -> ApiError {
+    let detail = error.to_string();
+    if detail.starts_with("reparent request ") && detail.contains(" controls session ") {
+        ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail,
+        }
+    } else {
+        ApiError::Internal(error)
     }
 }
 
@@ -2992,6 +3028,47 @@ async fn human_reject_reparent_request(
     request: Request,
 ) -> Result<Response, ApiError> {
     human_decide_reparent_request(&state, &request_id, &request, ReparentDecision::Rejected)
+}
+
+#[derive(Debug, Deserialize)]
+struct RepairReparentRequest {
+    action: String,
+}
+
+async fn repair_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(&state)?;
+    ensure_session_read_allowed(&state, &request)?;
+    let actor_id =
+        request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Operator authentication is required".to_owned(),
+        })?;
+    let (parts, body) = request.into_parts();
+    let bytes = to_bytes(body, 64 * 1024)
+        .await
+        .map_err(|error| ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("Invalid repair request body: {error}"),
+        })?;
+    let _ = parts;
+    let payload: RepairReparentRequest =
+        serde_json::from_slice(&bytes).map_err(|error| ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("Invalid repair request: {error}"),
+        })?;
+    let action = ReparentRepairAction::parse(&payload.action).ok_or_else(|| ApiError::Status {
+        status: StatusCode::BAD_REQUEST,
+        detail: "action must be resume or rollback_precommit".to_owned(),
+    })?;
+    reparent_mutation_response(state.session_store.repair_reparent_request(
+        &request_id,
+        &actor_id,
+        action,
+    )?)
 }
 
 fn human_decide_reparent_request(
@@ -3586,15 +3663,14 @@ fn queue_wait_notification(state: &AppState, watcher_session_id: &str, text: Str
 }
 
 fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_seconds: u64) {
-    let Some(parent_session_id) = child
+    if child
         .parent_session_id
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-    else {
+        .is_none_or(str::is_empty)
+    {
         return;
-    };
+    }
     let child_session_id = child.id.clone();
 
     tokio::spawn(async move {
@@ -3628,39 +3704,24 @@ fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_sec
             let Some(completion_message) = completion_message else {
                 continue;
             };
-
             let notification = format!(
                 "Child {} ({}) completed: {}",
                 child_display_name(&child),
                 short_session_id(&child_session_id),
                 completion_message
             );
-            let request = SendCoreInputRequest {
-                text: notification,
-                delivery_mode: "sequential".to_owned(),
-                sender_session_id: None,
-                from_sm_send: false,
-                timeout_seconds: None,
-                notify_on_delivery: false,
-                notify_after_seconds: None,
-                notify_on_stop: false,
-                remind_soft_threshold: None,
-                remind_hard_threshold: None,
-                remind_cancel_on_reply_session_id: None,
-                parent_session_id: None,
-            };
-            let _ = if state.config.rust_core.runtime_enabled {
-                let runtime = TmuxRuntime::from_app_config(&state.config);
-                state.session_store.send_core_input_with_runtime(
-                    &parent_session_id,
-                    request,
-                    &runtime,
-                )
-            } else {
-                state
-                    .session_store
-                    .send_core_input(&parent_session_id, request)
-            };
+            let runtime = state
+                .config
+                .rust_core
+                .runtime_enabled
+                .then(|| TmuxRuntime::from_app_config(&state.config));
+            let _ = state.session_store.send_parent_notification(
+                &child_session_id,
+                &notification,
+                "sequential",
+                "child_wait",
+                runtime.as_ref(),
+            );
             break;
         }
     });
@@ -11602,7 +11663,7 @@ where
     E: Into<anyhow::Error>,
 {
     fn from(error: E) -> Self {
-        Self::Internal(error.into())
+        authority_mutation_error(error.into())
     }
 }
 
