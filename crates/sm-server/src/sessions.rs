@@ -674,6 +674,18 @@ impl SessionStore {
     }
 
     fn recover_session_runtime_launch(&self, launch_id: &str) -> Result<()> {
+        let pending_launch = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            session_runtime_launch_records(&state)?
+                .into_iter()
+                .find(|record| record.id == launch_id)
+        };
+        let codex_cli_binding_guard = pending_launch
+            .as_ref()
+            .filter(|launch| launch.operation_kind == "create" && launch.provider == "codex")
+            .map(|launch| self.lock_codex_cli_binding_working_dir(&launch.working_dir))
+            .transpose()?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let Some(mut launch) = session_runtime_launch_records(&state)?
@@ -740,6 +752,34 @@ impl SessionStore {
             model: launch.model.clone(),
             reasoning_effort: launch.reasoning_effort.clone(),
         };
+        let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
+        let codex_cli_creation_binding =
+            if launch.operation_kind == "create" && launch.provider == "codex" {
+                let snapshot = snapshot_from_raw_value(&state)?;
+                let record = snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == launch.session_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("runtime launch session disappeared before recovery")
+                    })?;
+                let mut excluded_ids = snapshot
+                    .sessions
+                    .iter()
+                    .filter_map(|session| session.provider_resume_id.clone())
+                    .collect::<BTreeSet<_>>();
+                excluded_ids.extend(codex_cli_existing_session_ids(
+                    record,
+                    &self.codex_sessions_root,
+                ));
+                Some((
+                    record.clone(),
+                    excluded_ids,
+                    OffsetDateTime::now_utc().unix_timestamp_nanos(),
+                ))
+            } else {
+                None
+            };
         let result = (|| -> Result<()> {
             if session_runtime.session_exists(&launch.tmux_session)? {
                 session_runtime.kill_session(&launch.tmux_session)?;
@@ -766,6 +806,43 @@ impl SessionStore {
             return Ok(());
         }
 
+        let mut recovered_provider_resume_id = launch.provider_resume_id.clone();
+        if launch.operation_kind == "create" {
+            if let Some((record, excluded_ids, launched_at_ns)) =
+                codex_cli_creation_binding.as_ref()
+            {
+                recovered_provider_resume_id = wait_for_codex_cli_provider_resume_id(
+                    record,
+                    &self.codex_sessions_root,
+                    excluded_ids,
+                    *launched_at_ns,
+                    CODEX_CLI_SESSION_BIND_TIMEOUT,
+                );
+            }
+            if let Some(artifacts) = codex_fork_artifacts.as_ref() {
+                match wait_for_codex_fork_provider_resume_id(
+                    &artifacts.event_stream_path,
+                    CODEX_FORK_THREAD_STARTED_TIMEOUT,
+                ) {
+                    Ok(provider_resume_id) => {
+                        recovered_provider_resume_id = Some(provider_resume_id);
+                    }
+                    Err(error) => {
+                        let _ = session_runtime.kill_session(&launch.tmux_session);
+                        mark_runtime_launch_failed(
+                            &mut state,
+                            launch_id,
+                            &launch.session_id,
+                            true,
+                            &error.to_string(),
+                        )?;
+                        self.write_raw_json_value(&state)?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = session_object_mut(sessions, &launch.session_id) else {
             let _ = session_runtime.kill_session(&launch.tmux_session);
@@ -781,9 +858,69 @@ impl SessionStore {
         };
         session.insert("status".to_owned(), Value::String("running".to_owned()));
         session.insert("stopped_at".to_owned(), Value::Null);
+        if launch.operation_kind == "restore" {
+            session.insert("completion_status".to_owned(), Value::Null);
+            session.insert("completion_message".to_owned(), Value::Null);
+            session.insert("completed_at".to_owned(), Value::Null);
+            session.insert("agent_task_completed_at".to_owned(), Value::Null);
+        }
+        if let Some(provider_resume_id) = recovered_provider_resume_id.as_deref() {
+            session.insert(
+                "provider_resume_id".to_owned(),
+                Value::String(provider_resume_id.to_owned()),
+            );
+        }
         session.insert("last_activity".to_owned(), Value::String(now_rfc3339()));
-        mark_runtime_launch_applied(&mut state, launch_id, launch.provider_resume_id.as_deref())?;
+        let recovered = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
+        mark_runtime_launch_applied(
+            &mut state,
+            launch_id,
+            recovered_provider_resume_id.as_deref(),
+        )?;
         self.write_raw_json_value(&state)?;
+        drop(_guard);
+        if let Some(provider_resume_id) = recovered_provider_resume_id.as_deref() {
+            self.append_seat_session(
+                &launch.session_id,
+                &launch.provider,
+                provider_resume_id,
+                codex_fork_artifacts
+                    .as_ref()
+                    .and_then(|artifacts| artifacts.event_stream_path.to_str()),
+            );
+        }
+        if recovered_provider_resume_id.is_none() {
+            if let Some((record, excluded_ids, launched_at_ns)) = codex_cli_creation_binding {
+                let store = self.clone();
+                let session_id = launch.session_id.clone();
+                let spawn_result = thread::Builder::new()
+                    .name(format!(
+                        "sm-codex-recovery-bind-{}",
+                        sanitize_path_component(&session_id)
+                    ))
+                    .spawn(move || {
+                        let _binding_guard = codex_cli_binding_guard;
+                        if let Err(error) = store.complete_deferred_codex_cli_rebind(
+                            &session_id,
+                            &record,
+                            &excluded_ids,
+                            launched_at_ns,
+                            None,
+                            CODEX_CLI_DEFERRED_BIND_TIMEOUT,
+                        ) {
+                            eprintln!(
+                                "deferred recovered Codex thread discovery failed for seat {session_id}: {error:#}"
+                            );
+                        }
+                    });
+                if let Err(error) = spawn_result {
+                    eprintln!("failed to start recovered Codex thread discovery: {error}");
+                }
+            }
+        }
+        if let Some(artifacts) = codex_fork_artifacts {
+            self.start_codex_fork_event_monitor(recovered.id, artifacts.event_stream_path)?;
+        }
         Ok(())
     }
 
@@ -811,9 +948,9 @@ impl SessionStore {
                         Ok(false) => thread::sleep(Duration::from_secs(1)),
                         Err(error) => {
                             eprintln!(
-                                "credential rotation worker failed for {worker_session_id}: {error:#}"
+                                "credential rotation worker retrying for {worker_session_id}: {error:#}"
                             );
-                            break;
+                            thread::sleep(Duration::from_secs(1));
                         }
                     }
                 }
@@ -853,8 +990,14 @@ impl SessionStore {
             return Ok(true);
         };
         let session_runtime = runtime.for_socket_name(rotation.tmux_socket_name.as_deref());
+        if !session_runtime.session_exists(&rotation.tmux_session)? {
+            self.fail_waiting_credential_rotation(
+                &rotation.id,
+                "session runtime disappeared while waiting for idle",
+            )?;
+            return Ok(true);
+        }
         if !credential_rotation_has_fresh_idle_proof(&rotation, &session)
-            || !session_runtime.session_exists(&rotation.tmux_session)?
             || session_runtime.session_has_attached_clients(&rotation.tmux_session)?
             || !session_runtime.session_input_ready(&rotation.tmux_session, &rotation.provider)
             || !self.credential_rotation_queue_is_drained(session_id)?
@@ -872,6 +1015,15 @@ impl SessionStore {
         else {
             return Ok(true);
         };
+        if !session_runtime.session_exists(&rotation.tmux_session)? {
+            rotations[rotation_index].status = "failed".to_owned();
+            rotations[rotation_index].updated_at = now_rfc3339();
+            rotations[rotation_index].failure_reason =
+                Some("session runtime disappeared while waiting for idle".to_owned());
+            store_session_credential_rotation_records(&mut state, &rotations)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(true);
+        }
         let snapshot = snapshot_from_raw_value(&state)?;
         let Some(session) = snapshot
             .sessions
@@ -906,6 +1058,7 @@ impl SessionStore {
         if !credential_rotation_has_fresh_idle_proof(&rotations[rotation_index], &session)
             || json_text(raw_session.get("pending_handoff_path")).is_some()
             || json_text(raw_session.get("claude_handoff_in_progress_at")).is_some()
+            || review_dispatch_in_progress(raw_session)
             || !self.credential_rotation_queue_is_drained(session_id)?
             || session_runtime.session_has_attached_clients(&rotation.tmux_session)?
             || !session_runtime.session_input_ready(&rotation.tmux_session, &rotation.provider)
@@ -1029,6 +1182,27 @@ impl SessionStore {
             self.start_codex_fork_event_monitor(session.id, artifacts.event_stream_path)?;
         }
         Ok(true)
+    }
+
+    fn fail_waiting_credential_rotation(
+        &self,
+        rotation_id: &str,
+        failure_reason: &str,
+    ) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let mut rotations = session_credential_rotation_records(&state)?;
+        let Some(rotation) = rotations
+            .iter_mut()
+            .find(|record| record.id == rotation_id && record.status == "waiting_idle")
+        else {
+            return Ok(());
+        };
+        rotation.status = "failed".to_owned();
+        rotation.updated_at = now_rfc3339();
+        rotation.failure_reason = Some(failure_reason.to_owned());
+        store_session_credential_rotation_records(&mut state, &rotations)?;
+        self.write_raw_json_value(&state)
     }
 
     fn credential_rotation_queue_is_drained(&self, session_id: &str) -> Result<bool> {
@@ -9689,15 +9863,27 @@ fn credential_rotation_has_fresh_idle_proof(
     rotation: &SessionCredentialRotationRecord,
     session: &SessionRecord,
 ) -> bool {
-    if normalized_status(&session.status) != "idle" {
+    if normalized_status(&session.status) == "stopped" {
         return false;
     }
-    let proof_at = if session.provider == "claude" {
-        session.activity_hook_at.as_deref()
-    } else {
-        Some(session.last_activity.as_str())
-    };
-    proof_at.is_some_and(|proof_at| timestamp_is_after(proof_at, &rotation.requested_at))
+    match session.provider.as_str() {
+        "claude" => {
+            normalized_status(&session.status) == "idle"
+                && session
+                    .activity_hook_at
+                    .as_deref()
+                    .is_some_and(|proof_at| timestamp_is_after(proof_at, &rotation.requested_at))
+        }
+        "codex-fork" => {
+            normalized_status(&session.status) == "idle"
+                && timestamp_is_after(&session.last_activity, &rotation.requested_at)
+        }
+        // Classic Codex has no durable lifecycle event stream. Its paired
+        // session_input_ready check is a fresh composer observation performed
+        // after the request and repeated under the input fence.
+        "codex" => true,
+        _ => false,
+    }
 }
 
 fn session_id_exists(sessions: &[Value], session_id: &str) -> bool {
@@ -11384,6 +11570,59 @@ mod tests {
         assert_eq!(session_id.len(), 8);
         assert!(session_id.chars().all(|ch| ch.is_ascii_hexdigit()));
         assert_eq!(session_id, session_id.to_ascii_lowercase());
+    }
+
+    #[test]
+    fn credential_rotation_idle_proof_matches_provider_lifecycle_sources() {
+        let rotation = SessionCredentialRotationRecord {
+            id: "rotation01".to_owned(),
+            session_id: "abc12345".to_owned(),
+            provider: "claude".to_owned(),
+            provider_resume_id: "provider-thread".to_owned(),
+            tmux_session: "claude-abc12345".to_owned(),
+            tmux_socket_name: None,
+            request_actor: "operator".to_owned(),
+            status: "waiting_idle".to_owned(),
+            requested_at: "2026-06-01T00:00:30Z".to_owned(),
+            idle_proof_at: None,
+            runtime_launch_id: None,
+            updated_at: "2026-06-01T00:00:30Z".to_owned(),
+            applied_at: None,
+            failure_reason: None,
+        };
+
+        let mut claude = session_record("idle");
+        claude.activity_hook_at = Some("2026-06-01T00:00:31Z".to_owned());
+        assert!(credential_rotation_has_fresh_idle_proof(&rotation, &claude));
+        claude.status = "running".to_owned();
+        assert!(!credential_rotation_has_fresh_idle_proof(
+            &rotation, &claude
+        ));
+
+        let mut codex_fork = session_record("idle");
+        codex_fork.provider = "codex-fork".to_owned();
+        codex_fork.last_activity = "2026-06-01T00:00:31Z".to_owned();
+        assert!(credential_rotation_has_fresh_idle_proof(
+            &rotation,
+            &codex_fork
+        ));
+        codex_fork.status = "running".to_owned();
+        assert!(!credential_rotation_has_fresh_idle_proof(
+            &rotation,
+            &codex_fork
+        ));
+
+        let mut stock_codex = session_record("running");
+        stock_codex.provider = "codex".to_owned();
+        assert!(credential_rotation_has_fresh_idle_proof(
+            &rotation,
+            &stock_codex
+        ));
+        stock_codex.status = "stopped".to_owned();
+        assert!(!credential_rotation_has_fresh_idle_proof(
+            &rotation,
+            &stock_codex
+        ));
     }
 
     #[cfg(unix)]

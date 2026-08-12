@@ -12298,6 +12298,10 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     launches[1]["status"] = json!("launching");
     launches[1]["updated_at"] = json!("2026-08-11T00:00:00Z");
     interrupted_state["sessions"][0]["provider_resume_id"] = json!("runtime-thread-1");
+    interrupted_state["sessions"][0]["completion_status"] = json!("completed");
+    interrupted_state["sessions"][0]["completion_message"] = json!("stale completion");
+    interrupted_state["sessions"][0]["completed_at"] = json!("2026-08-11T00:00:00Z");
+    interrupted_state["sessions"][0]["agent_task_completed_at"] = json!("2026-08-11T00:00:00Z");
     fs::write(
         &state_file,
         serde_json::to_vec_pretty(&interrupted_state).unwrap(),
@@ -12319,6 +12323,19 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     assert_eq!(
         recovered_state["session_runtime_launches"][1]["credential_sha256"],
         recovered_hash
+    );
+    assert_eq!(
+        recovered_state["sessions"][0]["completion_status"],
+        Value::Null
+    );
+    assert_eq!(
+        recovered_state["sessions"][0]["completion_message"],
+        Value::Null
+    );
+    assert_eq!(recovered_state["sessions"][0]["completed_at"], Value::Null);
+    assert_eq!(
+        recovered_state["sessions"][0]["agent_task_completed_at"],
+        Value::Null
     );
     assert!(tmux_session_exists(&tmux_socket, &tmux_session));
     let (status, payload) = post_json(
@@ -15787,6 +15804,159 @@ while true; do sleep 1; done
     assert!(restored_text.contains("--event-schema-version 7"));
     assert!(restored_text.contains("--model gpt-default"));
     assert!(restored_text.contains("-c model_reasoning_effort=ultra"));
+}
+
+#[tokio::test]
+async fn runtime_launch_recovery_finalizes_codex_fork_identity_and_attribution() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let log_dir = unique_short_temp_dir("smrfr");
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&log_dir).unwrap();
+    fs::create_dir_all(&working_dir).unwrap();
+    let codex_binary = working_dir.join("fake-recovery-codex-fork");
+    fs::write(
+        &codex_binary,
+        r#"#!/bin/sh
+event_stream=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "--event-stream" ]; then
+    event_stream="$arg"
+  fi
+  previous="$arg"
+done
+printf '{"event_type":"thread/started","payload":{"thread":{"id":"recovered-provider-thread"}}}\n' >> "$event_stream"
+printf '{"event_type":"turn_complete","payload":{}}\n' >> "$event_stream"
+while true; do sleep 1; done
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&codex_binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&codex_binary, permissions).unwrap();
+    }
+    let tmux_socket = format!(
+        "sm-rust-test-codex-fork-recovery-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let session_id = "recoverfork";
+    let tmux_session = "sm-rust-codex-fork-recoverfork-0123456789ab";
+    let log_file = core_log_file_path(&log_dir, session_id);
+    fs::write(
+        &state_file,
+        serde_json::to_vec_pretty(&json!({
+            "sessions": [{
+                "id": session_id,
+                "name": "codex-fork-recoverfork",
+                "working_dir": working_dir.display().to_string(),
+                "tmux_session": tmux_session,
+                "tmux_socket_name": tmux_socket,
+                "node": "primary",
+                "provider": "codex-fork",
+                "log_file": log_file.display().to_string(),
+                "provider_resume_id": null,
+                "session_credential_sha256": "old-credential",
+                "status": "stopped",
+                "stopped_at": "2026-08-11T00:00:00Z",
+                "created_at": "2026-08-11T00:00:00Z",
+                "last_activity": "2026-08-11T00:00:00Z"
+            }],
+            "session_runtime_launches": [{
+                "id": "launchrecover1",
+                "operation_kind": "create",
+                "session_id": session_id,
+                "tmux_session": tmux_session,
+                "tmux_socket_name": tmux_socket,
+                "working_dir": working_dir.display().to_string(),
+                "log_file": log_file.display().to_string(),
+                "provider": "codex-fork",
+                "provider_resume_id": null,
+                "credential_rotation_id": null,
+                "initial_message": null,
+                "model": null,
+                "reasoning_effort": null,
+                "credential_sha256": "old-credential",
+                "status": "launching",
+                "created_at": "2026-08-11T00:00:00Z",
+                "updated_at": "2026-08-11T00:00:00Z",
+                "failure_reason": null
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db_path.display().to_string(),
+        },
+        codex_fork: CodexForkLaunchConfig {
+            command: codex_binary.display().to_string(),
+            args: vec![],
+            default_model: None,
+            event_schema_version: 2,
+            control_tmux_fallback_enabled: true,
+        },
+        rust_core: RustCoreConfig {
+            runtime_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            tmux_socket_name: Some(tmux_socket.clone()),
+            runtime_prompt_mode: Some("argv".to_owned()),
+            runtime_start_settle_ms: Some(50),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    };
+
+    let app = router(AppState::new(config));
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert_eq!(state["session_runtime_launches"][0]["status"], "applied");
+    assert_eq!(
+        state["session_runtime_launches"][0]["provider_resume_id"],
+        "recovered-provider-thread"
+    );
+    assert!(matches!(
+        state["sessions"][0]["status"].as_str(),
+        Some("running" | "idle")
+    ));
+    assert_eq!(
+        state["sessions"][0]["provider_resume_id"],
+        "recovered-provider-thread"
+    );
+    let connection = Connection::open(state_file.with_extension("usage.db")).unwrap();
+    let attributed_provider_session: String = connection
+        .query_row(
+            "SELECT provider_session_id FROM seat_sessions WHERE seat_id = 'recoverfork'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attributed_provider_session, "recovered-provider-thread");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let (_, session) = get_json(app.clone(), "/sessions/recoverfork").await;
+        if session["status"] == "idle" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recovered event monitor stayed stale"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]
