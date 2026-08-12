@@ -3176,6 +3176,62 @@ async fn codex_review_request_create_preserves_validation_errors_and_write_gate(
 }
 
 #[tokio::test]
+async fn codex_review_request_create_surfaces_transport_failure_as_bad_gateway() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-create-transport.db");
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [{
+                "id": "notify1",
+                "name": "codex-fork-notify1",
+                "working_dir": "/repo/notify",
+                "tmux_session": "codex-fork-notify1",
+                "log_file": "/tmp/notify1.log",
+                "status": "running",
+                "created_at": "2026-06-01T00:00:00Z",
+                "last_activity": "2026-06-01T00:01:00Z"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let poster = StubGitHubReviewPoster::failing(
+        "GitHub transport failure after 3 attempts: tls: failed to verify certificate: x509: certificate signed by unknown authority",
+    );
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 967,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "notify1"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .starts_with("GitHub transport failure after 3 attempts: tls:"));
+    assert_eq!(poster.calls().len(), 1);
+    assert!(!queue_db.exists());
+}
+
+#[tokio::test]
 async fn codex_review_request_cancel_preserves_missing_and_write_gate_errors() {
     let state_file = unique_temp_path();
     let queue_db = state_file.with_extension("codex-review-cancel-gates.db");
