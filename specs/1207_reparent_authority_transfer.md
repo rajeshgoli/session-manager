@@ -119,19 +119,37 @@ rotation record, acquire the session input fence, and verify that the provider
 turn is idle and its input queue is drained. Idle proof must be observed after
 the rotation was requested (a fresh Claude prompt/Stop boundary or Codex
 lifecycle event), not inferred from a stale projected status. Busy or unproven
-seats remain `waiting_idle` and are retried by the provider Stop/event path.
+seats remain `waiting_idle` and are retried by the provider Stop/event path. A
+rotation also requires no attached interactive tmux client, no pending typed
+input, and no pending handoff, clear, review, or `what` operation; those checks
+are repeated under the input fence immediately before stopping the runtime.
 The relaunch preserves the Session Manager ID, parent graph, task metadata, and
 provider resume ID; it rotates the runtime credential and verifier. A crash
 after the old runtime is stopped resumes the recorded relaunch on startup. If
-resumability or readiness
-cannot be established, the old runtime remains untouched and the rotation
-fails closed. There is no force-active mode in this epic.
+resumability or readiness cannot be established, the old runtime remains
+untouched and the rotation fails closed. There is no force-active mode in this
+epic.
 
-Startup completes every `relaunching` credential rotation synchronously before
-HTTP/input delivery becomes ready. If the named tmux runtime exists, recovery
-kills it and relaunches once from the frozen provider identity; this safely
-handles a crash after launch but before the new verifier was persisted. Waiting
-rotations start background idle-proof workers only after startup recovery.
+Every runtime-backed create, normal restore, and recredential relaunch uses one
+durable launch coordinator. Before touching tmux, it persists a
+`session_runtime_launches` record with operation kind, session ID, frozen launch
+parameters and provider resume identity, status (`prepared | launching |
+applied | failed`), timestamps, and failure reason. It never stores the
+plaintext credential. Under the input fence, the coordinator stops any prior
+named runtime when required, generates a credential, and atomically persists
+its verifier plus `status=launching` before starting tmux. Only after the launch
+succeeds does one JSON replacement mark the session running and the launch
+applied.
+
+Startup completes every `prepared` or `launching` record synchronously before
+HTTP/input delivery becomes ready. Recovery kills any runtime with the frozen
+tmux identity, generates a new credential/verifier, persists that new attempt,
+and launches once from the frozen provider identity. Thus a crash after launch
+but before final persistence discards the unknowable process-only credential
+and converges on a verifiable runtime. Create failure removes or terminally
+stops its provisional session; restore/recredential failure leaves the session
+stopped with an audited failed launch. Waiting recredential rotations start
+background idle-proof workers only after startup launch recovery.
 
 Deployment does not silently relaunch the fleet. After the merged server is
 healthy, the maintainer runs `sm recredential --all-live`; the command reports
@@ -158,11 +176,11 @@ Every required approver can reject. A rejection is terminal. Approvals and
 rejections are idempotent only when the same actor repeats the same decision;
 conflicting or unauthorized decisions fail.
 
-Requests expire after 24 hours by default. Expiration and staleness are evaluated
-under the session-state write lock before every read that claims actionability
-and before every decision or pre-quiesce apply attempt. An `applying` request at
-or beyond `json_routing_quiesced` never expires; recovery must finish its
-immutable transaction.
+Requests expire after 24 hours by default while `pending`. Expiration and
+staleness are evaluated under the session-state write lock before every read
+that claims actionability and before every decision or apply attempt. Once a
+request enters `applying`, it no longer expires; recovery must finish or abort
+its durable transaction.
 
 ## Durable model
 
@@ -187,7 +205,8 @@ decided_at
 applied_at
 failure_reason
 topology_fingerprint
-apply_stage                nullable | json_routing_quiesced |
+apply_stage                nullable | prequiesce_aborting |
+                           prequiesce_aborted | json_routing_quiesced |
                            routing_quiesced | authority_committed |
                            repair_rolled_back
 apply_plan                 nullable while pending; immutable once applying
@@ -201,8 +220,11 @@ repair_history[]           actor, action, prior failure, timestamp,
 The state root also has one `reparent_apply_lease` containing request ID and
 acquisition timestamp. Pending consent requests may coexist, but only the lease
 holder may enter `applying`, quiesce routes, or commit authority. A failed
-transaction retains the lease until a retry applies it or a verified rollback
-repairs it. Authority transactions are intentionally serialized globally;
+transaction retains the lease until a retry applies it, a verified rollback
+repairs it, or a verified pre-quiesce abort releases it. When the lease is
+empty, reconciliation selects the oldest ready request by `(created_at, id)`;
+this runs on startup, after every lease release, and after a mutation makes a
+request ready. Authority transactions are intentionally serialized globally;
 reparenting is rare, and avoiding cross-plan cycle races is more important than
 parallel apply throughput.
 
@@ -225,11 +247,12 @@ than partially applying. Recovery uses only the persisted plan plus
 expected-value checks.
 
 While the fence covers a session, create/spawn with that session as parent,
-restore of a stopped child, explicit retire/stop, and any parent-edge mutation
-that could change the planned graph return `409` with the controlling request
-ID. Observed provider/runtime death may still persist liveness truth; before
-authority commit it forces the transaction to restore its exact old parent
-edges and routing while preserving the observed stopped status, then end stale.
+restore or recredential of a covered seat, explicit retire/stop, and any
+parent-edge mutation that could change the planned graph return `409` with the
+controlling request ID. Observed provider/runtime death may still persist
+liveness truth; before authority commit it forces the transaction to restore
+its exact old parent edges and routing while preserving the observed stopped
+status, then end stale.
 A frozen child that stopped therefore remains stopped under the old source. If
 that restoration fails, the request enters the same durable quarantine as any
 other post-quiesce failure. These checks apply to every
@@ -271,6 +294,14 @@ cursor/timestamp, later idle proof, timestamps, and failure reason. It never
 contains the plaintext credential. Only one active rotation may cover a seat,
 and successful records are idempotent audit history.
 
+Runtime creation and relaunch use a separate top-level
+`session_runtime_launches` collection. Each record stores an operation ID,
+operation kind (`create | restore | recredential`), session ID, frozen tmux and
+provider launch parameters, provider resume identity, credential verifier,
+status (`prepared | launching | applied | failed`), timestamps, and failure
+reason. The active record is the source of truth for startup recovery; neither
+it nor any other durable record contains the plaintext credential.
+
 ## Validation
 
 Request creation and apply both reject:
@@ -285,8 +316,8 @@ Request creation and apply both reject:
 - tree initiation by anyone except source, target, or source's live parent;
 - tree promotion where target is not source's live direct child;
 - duplicate active requests whose affected edge sets overlap;
-- any request whose affected edge set overlaps a `failed` transaction that
-  reached `json_routing_quiesced` or later and has not been explicitly repaired;
+- any request whose affected edge set overlaps a failed transaction whose
+  durable topology/routing fence is still held;
 - a topology that changed after request creation.
 
 Apply revalidates all identities, liveness, topology, consent, and cycle
@@ -360,6 +391,20 @@ therefore a recoverable, fail-closed staged operation:
    fences and the global apply lease. Replay accepts an already-correct runtime
    registration and never starts a duplicate task.
 
+A deterministic failure or invalidated topology after step 1 but before
+`json_routing_quiesced` enters the durable pre-quiesce abort path. Under the
+state lock it first persists `apply_stage=prequiesce_aborting`; parent edges and
+existing routes are still unchanged. It then replays every deferred routing
+intent idempotently against the old canonical parent and verifies the replay.
+It also recreates and verifies any in-memory tasks stopped before the retained
+JSON records were quiesced. One final JSON replacement marks the request
+`stale` for invalid topology or `failed` for another deterministic apply error,
+records `apply_stage=prequiesce_aborted`, and releases both fences and the
+global lease.
+If replay or verification fails, the request remains `failed` at
+`prequiesce_aborting` and retains its fences and lease. Recovery or an operator
+`resume` continues that abort; it never replans or proceeds to quiescing.
+
 An interruption before step 3 exposes no new destructive authority and leaves
 old-parent routing paused rather than misdirected. An interruption after step 3
 has new authority with parent-derived routing still paused; dynamic delivery
@@ -373,14 +418,17 @@ restoration fails, the request remains failed and quarantined. After authority
 commit, recovery completes the recorded transaction; it never silently rolls
 authority back to a topology that may already have been observed.
 
-The applied and stale/rollback paths clear the global lease only in the same
-final JSON replacement that records every deferred routing intent replayed.
-Failure at any stage retains the lease. Startup recovers the recorded lease
+The applied, stale/rollback, and completed pre-quiesce abort paths clear the
+global lease only in the same final JSON replacement that records every
+deferred routing intent replayed. A failure during pre-quiesce abort or after
+`json_routing_quiesced` retains the lease. Startup recovers the recorded lease
 holder before another ready request may acquire it.
 
 On startup, all `applying` reparent records are recovered through their durable
 stage before retained parent-wake tasks are recreated and before HTTP/input
-readiness. In particular, a crash after an in-memory task was stopped but before
+readiness. `prequiesce_aborting` resumes only the abort path;
+`prequiesce_aborted` is already terminal and holds no lease. In particular, a
+crash after an in-memory task was stopped but before
 `json_routing_quiesced` cannot briefly recreate an old-parent task from the
 still-active retained record.
 
@@ -397,7 +445,9 @@ it.
 The authenticated human repair route supports exactly two audited actions:
 
 1. `resume` records a repair attempt, changes `failed` back to `applying`, and
-   retries the same immutable plan from its persisted stage. It never replans.
+   continues the persisted stage. At `prequiesce_aborting` it can only finish
+   the abort; at later stages it retries the same immutable plan. It never
+   replans.
 2. `rollback_precommit` is accepted only from `json_routing_quiesced` or
    `routing_quiesced`, before `authority_committed`. Under the routing fence,
    the server restores every route to the apply plan's exact recorded
@@ -547,6 +597,9 @@ PR targets `main`. Partial phases are not deployed.
   graph immediately after apply.
 - Pending and `applying` requests recover correctly after restart at every
   durable stage.
+- A failure before JSON quiesce durably aborts, restores any stopped in-memory
+  tasks, replays deferred routes to the old parent, and releases the global
+  lease; a crash during that abort resumes only the abort path.
 - Post-quiesce failures retain their overlap/routing fence; only a successful
   immutable-plan retry or verified pre-commit rollback releases it.
 - Deferred parent-derived route requests replay exactly once against the new
@@ -554,6 +607,9 @@ PR targets `main`. Partial phases are not deployed.
 - A pre-deployment live seat is recredentialed only after it becomes idle, keeps
   its seat and provider-thread identity, and recovers a crash after stop without
   accepting input under two runtimes.
+- Create, normal restore, and recredential each recover a crash after tmux
+  launch but before final persistence by replacing the unknowable runtime
+  credential through the same durable launch coordinator.
 - Legacy pending adoption records cannot auto-apply.
 - Rust CLI parser/dispatch and Python watch interaction tests pass.
 - Full Rust and retained Python test suites pass, or any demonstrably preexisting
