@@ -1005,8 +1005,8 @@ impl SessionStore {
             return Ok(false);
         }
 
-        let _guard = self.write_guard()?;
-        let _input_guard = session_runtime.lock_session_input(&rotation.tmux_session)?;
+        let (_input_guard, _guard) =
+            self.lock_session_input_then_state(&session_runtime, &rotation.tmux_session)?;
         let mut state = self.load_raw_json_value()?;
         let mut rotations = session_credential_rotation_records(&state)?;
         let Some(rotation_index) = rotations
@@ -5639,6 +5639,21 @@ impl SessionStore {
         self.write_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session state write lock poisoned"))
+    }
+
+    fn lock_session_input_then_state<'a>(
+        &'a self,
+        runtime: &TmuxRuntime,
+        tmux_session: &str,
+    ) -> Result<(
+        crate::runtime::SessionInputGuard,
+        std::sync::MutexGuard<'a, ()>,
+    )> {
+        // Claude handoff already holds this input fence before consulting durable
+        // state. Keep the same lock order for every operation that takes both.
+        let input_guard = runtime.lock_session_input(tmux_session)?;
+        let state_guard = self.write_guard()?;
+        Ok((input_guard, state_guard))
     }
 
     fn start_codex_fork_event_monitor(
@@ -11623,6 +11638,46 @@ mod tests {
             &rotation,
             &stock_codex
         ));
+    }
+
+    #[test]
+    fn credential_rotation_waiting_for_input_does_not_hold_state_lock() {
+        let state_file = unique_temp_path("credential-rotation-lock-order");
+        let store = SessionStore::new(state_file.clone());
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default());
+        let tmux_session = format!("lock-order-{}", generate_session_id());
+        let held_input = runtime.lock_session_input(&tmux_session).unwrap();
+        let contender_store = store.clone();
+        let contender_runtime = runtime.clone();
+        let contender_session = tmux_session.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let contender = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _guards = contender_store
+                .lock_session_input_then_state(&contender_runtime, &contender_session)
+                .unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let state_store = store.clone();
+        let (state_tx, state_rx) = std::sync::mpsc::channel();
+        let state_writer = thread::spawn(move || {
+            let _guard = state_store.write_guard().unwrap();
+            state_tx.send(()).unwrap();
+        });
+        state_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("input waiter held the global state lock");
+        assert!(acquired_rx.try_recv().is_err());
+
+        drop(held_input);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        contender.join().unwrap();
+        state_writer.join().unwrap();
+        let _ = fs::remove_file(state_file);
     }
 
     #[cfg(unix)]
