@@ -434,6 +434,9 @@ impl AppState {
         session_store
             .reconcile_reparent_requests()
             .context("reparent authority recovery failed")?;
+        if let Err(error) = session_store.reconcile_reparent_notifications() {
+            eprintln!("reparent notification recovery failed: {error:#}");
+        }
         if let Err(error) = session_store.recover_session_credential_rotation_workers() {
             eprintln!("session credential rotation recovery failed: {error:#}");
         }
@@ -2880,8 +2883,31 @@ async fn list_reparent_requests(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
+    reconcile_reparent_notifications_best_effort(&state);
+    let requests = if let Some(session_id) = header_text(request.headers(), "x-sm-session-id") {
+        let credential = reparent_session_credential(request.headers())?;
+        state
+            .session_store
+            .list_reparent_requests_for_session(&session_id, &credential)?
+            .ok_or_else(|| ApiError::Status {
+                status: StatusCode::FORBIDDEN,
+                detail: "session credential is missing, stale, or does not match the claimed actor"
+                    .to_owned(),
+            })?
+    } else {
+        if state.config.google_auth.requested()
+            && request_actor_email(&state.config, &request).is_none()
+        {
+            return Err(ApiError::Status {
+                status: StatusCode::UNAUTHORIZED,
+                detail: "Operator authentication or managed session identity is required"
+                    .to_owned(),
+            });
+        }
+        state.session_store.list_reparent_requests()?
+    };
     Ok(Json(json!({
-        "requests": state.session_store.list_reparent_requests()?,
+        "requests": requests,
     })))
 }
 
@@ -2964,10 +2990,37 @@ async fn get_reparent_request(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
+    reconcile_reparent_notifications_best_effort(&state);
     let record = state
         .session_store
         .get_reparent_request(&request_id)?
         .ok_or(ApiError::NotFound("Reparent request not found"))?;
+    if let Some(session_id) = header_text(request.headers(), "x-sm-session-id") {
+        let credential = reparent_session_credential(request.headers())?;
+        let visible = state
+            .session_store
+            .list_reparent_requests_for_session(&session_id, &credential)?
+            .ok_or_else(|| ApiError::Status {
+                status: StatusCode::FORBIDDEN,
+                detail: "session credential is missing, stale, or does not match the claimed actor"
+                    .to_owned(),
+            })?
+            .into_iter()
+            .any(|candidate| candidate.id == record.id);
+        if !visible {
+            return Err(ApiError::Status {
+                status: StatusCode::FORBIDDEN,
+                detail: "reparent request does not involve this session".to_owned(),
+            });
+        }
+    } else if state.config.google_auth.requested()
+        && request_actor_email(&state.config, &request).is_none()
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Operator authentication or managed session identity is required".to_owned(),
+        });
+    }
     Ok(Json(serde_json::to_value(record)?))
 }
 
@@ -2979,11 +3032,12 @@ async fn create_reparent_request(
 ) -> Result<Response, ApiError> {
     ensure_core_writes_enabled(&state)?;
     let credential = reparent_session_credential(&headers)?;
-    reparent_mutation_response(state.session_store.create_reparent_request(
-        &subject_session_id,
-        payload,
-        &credential,
-    )?)
+    let outcome =
+        state
+            .session_store
+            .create_reparent_request(&subject_session_id, payload, &credential)?;
+    reconcile_reparent_notifications_best_effort(&state);
+    reparent_mutation_response(outcome)
 }
 
 async fn create_reparent_tree_request(
@@ -2994,11 +3048,13 @@ async fn create_reparent_tree_request(
 ) -> Result<Response, ApiError> {
     ensure_core_writes_enabled(&state)?;
     let credential = reparent_session_credential(&headers)?;
-    reparent_mutation_response(state.session_store.create_reparent_tree_request(
+    let outcome = state.session_store.create_reparent_tree_request(
         &source_session_id,
         payload,
         &credential,
-    )?)
+    )?;
+    reconcile_reparent_notifications_best_effort(&state);
+    reparent_mutation_response(outcome)
 }
 
 async fn approve_reparent_request(
@@ -3009,12 +3065,14 @@ async fn approve_reparent_request(
 ) -> Result<Response, ApiError> {
     ensure_core_writes_enabled(&state)?;
     let credential = reparent_session_credential(&headers)?;
-    reparent_mutation_response(state.session_store.decide_reparent_request(
+    let outcome = state.session_store.decide_reparent_request(
         &request_id,
         payload,
         ReparentDecision::Approved,
         &credential,
-    )?)
+    )?;
+    reconcile_reparent_notifications_best_effort(&state);
+    reparent_mutation_response(outcome)
 }
 
 async fn reject_reparent_request(
@@ -3025,12 +3083,14 @@ async fn reject_reparent_request(
 ) -> Result<Response, ApiError> {
     ensure_core_writes_enabled(&state)?;
     let credential = reparent_session_credential(&headers)?;
-    reparent_mutation_response(state.session_store.decide_reparent_request(
+    let outcome = state.session_store.decide_reparent_request(
         &request_id,
         payload,
         ReparentDecision::Rejected,
         &credential,
-    )?)
+    )?;
+    reconcile_reparent_notifications_best_effort(&state);
+    reparent_mutation_response(outcome)
 }
 
 async fn human_approve_reparent_request(
@@ -3083,11 +3143,11 @@ async fn repair_reparent_request(
         status: StatusCode::BAD_REQUEST,
         detail: "action must be resume or rollback_precommit".to_owned(),
     })?;
-    reparent_mutation_response(state.session_store.repair_reparent_request(
-        &request_id,
-        &actor_id,
-        action,
-    )?)
+    let outcome = state
+        .session_store
+        .repair_reparent_request(&request_id, &actor_id, action)?;
+    reconcile_reparent_notifications_best_effort(&state);
+    reparent_mutation_response(outcome)
 }
 
 fn human_decide_reparent_request(
@@ -3102,11 +3162,17 @@ fn human_decide_reparent_request(
         status: StatusCode::UNAUTHORIZED,
         detail: "Operator authentication is required".to_owned(),
     })?;
-    reparent_mutation_response(
-        state
-            .session_store
-            .decide_reparent_request_as_human(request_id, &actor_id, decision)?,
-    )
+    let outcome = state
+        .session_store
+        .decide_reparent_request_as_human(request_id, &actor_id, decision)?;
+    reconcile_reparent_notifications_best_effort(state);
+    reparent_mutation_response(outcome)
+}
+
+fn reconcile_reparent_notifications_best_effort(state: &AppState) {
+    if let Err(error) = state.session_store.reconcile_reparent_notifications() {
+        eprintln!("reparent notification reconciliation failed: {error:#}");
+    }
 }
 
 fn reparent_session_credential(headers: &HeaderMap) -> Result<String, ApiError> {

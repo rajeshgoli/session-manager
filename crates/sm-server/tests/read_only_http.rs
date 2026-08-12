@@ -16943,6 +16943,58 @@ async fn reparent_request_read_marks_changed_topology_stale() {
 }
 
 #[tokio::test]
+async fn reparent_request_creation_persists_and_queues_exact_actionable_notification() {
+    let state_file = write_reparent_fixture();
+    let queue_db = queue_db_path_for_state_file(&state_file);
+    let mut config = config_with_state_file_and_queue(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, created) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let request_id = created["id"].as_str().unwrap();
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let intents = state["reparent_requests"][0]["notification_intents"]
+        .as_array()
+        .unwrap();
+    assert_eq!(intents.len(), 1);
+    assert_eq!(intents[0]["recipient_session_id"], "newparent");
+    assert!(intents[0]["enqueued_at"].as_str().is_some());
+
+    let messages = queued_message_texts(&queue_db, "newparent");
+    assert_eq!(messages.len(), 1);
+    let message = &messages[0];
+    assert!(message.contains(&format!("single request {request_id} from oldparent")));
+    assert!(message.contains("child: oldparent -> newparent"));
+    assert!(message.contains(&format!("sm reparent approve {request_id}")));
+    assert!(message.contains(&format!("sm reparent reject {request_id}")));
+
+    let (status, scoped) = get_json_with_host_and_headers(
+        app,
+        "/reparent-requests",
+        "localhost",
+        &[
+            ("x-sm-session-id", "unrelated".to_owned()),
+            ("x-sm-session-credential", "unrelated-token".to_owned()),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(scoped["requests"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn reparent_tree_dry_run_reports_exact_plan_without_persisting_a_request() {
     let state_file = write_reparent_tree_fixture();
     let mut config = config_with_state_file(&state_file);
@@ -17002,6 +17054,50 @@ async fn reparent_tree_dry_run_reports_exact_plan_without_persisting_a_request()
 
     let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
     assert!(state["reparent_requests"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reparent_tree_dry_run_reports_an_overlapping_active_request_as_a_blocker() {
+    let state_file = write_reparent_tree_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, active) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/sibling01/reparent-requests",
+        json!({
+            "requester_session_id": "source01",
+            "target_parent_session_id": "grand001"
+        }),
+        &[("x-sm-session-credential", "source-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let active_id = active["id"].as_str().unwrap();
+
+    let (status, preview) = post_json_with_headers_and_peer(
+        app,
+        "/sessions/source01/reparent-tree-requests",
+        json!({
+            "requester_session_id": "source01",
+            "target_session_id": "target01",
+            "dry_run": true
+        }),
+        &[("x-sm-session-credential", "source-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let blockers = preview["blockers"].as_array().unwrap();
+    assert_eq!(blockers.len(), 1);
+    assert!(blockers[0].as_str().unwrap().contains(active_id));
+    assert!(blockers[0].as_str().unwrap().contains("sibling01"));
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert_eq!(state["reparent_requests"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]

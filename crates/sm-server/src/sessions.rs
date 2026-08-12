@@ -1966,29 +1966,61 @@ impl SessionStore {
             required_human_approval,
             blockers: blockers.clone(),
         };
-        if request.dry_run {
-            return Ok(ReparentMutationOutcome::Preview(preview));
-        }
-        if let Some(blocker) = blockers.into_iter().next() {
-            return Ok(ReparentMutationOutcome::BadRequest(blocker));
-        }
         let now = OffsetDateTime::now_utc();
         let mut records = reparent_request_records(&state)?;
-        let _ = refresh_reparent_requests(&mut records, &sessions, now);
+        let refreshed = refresh_reparent_requests(&mut records, &sessions, now);
         let affected_ids = preview
             .edge_changes
             .iter()
             .map(|change| change.session_id.clone())
             .chain(expected_parent_session_id.iter().cloned())
             .collect::<BTreeSet<_>>();
-        if let Some(conflict) = records.iter().find(|record| {
+        let active_conflict = records.iter().find(|record| {
             record.is_active() && !record.affected_session_ids().is_disjoint(&affected_ids)
-        }) {
+        });
+        if request.dry_run {
+            let mut preview = preview;
+            if let Some(conflict) = active_conflict {
+                let overlapping_session = if affected_ids.contains(&conflict.subject_session_id) {
+                    conflict.subject_session_id.clone()
+                } else {
+                    conflict
+                        .affected_session_ids()
+                        .intersection(&affected_ids)
+                        .next()
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_owned())
+                };
+                preview.blockers.push(format!(
+                    "request {} already controls session {} in the tree promotion",
+                    conflict.id, overlapping_session
+                ));
+            }
+            if refreshed {
+                store_reparent_request_records(&mut state, &records)?;
+                self.write_raw_json_value(&state)?;
+            }
+            return Ok(ReparentMutationOutcome::Preview(preview));
+        }
+        if let Some(blocker) = blockers.into_iter().next() {
+            return Ok(ReparentMutationOutcome::BadRequest(blocker));
+        }
+        if let Some(conflict) = active_conflict {
+            let overlapping_session = if affected_ids.contains(&conflict.subject_session_id) {
+                conflict.subject_session_id.clone()
+            } else {
+                conflict
+                    .affected_session_ids()
+                    .intersection(&affected_ids)
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_owned())
+            };
             store_reparent_request_records(&mut state, &records)?;
             self.write_raw_json_value(&state)?;
             return Ok(ReparentMutationOutcome::Conflict(format!(
-                "request {} already controls part of the tree promotion",
-                conflict.id
+                "request {} already controls session {} in the tree promotion",
+                conflict.id, overlapping_session
             )));
         }
         let created_at = now.format(&Rfc3339)?;
@@ -2274,6 +2306,30 @@ impl SessionStore {
         Ok(records)
     }
 
+    pub fn list_reparent_requests_for_session(
+        &self,
+        session_id: &str,
+        session_credential: &str,
+    ) -> Result<Option<Vec<ReparentRequestRecord>>> {
+        let session_id = session_id.trim();
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        if !session_credential_matches(&sessions, session_id, session_credential) {
+            return Ok(None);
+        }
+        let mut records = reparent_request_records(&state)?;
+        if refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc()) {
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+        }
+        records.retain(|record| record.involves_session(session_id));
+        records.sort_by(|left, right| {
+            (&left.created_at, &left.id).cmp(&(&right.created_at, &right.id))
+        });
+        Ok(Some(records))
+    }
+
     pub fn send_parent_notification(
         &self,
         child_session_id: &str,
@@ -2345,6 +2401,82 @@ impl SessionStore {
                 return Ok(first);
             }
         }
+    }
+
+    pub fn reconcile_reparent_notifications(&self) -> Result<()> {
+        let pending = {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+            let mut records = reparent_request_records(&state)?;
+            let refreshed =
+                refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc());
+            let mut changed = refreshed;
+            for record in &mut records {
+                for desired in desired_reparent_notifications(record) {
+                    if record
+                        .notification_intents
+                        .iter()
+                        .all(|intent| intent.key != desired.intent.key)
+                    {
+                        record.notification_intents.push(desired.intent);
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                store_reparent_request_records(&mut state, &records)?;
+                self.write_raw_json_value(&state)?;
+            }
+            records
+                .iter()
+                .flat_map(|record| {
+                    desired_reparent_notifications(record)
+                        .into_iter()
+                        .filter(|desired| {
+                            record.notification_intents.iter().any(|intent| {
+                                intent.key == desired.intent.key && intent.enqueued_at.is_none()
+                            })
+                        })
+                })
+                .collect::<Vec<_>>()
+        };
+        for desired in pending {
+            let queue = self
+                .queue_store
+                .as_ref()
+                .context("reparent notifications require the retained queue store")?;
+            queue.enqueue_message_once_with_metadata(
+                &desired.intent.key,
+                &desired.intent.recipient_session_id,
+                &desired.text,
+                "important",
+                QueueMessageMetadata {
+                    message_category: Some("reparent".to_owned()),
+                    ..QueueMessageMetadata::default()
+                },
+            )?;
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let mut records = reparent_request_records(&state)?;
+            let record = records
+                .iter_mut()
+                .find(|record| record.id == desired.request_id)
+                .with_context(|| format!("reparent request {} disappeared", desired.request_id))?;
+            let intent = record
+                .notification_intents
+                .iter_mut()
+                .find(|intent| intent.key == desired.intent.key)
+                .with_context(|| {
+                    format!("reparent notification {} disappeared", desired.intent.key)
+                })?;
+            if intent.enqueued_at.is_none() {
+                intent.enqueued_at = Some(now_rfc3339());
+                store_reparent_request_records(&mut state, &records)?;
+                self.write_raw_json_value(&state)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn repair_reparent_request(
@@ -11642,12 +11774,24 @@ fn store_reparent_request_records(
     state: &mut Value,
     records: &[ReparentRequestRecord],
 ) -> Result<()> {
+    let mut records = records.to_vec();
+    for record in &mut records {
+        for desired in desired_reparent_notifications(record) {
+            if record
+                .notification_intents
+                .iter()
+                .all(|intent| intent.key != desired.intent.key)
+            {
+                record.notification_intents.push(desired.intent);
+            }
+        }
+    }
     let object = state
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("session state root must be an object"))?;
     object.insert(
         "reparent_requests".to_owned(),
-        serde_json::to_value(records)?,
+        serde_json::to_value(&records)?,
     );
     Ok(())
 }
@@ -12767,6 +12911,177 @@ pub struct ReparentNotificationIntent {
     pub enqueued_at: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct DesiredReparentNotification {
+    request_id: String,
+    intent: ReparentNotificationIntent,
+    text: String,
+}
+
+fn desired_reparent_notifications(
+    record: &ReparentRequestRecord,
+) -> Vec<DesiredReparentNotification> {
+    let mut desired = Vec::new();
+    if record.status == "pending" {
+        let approved = record
+            .approvals
+            .iter()
+            .filter(|approval| approval.actor_kind == "agent" && approval.decision == "approved")
+            .map(|approval| approval.actor_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let missing = record
+            .required_agent_approvals
+            .iter()
+            .filter(|actor| !approved.contains(actor.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let event = format!("approval:{}", missing.join(","));
+        for recipient in &missing {
+            desired.push(reparent_notification(
+                record,
+                &event,
+                recipient,
+                reparent_approval_notification_text(record),
+            ));
+        }
+        if record.approvals.len() > 1 {
+            for recipient in record
+                .required_agent_approvals
+                .iter()
+                .chain(std::iter::once(&record.initiator_session_id))
+                .filter(|recipient| !missing.contains(recipient))
+                .collect::<BTreeSet<_>>()
+            {
+                desired.push(reparent_notification(
+                    record,
+                    &event,
+                    recipient,
+                    reparent_progress_notification_text(record, &missing),
+                ));
+            }
+        }
+    } else if matches!(
+        record.status.as_str(),
+        "applied" | "rejected" | "expired" | "stale" | "failed" | "repaired"
+    ) {
+        let event = format!("terminal:{}", record.status);
+        for recipient in record
+            .required_agent_approvals
+            .iter()
+            .chain(std::iter::once(&record.initiator_session_id))
+            .collect::<BTreeSet<_>>()
+        {
+            desired.push(reparent_notification(
+                record,
+                &event,
+                recipient,
+                reparent_terminal_notification_text(record),
+            ));
+        }
+    }
+    desired
+}
+
+fn reparent_notification(
+    record: &ReparentRequestRecord,
+    event: &str,
+    recipient: &str,
+    text: String,
+) -> DesiredReparentNotification {
+    DesiredReparentNotification {
+        request_id: record.id.clone(),
+        intent: ReparentNotificationIntent {
+            key: format!("reparent:{}:{event}:{recipient}", record.id),
+            event: event.to_owned(),
+            recipient_session_id: recipient.to_owned(),
+            enqueued_at: None,
+        },
+        text,
+    }
+}
+
+fn reparent_approval_notification_text(record: &ReparentRequestRecord) -> String {
+    format!(
+        "[sm reparent] {} request {} from {} needs your approval. {} Expires {}. Approve: `sm reparent approve {}`. Reject: `sm reparent reject {}`.",
+        record.kind,
+        record.id,
+        record.initiator_session_id,
+        reparent_edge_summary(record),
+        record.expires_at,
+        record.id,
+        record.id,
+    )
+}
+
+fn reparent_progress_notification_text(
+    record: &ReparentRequestRecord,
+    missing: &[String],
+) -> String {
+    format!(
+        "[sm reparent] Request {} remains pending. Missing agent approvals: {}.{}",
+        record.id,
+        if missing.is_empty() {
+            "none".to_owned()
+        } else {
+            missing.join(", ")
+        },
+        if record.required_human_approval {
+            " Human approval is also required in `sm watch`."
+        } else {
+            ""
+        }
+    )
+}
+
+fn reparent_terminal_notification_text(record: &ReparentRequestRecord) -> String {
+    format!(
+        "[sm reparent] Request {} is {}. {}{}",
+        record.id,
+        record.status,
+        reparent_edge_summary(record),
+        record
+            .failure_reason
+            .as_deref()
+            .map(|reason| format!(" Reason: {reason}."))
+            .unwrap_or_default(),
+    )
+}
+
+fn reparent_edge_summary(record: &ReparentRequestRecord) -> String {
+    let edges = record
+        .apply_plan
+        .as_ref()
+        .map(|plan| plan.edge_changes.clone())
+        .unwrap_or_else(|| {
+            if record.kind == "tree" {
+                tree_reparent_edge_changes(
+                    &record.subject_session_id,
+                    &record.target_parent_session_id,
+                    record.expected_parent_session_id.as_deref(),
+                    &record.frozen_live_child_ids,
+                )
+            } else {
+                vec![ReparentEdgeChange {
+                    session_id: record.subject_session_id.clone(),
+                    expected_parent_session_id: record.expected_parent_session_id.clone(),
+                    new_parent_session_id: Some(record.target_parent_session_id.clone()),
+                }]
+            }
+        });
+    edges
+        .iter()
+        .map(|edge| {
+            format!(
+                "{}: {} -> {}",
+                edge.session_id,
+                edge.expected_parent_session_id.as_deref().unwrap_or("root"),
+                edge.new_parent_session_id.as_deref().unwrap_or("root")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ReparentDeferredRoutingIntent {
     pub key: String,
@@ -12926,6 +13241,15 @@ impl ReparentRequestRecord {
             );
         }
         affected
+    }
+
+    fn involves_session(&self, session_id: &str) -> bool {
+        self.initiator_session_id == session_id
+            || self
+                .required_agent_approvals
+                .iter()
+                .any(|id| id == session_id)
+            || self.affected_session_ids().contains(session_id)
     }
 
     fn is_apply_fenced(&self) -> bool {
@@ -17860,6 +18184,66 @@ mod tests {
             store.retire_core_session("child001", Some("newpar01")),
             Ok(CoreRetireOutcome::Retired(_))
         ));
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn reparent_notifications_are_exact_and_idempotent_across_reconciliation() {
+        let state_file = unique_temp_path("reparent-notifications");
+        let queue_db = state_file.with_extension("db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("oldpar01", None, "old-secret"),
+                    reparent_test_session("newpar01", None, "new-secret"),
+                    reparent_test_session("child001", Some("oldpar01"), "child-secret")
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue.ensure_schema().unwrap();
+        let store = SessionStore::new_with_queue(state_file.clone(), queue_db.clone());
+        let request = match store
+            .create_reparent_request(
+                "child001",
+                CreateReparentRequest {
+                    requester_session_id: "oldpar01".to_owned(),
+                    target_parent_session_id: "newpar01".to_owned(),
+                },
+                "old-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Created(record) => record,
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+
+        store.reconcile_reparent_notifications().unwrap();
+        store.reconcile_reparent_notifications().unwrap();
+        let pending = queue.pending_messages_for_target("newpar01", 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0]
+            .text
+            .contains(&format!("Approve: `sm reparent approve {}`", request.id)));
+        assert!(pending[0]
+            .text
+            .contains(&format!("Reject: `sm reparent reject {}`", request.id)));
+        assert!(pending[0].text.contains("child001: oldpar01 -> newpar01"));
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        let intents = state["reparent_requests"][0]["notification_intents"]
+            .as_array()
+            .unwrap();
+        let target_intents = intents
+            .iter()
+            .filter(|intent| intent["recipient_session_id"] == "newpar01")
+            .collect::<Vec<_>>();
+        assert_eq!(target_intents.len(), 1);
+        assert!(target_intents[0]["enqueued_at"].is_string());
 
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
