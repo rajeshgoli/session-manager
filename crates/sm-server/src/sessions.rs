@@ -9714,6 +9714,7 @@ fn complete_runtime_message_delivery_raw(
 
     let fenced_message;
     let message = if message.parent_session_id.is_some()
+        && message.remind_soft_threshold.is_some()
         && active_reparent_request_for_session(state, &message.target_session_id)?.is_some()
     {
         persist_deferred_parent_wake_intent(state, message)?;
@@ -18106,6 +18107,46 @@ mod tests {
                 .as_deref(),
             Some("newpar01")
         );
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn delivered_parent_metadata_without_reminder_creates_no_deferred_wake() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-no-reminder-wake");
+        let message_id = queue
+            .enqueue_message_with_metadata(
+                "child001",
+                "delivery has parent metadata only",
+                "important",
+                QueueMessageMetadata {
+                    parent_session_id: Some("oldpar01".to_owned()),
+                    ..QueueMessageMetadata::default()
+                },
+            )
+            .unwrap();
+        queue.cancel_parent_wake("child001").unwrap();
+        store.acquire_reparent_apply_lease().unwrap();
+        let message = queue
+            .pending_messages_for_target("child001", 10)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.id == message_id)
+            .unwrap();
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default());
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            complete_runtime_message_delivery_raw(&store, &mut state, &runtime, &queue, &message)
+                .unwrap();
+            store.write_raw_json_value(&state).unwrap();
+        }
+
+        let record = store.get_reparent_request(&request_id).unwrap().unwrap();
+        assert!(record.deferred_routing_intents.is_empty());
+        assert_eq!(queue.active_parent_wake_parent("child001").unwrap(), None);
 
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
