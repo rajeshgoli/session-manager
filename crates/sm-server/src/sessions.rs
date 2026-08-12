@@ -2690,12 +2690,6 @@ impl SessionStore {
                 let state = self.load_raw_json_value()?;
                 raw_session_object(&state, &intent.child_session_id)
                     .and_then(|session| json_text(session.get("parent_session_id")))
-                    .with_context(|| {
-                        format!(
-                            "deferred route for {} has no canonical parent",
-                            intent.child_session_id
-                        )
-                    })?
             };
             match intent.operation.as_str() {
                 "parent_wake" => {
@@ -2704,13 +2698,16 @@ impl SessionStore {
                         .get("period_seconds")
                         .and_then(Value::as_i64)
                         .context("deferred parent wake has no period")?;
-                    if let Some(queue) = self.queue_store.as_ref() {
+                    if let (Some(queue), Some(parent_session_id)) = (
+                        self.queue_store.as_ref(),
+                        resolved_parent_session_id.as_deref(),
+                    ) {
                         queue.register_parent_wake(
                             &intent.child_session_id,
-                            &resolved_parent_session_id,
+                            parent_session_id,
                             period_seconds,
                         )?;
-                    } else {
+                    } else if resolved_parent_session_id.is_some() {
                         anyhow::bail!("deferred parent wake requires the retained queue store")
                     }
                 }
@@ -2721,10 +2718,13 @@ impl SessionStore {
                         .and_then(Value::as_str)
                         .context("deferred task-complete has no text")?;
                     let message_id = deferred_task_complete_message_id(request_id, &intent.key);
-                    if let Some(queue) = self.queue_store.as_ref() {
+                    if let (Some(queue), Some(parent_session_id)) = (
+                        self.queue_store.as_ref(),
+                        resolved_parent_session_id.as_deref(),
+                    ) {
                         queue.enqueue_message_once_with_metadata(
                             &message_id,
-                            &resolved_parent_session_id,
+                            parent_session_id,
                             text,
                             "important",
                             QueueMessageMetadata {
@@ -2733,8 +2733,8 @@ impl SessionStore {
                             },
                         )?;
                         queue.cancel_parent_wake(&intent.child_session_id)?;
-                        replay_targets.insert(resolved_parent_session_id.clone());
-                    } else {
+                        replay_targets.insert(parent_session_id.to_owned());
+                    } else if resolved_parent_session_id.is_some() {
                         anyhow::bail!("deferred task-complete requires the retained queue store")
                     }
                 }
@@ -2755,10 +2755,13 @@ impl SessionStore {
                         .and_then(Value::as_str)
                         .context("deferred parent message has no category")?;
                     let message_id = deferred_parent_message_id(request_id, &intent.key);
-                    if let Some(queue) = self.queue_store.as_ref() {
+                    if let (Some(queue), Some(parent_session_id)) = (
+                        self.queue_store.as_ref(),
+                        resolved_parent_session_id.as_deref(),
+                    ) {
                         queue.enqueue_message_once_with_metadata(
                             &message_id,
-                            &resolved_parent_session_id,
+                            parent_session_id,
                             text,
                             delivery_mode,
                             QueueMessageMetadata {
@@ -2767,8 +2770,8 @@ impl SessionStore {
                                 ..QueueMessageMetadata::default()
                             },
                         )?;
-                        replay_targets.insert(resolved_parent_session_id.clone());
-                    } else {
+                        replay_targets.insert(parent_session_id.to_owned());
+                    } else if resolved_parent_session_id.is_some() {
                         anyhow::bail!("deferred parent message requires the retained queue store")
                     }
                 }
@@ -2784,8 +2787,10 @@ impl SessionStore {
                         .and_then(Value::as_str)
                         .context("deferred parent input has no delivery mode")?;
                     let message_id = deferred_parent_message_id(request_id, &intent.key);
-                    let metadata =
-                        deferred_parent_input_metadata(&intent, &resolved_parent_session_id)?;
+                    let metadata = deferred_parent_input_metadata(
+                        &intent,
+                        resolved_parent_session_id.as_deref(),
+                    )?;
                     if let Some(queue) = self.queue_store.as_ref() {
                         queue.enqueue_message_once_with_metadata(
                             &message_id,
@@ -2817,12 +2822,14 @@ impl SessionStore {
                         .get("period_seconds")
                         .and_then(Value::as_i64)
                         .context("deferred parent wake has no period")?;
-                    upsert_parent_wake_raw(
-                        &mut state,
-                        &intent.child_session_id,
-                        &resolved_parent_session_id,
-                        period_seconds,
-                    )?;
+                    if let Some(parent_session_id) = resolved_parent_session_id.as_deref() {
+                        upsert_parent_wake_raw(
+                            &mut state,
+                            &intent.child_session_id,
+                            parent_session_id,
+                            period_seconds,
+                        )?;
+                    }
                 }
                 "task_complete" => {
                     let text = intent
@@ -2831,15 +2838,17 @@ impl SessionStore {
                         .and_then(Value::as_str)
                         .context("deferred task-complete has no text")?;
                     let message_id = deferred_task_complete_message_id(request_id, &intent.key);
-                    push_retained_message_once_raw(
-                        &mut state,
-                        &message_id,
-                        &resolved_parent_session_id,
-                        text,
-                        "important",
-                        Some("task_complete"),
-                    )?;
-                    deactivate_parent_wake_raw(&mut state, &intent.child_session_id)?;
+                    if let Some(parent_session_id) = resolved_parent_session_id.as_deref() {
+                        push_retained_message_once_raw(
+                            &mut state,
+                            &message_id,
+                            parent_session_id,
+                            text,
+                            "important",
+                            Some("task_complete"),
+                        )?;
+                        deactivate_parent_wake_raw(&mut state, &intent.child_session_id)?;
+                    }
                 }
                 "parent_message" => {
                     let text = intent
@@ -2858,21 +2867,23 @@ impl SessionStore {
                         .and_then(Value::as_str)
                         .context("deferred parent message has no category")?;
                     let message_id = deferred_parent_message_id(request_id, &intent.key);
-                    push_retained_message_once_raw(
-                        &mut state,
-                        &message_id,
-                        &resolved_parent_session_id,
-                        text,
-                        delivery_mode,
-                        Some(category),
-                    )?;
+                    if let Some(parent_session_id) = resolved_parent_session_id.as_deref() {
+                        push_retained_message_once_raw(
+                            &mut state,
+                            &message_id,
+                            parent_session_id,
+                            text,
+                            delivery_mode,
+                            Some(category),
+                        )?;
+                    }
                 }
                 "parent_input" => {}
                 other => anyhow::bail!("unsupported deferred routing operation {other}"),
             }
             if current.replayed_at.is_none() {
                 current.replayed_at = Some(now_rfc3339());
-                current.resolved_parent_session_id = Some(resolved_parent_session_id);
+                current.resolved_parent_session_id = resolved_parent_session_id;
             }
             store_reparent_request_records(&mut state, &records)?;
             self.write_raw_json_value(&state)?;
@@ -4741,7 +4752,7 @@ impl SessionStore {
         emitted_at: Option<&str>,
         runtime: Option<&TmuxRuntime>,
     ) -> Result<ContextUsageOutcome> {
-        let (notify_target, label, informational_only) = {
+        let (notify_target, notify_source, label, informational_only) = {
             let sessions = ensure_sessions_array_mut(state)?;
             let Some(session) = session_object_mut(sessions, session_id) else {
                 return Ok(ContextUsageOutcome::UnknownSession);
@@ -4758,22 +4769,33 @@ impl SessionStore {
                     .as_deref()
                     .unwrap_or("claude"),
             );
-            let notify_target = if informational_only {
+            let (notify_target, notify_source) = if informational_only {
                 session.insert("context_monitor_enabled".to_owned(), Value::Bool(false));
                 session.insert("context_monitor_notify".to_owned(), Value::Null);
                 session.insert(
                     "context_monitor_notify_source".to_owned(),
                     Value::String(default_context_monitor_notify_source()),
                 );
-                None
+                (None, default_context_monitor_notify_source())
             } else {
-                json_text(session.get("context_monitor_notify"))
-                    // Fall back to the parent so an unregistered child still reports
-                    // its own context loss upward (#210).
-                    .or_else(|| json_text(session.get("parent_session_id")))
+                let configured_target = json_text(session.get("context_monitor_notify"));
+                let notify_source = if configured_target.is_some() {
+                    json_text(session.get("context_monitor_notify_source"))
+                        .unwrap_or_else(default_context_monitor_notify_source)
+                } else {
+                    "parent_derived".to_owned()
+                };
+                (
+                    configured_target
+                        // Fall back to the parent so an unregistered child still reports
+                        // its own context loss upward (#210).
+                        .or_else(|| json_text(session.get("parent_session_id"))),
+                    notify_source,
+                )
             };
             (
                 notify_target,
+                notify_source,
                 raw_session_label(session, session_id),
                 informational_only,
             )
@@ -4784,8 +4806,12 @@ impl SessionStore {
                 "[sm context] Compaction fired for {label} ({session_id}). \
                  Context was compacted — agent is still running."
             );
-            if let Some(request_id) = active_reparent_route_request_for_session(state, session_id)?
-            {
+            let deferred_request_id = if notify_source == "parent_derived" {
+                active_reparent_route_request_for_session(state, session_id)?
+            } else {
+                None
+            };
+            if let Some(request_id) = deferred_request_id {
                 persist_deferred_parent_message_intent(
                     state,
                     &request_id,
@@ -8571,7 +8597,7 @@ fn persist_deferred_parent_input_intent(
 
 fn deferred_parent_input_metadata(
     intent: &ReparentDeferredRoutingIntent,
-    parent_session_id: &str,
+    parent_session_id: Option<&str>,
 ) -> Result<QueueMessageMetadata> {
     Ok(QueueMessageMetadata {
         sender_session_id: intent
@@ -8620,7 +8646,7 @@ fn deferred_parent_input_metadata(
             .get("remind_cancel_on_reply_session_id")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
-        parent_session_id: Some(parent_session_id.to_owned()),
+        parent_session_id: parent_session_id.map(ToOwned::to_owned),
         ..QueueMessageMetadata::default()
     })
 }
@@ -17579,6 +17605,15 @@ mod tests {
         store.quiesce_reparent_json_routing(&request.id).unwrap();
         store.quiesce_reparent_queue_routing(&request.id).unwrap();
         store
+            .send_parent_notification(
+                "child001",
+                "Child child001 completed: Session exited",
+                "sequential",
+                "child_wait",
+                None,
+            )
+            .unwrap();
+        store
             .fail_reparent_apply(&request.id, "injected parentless failure")
             .unwrap();
         let repaired = store
@@ -17599,6 +17634,15 @@ mod tests {
         let record = store.get_reparent_request(&request.id).unwrap().unwrap();
         assert_eq!(record.status, "repaired");
         assert_eq!(record.apply_stage.as_deref(), Some("repair_rolled_back"));
+        assert_eq!(record.deferred_routing_intents.len(), 1);
+        assert!(record.deferred_routing_intents[0].replayed_at.is_some());
+        assert!(record.deferred_routing_intents[0]
+            .resolved_parent_session_id
+            .is_none());
+        assert!(queue
+            .pending_messages_for_target("newpar01", 10)
+            .unwrap()
+            .is_empty());
 
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
@@ -17800,6 +17844,51 @@ mod tests {
             messages[0].message_category.as_deref(),
             Some("context_monitor")
         );
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn explicit_compaction_target_is_not_retargeted_during_reparent() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-explicit-compaction");
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            let child =
+                session_object_mut(ensure_sessions_array_mut(&mut state).unwrap(), "child001")
+                    .unwrap();
+            child.insert(
+                "context_monitor_notify".to_owned(),
+                Value::String("oldpar01".to_owned()),
+            );
+            child.insert(
+                "context_monitor_notify_source".to_owned(),
+                Value::String("explicit".to_owned()),
+            );
+            store.write_raw_json_value(&state).unwrap();
+        }
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request_id).unwrap();
+        store.quiesce_reparent_queue_routing(&request_id).unwrap();
+
+        store
+            .apply_context_usage_event(&lifecycle_event("child001", "compaction"), None)
+            .unwrap();
+
+        let record = store.get_reparent_request(&request_id).unwrap().unwrap();
+        assert!(record.deferred_routing_intents.is_empty());
+        let messages = queue.pending_messages_for_target("oldpar01", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].message_category.as_deref(),
+            Some("context_monitor")
+        );
+        assert!(queue
+            .pending_messages_for_target("newpar01", 10)
+            .unwrap()
+            .is_empty());
+
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }
