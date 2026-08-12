@@ -2638,25 +2638,35 @@ impl SessionStore {
             Vec::new()
         };
         self.persist_delivered_reparent_wake_intents(request_id, &delivered_message_rows)?;
-        let replay_targets = self.replay_deferred_reparent_routes(request_id, false)?;
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
-        let mut records = reparent_request_records(&state)?;
-        let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
-        if record.apply_stage.as_deref() != Some("authority_committed") {
-            anyhow::bail!("reparent request stage changed during queue retarget")
+        let mut replay_targets = BTreeSet::new();
+        loop {
+            replay_targets.extend(self.replay_deferred_reparent_routes(request_id, false)?);
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let mut records = reparent_request_records(&state)?;
+            let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
+            if record.apply_stage.as_deref() != Some("authority_committed") {
+                anyhow::bail!("reparent request stage changed during queue retarget")
+            }
+            if record
+                .deferred_routing_intents
+                .iter()
+                .any(|intent| intent.replayed_at.is_none())
+            {
+                continue;
+            }
+            let now = now_rfc3339();
+            record.status = "applied".to_owned();
+            record.apply_stage = Some("applied".to_owned());
+            record.applied_at = Some(now.clone());
+            record.decided_at = Some(now);
+            record.ready_to_apply = false;
+            record.failure_reason = None;
+            store_reparent_request_records(&mut state, &records)?;
+            store_reparent_apply_lease(&mut state, None)?;
+            self.write_raw_json_value(&state)?;
+            break;
         }
-        let now = now_rfc3339();
-        record.status = "applied".to_owned();
-        record.apply_stage = Some("applied".to_owned());
-        record.applied_at = Some(now.clone());
-        record.decided_at = Some(now);
-        record.ready_to_apply = false;
-        record.failure_reason = None;
-        store_reparent_request_records(&mut state, &records)?;
-        store_reparent_apply_lease(&mut state, None)?;
-        self.write_raw_json_value(&state)?;
-        drop(_guard);
         self.drain_reparent_replay_targets(&replay_targets);
         Ok(())
     }
@@ -2984,20 +2994,33 @@ impl SessionStore {
     }
 
     fn complete_reparent_prequiesce_abort(&self, request_id: &str) -> Result<()> {
-        let replay_targets = self.replay_deferred_reparent_routes(request_id, true)?;
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
-        let mut records = reparent_request_records(&state)?;
-        let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
-        if record.apply_stage.as_deref() != Some("prequiesce_aborting") {
-            anyhow::bail!("reparent request stage changed during pre-quiesce abort")
+        let mut replay_targets = BTreeSet::new();
+        let mut reapply_completed = true;
+        loop {
+            replay_targets
+                .extend(self.replay_deferred_reparent_routes(request_id, reapply_completed)?);
+            reapply_completed = false;
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let mut records = reparent_request_records(&state)?;
+            let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
+            if record.apply_stage.as_deref() != Some("prequiesce_aborting") {
+                anyhow::bail!("reparent request stage changed during pre-quiesce abort")
+            }
+            if record
+                .deferred_routing_intents
+                .iter()
+                .any(|intent| intent.replayed_at.is_none())
+            {
+                continue;
+            }
+            record.status = "stale".to_owned();
+            record.apply_stage = Some("prequiesce_aborted".to_owned());
+            store_reparent_request_records(&mut state, &records)?;
+            store_reparent_apply_lease(&mut state, None)?;
+            self.write_raw_json_value(&state)?;
+            break;
         }
-        record.status = "stale".to_owned();
-        record.apply_stage = Some("prequiesce_aborted".to_owned());
-        store_reparent_request_records(&mut state, &records)?;
-        store_reparent_apply_lease(&mut state, None)?;
-        self.write_raw_json_value(&state)?;
-        drop(_guard);
         self.drain_reparent_replay_targets(&replay_targets);
         Ok(())
     }
@@ -3057,28 +3080,41 @@ impl SessionStore {
             verify_old_reparent_edges(&state, &plan)?;
             self.write_raw_json_value(&state)?;
         }
-        let replay_targets = self.replay_deferred_reparent_routes(request_id, true)?;
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
-        let mut records = reparent_request_records(&state)?;
-        let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
-        record.status = if stale_reason.is_some() {
-            "stale".to_owned()
-        } else {
-            "repaired".to_owned()
-        };
-        record.apply_stage = Some(if stale_reason.is_some() {
-            "prequiesce_aborted".to_owned()
-        } else {
-            "repair_rolled_back".to_owned()
-        });
-        record.failure_reason = stale_reason.map(ToOwned::to_owned);
-        record.ready_to_apply = false;
-        record.decided_at = Some(now_rfc3339());
-        store_reparent_request_records(&mut state, &records)?;
-        store_reparent_apply_lease(&mut state, None)?;
-        self.write_raw_json_value(&state)?;
-        drop(_guard);
+        let mut replay_targets = BTreeSet::new();
+        let mut reapply_completed = true;
+        loop {
+            replay_targets
+                .extend(self.replay_deferred_reparent_routes(request_id, reapply_completed)?);
+            reapply_completed = false;
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let mut records = reparent_request_records(&state)?;
+            let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
+            if record
+                .deferred_routing_intents
+                .iter()
+                .any(|intent| intent.replayed_at.is_none())
+            {
+                continue;
+            }
+            record.status = if stale_reason.is_some() {
+                "stale".to_owned()
+            } else {
+                "repaired".to_owned()
+            };
+            record.apply_stage = Some(if stale_reason.is_some() {
+                "prequiesce_aborted".to_owned()
+            } else {
+                "repair_rolled_back".to_owned()
+            });
+            record.failure_reason = stale_reason.map(ToOwned::to_owned);
+            record.ready_to_apply = false;
+            record.decided_at = Some(now_rfc3339());
+            store_reparent_request_records(&mut state, &records)?;
+            store_reparent_apply_lease(&mut state, None)?;
+            self.write_raw_json_value(&state)?;
+            break;
+        }
         self.drain_reparent_replay_targets(&replay_targets);
         Ok(())
     }
