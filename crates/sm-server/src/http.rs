@@ -537,6 +537,7 @@ fn github_transport_error(detail: &str) -> bool {
         "certificate signed by unknown authority",
         "could not resolve host",
         "temporary failure in name resolution",
+        "error connecting to",
         "connection reset",
         "connection refused",
         "connection timed out",
@@ -13349,6 +13350,13 @@ mod tests {
                 status: StatusCode::BAD_GATEWAY,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn github_cli_dns_connection_wording_is_retryable() {
+        assert!(github_transport_error(
+            "error connecting to api.github.com\ncheck your internet connection or https://www.githubstatus.com"
         ));
     }
 
