@@ -528,6 +528,59 @@ class SessionManagerClient:
         detail = data.get("detail") if isinstance(data, dict) else None
         return {"ok": ok, "unavailable": False, "status_code": status_code, "data": data, "detail": detail}
 
+    def list_reparent_requests(self) -> dict:
+        """List consent-based authority transfer requests for operator watch."""
+        data, status_code, unavailable = self._request_with_status("GET", "/reparent-requests")
+        if unavailable:
+            return {"ok": False, "unavailable": True, "requests": [], "detail": None}
+        requests = data.get("requests", []) if isinstance(data, dict) else []
+        return {
+            "ok": status_code == 200,
+            "unavailable": False,
+            "status_code": status_code,
+            "requests": requests if isinstance(requests, list) else [],
+            "detail": data.get("detail") if isinstance(data, dict) else None,
+        }
+
+    def decide_reparent_request_as_human(self, request_id: str, approve: bool) -> dict:
+        """Approve or reject one human-gated reparent request."""
+        action = "human-approve" if approve else "human-reject"
+        request_path = urllib.parse.quote(request_id, safe="")
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            f"/reparent-requests/{request_path}/{action}",
+            {},
+            timeout=MUTATION_API_TIMEOUT,
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "detail": None}
+        return {
+            "ok": status_code == 200,
+            "unavailable": False,
+            "status_code": status_code,
+            "data": data,
+            "detail": data.get("detail") if isinstance(data, dict) else None,
+        }
+
+    def repair_reparent_request(self, request_id: str, action: str) -> dict:
+        """Run one authenticated operator repair action."""
+        request_path = urllib.parse.quote(request_id, safe="")
+        data, status_code, unavailable = self._request_with_status(
+            "POST",
+            f"/reparent-requests/{request_path}/repair",
+            {"action": action},
+            timeout=MUTATION_API_TIMEOUT,
+        )
+        if unavailable:
+            return {"ok": False, "unavailable": True, "detail": None}
+        return {
+            "ok": status_code == 200,
+            "unavailable": False,
+            "status_code": status_code,
+            "data": data,
+            "detail": data.get("detail") if isinstance(data, dict) else None,
+        }
+
     def update_friendly_name(self, session_id: str, friendly_name: str) -> tuple[bool, bool]:
         """
         Update session friendly name.

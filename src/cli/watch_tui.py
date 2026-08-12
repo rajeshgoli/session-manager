@@ -105,6 +105,7 @@ class WatchRow:
     text: str = ""
     session_id: Optional[str] = None
     repo_key: Optional[str] = None
+    request_id: Optional[str] = None
     activity_state: str = "idle"
     columns: dict[str, str] = field(default_factory=dict)
 
@@ -391,21 +392,35 @@ def _task_completion_line(session: dict) -> Optional[str]:
     return f"task: completed ({_age_from_iso(completed_at)})"
 
 
-def _pending_adoption_lines(session: dict) -> list[str]:
-    proposals = session.get("pending_adoption_proposals") or []
-    lines: list[str] = []
-    for proposal in proposals:
-        if proposal.get("status") != "pending":
-            continue
-        proposer_name = proposal.get("proposer_name") or proposal.get("proposer_session_id") or "unknown"
-        proposer_id = proposal.get("proposer_session_id") or "unknown"
-        created_at = proposal.get("created_at")
-        age = _age_from_iso(created_at)
-        age_suffix = f" ({age})" if age != "-" else ""
-        lines.append(
-            f"adopt: pending from {proposer_name} [{proposer_id}]{age_suffix}  [A accept / X reject]"
-        )
-    return lines
+def _reparent_request_line(request: dict) -> str:
+    request_id = request.get("id") or "unknown"
+    kind = request.get("kind") or "unknown"
+    source = request.get("subject_session_id") or "unknown"
+    target = request.get("target_parent_session_id") or "unknown"
+    status = request.get("status") or "unknown"
+    age = _age_from_iso(request.get("created_at"))
+    expiry = request.get("expires_at") or "unknown"
+    approvals = request.get("approvals") or []
+    approved = {
+        approval.get("actor_id")
+        for approval in approvals
+        if approval.get("actor_kind") == "agent" and approval.get("decision") == "approved"
+    }
+    missing = [
+        actor for actor in (request.get("required_agent_approvals") or []) if actor not in approved
+    ]
+    missing_text = ",".join(missing) if missing else "none"
+    action = "A approve / X reject" if request.get("required_human_approval") and status == "pending" else ""
+    if status == "failed":
+        stage = request.get("apply_stage") or "unknown"
+        action = "R resume"
+        if stage in {"json_routing_quiesced", "routing_quiesced"}:
+            action += " / B rollback"
+    suffix = f"  [{action}]" if action else ""
+    return (
+        f"reparent {request_id}: {kind} {source} -> {target} {status} age={age} "
+        f"expires={expiry} missing={missing_text}{suffix}"
+    )
 
 
 def _format_age(last_activity: Optional[str], activity_state: str) -> str:
@@ -623,6 +638,7 @@ def build_watch_rows(
     expanded_session_ids: Optional[set[str]] = None,
     detail_cache: Optional[dict[str, DetailSnapshot]] = None,
     codex_projection_enabled: bool = True,
+    reparent_requests: Optional[list[dict]] = None,
 ) -> tuple[list[WatchRow], list[str], int]:
     """Build grouped rows and selectable session IDs."""
     rows: list[WatchRow] = []
@@ -633,6 +649,14 @@ def build_watch_rows(
     roots_by_repo: dict[str, list[dict]] = {}
     same_repo_children: dict[str, list[dict]] = {}
     cross_repo_children: dict[str, dict[str, list[dict]]] = {}
+    requests_by_source: dict[str, list[dict]] = {}
+    for request in reparent_requests or []:
+        if request.get("status") == "pending" and request.get("required_human_approval"):
+            requests_by_source.setdefault(request.get("subject_session_id") or "", []).append(request)
+        elif request.get("status") == "failed":
+            requests_by_source.setdefault(request.get("subject_session_id") or "", []).append(request)
+    for requests in requests_by_source.values():
+        requests.sort(key=lambda request: (request.get("created_at") or "", request.get("id") or ""))
 
     for session in sessions:
         key = _repo_key(session.get("working_dir", ""))
@@ -730,12 +754,13 @@ def build_watch_rows(
                 )
             )
 
-        for adoption_line in _pending_adoption_lines(session):
+        for request in requests_by_source.get(session_id or "", []):
             rows.append(
                 WatchRow(
-                    kind="status",
-                    text=f"{status_prefix}{adoption_line}",
+                    kind="reparent",
+                    text=f"{status_prefix}{_reparent_request_line(request)}",
                     session_id=session_id,
+                    request_id=request.get("id"),
                 )
             )
 
@@ -1390,6 +1415,7 @@ def _render(
     rows: list[WatchRow],
     selected_session_id: Optional[str],
     selected_repo_key: Optional[str],
+    selected_request_id: Optional[str],
     scroll_offset: int,
     total_sessions: int,
     repo_count: int,
@@ -1442,6 +1468,11 @@ def _render(
             stdscr.addnstr(y, 0, f"{marker} {row.text}", _render_columns(width, 0), attr)
         elif row.kind == "repo_ref":
             stdscr.addnstr(y, 4, row.text, _render_columns(width, 4), curses.A_BOLD)
+        elif row.kind == "reparent":
+            is_selected = row.request_id == selected_request_id
+            marker = ">" if is_selected else " "
+            attr = curses.A_REVERSE | curses.A_BOLD if is_selected else curses.A_BOLD
+            stdscr.addnstr(y, 2, f"{marker} {row.text}", _render_columns(width, 2), attr)
         elif row.kind == "status":
             stdscr.addnstr(y, 4, row.text, _render_columns(width, 4), curses.A_NORMAL)
         else:
@@ -1461,7 +1492,7 @@ def _render(
     if restore_mode:
         footer = f"j/k: move  Enter: restore/expand  o: sort={restore_sort}  R: hide repo  U: show repos  Tab: expand/collapse  E: expand all  C: collapse all  /: search  r: refresh  q: quit"
     else:
-        footer = "j/k: move  +: create  F: fork  Enter: attach  s: send  K,K: retire  n: rename  A/X: adopt  Tab: details  /: filter  r: refresh  q: quit"
+        footer = "j/k: move  +: create  F: fork  Enter: attach  s: send  K,K: retire  n: rename  A/X: reparent  R/B: repair  Tab: details  /: filter  r: refresh  q: quit"
     stdscr.addnstr(height - 1, 0, footer, _render_columns(width, 0, reserve_last_cell=True))
     stdscr.refresh()
 
@@ -1493,6 +1524,7 @@ def run_watch_tui(
         try:
             selected_session_id: Optional[str] = None
             selected_repo_key: Optional[str] = None
+            selected_request_id: Optional[str] = None
             text_filter: Optional[str] = None
             flash_message: Optional[str] = None
             flash_until = 0.0
@@ -1500,6 +1532,7 @@ def run_watch_tui(
             selectable: list[str] = []
             latest_sessions: list[dict] = []
             latest_by_id: dict[str, dict] = {}
+            latest_reparent_by_id: dict[str, dict] = {}
             expanded_session_ids: set[str] = set()
             collapsed_session_ids: set[str] = set()
             collapsed_repo_keys: set[str] = set()
@@ -1533,6 +1566,18 @@ def run_watch_tui(
                         flash_message = "Session manager unavailable"
                         flash_until = now + 2.5
                     else:
+                        reparent_result = (
+                            client.list_reparent_requests() if not restore_mode else {"ok": True, "requests": []}
+                        )
+                        if reparent_result.get("unavailable"):
+                            flash_message = "Reparent requests unavailable"
+                            flash_until = now + 2.5
+                        reparent_requests = reparent_result.get("requests") or []
+                        latest_reparent_by_id = {
+                            request.get("id", ""): request
+                            for request in reparent_requests
+                            if request.get("id")
+                        }
                         filtered = filter_sessions(
                             listed,
                             repo_filter=repo_filter,
@@ -1572,6 +1617,7 @@ def run_watch_tui(
                                 expanded_session_ids=expanded_session_ids,
                                 detail_cache=detail_cache,
                                 codex_projection_enabled=codex_projection_enabled,
+                                reparent_requests=reparent_requests,
                             )
                             spinner_index += 1
                             # Prune stale expanded IDs and enqueue refresh for active details.
@@ -1582,6 +1628,11 @@ def run_watch_tui(
                                     detail_worker.request(session)
                         if not restore_mode and selected_session_id not in selectable:
                             selected_session_id = selectable[0] if selectable else None
+                        visible_request_ids = {
+                            row.request_id for row in rows if row.kind == "reparent" and row.request_id
+                        }
+                        if selected_request_id not in visible_request_ids:
+                            selected_request_id = None
 
                     next_refresh = now + max(0.2, interval)
 
@@ -1592,7 +1643,12 @@ def run_watch_tui(
 
                 max_rows = max(0, stdscr.getmaxyx()[0] - _RESERVED_SCREEN_ROWS)
                 selected_row_idx = None
-                if selected_session_id:
+                if selected_request_id:
+                    for idx, row in enumerate(rows):
+                        if row.kind == "reparent" and row.request_id == selected_request_id:
+                            selected_row_idx = idx
+                            break
+                elif selected_session_id:
                     for idx, row in enumerate(rows):
                         if row.kind == "session" and row.session_id == selected_session_id:
                             selected_row_idx = idx
@@ -1617,6 +1673,7 @@ def run_watch_tui(
                     rows=rows,
                     selected_session_id=selected_session_id,
                     selected_repo_key=selected_repo_key,
+                    selected_request_id=selected_request_id,
                     scroll_offset=scroll_offset,
                     total_sessions=total_sessions,
                     repo_count=repo_count,
@@ -1648,9 +1705,18 @@ def run_watch_tui(
                             selected_session_id, selected_repo_key = restore_selection_from_key(
                                 restore_keys[min(current_idx + 1, len(restore_keys) - 1)]
                             )
-                    elif selectable:
-                        current_idx = selectable.index(selected_session_id) if selected_session_id in selectable else 0
-                        selected_session_id = selectable[min(current_idx + 1, len(selectable) - 1)]
+                    else:
+                        navigation = [
+                            (row.kind, row.session_id, row.request_id)
+                            for row in rows
+                            if row.kind in {"session", "reparent"}
+                        ]
+                        current = ("reparent", selected_session_id, selected_request_id) if selected_request_id else ("session", selected_session_id, None)
+                        if navigation:
+                            current_idx = navigation.index(current) if current in navigation else 0
+                            kind, selected_session_id, selected_request_id = navigation[min(current_idx + 1, len(navigation) - 1)]
+                            if kind == "session":
+                                selected_request_id = None
                     continue
 
                 if key in (ord("k"), curses.KEY_UP):
@@ -1662,9 +1728,18 @@ def run_watch_tui(
                             selected_session_id, selected_repo_key = restore_selection_from_key(
                                 restore_keys[max(current_idx - 1, 0)]
                             )
-                    elif selectable:
-                        current_idx = selectable.index(selected_session_id) if selected_session_id in selectable else 0
-                        selected_session_id = selectable[max(current_idx - 1, 0)]
+                    else:
+                        navigation = [
+                            (row.kind, row.session_id, row.request_id)
+                            for row in rows
+                            if row.kind in {"session", "reparent"}
+                        ]
+                        current = ("reparent", selected_session_id, selected_request_id) if selected_request_id else ("session", selected_session_id, None)
+                        if navigation:
+                            current_idx = navigation.index(current) if current in navigation else 0
+                            kind, selected_session_id, selected_request_id = navigation[max(current_idx - 1, 0)]
+                            if kind == "session":
+                                selected_request_id = None
                     continue
 
                 if key in (ord("r"),):
@@ -1679,6 +1754,7 @@ def run_watch_tui(
                 selected = None
                 if selected_session_id:
                     selected = latest_by_id.get(selected_session_id)
+                selected_request = latest_reparent_by_id.get(selected_request_id or "")
 
                 if key in (ord("/"),):
                     entered = _prompt_input(stdscr, "filter (blank=clear): ")
@@ -1911,41 +1987,54 @@ def run_watch_tui(
                     continue
 
                 if key in (ord("A"), ord("X")):
-                    if not selected:
-                        flash_message = "No session selected"
+                    if not selected_request:
+                        flash_message = "Select a human-gated reparent request"
                         flash_until = time.monotonic() + 2.0
                         continue
-
-                    proposals = [
-                        proposal
-                        for proposal in (selected.get("pending_adoption_proposals") or [])
-                        if proposal.get("status") == "pending"
-                    ]
-                    if not proposals:
-                        flash_message = "No pending adoption proposal"
+                    if (
+                        selected_request.get("status") != "pending"
+                        or not selected_request.get("required_human_approval")
+                    ):
+                        flash_message = "Selected request does not need a human decision"
                         flash_until = time.monotonic() + 2.0
                         continue
-
-                    proposal = proposals[0]
-                    proposal_id = proposal.get("id")
-                    if not proposal_id:
-                        flash_message = "Pending adoption proposal is missing an id"
-                        flash_until = time.monotonic() + 2.0
-                        continue
-
-                    if key == ord("A"):
-                        result = client.accept_adoption_proposal(proposal_id)
-                        action = "accepted"
-                    else:
-                        result = client.reject_adoption_proposal(proposal_id)
-                        action = "rejected"
+                    result = client.decide_reparent_request_as_human(
+                        selected_request_id,
+                        approve=key == ord("A"),
+                    )
+                    action = "approved" if key == ord("A") else "rejected"
 
                     if result.get("unavailable"):
                         flash_message = "Session manager unavailable"
                     elif result.get("ok"):
-                        flash_message = f"Adoption {action} for {selected_session_id}"
+                        flash_message = f"Reparent request {selected_request_id} {action}"
                     else:
-                        flash_message = str(result.get("detail") or f"Failed to {action} adoption proposal")
+                        flash_message = str(result.get("detail") or f"Failed to {action} reparent request")
+                    flash_until = time.monotonic() + 2.5
+                    next_refresh = 0.0
+                    continue
+
+                if key in (ord("R"), ord("B")):
+                    if not selected_request or selected_request.get("status") != "failed":
+                        flash_message = "Select a failed reparent request"
+                        flash_until = time.monotonic() + 2.0
+                        continue
+                    stage = selected_request.get("apply_stage") or "unknown"
+                    action = "resume" if key == ord("R") else "rollback_precommit"
+                    if action == "rollback_precommit" and stage not in {
+                        "json_routing_quiesced",
+                        "routing_quiesced",
+                    }:
+                        flash_message = f"Rollback is unsafe from stage {stage}; resume only"
+                        flash_until = time.monotonic() + 3.0
+                        continue
+                    result = client.repair_reparent_request(selected_request_id, action)
+                    if result.get("unavailable"):
+                        flash_message = "Session manager unavailable"
+                    elif result.get("ok"):
+                        flash_message = f"Reparent request {selected_request_id}: {action}"
+                    else:
+                        flash_message = str(result.get("detail") or f"Failed to {action}")
                     flash_until = time.monotonic() + 2.5
                     next_refresh = 0.0
                     continue

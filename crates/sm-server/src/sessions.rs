@@ -23,10 +23,12 @@ use time::{
 };
 
 use crate::queue::{
-    followup_notification_text, PendingMessage, QueueMessageMetadata, RetainedQueueStore,
+    followup_notification_text, ParentRoutingMessageRow, ParentRoutingSnapshot,
+    ParentRoutingWakeRow, PendingMessage, QueueMessageMetadata, RetainedQueueStore,
     StopNotifyState,
 };
 use crate::{
+    btw::BtwStore,
     config::{CodexReviewConfig, ContextMonitorConfig},
     runtime::{ConditionalClearOutcome, TmuxRuntime, TmuxSessionSpec},
     seat_sessions::{SeatSessionIdentity, SeatSessionStore},
@@ -49,6 +51,7 @@ const CODEX_FORK_EVENT_MONITOR_POLL: Duration = Duration::from_millis(250);
 const CODEX_FORK_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const SEAT_SESSION_RETRY_ATTEMPTS: usize = 20;
 const SEAT_SESSION_RETRY_DELAY: Duration = Duration::from_millis(100);
+const REPARENT_REQUEST_TTL_HOURS: i64 = 24;
 static STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -69,6 +72,7 @@ pub struct SessionStore {
     delivery_runtime: Option<TmuxRuntime>,
     codex_fork_handoff_monitors: Arc<Mutex<BTreeSet<String>>>,
     claude_handoff_workers: Arc<Mutex<BTreeSet<String>>>,
+    credential_rotation_workers: Arc<Mutex<BTreeSet<String>>>,
     seat_session_appends: Arc<Mutex<BTreeSet<(String, String, String)>>>,
     clear_operation_locks: Arc<Mutex<BTreeMap<String, Weak<SessionClearLock>>>>,
     seat_session_store: SeatSessionStore,
@@ -123,6 +127,7 @@ impl SessionStore {
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
             claude_handoff_workers: Arc::new(Mutex::new(BTreeSet::new())),
+            credential_rotation_workers: Arc::new(Mutex::new(BTreeSet::new())),
             seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
@@ -653,6 +658,606 @@ impl SessionStore {
         self
     }
 
+    pub fn recover_session_runtime_launches(&self) -> Result<()> {
+        loop {
+            let launch_id = {
+                let _guard = self.write_guard()?;
+                let state = self.load_raw_json_value()?;
+                session_runtime_launch_records(&state)?
+                    .into_iter()
+                    .find(|record| matches!(record.status.as_str(), "prepared" | "launching"))
+                    .map(|record| record.id)
+            };
+            let Some(launch_id) = launch_id else {
+                return Ok(());
+            };
+            self.recover_session_runtime_launch(&launch_id)?;
+        }
+    }
+
+    fn recover_session_runtime_launch(&self, launch_id: &str) -> Result<()> {
+        let pending_launch = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            session_runtime_launch_records(&state)?
+                .into_iter()
+                .find(|record| record.id == launch_id)
+        };
+        let codex_cli_binding_guard = pending_launch
+            .as_ref()
+            .filter(|launch| launch.operation_kind == "create" && launch.provider == "codex")
+            .map(|launch| self.lock_codex_cli_binding_working_dir(&launch.working_dir))
+            .transpose()?;
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let Some(mut launch) = session_runtime_launch_records(&state)?
+            .into_iter()
+            .find(|record| record.id == launch_id)
+        else {
+            return Ok(());
+        };
+        if !matches!(launch.status.as_str(), "prepared" | "launching") {
+            return Ok(());
+        }
+        let Some(runtime) = self.delivery_runtime.as_ref() else {
+            mark_runtime_launch_failed(
+                &mut state,
+                launch_id,
+                &launch.session_id,
+                launch.operation_kind == "create",
+                "runtime launch recovery is disabled",
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(());
+        };
+        let session_runtime = runtime.for_socket_name(launch.tmux_socket_name.as_deref());
+        let credential = generate_session_credential();
+        let credential_sha256 = sha256_text(&credential);
+        launch.credential_sha256 = credential_sha256.clone();
+        launch.status = "launching".to_owned();
+        launch.updated_at = now_rfc3339();
+        launch.failure_reason = None;
+        let mut records = session_runtime_launch_records(&state)?;
+        let Some(stored_launch) = records.iter_mut().find(|record| record.id == launch_id) else {
+            return Ok(());
+        };
+        *stored_launch = launch.clone();
+        store_session_runtime_launch_records(&mut state, &records)?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, &launch.session_id) else {
+            mark_runtime_launch_failed(
+                &mut state,
+                launch_id,
+                &launch.session_id,
+                false,
+                "runtime launch session is missing",
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(());
+        };
+        session.insert(
+            "session_credential_sha256".to_owned(),
+            Value::String(credential_sha256),
+        );
+        session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+        session.insert("stopped_at".to_owned(), Value::String(now_rfc3339()));
+        self.write_raw_json_value(&state)?;
+
+        let spec = TmuxSessionSpec {
+            session_id: launch.session_id.clone(),
+            session_credential: Some(credential),
+            tmux_session: launch.tmux_session.clone(),
+            working_dir: launch.working_dir.clone(),
+            log_file: PathBuf::from(&launch.log_file),
+            provider: launch.provider.clone(),
+            initial_message: launch.initial_message.clone(),
+            model: launch.model.clone(),
+            reasoning_effort: launch.reasoning_effort.clone(),
+        };
+        let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
+        let codex_cli_creation_binding =
+            if launch.operation_kind == "create" && launch.provider == "codex" {
+                let snapshot = snapshot_from_raw_value(&state)?;
+                let record = snapshot
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == launch.session_id)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("runtime launch session disappeared before recovery")
+                    })?;
+                let mut excluded_ids = snapshot
+                    .sessions
+                    .iter()
+                    .filter_map(|session| session.provider_resume_id.clone())
+                    .collect::<BTreeSet<_>>();
+                excluded_ids.extend(codex_cli_existing_session_ids(
+                    record,
+                    &self.codex_sessions_root,
+                ));
+                Some((
+                    record.clone(),
+                    excluded_ids,
+                    OffsetDateTime::now_utc().unix_timestamp_nanos(),
+                ))
+            } else {
+                None
+            };
+        let result = (|| -> Result<()> {
+            if session_runtime.session_exists(&launch.tmux_session)? {
+                session_runtime.kill_session(&launch.tmux_session)?;
+            }
+            if launch.operation_kind == "create" {
+                session_runtime.create_session(&spec)
+            } else {
+                session_runtime.restore_session(
+                    &spec,
+                    &launch.provider,
+                    launch.provider_resume_id.as_deref(),
+                )
+            }
+        })();
+        if let Err(error) = result {
+            mark_runtime_launch_failed(
+                &mut state,
+                launch_id,
+                &launch.session_id,
+                launch.operation_kind == "create",
+                &error.to_string(),
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(());
+        }
+
+        let mut recovered_provider_resume_id = launch.provider_resume_id.clone();
+        if launch.operation_kind == "create" {
+            if let Some((record, excluded_ids, launched_at_ns)) =
+                codex_cli_creation_binding.as_ref()
+            {
+                recovered_provider_resume_id = wait_for_codex_cli_provider_resume_id(
+                    record,
+                    &self.codex_sessions_root,
+                    excluded_ids,
+                    *launched_at_ns,
+                    CODEX_CLI_SESSION_BIND_TIMEOUT,
+                );
+            }
+            if let Some(artifacts) = codex_fork_artifacts.as_ref() {
+                match wait_for_codex_fork_provider_resume_id(
+                    &artifacts.event_stream_path,
+                    CODEX_FORK_THREAD_STARTED_TIMEOUT,
+                ) {
+                    Ok(provider_resume_id) => {
+                        recovered_provider_resume_id = Some(provider_resume_id);
+                    }
+                    Err(error) => {
+                        let _ = session_runtime.kill_session(&launch.tmux_session);
+                        mark_runtime_launch_failed(
+                            &mut state,
+                            launch_id,
+                            &launch.session_id,
+                            true,
+                            &error.to_string(),
+                        )?;
+                        self.write_raw_json_value(&state)?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, &launch.session_id) else {
+            let _ = session_runtime.kill_session(&launch.tmux_session);
+            mark_runtime_launch_failed(
+                &mut state,
+                launch_id,
+                &launch.session_id,
+                false,
+                "runtime launch session disappeared after recovery",
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(());
+        };
+        session.insert("status".to_owned(), Value::String("running".to_owned()));
+        session.insert("stopped_at".to_owned(), Value::Null);
+        if launch.operation_kind == "restore" {
+            session.insert("completion_status".to_owned(), Value::Null);
+            session.insert("completion_message".to_owned(), Value::Null);
+            session.insert("completed_at".to_owned(), Value::Null);
+            session.insert("agent_task_completed_at".to_owned(), Value::Null);
+        }
+        if let Some(provider_resume_id) = recovered_provider_resume_id.as_deref() {
+            session.insert(
+                "provider_resume_id".to_owned(),
+                Value::String(provider_resume_id.to_owned()),
+            );
+        }
+        session.insert("last_activity".to_owned(), Value::String(now_rfc3339()));
+        let recovered = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
+        mark_runtime_launch_applied(
+            &mut state,
+            launch_id,
+            recovered_provider_resume_id.as_deref(),
+        )?;
+        self.write_raw_json_value(&state)?;
+        drop(_guard);
+        if let Some(provider_resume_id) = recovered_provider_resume_id.as_deref() {
+            self.append_seat_session(
+                &launch.session_id,
+                &launch.provider,
+                provider_resume_id,
+                codex_fork_artifacts
+                    .as_ref()
+                    .and_then(|artifacts| artifacts.event_stream_path.to_str()),
+            );
+        }
+        if recovered_provider_resume_id.is_none() {
+            if let Some((record, excluded_ids, launched_at_ns)) = codex_cli_creation_binding {
+                let store = self.clone();
+                let session_id = launch.session_id.clone();
+                let spawn_result = thread::Builder::new()
+                    .name(format!(
+                        "sm-codex-recovery-bind-{}",
+                        sanitize_path_component(&session_id)
+                    ))
+                    .spawn(move || {
+                        let _binding_guard = codex_cli_binding_guard;
+                        if let Err(error) = store.complete_deferred_codex_cli_rebind(
+                            &session_id,
+                            &record,
+                            &excluded_ids,
+                            launched_at_ns,
+                            None,
+                            CODEX_CLI_DEFERRED_BIND_TIMEOUT,
+                        ) {
+                            eprintln!(
+                                "deferred recovered Codex thread discovery failed for seat {session_id}: {error:#}"
+                            );
+                        }
+                    });
+                if let Err(error) = spawn_result {
+                    eprintln!("failed to start recovered Codex thread discovery: {error}");
+                }
+            }
+        }
+        if let Some(artifacts) = codex_fork_artifacts {
+            self.start_codex_fork_event_monitor(recovered.id, artifacts.event_stream_path)?;
+        }
+        Ok(())
+    }
+
+    fn start_credential_rotation_worker(&self, session_id: String) -> Result<()> {
+        {
+            let mut workers = self
+                .credential_rotation_workers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("credential rotation worker registry poisoned"))?;
+            if !workers.insert(session_id.clone()) {
+                return Ok(());
+            }
+        }
+        let store = self.clone();
+        let worker_session_id = session_id.clone();
+        let spawn_result = thread::Builder::new()
+            .name(format!(
+                "sm-recredential-{}",
+                sanitize_path_component(&session_id)
+            ))
+            .spawn(move || {
+                loop {
+                    match store.try_apply_waiting_credential_rotation(&worker_session_id) {
+                        Ok(true) => break,
+                        Ok(false) => thread::sleep(Duration::from_secs(1)),
+                        Err(error) => {
+                            eprintln!(
+                                "credential rotation worker retrying for {worker_session_id}: {error:#}"
+                            );
+                            thread::sleep(Duration::from_secs(1));
+                        }
+                    }
+                }
+                if let Ok(mut workers) = store.credential_rotation_workers.lock() {
+                    workers.remove(&worker_session_id);
+                }
+            });
+        if let Err(error) = spawn_result {
+            if let Ok(mut workers) = self.credential_rotation_workers.lock() {
+                workers.remove(&session_id);
+            }
+            return Err(error).context("failed to start credential rotation worker");
+        }
+        Ok(())
+    }
+
+    fn try_apply_waiting_credential_rotation(&self, session_id: &str) -> Result<bool> {
+        let (rotation, session, recovering_launch_id) = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            let rotations = session_credential_rotation_records(&state)?;
+            let recovering_launch_id = rotations
+                .iter()
+                .find(|record| record.session_id == session_id && record.status == "relaunching")
+                .map(|rotation| {
+                    rotation.runtime_launch_id.clone().with_context(|| {
+                        format!(
+                            "relaunching credential rotation {} has no runtime launch",
+                            rotation.id
+                        )
+                    })
+                })
+                .transpose()?;
+            if recovering_launch_id.is_some() {
+                (None, None, recovering_launch_id)
+            } else {
+                let Some(rotation) = rotations.into_iter().find(|record| {
+                    record.session_id == session_id && record.status == "waiting_idle"
+                }) else {
+                    return Ok(true);
+                };
+                let Some(session) = snapshot_from_raw_value(&state)?
+                    .sessions
+                    .into_iter()
+                    .find(|session| session.id == session_id)
+                else {
+                    return Ok(true);
+                };
+                (Some(rotation), Some(session), None)
+            }
+        };
+        if let Some(launch_id) = recovering_launch_id {
+            self.recover_session_runtime_launch(&launch_id)?;
+            return Ok(true);
+        }
+        let rotation = rotation.expect("waiting rotation checked above");
+        let session = session.expect("waiting rotation session checked above");
+        let Some(runtime) = self.delivery_runtime.as_ref() else {
+            return Ok(true);
+        };
+        let session_runtime = runtime.for_socket_name(rotation.tmux_socket_name.as_deref());
+        if !session_runtime.session_exists(&rotation.tmux_session)? {
+            self.fail_waiting_credential_rotation(
+                &rotation.id,
+                "session runtime disappeared while waiting for idle",
+            )?;
+            return Ok(true);
+        }
+        if !credential_rotation_has_fresh_idle_proof(&rotation, &session)
+            || session_runtime.session_has_attached_clients(&rotation.tmux_session)?
+            || !session_runtime.session_input_ready(&rotation.tmux_session, &rotation.provider)
+            || !self.credential_rotation_queue_is_drained(session_id)?
+            || self.credential_rotation_has_active_btw(session_id)?
+        {
+            return Ok(false);
+        }
+
+        let (_clear_guard, _guard, _input_guard) = self.lock_credential_rotation_fences(
+            session_id,
+            &session_runtime,
+            &rotation.tmux_session,
+        )?;
+        let mut state = self.load_raw_json_value()?;
+        let mut rotations = session_credential_rotation_records(&state)?;
+        let Some(rotation_index) = rotations
+            .iter()
+            .position(|record| record.id == rotation.id && record.status == "waiting_idle")
+        else {
+            return Ok(true);
+        };
+        if !session_runtime.session_exists(&rotation.tmux_session)? {
+            rotations[rotation_index].status = "failed".to_owned();
+            rotations[rotation_index].updated_at = now_rfc3339();
+            rotations[rotation_index].failure_reason =
+                Some("session runtime disappeared while waiting for idle".to_owned());
+            store_session_credential_rotation_records(&mut state, &rotations)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(true);
+        }
+        let snapshot = snapshot_from_raw_value(&state)?;
+        let Some(session) = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+        else {
+            rotations[rotation_index].status = "failed".to_owned();
+            rotations[rotation_index].updated_at = now_rfc3339();
+            rotations[rotation_index].failure_reason = Some("session disappeared".to_owned());
+            store_session_credential_rotation_records(&mut state, &rotations)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(true);
+        };
+        if !session.is_live_for_registry()
+            || session.provider != rotation.provider
+            || session.tmux_session != rotation.tmux_session
+            || session.tmux_socket_name != rotation.tmux_socket_name
+            || provider_resume_id_for_restore(&session).as_deref()
+                != Some(rotation.provider_resume_id.as_str())
+        {
+            rotations[rotation_index].status = "failed".to_owned();
+            rotations[rotation_index].updated_at = now_rfc3339();
+            rotations[rotation_index].failure_reason =
+                Some("session runtime identity changed while waiting for idle".to_owned());
+            store_session_credential_rotation_records(&mut state, &rotations)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(true);
+        }
+        let raw_session = raw_session_object(&state, session_id)
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared"))?;
+        if !credential_rotation_has_fresh_idle_proof(&rotations[rotation_index], &session)
+            || active_reparent_request_for_session(&state, session_id)?.is_some()
+            || json_text(raw_session.get("pending_handoff_path")).is_some()
+            || json_text(raw_session.get("claude_handoff_in_progress_at")).is_some()
+            || review_dispatch_in_progress(raw_session)
+            || !self.credential_rotation_queue_is_drained(session_id)?
+            || self.credential_rotation_has_active_btw(session_id)?
+            || session_runtime.session_has_attached_clients(&rotation.tmux_session)?
+            || !session_runtime.session_input_ready(&rotation.tmux_session, &rotation.provider)
+        {
+            return Ok(false);
+        }
+
+        let Some(log_file) = session
+            .log_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(expand_home)
+        else {
+            rotations[rotation_index].status = "failed".to_owned();
+            rotations[rotation_index].updated_at = now_rfc3339();
+            rotations[rotation_index].failure_reason =
+                Some("session log file is missing".to_owned());
+            store_session_credential_rotation_records(&mut state, &rotations)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(true);
+        };
+        let credential = generate_session_credential();
+        let credential_sha256 = sha256_text(&credential);
+        let spec = TmuxSessionSpec {
+            session_id: session.id.clone(),
+            session_credential: Some(credential),
+            tmux_session: session.tmux_session.clone(),
+            working_dir: expand_home(&session.working_dir).display().to_string(),
+            log_file,
+            provider: session.provider.clone(),
+            initial_message: None,
+            model: session.model.clone(),
+            reasoning_effort: session.reasoning_effort.clone(),
+        };
+        let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
+        let mut launches = session_runtime_launch_records(&state)?;
+        let launch_id = generate_unique_runtime_launch_id(&launches)?;
+        let now = now_rfc3339();
+        launches.push(SessionRuntimeLaunchRecord {
+            id: launch_id.clone(),
+            operation_kind: "recredential".to_owned(),
+            session_id: session.id.clone(),
+            tmux_session: session.tmux_session.clone(),
+            tmux_socket_name: session_runtime.socket_name().map(ToOwned::to_owned),
+            working_dir: spec.working_dir.clone(),
+            log_file: spec.log_file.display().to_string(),
+            provider: session.provider.clone(),
+            provider_resume_id: Some(rotation.provider_resume_id.clone()),
+            credential_rotation_id: Some(rotation.id.clone()),
+            initial_message: None,
+            model: session.model.clone(),
+            reasoning_effort: session.reasoning_effort.clone(),
+            credential_sha256: credential_sha256.clone(),
+            status: "launching".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            failure_reason: None,
+        });
+        rotations[rotation_index].status = "relaunching".to_owned();
+        rotations[rotation_index].idle_proof_at = Some(now.clone());
+        rotations[rotation_index].runtime_launch_id = Some(launch_id.clone());
+        rotations[rotation_index].updated_at = now;
+        {
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let raw_session = session_object_mut(sessions, session_id)
+                .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared"))?;
+            raw_session.insert(
+                "session_credential_sha256".to_owned(),
+                Value::String(credential_sha256),
+            );
+            raw_session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+            raw_session.insert("stopped_at".to_owned(), Value::String(now_rfc3339()));
+        }
+        store_session_runtime_launch_records(&mut state, &launches)?;
+        store_session_credential_rotation_records(&mut state, &rotations)?;
+        self.write_raw_json_value(&state)?;
+
+        let relaunch_result = (|| -> Result<()> {
+            if session_runtime.session_exists(&session.tmux_session)? {
+                session_runtime.kill_session(&session.tmux_session)?;
+            }
+            session_runtime.restore_session(
+                &spec,
+                &session.provider,
+                Some(&rotation.provider_resume_id),
+            )
+        })();
+        if let Err(error) = relaunch_result {
+            mark_runtime_launch_failed(
+                &mut state,
+                &launch_id,
+                session_id,
+                false,
+                &error.to_string(),
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(true);
+        }
+
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(raw_session) = session_object_mut(sessions, session_id) else {
+            let _ = session_runtime.kill_session(&session.tmux_session);
+            mark_runtime_launch_failed(
+                &mut state,
+                &launch_id,
+                session_id,
+                false,
+                "session disappeared after credential relaunch",
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(true);
+        };
+        raw_session.insert("status".to_owned(), Value::String("running".to_owned()));
+        raw_session.insert("stopped_at".to_owned(), Value::Null);
+        raw_session.insert("last_activity".to_owned(), Value::String(now_rfc3339()));
+        mark_runtime_launch_applied(&mut state, &launch_id, Some(&rotation.provider_resume_id))?;
+        self.write_raw_json_value(&state)?;
+        drop(_guard);
+        if let Some(artifacts) = codex_fork_artifacts {
+            self.start_codex_fork_event_monitor(session.id, artifacts.event_stream_path)?;
+        }
+        Ok(true)
+    }
+
+    fn fail_waiting_credential_rotation(
+        &self,
+        rotation_id: &str,
+        failure_reason: &str,
+    ) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let mut rotations = session_credential_rotation_records(&state)?;
+        let Some(rotation) = rotations
+            .iter_mut()
+            .find(|record| record.id == rotation_id && record.status == "waiting_idle")
+        else {
+            return Ok(());
+        };
+        rotation.status = "failed".to_owned();
+        rotation.updated_at = now_rfc3339();
+        rotation.failure_reason = Some(failure_reason.to_owned());
+        store_session_credential_rotation_records(&mut state, &rotations)?;
+        self.write_raw_json_value(&state)
+    }
+
+    fn credential_rotation_queue_is_drained(&self, session_id: &str) -> Result<bool> {
+        self.queue_store
+            .as_ref()
+            .map(|queue| {
+                queue
+                    .pending_messages_for_target(session_id, 1)
+                    .map(|messages| messages.is_empty())
+            })
+            .unwrap_or(Ok(true))
+    }
+
+    fn credential_rotation_has_active_btw(&self, session_id: &str) -> Result<bool> {
+        let Some(queue) = self.queue_store.as_ref() else {
+            return Ok(false);
+        };
+        if !queue.db_path().exists() {
+            return Ok(false);
+        }
+        Ok(BtwStore::new(queue.db_path().to_path_buf())?
+            .active_for_target(session_id)?
+            .is_some())
+    }
+
     #[cfg(test)]
     fn new_with_legacy_fallback(state_file: PathBuf, legacy_state_file: PathBuf) -> Self {
         let seat_session_store = SeatSessionStore::for_state_file(&state_file);
@@ -667,6 +1272,7 @@ impl SessionStore {
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
             claude_handoff_workers: Arc::new(Mutex::new(BTreeSet::new())),
+            credential_rotation_workers: Arc::new(Mutex::new(BTreeSet::new())),
             seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
@@ -1107,6 +1713,1951 @@ impl SessionStore {
             .collect())
     }
 
+    pub fn create_reparent_request(
+        &self,
+        subject_session_id: &str,
+        request: CreateReparentRequest,
+        session_credential: &str,
+    ) -> Result<ReparentMutationOutcome> {
+        let subject_session_id = subject_session_id.trim();
+        let target_parent_session_id = request.target_parent_session_id.trim();
+        let requester_session_id = request.requester_session_id.trim();
+        if subject_session_id.is_empty()
+            || target_parent_session_id.is_empty()
+            || requester_session_id.is_empty()
+        {
+            return Ok(ReparentMutationOutcome::BadRequest(
+                "subject, target parent, and requester session IDs are required".to_owned(),
+            ));
+        }
+        if subject_session_id == target_parent_session_id {
+            return Ok(ReparentMutationOutcome::BadRequest(
+                "a session cannot be its own parent".to_owned(),
+            ));
+        }
+
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        if !session_credential_matches(&sessions, requester_session_id, session_credential) {
+            return Ok(ReparentMutationOutcome::Forbidden(
+                "session credential is missing, stale, or does not match the claimed actor"
+                    .to_owned(),
+            ));
+        }
+        let Some(subject) = sessions
+            .iter()
+            .find(|session| session.id == subject_session_id)
+        else {
+            return Ok(ReparentMutationOutcome::SessionNotFound(
+                subject_session_id.to_owned(),
+            ));
+        };
+        if !subject.is_live_for_registry() {
+            return Ok(ReparentMutationOutcome::BadRequest(format!(
+                "subject session {subject_session_id} is stopped"
+            )));
+        }
+        let Some(target_parent) = sessions
+            .iter()
+            .find(|session| session.id == target_parent_session_id)
+        else {
+            return Ok(ReparentMutationOutcome::SessionNotFound(
+                target_parent_session_id.to_owned(),
+            ));
+        };
+        if !target_parent.is_live_for_registry() {
+            return Ok(ReparentMutationOutcome::BadRequest(format!(
+                "target parent session {target_parent_session_id} is stopped"
+            )));
+        }
+        if !session_supports_reparent_consent(target_parent) {
+            return Ok(ReparentMutationOutcome::BadRequest(format!(
+                "target parent session {target_parent_session_id} cannot participate in credential-bound consent"
+            )));
+        }
+        if subject.parent_session_id.as_deref() == Some(target_parent_session_id) {
+            return Ok(ReparentMutationOutcome::BadRequest(format!(
+                "session {subject_session_id} is already a child of {target_parent_session_id}"
+            )));
+        }
+
+        let expected_parent_session_id = subject.parent_session_id.clone();
+        let expected_parent_is_live = expected_parent_session_id.as_deref().is_some_and(|id| {
+            sessions
+                .iter()
+                .find(|session| session.id == id)
+                .is_some_and(SessionRecord::is_live_for_registry)
+        });
+        let requester_is_current_parent = expected_parent_is_live
+            && expected_parent_session_id.as_deref() == Some(requester_session_id);
+        let requester_is_target_parent = requester_session_id == target_parent_session_id;
+        if !requester_is_current_parent && !requester_is_target_parent {
+            return Ok(ReparentMutationOutcome::Forbidden(
+                "only the live current parent or proposed new parent may request reparenting"
+                    .to_owned(),
+            ));
+        }
+        if expected_parent_is_live {
+            let expected_parent = sessions
+                .iter()
+                .find(|session| Some(session.id.as_str()) == expected_parent_session_id.as_deref())
+                .expect("live expected parent checked above");
+            if !session_supports_reparent_consent(expected_parent) {
+                return Ok(ReparentMutationOutcome::BadRequest(format!(
+                    "current parent session {} cannot participate in credential-bound consent",
+                    expected_parent.id
+                )));
+            }
+        }
+        if reparent_would_create_cycle(&sessions, subject_session_id, target_parent_session_id) {
+            return Ok(ReparentMutationOutcome::Conflict(
+                "reparenting would create a session hierarchy cycle".to_owned(),
+            ));
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let mut records = reparent_request_records(&state)?;
+        let _ = refresh_reparent_requests(&mut records, &sessions, now);
+        let affected_ids = BTreeSet::from([subject_session_id.to_owned()]);
+        if let Some(conflict) = records.iter().find(|record| {
+            record.is_active() && !record.affected_session_ids().is_disjoint(&affected_ids)
+        }) {
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(ReparentMutationOutcome::Conflict(format!(
+                "request {} already controls session {}",
+                conflict.id, subject_session_id
+            )));
+        }
+
+        let mut required_agent_approvals = BTreeSet::from([target_parent_session_id.to_owned()]);
+        if expected_parent_is_live {
+            if let Some(parent_id) = expected_parent_session_id.as_ref() {
+                required_agent_approvals.insert(parent_id.clone());
+            }
+        }
+        let required_agent_approvals = required_agent_approvals.into_iter().collect::<Vec<_>>();
+        let required_human_approval = !expected_parent_is_live;
+        let created_at = now.format(&Rfc3339)?;
+        let expires_at =
+            (now + TimeDuration::hours(REPARENT_REQUEST_TTL_HOURS)).format(&Rfc3339)?;
+        let id = generate_unique_reparent_request_id(&records)?;
+        let topology_fingerprint = reparent_topology_fingerprint(
+            "single",
+            subject_session_id,
+            target_parent_session_id,
+            expected_parent_session_id.as_deref(),
+            &[],
+        );
+        let approvals = vec![ReparentApprovalRecord {
+            actor_kind: "agent".to_owned(),
+            actor_id: requester_session_id.to_owned(),
+            decision: "approved".to_owned(),
+            decided_at: created_at.clone(),
+        }];
+        let ready_to_apply = approvals_satisfied(
+            &required_agent_approvals,
+            required_human_approval,
+            &approvals,
+        );
+        let record = ReparentRequestRecord {
+            id,
+            kind: "single".to_owned(),
+            subject_session_id: subject_session_id.to_owned(),
+            target_parent_session_id: target_parent_session_id.to_owned(),
+            expected_parent_session_id,
+            expected_parent_is_live,
+            frozen_live_child_ids: Vec::new(),
+            initiator_session_id: requester_session_id.to_owned(),
+            required_agent_approvals,
+            required_human_approval,
+            approvals,
+            status: "pending".to_owned(),
+            ready_to_apply,
+            created_at,
+            expires_at,
+            decided_at: None,
+            applied_at: None,
+            failure_reason: None,
+            topology_fingerprint,
+            apply_stage: None,
+            apply_plan: None,
+            notification_intents: Vec::new(),
+            deferred_routing_intents: Vec::new(),
+            repair_history: Vec::new(),
+        };
+        records.push(record.clone());
+        store_reparent_request_records(&mut state, &records)?;
+        self.write_raw_json_value(&state)?;
+        Ok(ReparentMutationOutcome::Created(record))
+    }
+
+    pub fn create_reparent_tree_request(
+        &self,
+        source_session_id: &str,
+        request: CreateReparentTreeRequest,
+        session_credential: &str,
+    ) -> Result<ReparentMutationOutcome> {
+        let source_session_id = source_session_id.trim();
+        let target_session_id = request.target_session_id.trim();
+        let requester_session_id = request.requester_session_id.trim();
+        if source_session_id.is_empty()
+            || target_session_id.is_empty()
+            || requester_session_id.is_empty()
+        {
+            return Ok(ReparentMutationOutcome::BadRequest(
+                "source, target, and requester session IDs are required".to_owned(),
+            ));
+        }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        if !session_credential_matches(&sessions, requester_session_id, session_credential) {
+            return Ok(ReparentMutationOutcome::Forbidden(
+                "session credential is missing, stale, or does not match the claimed actor"
+                    .to_owned(),
+            ));
+        }
+        let Some(source) = sessions
+            .iter()
+            .find(|session| session.id == source_session_id)
+        else {
+            return Ok(ReparentMutationOutcome::SessionNotFound(
+                source_session_id.to_owned(),
+            ));
+        };
+        let Some(target) = sessions
+            .iter()
+            .find(|session| session.id == target_session_id)
+        else {
+            return Ok(ReparentMutationOutcome::SessionNotFound(
+                target_session_id.to_owned(),
+            ));
+        };
+        let mut blockers = Vec::new();
+        if !source.is_live_for_registry() {
+            blockers.push(format!("source session {source_session_id} is stopped"));
+        }
+        if !target.is_live_for_registry() {
+            blockers.push(format!("target session {target_session_id} is stopped"));
+        }
+        if !session_supports_reparent_consent(source) {
+            blockers.push(format!(
+                "source session {source_session_id} cannot participate in credential-bound consent"
+            ));
+        }
+        if !session_supports_reparent_consent(target) {
+            blockers.push(format!(
+                "target session {target_session_id} cannot participate in credential-bound consent"
+            ));
+        }
+        if target.parent_session_id.as_deref() != Some(source_session_id) {
+            blockers.push(format!(
+                "target session {target_session_id} is not a live direct child of {source_session_id}"
+            ));
+        }
+        let expected_parent_session_id = source.parent_session_id.clone();
+        let expected_parent_is_live = expected_parent_session_id.as_deref().is_some_and(|id| {
+            sessions
+                .iter()
+                .find(|session| session.id == id)
+                .is_some_and(SessionRecord::is_live_for_registry)
+        });
+        if expected_parent_is_live {
+            let expected_parent = sessions
+                .iter()
+                .find(|session| Some(session.id.as_str()) == expected_parent_session_id.as_deref())
+                .expect("live expected parent checked above");
+            if !session_supports_reparent_consent(expected_parent) {
+                blockers.push(format!(
+                    "current parent session {} cannot participate in credential-bound consent",
+                    expected_parent.id
+                ));
+            }
+        }
+        let initiator_allowed = requester_session_id == source_session_id
+            || requester_session_id == target_session_id
+            || (expected_parent_is_live
+                && expected_parent_session_id.as_deref() == Some(requester_session_id));
+        if !initiator_allowed {
+            return Ok(ReparentMutationOutcome::Forbidden(
+                "only the source, target, or live source parent may request tree promotion"
+                    .to_owned(),
+            ));
+        }
+        let frozen_live_child_ids = sessions
+            .iter()
+            .filter(|session| {
+                session.is_live_for_registry()
+                    && session.parent_session_id.as_deref() == Some(source_session_id)
+            })
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        let edge_changes = tree_reparent_edge_changes(
+            source_session_id,
+            target_session_id,
+            expected_parent_session_id.as_deref(),
+            &frozen_live_child_ids,
+        );
+        if reparent_plan_would_create_cycle(&sessions, &edge_changes) {
+            blockers.push("tree promotion would create a session hierarchy cycle".to_owned());
+        }
+        let (json_routing_changes, queue_routing_changes) =
+            self.build_reparent_routing_changes(&state, &edge_changes)?;
+        let mut required_agent_approvals =
+            BTreeSet::from([source_session_id.to_owned(), target_session_id.to_owned()]);
+        if expected_parent_is_live {
+            if let Some(parent) = expected_parent_session_id.as_ref() {
+                required_agent_approvals.insert(parent.clone());
+            }
+        }
+        let required_agent_approvals = required_agent_approvals.into_iter().collect::<Vec<_>>();
+        let required_human_approval =
+            expected_parent_session_id.is_some() && !expected_parent_is_live;
+        let preview = ReparentTreePreview {
+            kind: "tree".to_owned(),
+            source_session_id: source_session_id.to_owned(),
+            target_session_id: target_session_id.to_owned(),
+            frozen_live_child_ids: frozen_live_child_ids.clone(),
+            edge_changes,
+            json_routing_changes,
+            queue_routing_changes,
+            required_agent_approvals: required_agent_approvals.clone(),
+            required_human_approval,
+            blockers: blockers.clone(),
+        };
+        let now = OffsetDateTime::now_utc();
+        let mut records = reparent_request_records(&state)?;
+        let refreshed = refresh_reparent_requests(&mut records, &sessions, now);
+        let affected_ids = preview
+            .edge_changes
+            .iter()
+            .map(|change| change.session_id.clone())
+            .chain(expected_parent_session_id.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let active_conflict = records.iter().find(|record| {
+            record.is_active() && !record.affected_session_ids().is_disjoint(&affected_ids)
+        });
+        if request.dry_run {
+            let mut preview = preview;
+            if let Some(conflict) = active_conflict {
+                let overlapping_session = if affected_ids.contains(&conflict.subject_session_id) {
+                    conflict.subject_session_id.clone()
+                } else {
+                    conflict
+                        .affected_session_ids()
+                        .intersection(&affected_ids)
+                        .next()
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_owned())
+                };
+                preview.blockers.push(format!(
+                    "request {} already controls session {} in the tree promotion",
+                    conflict.id, overlapping_session
+                ));
+            }
+            if refreshed {
+                store_reparent_request_records(&mut state, &records)?;
+                self.write_raw_json_value(&state)?;
+            }
+            return Ok(ReparentMutationOutcome::Preview(preview));
+        }
+        if let Some(blocker) = blockers.into_iter().next() {
+            return Ok(ReparentMutationOutcome::BadRequest(blocker));
+        }
+        if let Some(conflict) = active_conflict {
+            let overlapping_session = if affected_ids.contains(&conflict.subject_session_id) {
+                conflict.subject_session_id.clone()
+            } else {
+                conflict
+                    .affected_session_ids()
+                    .intersection(&affected_ids)
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_owned())
+            };
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(ReparentMutationOutcome::Conflict(format!(
+                "request {} already controls session {} in the tree promotion",
+                conflict.id, overlapping_session
+            )));
+        }
+        let created_at = now.format(&Rfc3339)?;
+        let expires_at =
+            (now + TimeDuration::hours(REPARENT_REQUEST_TTL_HOURS)).format(&Rfc3339)?;
+        let approvals = vec![ReparentApprovalRecord {
+            actor_kind: "agent".to_owned(),
+            actor_id: requester_session_id.to_owned(),
+            decision: "approved".to_owned(),
+            decided_at: created_at.clone(),
+        }];
+        let record = ReparentRequestRecord {
+            id: generate_unique_reparent_request_id(&records)?,
+            kind: "tree".to_owned(),
+            subject_session_id: source_session_id.to_owned(),
+            target_parent_session_id: target_session_id.to_owned(),
+            expected_parent_session_id,
+            expected_parent_is_live,
+            frozen_live_child_ids,
+            initiator_session_id: requester_session_id.to_owned(),
+            required_agent_approvals: required_agent_approvals.clone(),
+            required_human_approval,
+            ready_to_apply: approvals_satisfied(
+                &required_agent_approvals,
+                required_human_approval,
+                &approvals,
+            ),
+            approvals,
+            status: "pending".to_owned(),
+            created_at,
+            expires_at,
+            decided_at: None,
+            applied_at: None,
+            failure_reason: None,
+            topology_fingerprint: reparent_topology_fingerprint(
+                "tree",
+                source_session_id,
+                target_session_id,
+                source.parent_session_id.as_deref(),
+                &preview.frozen_live_child_ids,
+            ),
+            apply_stage: None,
+            apply_plan: None,
+            notification_intents: Vec::new(),
+            deferred_routing_intents: Vec::new(),
+            repair_history: Vec::new(),
+        };
+        records.push(record.clone());
+        store_reparent_request_records(&mut state, &records)?;
+        self.write_raw_json_value(&state)?;
+        Ok(ReparentMutationOutcome::Created(record))
+    }
+
+    pub fn decide_reparent_request(
+        &self,
+        request_id: &str,
+        request: DecideReparentRequest,
+        decision: ReparentDecision,
+        session_credential: &str,
+    ) -> Result<ReparentMutationOutcome> {
+        let request_id = request_id.trim();
+        let requester_session_id = request.requester_session_id.trim();
+        if request_id.is_empty() || requester_session_id.is_empty() {
+            return Ok(ReparentMutationOutcome::BadRequest(
+                "request ID and requester session ID are required".to_owned(),
+            ));
+        }
+
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        if !session_credential_matches(&sessions, requester_session_id, session_credential) {
+            return Ok(ReparentMutationOutcome::Forbidden(
+                "session credential is missing, stale, or does not match the claimed actor"
+                    .to_owned(),
+            ));
+        }
+        let mut records = reparent_request_records(&state)?;
+        let now = OffsetDateTime::now_utc();
+        let refreshed = refresh_reparent_requests(&mut records, &sessions, now);
+        let Some(index) = records.iter().position(|record| record.id == request_id) else {
+            if refreshed {
+                store_reparent_request_records(&mut state, &records)?;
+                self.write_raw_json_value(&state)?;
+            }
+            return Ok(ReparentMutationOutcome::RequestNotFound);
+        };
+        let record = &mut records[index];
+        if !record
+            .required_agent_approvals
+            .iter()
+            .any(|actor| actor == requester_session_id)
+        {
+            return Ok(ReparentMutationOutcome::Forbidden(format!(
+                "session {requester_session_id} is not a required approver for request {request_id}"
+            )));
+        }
+        if let Some(existing) = record.approvals.iter().find(|approval| {
+            approval.actor_kind == "agent" && approval.actor_id == requester_session_id
+        }) {
+            if existing.decision == decision.as_str() {
+                let updated = record.clone();
+                if refreshed {
+                    store_reparent_request_records(&mut state, &records)?;
+                    self.write_raw_json_value(&state)?;
+                }
+                return Ok(ReparentMutationOutcome::Updated(updated));
+            }
+            return Ok(ReparentMutationOutcome::Conflict(format!(
+                "session {requester_session_id} already {} request {request_id}",
+                existing.decision
+            )));
+        }
+        if record.status == "expired" {
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(ReparentMutationOutcome::Expired);
+        }
+        if record.status != "pending" {
+            let detail = format!(
+                "request {} is already {}{}",
+                record.id,
+                record.status,
+                record
+                    .failure_reason
+                    .as_deref()
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            );
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(ReparentMutationOutcome::Conflict(detail));
+        }
+        let decided_at = now.format(&Rfc3339)?;
+        record.approvals.push(ReparentApprovalRecord {
+            actor_kind: "agent".to_owned(),
+            actor_id: requester_session_id.to_owned(),
+            decision: decision.as_str().to_owned(),
+            decided_at: decided_at.clone(),
+        });
+        if decision == ReparentDecision::Rejected {
+            record.status = "rejected".to_owned();
+            record.decided_at = Some(decided_at);
+            record.ready_to_apply = false;
+        } else {
+            record.ready_to_apply = approvals_satisfied(
+                &record.required_agent_approvals,
+                record.required_human_approval,
+                &record.approvals,
+            );
+        }
+        let updated = record.clone();
+        store_reparent_request_records(&mut state, &records)?;
+        self.write_raw_json_value(&state)?;
+        drop(_guard);
+        if decision == ReparentDecision::Approved && updated.ready_to_apply {
+            self.reconcile_reparent_requests()?;
+            if let Some(applied) = self.get_reparent_request(&updated.id)? {
+                return Ok(ReparentMutationOutcome::Updated(applied));
+            }
+        }
+        Ok(ReparentMutationOutcome::Updated(updated))
+    }
+
+    pub fn decide_reparent_request_as_human(
+        &self,
+        request_id: &str,
+        actor_id: &str,
+        decision: ReparentDecision,
+    ) -> Result<ReparentMutationOutcome> {
+        let request_id = request_id.trim();
+        let actor_id = actor_id.trim();
+        if request_id.is_empty() || actor_id.is_empty() {
+            return Ok(ReparentMutationOutcome::BadRequest(
+                "request ID and authenticated human actor are required".to_owned(),
+            ));
+        }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        let mut records = reparent_request_records(&state)?;
+        let now = OffsetDateTime::now_utc();
+        let refreshed = refresh_reparent_requests(&mut records, &sessions, now);
+        let Some(index) = records.iter().position(|record| record.id == request_id) else {
+            if refreshed {
+                store_reparent_request_records(&mut state, &records)?;
+                self.write_raw_json_value(&state)?;
+            }
+            return Ok(ReparentMutationOutcome::RequestNotFound);
+        };
+        let record = &mut records[index];
+        if !record.required_human_approval {
+            return Ok(ReparentMutationOutcome::Forbidden(format!(
+                "request {request_id} does not require human approval"
+            )));
+        }
+        if let Some(existing) = record
+            .approvals
+            .iter()
+            .find(|approval| approval.actor_kind == "human")
+        {
+            if existing.actor_id == actor_id && existing.decision == decision.as_str() {
+                let updated = record.clone();
+                if refreshed {
+                    store_reparent_request_records(&mut state, &records)?;
+                    self.write_raw_json_value(&state)?;
+                }
+                return Ok(ReparentMutationOutcome::Updated(updated));
+            }
+            return Ok(ReparentMutationOutcome::Conflict(format!(
+                "human actor {} already {} request {request_id}",
+                existing.actor_id, existing.decision
+            )));
+        }
+        if record.status == "expired" {
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(ReparentMutationOutcome::Expired);
+        }
+        if record.status != "pending" {
+            return Ok(ReparentMutationOutcome::Conflict(format!(
+                "request {} is already {}",
+                record.id, record.status
+            )));
+        }
+        let decided_at = now.format(&Rfc3339)?;
+        record.approvals.push(ReparentApprovalRecord {
+            actor_kind: "human".to_owned(),
+            actor_id: actor_id.to_owned(),
+            decision: decision.as_str().to_owned(),
+            decided_at: decided_at.clone(),
+        });
+        if decision == ReparentDecision::Rejected {
+            record.status = "rejected".to_owned();
+            record.decided_at = Some(decided_at);
+            record.ready_to_apply = false;
+        } else {
+            record.ready_to_apply = approvals_satisfied(
+                &record.required_agent_approvals,
+                record.required_human_approval,
+                &record.approvals,
+            );
+        }
+        let updated = record.clone();
+        store_reparent_request_records(&mut state, &records)?;
+        self.write_raw_json_value(&state)?;
+        drop(_guard);
+        if decision == ReparentDecision::Approved && updated.ready_to_apply {
+            self.reconcile_reparent_requests()?;
+            if let Some(applied) = self.get_reparent_request(&updated.id)? {
+                return Ok(ReparentMutationOutcome::Updated(applied));
+            }
+        }
+        Ok(ReparentMutationOutcome::Updated(updated))
+    }
+
+    pub fn get_reparent_request(&self, request_id: &str) -> Result<Option<ReparentRequestRecord>> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        let mut records = reparent_request_records(&state)?;
+        if refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc()) {
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+        }
+        Ok(records
+            .into_iter()
+            .find(|record| record.id == request_id.trim()))
+    }
+
+    pub fn list_reparent_requests(&self) -> Result<Vec<ReparentRequestRecord>> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        let mut records = reparent_request_records(&state)?;
+        if refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc()) {
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+        }
+        records.sort_by(|left, right| {
+            (&left.created_at, &left.id).cmp(&(&right.created_at, &right.id))
+        });
+        Ok(records)
+    }
+
+    pub fn list_reparent_requests_for_session(
+        &self,
+        session_id: &str,
+        session_credential: &str,
+    ) -> Result<Option<Vec<ReparentRequestRecord>>> {
+        let session_id = session_id.trim();
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        if !session_credential_matches(&sessions, session_id, session_credential) {
+            return Ok(None);
+        }
+        let mut records = reparent_request_records(&state)?;
+        if refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc()) {
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+        }
+        records.retain(|record| record.involves_session(session_id));
+        records.sort_by(|left, right| {
+            (&left.created_at, &left.id).cmp(&(&right.created_at, &right.id))
+        });
+        Ok(Some(records))
+    }
+
+    pub fn send_parent_notification(
+        &self,
+        child_session_id: &str,
+        text: &str,
+        delivery_mode: &str,
+        message_category: &str,
+        runtime: Option<&TmuxRuntime>,
+    ) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        if let Some(request_id) =
+            active_reparent_route_request_for_session(&state, child_session_id)?
+        {
+            persist_deferred_parent_message_intent(
+                &mut state,
+                &request_id,
+                &format!("{message_category}:{child_session_id}:{}", now_rfc3339()),
+                child_session_id,
+                text,
+                delivery_mode,
+                message_category,
+            )?;
+            return self.write_raw_json_value(&state);
+        }
+        let Some(parent_session_id) = raw_session_object(&state, child_session_id)
+            .and_then(|session| json_text(session.get("parent_session_id")))
+        else {
+            return Ok(());
+        };
+        self.queue_parent_message(
+            &mut state,
+            child_session_id,
+            &parent_session_id,
+            text,
+            delivery_mode,
+            message_category,
+            runtime,
+        )?;
+        self.write_raw_json_value(&state)
+    }
+
+    pub fn reconcile_reparent_requests(&self) -> Result<Option<ReparentRequestRecord>> {
+        let mut first = None;
+        loop {
+            let request_id = match self.acquire_reparent_apply_lease()? {
+                Some(request_id) => request_id,
+                None => return Ok(first),
+            };
+            if self
+                .get_reparent_request(&request_id)?
+                .is_some_and(|record| {
+                    record.status == "failed"
+                        && record.apply_stage.as_deref() != Some("prequiesce_aborting")
+                })
+            {
+                return Ok(first.or(self.get_reparent_request(&request_id)?));
+            }
+            if let Err(error) = self.apply_reparent_request(&request_id) {
+                self.fail_reparent_apply(&request_id, &error.to_string())?;
+            }
+            let current = self.get_reparent_request(&request_id)?;
+            if first.is_none() {
+                first = current.clone();
+            }
+            if current
+                .as_ref()
+                .is_some_and(|record| record.status == "failed")
+            {
+                return Ok(first);
+            }
+        }
+    }
+
+    pub fn reconcile_reparent_notifications(&self) -> Result<()> {
+        let (pending, recipients) = {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+            let mut records = reparent_request_records(&state)?;
+            let refreshed =
+                refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc());
+            let mut changed = refreshed;
+            for record in &mut records {
+                for desired in desired_reparent_notifications(record) {
+                    if record
+                        .notification_intents
+                        .iter()
+                        .all(|intent| intent.key != desired.intent.key)
+                    {
+                        record.notification_intents.push(desired.intent);
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                store_reparent_request_records(&mut state, &records)?;
+                self.write_raw_json_value(&state)?;
+            }
+            let pending = records
+                .iter()
+                .flat_map(|record| {
+                    desired_reparent_notifications(record)
+                        .into_iter()
+                        .filter(|desired| {
+                            record.notification_intents.iter().any(|intent| {
+                                intent.key == desired.intent.key && intent.enqueued_at.is_none()
+                            })
+                        })
+                })
+                .collect::<Vec<_>>();
+            let recipients = records
+                .iter()
+                .flat_map(|record| {
+                    record
+                        .notification_intents
+                        .iter()
+                        .map(|intent| intent.recipient_session_id.clone())
+                })
+                .collect::<BTreeSet<_>>();
+            (pending, recipients)
+        };
+        for desired in pending {
+            let queue = self
+                .queue_store
+                .as_ref()
+                .context("reparent notifications require the retained queue store")?;
+            queue.enqueue_message_once_with_metadata(
+                &desired.intent.key,
+                &desired.intent.recipient_session_id,
+                &desired.text,
+                "important",
+                QueueMessageMetadata {
+                    message_category: Some("reparent".to_owned()),
+                    ..QueueMessageMetadata::default()
+                },
+            )?;
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let mut records = reparent_request_records(&state)?;
+            let record = records
+                .iter_mut()
+                .find(|record| record.id == desired.request_id)
+                .with_context(|| format!("reparent request {} disappeared", desired.request_id))?;
+            let intent = record
+                .notification_intents
+                .iter_mut()
+                .find(|intent| intent.key == desired.intent.key)
+                .with_context(|| {
+                    format!("reparent notification {} disappeared", desired.intent.key)
+                })?;
+            if intent.enqueued_at.is_none() {
+                intent.enqueued_at = Some(now_rfc3339());
+                store_reparent_request_records(&mut state, &records)?;
+                self.write_raw_json_value(&state)?;
+            }
+        }
+        if let Some(runtime) = self.delivery_runtime.as_ref() {
+            let mut first_error = None;
+            for recipient in recipients {
+                if let Err(error) = self.drain_runtime_pending_messages_for_session_category(
+                    &recipient,
+                    runtime,
+                    Some("reparent"),
+                ) {
+                    if first_error.is_none() {
+                        first_error = Some(error.context(format!(
+                            "failed to deliver reparent notifications to {recipient}"
+                        )));
+                    }
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn repair_reparent_request(
+        &self,
+        request_id: &str,
+        actor_id: &str,
+        action: ReparentRepairAction,
+    ) -> Result<ReparentMutationOutcome> {
+        let request_id = request_id.trim();
+        let actor_id = actor_id.trim();
+        if request_id.is_empty() || actor_id.is_empty() {
+            return Ok(ReparentMutationOutcome::BadRequest(
+                "request ID and authenticated human actor are required".to_owned(),
+            ));
+        }
+        let attempted_at = now_rfc3339();
+        {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let mut records = reparent_request_records(&state)?;
+            let Some(record) = records.iter_mut().find(|record| record.id == request_id) else {
+                return Ok(ReparentMutationOutcome::RequestNotFound);
+            };
+            let lease = reparent_apply_lease(&state)?;
+            if record.status != "failed"
+                || lease.as_ref().map(|lease| lease.request_id.as_str()) != Some(request_id)
+            {
+                return Ok(ReparentMutationOutcome::Conflict(format!(
+                    "request {request_id} is not a quarantined apply transaction"
+                )));
+            }
+            let stage = record.apply_stage.as_deref().unwrap_or("applying");
+            let allowed = match action {
+                ReparentRepairAction::Resume => matches!(
+                    stage,
+                    "prequiesce_aborting"
+                        | "json_routing_quiesced"
+                        | "routing_quiesced"
+                        | "authority_committed"
+                ),
+                ReparentRepairAction::RollbackPrecommit => {
+                    matches!(stage, "json_routing_quiesced" | "routing_quiesced")
+                }
+            };
+            if !allowed {
+                return Ok(ReparentMutationOutcome::Conflict(format!(
+                    "repair action {} is not allowed from stage {stage}",
+                    action.as_str()
+                )));
+            }
+            record.repair_history.push(ReparentRepairRecord {
+                actor_kind: "human".to_owned(),
+                actor_id: actor_id.to_owned(),
+                action: action.as_str().to_owned(),
+                prior_failure: record.failure_reason.clone(),
+                attempted_at: attempted_at.clone(),
+                verified_state_fingerprint: None,
+            });
+            if action == ReparentRepairAction::Resume {
+                record.status = "applying".to_owned();
+                record.failure_reason = None;
+            }
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+        }
+        match action {
+            ReparentRepairAction::Resume => {
+                if let Err(error) = self.apply_reparent_request(request_id) {
+                    self.fail_reparent_apply(request_id, &error.to_string())?;
+                }
+            }
+            ReparentRepairAction::RollbackPrecommit => {
+                if let Err(error) = self.rollback_reparent_precommit(request_id, None) {
+                    self.fail_reparent_apply(request_id, &error.to_string())?;
+                }
+            }
+        }
+        let repaired = self
+            .get_reparent_request(request_id)?
+            .filter(|record| matches!(record.status.as_str(), "applied" | "repaired"));
+        if repaired.is_some() {
+            self.verify_reparent_repair(request_id, &attempted_at)?;
+            self.reconcile_reparent_requests()?;
+        }
+        Ok(self
+            .get_reparent_request(request_id)?
+            .map(ReparentMutationOutcome::Updated)
+            .unwrap_or(ReparentMutationOutcome::RequestNotFound))
+    }
+
+    fn verify_reparent_repair(&self, request_id: &str, attempted_at: &str) -> Result<()> {
+        let (record, state_projection) = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            let record = reparent_request_records(&state)?
+                .into_iter()
+                .find(|record| record.id == request_id)
+                .with_context(|| format!("reparent request {request_id} disappeared"))?;
+            let sessions = record
+                .affected_session_ids()
+                .into_iter()
+                .map(|session_id| {
+                    let session = raw_session_object(&state, &session_id);
+                    json!({
+                        "id": session_id,
+                        "parent_session_id": session.and_then(|value| value.get("parent_session_id")).cloned(),
+                        "context_monitor_enabled": session.and_then(|value| value.get("context_monitor_enabled")).cloned(),
+                        "context_monitor_notify": session.and_then(|value| value.get("context_monitor_notify")).cloned(),
+                        "context_monitor_notify_source": session.and_then(|value| value.get("context_monitor_notify_source")).cloned(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let projection = json!({
+                "sessions": sessions,
+                "retained_parent_wake_registrations": state.get("retained_parent_wake_registrations"),
+                "retained_pending_messages": state.get("retained_pending_messages"),
+                "request_status": record.status,
+                "apply_stage": record.apply_stage,
+            });
+            (record, projection)
+        };
+        let queue_projection = if let (Some(queue), Some(plan)) =
+            (self.queue_store.as_ref(), record.apply_plan.as_ref())
+        {
+            let mut projections = Vec::new();
+            for change in &plan.edge_changes {
+                let parent = if record.status == "repaired" {
+                    change.expected_parent_session_id.as_deref()
+                } else {
+                    change.new_parent_session_id.as_deref()
+                };
+                projections.push(json!({
+                    "session_id": change.session_id,
+                    "parent_session_id": parent,
+                    "routing": match parent {
+                        Some(parent) => queue.snapshot_parent_routing(&change.session_id, parent)?,
+                        None => ParentRoutingSnapshot::default(),
+                    },
+                }));
+            }
+            Value::Array(projections)
+        } else {
+            Value::Null
+        };
+        let fingerprint = {
+            let canonical = json!({
+                "state": state_projection,
+                "queue": queue_projection,
+            });
+            let digest = Sha256::digest(serde_json::to_vec(&canonical)?);
+            digest.iter().map(|byte| format!("{byte:02x}")).collect()
+        };
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let mut records = reparent_request_records(&state)?;
+        let record = records
+            .iter_mut()
+            .find(|record| record.id == request_id)
+            .with_context(|| format!("reparent request {request_id} disappeared"))?;
+        let repair = record
+            .repair_history
+            .iter_mut()
+            .find(|repair| repair.attempted_at == attempted_at)
+            .with_context(|| format!("repair attempt {attempted_at} disappeared"))?;
+        repair.verified_state_fingerprint = Some(fingerprint);
+        store_reparent_request_records(&mut state, &records)?;
+        self.write_raw_json_value(&state)
+    }
+
+    fn acquire_reparent_apply_lease(&self) -> Result<Option<String>> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        if let Some(lease) = reparent_apply_lease(&state)? {
+            return Ok(Some(lease.request_id));
+        }
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        let mut records = reparent_request_records(&state)?;
+        let _ = refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc());
+        let Some(index) = records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| {
+                matches!(record.kind.as_str(), "single" | "tree")
+                    && record.status == "pending"
+                    && record.ready_to_apply
+            })
+            .min_by(|(_, left), (_, right)| {
+                (&left.created_at, &left.id).cmp(&(&right.created_at, &right.id))
+            })
+            .map(|(index, _)| index)
+        else {
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(None);
+        };
+        if let Some(reason) = reparent_stale_reason(&records[index], &sessions) {
+            records[index].status = "stale".to_owned();
+            records[index].ready_to_apply = false;
+            records[index].failure_reason = Some(reason);
+            records[index].decided_at = Some(now_rfc3339());
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(None);
+        }
+        let plan = self.build_reparent_apply_plan(&state, &records[index])?;
+        let request_id = records[index].id.clone();
+        let acquired_at = now_rfc3339();
+        records[index].status = "applying".to_owned();
+        records[index].apply_stage = Some("applying".to_owned());
+        records[index].apply_plan = Some(plan);
+        records[index].failure_reason = None;
+        store_reparent_request_records(&mut state, &records)?;
+        store_reparent_apply_lease(
+            &mut state,
+            Some(&ReparentApplyLease {
+                request_id: request_id.clone(),
+                acquired_at,
+            }),
+        )?;
+        self.write_raw_json_value(&state)?;
+        Ok(Some(request_id))
+    }
+
+    fn build_reparent_apply_plan(
+        &self,
+        state: &Value,
+        record: &ReparentRequestRecord,
+    ) -> Result<ReparentApplyPlan> {
+        let edge_changes = if record.kind == "tree" {
+            tree_reparent_edge_changes(
+                &record.subject_session_id,
+                &record.target_parent_session_id,
+                record.expected_parent_session_id.as_deref(),
+                &record.frozen_live_child_ids,
+            )
+        } else {
+            vec![ReparentEdgeChange {
+                session_id: record.subject_session_id.clone(),
+                expected_parent_session_id: record.expected_parent_session_id.clone(),
+                new_parent_session_id: Some(record.target_parent_session_id.clone()),
+            }]
+        };
+        let (json_routing_changes, queue_routing_changes) =
+            self.build_reparent_routing_changes(state, &edge_changes)?;
+        Ok(ReparentApplyPlan {
+            version: 1,
+            edge_changes,
+            json_routing_changes,
+            queue_routing_changes,
+        })
+    }
+
+    fn build_reparent_routing_changes(
+        &self,
+        state: &Value,
+        edge_changes: &[ReparentEdgeChange],
+    ) -> Result<(Vec<ReparentRoutingChange>, Vec<ReparentRoutingChange>)> {
+        let mut json_routing_changes = Vec::new();
+        let mut queue_routing_changes = Vec::new();
+        for edge in edge_changes {
+            let Some(old_parent) = edge.expected_parent_session_id.as_deref() else {
+                continue;
+            };
+            for entry in state
+                .get("retained_parent_wake_registrations")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|entry| {
+                    entry.get("child_session_id").and_then(Value::as_str)
+                        == Some(edge.session_id.as_str())
+                        && json_text(entry.get("parent_session_id")).as_deref() == Some(old_parent)
+                        && entry
+                            .get("is_active")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true)
+                })
+            {
+                let record_id = json_text(entry.get("id")).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "parent wake for {} is missing its durable ID",
+                        edge.session_id
+                    )
+                })?;
+                let period_seconds = entry
+                    .get("period_seconds")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("parent wake {record_id} is missing its period")
+                    })?;
+                json_routing_changes.push(ReparentRoutingChange {
+                    store: "json".to_owned(),
+                    record_kind: "parent_wake".to_owned(),
+                    record_id,
+                    child_session_id: edge.session_id.clone(),
+                    expected_target_session_id: Some(old_parent.to_owned()),
+                    new_target_session_id: edge.new_parent_session_id.clone(),
+                    prior_active: Some(true),
+                    period_seconds: Some(period_seconds),
+                    creates_parent_wake: false,
+                });
+            }
+            if let Some(session) = raw_session_object(state, &edge.session_id).filter(|session| {
+                json_text(session.get("context_monitor_notify")).as_deref() == Some(old_parent)
+                    && json_text(session.get("context_monitor_notify_source")).as_deref()
+                        == Some("parent_derived")
+            }) {
+                json_routing_changes.push(ReparentRoutingChange {
+                    store: "json".to_owned(),
+                    record_kind: "context_monitor".to_owned(),
+                    record_id: edge.session_id.clone(),
+                    child_session_id: edge.session_id.clone(),
+                    expected_target_session_id: Some(old_parent.to_owned()),
+                    new_target_session_id: edge.new_parent_session_id.clone(),
+                    prior_active: Some(
+                        session
+                            .get("context_monitor_enabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    ),
+                    period_seconds: None,
+                    creates_parent_wake: false,
+                });
+            }
+            let queue_snapshot = match self.queue_store.as_ref() {
+                Some(queue) => queue.snapshot_parent_routing(&edge.session_id, old_parent)?,
+                None => ParentRoutingSnapshot::default(),
+            };
+            queue_routing_changes.extend(queue_snapshot.wake_rows.into_iter().map(|row| {
+                ReparentRoutingChange {
+                    store: "queue".to_owned(),
+                    record_kind: "parent_wake".to_owned(),
+                    record_id: row.id,
+                    child_session_id: row.child_session_id,
+                    expected_target_session_id: Some(row.parent_session_id),
+                    new_target_session_id: edge.new_parent_session_id.clone(),
+                    prior_active: Some(row.is_active),
+                    period_seconds: Some(row.period_seconds),
+                    creates_parent_wake: false,
+                }
+            }));
+            queue_routing_changes.extend(queue_snapshot.message_rows.into_iter().map(|row| {
+                ReparentRoutingChange {
+                    store: "queue".to_owned(),
+                    record_kind: "message".to_owned(),
+                    record_id: row.id,
+                    child_session_id: row.child_session_id,
+                    expected_target_session_id: Some(row.parent_session_id),
+                    new_target_session_id: edge.new_parent_session_id.clone(),
+                    prior_active: None,
+                    period_seconds: None,
+                    creates_parent_wake: row.creates_parent_wake,
+                }
+            }));
+        }
+        Ok((json_routing_changes, queue_routing_changes))
+    }
+
+    fn apply_reparent_request(&self, request_id: &str) -> Result<()> {
+        for _ in 0..8 {
+            let stage = {
+                let _guard = self.write_guard()?;
+                let state = self.load_raw_json_value()?;
+                let lease =
+                    reparent_apply_lease(&state)?.context("reparent apply lease disappeared")?;
+                if lease.request_id != request_id {
+                    anyhow::bail!(
+                        "reparent apply lease belongs to {}, not {request_id}",
+                        lease.request_id
+                    );
+                }
+                reparent_request_records(&state)?
+                    .into_iter()
+                    .find(|record| record.id == request_id)
+                    .with_context(|| format!("reparent request {request_id} disappeared"))?
+                    .apply_stage
+                    .unwrap_or_else(|| "applying".to_owned())
+            };
+            match stage.as_str() {
+                "applying" => self.quiesce_reparent_json_routing(request_id)?,
+                "prequiesce_aborting" => {
+                    self.complete_reparent_prequiesce_abort(request_id)?;
+                    return Ok(());
+                }
+                "json_routing_quiesced" => self.quiesce_reparent_queue_routing(request_id)?,
+                "routing_quiesced" => {
+                    if let Some(reason) = self.commit_reparent_authority(request_id)? {
+                        self.rollback_reparent_precommit(request_id, Some(&reason))?;
+                        return Ok(());
+                    }
+                }
+                "authority_committed" => {
+                    self.finish_reparent_routing(request_id)?;
+                    return Ok(());
+                }
+                "applied" => return Ok(()),
+                other => {
+                    anyhow::bail!("reparent request {request_id} cannot resume from stage {other}")
+                }
+            }
+        }
+        anyhow::bail!("reparent request {request_id} exceeded the apply stage limit")
+    }
+
+    fn quiesce_reparent_json_routing(&self, request_id: &str) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let mut records = reparent_request_records(&state)?;
+        let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
+        let plan = record
+            .apply_plan
+            .clone()
+            .context("reparent apply plan is missing")?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        if let Some(reason) = reparent_stale_reason(record, &sessions) {
+            anyhow::bail!("reparent request became stale before quiesce: {reason}");
+        }
+        quiesce_json_reparent_routes(&mut state, &plan)?;
+        record.apply_stage = Some("json_routing_quiesced".to_owned());
+        store_reparent_request_records(&mut state, &records)?;
+        self.write_raw_json_value(&state)
+    }
+
+    fn quiesce_reparent_queue_routing(&self, request_id: &str) -> Result<()> {
+        let snapshot = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            let records = reparent_request_records(&state)?;
+            let record = leased_reparent_request(&state, &records, request_id)?;
+            queue_snapshot_from_plan(
+                record
+                    .apply_plan
+                    .as_ref()
+                    .context("reparent apply plan is missing")?,
+            )?
+        };
+        if let Some(queue) = self.queue_store.as_ref() {
+            queue.quiesce_parent_routing(&snapshot)?;
+        } else if !snapshot.wake_rows.is_empty() || !snapshot.message_rows.is_empty() {
+            anyhow::bail!("reparent plan requires the retained queue store")
+        }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let mut records = reparent_request_records(&state)?;
+        let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
+        if record.apply_stage.as_deref() != Some("json_routing_quiesced") {
+            anyhow::bail!("reparent request stage changed during queue quiesce")
+        }
+        record.apply_stage = Some("routing_quiesced".to_owned());
+        store_reparent_request_records(&mut state, &records)?;
+        self.write_raw_json_value(&state)
+    }
+
+    fn commit_reparent_authority(&self, request_id: &str) -> Result<Option<String>> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let mut records = reparent_request_records(&state)?;
+        let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
+        let plan = record
+            .apply_plan
+            .clone()
+            .context("reparent apply plan is missing")?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        if let Some(reason) = reparent_stale_reason(record, &sessions) {
+            return Ok(Some(reason));
+        }
+        commit_json_reparent_plan(&mut state, &plan)?;
+        record.apply_stage = Some("authority_committed".to_owned());
+        store_reparent_request_records(&mut state, &records)?;
+        self.write_raw_json_value(&state)?;
+        Ok(None)
+    }
+
+    fn finish_reparent_routing(&self, request_id: &str) -> Result<()> {
+        let route_groups = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            let records = reparent_request_records(&state)?;
+            let record = leased_reparent_request(&state, &records, request_id)?;
+            let plan = record
+                .apply_plan
+                .as_ref()
+                .context("reparent apply plan is missing")?;
+            queue_route_groups_from_plan(plan, false)?
+        };
+        let mut delivered_message_rows = Vec::new();
+        for (snapshot, parent) in route_groups {
+            if let Some(queue) = self.queue_store.as_ref() {
+                delivered_message_rows.extend(
+                    queue
+                        .retarget_parent_routing(&snapshot, parent.as_deref())?
+                        .delivered_message_rows,
+                );
+            } else if !snapshot.wake_rows.is_empty() || !snapshot.message_rows.is_empty() {
+                anyhow::bail!("reparent plan requires the retained queue store")
+            }
+        }
+        self.persist_delivered_reparent_wake_intents(request_id, &delivered_message_rows)?;
+        let mut replay_targets = BTreeSet::new();
+        loop {
+            replay_targets.extend(self.replay_deferred_reparent_routes(request_id, false)?);
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let mut records = reparent_request_records(&state)?;
+            let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
+            if record.apply_stage.as_deref() != Some("authority_committed") {
+                anyhow::bail!("reparent request stage changed during queue retarget")
+            }
+            if record
+                .deferred_routing_intents
+                .iter()
+                .any(|intent| intent.replayed_at.is_none())
+            {
+                continue;
+            }
+            let now = now_rfc3339();
+            record.status = "applied".to_owned();
+            record.apply_stage = Some("applied".to_owned());
+            record.applied_at = Some(now.clone());
+            record.decided_at = Some(now);
+            record.ready_to_apply = false;
+            record.failure_reason = None;
+            store_reparent_request_records(&mut state, &records)?;
+            store_reparent_apply_lease(&mut state, None)?;
+            self.write_raw_json_value(&state)?;
+            break;
+        }
+        self.drain_reparent_replay_targets(&replay_targets);
+        Ok(())
+    }
+
+    fn replay_deferred_reparent_routes(
+        &self,
+        request_id: &str,
+        reapply_completed: bool,
+    ) -> Result<BTreeSet<String>> {
+        let mut reapplied = BTreeSet::new();
+        let mut replay_targets = BTreeSet::new();
+        loop {
+            let intent = {
+                let _guard = self.write_guard()?;
+                let state = self.load_raw_json_value()?;
+                let records = reparent_request_records(&state)?;
+                leased_reparent_request(&state, &records, request_id)?
+                    .deferred_routing_intents
+                    .iter()
+                    .find(|intent| {
+                        intent.replayed_at.is_none()
+                            || (reapply_completed && !reapplied.contains(&intent.key))
+                    })
+                    .cloned()
+            };
+            let Some(intent) = intent else {
+                return Ok(replay_targets);
+            };
+            let resolved_parent_session_id = {
+                let _guard = self.write_guard()?;
+                let state = self.load_raw_json_value()?;
+                raw_session_object(&state, &intent.child_session_id)
+                    .and_then(|session| json_text(session.get("parent_session_id")))
+            };
+            match intent.operation.as_str() {
+                "parent_wake" => {
+                    let period_seconds = intent
+                        .payload
+                        .get("period_seconds")
+                        .and_then(Value::as_i64)
+                        .context("deferred parent wake has no period")?;
+                    if let (Some(queue), Some(parent_session_id)) = (
+                        self.queue_store.as_ref(),
+                        resolved_parent_session_id.as_deref(),
+                    ) {
+                        queue.register_parent_wake(
+                            &intent.child_session_id,
+                            parent_session_id,
+                            period_seconds,
+                        )?;
+                    } else if resolved_parent_session_id.is_some() {
+                        anyhow::bail!("deferred parent wake requires the retained queue store")
+                    }
+                }
+                "task_complete" => {
+                    let text = intent
+                        .payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .context("deferred task-complete has no text")?;
+                    let message_id = deferred_task_complete_message_id(request_id, &intent.key);
+                    if let (Some(queue), Some(parent_session_id)) = (
+                        self.queue_store.as_ref(),
+                        resolved_parent_session_id.as_deref(),
+                    ) {
+                        queue.enqueue_message_once_with_metadata(
+                            &message_id,
+                            parent_session_id,
+                            text,
+                            "important",
+                            QueueMessageMetadata {
+                                message_category: Some("task_complete".to_owned()),
+                                ..QueueMessageMetadata::default()
+                            },
+                        )?;
+                        queue.cancel_parent_wake(&intent.child_session_id)?;
+                        replay_targets.insert(parent_session_id.to_owned());
+                    } else if resolved_parent_session_id.is_some() {
+                        anyhow::bail!("deferred task-complete requires the retained queue store")
+                    }
+                }
+                "parent_message" => {
+                    let text = intent
+                        .payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .context("deferred parent message has no text")?;
+                    let delivery_mode = intent
+                        .payload
+                        .get("delivery_mode")
+                        .and_then(Value::as_str)
+                        .context("deferred parent message has no delivery mode")?;
+                    let category = intent
+                        .payload
+                        .get("message_category")
+                        .and_then(Value::as_str)
+                        .context("deferred parent message has no category")?;
+                    let message_id = deferred_parent_message_id(request_id, &intent.key);
+                    if let (Some(queue), Some(parent_session_id)) = (
+                        self.queue_store.as_ref(),
+                        resolved_parent_session_id.as_deref(),
+                    ) {
+                        queue.enqueue_message_once_with_metadata(
+                            &message_id,
+                            parent_session_id,
+                            text,
+                            delivery_mode,
+                            QueueMessageMetadata {
+                                sender_session_id: Some(intent.child_session_id.clone()),
+                                message_category: Some(category.to_owned()),
+                                ..QueueMessageMetadata::default()
+                            },
+                        )?;
+                        replay_targets.insert(parent_session_id.to_owned());
+                    } else if resolved_parent_session_id.is_some() {
+                        anyhow::bail!("deferred parent message requires the retained queue store")
+                    }
+                }
+                "parent_input" => {
+                    let text = intent
+                        .payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .context("deferred parent input has no text")?;
+                    let delivery_mode = intent
+                        .payload
+                        .get("delivery_mode")
+                        .and_then(Value::as_str)
+                        .context("deferred parent input has no delivery mode")?;
+                    let message_id = deferred_parent_message_id(request_id, &intent.key);
+                    let metadata = deferred_parent_input_metadata(
+                        &intent,
+                        resolved_parent_session_id.as_deref(),
+                    )?;
+                    if let Some(queue) = self.queue_store.as_ref() {
+                        queue.enqueue_message_once_with_metadata(
+                            &message_id,
+                            &intent.child_session_id,
+                            text,
+                            delivery_mode,
+                            metadata,
+                        )?;
+                        replay_targets.insert(intent.child_session_id.clone());
+                    } else {
+                        anyhow::bail!("deferred parent input requires the retained queue store")
+                    }
+                }
+                other => anyhow::bail!("unsupported deferred routing operation {other}"),
+            }
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let mut records = reparent_request_records(&state)?;
+            let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
+            let current = record
+                .deferred_routing_intents
+                .iter_mut()
+                .find(|current| current.key == intent.key)
+                .with_context(|| format!("deferred routing intent {} disappeared", intent.key))?;
+            match intent.operation.as_str() {
+                "parent_wake" => {
+                    let period_seconds = intent
+                        .payload
+                        .get("period_seconds")
+                        .and_then(Value::as_i64)
+                        .context("deferred parent wake has no period")?;
+                    if let Some(parent_session_id) = resolved_parent_session_id.as_deref() {
+                        upsert_parent_wake_raw(
+                            &mut state,
+                            &intent.child_session_id,
+                            parent_session_id,
+                            period_seconds,
+                        )?;
+                    }
+                }
+                "task_complete" => {
+                    let text = intent
+                        .payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .context("deferred task-complete has no text")?;
+                    let message_id = deferred_task_complete_message_id(request_id, &intent.key);
+                    if let Some(parent_session_id) = resolved_parent_session_id.as_deref() {
+                        push_retained_message_once_raw(
+                            &mut state,
+                            &message_id,
+                            parent_session_id,
+                            text,
+                            "important",
+                            Some("task_complete"),
+                        )?;
+                        deactivate_parent_wake_raw(&mut state, &intent.child_session_id)?;
+                    }
+                }
+                "parent_message" => {
+                    let text = intent
+                        .payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .context("deferred parent message has no text")?;
+                    let delivery_mode = intent
+                        .payload
+                        .get("delivery_mode")
+                        .and_then(Value::as_str)
+                        .context("deferred parent message has no delivery mode")?;
+                    let category = intent
+                        .payload
+                        .get("message_category")
+                        .and_then(Value::as_str)
+                        .context("deferred parent message has no category")?;
+                    let message_id = deferred_parent_message_id(request_id, &intent.key);
+                    if let Some(parent_session_id) = resolved_parent_session_id.as_deref() {
+                        push_retained_message_once_raw(
+                            &mut state,
+                            &message_id,
+                            parent_session_id,
+                            text,
+                            delivery_mode,
+                            Some(category),
+                        )?;
+                    }
+                }
+                "parent_input" => {}
+                other => anyhow::bail!("unsupported deferred routing operation {other}"),
+            }
+            if current.replayed_at.is_none() {
+                current.replayed_at = Some(now_rfc3339());
+                current.resolved_parent_session_id = resolved_parent_session_id;
+            }
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+            reapplied.insert(intent.key);
+        }
+    }
+
+    fn drain_reparent_replay_targets(&self, targets: &BTreeSet<String>) {
+        let (Some(runtime), Some(queue)) =
+            (self.delivery_runtime.as_ref(), self.queue_store.as_ref())
+        else {
+            return;
+        };
+        let result = (|| -> Result<()> {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            for target in targets {
+                let node = raw_session_object(&state, target)
+                    .and_then(|session| json_text(session.get("node")))
+                    .unwrap_or_else(default_node);
+                if is_primary_node(&node) {
+                    drain_pending_runtime_messages_raw(
+                        self, &mut state, target, runtime, queue, None, None, None,
+                    )?;
+                }
+            }
+            self.write_raw_json_value(&state)
+        })();
+        if let Err(error) = result {
+            eprintln!("deferred reparent message drain will retry on later traffic: {error:#}");
+        }
+    }
+
+    fn persist_delivered_reparent_wake_intents(
+        &self,
+        request_id: &str,
+        delivered_message_rows: &[ParentRoutingMessageRow],
+    ) -> Result<()> {
+        if !delivered_message_rows
+            .iter()
+            .any(|message| message.creates_parent_wake)
+        {
+            return Ok(());
+        }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let mut records = reparent_request_records(&state)?;
+        let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
+        for message in delivered_message_rows
+            .iter()
+            .filter(|message| message.creates_parent_wake)
+        {
+            let key = format!("delivered-planned-parent-wake:{}", message.id);
+            if !record
+                .deferred_routing_intents
+                .iter()
+                .any(|intent| intent.key == key)
+            {
+                record
+                    .deferred_routing_intents
+                    .push(ReparentDeferredRoutingIntent {
+                        key,
+                        operation: "parent_wake".to_owned(),
+                        child_session_id: message.child_session_id.clone(),
+                        payload: json!({ "period_seconds": 600 }),
+                        created_at: now_rfc3339(),
+                        replayed_at: None,
+                        resolved_parent_session_id: None,
+                    });
+            }
+        }
+        store_reparent_request_records(&mut state, &records)?;
+        self.write_raw_json_value(&state)
+    }
+
+    fn fail_reparent_apply(&self, request_id: &str, failure_reason: &str) -> Result<()> {
+        let before_quiesce = {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let mut records = reparent_request_records(&state)?;
+            let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
+            let before_quiesce = matches!(record.apply_stage.as_deref(), None | Some("applying"));
+            record.status = "failed".to_owned();
+            if before_quiesce {
+                record.apply_stage = Some("prequiesce_aborting".to_owned());
+            }
+            record.failure_reason = Some(failure_reason.to_owned());
+            record.ready_to_apply = false;
+            record.decided_at = Some(now_rfc3339());
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+            before_quiesce
+        };
+        if !before_quiesce {
+            return Ok(());
+        }
+        self.complete_reparent_prequiesce_abort(request_id)
+    }
+
+    fn complete_reparent_prequiesce_abort(&self, request_id: &str) -> Result<()> {
+        let mut replay_targets = BTreeSet::new();
+        let mut reapply_completed = true;
+        loop {
+            replay_targets
+                .extend(self.replay_deferred_reparent_routes(request_id, reapply_completed)?);
+            reapply_completed = false;
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let mut records = reparent_request_records(&state)?;
+            let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
+            if record.apply_stage.as_deref() != Some("prequiesce_aborting") {
+                anyhow::bail!("reparent request stage changed during pre-quiesce abort")
+            }
+            if record
+                .deferred_routing_intents
+                .iter()
+                .any(|intent| intent.replayed_at.is_none())
+            {
+                continue;
+            }
+            record.status = "stale".to_owned();
+            record.apply_stage = Some("prequiesce_aborted".to_owned());
+            store_reparent_request_records(&mut state, &records)?;
+            store_reparent_apply_lease(&mut state, None)?;
+            self.write_raw_json_value(&state)?;
+            break;
+        }
+        self.drain_reparent_replay_targets(&replay_targets);
+        Ok(())
+    }
+
+    fn rollback_reparent_precommit(
+        &self,
+        request_id: &str,
+        stale_reason: Option<&str>,
+    ) -> Result<()> {
+        let (plan, route_groups) = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            let records = reparent_request_records(&state)?;
+            let record = leased_reparent_request(&state, &records, request_id)?;
+            if !matches!(
+                record.apply_stage.as_deref(),
+                Some("json_routing_quiesced" | "routing_quiesced")
+            ) {
+                anyhow::bail!("request {request_id} is no longer pre-commit")
+            }
+            let plan = record
+                .apply_plan
+                .clone()
+                .context("reparent apply plan is missing")?;
+            (plan.clone(), queue_route_groups_from_plan(&plan, true)?)
+        };
+        let mut delivered_message_rows = Vec::new();
+        for (snapshot, parent) in route_groups {
+            if let Some(queue) = self.queue_store.as_ref() {
+                delivered_message_rows.extend(
+                    queue
+                        .retarget_parent_routing(&snapshot, parent.as_deref())?
+                        .delivered_message_rows,
+                );
+            } else if !snapshot.wake_rows.is_empty() || !snapshot.message_rows.is_empty() {
+                anyhow::bail!("reparent plan requires the retained queue store")
+            }
+        }
+        self.persist_delivered_reparent_wake_intents(request_id, &delivered_message_rows)?;
+        {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let records = reparent_request_records(&state)?;
+            let _ = leased_reparent_request(&state, &records, request_id)?;
+            restore_json_reparent_routes(&mut state, &plan)?;
+            verify_old_reparent_edges(&state, &plan)?;
+            self.write_raw_json_value(&state)?;
+        }
+        let mut replay_targets = BTreeSet::new();
+        let mut reapply_completed = true;
+        loop {
+            replay_targets
+                .extend(self.replay_deferred_reparent_routes(request_id, reapply_completed)?);
+            reapply_completed = false;
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let mut records = reparent_request_records(&state)?;
+            let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
+            if record
+                .deferred_routing_intents
+                .iter()
+                .any(|intent| intent.replayed_at.is_none())
+            {
+                continue;
+            }
+            record.status = if stale_reason.is_some() {
+                "stale".to_owned()
+            } else {
+                "repaired".to_owned()
+            };
+            record.apply_stage = Some(if stale_reason.is_some() {
+                "prequiesce_aborted".to_owned()
+            } else {
+                "repair_rolled_back".to_owned()
+            });
+            record.failure_reason = stale_reason.map(ToOwned::to_owned);
+            record.ready_to_apply = false;
+            record.decided_at = Some(now_rfc3339());
+            store_reparent_request_records(&mut state, &records)?;
+            store_reparent_apply_lease(&mut state, None)?;
+            self.write_raw_json_value(&state)?;
+            break;
+        }
+        self.drain_reparent_replay_targets(&replay_targets);
+        Ok(())
+    }
+
+    pub fn create_session_credential_rotation(
+        &self,
+        session_id: &str,
+        request_actor: &str,
+    ) -> Result<CredentialRotationOutcome> {
+        let session_id = session_id.trim();
+        let request_actor = request_actor.trim();
+        if session_id.is_empty() || request_actor.is_empty() {
+            return Ok(CredentialRotationOutcome::BadRequest(
+                "session ID and authenticated request actor are required".to_owned(),
+            ));
+        }
+        if self.delivery_runtime.is_none() {
+            return Ok(CredentialRotationOutcome::BadRequest(
+                "runtime-backed sessions are disabled".to_owned(),
+            ));
+        }
+
+        let record = {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            if let Some(request_id) = active_reparent_request_for_session(&state, session_id)? {
+                return Ok(CredentialRotationOutcome::Conflict(format!(
+                    "reparent request {request_id} controls session {session_id}"
+                )));
+            }
+            let snapshot = snapshot_from_raw_value(&state)?;
+            let Some(session) = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+            else {
+                return Ok(CredentialRotationOutcome::SessionNotFound);
+            };
+            if !session.is_live_for_registry() {
+                return Ok(CredentialRotationOutcome::BadRequest(format!(
+                    "session {session_id} is stopped"
+                )));
+            }
+            if !is_primary_node(&session.node) {
+                return Ok(CredentialRotationOutcome::BadRequest(format!(
+                    "session {session_id} belongs to remote node {}",
+                    session.node
+                )));
+            }
+            if !matches!(session.provider.as_str(), "claude" | "codex" | "codex-fork") {
+                return Ok(CredentialRotationOutcome::BadRequest(format!(
+                    "provider {} does not support credential rotation",
+                    session.provider
+                )));
+            }
+            let Some(provider_resume_id) = provider_resume_id_for_restore(session) else {
+                return Ok(CredentialRotationOutcome::BadRequest(format!(
+                    "session {session_id} has no resumable provider identity"
+                )));
+            };
+            let mut rotations = session_credential_rotation_records(&state)?;
+            rotations.sort_by(|left, right| {
+                (&left.requested_at, &left.id).cmp(&(&right.requested_at, &right.id))
+            });
+            if let Some(existing) = rotations.iter().rev().find(|rotation| {
+                rotation.session_id == session_id
+                    && matches!(
+                        rotation.status.as_str(),
+                        "waiting_idle" | "relaunching" | "applied"
+                    )
+            }) {
+                return Ok(CredentialRotationOutcome::Existing(existing.clone()));
+            }
+            let now = now_rfc3339();
+            let rotation = SessionCredentialRotationRecord {
+                id: generate_unique_credential_rotation_id(&rotations)?,
+                session_id: session.id.clone(),
+                provider: session.provider.clone(),
+                provider_resume_id,
+                tmux_session: session.tmux_session.clone(),
+                tmux_socket_name: session.tmux_socket_name.clone(),
+                request_actor: request_actor.to_owned(),
+                status: "waiting_idle".to_owned(),
+                requested_at: now.clone(),
+                idle_proof_at: None,
+                runtime_launch_id: None,
+                updated_at: now,
+                applied_at: None,
+                failure_reason: None,
+            };
+            rotations.push(rotation.clone());
+            store_session_credential_rotation_records(&mut state, &rotations)?;
+            self.write_raw_json_value(&state)?;
+            rotation
+        };
+        self.start_credential_rotation_worker(record.session_id.clone())?;
+        Ok(CredentialRotationOutcome::Created(record))
+    }
+
+    pub fn list_session_credential_rotations(
+        &self,
+    ) -> Result<Vec<SessionCredentialRotationRecord>> {
+        let _guard = self.write_guard()?;
+        let state = self.load_raw_json_value()?;
+        let mut records = session_credential_rotation_records(&state)?;
+        records.sort_by(|left, right| {
+            (&left.requested_at, &left.id).cmp(&(&right.requested_at, &right.id))
+        });
+        Ok(records)
+    }
+
+    pub fn recover_session_credential_rotation_workers(&self) -> Result<usize> {
+        let session_ids = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            session_credential_rotation_records(&state)?
+                .into_iter()
+                .filter(|record| record.status == "waiting_idle")
+                .map(|record| record.session_id)
+                .collect::<BTreeSet<_>>()
+        };
+        for session_id in &session_ids {
+            self.start_credential_rotation_worker(session_id.clone())?;
+        }
+        Ok(session_ids.len())
+    }
+
     pub fn create_core_session(
         &self,
         request: CreateCoreSessionRequest,
@@ -1114,6 +3665,9 @@ impl SessionStore {
     ) -> Result<SessionRecord> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
+        if let Some(parent_id) = request.parent_session_id.as_deref() {
+            ensure_session_not_reparent_fenced(&state, parent_id)?;
+        }
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let record =
             self.build_core_session_record(sessions, &request, log_dir.as_deref(), false, None)?;
@@ -1165,14 +3719,22 @@ impl SessionStore {
             .transpose()?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let mut record = self.build_core_session_record(
-            sessions,
-            &request,
-            log_dir.as_deref(),
-            true,
-            runtime.socket_name(),
-        )?;
+        if let Some(parent_id) = request.parent_session_id.as_deref() {
+            ensure_session_not_reparent_fenced(&state, parent_id)?;
+        }
+        let mut record = {
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            self.build_core_session_record(
+                sessions,
+                &request,
+                log_dir.as_deref(),
+                true,
+                runtime.socket_name(),
+            )?
+        };
+        let session_credential = generate_session_credential();
+        let credential_sha256 = sha256_text(&session_credential);
+        record.session_credential_sha256 = Some(credential_sha256.clone());
         if record.provider == "codex"
             && codex_cli_working_dir.as_deref() != Some(record.working_dir.as_str())
         {
@@ -1186,6 +3748,7 @@ impl SessionStore {
             .ok_or_else(|| anyhow::anyhow!("runtime session missing log file"))?;
         let spec = TmuxSessionSpec {
             session_id: record.id.clone(),
+            session_credential: Some(session_credential),
             tmux_session: record.tmux_session.clone(),
             working_dir: expand_home(&record.working_dir).display().to_string(),
             log_file,
@@ -1196,8 +3759,11 @@ impl SessionStore {
         };
         let codex_fork_artifacts = runtime.codex_fork_runtime_artifacts(&spec)?;
         let codex_cli_creation_binding = (record.provider == "codex").then(|| {
-            let mut excluded_ids = sessions
-                .iter()
+            let mut excluded_ids = state
+                .get("sessions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
                 .filter_map(|session| json_text(session.get("provider_resume_id")))
                 .collect::<BTreeSet<_>>();
             excluded_ids.extend(codex_cli_existing_session_ids(
@@ -1209,7 +3775,46 @@ impl SessionStore {
                 OffsetDateTime::now_utc().unix_timestamp_nanos(),
             )
         });
-        runtime.create_session(&spec)?;
+        let mut launch_records = session_runtime_launch_records(&state)?;
+        let launch_id = generate_unique_runtime_launch_id(&launch_records)?;
+        let launch_time = now_rfc3339();
+        launch_records.push(SessionRuntimeLaunchRecord {
+            id: launch_id.clone(),
+            operation_kind: "create".to_owned(),
+            session_id: record.id.clone(),
+            tmux_session: record.tmux_session.clone(),
+            tmux_socket_name: runtime.socket_name().map(ToOwned::to_owned),
+            working_dir: spec.working_dir.clone(),
+            log_file: spec.log_file.display().to_string(),
+            provider: record.provider.clone(),
+            provider_resume_id: None,
+            credential_rotation_id: None,
+            initial_message: request.initial_message.clone(),
+            model: request.model.clone(),
+            reasoning_effort: request.reasoning_effort.clone(),
+            credential_sha256,
+            status: "launching".to_owned(),
+            created_at: launch_time.clone(),
+            updated_at: launch_time,
+            failure_reason: None,
+        });
+        record.status = "stopped".to_owned();
+        record.stopped_at = Some(now_rfc3339());
+        ensure_sessions_array_mut(&mut state)?.push(serde_json::to_value(&record)?);
+        store_session_runtime_launch_records(&mut state, &launch_records)?;
+        self.write_raw_json_value(&state)?;
+
+        if let Err(error) = runtime.create_session(&spec) {
+            mark_runtime_launch_failed(
+                &mut state,
+                &launch_id,
+                &record.id,
+                true,
+                &error.to_string(),
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Err(error);
+        }
         if let Some((excluded_ids, launched_at_ns)) = codex_cli_creation_binding.as_ref() {
             record.provider_resume_id = wait_for_codex_cli_provider_resume_id(
                 &record,
@@ -1229,6 +3834,14 @@ impl SessionStore {
                 }
                 Err(error) => {
                     let _ = runtime.kill_session(&record.tmux_session);
+                    mark_runtime_launch_failed(
+                        &mut state,
+                        &launch_id,
+                        &record.id,
+                        true,
+                        &error.to_string(),
+                    )?;
+                    self.write_raw_json_value(&state)?;
                     return Err(error).with_context(|| {
                         format!(
                             "codex-fork session {} did not publish a provider resume id",
@@ -1238,7 +3851,18 @@ impl SessionStore {
                 }
             }
         }
-        sessions.push(serde_json::to_value(&record)?);
+        record.status = "running".to_owned();
+        record.stopped_at = None;
+        record.last_activity = now_rfc3339();
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = sessions
+            .iter_mut()
+            .find(|session| session.get("id").and_then(Value::as_str) == Some(record.id.as_str()))
+        else {
+            anyhow::bail!("provisional runtime session {} disappeared", record.id);
+        };
+        *session = serde_json::to_value(&record)?;
+        mark_runtime_launch_applied(&mut state, &launch_id, record.provider_resume_id.as_deref())?;
         if let Err(error) = self.write_raw_json_value(&state) {
             let _ = runtime.kill_session(&record.tmux_session);
             return Err(error);
@@ -1353,6 +3977,32 @@ impl SessionStore {
 
         let delivery_mode = normalized_delivery_mode(&request.delivery_mode);
         let (queued_text, sender_name) = format_send_input_text_raw(&state, &request);
+        if request.parent_session_id.is_some() {
+            if let Some(request_id) = active_reparent_route_request_for_session(&state, session_id)?
+            {
+                let key = format!("parent-input:{}", generate_session_id());
+                let metadata =
+                    queue_metadata_for_send_request(&state, session_id, &request, sender_name);
+                persist_deferred_parent_input_intent(
+                    &mut state,
+                    &request_id,
+                    &key,
+                    session_id,
+                    &queued_text,
+                    &delivery_mode,
+                    &metadata,
+                )?;
+                self.write_raw_json_value(&state)?;
+                return Ok(Some(CoreInputResult {
+                    ok: true,
+                    session_id: session_id.to_owned(),
+                    delivered: false,
+                    delivery_mode: request.delivery_mode,
+                    notify_after_seconds: request.notify_after_seconds,
+                    status: initial_status,
+                }));
+            }
+        }
         if should_persist_runtime_send(&delivery_mode) {
             if let Some(queue) = &self.queue_store {
                 let metadata =
@@ -1999,6 +4649,22 @@ impl SessionStore {
         self.lock_named_clear_operation(session_id)
     }
 
+    fn lock_credential_rotation_fences<'a>(
+        &'a self,
+        session_id: &str,
+        runtime: &TmuxRuntime,
+        tmux_session: &str,
+    ) -> Result<(
+        SessionClearGuard,
+        std::sync::MutexGuard<'a, ()>,
+        crate::runtime::SessionInputGuard,
+    )> {
+        let clear_guard = self.lock_clear_operation(session_id)?;
+        let state_guard = self.write_guard()?;
+        let input_guard = runtime.lock_session_input(tmux_session)?;
+        Ok((clear_guard, state_guard, input_guard))
+    }
+
     fn lock_codex_cli_binding_operation(
         &self,
         record: &SessionRecord,
@@ -2050,6 +4716,7 @@ impl SessionStore {
     pub fn restore_core_session(&self, session_id: &str) -> Result<Option<CoreRestoreOutcome>> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
+        ensure_session_not_reparent_fenced(&state, session_id)?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(None);
@@ -2084,6 +4751,7 @@ impl SessionStore {
     ) -> Result<Option<CoreRestoreOutcome>> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
+        ensure_session_not_reparent_fenced(&state, session_id)?;
         let snapshot = snapshot_from_raw_value(&state)?;
         let Some(mut record) = snapshot
             .sessions
@@ -2151,11 +4819,11 @@ impl SessionStore {
         else {
             return Err(anyhow::anyhow!("session {session_id} missing log_file"));
         };
-        if session_runtime.session_exists(&record.tmux_session)? {
-            let _ = session_runtime.kill_session(&record.tmux_session)?;
-        }
+        let session_credential = generate_session_credential();
+        let credential_sha256 = sha256_text(&session_credential);
         let spec = TmuxSessionSpec {
             session_id: record.id.clone(),
+            session_credential: Some(session_credential),
             tmux_session: record.tmux_session.clone(),
             working_dir: expand_home(&record.working_dir).display().to_string(),
             log_file,
@@ -2165,7 +4833,92 @@ impl SessionStore {
             reasoning_effort: record.reasoning_effort.clone(),
         };
         let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
-        session_runtime.restore_session(&spec, &record.provider, provider_resume_id.as_deref())?;
+        let mut launch_records = session_runtime_launch_records(&state)?;
+        let launch_id = generate_unique_runtime_launch_id(&launch_records)?;
+        let launch_time = now_rfc3339();
+        launch_records.push(SessionRuntimeLaunchRecord {
+            id: launch_id.clone(),
+            operation_kind: "restore".to_owned(),
+            session_id: record.id.clone(),
+            tmux_session: record.tmux_session.clone(),
+            tmux_socket_name: session_runtime.socket_name().map(ToOwned::to_owned),
+            working_dir: spec.working_dir.clone(),
+            log_file: spec.log_file.display().to_string(),
+            provider: record.provider.clone(),
+            provider_resume_id: provider_resume_id.clone(),
+            credential_rotation_id: None,
+            initial_message: None,
+            model: record.model.clone(),
+            reasoning_effort: record.reasoning_effort.clone(),
+            credential_sha256: credential_sha256.clone(),
+            status: "launching".to_owned(),
+            created_at: launch_time.clone(),
+            updated_at: launch_time,
+            failure_reason: None,
+        });
+        {
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(None);
+            };
+            session.insert(
+                "session_credential_sha256".to_owned(),
+                Value::String(credential_sha256),
+            );
+            if stored_provider_resume_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                != provider_resume_id.as_deref()
+            {
+                if let Some(provider_resume_id) = provider_resume_id.as_deref() {
+                    session.insert(
+                        "provider_resume_id".to_owned(),
+                        Value::String(provider_resume_id.to_owned()),
+                    );
+                }
+            }
+            if let Some(transcript_path) = record
+                .transcript_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                session.insert(
+                    "transcript_path".to_owned(),
+                    Value::String(transcript_path.to_owned()),
+                );
+            }
+        }
+        store_session_runtime_launch_records(&mut state, &launch_records)?;
+        self.write_raw_json_value(&state)?;
+
+        if session_runtime.session_exists(&record.tmux_session)? {
+            if let Err(error) = session_runtime.kill_session(&record.tmux_session) {
+                mark_runtime_launch_failed(
+                    &mut state,
+                    &launch_id,
+                    &record.id,
+                    false,
+                    &format!("failed to tear down prior runtime before restore: {error}"),
+                )?;
+                self.write_raw_json_value(&state)?;
+                return Err(error);
+            }
+        }
+        if let Err(error) =
+            session_runtime.restore_session(&spec, &record.provider, provider_resume_id.as_deref())
+        {
+            mark_runtime_launch_failed(
+                &mut state,
+                &launch_id,
+                &record.id,
+                false,
+                &error.to_string(),
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Err(error);
+        }
 
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = session_object_mut(sessions, session_id) else {
@@ -2191,10 +4944,10 @@ impl SessionStore {
             .filter(|value| !value.is_empty())
             != provider_resume_id.as_deref()
         {
-            if let Some(provider_resume_id) = provider_resume_id {
+            if let Some(provider_resume_id) = provider_resume_id.as_deref() {
                 session.insert(
                     "provider_resume_id".to_owned(),
-                    Value::String(provider_resume_id),
+                    Value::String(provider_resume_id.to_owned()),
                 );
             }
         }
@@ -2210,6 +4963,7 @@ impl SessionStore {
             );
         }
         let restored = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
+        mark_runtime_launch_applied(&mut state, &launch_id, provider_resume_id.as_deref())?;
         self.write_raw_json_value(&state)?;
         if let Some(provider_resume_id) = provider_resume_id_for_restore(&restored) {
             self.append_seat_session(
@@ -2304,6 +5058,7 @@ impl SessionStore {
     ) -> Result<ContextMonitorOutcome> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
+        ensure_session_not_reparent_fenced(&state, session_id)?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let requester_session_id = request.requester_session_id.trim();
         if requester_session_id.is_empty() {
@@ -2346,9 +5101,21 @@ impl SessionStore {
             Value::Bool(effective_enabled),
         );
         if effective_enabled {
+            let notify_session_id = notify_session_id.unwrap();
             session.insert(
                 "context_monitor_notify".to_owned(),
-                Value::String(notify_session_id.unwrap()),
+                Value::String(notify_session_id.clone()),
+            );
+            session.insert(
+                "context_monitor_notify_source".to_owned(),
+                Value::String(
+                    if is_parent && notify_session_id == requester_session_id {
+                        "parent_derived"
+                    } else {
+                        "explicit"
+                    }
+                    .to_owned(),
+                ),
             );
             // Enabling starts a fresh notification cycle. Without this, latches
             // left set by an earlier cycle suppress the first warning until a
@@ -2358,6 +5125,10 @@ impl SessionStore {
             reset_context_oneshot_flags(session);
         } else {
             session.insert("context_monitor_notify".to_owned(), Value::Null);
+            session.insert(
+                "context_monitor_notify_source".to_owned(),
+                Value::String(default_context_monitor_notify_source()),
+            );
             if request.enabled {
                 reset_context_oneshot_flags(session);
             }
@@ -2433,7 +5204,7 @@ impl SessionStore {
         emitted_at: Option<&str>,
         runtime: Option<&TmuxRuntime>,
     ) -> Result<ContextUsageOutcome> {
-        let (notify_target, label, informational_only) = {
+        let (notify_target, notify_source, label, informational_only) = {
             let sessions = ensure_sessions_array_mut(state)?;
             let Some(session) = session_object_mut(sessions, session_id) else {
                 return Ok(ContextUsageOutcome::UnknownSession);
@@ -2450,18 +5221,33 @@ impl SessionStore {
                     .as_deref()
                     .unwrap_or("claude"),
             );
-            let notify_target = if informational_only {
+            let (notify_target, notify_source) = if informational_only {
                 session.insert("context_monitor_enabled".to_owned(), Value::Bool(false));
                 session.insert("context_monitor_notify".to_owned(), Value::Null);
-                None
+                session.insert(
+                    "context_monitor_notify_source".to_owned(),
+                    Value::String(default_context_monitor_notify_source()),
+                );
+                (None, default_context_monitor_notify_source())
             } else {
-                json_text(session.get("context_monitor_notify"))
-                    // Fall back to the parent so an unregistered child still reports
-                    // its own context loss upward (#210).
-                    .or_else(|| json_text(session.get("parent_session_id")))
+                let configured_target = json_text(session.get("context_monitor_notify"));
+                let notify_source = if configured_target.is_some() {
+                    json_text(session.get("context_monitor_notify_source"))
+                        .unwrap_or_else(default_context_monitor_notify_source)
+                } else {
+                    "parent_derived".to_owned()
+                };
+                (
+                    configured_target
+                        // Fall back to the parent so an unregistered child still reports
+                        // its own context loss upward (#210).
+                        .or_else(|| json_text(session.get("parent_session_id"))),
+                    notify_source,
+                )
             };
             (
                 notify_target,
+                notify_source,
                 raw_session_label(session, session_id),
                 informational_only,
             )
@@ -2472,14 +5258,31 @@ impl SessionStore {
                 "[sm context] Compaction fired for {label} ({session_id}). \
                  Context was compacted — agent is still running."
             );
-            self.queue_context_monitor_message(
-                state,
-                session_id,
-                &notify_target,
-                &text,
-                "sequential",
-                runtime,
-            )?;
+            let deferred_request_id = if notify_source == "parent_derived" {
+                active_reparent_route_request_for_session(state, session_id)?
+            } else {
+                None
+            };
+            if let Some(request_id) = deferred_request_id {
+                persist_deferred_parent_message_intent(
+                    state,
+                    &request_id,
+                    &format!("context-compaction:{session_id}:{}", now_rfc3339()),
+                    session_id,
+                    &text,
+                    "sequential",
+                    "context_monitor",
+                )?;
+            } else {
+                self.queue_context_monitor_message(
+                    state,
+                    session_id,
+                    &notify_target,
+                    &text,
+                    "sequential",
+                    runtime,
+                )?;
+            }
         }
 
         if informational_only {
@@ -2608,6 +5411,10 @@ impl SessionStore {
                 if had_alert_state {
                     session.insert("context_monitor_enabled".to_owned(), Value::Bool(false));
                     session.insert("context_monitor_notify".to_owned(), Value::Null);
+                    session.insert(
+                        "context_monitor_notify_source".to_owned(),
+                        Value::String(default_context_monitor_notify_source()),
+                    );
                     reset_context_oneshot_flags(session);
                     self.cancel_context_monitor_alerts(session_id)?;
                     changed = true;
@@ -2720,6 +5527,27 @@ impl SessionStore {
         delivery_mode: &str,
         runtime: Option<&TmuxRuntime>,
     ) -> Result<()> {
+        self.queue_parent_message(
+            state,
+            sender_session_id,
+            notify_target,
+            text,
+            delivery_mode,
+            "context_monitor",
+            runtime,
+        )
+    }
+
+    fn queue_parent_message(
+        &self,
+        state: &mut Value,
+        sender_session_id: &str,
+        notify_target: &str,
+        text: &str,
+        delivery_mode: &str,
+        message_category: &str,
+        runtime: Option<&TmuxRuntime>,
+    ) -> Result<()> {
         if raw_session_object(state, notify_target).is_none() {
             return Ok(());
         }
@@ -2730,7 +5558,7 @@ impl SessionStore {
                 delivery_mode,
                 QueueMessageMetadata {
                     sender_session_id: Some(sender_session_id.to_owned()),
-                    message_category: Some("context_monitor".to_owned()),
+                    message_category: Some(message_category.to_owned()),
                     ..QueueMessageMetadata::default()
                 },
             )?;
@@ -2757,7 +5585,7 @@ impl SessionStore {
             notify_target,
             text,
             delivery_mode,
-            Some("context_monitor"),
+            Some(message_category),
         )?;
         Ok(())
     }
@@ -3930,6 +6758,7 @@ impl SessionStore {
     ) -> Result<CoreRetireOutcome> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
+        ensure_session_not_reparent_fenced(&state, session_id)?;
         let recipient_name = {
             let sessions = ensure_sessions_array_mut(&mut state)?;
             let Some(session) = session_object_mut(sessions, session_id) else {
@@ -3971,6 +6800,7 @@ impl SessionStore {
     ) -> Result<CoreRetireOutcome> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
+        ensure_session_not_reparent_fenced(&state, session_id)?;
         let (node, tmux_session, session_socket_name, recipient_name) = {
             let sessions = ensure_sessions_array_mut(&mut state)?;
             let Some(session) = session_object_mut(sessions, session_id) else {
@@ -4079,6 +6909,63 @@ impl SessionStore {
             )));
         };
 
+        let completed_at = now_rfc3339();
+        let friendly = session
+            .cached_display_name()
+            .unwrap_or_else(|| non_empty_or(session.name.clone(), &session.id));
+        let completion_text =
+            format!("[sm task-complete] agent {session_id}({friendly}) completed its task.");
+        if let Some(request_id) = active_reparent_route_request_for_session(&state, session_id)? {
+            if let Some(queue) = &self.queue_store {
+                queue.cancel_remind(session_id)?;
+            }
+            deactivate_remind_raw(&mut state, session_id)?;
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let session_object = session_object_mut(sessions, session_id)
+                .ok_or_else(|| anyhow::anyhow!("session disappeared during task-complete"))?;
+            session_object.insert(
+                "agent_task_completed_at".to_owned(),
+                Value::String(completed_at.clone()),
+            );
+            session_object.insert("agent_status_text".to_owned(), Value::Null);
+            session_object.insert("agent_status_at".to_owned(), Value::Null);
+
+            let mut records = reparent_request_records(&state)?;
+            let record = records
+                .iter_mut()
+                .find(|record| record.id == request_id)
+                .with_context(|| format!("reparent request {request_id} disappeared"))?;
+            let key = format!("task-complete:{session_id}:{completed_at}");
+            if !record
+                .deferred_routing_intents
+                .iter()
+                .any(|intent| intent.key == key)
+            {
+                record
+                    .deferred_routing_intents
+                    .push(ReparentDeferredRoutingIntent {
+                        key,
+                        operation: "task_complete".to_owned(),
+                        child_session_id: session_id.to_owned(),
+                        payload: json!({
+                            "text": completion_text,
+                            "completed_at": completed_at,
+                        }),
+                        created_at: now_rfc3339(),
+                        replayed_at: None,
+                        resolved_parent_session_id: None,
+                    });
+            }
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(TaskCompleteOutcome::Completed(TaskCompleteResult {
+                status: "completed".to_owned(),
+                session_id: session_id.to_owned(),
+                em_notified: false,
+                agent_task_completed_at: completed_at,
+            }));
+        }
+
         let queue_parent = match &self.queue_store {
             Some(queue) => queue.active_parent_wake_parent(session_id)?,
             None => None,
@@ -4093,7 +6980,6 @@ impl SessionStore {
         deactivate_remind_raw(&mut state, session_id)?;
         deactivate_parent_wake_raw(&mut state, session_id)?;
 
-        let completed_at = now_rfc3339();
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let session_object = session_object_mut(sessions, session_id)
             .ok_or_else(|| anyhow::anyhow!("session disappeared during task-complete"))?;
@@ -4106,11 +6992,7 @@ impl SessionStore {
 
         let mut em_notified = false;
         if let Some(em_session_id) = em_session_id {
-            let friendly = session
-                .cached_display_name()
-                .unwrap_or_else(|| non_empty_or(session.name.clone(), &session.id));
-            let text =
-                format!("[sm task-complete] agent {session_id}({friendly}) completed its task.");
+            let text = completion_text;
             if let Some(queue) = &self.queue_store {
                 let message_id = queue.enqueue_message(
                     &em_session_id,
@@ -4640,6 +7522,10 @@ impl SessionStore {
                 if had_alert_state {
                     session.insert("context_monitor_enabled".to_owned(), Value::Bool(false));
                     session.insert("context_monitor_notify".to_owned(), Value::Null);
+                    session.insert(
+                        "context_monitor_notify_source".to_owned(),
+                        Value::String(default_context_monitor_notify_source()),
+                    );
                     reset_context_oneshot_flags(session);
                     self.cancel_context_monitor_alerts(session_id)?;
                     changed = true;
@@ -4780,6 +7666,7 @@ impl SessionStore {
             git_remote_url: None,
             review_config: None,
             parent_session_id: request.parent_session_id.clone(),
+            session_credential_sha256: None,
             last_handoff_path: None,
             agent_status_text: None,
             agent_status_at: None,
@@ -4805,6 +7692,7 @@ impl SessionStore {
             context_compaction_active: false,
             context_monitor_enabled: false,
             context_monitor_notify: None,
+            context_monitor_notify_source: default_context_monitor_notify_source(),
             context_warning_sent: false,
             context_critical_sent: false,
             aliases: Vec::new(),
@@ -5293,6 +8181,63 @@ pub struct ContextMonitorRequest {
     pub notify_session_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateReparentRequest {
+    pub requester_session_id: String,
+    pub target_parent_session_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateReparentTreeRequest {
+    pub requester_session_id: String,
+    pub target_session_id: String,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DecideReparentRequest {
+    pub requester_session_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReparentDecision {
+    Approved,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReparentRepairAction {
+    Resume,
+    RollbackPrecommit,
+}
+
+impl ReparentRepairAction {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "resume" => Some(Self::Resume),
+            "rollback_precommit" => Some(Self::RollbackPrecommit),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Resume => "resume",
+            Self::RollbackPrecommit => "rollback_precommit",
+        }
+    }
+}
+
+impl ReparentDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
 /// One post from a context-monitor producer hook. `event` distinguishes the
 /// lifecycle hooks (`compaction`, `compaction_complete`, `context_reset`) from a
 /// plain status-line usage sample, which carries no `event` at all.
@@ -5629,6 +8574,28 @@ pub enum ContextMonitorOutcome {
     Unauthorized,
 }
 
+#[derive(Debug, Clone)]
+pub enum ReparentMutationOutcome {
+    Created(ReparentRequestRecord),
+    Updated(ReparentRequestRecord),
+    Preview(ReparentTreePreview),
+    SessionNotFound(String),
+    RequestNotFound,
+    BadRequest(String),
+    Forbidden(String),
+    Conflict(String),
+    Expired,
+}
+
+#[derive(Debug, Clone)]
+pub enum CredentialRotationOutcome {
+    Created(SessionCredentialRotationRecord),
+    Existing(SessionCredentialRotationRecord),
+    SessionNotFound,
+    BadRequest(String),
+    Conflict(String),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HandoffResult {
     pub status: String,
@@ -5952,6 +8919,197 @@ fn push_retained_message_raw(
         "created_at": now_rfc3339(),
     }));
     Ok(())
+}
+
+fn push_retained_message_once_raw(
+    state: &mut Value,
+    id: &str,
+    target_session_id: &str,
+    text: &str,
+    delivery_mode: &str,
+    message_category: Option<&str>,
+) -> Result<()> {
+    let messages = ensure_array_field_mut(state, "retained_pending_messages")?;
+    if let Some(existing) = messages
+        .iter()
+        .find(|message| json_text(message.get("id")).as_deref() == Some(id))
+    {
+        let matches = json_text(existing.get("target_session_id")).as_deref()
+            == Some(target_session_id)
+            && existing.get("text").and_then(Value::as_str) == Some(text)
+            && existing.get("delivery_mode").and_then(Value::as_str) == Some(delivery_mode)
+            && json_text(existing.get("message_category")).as_deref() == message_category;
+        if !matches {
+            anyhow::bail!("retained message id {id} already exists with different content");
+        }
+        return Ok(());
+    }
+    messages.push(json!({
+        "id": id,
+        "target_session_id": target_session_id,
+        "text": text,
+        "delivery_mode": delivery_mode,
+        "message_category": message_category,
+        "created_at": now_rfc3339(),
+    }));
+    Ok(())
+}
+
+fn deferred_task_complete_message_id(request_id: &str, intent_key: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(request_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(intent_key.as_bytes());
+    format!("reparent-task-complete-{:x}", digest.finalize())
+}
+
+fn deferred_parent_message_id(request_id: &str, intent_key: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(request_id.as_bytes());
+    digest.update(b"\0parent-message\0");
+    digest.update(intent_key.as_bytes());
+    format!("reparent-parent-message-{:x}", digest.finalize())
+}
+
+fn persist_deferred_parent_message_intent(
+    state: &mut Value,
+    request_id: &str,
+    key: &str,
+    child_session_id: &str,
+    text: &str,
+    delivery_mode: &str,
+    message_category: &str,
+) -> Result<()> {
+    let mut records = reparent_request_records(state)?;
+    let record = records
+        .iter_mut()
+        .find(|record| record.id == request_id)
+        .with_context(|| format!("reparent request {request_id} disappeared"))?;
+    if !record
+        .deferred_routing_intents
+        .iter()
+        .any(|intent| intent.key == key)
+    {
+        record
+            .deferred_routing_intents
+            .push(ReparentDeferredRoutingIntent {
+                key: key.to_owned(),
+                operation: "parent_message".to_owned(),
+                child_session_id: child_session_id.to_owned(),
+                payload: json!({
+                    "text": text,
+                    "delivery_mode": delivery_mode,
+                    "message_category": message_category,
+                }),
+                created_at: now_rfc3339(),
+                replayed_at: None,
+                resolved_parent_session_id: None,
+            });
+    }
+    store_reparent_request_records(state, &records)
+}
+
+fn persist_deferred_parent_input_intent(
+    state: &mut Value,
+    request_id: &str,
+    key: &str,
+    target_session_id: &str,
+    text: &str,
+    delivery_mode: &str,
+    metadata: &QueueMessageMetadata,
+) -> Result<()> {
+    let mut records = reparent_request_records(state)?;
+    let record = records
+        .iter_mut()
+        .find(|record| record.id == request_id)
+        .with_context(|| format!("reparent request {request_id} disappeared"))?;
+    if !record
+        .deferred_routing_intents
+        .iter()
+        .any(|intent| intent.key == key)
+    {
+        record
+            .deferred_routing_intents
+            .push(ReparentDeferredRoutingIntent {
+                key: key.to_owned(),
+                operation: "parent_input".to_owned(),
+                child_session_id: target_session_id.to_owned(),
+                payload: json!({
+                    "text": text,
+                    "delivery_mode": delivery_mode,
+                    "sender_session_id": metadata.sender_session_id,
+                    "sender_name": metadata.sender_name,
+                    "from_sm_send": metadata.from_sm_send,
+                    "timeout_seconds": metadata.timeout_seconds,
+                    "notify_on_delivery": metadata.notify_on_delivery,
+                    "notify_after_seconds": metadata.notify_after_seconds,
+                    "notify_on_stop": metadata.notify_on_stop,
+                    "remind_soft_threshold": metadata.remind_soft_threshold,
+                    "remind_hard_threshold": metadata.remind_hard_threshold,
+                    "remind_cancel_on_reply_session_id": metadata.remind_cancel_on_reply_session_id,
+                }),
+                created_at: now_rfc3339(),
+                replayed_at: None,
+                resolved_parent_session_id: None,
+            });
+    }
+    store_reparent_request_records(state, &records)
+}
+
+fn deferred_parent_input_metadata(
+    intent: &ReparentDeferredRoutingIntent,
+    parent_session_id: Option<&str>,
+) -> Result<QueueMessageMetadata> {
+    Ok(QueueMessageMetadata {
+        sender_session_id: intent
+            .payload
+            .get("sender_session_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        sender_name: intent
+            .payload
+            .get("sender_name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        from_sm_send: intent
+            .payload
+            .get("from_sm_send")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        timeout_seconds: intent
+            .payload
+            .get("timeout_seconds")
+            .and_then(Value::as_u64),
+        notify_on_delivery: intent
+            .payload
+            .get("notify_on_delivery")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        notify_after_seconds: intent
+            .payload
+            .get("notify_after_seconds")
+            .and_then(Value::as_u64),
+        notify_on_stop: intent
+            .payload
+            .get("notify_on_stop")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        remind_soft_threshold: intent
+            .payload
+            .get("remind_soft_threshold")
+            .and_then(Value::as_u64),
+        remind_hard_threshold: intent
+            .payload
+            .get("remind_hard_threshold")
+            .and_then(Value::as_u64),
+        remind_cancel_on_reply_session_id: intent
+            .payload
+            .get("remind_cancel_on_reply_session_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        parent_session_id: parent_session_id.map(ToOwned::to_owned),
+        ..QueueMessageMetadata::default()
+    })
 }
 
 fn upsert_remind_raw(
@@ -6513,6 +9671,7 @@ fn codex_fork_spec_for_session_raw(
         .ok_or_else(|| anyhow::anyhow!("session {session_id} missing log_file"))?;
     Ok(TmuxSessionSpec {
         session_id: session_id.to_owned(),
+        session_credential: None,
         tmux_session,
         working_dir: expand_home(&working_dir).display().to_string(),
         log_file: expand_home(&log_file),
@@ -6555,6 +9714,7 @@ pub fn submit_codex_fork_btw(
     }
     let spec = TmuxSessionSpec {
         session_id: session.id.clone(),
+        session_credential: None,
         tmux_session: session.tmux_session.clone(),
         working_dir: session.working_dir.clone(),
         log_file: session
@@ -6977,6 +10137,24 @@ fn complete_runtime_message_delivery_raw(
         message
     };
 
+    let fenced_message;
+    let message = if message.parent_session_id.is_some()
+        && message.remind_soft_threshold.is_some()
+        && active_reparent_request_for_session(state, &message.target_session_id)?.is_some()
+    {
+        persist_deferred_parent_wake_intent(state, message)?;
+        // The intent must be durable before SQLite marks the source message
+        // delivered, otherwise a crash can lose the parent wake entirely.
+        store.write_raw_json_value(state)?;
+        fenced_message = PendingMessage {
+            parent_session_id: None,
+            ..message.clone()
+        };
+        &fenced_message
+    } else {
+        message
+    };
+
     queue.mark_delivered_and_apply_side_effects(message)?;
 
     if message.notify_on_delivery {
@@ -7040,6 +10218,36 @@ fn complete_runtime_message_delivery_raw(
         queue.clone(),
         message.clone(),
     );
+    Ok(())
+}
+
+fn persist_deferred_parent_wake_intent(state: &mut Value, message: &PendingMessage) -> Result<()> {
+    let request_id = active_reparent_request_for_session(state, &message.target_session_id)?
+        .context("routing fence disappeared while deferring parent wake")?;
+    let mut records = reparent_request_records(state)?;
+    let record = records
+        .iter_mut()
+        .find(|record| record.id == request_id)
+        .with_context(|| format!("reparent request {request_id} disappeared"))?;
+    let key = format!("message-parent-wake:{}", message.id);
+    if !record
+        .deferred_routing_intents
+        .iter()
+        .any(|intent| intent.key == key)
+    {
+        record
+            .deferred_routing_intents
+            .push(ReparentDeferredRoutingIntent {
+                key,
+                operation: "parent_wake".to_owned(),
+                child_session_id: message.target_session_id.clone(),
+                payload: json!({ "period_seconds": 600 }),
+                created_at: now_rfc3339(),
+                replayed_at: None,
+                resolved_parent_session_id: None,
+            });
+        store_reparent_request_records(state, &records)?;
+    }
     Ok(())
 }
 
@@ -8156,6 +11364,7 @@ fn codex_fork_event_stream_path(session: &SessionRecord, runtime: &TmuxRuntime) 
     let log_file = session.log_file.as_deref().map(expand_home)?;
     let spec = TmuxSessionSpec {
         session_id: session.id.clone(),
+        session_credential: None,
         tmux_session: session.tmux_session.clone(),
         working_dir: session.working_dir.clone(),
         log_file: log_file.clone(),
@@ -8515,10 +11724,948 @@ fn generate_unique_session_id(sessions: &[Value]) -> Result<String> {
     anyhow::bail!("failed to generate unique session id after 64 attempts")
 }
 
+fn generate_unique_reparent_request_id(records: &[ReparentRequestRecord]) -> Result<String> {
+    for _ in 0..64 {
+        let mut bytes = [0u8; 6];
+        OsRng.fill_bytes(&mut bytes);
+        let mut id = String::with_capacity(12);
+        for byte in bytes {
+            id.push(hex_char(byte >> 4));
+            id.push(hex_char(byte & 0x0f));
+        }
+        if !records.iter().any(|record| record.id == id) {
+            return Ok(id);
+        }
+    }
+    anyhow::bail!("failed to generate unique reparent request id after 64 attempts")
+}
+
+fn generate_unique_runtime_launch_id(records: &[SessionRuntimeLaunchRecord]) -> Result<String> {
+    for _ in 0..64 {
+        let id = generate_session_id();
+        if !records.iter().any(|record| record.id == id) {
+            return Ok(id);
+        }
+    }
+    anyhow::bail!("failed to generate unique runtime launch id after 64 attempts")
+}
+
+fn generate_unique_credential_rotation_id(
+    records: &[SessionCredentialRotationRecord],
+) -> Result<String> {
+    for _ in 0..64 {
+        let id = generate_session_id();
+        if !records.iter().any(|record| record.id == id) {
+            return Ok(id);
+        }
+    }
+    anyhow::bail!("failed to generate unique credential rotation id after 64 attempts")
+}
+
+fn generate_session_credential() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let mut credential = String::with_capacity(64);
+    for byte in bytes {
+        credential.push(hex_char(byte >> 4));
+        credential.push(hex_char(byte & 0x0f));
+    }
+    credential
+}
+
+fn sha256_text(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn constant_time_text_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+fn session_credential_matches(
+    sessions: &[SessionRecord],
+    session_id: &str,
+    credential: &str,
+) -> bool {
+    let session_id = session_id.trim();
+    let credential = credential.trim();
+    if session_id.is_empty() || credential.is_empty() {
+        return false;
+    }
+    let Some(expected) = sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .and_then(|session| session.session_credential_sha256.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    constant_time_text_eq(expected, &sha256_text(credential))
+}
+
+fn credential_rotation_has_fresh_idle_proof(
+    rotation: &SessionCredentialRotationRecord,
+    session: &SessionRecord,
+) -> bool {
+    if normalized_status(&session.status) == "stopped" {
+        return false;
+    }
+    match session.provider.as_str() {
+        "claude" => {
+            normalized_status(&session.status) == "idle"
+                && session
+                    .activity_hook_at
+                    .as_deref()
+                    .is_some_and(|proof_at| timestamp_is_after(proof_at, &rotation.requested_at))
+        }
+        "codex-fork" => {
+            normalized_status(&session.status) == "idle"
+                && timestamp_is_after(&session.last_activity, &rotation.requested_at)
+        }
+        // Classic Codex has no durable lifecycle event stream. Its paired
+        // session_input_ready check is a fresh composer observation performed
+        // after the request and repeated under the input fence.
+        "codex" => true,
+        _ => false,
+    }
+}
+
 fn session_id_exists(sessions: &[Value], session_id: &str) -> bool {
     sessions
         .iter()
         .any(|value| value.get("id").and_then(Value::as_str) == Some(session_id))
+}
+
+fn reparent_request_records(state: &Value) -> Result<Vec<ReparentRequestRecord>> {
+    state
+        .get("reparent_requests")
+        .and_then(Value::as_array)
+        .map(|records| {
+            records
+                .iter()
+                .map(|record| {
+                    serde_json::from_value(record.clone())
+                        .context("failed to parse reparent request record")
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn store_reparent_request_records(
+    state: &mut Value,
+    records: &[ReparentRequestRecord],
+) -> Result<()> {
+    let mut records = records.to_vec();
+    for record in &mut records {
+        for desired in desired_reparent_notifications(record) {
+            if record
+                .notification_intents
+                .iter()
+                .all(|intent| intent.key != desired.intent.key)
+            {
+                record.notification_intents.push(desired.intent);
+            }
+        }
+    }
+    let object = state
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("session state root must be an object"))?;
+    object.insert(
+        "reparent_requests".to_owned(),
+        serde_json::to_value(&records)?,
+    );
+    Ok(())
+}
+
+fn reparent_apply_lease(state: &Value) -> Result<Option<ReparentApplyLease>> {
+    match state.get("reparent_apply_lease") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone())
+            .context("failed to parse reparent apply lease")
+            .map(Some),
+    }
+}
+
+fn store_reparent_apply_lease(state: &mut Value, lease: Option<&ReparentApplyLease>) -> Result<()> {
+    let object = state
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("session state root must be an object"))?;
+    object.insert(
+        "reparent_apply_lease".to_owned(),
+        lease
+            .map(serde_json::to_value)
+            .transpose()?
+            .unwrap_or(Value::Null),
+    );
+    Ok(())
+}
+
+fn active_reparent_request_for_session(state: &Value, session_id: &str) -> Result<Option<String>> {
+    Ok(reparent_request_records(state)?
+        .into_iter()
+        .find(|record| {
+            record.is_apply_fenced() && record.affected_session_ids().contains(session_id.trim())
+        })
+        .map(|record| record.id))
+}
+
+fn active_reparent_route_request_for_session(
+    state: &Value,
+    session_id: &str,
+) -> Result<Option<String>> {
+    Ok(reparent_request_records(state)?
+        .into_iter()
+        .find(|record| {
+            record.is_apply_fenced()
+                && record.apply_plan.as_ref().is_some_and(|plan| {
+                    plan.edge_changes
+                        .iter()
+                        .any(|change| change.session_id == session_id.trim())
+                })
+        })
+        .map(|record| record.id))
+}
+
+fn ensure_session_not_reparent_fenced(state: &Value, session_id: &str) -> Result<()> {
+    if let Some(request_id) = active_reparent_request_for_session(state, session_id)? {
+        anyhow::bail!("reparent request {request_id} controls session {session_id}")
+    }
+    Ok(())
+}
+
+fn leased_reparent_request<'a>(
+    state: &Value,
+    records: &'a [ReparentRequestRecord],
+    request_id: &str,
+) -> Result<&'a ReparentRequestRecord> {
+    let lease = reparent_apply_lease(state)?.context("reparent apply lease disappeared")?;
+    if lease.request_id != request_id {
+        anyhow::bail!(
+            "reparent apply lease belongs to {}, not {request_id}",
+            lease.request_id
+        );
+    }
+    records
+        .iter()
+        .find(|record| record.id == request_id)
+        .with_context(|| format!("reparent request {request_id} disappeared"))
+}
+
+fn leased_reparent_request_mut<'a>(
+    state: &Value,
+    records: &'a mut [ReparentRequestRecord],
+    request_id: &str,
+) -> Result<&'a mut ReparentRequestRecord> {
+    let lease = reparent_apply_lease(state)?.context("reparent apply lease disappeared")?;
+    if lease.request_id != request_id {
+        anyhow::bail!(
+            "reparent apply lease belongs to {}, not {request_id}",
+            lease.request_id
+        );
+    }
+    records
+        .iter_mut()
+        .find(|record| record.id == request_id)
+        .with_context(|| format!("reparent request {request_id} disappeared"))
+}
+
+fn queue_snapshot_from_plan(plan: &ReparentApplyPlan) -> Result<ParentRoutingSnapshot> {
+    let mut snapshot = ParentRoutingSnapshot::default();
+    for change in &plan.queue_routing_changes {
+        if change.store != "queue" {
+            anyhow::bail!("queue routing plan contains store {}", change.store);
+        }
+        let old_parent = change
+            .expected_target_session_id
+            .clone()
+            .with_context(|| format!("routing change {} has no old parent", change.record_id))?;
+        match change.record_kind.as_str() {
+            "parent_wake" => snapshot.wake_rows.push(ParentRoutingWakeRow {
+                id: change.record_id.clone(),
+                child_session_id: change.child_session_id.clone(),
+                parent_session_id: old_parent,
+                period_seconds: change
+                    .period_seconds
+                    .with_context(|| format!("parent wake {} has no period", change.record_id))?,
+                is_active: change.prior_active.with_context(|| {
+                    format!("parent wake {} has no active state", change.record_id)
+                })?,
+            }),
+            "message" => snapshot.message_rows.push(ParentRoutingMessageRow {
+                id: change.record_id.clone(),
+                child_session_id: change.child_session_id.clone(),
+                parent_session_id: old_parent,
+                creates_parent_wake: change.creates_parent_wake,
+            }),
+            other => anyhow::bail!("unsupported queue routing record kind {other}"),
+        }
+    }
+    Ok(snapshot)
+}
+
+fn queue_route_groups_from_plan(
+    plan: &ReparentApplyPlan,
+    restore_old_targets: bool,
+) -> Result<Vec<(ParentRoutingSnapshot, Option<String>)>> {
+    let mut groups = BTreeMap::<Option<String>, ParentRoutingSnapshot>::new();
+    for change in &plan.queue_routing_changes {
+        if change.store != "queue" {
+            anyhow::bail!("queue routing plan contains store {}", change.store);
+        }
+        let old_parent = change
+            .expected_target_session_id
+            .clone()
+            .with_context(|| format!("routing change {} has no old parent", change.record_id))?;
+        let target = if restore_old_targets {
+            Some(old_parent.clone())
+        } else {
+            change.new_target_session_id.clone()
+        };
+        let snapshot = groups.entry(target).or_default();
+        match change.record_kind.as_str() {
+            "parent_wake" => snapshot.wake_rows.push(ParentRoutingWakeRow {
+                id: change.record_id.clone(),
+                child_session_id: change.child_session_id.clone(),
+                parent_session_id: old_parent,
+                period_seconds: change
+                    .period_seconds
+                    .with_context(|| format!("parent wake {} has no period", change.record_id))?,
+                is_active: change.prior_active.with_context(|| {
+                    format!("parent wake {} has no active state", change.record_id)
+                })?,
+            }),
+            "message" => snapshot.message_rows.push(ParentRoutingMessageRow {
+                id: change.record_id.clone(),
+                child_session_id: change.child_session_id.clone(),
+                parent_session_id: old_parent,
+                creates_parent_wake: change.creates_parent_wake,
+            }),
+            other => anyhow::bail!("unsupported queue routing record kind {other}"),
+        }
+    }
+    Ok(groups
+        .into_iter()
+        .map(|(target, snapshot)| (snapshot, target))
+        .collect())
+}
+
+fn quiesce_json_reparent_routes(state: &mut Value, plan: &ReparentApplyPlan) -> Result<()> {
+    for change in &plan.json_routing_changes {
+        match change.record_kind.as_str() {
+            "parent_wake" => {
+                let registrations =
+                    ensure_array_field_mut(state, "retained_parent_wake_registrations")?;
+                let entry = registrations
+                    .iter_mut()
+                    .find(|entry| json_text(entry.get("id")).as_deref() == Some(&change.record_id))
+                    .with_context(|| format!("parent wake {} disappeared", change.record_id))?;
+                let object = entry
+                    .as_object_mut()
+                    .context("parent wake record must be an object")?;
+                validate_json_parent_route(object, change, true)?;
+                object.insert("is_active".to_owned(), Value::Bool(false));
+            }
+            "context_monitor" => {
+                let sessions = ensure_sessions_array_mut(state)?;
+                let session = session_object_mut(sessions, &change.child_session_id)
+                    .with_context(|| format!("session {} disappeared", change.child_session_id))?;
+                validate_json_parent_route(session, change, true)?;
+                session.insert("context_monitor_enabled".to_owned(), Value::Bool(false));
+            }
+            other => anyhow::bail!("unsupported JSON routing record kind {other}"),
+        }
+    }
+    Ok(())
+}
+
+fn commit_json_reparent_plan(state: &mut Value, plan: &ReparentApplyPlan) -> Result<()> {
+    for change in &plan.edge_changes {
+        let sessions = ensure_sessions_array_mut(state)?;
+        let session = session_object_mut(sessions, &change.session_id)
+            .with_context(|| format!("session {} disappeared", change.session_id))?;
+        let current_parent = json_text(session.get("parent_session_id"));
+        if current_parent != change.expected_parent_session_id {
+            anyhow::bail!(
+                "session {} parent changed after planning",
+                change.session_id
+            );
+        }
+        session.insert(
+            "parent_session_id".to_owned(),
+            change
+                .new_parent_session_id
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
+        );
+    }
+    for change in &plan.json_routing_changes {
+        match change.record_kind.as_str() {
+            "parent_wake" => {
+                let registrations =
+                    ensure_array_field_mut(state, "retained_parent_wake_registrations")?;
+                let entry = registrations
+                    .iter_mut()
+                    .find(|entry| json_text(entry.get("id")).as_deref() == Some(&change.record_id))
+                    .with_context(|| format!("parent wake {} disappeared", change.record_id))?;
+                let object = entry
+                    .as_object_mut()
+                    .context("parent wake record must be an object")?;
+                validate_json_parent_route(object, change, false)?;
+                if let Some(new_parent) = change.new_target_session_id.as_ref() {
+                    object.insert(
+                        "parent_session_id".to_owned(),
+                        Value::String(new_parent.clone()),
+                    );
+                }
+                object.insert(
+                    "is_active".to_owned(),
+                    Value::Bool(
+                        change.new_target_session_id.is_some()
+                            && change.prior_active.unwrap_or(false),
+                    ),
+                );
+            }
+            "context_monitor" => {
+                let sessions = ensure_sessions_array_mut(state)?;
+                let session = session_object_mut(sessions, &change.child_session_id)
+                    .with_context(|| format!("session {} disappeared", change.child_session_id))?;
+                validate_json_parent_route(session, change, false)?;
+                session.insert(
+                    "context_monitor_notify".to_owned(),
+                    change
+                        .new_target_session_id
+                        .clone()
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
+                );
+                session.insert(
+                    "context_monitor_enabled".to_owned(),
+                    Value::Bool(
+                        change.new_target_session_id.is_some()
+                            && change.prior_active.unwrap_or(false),
+                    ),
+                );
+            }
+            other => anyhow::bail!("unsupported JSON routing record kind {other}"),
+        }
+    }
+    Ok(())
+}
+
+fn restore_json_reparent_routes(state: &mut Value, plan: &ReparentApplyPlan) -> Result<()> {
+    for change in &plan.json_routing_changes {
+        let old_parent = change
+            .expected_target_session_id
+            .clone()
+            .with_context(|| format!("routing change {} has no old parent", change.record_id))?;
+        match change.record_kind.as_str() {
+            "parent_wake" => {
+                let registrations =
+                    ensure_array_field_mut(state, "retained_parent_wake_registrations")?;
+                let entry = registrations
+                    .iter_mut()
+                    .find(|entry| json_text(entry.get("id")).as_deref() == Some(&change.record_id))
+                    .with_context(|| format!("parent wake {} disappeared", change.record_id))?;
+                let object = entry
+                    .as_object_mut()
+                    .context("parent wake record must be an object")?;
+                let already_restored = json_text(object.get("parent_session_id")).as_deref()
+                    == Some(old_parent.as_str())
+                    && object
+                        .get("is_active")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                        == change.prior_active.unwrap_or(false);
+                if !already_restored {
+                    validate_json_parent_route(object, change, false)?;
+                }
+                object.insert("parent_session_id".to_owned(), Value::String(old_parent));
+                object.insert(
+                    "is_active".to_owned(),
+                    Value::Bool(change.prior_active.unwrap_or(false)),
+                );
+            }
+            "context_monitor" => {
+                let sessions = ensure_sessions_array_mut(state)?;
+                let session = session_object_mut(sessions, &change.child_session_id)
+                    .with_context(|| format!("session {} disappeared", change.child_session_id))?;
+                let already_restored = json_text(session.get("context_monitor_notify")).as_deref()
+                    == Some(old_parent.as_str())
+                    && session
+                        .get("context_monitor_enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                        == change.prior_active.unwrap_or(false);
+                if !already_restored {
+                    validate_json_parent_route(session, change, false)?;
+                }
+                session.insert(
+                    "context_monitor_notify".to_owned(),
+                    Value::String(old_parent),
+                );
+                session.insert(
+                    "context_monitor_enabled".to_owned(),
+                    Value::Bool(change.prior_active.unwrap_or(false)),
+                );
+            }
+            other => anyhow::bail!("unsupported JSON routing record kind {other}"),
+        }
+    }
+    Ok(())
+}
+
+fn verify_old_reparent_edges(state: &Value, plan: &ReparentApplyPlan) -> Result<()> {
+    for change in &plan.edge_changes {
+        let session = raw_session_object(state, &change.session_id)
+            .with_context(|| format!("session {} disappeared", change.session_id))?;
+        if json_text(session.get("parent_session_id")) != change.expected_parent_session_id {
+            anyhow::bail!(
+                "session {} authority changed before rollback",
+                change.session_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_json_parent_route(
+    object: &Map<String, Value>,
+    change: &ReparentRoutingChange,
+    allow_pre_state: bool,
+) -> Result<()> {
+    let target_field = if change.record_kind == "context_monitor" {
+        "context_monitor_notify"
+    } else {
+        "parent_session_id"
+    };
+    let active_field = if change.record_kind == "context_monitor" {
+        "context_monitor_enabled"
+    } else {
+        "is_active"
+    };
+    let current_target = json_text(object.get(target_field));
+    let current_active = object
+        .get(active_field)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let old_parent = change.expected_target_session_id.as_deref();
+    let valid = current_target.as_deref() == old_parent
+        && (!current_active || (allow_pre_state && change.prior_active == Some(current_active)));
+    if !valid {
+        anyhow::bail!("JSON route {} changed after planning", change.record_id);
+    }
+    if change.record_kind == "context_monitor"
+        && json_text(object.get("context_monitor_notify_source")).as_deref()
+            != Some("parent_derived")
+    {
+        anyhow::bail!(
+            "context monitor {} lost parent provenance",
+            change.record_id
+        );
+    }
+    Ok(())
+}
+
+fn session_runtime_launch_records(state: &Value) -> Result<Vec<SessionRuntimeLaunchRecord>> {
+    state
+        .get("session_runtime_launches")
+        .and_then(Value::as_array)
+        .map(|records| {
+            records
+                .iter()
+                .map(|record| {
+                    serde_json::from_value(record.clone())
+                        .context("failed to parse session runtime launch record")
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn store_session_runtime_launch_records(
+    state: &mut Value,
+    records: &[SessionRuntimeLaunchRecord],
+) -> Result<()> {
+    let object = state
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("session state root must be an object"))?;
+    object.insert(
+        "session_runtime_launches".to_owned(),
+        serde_json::to_value(records)?,
+    );
+    Ok(())
+}
+
+fn session_credential_rotation_records(
+    state: &Value,
+) -> Result<Vec<SessionCredentialRotationRecord>> {
+    state
+        .get("session_credential_rotations")
+        .and_then(Value::as_array)
+        .map(|records| {
+            records
+                .iter()
+                .map(|record| {
+                    serde_json::from_value(record.clone())
+                        .context("failed to parse session credential rotation record")
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn store_session_credential_rotation_records(
+    state: &mut Value,
+    records: &[SessionCredentialRotationRecord],
+) -> Result<()> {
+    let object = state
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("session state root must be an object"))?;
+    object.insert(
+        "session_credential_rotations".to_owned(),
+        serde_json::to_value(records)?,
+    );
+    Ok(())
+}
+
+fn mark_runtime_launch_applied(
+    state: &mut Value,
+    launch_id: &str,
+    provider_resume_id: Option<&str>,
+) -> Result<()> {
+    let mut records = session_runtime_launch_records(state)?;
+    let record = records
+        .iter_mut()
+        .find(|record| record.id == launch_id)
+        .ok_or_else(|| anyhow::anyhow!("runtime launch {launch_id} disappeared"))?;
+    record.status = "applied".to_owned();
+    record.updated_at = now_rfc3339();
+    record.failure_reason = None;
+    if let Some(provider_resume_id) = provider_resume_id {
+        record.provider_resume_id = Some(provider_resume_id.to_owned());
+    }
+    let credential_rotation_id = record.credential_rotation_id.clone();
+    store_session_runtime_launch_records(state, &records)?;
+    if let Some(credential_rotation_id) = credential_rotation_id {
+        let mut rotations = session_credential_rotation_records(state)?;
+        let rotation = rotations
+            .iter_mut()
+            .find(|rotation| rotation.id == credential_rotation_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "credential rotation {credential_rotation_id} disappeared during launch"
+                )
+            })?;
+        let now = now_rfc3339();
+        rotation.status = "applied".to_owned();
+        rotation.updated_at = now.clone();
+        rotation.applied_at = Some(now);
+        rotation.failure_reason = None;
+        rotation.runtime_launch_id = Some(launch_id.to_owned());
+        store_session_credential_rotation_records(state, &rotations)?;
+    }
+    Ok(())
+}
+
+fn mark_runtime_launch_failed(
+    state: &mut Value,
+    launch_id: &str,
+    session_id: &str,
+    remove_provisional_session: bool,
+    failure_reason: &str,
+) -> Result<()> {
+    let mut records = session_runtime_launch_records(state)?;
+    let record = records
+        .iter_mut()
+        .find(|record| record.id == launch_id)
+        .ok_or_else(|| anyhow::anyhow!("runtime launch {launch_id} disappeared"))?;
+    record.status = "failed".to_owned();
+    record.updated_at = now_rfc3339();
+    record.failure_reason = Some(failure_reason.to_owned());
+    let credential_rotation_id = record.credential_rotation_id.clone();
+    store_session_runtime_launch_records(state, &records)?;
+    if let Some(credential_rotation_id) = credential_rotation_id {
+        let mut rotations = session_credential_rotation_records(state)?;
+        if let Some(rotation) = rotations
+            .iter_mut()
+            .find(|rotation| rotation.id == credential_rotation_id)
+        {
+            rotation.status = "failed".to_owned();
+            rotation.updated_at = now_rfc3339();
+            rotation.failure_reason = Some(failure_reason.to_owned());
+            rotation.runtime_launch_id = Some(launch_id.to_owned());
+            store_session_credential_rotation_records(state, &rotations)?;
+        }
+    }
+    let sessions = ensure_sessions_array_mut(state)?;
+    if remove_provisional_session {
+        sessions.retain(|session| session.get("id").and_then(Value::as_str) != Some(session_id));
+    } else if let Some(session) = session_object_mut(sessions, session_id) {
+        session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+        session.insert("stopped_at".to_owned(), Value::String(now_rfc3339()));
+    }
+    Ok(())
+}
+
+fn reparent_topology_fingerprint(
+    kind: &str,
+    subject_session_id: &str,
+    target_parent_session_id: &str,
+    expected_parent_session_id: Option<&str>,
+    frozen_live_child_ids: &[String],
+) -> String {
+    let mut children = frozen_live_child_ids.to_vec();
+    children.sort();
+    let canonical = json!({
+        "kind": kind,
+        "subject_session_id": subject_session_id,
+        "target_parent_session_id": target_parent_session_id,
+        "expected_parent_session_id": expected_parent_session_id,
+        "frozen_live_child_ids": children,
+    });
+    let digest = Sha256::digest(serde_json::to_vec(&canonical).unwrap_or_default());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn approvals_satisfied(
+    required_agent_approvals: &[String],
+    required_human_approval: bool,
+    approvals: &[ReparentApprovalRecord],
+) -> bool {
+    let agents_satisfied = required_agent_approvals.iter().all(|required| {
+        approvals.iter().any(|approval| {
+            approval.actor_kind == "agent"
+                && approval.actor_id == *required
+                && approval.decision == "approved"
+        })
+    });
+    let human_satisfied = !required_human_approval
+        || approvals
+            .iter()
+            .any(|approval| approval.actor_kind == "human" && approval.decision == "approved");
+    agents_satisfied && human_satisfied
+}
+
+fn refresh_reparent_requests(
+    records: &mut [ReparentRequestRecord],
+    sessions: &[SessionRecord],
+    now: OffsetDateTime,
+) -> bool {
+    let mut changed = false;
+    let decided_at = now
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned());
+    for record in records {
+        if record.status != "pending" {
+            continue;
+        }
+        match parse_timestamp(&record.expires_at) {
+            Some(expires_at) if expires_at <= now => {
+                record.status = "expired".to_owned();
+                record.decided_at = Some(decided_at.clone());
+                record.failure_reason = Some("request expired before all approvals".to_owned());
+                record.ready_to_apply = false;
+                changed = true;
+                continue;
+            }
+            None => {
+                record.status = "stale".to_owned();
+                record.decided_at = Some(decided_at.clone());
+                record.failure_reason = Some("request expiry timestamp is invalid".to_owned());
+                record.ready_to_apply = false;
+                changed = true;
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(reason) = reparent_stale_reason(record, sessions) {
+            record.status = "stale".to_owned();
+            record.decided_at = Some(decided_at.clone());
+            record.failure_reason = Some(reason);
+            record.ready_to_apply = false;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn reparent_stale_reason(
+    record: &ReparentRequestRecord,
+    sessions: &[SessionRecord],
+) -> Option<String> {
+    let expected_fingerprint = reparent_topology_fingerprint(
+        &record.kind,
+        &record.subject_session_id,
+        &record.target_parent_session_id,
+        record.expected_parent_session_id.as_deref(),
+        &record.frozen_live_child_ids,
+    );
+    if record.topology_fingerprint != expected_fingerprint {
+        return Some("stored topology fingerprint does not match the request plan".to_owned());
+    }
+    let Some(subject) = sessions
+        .iter()
+        .find(|session| session.id == record.subject_session_id)
+    else {
+        return Some("subject session no longer exists".to_owned());
+    };
+    if !subject.is_live_for_registry() {
+        return Some("subject session is no longer live".to_owned());
+    }
+    if subject.parent_session_id != record.expected_parent_session_id {
+        return Some("subject parent changed after request creation".to_owned());
+    }
+    let expected_parent_is_live_now =
+        record
+            .expected_parent_session_id
+            .as_deref()
+            .is_some_and(|parent_id| {
+                sessions
+                    .iter()
+                    .find(|session| session.id == parent_id)
+                    .is_some_and(SessionRecord::is_live_for_registry)
+            });
+    if expected_parent_is_live_now != record.expected_parent_is_live {
+        return Some("current parent liveness changed after request creation".to_owned());
+    }
+    let Some(target) = sessions
+        .iter()
+        .find(|session| session.id == record.target_parent_session_id)
+    else {
+        return Some("target parent session no longer exists".to_owned());
+    };
+    if !target.is_live_for_registry() {
+        return Some("target parent session is no longer live".to_owned());
+    }
+    if record.kind == "tree" {
+        if target.parent_session_id.as_deref() != Some(&record.subject_session_id) {
+            return Some("tree target is no longer a direct child of the source".to_owned());
+        }
+        let current_live_children = sessions
+            .iter()
+            .filter(|session| {
+                session.is_live_for_registry()
+                    && session.parent_session_id.as_deref()
+                        == Some(record.subject_session_id.as_str())
+            })
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        if current_live_children != record.frozen_live_child_ids {
+            return Some("source live-child set changed after request creation".to_owned());
+        }
+        let changes = tree_reparent_edge_changes(
+            &record.subject_session_id,
+            &record.target_parent_session_id,
+            record.expected_parent_session_id.as_deref(),
+            &record.frozen_live_child_ids,
+        );
+        if reparent_plan_would_create_cycle(sessions, &changes) {
+            return Some("current tree plan would create a hierarchy cycle".to_owned());
+        }
+    } else if reparent_would_create_cycle(
+        sessions,
+        &record.subject_session_id,
+        &record.target_parent_session_id,
+    ) {
+        return Some("current topology would create a hierarchy cycle".to_owned());
+    }
+    None
+}
+
+fn tree_reparent_edge_changes(
+    source_session_id: &str,
+    target_session_id: &str,
+    source_parent_session_id: Option<&str>,
+    frozen_live_child_ids: &[String],
+) -> Vec<ReparentEdgeChange> {
+    let mut changes = vec![
+        ReparentEdgeChange {
+            session_id: target_session_id.to_owned(),
+            expected_parent_session_id: Some(source_session_id.to_owned()),
+            new_parent_session_id: source_parent_session_id.map(ToOwned::to_owned),
+        },
+        ReparentEdgeChange {
+            session_id: source_session_id.to_owned(),
+            expected_parent_session_id: source_parent_session_id.map(ToOwned::to_owned),
+            new_parent_session_id: Some(target_session_id.to_owned()),
+        },
+    ];
+    changes.extend(
+        frozen_live_child_ids
+            .iter()
+            .filter(|child| child.as_str() != target_session_id)
+            .map(|child| ReparentEdgeChange {
+                session_id: child.clone(),
+                expected_parent_session_id: Some(source_session_id.to_owned()),
+                new_parent_session_id: Some(target_session_id.to_owned()),
+            }),
+    );
+    changes
+}
+
+fn reparent_plan_would_create_cycle(
+    sessions: &[SessionRecord],
+    changes: &[ReparentEdgeChange],
+) -> bool {
+    let mut parents = sessions
+        .iter()
+        .map(|session| (session.id.clone(), session.parent_session_id.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for change in changes {
+        parents.insert(
+            change.session_id.clone(),
+            change.new_parent_session_id.clone(),
+        );
+    }
+    for start in parents.keys() {
+        let mut current = Some(start.as_str());
+        let mut visited = BTreeSet::new();
+        while let Some(id) = current {
+            if !visited.insert(id.to_owned()) {
+                return true;
+            }
+            current = parents.get(id).and_then(|parent| parent.as_deref());
+        }
+    }
+    false
+}
+
+fn reparent_would_create_cycle(
+    sessions: &[SessionRecord],
+    subject_session_id: &str,
+    target_parent_session_id: &str,
+) -> bool {
+    if subject_session_id == target_parent_session_id {
+        return true;
+    }
+    let by_id = sessions
+        .iter()
+        .map(|session| (session.id.as_str(), session))
+        .collect::<BTreeMap<_, _>>();
+    let mut current_id = Some(target_parent_session_id);
+    let mut visited = BTreeSet::new();
+    while let Some(session_id) = current_id {
+        if session_id == subject_session_id {
+            return true;
+        }
+        if !visited.insert(session_id) {
+            return true;
+        }
+        current_id = by_id
+            .get(session_id)
+            .and_then(|session| session.parent_session_id.as_deref());
+    }
+    false
 }
 
 fn now_rfc3339() -> String {
@@ -8721,8 +12868,12 @@ impl StateSnapshot {
                     proposer_name: proposer_names.get(&proposal.proposer_session_id).cloned(),
                     target_session_id: proposal.target_session_id.clone(),
                     created_at: proposal.created_at.clone(),
-                    status: proposal.status.clone(),
+                    status: "stale".to_owned(),
                     decided_at: proposal.decided_at.clone(),
+                    actionable: false,
+                    failure_reason: Some(
+                        "legacy adoption proposal requires a new consent request".to_owned(),
+                    ),
                 });
         }
         for proposals in proposal_map.values_mut() {
@@ -8773,6 +12924,442 @@ struct AdoptionProposalRecord {
     status: String,
     #[serde(default)]
     decided_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReparentApprovalRecord {
+    pub actor_kind: String,
+    pub actor_id: String,
+    pub decision: String,
+    pub decided_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReparentEdgeChange {
+    pub session_id: String,
+    #[serde(default)]
+    pub expected_parent_session_id: Option<String>,
+    #[serde(default)]
+    pub new_parent_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReparentRoutingChange {
+    pub store: String,
+    pub record_kind: String,
+    pub record_id: String,
+    pub child_session_id: String,
+    #[serde(default)]
+    pub expected_target_session_id: Option<String>,
+    #[serde(default)]
+    pub new_target_session_id: Option<String>,
+    #[serde(default)]
+    pub prior_active: Option<bool>,
+    #[serde(default)]
+    pub period_seconds: Option<i64>,
+    #[serde(default)]
+    pub creates_parent_wake: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReparentApplyPlan {
+    pub version: u32,
+    #[serde(default)]
+    pub edge_changes: Vec<ReparentEdgeChange>,
+    #[serde(default)]
+    pub json_routing_changes: Vec<ReparentRoutingChange>,
+    #[serde(default)]
+    pub queue_routing_changes: Vec<ReparentRoutingChange>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReparentTreePreview {
+    pub kind: String,
+    pub source_session_id: String,
+    pub target_session_id: String,
+    pub frozen_live_child_ids: Vec<String>,
+    pub edge_changes: Vec<ReparentEdgeChange>,
+    pub json_routing_changes: Vec<ReparentRoutingChange>,
+    pub queue_routing_changes: Vec<ReparentRoutingChange>,
+    pub required_agent_approvals: Vec<String>,
+    pub required_human_approval: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReparentApplyLease {
+    pub request_id: String,
+    pub acquired_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReparentNotificationIntent {
+    pub key: String,
+    pub event: String,
+    pub recipient_session_id: String,
+    #[serde(default)]
+    pub enqueued_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DesiredReparentNotification {
+    request_id: String,
+    intent: ReparentNotificationIntent,
+    text: String,
+}
+
+fn desired_reparent_notifications(
+    record: &ReparentRequestRecord,
+) -> Vec<DesiredReparentNotification> {
+    let mut desired = Vec::new();
+    if record.status == "pending" {
+        let approved = record
+            .approvals
+            .iter()
+            .filter(|approval| approval.actor_kind == "agent" && approval.decision == "approved")
+            .map(|approval| approval.actor_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let missing = record
+            .required_agent_approvals
+            .iter()
+            .filter(|actor| !approved.contains(actor.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let event = format!("approval:{}", missing.join(","));
+        for recipient in &missing {
+            desired.push(reparent_notification(
+                record,
+                &event,
+                recipient,
+                reparent_approval_notification_text(record),
+            ));
+        }
+        if record.approvals.len() > 1 {
+            for recipient in record
+                .required_agent_approvals
+                .iter()
+                .chain(std::iter::once(&record.initiator_session_id))
+                .filter(|recipient| !missing.contains(recipient))
+                .collect::<BTreeSet<_>>()
+            {
+                desired.push(reparent_notification(
+                    record,
+                    &event,
+                    recipient,
+                    reparent_progress_notification_text(record, &missing),
+                ));
+            }
+        }
+    } else if matches!(
+        record.status.as_str(),
+        "applied" | "rejected" | "expired" | "stale" | "failed" | "repaired"
+    ) {
+        let event = format!("terminal:{}", record.status);
+        for recipient in record
+            .required_agent_approvals
+            .iter()
+            .chain(std::iter::once(&record.initiator_session_id))
+            .collect::<BTreeSet<_>>()
+        {
+            desired.push(reparent_notification(
+                record,
+                &event,
+                recipient,
+                reparent_terminal_notification_text(record),
+            ));
+        }
+    }
+    desired
+}
+
+fn reparent_notification(
+    record: &ReparentRequestRecord,
+    event: &str,
+    recipient: &str,
+    text: String,
+) -> DesiredReparentNotification {
+    DesiredReparentNotification {
+        request_id: record.id.clone(),
+        intent: ReparentNotificationIntent {
+            key: format!("reparent:{}:{event}:{recipient}", record.id),
+            event: event.to_owned(),
+            recipient_session_id: recipient.to_owned(),
+            enqueued_at: None,
+        },
+        text,
+    }
+}
+
+fn reparent_approval_notification_text(record: &ReparentRequestRecord) -> String {
+    format!(
+        "[sm reparent] {} request {} from {} needs your approval. {} Expires {}. Approve: `sm reparent approve {}`. Reject: `sm reparent reject {}`.",
+        record.kind,
+        record.id,
+        record.initiator_session_id,
+        reparent_edge_summary(record),
+        record.expires_at,
+        record.id,
+        record.id,
+    )
+}
+
+fn reparent_progress_notification_text(
+    record: &ReparentRequestRecord,
+    missing: &[String],
+) -> String {
+    format!(
+        "[sm reparent] Request {} remains pending. Missing agent approvals: {}.{}",
+        record.id,
+        if missing.is_empty() {
+            "none".to_owned()
+        } else {
+            missing.join(", ")
+        },
+        if record.required_human_approval {
+            " Human approval is also required in `sm watch`."
+        } else {
+            ""
+        }
+    )
+}
+
+fn reparent_terminal_notification_text(record: &ReparentRequestRecord) -> String {
+    format!(
+        "[sm reparent] Request {} is {}. {}{}",
+        record.id,
+        record.status,
+        reparent_edge_summary(record),
+        record
+            .failure_reason
+            .as_deref()
+            .map(|reason| format!(" Reason: {reason}."))
+            .unwrap_or_default(),
+    )
+}
+
+fn reparent_edge_summary(record: &ReparentRequestRecord) -> String {
+    let edges = record
+        .apply_plan
+        .as_ref()
+        .map(|plan| plan.edge_changes.clone())
+        .unwrap_or_else(|| {
+            if record.kind == "tree" {
+                tree_reparent_edge_changes(
+                    &record.subject_session_id,
+                    &record.target_parent_session_id,
+                    record.expected_parent_session_id.as_deref(),
+                    &record.frozen_live_child_ids,
+                )
+            } else {
+                vec![ReparentEdgeChange {
+                    session_id: record.subject_session_id.clone(),
+                    expected_parent_session_id: record.expected_parent_session_id.clone(),
+                    new_parent_session_id: Some(record.target_parent_session_id.clone()),
+                }]
+            }
+        });
+    edges
+        .iter()
+        .map(|edge| {
+            format!(
+                "{}: {} -> {}",
+                edge.session_id,
+                edge.expected_parent_session_id.as_deref().unwrap_or("root"),
+                edge.new_parent_session_id.as_deref().unwrap_or("root")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReparentDeferredRoutingIntent {
+    pub key: String,
+    pub operation: String,
+    pub child_session_id: String,
+    pub payload: Value,
+    pub created_at: String,
+    #[serde(default)]
+    pub replayed_at: Option<String>,
+    #[serde(default)]
+    pub resolved_parent_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReparentRepairRecord {
+    pub actor_kind: String,
+    pub actor_id: String,
+    pub action: String,
+    #[serde(default)]
+    pub prior_failure: Option<String>,
+    pub attempted_at: String,
+    #[serde(default)]
+    pub verified_state_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReparentRequestRecord {
+    pub id: String,
+    pub kind: String,
+    pub subject_session_id: String,
+    pub target_parent_session_id: String,
+    #[serde(default)]
+    pub expected_parent_session_id: Option<String>,
+    #[serde(default)]
+    pub expected_parent_is_live: bool,
+    #[serde(default)]
+    pub frozen_live_child_ids: Vec<String>,
+    pub initiator_session_id: String,
+    #[serde(default)]
+    pub required_agent_approvals: Vec<String>,
+    #[serde(default)]
+    pub required_human_approval: bool,
+    #[serde(default)]
+    pub approvals: Vec<ReparentApprovalRecord>,
+    pub status: String,
+    #[serde(default)]
+    pub ready_to_apply: bool,
+    pub created_at: String,
+    pub expires_at: String,
+    #[serde(default)]
+    pub decided_at: Option<String>,
+    #[serde(default)]
+    pub applied_at: Option<String>,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+    pub topology_fingerprint: String,
+    #[serde(default)]
+    pub apply_stage: Option<String>,
+    #[serde(default)]
+    pub apply_plan: Option<ReparentApplyPlan>,
+    #[serde(default)]
+    pub notification_intents: Vec<ReparentNotificationIntent>,
+    #[serde(default)]
+    pub deferred_routing_intents: Vec<ReparentDeferredRoutingIntent>,
+    #[serde(default)]
+    pub repair_history: Vec<ReparentRepairRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SessionRuntimeLaunchRecord {
+    pub id: String,
+    pub operation_kind: String,
+    pub session_id: String,
+    pub tmux_session: String,
+    #[serde(default)]
+    pub tmux_socket_name: Option<String>,
+    pub working_dir: String,
+    pub log_file: String,
+    pub provider: String,
+    #[serde(default)]
+    pub provider_resume_id: Option<String>,
+    #[serde(default)]
+    pub credential_rotation_id: Option<String>,
+    #[serde(default)]
+    pub initial_message: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    pub credential_sha256: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SessionCredentialRotationRecord {
+    pub id: String,
+    pub session_id: String,
+    pub provider: String,
+    pub provider_resume_id: String,
+    pub tmux_session: String,
+    #[serde(default)]
+    pub tmux_socket_name: Option<String>,
+    pub request_actor: String,
+    pub status: String,
+    pub requested_at: String,
+    #[serde(default)]
+    pub idle_proof_at: Option<String>,
+    #[serde(default)]
+    pub runtime_launch_id: Option<String>,
+    pub updated_at: String,
+    #[serde(default)]
+    pub applied_at: Option<String>,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+}
+
+impl ReparentRequestRecord {
+    fn is_active(&self) -> bool {
+        matches!(self.status.as_str(), "pending" | "applying")
+            || (self.status == "failed"
+                && matches!(
+                    self.apply_stage.as_deref(),
+                    Some(
+                        "prequiesce_aborting"
+                            | "json_routing_quiesced"
+                            | "routing_quiesced"
+                            | "authority_committed"
+                    )
+                ))
+    }
+
+    fn affected_session_ids(&self) -> BTreeSet<String> {
+        let mut affected = self
+            .frozen_live_child_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        affected.insert(self.subject_session_id.clone());
+        affected.insert(self.target_parent_session_id.clone());
+        if let Some(parent_id) = self.expected_parent_session_id.as_ref() {
+            affected.insert(parent_id.clone());
+        }
+        if let Some(plan) = self.apply_plan.as_ref() {
+            affected.extend(
+                plan.edge_changes
+                    .iter()
+                    .map(|change| change.session_id.clone()),
+            );
+            affected.extend(
+                plan.json_routing_changes
+                    .iter()
+                    .map(|change| change.child_session_id.clone()),
+            );
+            affected.extend(
+                plan.queue_routing_changes
+                    .iter()
+                    .map(|change| change.child_session_id.clone()),
+            );
+        }
+        affected
+    }
+
+    fn involves_session(&self, session_id: &str) -> bool {
+        self.initiator_session_id == session_id
+            || self
+                .required_agent_approvals
+                .iter()
+                .any(|id| id == session_id)
+            || self.affected_session_ids().contains(session_id)
+    }
+
+    fn is_apply_fenced(&self) -> bool {
+        self.status == "applying"
+            || (self.status == "failed"
+                && matches!(
+                    self.apply_stage.as_deref(),
+                    Some(
+                        "prequiesce_aborting"
+                            | "json_routing_quiesced"
+                            | "routing_quiesced"
+                            | "authority_committed"
+                    )
+                ))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -8842,6 +13429,8 @@ pub struct SessionRecord {
     #[serde(default)]
     pub parent_session_id: Option<String>,
     #[serde(default)]
+    pub session_credential_sha256: Option<String>,
+    #[serde(default)]
     pub last_handoff_path: Option<String>,
     #[serde(default)]
     pub agent_status_text: Option<String>,
@@ -8895,6 +13484,8 @@ pub struct SessionRecord {
     pub context_monitor_enabled: bool,
     #[serde(default)]
     pub context_monitor_notify: Option<String>,
+    #[serde(default = "default_context_monitor_notify_source")]
+    pub context_monitor_notify_source: String,
     /// One-shot latches for the current accumulation cycle. Persisted rather
     /// than held in memory (as the Python server did) so a server restart does
     /// not re-fire a warning the agent has already been told about; the cycle
@@ -9007,6 +13598,8 @@ pub struct AdoptionProposalResponse {
     created_at: String,
     status: String,
     decided_at: Option<String>,
+    actionable: bool,
+    failure_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -9473,8 +14066,19 @@ fn default_provider() -> String {
     "claude".to_owned()
 }
 
+fn default_context_monitor_notify_source() -> String {
+    "explicit".to_owned()
+}
+
 fn provider_manages_context_inline(provider: &str) -> bool {
     matches!(provider.trim(), "codex" | "codex-fork" | "codex-app")
+}
+
+fn session_supports_reparent_consent(session: &SessionRecord) -> bool {
+    is_primary_node(&session.node)
+        && matches!(session.provider.as_str(), "claude" | "codex" | "codex-fork")
+        && (session.session_credential_sha256.is_some()
+            || provider_resume_id_for_restore(session).is_some())
 }
 
 fn default_delivery_mode() -> String {
@@ -9645,6 +14249,184 @@ mod tests {
         assert_eq!(session_id, session_id.to_ascii_lowercase());
     }
 
+    #[test]
+    fn credential_rotation_idle_proof_matches_provider_lifecycle_sources() {
+        let rotation = SessionCredentialRotationRecord {
+            id: "rotation01".to_owned(),
+            session_id: "abc12345".to_owned(),
+            provider: "claude".to_owned(),
+            provider_resume_id: "provider-thread".to_owned(),
+            tmux_session: "claude-abc12345".to_owned(),
+            tmux_socket_name: None,
+            request_actor: "operator".to_owned(),
+            status: "waiting_idle".to_owned(),
+            requested_at: "2026-06-01T00:00:30Z".to_owned(),
+            idle_proof_at: None,
+            runtime_launch_id: None,
+            updated_at: "2026-06-01T00:00:30Z".to_owned(),
+            applied_at: None,
+            failure_reason: None,
+        };
+
+        let mut claude = session_record("idle");
+        claude.activity_hook_at = Some("2026-06-01T00:00:31Z".to_owned());
+        assert!(credential_rotation_has_fresh_idle_proof(&rotation, &claude));
+        claude.status = "running".to_owned();
+        assert!(!credential_rotation_has_fresh_idle_proof(
+            &rotation, &claude
+        ));
+
+        let mut codex_fork = session_record("idle");
+        codex_fork.provider = "codex-fork".to_owned();
+        codex_fork.last_activity = "2026-06-01T00:00:31Z".to_owned();
+        assert!(credential_rotation_has_fresh_idle_proof(
+            &rotation,
+            &codex_fork
+        ));
+        codex_fork.status = "running".to_owned();
+        assert!(!credential_rotation_has_fresh_idle_proof(
+            &rotation,
+            &codex_fork
+        ));
+
+        let mut stock_codex = session_record("running");
+        stock_codex.provider = "codex".to_owned();
+        assert!(credential_rotation_has_fresh_idle_proof(
+            &rotation,
+            &stock_codex
+        ));
+        stock_codex.status = "stopped".to_owned();
+        assert!(!credential_rotation_has_fresh_idle_proof(
+            &rotation,
+            &stock_codex
+        ));
+    }
+
+    #[test]
+    fn credential_rotation_worker_recovers_a_relaunching_runtime_transaction() {
+        let state_file = unique_temp_path("credential-rotation-relaunch-recovery");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [reparent_test_session("rotate01", None, "old-secret")],
+                "session_runtime_launches": [{
+                    "id": "launch01",
+                    "operation_kind": "recredential",
+                    "session_id": "rotate01",
+                    "tmux_session": "claude-rotate01",
+                    "working_dir": "/repo",
+                    "log_file": "/tmp/rotate01.log",
+                    "provider": "claude",
+                    "provider_resume_id": "provider-thread",
+                    "credential_rotation_id": "rotation01",
+                    "credential_sha256": sha256_text("new-secret"),
+                    "status": "launching",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "updated_at": "2026-06-01T00:00:01Z"
+                }],
+                "session_credential_rotations": [{
+                    "id": "rotation01",
+                    "session_id": "rotate01",
+                    "provider": "claude",
+                    "provider_resume_id": "provider-thread",
+                    "tmux_session": "claude-rotate01",
+                    "request_actor": "operator",
+                    "status": "relaunching",
+                    "requested_at": "2026-06-01T00:00:00Z",
+                    "runtime_launch_id": "launch01",
+                    "updated_at": "2026-06-01T00:00:01Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(state_file.clone());
+
+        assert!(store
+            .try_apply_waiting_credential_rotation("rotate01")
+            .unwrap());
+
+        let state = store.load_raw_json_value().unwrap();
+        assert_eq!(state["session_runtime_launches"][0]["status"], "failed");
+        assert_eq!(state["session_credential_rotations"][0]["status"], "failed");
+        assert_ne!(
+            state["session_credential_rotations"][0]["status"],
+            "relaunching"
+        );
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn credential_rotation_and_clear_share_one_seat_operation_fence() {
+        let state_file = unique_temp_path("credential-rotation-clear-fence");
+        let store = SessionStore::new(state_file.clone());
+        let clear_guard = store.lock_clear_operation("codex001").unwrap();
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default());
+        let contender_store = store.clone();
+        let contender_runtime = runtime.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let contender = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _guards = contender_store
+                .lock_credential_rotation_fences("codex001", &contender_runtime, "tmux-codex001")
+                .unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(acquired_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+        drop(clear_guard);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        contender.join().unwrap();
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn credential_rotation_uses_the_send_state_then_input_lock_order() {
+        let state_file = unique_temp_path("credential-rotation-send-lock-order");
+        let store = SessionStore::new(state_file.clone());
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default());
+        let tmux_session = format!("lock-order-{}", generate_session_id());
+        let held_input = runtime.lock_session_input(&tmux_session).unwrap();
+        let send_store = store.clone();
+        let send_runtime = runtime.clone();
+        let send_session = tmux_session.clone();
+        let (send_state_tx, send_state_rx) = std::sync::mpsc::channel();
+        let (send_done_tx, send_done_rx) = std::sync::mpsc::channel();
+        let send = thread::spawn(move || {
+            let _state_guard = send_store.write_guard().unwrap();
+            send_state_tx.send(()).unwrap();
+            let _input_guard = send_runtime.lock_session_input(&send_session).unwrap();
+            send_done_tx.send(()).unwrap();
+        });
+        send_state_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let rotation_store = store.clone();
+        let rotation_runtime = runtime.clone();
+        let rotation_session = tmux_session.clone();
+        let (rotation_done_tx, rotation_done_rx) = std::sync::mpsc::channel();
+        let rotation = thread::spawn(move || {
+            let _guards = rotation_store
+                .lock_credential_rotation_fences("codex001", &rotation_runtime, &rotation_session)
+                .unwrap();
+            rotation_done_tx.send(()).unwrap();
+        });
+        assert!(rotation_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err());
+
+        drop(held_input);
+        send_done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        rotation_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        send.join().unwrap();
+        rotation.join().unwrap();
+        let _ = fs::remove_file(state_file);
+    }
+
     #[cfg(unix)]
     #[test]
     fn codex_fork_btw_retries_stale_epoch_with_the_same_request_id() {
@@ -9746,6 +14528,7 @@ mod tests {
             git_remote_url: None,
             review_config: None,
             parent_session_id: None,
+            session_credential_sha256: None,
             last_handoff_path: None,
             agent_status_text: None,
             agent_status_at: None,
@@ -9771,6 +14554,7 @@ mod tests {
             context_compaction_active: false,
             context_monitor_enabled: false,
             context_monitor_notify: None,
+            context_monitor_notify_source: default_context_monitor_notify_source(),
             context_warning_sent: false,
             context_critical_sent: false,
             aliases: Vec::new(),
@@ -11019,6 +15803,7 @@ mod tests {
         let record = snapshot.sessions.first().unwrap();
         let spec = TmuxSessionSpec {
             session_id: record.id.clone(),
+            session_credential: None,
             tmux_session: record.tmux_session.clone(),
             working_dir: record.working_dir.clone(),
             log_file,
@@ -12072,6 +16857,14 @@ mod tests {
         assert_eq!(
             child.pending_adoption_proposals[0].proposer_name.as_deref(),
             Some("maintainer")
+        );
+        assert_eq!(child.pending_adoption_proposals[0].status, "stale");
+        assert!(!child.pending_adoption_proposals[0].actionable);
+        assert_eq!(
+            child.pending_adoption_proposals[0]
+                .failure_reason
+                .as_deref(),
+            Some("legacy adoption proposal requires a new consent request")
         );
     }
 
@@ -13421,6 +18214,1281 @@ mod tests {
         assert!(provider_manages_context_inline("codex-fork"));
         assert!(provider_manages_context_inline("codex-app"));
         assert!(!provider_manages_context_inline("claude"));
+    }
+
+    #[test]
+    fn approved_single_reparent_retargets_parent_derived_routing_across_stores() {
+        let state_file = unique_temp_path("reparent-apply");
+        let queue_db = state_file.with_extension("db");
+        let old_credential = "old-parent-secret";
+        let new_credential = "new-parent-secret";
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("oldpar01", None, old_credential),
+                    reparent_test_session("newpar01", None, new_credential),
+                    {
+                        "id": "child001",
+                        "name": "claude-child001",
+                        "working_dir": "/repo",
+                        "tmux_session": "claude-child001",
+                        "status": "running",
+                        "created_at": "2026-06-01T00:00:00Z",
+                        "last_activity": "2026-06-01T00:01:00Z",
+                        "parent_session_id": "oldpar01",
+                        "context_monitor_enabled": true,
+                        "context_monitor_notify": "oldpar01",
+                        "context_monitor_notify_source": "parent_derived"
+                    }
+                ],
+                "retained_parent_wake_registrations": [{
+                    "id": "json-wake-child001",
+                    "child_session_id": "child001",
+                    "parent_session_id": "oldpar01",
+                    "period_seconds": 600,
+                    "is_active": true
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue.ensure_schema().unwrap();
+        queue
+            .register_parent_wake("child001", "oldpar01", 600)
+            .unwrap();
+        let message_id = queue
+            .enqueue_message_with_metadata(
+                "child001",
+                "wait for parent",
+                "important",
+                QueueMessageMetadata {
+                    parent_session_id: Some("oldpar01".to_owned()),
+                    ..QueueMessageMetadata::default()
+                },
+            )
+            .unwrap();
+        let store = SessionStore::new_with_queue(state_file.clone(), queue_db.clone());
+
+        let request = match store
+            .create_reparent_request(
+                "child001",
+                CreateReparentRequest {
+                    requester_session_id: "oldpar01".to_owned(),
+                    target_parent_session_id: "newpar01".to_owned(),
+                },
+                old_credential,
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Created(record) => record,
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+        let applied = match store
+            .decide_reparent_request(
+                &request.id,
+                DecideReparentRequest {
+                    requester_session_id: "newpar01".to_owned(),
+                },
+                ReparentDecision::Approved,
+                new_credential,
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Updated(record) => record,
+            other => panic!("unexpected approval outcome: {other:?}"),
+        };
+
+        assert_eq!(applied.status, "applied");
+        assert_eq!(applied.apply_stage.as_deref(), Some("applied"));
+        let child = store.get_session("child001").unwrap().unwrap();
+        assert_eq!(child.parent_session_id.as_deref(), Some("newpar01"));
+        assert_eq!(child.context_monitor_notify.as_deref(), Some("newpar01"));
+        assert!(child.context_monitor_enabled);
+        assert_eq!(child.context_monitor_notify_source, "parent_derived");
+        assert_eq!(
+            queue
+                .active_parent_wake_parent("child001")
+                .unwrap()
+                .as_deref(),
+            Some("newpar01")
+        );
+        let pending = queue.pending_messages_for_target("child001", 10).unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .find(|message| message.id == message_id)
+                .and_then(|message| message.parent_session_id.as_deref()),
+            Some("newpar01")
+        );
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert!(state["reparent_apply_lease"].is_null());
+        assert_eq!(
+            state["retained_parent_wake_registrations"][0]["parent_session_id"],
+            "newpar01"
+        );
+        assert_eq!(
+            state["retained_parent_wake_registrations"][0]["is_active"],
+            true
+        );
+        assert!(matches!(
+            store.retire_core_session("child001", Some("oldpar01")),
+            Ok(CoreRetireOutcome::NotChild)
+        ));
+        assert!(matches!(
+            store.retire_core_session("child001", Some("newpar01")),
+            Ok(CoreRetireOutcome::Retired(_))
+        ));
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn reparent_request_rejects_a_remote_required_approver() {
+        let state_file = unique_temp_path("reparent-remote-approver");
+        let mut target = reparent_test_session("newpar01", None, "new-secret");
+        target["node"] = json!("remote-builder");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("oldpar01", None, "old-secret"),
+                    target,
+                    reparent_test_session("child001", Some("oldpar01"), "child-secret")
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(state_file.clone());
+
+        let outcome = store
+            .create_reparent_request(
+                "child001",
+                CreateReparentRequest {
+                    requester_session_id: "oldpar01".to_owned(),
+                    target_parent_session_id: "newpar01".to_owned(),
+                },
+                "old-secret",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ReparentMutationOutcome::BadRequest(message)
+                if message.contains("cannot participate in credential-bound consent")
+        ));
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn reparent_tree_preview_reports_unsupported_approver_provider() {
+        let state_file = unique_temp_path("reparent-tree-unsupported-approver");
+        let mut target = reparent_test_session("target01", Some("source01"), "target-secret");
+        target["provider"] = json!("codex-app");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("source01", None, "source-secret"),
+                    target
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(state_file.clone());
+
+        let outcome = store
+            .create_reparent_tree_request(
+                "source01",
+                CreateReparentTreeRequest {
+                    requester_session_id: "source01".to_owned(),
+                    target_session_id: "target01".to_owned(),
+                    dry_run: true,
+                },
+                "source-secret",
+            )
+            .unwrap();
+
+        let ReparentMutationOutcome::Preview(preview) = outcome else {
+            panic!("unexpected tree preview outcome: {outcome:?}");
+        };
+        assert!(preview.blockers.iter().any(|blocker| {
+            blocker.contains("target session target01")
+                && blocker.contains("cannot participate in credential-bound consent")
+        }));
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn prequiesce_abort_failure_keeps_reparent_exclusivity() {
+        let (store, _queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-prequiesce-exclusivity");
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            let mut records = reparent_request_records(&state).unwrap();
+            let record = records
+                .iter_mut()
+                .find(|record| record.id == request_id)
+                .unwrap();
+            record.status = "failed".to_owned();
+            record.apply_stage = Some("prequiesce_aborting".to_owned());
+            record.failure_reason = Some("injected abort failure".to_owned());
+            store_reparent_request_records(&mut state, &records).unwrap();
+            store.write_raw_json_value(&state).unwrap();
+        }
+
+        let outcome = store
+            .create_reparent_request(
+                "child001",
+                CreateReparentRequest {
+                    requester_session_id: "oldpar01".to_owned(),
+                    target_parent_session_id: "newpar01".to_owned(),
+                },
+                "old-parent-secret",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ReparentMutationOutcome::Conflict(message) if message.contains(&request_id)
+        ));
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn reparent_notifications_are_exact_and_idempotent_across_reconciliation() {
+        let state_file = unique_temp_path("reparent-notifications");
+        let queue_db = state_file.with_extension("db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("oldpar01", None, "old-secret"),
+                    reparent_test_session("newpar01", None, "new-secret"),
+                    reparent_test_session("child001", Some("oldpar01"), "child-secret")
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue.ensure_schema().unwrap();
+        let store = SessionStore::new_with_queue(state_file.clone(), queue_db.clone());
+        let request = match store
+            .create_reparent_request(
+                "child001",
+                CreateReparentRequest {
+                    requester_session_id: "oldpar01".to_owned(),
+                    target_parent_session_id: "newpar01".to_owned(),
+                },
+                "old-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Created(record) => record,
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+
+        store.reconcile_reparent_notifications().unwrap();
+        store.reconcile_reparent_notifications().unwrap();
+        let pending = queue.pending_messages_for_target("newpar01", 10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0]
+            .text
+            .contains(&format!("Approve: `sm reparent approve {}`", request.id)));
+        assert!(pending[0]
+            .text
+            .contains(&format!("Reject: `sm reparent reject {}`", request.id)));
+        assert!(pending[0].text.contains("child001: oldpar01 -> newpar01"));
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        let intents = state["reparent_requests"][0]["notification_intents"]
+            .as_array()
+            .unwrap();
+        let target_intents = intents
+            .iter()
+            .filter(|intent| intent["recipient_session_id"] == "newpar01")
+            .collect::<Vec<_>>();
+        assert_eq!(target_intents.len(), 1);
+        assert!(target_intents[0]["enqueued_at"].is_string());
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn approved_tree_reparent_splits_queue_routes_across_each_new_parent() {
+        let state_file = unique_temp_path("reparent-tree-routing");
+        let queue_db = state_file.with_extension("db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("grand001", None, "grand-secret"),
+                    reparent_test_session("source01", Some("grand001"), "source-secret"),
+                    reparent_test_session("target01", Some("source01"), "target-secret"),
+                    reparent_test_session("sibling1", Some("source01"), "sibling-secret")
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue.ensure_schema().unwrap();
+        let mut message_ids = BTreeMap::new();
+        for (child, parent) in [
+            ("source01", "grand001"),
+            ("target01", "source01"),
+            ("sibling1", "source01"),
+        ] {
+            queue.register_parent_wake(child, parent, 600).unwrap();
+            let message_id = queue
+                .enqueue_message_with_metadata(
+                    child,
+                    &format!("pending for {child}"),
+                    "important",
+                    QueueMessageMetadata {
+                        parent_session_id: Some(parent.to_owned()),
+                        ..QueueMessageMetadata::default()
+                    },
+                )
+                .unwrap();
+            message_ids.insert(child, message_id);
+        }
+        let store = SessionStore::new_with_queue(state_file.clone(), queue_db.clone());
+        let request = match store
+            .create_reparent_tree_request(
+                "source01",
+                CreateReparentTreeRequest {
+                    requester_session_id: "source01".to_owned(),
+                    target_session_id: "target01".to_owned(),
+                    dry_run: false,
+                },
+                "source-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Created(record) => record,
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+        let pending = match store
+            .decide_reparent_request(
+                &request.id,
+                DecideReparentRequest {
+                    requester_session_id: "target01".to_owned(),
+                },
+                ReparentDecision::Approved,
+                "target-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Updated(record) => record,
+            other => panic!("unexpected target approval outcome: {other:?}"),
+        };
+        assert_eq!(pending.status, "pending");
+        let applied = match store
+            .decide_reparent_request(
+                &request.id,
+                DecideReparentRequest {
+                    requester_session_id: "grand001".to_owned(),
+                },
+                ReparentDecision::Approved,
+                "grand-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Updated(record) => record,
+            other => panic!("unexpected grandparent approval outcome: {other:?}"),
+        };
+        assert_eq!(applied.status, "applied");
+
+        for (child, parent) in [
+            ("source01", "target01"),
+            ("target01", "grand001"),
+            ("sibling1", "target01"),
+        ] {
+            assert_eq!(
+                store
+                    .get_session(child)
+                    .unwrap()
+                    .unwrap()
+                    .parent_session_id
+                    .as_deref(),
+                Some(parent)
+            );
+            assert_eq!(
+                queue.active_parent_wake_parent(child).unwrap().as_deref(),
+                Some(parent)
+            );
+            let pending = queue.pending_messages_for_target(child, 10).unwrap();
+            assert_eq!(
+                pending
+                    .iter()
+                    .find(|message| message.id == message_ids[child])
+                    .and_then(|message| message.parent_session_id.as_deref()),
+                Some(parent)
+            );
+        }
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn failed_tree_reparent_restores_every_queue_route_before_releasing_lease() {
+        let state_file = unique_temp_path("reparent-tree-rollback");
+        let queue_db = state_file.with_extension("db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("grand001", None, "grand-secret"),
+                    reparent_test_session("source01", Some("grand001"), "source-secret"),
+                    reparent_test_session("target01", Some("source01"), "target-secret"),
+                    reparent_test_session("sibling1", Some("source01"), "sibling-secret")
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue.ensure_schema().unwrap();
+        for (child, parent) in [
+            ("source01", "grand001"),
+            ("target01", "source01"),
+            ("sibling1", "source01"),
+        ] {
+            queue.register_parent_wake(child, parent, 600).unwrap();
+            queue
+                .enqueue_message_with_metadata(
+                    child,
+                    &format!("pending for {child}"),
+                    "important",
+                    QueueMessageMetadata {
+                        parent_session_id: Some(parent.to_owned()),
+                        ..QueueMessageMetadata::default()
+                    },
+                )
+                .unwrap();
+        }
+        let store = SessionStore::new_with_queue(state_file.clone(), queue_db.clone());
+        let request = match store
+            .create_reparent_tree_request(
+                "source01",
+                CreateReparentTreeRequest {
+                    requester_session_id: "source01".to_owned(),
+                    target_session_id: "target01".to_owned(),
+                    dry_run: false,
+                },
+                "source-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Created(record) => record,
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            let mut records = reparent_request_records(&state).unwrap();
+            let record = records
+                .iter_mut()
+                .find(|record| record.id == request.id)
+                .unwrap();
+            for actor_id in ["target01", "grand001"] {
+                record.approvals.push(ReparentApprovalRecord {
+                    actor_kind: "agent".to_owned(),
+                    actor_id: actor_id.to_owned(),
+                    decision: "approved".to_owned(),
+                    decided_at: now_rfc3339(),
+                });
+            }
+            record.ready_to_apply = true;
+            store_reparent_request_records(&mut state, &records).unwrap();
+            store.write_raw_json_value(&state).unwrap();
+        }
+        assert_eq!(
+            store.acquire_reparent_apply_lease().unwrap().as_deref(),
+            Some(request.id.as_str())
+        );
+        store.quiesce_reparent_json_routing(&request.id).unwrap();
+        store.quiesce_reparent_queue_routing(&request.id).unwrap();
+        store
+            .fail_reparent_apply(&request.id, "injected tree precommit failure")
+            .unwrap();
+        let repaired = match store
+            .repair_reparent_request(
+                &request.id,
+                "owner@example.com",
+                ReparentRepairAction::RollbackPrecommit,
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Updated(record) => record,
+            other => panic!("unexpected repair outcome: {other:?}"),
+        };
+        assert_eq!(repaired.status, "repaired");
+        assert!(repaired.repair_history[0]
+            .verified_state_fingerprint
+            .is_some());
+        for (child, parent) in [
+            ("source01", "grand001"),
+            ("target01", "source01"),
+            ("sibling1", "source01"),
+        ] {
+            assert_eq!(
+                store
+                    .get_session(child)
+                    .unwrap()
+                    .unwrap()
+                    .parent_session_id
+                    .as_deref(),
+                Some(parent)
+            );
+            assert_eq!(
+                queue.active_parent_wake_parent(child).unwrap().as_deref(),
+                Some(parent)
+            );
+            assert_eq!(
+                queue.pending_messages_for_target(child, 10).unwrap()[0]
+                    .parent_session_id
+                    .as_deref(),
+                Some(parent)
+            );
+        }
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert!(state["reparent_apply_lease"].is_null());
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn legacy_context_monitor_provenance_defaults_to_explicit() {
+        let value = reparent_test_session("legacy01", None, "legacy-secret");
+        let record: SessionRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(record.context_monitor_notify_source, "explicit");
+    }
+
+    #[test]
+    fn failed_precommit_reparent_rolls_back_exact_routes_and_releases_lease() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-rollback");
+        assert_eq!(
+            store.acquire_reparent_apply_lease().unwrap().as_deref(),
+            Some(request_id.as_str())
+        );
+        store.quiesce_reparent_json_routing(&request_id).unwrap();
+        store.quiesce_reparent_queue_routing(&request_id).unwrap();
+        store
+            .fail_reparent_apply(&request_id, "injected precommit failure")
+            .unwrap();
+
+        let failed = store.get_reparent_request(&request_id).unwrap().unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.apply_stage.as_deref(), Some("routing_quiesced"));
+        assert_eq!(queue.active_parent_wake_parent("child001").unwrap(), None);
+
+        let repaired = match store
+            .repair_reparent_request(
+                &request_id,
+                "owner@example.com",
+                ReparentRepairAction::RollbackPrecommit,
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Updated(record) => record,
+            other => panic!("unexpected repair outcome: {other:?}"),
+        };
+        assert_eq!(repaired.status, "repaired");
+        assert_eq!(repaired.apply_stage.as_deref(), Some("repair_rolled_back"));
+        assert_eq!(repaired.repair_history.len(), 1);
+        assert!(repaired.repair_history[0]
+            .verified_state_fingerprint
+            .is_some());
+        assert_ne!(
+            repaired.repair_history[0]
+                .verified_state_fingerprint
+                .as_deref(),
+            Some(repaired.topology_fingerprint.as_str())
+        );
+        assert_eq!(
+            queue
+                .active_parent_wake_parent("child001")
+                .unwrap()
+                .as_deref(),
+            Some("oldpar01")
+        );
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert!(state["reparent_apply_lease"].is_null());
+        assert_eq!(
+            state["retained_parent_wake_registrations"][0]["parent_session_id"],
+            "oldpar01"
+        );
+        assert_eq!(
+            state["retained_parent_wake_registrations"][0]["is_active"],
+            true
+        );
+        assert_eq!(
+            json_text(
+                raw_session_object(&state, "child001")
+                    .unwrap()
+                    .get("parent_session_id")
+            )
+            .as_deref(),
+            Some("oldpar01")
+        );
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn parentless_precommit_reparent_rolls_back_without_stranding_the_lease() {
+        let state_file = unique_temp_path("reparent-parentless-rollback");
+        let queue_db = state_file.with_extension("db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("newpar01", None, "new-parent-secret"),
+                    reparent_test_session("child001", None, "child-secret")
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue.ensure_schema().unwrap();
+        let store = SessionStore::new_with_queue(state_file.clone(), queue_db.clone());
+        let request = match store
+            .create_reparent_request(
+                "child001",
+                CreateReparentRequest {
+                    requester_session_id: "newpar01".to_owned(),
+                    target_parent_session_id: "newpar01".to_owned(),
+                },
+                "new-parent-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Created(record) => record,
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            let mut records = reparent_request_records(&state).unwrap();
+            let record = records
+                .iter_mut()
+                .find(|record| record.id == request.id)
+                .unwrap();
+            record.approvals.push(ReparentApprovalRecord {
+                actor_kind: "human".to_owned(),
+                actor_id: "owner@example.com".to_owned(),
+                decision: "approved".to_owned(),
+                decided_at: now_rfc3339(),
+            });
+            record.ready_to_apply = true;
+            store_reparent_request_records(&mut state, &records).unwrap();
+            store.write_raw_json_value(&state).unwrap();
+        }
+
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request.id).unwrap();
+        store.quiesce_reparent_queue_routing(&request.id).unwrap();
+        store
+            .send_parent_notification(
+                "child001",
+                "Child child001 completed: Session exited",
+                "sequential",
+                "child_wait",
+                None,
+            )
+            .unwrap();
+        store
+            .fail_reparent_apply(&request.id, "injected parentless failure")
+            .unwrap();
+        let repaired = store
+            .repair_reparent_request(
+                &request.id,
+                "owner@example.com",
+                ReparentRepairAction::RollbackPrecommit,
+            )
+            .unwrap();
+        assert!(matches!(repaired, ReparentMutationOutcome::Updated(_)));
+
+        let state = store.load_raw_json_value().unwrap();
+        assert!(state["reparent_apply_lease"].is_null());
+        assert!(raw_session_object(&state, "child001")
+            .unwrap()
+            .get("parent_session_id")
+            .is_none_or(Value::is_null));
+        let record = store.get_reparent_request(&request.id).unwrap().unwrap();
+        assert_eq!(record.status, "repaired");
+        assert_eq!(record.apply_stage.as_deref(), Some("repair_rolled_back"));
+        assert_eq!(record.deferred_routing_intents.len(), 1);
+        assert!(record.deferred_routing_intents[0].replayed_at.is_some());
+        assert!(record.deferred_routing_intents[0]
+            .resolved_parent_session_id
+            .is_none());
+        assert!(queue
+            .pending_messages_for_target("newpar01", 10)
+            .unwrap()
+            .is_empty());
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn authority_committed_reparent_resumes_forward_from_immutable_plan() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-forward-recovery");
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request_id).unwrap();
+        store.quiesce_reparent_queue_routing(&request_id).unwrap();
+        store.commit_reparent_authority(&request_id).unwrap();
+
+        let recovered = store.reconcile_reparent_requests().unwrap().unwrap();
+        assert_eq!(recovered.status, "applied");
+        assert_eq!(
+            store
+                .get_session("child001")
+                .unwrap()
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("newpar01")
+        );
+        assert_eq!(
+            queue
+                .active_parent_wake_parent("child001")
+                .unwrap()
+                .as_deref(),
+            Some("newpar01")
+        );
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert!(state["reparent_apply_lease"].is_null());
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn task_complete_during_reparent_notifies_only_the_committed_parent() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-task-complete");
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request_id).unwrap();
+        store.quiesce_reparent_queue_routing(&request_id).unwrap();
+
+        let completed = store
+            .task_complete(
+                "child001",
+                TaskCompleteRequest {
+                    requester_session_id: "child001".to_owned(),
+                },
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            completed,
+            TaskCompleteOutcome::Completed(TaskCompleteResult {
+                em_notified: false,
+                ..
+            })
+        ));
+        assert!(queue
+            .pending_messages_for_target("oldpar01", 10)
+            .unwrap()
+            .is_empty());
+
+        store.commit_reparent_authority(&request_id).unwrap();
+        store.finish_reparent_routing(&request_id).unwrap();
+
+        let messages = queue.pending_messages_for_target("newpar01", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].message_category.as_deref(),
+            Some("task_complete")
+        );
+        assert!(queue
+            .active_parent_wake_parent("child001")
+            .unwrap()
+            .is_none());
+        let record = store.get_reparent_request(&request_id).unwrap().unwrap();
+        assert_eq!(record.status, "applied");
+        assert_eq!(record.deferred_routing_intents.len(), 1);
+        assert!(record.deferred_routing_intents[0].replayed_at.is_some());
+        assert_eq!(
+            record.deferred_routing_intents[0]
+                .resolved_parent_session_id
+                .as_deref(),
+            Some("newpar01")
+        );
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn task_complete_for_an_affected_parent_is_not_deferred_as_a_changed_edge() {
+        let (store, _queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-parent-task-complete");
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request_id).unwrap();
+        store.quiesce_reparent_queue_routing(&request_id).unwrap();
+
+        store
+            .task_complete(
+                "newpar01",
+                TaskCompleteRequest {
+                    requester_session_id: "newpar01".to_owned(),
+                },
+                None,
+            )
+            .unwrap();
+
+        let record = store.get_reparent_request(&request_id).unwrap().unwrap();
+        assert!(record.deferred_routing_intents.is_empty());
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn parent_derived_input_created_during_reparent_replays_with_new_parent() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-parent-input");
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request_id).unwrap();
+        store.quiesce_reparent_queue_routing(&request_id).unwrap();
+
+        let outcome = store
+            .send_core_input_with_runtime(
+                "child001",
+                SendCoreInputRequest {
+                    text: "queued during reparent".to_owned(),
+                    delivery_mode: "important".to_owned(),
+                    sender_session_id: None,
+                    from_sm_send: false,
+                    timeout_seconds: None,
+                    notify_on_delivery: true,
+                    notify_after_seconds: Some(15),
+                    notify_on_stop: true,
+                    remind_soft_threshold: Some(600),
+                    remind_hard_threshold: None,
+                    remind_cancel_on_reply_session_id: None,
+                    parent_session_id: Some("oldpar01".to_owned()),
+                },
+                &TmuxRuntime::from_config(&crate::config::RustCoreConfig::default()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!outcome.delivered);
+        assert!(queue
+            .pending_messages_for_target("child001", 10)
+            .unwrap()
+            .is_empty());
+
+        store.commit_reparent_authority(&request_id).unwrap();
+        store.finish_reparent_routing(&request_id).unwrap();
+
+        let messages = queue.pending_messages_for_target("child001", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].parent_session_id.as_deref(), Some("newpar01"));
+        assert!(!messages[0].notify_on_delivery);
+        assert_eq!(messages[0].notify_after_seconds, None);
+        assert!(!messages[0].notify_on_stop);
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn compaction_during_reparent_notifies_only_the_committed_parent() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-compaction");
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request_id).unwrap();
+        store.quiesce_reparent_queue_routing(&request_id).unwrap();
+
+        assert_eq!(
+            store
+                .apply_context_usage_event(&lifecycle_event("child001", "compaction"), None)
+                .unwrap(),
+            ContextUsageOutcome::CompactionLogged
+        );
+        assert!(queue
+            .pending_messages_for_target("oldpar01", 10)
+            .unwrap()
+            .is_empty());
+        let record = store.get_reparent_request(&request_id).unwrap().unwrap();
+        assert_eq!(record.deferred_routing_intents.len(), 1);
+        assert_eq!(
+            record.deferred_routing_intents[0].operation,
+            "parent_message"
+        );
+
+        store.commit_reparent_authority(&request_id).unwrap();
+        store.finish_reparent_routing(&request_id).unwrap();
+
+        let messages = queue.pending_messages_for_target("newpar01", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].message_category.as_deref(),
+            Some("context_monitor")
+        );
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn explicit_compaction_target_is_not_retargeted_during_reparent() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-explicit-compaction");
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            let child =
+                session_object_mut(ensure_sessions_array_mut(&mut state).unwrap(), "child001")
+                    .unwrap();
+            child.insert(
+                "context_monitor_notify".to_owned(),
+                Value::String("oldpar01".to_owned()),
+            );
+            child.insert(
+                "context_monitor_notify_source".to_owned(),
+                Value::String("explicit".to_owned()),
+            );
+            store.write_raw_json_value(&state).unwrap();
+        }
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request_id).unwrap();
+        store.quiesce_reparent_queue_routing(&request_id).unwrap();
+
+        store
+            .apply_context_usage_event(&lifecycle_event("child001", "compaction"), None)
+            .unwrap();
+
+        let record = store.get_reparent_request(&request_id).unwrap().unwrap();
+        assert!(record.deferred_routing_intents.is_empty());
+        let messages = queue.pending_messages_for_target("oldpar01", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].message_category.as_deref(),
+            Some("context_monitor")
+        );
+        assert!(queue
+            .pending_messages_for_target("newpar01", 10)
+            .unwrap()
+            .is_empty());
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn child_wait_notification_resolves_parent_after_reparent_commit() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-child-wait");
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request_id).unwrap();
+        store.quiesce_reparent_queue_routing(&request_id).unwrap();
+
+        store
+            .send_parent_notification(
+                "child001",
+                "Child child001 completed: Session exited",
+                "sequential",
+                "child_wait",
+                None,
+            )
+            .unwrap();
+        assert!(queue
+            .pending_messages_for_target("oldpar01", 10)
+            .unwrap()
+            .is_empty());
+
+        store.commit_reparent_authority(&request_id).unwrap();
+        store.finish_reparent_routing(&request_id).unwrap();
+
+        let messages = queue.pending_messages_for_target("newpar01", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_category.as_deref(), Some("child_wait"));
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn stale_after_routing_quiesce_rolls_back_without_human_repair() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-stale-rollback");
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request_id).unwrap();
+        store.quiesce_reparent_queue_routing(&request_id).unwrap();
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+            session_object_mut(sessions, "newpar01")
+                .unwrap()
+                .insert("status".to_owned(), Value::String("stopped".to_owned()));
+            store.write_raw_json_value(&state).unwrap();
+        }
+
+        store.apply_reparent_request(&request_id).unwrap();
+
+        let record = store.get_reparent_request(&request_id).unwrap().unwrap();
+        assert_eq!(record.status, "stale");
+        assert_eq!(record.apply_stage.as_deref(), Some("prequiesce_aborted"));
+        assert!(record.failure_reason.is_some());
+        assert_eq!(
+            store
+                .get_session("child001")
+                .unwrap()
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("oldpar01")
+        );
+        assert_eq!(
+            queue
+                .active_parent_wake_parent("child001")
+                .unwrap()
+                .as_deref(),
+            Some("oldpar01")
+        );
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert!(state["reparent_apply_lease"].is_null());
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn prequiesce_abort_replays_deferred_completion_before_releasing_lease() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-prequiesce-abort");
+        store.acquire_reparent_apply_lease().unwrap();
+        store
+            .task_complete(
+                "child001",
+                TaskCompleteRequest {
+                    requester_session_id: "child001".to_owned(),
+                },
+                None,
+            )
+            .unwrap();
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+            session_object_mut(sessions, "newpar01")
+                .unwrap()
+                .insert("status".to_owned(), Value::String("stopped".to_owned()));
+            store.write_raw_json_value(&state).unwrap();
+        }
+
+        let error = store.apply_reparent_request(&request_id).unwrap_err();
+        store
+            .fail_reparent_apply(&request_id, &error.to_string())
+            .unwrap();
+
+        let record = store.get_reparent_request(&request_id).unwrap().unwrap();
+        assert_eq!(record.status, "stale");
+        assert!(record.deferred_routing_intents[0].replayed_at.is_some());
+        assert_eq!(
+            record.deferred_routing_intents[0]
+                .resolved_parent_session_id
+                .as_deref(),
+            Some("oldpar01")
+        );
+        let messages = queue.pending_messages_for_target("oldpar01", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].message_category.as_deref(),
+            Some("task_complete")
+        );
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert!(state["reparent_apply_lease"].is_null());
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn delivered_planned_message_recreates_its_parent_wake_after_commit() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-delivered-message");
+        let message_id = queue
+            .enqueue_message_with_metadata(
+                "child001",
+                "delivery races reparent",
+                "important",
+                QueueMessageMetadata {
+                    remind_soft_threshold: Some(600),
+                    parent_session_id: Some("oldpar01".to_owned()),
+                    ..QueueMessageMetadata::default()
+                },
+            )
+            .unwrap();
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request_id).unwrap();
+        store.quiesce_reparent_queue_routing(&request_id).unwrap();
+        let message = queue
+            .pending_messages_for_target("child001", 10)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.id == message_id)
+            .unwrap();
+        assert!(message.parent_session_id.is_none());
+        queue
+            .mark_delivered_and_apply_side_effects(&message)
+            .unwrap();
+        store.commit_reparent_authority(&request_id).unwrap();
+        store.finish_reparent_routing(&request_id).unwrap();
+
+        let record = store.get_reparent_request(&request_id).unwrap().unwrap();
+        let intent = record
+            .deferred_routing_intents
+            .iter()
+            .find(|intent| intent.key == format!("delivered-planned-parent-wake:{message_id}"))
+            .unwrap();
+        assert!(intent.replayed_at.is_some());
+        assert_eq!(
+            intent.resolved_parent_session_id.as_deref(),
+            Some("newpar01")
+        );
+        assert_eq!(
+            queue
+                .active_parent_wake_parent("child001")
+                .unwrap()
+                .as_deref(),
+            Some("newpar01")
+        );
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn delivered_parent_metadata_without_reminder_creates_no_deferred_wake() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-no-reminder-wake");
+        let message_id = queue
+            .enqueue_message_with_metadata(
+                "child001",
+                "delivery has parent metadata only",
+                "important",
+                QueueMessageMetadata {
+                    parent_session_id: Some("oldpar01".to_owned()),
+                    ..QueueMessageMetadata::default()
+                },
+            )
+            .unwrap();
+        queue.cancel_parent_wake("child001").unwrap();
+        store.acquire_reparent_apply_lease().unwrap();
+        let message = queue
+            .pending_messages_for_target("child001", 10)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.id == message_id)
+            .unwrap();
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default());
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            complete_runtime_message_delivery_raw(&store, &mut state, &runtime, &queue, &message)
+                .unwrap();
+            store.write_raw_json_value(&state).unwrap();
+        }
+
+        let record = store.get_reparent_request(&request_id).unwrap().unwrap();
+        assert!(record.deferred_routing_intents.is_empty());
+        assert_eq!(queue.active_parent_wake_parent("child001").unwrap(), None);
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    fn prepared_reparent_transaction(
+        label: &str,
+    ) -> (SessionStore, RetainedQueueStore, PathBuf, PathBuf, String) {
+        let state_file = unique_temp_path(label);
+        let queue_db = state_file.with_extension("db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("oldpar01", None, "old-parent-secret"),
+                    reparent_test_session("newpar01", None, "new-parent-secret"),
+                    reparent_test_session("child001", Some("oldpar01"), "child-secret")
+                ],
+                "retained_parent_wake_registrations": [{
+                    "id": "json-wake-child001",
+                    "child_session_id": "child001",
+                    "parent_session_id": "oldpar01",
+                    "period_seconds": 600,
+                    "is_active": true
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue.ensure_schema().unwrap();
+        queue
+            .register_parent_wake("child001", "oldpar01", 600)
+            .unwrap();
+        let store = SessionStore::new_with_queue(state_file.clone(), queue_db.clone());
+        let request = match store
+            .create_reparent_request(
+                "child001",
+                CreateReparentRequest {
+                    requester_session_id: "oldpar01".to_owned(),
+                    target_parent_session_id: "newpar01".to_owned(),
+                },
+                "old-parent-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Created(record) => record,
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            let mut records = reparent_request_records(&state).unwrap();
+            let record = records
+                .iter_mut()
+                .find(|record| record.id == request.id)
+                .unwrap();
+            record.approvals.push(ReparentApprovalRecord {
+                actor_kind: "agent".to_owned(),
+                actor_id: "newpar01".to_owned(),
+                decision: "approved".to_owned(),
+                decided_at: now_rfc3339(),
+            });
+            record.ready_to_apply = true;
+            store_reparent_request_records(&mut state, &records).unwrap();
+            store.write_raw_json_value(&state).unwrap();
+        }
+        (store, queue, state_file, queue_db, request.id)
+    }
+
+    fn reparent_test_session(id: &str, parent: Option<&str>, credential: &str) -> Value {
+        json!({
+            "id": id,
+            "name": format!("claude-{id}"),
+            "working_dir": "/repo",
+            "tmux_session": format!("claude-{id}"),
+            "status": "running",
+            "created_at": "2026-06-01T00:00:00Z",
+            "last_activity": "2026-06-01T00:01:00Z",
+            "parent_session_id": parent,
+            "session_credential_sha256": sha256_text(credential)
+        })
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

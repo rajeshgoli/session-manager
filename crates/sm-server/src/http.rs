@@ -16,6 +16,7 @@ use std::{
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
+use anyhow::Context as _;
 use axum::{
     body::{to_bytes, Body, Bytes},
     extract::{
@@ -119,8 +120,10 @@ use crate::sessions::{
     ClaudeHookGate, ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome,
     ContextMonitorRequest, ContextSnapshotResponse, ContextUsageEvent, ContextUsageOutcome,
     CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
-    CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
-    MaintainerMutationOutcome, RegistryMutationOutcome, RoleRegistrationRequest,
+    CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, CreateReparentRequest,
+    CreateReparentTreeRequest, CredentialRotationOutcome, DecideReparentRequest, HandoffOutcome,
+    HandoffRequest, MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision,
+    ReparentMutationOutcome, ReparentRepairAction, RoleRegistrationRequest,
     SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest, SendCoreInputRequest,
     SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
     SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest, SubagentStartOutcome,
@@ -375,6 +378,10 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: AppConfig) -> Self {
+        Self::try_new(config).expect("session manager startup recovery failed")
+    }
+
+    pub fn try_new(config: AppConfig) -> anyhow::Result<Self> {
         let state_file = expand_home(&config.paths.state_file);
         let queue_db_path = expand_home(&config.sm_send.db_path);
         let mut session_store = SessionStore::new_with_queue(state_file, queue_db_path)
@@ -421,6 +428,18 @@ impl AppState {
                 );
             session_store = session_store.with_usage_report_store(report_store);
         }
+        session_store
+            .recover_session_runtime_launches()
+            .context("session runtime launch recovery failed")?;
+        session_store
+            .reconcile_reparent_requests()
+            .context("reparent authority recovery failed")?;
+        if let Err(error) = session_store.reconcile_reparent_notifications() {
+            eprintln!("reparent notification recovery failed: {error:#}");
+        }
+        if let Err(error) = session_store.recover_session_credential_rotation_workers() {
+            eprintln!("session credential rotation recovery failed: {error:#}");
+        }
         if let Err(error) = session_store.recover_pending_codex_fork_handoffs() {
             eprintln!("codex-fork handoff recovery failed: {error:#}");
         }
@@ -434,7 +453,7 @@ impl AppState {
         OsRng.fill_bytes(&mut mobile_terminal_secret);
         let (tmux_client_event_tx, _) = broadcast::channel(128);
         let studio_ssh_enabled = studio_ssh::status(&config.external_access.studio_ssh).enabled;
-        Self {
+        Ok(Self {
             config,
             session_store,
             github_review_poster: Arc::new(GhCliReviewPoster),
@@ -452,7 +471,7 @@ impl AppState {
             mobile_terminal_runtime_disabled: Arc::new(AtomicBool::new(false)),
             studio_ssh_enabled: Arc::new(AtomicBool::new(studio_ssh_enabled)),
             mobile_terminal_secret,
-        }
+        })
     }
 
     pub fn with_github_review_poster(mut self, poster: Arc<dyn GitHubReviewPoster>) -> Self {
@@ -1040,6 +1059,32 @@ pub fn router(state: AppState) -> Router {
         .route(DEFAULT_EMAIL_WEBHOOK_PATH, post(inbound_email_webhook))
         .route("/usage/accounts", get(get_account_usage))
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/reparent-requests", get(list_reparent_requests))
+        .route(
+            "/session-credential-rotations",
+            get(list_session_credential_rotations),
+        )
+        .route("/reparent-requests/{request_id}", get(get_reparent_request))
+        .route(
+            "/reparent-requests/{request_id}/approve",
+            post(approve_reparent_request),
+        )
+        .route(
+            "/reparent-requests/{request_id}/reject",
+            post(reject_reparent_request),
+        )
+        .route(
+            "/reparent-requests/{request_id}/human-approve",
+            post(human_approve_reparent_request),
+        )
+        .route(
+            "/reparent-requests/{request_id}/human-reject",
+            post(human_reject_reparent_request),
+        )
+        .route(
+            "/reparent-requests/{request_id}/repair",
+            post(repair_reparent_request),
+        )
         .route("/sessions/input-batch", post(send_session_input_batch))
         .route("/sessions/spawn", post(spawn_session))
         .route("/sessions/review", post(spawn_review_session))
@@ -1049,6 +1094,18 @@ pub fn router(state: AppState) -> Router {
             get(get_session).patch(update_session_metadata),
         )
         .route("/sessions/{session_id}/context", get(get_session_context))
+        .route(
+            "/sessions/{session_id}/reparent-requests",
+            post(create_reparent_request),
+        )
+        .route(
+            "/sessions/{session_id}/reparent-tree-requests",
+            post(create_reparent_tree_request),
+        )
+        .route(
+            "/sessions/{session_id}/credential-rotation",
+            post(create_session_credential_rotation),
+        )
         .route("/sessions/{session_id}/usage", get(get_session_usage))
         .route("/sessions/{session_id}/review", post(start_session_review))
         .route(
@@ -2821,6 +2878,351 @@ async fn list_sessions(
     Ok(Json(SessionsEnvelope::from(sessions)))
 }
 
+async fn list_reparent_requests(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    reconcile_reparent_notifications_best_effort(&state);
+    let requests = if let Some(session_id) = header_text(request.headers(), "x-sm-session-id") {
+        let credential = reparent_session_credential(request.headers())?;
+        state
+            .session_store
+            .list_reparent_requests_for_session(&session_id, &credential)?
+            .ok_or_else(|| ApiError::Status {
+                status: StatusCode::FORBIDDEN,
+                detail: "session credential is missing, stale, or does not match the claimed actor"
+                    .to_owned(),
+            })?
+    } else {
+        if state.config.google_auth.requested()
+            && request_actor_email(&state.config, &request).is_none()
+        {
+            return Err(ApiError::Status {
+                status: StatusCode::UNAUTHORIZED,
+                detail: "Operator authentication or managed session identity is required"
+                    .to_owned(),
+            });
+        }
+        state.session_store.list_reparent_requests()?
+    };
+    Ok(Json(json!({
+        "requests": requests,
+    })))
+}
+
+async fn list_session_credential_rotations(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    if request_actor_email(&state.config, &request).is_none() {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Operator authentication is required".to_owned(),
+        });
+    }
+    Ok(Json(json!({
+        "rotations": state.session_store.list_session_credential_rotations()?,
+    })))
+}
+
+async fn create_session_credential_rotation(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(&state)?;
+    ensure_session_read_allowed(&state, &request)?;
+    let request_actor =
+        request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Operator authentication is required".to_owned(),
+        })?;
+    if btw_db_path(&state).exists() {
+        if let Some(active) = btw_store(&state)?.active_for_target(&session_id)? {
+            return Err(ApiError::Status {
+                status: StatusCode::CONFLICT,
+                detail: format!(
+                    "session {session_id} has active sm what request {}",
+                    active.request_id
+                ),
+            });
+        }
+    }
+    match state
+        .session_store
+        .create_session_credential_rotation(&session_id, &request_actor)?
+    {
+        CredentialRotationOutcome::Created(record) => {
+            Ok((StatusCode::CREATED, Json(serde_json::to_value(record)?)).into_response())
+        }
+        CredentialRotationOutcome::Existing(record) => {
+            Ok(Json(serde_json::to_value(record)?).into_response())
+        }
+        CredentialRotationOutcome::SessionNotFound => Err(ApiError::NotFound("Session not found")),
+        CredentialRotationOutcome::BadRequest(detail) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail,
+        }),
+        CredentialRotationOutcome::Conflict(detail) => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail,
+        }),
+    }
+}
+
+fn authority_mutation_error(error: anyhow::Error) -> ApiError {
+    let detail = error.to_string();
+    if detail.starts_with("reparent request ") && detail.contains(" controls session ") {
+        ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail,
+        }
+    } else {
+        ApiError::Internal(error)
+    }
+}
+
+async fn get_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    reconcile_reparent_notifications_best_effort(&state);
+    let record = state
+        .session_store
+        .get_reparent_request(&request_id)?
+        .ok_or(ApiError::NotFound("Reparent request not found"))?;
+    if let Some(session_id) = header_text(request.headers(), "x-sm-session-id") {
+        let credential = reparent_session_credential(request.headers())?;
+        let visible = state
+            .session_store
+            .list_reparent_requests_for_session(&session_id, &credential)?
+            .ok_or_else(|| ApiError::Status {
+                status: StatusCode::FORBIDDEN,
+                detail: "session credential is missing, stale, or does not match the claimed actor"
+                    .to_owned(),
+            })?
+            .into_iter()
+            .any(|candidate| candidate.id == record.id);
+        if !visible {
+            return Err(ApiError::Status {
+                status: StatusCode::FORBIDDEN,
+                detail: "reparent request does not involve this session".to_owned(),
+            });
+        }
+    } else if state.config.google_auth.requested()
+        && request_actor_email(&state.config, &request).is_none()
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Operator authentication or managed session identity is required".to_owned(),
+        });
+    }
+    Ok(Json(serde_json::to_value(record)?))
+}
+
+async fn create_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(subject_session_id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateReparentRequest>,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(&state)?;
+    let credential = reparent_session_credential(&headers)?;
+    let outcome =
+        state
+            .session_store
+            .create_reparent_request(&subject_session_id, payload, &credential)?;
+    reconcile_reparent_notifications_best_effort(&state);
+    reparent_mutation_response(outcome)
+}
+
+async fn create_reparent_tree_request(
+    State(state): State<Arc<AppState>>,
+    Path(source_session_id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateReparentTreeRequest>,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(&state)?;
+    let credential = reparent_session_credential(&headers)?;
+    let outcome = state.session_store.create_reparent_tree_request(
+        &source_session_id,
+        payload,
+        &credential,
+    )?;
+    reconcile_reparent_notifications_best_effort(&state);
+    reparent_mutation_response(outcome)
+}
+
+async fn approve_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<DecideReparentRequest>,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(&state)?;
+    let credential = reparent_session_credential(&headers)?;
+    let outcome = state.session_store.decide_reparent_request(
+        &request_id,
+        payload,
+        ReparentDecision::Approved,
+        &credential,
+    )?;
+    reconcile_reparent_notifications_best_effort(&state);
+    reparent_mutation_response(outcome)
+}
+
+async fn reject_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<DecideReparentRequest>,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(&state)?;
+    let credential = reparent_session_credential(&headers)?;
+    let outcome = state.session_store.decide_reparent_request(
+        &request_id,
+        payload,
+        ReparentDecision::Rejected,
+        &credential,
+    )?;
+    reconcile_reparent_notifications_best_effort(&state);
+    reparent_mutation_response(outcome)
+}
+
+async fn human_approve_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    human_decide_reparent_request(&state, &request_id, &request, ReparentDecision::Approved)
+}
+
+async fn human_reject_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    human_decide_reparent_request(&state, &request_id, &request, ReparentDecision::Rejected)
+}
+
+#[derive(Debug, Deserialize)]
+struct RepairReparentRequest {
+    action: String,
+}
+
+async fn repair_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(&state)?;
+    ensure_session_read_allowed(&state, &request)?;
+    let actor_id =
+        request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Operator authentication is required".to_owned(),
+        })?;
+    let (parts, body) = request.into_parts();
+    let bytes = to_bytes(body, 64 * 1024)
+        .await
+        .map_err(|error| ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("Invalid repair request body: {error}"),
+        })?;
+    let _ = parts;
+    let payload: RepairReparentRequest =
+        serde_json::from_slice(&bytes).map_err(|error| ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("Invalid repair request: {error}"),
+        })?;
+    let action = ReparentRepairAction::parse(&payload.action).ok_or_else(|| ApiError::Status {
+        status: StatusCode::BAD_REQUEST,
+        detail: "action must be resume or rollback_precommit".to_owned(),
+    })?;
+    let outcome = state
+        .session_store
+        .repair_reparent_request(&request_id, &actor_id, action)?;
+    reconcile_reparent_notifications_best_effort(&state);
+    reparent_mutation_response(outcome)
+}
+
+fn human_decide_reparent_request(
+    state: &AppState,
+    request_id: &str,
+    request: &Request,
+    decision: ReparentDecision,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(state)?;
+    ensure_session_read_allowed(state, request)?;
+    let actor_id = request_actor_email(&state.config, request).ok_or_else(|| ApiError::Status {
+        status: StatusCode::UNAUTHORIZED,
+        detail: "Operator authentication is required".to_owned(),
+    })?;
+    let outcome = state
+        .session_store
+        .decide_reparent_request_as_human(request_id, &actor_id, decision)?;
+    reconcile_reparent_notifications_best_effort(state);
+    reparent_mutation_response(outcome)
+}
+
+fn reconcile_reparent_notifications_best_effort(state: &AppState) {
+    if let Err(error) = state.session_store.reconcile_reparent_notifications() {
+        eprintln!("reparent notification reconciliation failed: {error:#}");
+    }
+}
+
+fn reparent_session_credential(headers: &HeaderMap) -> Result<String, ApiError> {
+    let credential = header_text(headers, "x-sm-session-credential").unwrap_or_default();
+    if credential.is_empty() {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "X-SM-Session-Credential is required".to_owned(),
+        });
+    }
+    Ok(credential)
+}
+
+fn reparent_mutation_response(outcome: ReparentMutationOutcome) -> Result<Response, ApiError> {
+    match outcome {
+        ReparentMutationOutcome::Created(record) => {
+            Ok((StatusCode::CREATED, Json(serde_json::to_value(record)?)).into_response())
+        }
+        ReparentMutationOutcome::Updated(record) => {
+            Ok(Json(serde_json::to_value(record)?).into_response())
+        }
+        ReparentMutationOutcome::Preview(preview) => {
+            Ok(Json(serde_json::to_value(preview)?).into_response())
+        }
+        ReparentMutationOutcome::SessionNotFound(session_id) => Err(ApiError::Status {
+            status: StatusCode::NOT_FOUND,
+            detail: format!("Session {session_id} not found"),
+        }),
+        ReparentMutationOutcome::RequestNotFound => {
+            Err(ApiError::NotFound("Reparent request not found"))
+        }
+        ReparentMutationOutcome::BadRequest(detail) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail,
+        }),
+        ReparentMutationOutcome::Forbidden(detail) => Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail,
+        }),
+        ReparentMutationOutcome::Conflict(detail) => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail,
+        }),
+        ReparentMutationOutcome::Expired => Err(ApiError::Status {
+            status: StatusCode::GONE,
+            detail: "Reparent request expired".to_owned(),
+        }),
+    }
+}
+
 async fn list_children_sessions(
     State(state): State<Arc<AppState>>,
     Path(parent_session_id): Path<String>,
@@ -3349,15 +3751,14 @@ fn queue_wait_notification(state: &AppState, watcher_session_id: &str, text: Str
 }
 
 fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_seconds: u64) {
-    let Some(parent_session_id) = child
+    if child
         .parent_session_id
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-    else {
+        .is_none_or(str::is_empty)
+    {
         return;
-    };
+    }
     let child_session_id = child.id.clone();
 
     tokio::spawn(async move {
@@ -3391,39 +3792,24 @@ fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_sec
             let Some(completion_message) = completion_message else {
                 continue;
             };
-
             let notification = format!(
                 "Child {} ({}) completed: {}",
                 child_display_name(&child),
                 short_session_id(&child_session_id),
                 completion_message
             );
-            let request = SendCoreInputRequest {
-                text: notification,
-                delivery_mode: "sequential".to_owned(),
-                sender_session_id: None,
-                from_sm_send: false,
-                timeout_seconds: None,
-                notify_on_delivery: false,
-                notify_after_seconds: None,
-                notify_on_stop: false,
-                remind_soft_threshold: None,
-                remind_hard_threshold: None,
-                remind_cancel_on_reply_session_id: None,
-                parent_session_id: None,
-            };
-            let _ = if state.config.rust_core.runtime_enabled {
-                let runtime = TmuxRuntime::from_app_config(&state.config);
-                state.session_store.send_core_input_with_runtime(
-                    &parent_session_id,
-                    request,
-                    &runtime,
-                )
-            } else {
-                state
-                    .session_store
-                    .send_core_input(&parent_session_id, request)
-            };
+            let runtime = state
+                .config
+                .rust_core
+                .runtime_enabled
+                .then(|| TmuxRuntime::from_app_config(&state.config));
+            let _ = state.session_store.send_parent_notification(
+                &child_session_id,
+                &notification,
+                "sequential",
+                "child_wait",
+                runtime.as_ref(),
+            );
             break;
         }
     });
@@ -9289,6 +9675,7 @@ fn codex_fork_event_stream_path_for_session(
         .filter(|value| !value.is_empty())?;
     let spec = crate::runtime::TmuxSessionSpec {
         session_id: session.id.clone(),
+        session_credential: None,
         tmux_session: session.tmux_session.clone(),
         working_dir: expand_home(&session.working_dir).display().to_string(),
         log_file: expand_home(log_file),
@@ -11364,7 +11751,7 @@ where
     E: Into<anyhow::Error>,
 {
     fn from(error: E) -> Self {
-        Self::Internal(error.into())
+        authority_mutation_error(error.into())
     }
 }
 
@@ -12537,6 +12924,7 @@ fn node_restore_candidate_value(session: SessionRecord, node_id: &str) -> Result
             detail: "failed to project node restore candidate".to_owned(),
         });
     };
+    object.remove("session_credential_sha256");
     object.insert("node".to_owned(), Value::String(node_id.to_owned()));
     object.insert("origin_node".to_owned(), Value::String(node_id.to_owned()));
     object.insert(
@@ -13310,6 +13698,7 @@ mod tests {
         .unwrap();
         let spec = crate::runtime::TmuxSessionSpec {
             session_id: session.id.clone(),
+            session_credential: None,
             tmux_session: session.tmux_session.clone(),
             working_dir: session.working_dir.clone(),
             log_file: log_file.clone(),
@@ -13359,6 +13748,7 @@ mod tests {
         .unwrap();
         let spec = crate::runtime::TmuxSessionSpec {
             session_id: session.id.clone(),
+            session_credential: None,
             tmux_session: session.tmux_session.clone(),
             working_dir: session.working_dir.clone(),
             log_file: log_file.clone(),
@@ -13411,6 +13801,7 @@ mod tests {
         .unwrap();
         let spec = crate::runtime::TmuxSessionSpec {
             session_id: session.id.clone(),
+            session_credential: None,
             tmux_session: session.tmux_session.clone(),
             working_dir: session.working_dir.clone(),
             log_file: log_file.clone(),

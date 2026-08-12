@@ -158,6 +158,40 @@ impl BtwStore {
         })
     }
 
+    pub fn active_for_target(&self, target_session_id: &str) -> Result<Option<BtwRequestRecord>> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                r#"
+                SELECT
+                    request_id,
+                    requester_session_id,
+                    target_session_id,
+                    target_provider,
+                    delivery_mode,
+                    prompt,
+                    status,
+                    provider_correlation,
+                    created_at,
+                    started_at,
+                    finished_at,
+                    result,
+                    error,
+                    response_delivered_at,
+                    response_undeliverable_at
+                FROM btw_requests
+                WHERE target_session_id = ?1
+                  AND status IN ('pending', 'running')
+                ORDER BY created_at ASC
+                LIMIT 1
+                "#,
+                [target_session_id],
+                record_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
     pub fn list_recoverable(&self) -> Result<Vec<BtwRequestRecord>> {
         self.with_connection(|conn| {
             let mut statement = conn.prepare(
