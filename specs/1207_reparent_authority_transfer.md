@@ -122,8 +122,8 @@ lifecycle event), not inferred from a stale projected status. Busy or unproven
 seats remain `waiting_idle` and are retried by the provider Stop/event path.
 The relaunch preserves the Session Manager ID, parent graph, task metadata, and
 provider resume ID; it rotates the runtime credential and verifier. A crash
-after the old runtime is
-stopped resumes the recorded relaunch on startup. If resumability or readiness
+after the old runtime is stopped resumes the recorded relaunch on startup. If
+resumability or readiness
 cannot be established, the old runtime remains untouched and the rotation
 fails closed. There is no force-active mode in this epic.
 
@@ -218,9 +218,11 @@ While the fence covers a session, create/spawn with that session as parent,
 restore of a stopped child, explicit retire/stop, and any parent-edge mutation
 that could change the planned graph return `409` with the controlling request
 ID. Observed provider/runtime death may still persist liveness truth; before
-authority commit it forces the transaction to restore its exact pre-state and
-end stale. If that restoration fails, the request enters the same durable
-quarantine as any other post-quiesce failure. These checks apply to every
+authority commit it forces the transaction to restore its exact old parent
+edges and routing while preserving the observed stopped status, then end stale.
+A frozen child that stopped therefore remains stopped under the old source. If
+that restoration fails, the request enters the same durable quarantine as any
+other post-quiesce failure. These checks apply to every
 session in a tree plan's source/target/grandparent/frozen-child set, not only to
 the edge rows being rewritten.
 
@@ -349,12 +351,12 @@ has new authority with parent-derived routing still paused; dynamic delivery
 uses the canonical new edge. Startup and the next request-store mutation resume
 `applying` records from their immutable plan. A retry never recomputes a
 different topology. If the frozen topology no longer matches before authority
-commit, the server restores the exact pre-state, replays deferred routing
-against the unchanged old parent, marks the request stale, and only then
-releases the fences. If that restoration fails, the request remains failed and
-quarantined. After authority commit, recovery completes the recorded
-transaction; it never silently rolls authority back to a topology that may
-already have been observed.
+commit, the server restores the exact old authority/routing state without
+rewriting observed liveness, replays deferred routing against the unchanged old
+parent, marks the request stale, and only then releases the fences. If that
+restoration fails, the request remains failed and quarantined. After authority
+commit, recovery completes the recorded transaction; it never silently rolls
+authority back to a topology that may already have been observed.
 
 On startup, all `applying` reparent records are recovered through their durable
 stage before retained parent-wake tasks are recreated and before HTTP/input
@@ -378,8 +380,8 @@ The authenticated human repair route supports exactly two audited actions:
 2. `rollback_precommit` is accepted only from `json_routing_quiesced` or
    `routing_quiesced`, before `authority_committed`. Under the routing fence,
    the server restores every route to the apply plan's exact recorded
-   pre-state, verifies all parent edges
-   still match the old topology and all runtime/JSON/SQLite routes match that
+   pre-state, verifies all parent edges still match the old topology and all
+   runtime/JSON/SQLite routes match that
    pre-state, replays deferred routing intents against the unchanged old parent,
    then atomically records `status=repaired` and
    `apply_stage=repair_rolled_back`. Any mismatch leaves the request failed and
