@@ -169,7 +169,7 @@ version
 edge_changes[]             session ID, expected old parent, new parent
 json_routing_changes[]     record kind/ID, expected old target, new target
 queue_routing_changes[]    table/record ID, child ID, expected old target,
-                           new target, prior active state
+                           new target, prior active state, runtime task key
 ```
 
 The transition from `pending` to `applying` discovers these exact records once
@@ -240,16 +240,22 @@ therefore a recoverable, fail-closed staged operation:
 
 1. Under the session write lock, revalidate and persist `status=applying` with
    the complete immutable plan. Parent edges remain unchanged.
-2. In one SQLite transaction, idempotently quiesce affected parent-derived wake
-   registrations and pending wake metadata. Persist
+2. Through the queue coordinator's routing fence, stop and remove each affected
+   in-memory parent-wake task/registration, then in one SQLite transaction
+   idempotently quiesce affected parent-derived wake registrations and pending
+   wake metadata. Persist
    `apply_stage=routing_quiesced` in JSON. A replay accepts either each plan
    entry's recorded pre-state or its exact already-quiesced state; any third
-   state fails closed.
+   state fails closed. On process restart, inactive SQLite rows cannot recreate
+   the stopped runtime tasks.
 3. In one atomic JSON replacement, update all parent edges and JSON-backed
    routing, and persist `apply_stage=authority_committed`. Dynamic
    task-complete and wait-monitor delivery now resolves this canonical edge.
 4. In one idempotent SQLite transaction, retarget and reactivate affected
-   parent-derived routes, then mark the JSON request `applied`.
+   parent-derived routes, then recreate their in-memory registrations/tasks
+   with the new target under the routing fence and mark the JSON request
+   `applied`. Replay accepts an already-correct runtime registration and never
+   starts a duplicate task.
 
 An interruption before step 3 exposes no new destructive authority and leaves
 old-parent routing paused rather than misdirected. An interruption after step 3
