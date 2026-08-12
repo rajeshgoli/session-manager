@@ -1262,6 +1262,7 @@ impl SessionStore {
             apply_stage: None,
             apply_plan: None,
             notification_intents: Vec::new(),
+            deferred_routing_intents: Vec::new(),
             repair_history: Vec::new(),
         };
         records.push(record.clone());
@@ -9442,6 +9443,19 @@ pub struct ReparentNotificationIntent {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReparentDeferredRoutingIntent {
+    pub key: String,
+    pub operation: String,
+    pub child_session_id: String,
+    pub payload: Value,
+    pub created_at: String,
+    #[serde(default)]
+    pub replayed_at: Option<String>,
+    #[serde(default)]
+    pub resolved_parent_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ReparentRepairRecord {
     pub actor_kind: String,
     pub actor_id: String,
@@ -9490,6 +9504,8 @@ pub struct ReparentRequestRecord {
     pub apply_plan: Option<ReparentApplyPlan>,
     #[serde(default)]
     pub notification_intents: Vec<ReparentNotificationIntent>,
+    #[serde(default)]
+    pub deferred_routing_intents: Vec<ReparentDeferredRoutingIntent>,
     #[serde(default)]
     pub repair_history: Vec<ReparentRepairRecord>,
 }
