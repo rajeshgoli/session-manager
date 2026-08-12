@@ -9500,7 +9500,7 @@ impl ReparentRequestRecord {
             || (self.status == "failed"
                 && matches!(
                     self.apply_stage.as_deref(),
-                    Some("routing_quiesced" | "authority_committed")
+                    Some("json_routing_quiesced" | "routing_quiesced" | "authority_committed")
                 ))
     }
 

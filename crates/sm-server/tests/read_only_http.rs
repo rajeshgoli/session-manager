@@ -16281,7 +16281,7 @@ async fn reparent_request_reserves_failed_post_quiesce_edges() {
     let mut raw_state: Value =
         serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
     raw_state["reparent_requests"][0]["status"] = json!("failed");
-    raw_state["reparent_requests"][0]["apply_stage"] = json!("routing_quiesced");
+    raw_state["reparent_requests"][0]["apply_stage"] = json!("json_routing_quiesced");
     raw_state["reparent_requests"][0]["failure_reason"] = json!("fixture route failure");
     fs::write(&state_file, serde_json::to_vec_pretty(&raw_state).unwrap()).unwrap();
 
