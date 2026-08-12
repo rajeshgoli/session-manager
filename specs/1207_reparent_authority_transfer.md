@@ -2,8 +2,8 @@
 
 Status: implementation contract
 
-Epic: #1207  
-Incident and diagnosis: #1204  
+Epic: #1207
+Incident and diagnosis: #1204
 Phases: #1209, #1208, #1211, #1210
 
 ## Summary
