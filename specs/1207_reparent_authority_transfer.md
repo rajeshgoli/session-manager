@@ -192,6 +192,8 @@ apply_stage                nullable | json_routing_quiesced |
                            repair_rolled_back
 apply_plan                 nullable while pending; immutable once applying
 notification_intents[]     deterministic event/recipient delivery records
+deferred_routing_intents[] idempotency key, operation payload, created_at,
+                           replayed_at and resolved parent
 repair_history[]           actor, action, prior failure, timestamp,
                            verified post-state fingerprint
 ```
@@ -208,13 +210,32 @@ queue_routing_changes[]    table/record ID, child ID, expected old target,
 ```
 
 The transition from `pending` to `applying` discovers these exact records once
-under the state lock and persists the plan before quiescing anything. Recovery
-uses only this plan plus expected-value checks. A route created after planning
-must not escape the plan: while an `applying` request covers a child, creation
-of parent-derived wake/message metadata for that child is deferred behind the
-transaction. After `authority_committed`, deferred creation derives the new
-canonical parent. Every parent-derived route creation path must use this fence;
-direct queue-table writes are not permitted.
+under the state lock and atomically persists both the plan and a durable
+topology/routing fence before quiescing anything. Recovery uses only this plan
+plus expected-value checks.
+
+While the fence covers a session, create/spawn with that session as parent,
+restore of a stopped child, explicit retire/stop, and any parent-edge mutation
+that could change the planned graph return `409` with the controlling request
+ID. Observed provider/runtime death may still persist liveness truth; before
+authority commit it forces the transaction to restore its exact pre-state and
+end stale. If that restoration fails, the request enters the same durable
+quarantine as any other post-quiesce failure. These checks apply to every
+session in a tree plan's source/target/grandparent/frozen-child set, not only to
+the edge rows being rewritten.
+
+A route requested after planning must not escape the routing fence. The server
+persists a `deferred_routing_intent` with an idempotency key and complete
+operation payload instead of writing the live JSON/SQLite route. Direct
+queue-table writes are not permitted. On `authority_committed`, each intent is
+replayed once against the new canonical parent. If the transaction becomes
+stale before commit or completes a pre-commit rollback, each intent is replayed
+once against the unchanged old canonical parent before the fence is released.
+Replay first idempotently upserts the target JSON/SQLite record under the
+intent's key. After that record is confirmed, JSON records `replayed_at` and the
+resolved parent. The final JSON replacement releases the fence only when every
+intent is marked replayed. A crash between stores repeats the same keyed upsert,
+so recovery cannot lose or duplicate the operation.
 Parent-derived route reads and mutations, including task-complete fallback and
 deactivation, use the same fence; it is not limited to creation.
 
@@ -294,8 +315,10 @@ retargeted during apply.
 The JSON state file and queue SQLite cannot share an ACID transaction. Apply is
 therefore a recoverable, fail-closed staged operation:
 
-1. Under the session write lock, revalidate and persist `status=applying` with
-   the complete immutable plan. Parent edges remain unchanged.
+1. Under the session write lock, revalidate and atomically persist
+   `status=applying`, the complete immutable plan, and its topology/routing
+   fence. Parent edges remain unchanged. Every conflicting topology mutation
+   checks this fence under the same lock.
 2. Through the queue coordinator's routing fence, stop and remove each affected
    in-memory parent-wake task/registration. Under the session-state lock,
    atomically mark every affected retained JSON parent-wake registration
@@ -310,23 +333,28 @@ therefore a recoverable, fail-closed staged operation:
 3. In one atomic JSON replacement, update all parent edges and JSON-backed
    routing, and persist `apply_stage=authority_committed`. Dynamic
    task-complete and wait-monitor delivery now resolves this canonical edge.
+   Deferred routing intents are now eligible to resolve against the new graph;
+   topology mutations remain fenced until their replay is durable.
 4. In one idempotent SQLite transaction, retarget and reactivate affected
    parent-derived routes. Under the state lock, retarget and reactivate the
    retained JSON registrations, then recreate their in-memory tasks with the
-   new target under the routing fence and mark the JSON request `applied`.
-   Replay accepts an already-correct runtime registration and never starts a
-   duplicate task.
+   new target under the routing fence, replay deferred routing intents against
+   the new canonical parents, mark the JSON request `applied`, and release both
+   fences. Replay accepts an already-correct runtime registration and never
+   starts a duplicate task.
 
 An interruption before step 3 exposes no new destructive authority and leaves
 old-parent routing paused rather than misdirected. An interruption after step 3
 has new authority with parent-derived routing still paused; dynamic delivery
 uses the canonical new edge. Startup and the next request-store mutation resume
 `applying` records from their immutable plan. A retry never recomputes a
-different topology. If the frozen topology no longer matches before routing is
-quiesced, the request becomes stale. After quiescing, recovery completes the
-recorded transaction or reports a durable `failed` state requiring operator
-repair; it never silently rolls authority back to a topology that may already
-have been observed.
+different topology. If the frozen topology no longer matches before authority
+commit, the server restores the exact pre-state, replays deferred routing
+against the unchanged old parent, marks the request stale, and only then
+releases the fences. If that restoration fails, the request remains failed and
+quarantined. After authority commit, recovery completes the recorded
+transaction; it never silently rolls authority back to a topology that may
+already have been observed.
 
 On startup, all `applying` reparent records are recovered through their durable
 stage before retained parent-wake tasks are recreated and before HTTP/input
@@ -352,7 +380,8 @@ The authenticated human repair route supports exactly two audited actions:
    the server restores every route to the apply plan's exact recorded
    pre-state, verifies all parent edges
    still match the old topology and all runtime/JSON/SQLite routes match that
-   pre-state, then atomically records `status=repaired` and
+   pre-state, replays deferred routing intents against the unchanged old parent,
+   then atomically records `status=repaired` and
    `apply_stage=repair_rolled_back`. Any mismatch leaves the request failed and
    quarantined.
 
@@ -485,12 +514,17 @@ PR targets `main`. Partial phases are not deployed.
 - A regular reparent changes exactly one edge.
 - A tree promotion produces exactly the documented live graph and preserves
   stopped lineage.
+- Conflicting spawn/restore/retire/topology mutations are fenced until commit;
+  an observed pre-commit liveness change restores the old graph instead of
+  applying a stale frozen child set.
 - Parent-derived routing and direct-child destructive authority follow the new
   graph immediately after apply.
 - Pending and `applying` requests recover correctly after restart at every
   durable stage.
 - Post-quiesce failures retain their overlap/routing fence; only a successful
   immutable-plan retry or verified pre-commit rollback releases it.
+- Deferred parent-derived route requests replay exactly once against the new
+  parent after commit or the old parent after stale/rollback release.
 - A pre-deployment live seat is recredentialed only after it becomes idle, keeps
   its seat and provider-thread identity, and recovers a crash after stop without
   accepting input under two runtimes.
