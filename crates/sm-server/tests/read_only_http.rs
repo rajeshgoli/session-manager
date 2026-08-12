@@ -171,6 +171,13 @@ fn queued_message_texts(db_path: &PathBuf, target_session_id: &str) -> Vec<Strin
     last_texts
 }
 
+fn session_credential_hash(credential: &str) -> String {
+    Sha256::digest(credential.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn queue_job_completion_notified_at(queue_state_dir: &PathBuf, job_id: &str) -> Option<String> {
     for attempt in 0..50 {
         let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
@@ -880,6 +887,7 @@ async fn node_restore_candidates_project_primary_stopped_sessions() {
     assert_eq!(candidate["restore_source"], "server_state");
     assert_eq!(candidate["activity_state"], "stopped");
     assert_eq!(candidate["provider"], "claude");
+    assert!(candidate.get("session_credential_sha256").is_none());
 }
 
 #[tokio::test]
@@ -11566,7 +11574,8 @@ async fn fixture_registry_prunes_stale_roles_and_updates_maintainer_alias() {
                     "provider": "claude",
                     "created_at": "2026-06-01T00:00:00",
                     "last_activity": "2026-06-01T00:01:00",
-                    "stopped_at": "2026-06-01T00:02:00"
+                    "stopped_at": "2026-06-01T00:02:00",
+                    "session_credential_sha256": "must-not-leave-server-state"
                 }
             ],
             "maintainer_session_id": "staleagent",
@@ -12137,6 +12146,14 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     assert_eq!(payload["id"], "runtimecore");
     assert_eq!(payload["status"], "running");
     assert_eq!(payload["tmux_socket_name"], tmux_socket);
+    assert!(payload.get("session_credential_sha256").is_none());
+    let created_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let created_credential_hash = created_state["sessions"][0]["session_credential_sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(created_credential_hash.len(), 64);
     let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
 
     let payload =
@@ -12232,6 +12249,14 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     assert_eq!(payload["id"], "runtimecore");
     assert_eq!(payload["status"], "running");
     assert_eq!(payload["completion_status"], Value::Null);
+    assert!(payload.get("session_credential_sha256").is_none());
+    let restored_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let restored_credential_hash = restored_state["sessions"][0]["session_credential_sha256"]
+        .as_str()
+        .unwrap();
+    assert_eq!(restored_credential_hash.len(), 64);
+    assert_ne!(restored_credential_hash, created_credential_hash);
     assert!(tmux_session_exists(&tmux_socket, &tmux_session));
 
     let (status, payload) = post_json(
@@ -16056,8 +16081,10 @@ async fn sessions_project_top_level_registry_and_adoption_state() {
                 "proposer_name": "maintainer",
                 "target_session_id": "child001",
                 "created_at": "2026-06-01T00:03:00",
-                "status": "pending",
-                "decided_at": null
+                "status": "stale",
+                "decided_at": null,
+                "actionable": false,
+                "failure_reason": "legacy adoption proposal requires a new consent request"
             }
         ])
     );
@@ -16077,6 +16104,427 @@ async fn sessions_project_top_level_registry_and_adoption_state() {
         .unwrap()
         .iter()
         .any(|entry| entry["role"] == "maintainer" && entry["session_id"] == "em123456"));
+}
+
+#[tokio::test]
+async fn reparent_request_requires_bound_credentials_and_dual_agent_consent() {
+    let state_file = write_reparent_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(payload["detail"].as_str().unwrap().contains("Credential"));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "new-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .contains("does not match"));
+
+    let (status, created) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["kind"], "single");
+    assert_eq!(created["expected_parent_session_id"], "oldparent");
+    assert_eq!(
+        created["required_agent_approvals"],
+        json!(["newparent", "oldparent"])
+    );
+    assert_eq!(created["required_human_approval"], false);
+    assert_eq!(created["ready_to_apply"], false);
+    let request_id = created["id"].as_str().unwrap();
+
+    let (status, approved) = post_json_with_headers_and_peer(
+        app.clone(),
+        &format!("/reparent-requests/{request_id}/approve"),
+        json!({ "requester_session_id": "newparent" }),
+        &[("x-sm-session-credential", "new-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(approved["status"], "pending");
+    assert_eq!(approved["ready_to_apply"], true);
+    assert_eq!(approved["approvals"].as_array().unwrap().len(), 2);
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let child = raw_state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "child")
+        .unwrap();
+    assert_eq!(child["parent_session_id"], "oldparent");
+    assert_eq!(raw_state["reparent_requests"][0]["ready_to_apply"], true);
+}
+
+#[tokio::test]
+async fn reparent_request_rejects_unauthorized_cycles_and_overlapping_edges() {
+    let state_file = write_reparent_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "unrelated",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "unrelated-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .contains("current parent"));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "grandchild"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(payload["detail"].as_str().unwrap().contains("cycle"));
+
+    let (status, created) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "newparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "new-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(!created["id"].as_str().unwrap().is_empty());
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "unrelated"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .contains("already controls"));
+}
+
+#[tokio::test]
+async fn reparent_request_reserves_failed_post_quiesce_edges() {
+    let state_file = write_reparent_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, created) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let mut raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    raw_state["reparent_requests"][0]["status"] = json!("failed");
+    raw_state["reparent_requests"][0]["apply_stage"] = json!("routing_quiesced");
+    raw_state["reparent_requests"][0]["failure_reason"] = json!("fixture route failure");
+    fs::write(&state_file, serde_json::to_vec_pretty(&raw_state).unwrap()).unwrap();
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .contains(created["id"].as_str().unwrap()));
+}
+
+#[tokio::test]
+async fn reparent_request_uses_human_gate_when_the_recorded_parent_is_not_live() {
+    let state_file = write_reparent_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, created) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/orphan/reparent-requests",
+        json!({
+            "requester_session_id": "newparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "new-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["expected_parent_session_id"], "stoppedparent");
+    assert_eq!(created["expected_parent_is_live"], false);
+    assert_eq!(created["required_agent_approvals"], json!(["newparent"]));
+    assert_eq!(created["required_human_approval"], true);
+    assert_eq!(created["ready_to_apply"], false);
+
+    let request_id = created["id"].as_str().unwrap();
+    let (status, repeated) = post_json_with_headers_and_peer(
+        app.clone(),
+        &format!("/reparent-requests/{request_id}/approve"),
+        json!({ "requester_session_id": "newparent" }),
+        &[("x-sm-session-credential", "new-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(repeated["status"], "pending");
+    assert_eq!(repeated["ready_to_apply"], false);
+
+    let (status, conflicting) = post_json_with_headers_and_peer(
+        app,
+        &format!("/reparent-requests/{request_id}/reject"),
+        json!({ "requester_session_id": "newparent" }),
+        &[("x-sm-session-credential", "new-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(conflicting["detail"]
+        .as_str()
+        .unwrap()
+        .contains("already approved"));
+}
+
+#[tokio::test]
+async fn reparent_request_rejection_is_terminal_and_same_decision_is_idempotent() {
+    let state_file = write_reparent_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, created) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let request_id = created["id"].as_str().unwrap();
+
+    for _ in 0..2 {
+        let (status, rejected) = post_json_with_headers_and_peer(
+            app.clone(),
+            &format!("/reparent-requests/{request_id}/reject"),
+            json!({ "requester_session_id": "newparent" }),
+            &[("x-sm-session-credential", "new-token")],
+            Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(rejected["status"], "rejected");
+        assert_eq!(rejected["ready_to_apply"], false);
+    }
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        &format!("/reparent-requests/{request_id}/approve"),
+        json!({ "requester_session_id": "newparent" }),
+        &[("x-sm-session-credential", "new-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .contains("already rejected"));
+}
+
+#[tokio::test]
+async fn reparent_request_expiration_is_persisted_and_blocks_missing_approval() {
+    let state_file = write_reparent_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, created) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let request_id = created["id"].as_str().unwrap().to_owned();
+
+    let mut raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    raw_state["reparent_requests"][0]["expires_at"] = json!("2020-01-01T00:00:00Z");
+    fs::write(&state_file, serde_json::to_vec_pretty(&raw_state).unwrap()).unwrap();
+
+    let (status, record) = get_json(app.clone(), &format!("/reparent-requests/{request_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(record["status"], "expired");
+    assert_eq!(record["ready_to_apply"], false);
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        &format!("/reparent-requests/{request_id}/approve"),
+        json!({ "requester_session_id": "newparent" }),
+        &[("x-sm-session-credential", "new-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE);
+    assert_eq!(payload["detail"], "Reparent request expired");
+}
+
+#[tokio::test]
+async fn reparent_request_with_invalid_expiration_fails_closed() {
+    let state_file = write_reparent_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, created) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let request_id = created["id"].as_str().unwrap().to_owned();
+
+    let mut raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    raw_state["reparent_requests"][0]["expires_at"] = json!("not-a-timestamp");
+    fs::write(&state_file, serde_json::to_vec_pretty(&raw_state).unwrap()).unwrap();
+
+    let (status, record) = get_json(app, &format!("/reparent-requests/{request_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(record["status"], "stale");
+    assert_eq!(record["ready_to_apply"], false);
+    assert_eq!(
+        record["failure_reason"],
+        "request expiry timestamp is invalid"
+    );
+}
+
+#[tokio::test]
+async fn reparent_request_read_marks_changed_topology_stale() {
+    let state_file = write_reparent_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, created) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let request_id = created["id"].as_str().unwrap().to_owned();
+
+    let mut raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let child = raw_state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "child")
+        .unwrap();
+    child["parent_session_id"] = json!("unrelated");
+    fs::write(&state_file, serde_json::to_vec_pretty(&raw_state).unwrap()).unwrap();
+
+    let (status, record) = get_json(app, &format!("/reparent-requests/{request_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(record["status"], "stale");
+    assert_eq!(record["ready_to_apply"], false);
+    assert!(record["failure_reason"]
+        .as_str()
+        .unwrap()
+        .contains("parent changed"));
 }
 
 fn config_with_state_file(state_file: &PathBuf) -> AppConfig {
@@ -16841,6 +17289,55 @@ fn write_registry_fixture() -> PathBuf {
             ]
         })
         .to_string(),
+    )
+    .unwrap();
+    path
+}
+
+fn write_reparent_fixture() -> PathBuf {
+    let path = unique_temp_path();
+    let session = |id: &str, status: &str, parent_session_id: Option<&str>, credential: &str| {
+        let mut value = json!({
+            "id": id,
+            "name": format!("claude-{id}"),
+            "working_dir": "/repo",
+            "tmux_session": format!("claude-{id}"),
+            "log_file": format!("/tmp/{id}.log"),
+            "provider": "claude",
+            "status": status,
+            "created_at": "2026-06-01T00:00:00Z",
+            "last_activity": "2026-06-01T00:01:00Z",
+            "session_credential_sha256": session_credential_hash(credential)
+        });
+        if let Some(parent_session_id) = parent_session_id {
+            value["parent_session_id"] = json!(parent_session_id);
+        }
+        value
+    };
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({
+            "sessions": [
+                session("oldparent", "running", None, "old-token"),
+                session("newparent", "running", None, "new-token"),
+                session("unrelated", "running", None, "unrelated-token"),
+                session("child", "running", Some("oldparent"), "child-token"),
+                session("grandchild", "running", Some("child"), "grandchild-token"),
+                session("stoppedparent", "stopped", None, "stopped-token"),
+                session("orphan", "running", Some("stoppedparent"), "orphan-token")
+            ],
+            "adoption_proposals": [
+                {
+                    "id": "legacy-proposal",
+                    "proposer_session_id": "newparent",
+                    "target_session_id": "child",
+                    "created_at": "2026-06-01T00:02:00Z",
+                    "status": "pending",
+                    "decided_at": null
+                }
+            ]
+        }))
+        .unwrap(),
     )
     .unwrap();
     path
