@@ -119,13 +119,14 @@ use crate::sessions::{
     ClaudeHookGate, ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome,
     ContextMonitorRequest, ContextSnapshotResponse, ContextUsageEvent, ContextUsageOutcome,
     CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
-    CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, HandoffOutcome, HandoffRequest,
-    MaintainerMutationOutcome, RegistryMutationOutcome, RoleRegistrationRequest,
-    SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest, SendCoreInputRequest,
-    SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
-    SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest, SubagentStartOutcome,
-    SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest, TaskCompleteOutcome,
-    TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
+    CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, CreateReparentRequest,
+    CredentialRotationOutcome, DecideReparentRequest, HandoffOutcome, HandoffRequest,
+    MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision, ReparentMutationOutcome,
+    RoleRegistrationRequest, SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest,
+    SendCoreInputRequest, SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore,
+    SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest,
+    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
+    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
 };
 
 use crate::studio_ssh::{self, StudioSshStatus};
@@ -420,6 +421,12 @@ impl AppState {
                         .map(|account| (account.key.clone(), account.label.clone())),
                 );
             session_store = session_store.with_usage_report_store(report_store);
+        }
+        if let Err(error) = session_store.recover_session_runtime_launches() {
+            eprintln!("session runtime launch recovery failed: {error:#}");
+        }
+        if let Err(error) = session_store.recover_session_credential_rotation_workers() {
+            eprintln!("session credential rotation recovery failed: {error:#}");
         }
         if let Err(error) = session_store.recover_pending_codex_fork_handoffs() {
             eprintln!("codex-fork handoff recovery failed: {error:#}");
@@ -1040,6 +1047,28 @@ pub fn router(state: AppState) -> Router {
         .route(DEFAULT_EMAIL_WEBHOOK_PATH, post(inbound_email_webhook))
         .route("/usage/accounts", get(get_account_usage))
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/reparent-requests", get(list_reparent_requests))
+        .route(
+            "/session-credential-rotations",
+            get(list_session_credential_rotations),
+        )
+        .route("/reparent-requests/{request_id}", get(get_reparent_request))
+        .route(
+            "/reparent-requests/{request_id}/approve",
+            post(approve_reparent_request),
+        )
+        .route(
+            "/reparent-requests/{request_id}/reject",
+            post(reject_reparent_request),
+        )
+        .route(
+            "/reparent-requests/{request_id}/human-approve",
+            post(human_approve_reparent_request),
+        )
+        .route(
+            "/reparent-requests/{request_id}/human-reject",
+            post(human_reject_reparent_request),
+        )
         .route("/sessions/input-batch", post(send_session_input_batch))
         .route("/sessions/spawn", post(spawn_session))
         .route("/sessions/review", post(spawn_review_session))
@@ -1049,6 +1078,14 @@ pub fn router(state: AppState) -> Router {
             get(get_session).patch(update_session_metadata),
         )
         .route("/sessions/{session_id}/context", get(get_session_context))
+        .route(
+            "/sessions/{session_id}/reparent-requests",
+            post(create_reparent_request),
+        )
+        .route(
+            "/sessions/{session_id}/credential-rotation",
+            post(create_session_credential_rotation),
+        )
         .route("/sessions/{session_id}/usage", get(get_session_usage))
         .route("/sessions/{session_id}/review", post(start_session_review))
         .route(
@@ -2819,6 +2856,206 @@ async fn list_sessions(
         .map(|session| session_response_with_live_activity(&state, session))
         .collect::<Vec<_>>();
     Ok(Json(SessionsEnvelope::from(sessions)))
+}
+
+async fn list_reparent_requests(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    Ok(Json(json!({
+        "requests": state.session_store.list_reparent_requests()?,
+    })))
+}
+
+async fn list_session_credential_rotations(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    if request_actor_email(&state.config, &request).is_none() {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Operator authentication is required".to_owned(),
+        });
+    }
+    Ok(Json(json!({
+        "rotations": state.session_store.list_session_credential_rotations()?,
+    })))
+}
+
+async fn create_session_credential_rotation(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(&state)?;
+    ensure_session_read_allowed(&state, &request)?;
+    let request_actor =
+        request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Operator authentication is required".to_owned(),
+        })?;
+    match state
+        .session_store
+        .create_session_credential_rotation(&session_id, &request_actor)?
+    {
+        CredentialRotationOutcome::Created(record) => {
+            Ok((StatusCode::CREATED, Json(serde_json::to_value(record)?)).into_response())
+        }
+        CredentialRotationOutcome::Existing(record) => {
+            Ok(Json(serde_json::to_value(record)?).into_response())
+        }
+        CredentialRotationOutcome::SessionNotFound => Err(ApiError::NotFound("Session not found")),
+        CredentialRotationOutcome::BadRequest(detail) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail,
+        }),
+        CredentialRotationOutcome::Conflict(detail) => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail,
+        }),
+    }
+}
+
+async fn get_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let record = state
+        .session_store
+        .get_reparent_request(&request_id)?
+        .ok_or(ApiError::NotFound("Reparent request not found"))?;
+    Ok(Json(serde_json::to_value(record)?))
+}
+
+async fn create_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(subject_session_id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateReparentRequest>,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(&state)?;
+    let credential = reparent_session_credential(&headers)?;
+    reparent_mutation_response(state.session_store.create_reparent_request(
+        &subject_session_id,
+        payload,
+        &credential,
+    )?)
+}
+
+async fn approve_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<DecideReparentRequest>,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(&state)?;
+    let credential = reparent_session_credential(&headers)?;
+    reparent_mutation_response(state.session_store.decide_reparent_request(
+        &request_id,
+        payload,
+        ReparentDecision::Approved,
+        &credential,
+    )?)
+}
+
+async fn reject_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<DecideReparentRequest>,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(&state)?;
+    let credential = reparent_session_credential(&headers)?;
+    reparent_mutation_response(state.session_store.decide_reparent_request(
+        &request_id,
+        payload,
+        ReparentDecision::Rejected,
+        &credential,
+    )?)
+}
+
+async fn human_approve_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    human_decide_reparent_request(&state, &request_id, &request, ReparentDecision::Approved)
+}
+
+async fn human_reject_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    human_decide_reparent_request(&state, &request_id, &request, ReparentDecision::Rejected)
+}
+
+fn human_decide_reparent_request(
+    state: &AppState,
+    request_id: &str,
+    request: &Request,
+    decision: ReparentDecision,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(state)?;
+    ensure_session_read_allowed(state, request)?;
+    let actor_id = request_actor_email(&state.config, request).ok_or_else(|| ApiError::Status {
+        status: StatusCode::UNAUTHORIZED,
+        detail: "Operator authentication is required".to_owned(),
+    })?;
+    reparent_mutation_response(
+        state
+            .session_store
+            .decide_reparent_request_as_human(request_id, &actor_id, decision)?,
+    )
+}
+
+fn reparent_session_credential(headers: &HeaderMap) -> Result<String, ApiError> {
+    let credential = header_text(headers, "x-sm-session-credential").unwrap_or_default();
+    if credential.is_empty() {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "X-SM-Session-Credential is required".to_owned(),
+        });
+    }
+    Ok(credential)
+}
+
+fn reparent_mutation_response(outcome: ReparentMutationOutcome) -> Result<Response, ApiError> {
+    match outcome {
+        ReparentMutationOutcome::Created(record) => {
+            Ok((StatusCode::CREATED, Json(serde_json::to_value(record)?)).into_response())
+        }
+        ReparentMutationOutcome::Updated(record) => {
+            Ok(Json(serde_json::to_value(record)?).into_response())
+        }
+        ReparentMutationOutcome::SessionNotFound(session_id) => Err(ApiError::Status {
+            status: StatusCode::NOT_FOUND,
+            detail: format!("Session {session_id} not found"),
+        }),
+        ReparentMutationOutcome::RequestNotFound => {
+            Err(ApiError::NotFound("Reparent request not found"))
+        }
+        ReparentMutationOutcome::BadRequest(detail) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail,
+        }),
+        ReparentMutationOutcome::Forbidden(detail) => Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail,
+        }),
+        ReparentMutationOutcome::Conflict(detail) => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail,
+        }),
+        ReparentMutationOutcome::Expired => Err(ApiError::Status {
+            status: StatusCode::GONE,
+            detail: "Reparent request expired".to_owned(),
+        }),
+    }
 }
 
 async fn list_children_sessions(
@@ -9289,6 +9526,7 @@ fn codex_fork_event_stream_path_for_session(
         .filter(|value| !value.is_empty())?;
     let spec = crate::runtime::TmuxSessionSpec {
         session_id: session.id.clone(),
+        session_credential: None,
         tmux_session: session.tmux_session.clone(),
         working_dir: expand_home(&session.working_dir).display().to_string(),
         log_file: expand_home(log_file),
@@ -12537,6 +12775,7 @@ fn node_restore_candidate_value(session: SessionRecord, node_id: &str) -> Result
             detail: "failed to project node restore candidate".to_owned(),
         });
     };
+    object.remove("session_credential_sha256");
     object.insert("node".to_owned(), Value::String(node_id.to_owned()));
     object.insert("origin_node".to_owned(), Value::String(node_id.to_owned()));
     object.insert(
@@ -13310,6 +13549,7 @@ mod tests {
         .unwrap();
         let spec = crate::runtime::TmuxSessionSpec {
             session_id: session.id.clone(),
+            session_credential: None,
             tmux_session: session.tmux_session.clone(),
             working_dir: session.working_dir.clone(),
             log_file: log_file.clone(),
@@ -13359,6 +13599,7 @@ mod tests {
         .unwrap();
         let spec = crate::runtime::TmuxSessionSpec {
             session_id: session.id.clone(),
+            session_credential: None,
             tmux_session: session.tmux_session.clone(),
             working_dir: session.working_dir.clone(),
             log_file: log_file.clone(),
@@ -13411,6 +13652,7 @@ mod tests {
         .unwrap();
         let spec = crate::runtime::TmuxSessionSpec {
             session_id: session.id.clone(),
+            session_credential: None,
             tmux_session: session.tmux_session.clone(),
             working_dir: session.working_dir.clone(),
             log_file: log_file.clone(),

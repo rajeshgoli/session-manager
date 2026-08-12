@@ -80,9 +80,10 @@ pub(crate) enum ConditionalClearOutcome {
     SessionMissing,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TmuxSessionSpec {
     pub session_id: String,
+    pub session_credential: Option<String>,
     pub tmux_session: String,
     pub working_dir: String,
     pub log_file: PathBuf,
@@ -265,7 +266,11 @@ impl TmuxRuntime {
                 .is_some_and(|value| !value.is_empty());
 
         let mut command = self.launch_command(spec, &prompt_mode)?;
-        command = managed_session_command(&command, &spec.session_id);
+        command = managed_session_command(
+            &command,
+            &spec.session_id,
+            spec.session_credential.as_deref(),
+        );
 
         let create_result = if self.tmux_history_limit.is_some()
             || (self.socket_name.is_some() && self.tmux_native_scrollback)
@@ -879,6 +884,28 @@ impl TmuxRuntime {
         Some(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    pub fn session_input_ready(&self, tmux_session: &str, provider: &str) -> bool {
+        match provider {
+            "codex" | "codex-fork" => self.codex_composer_is_ready(tmux_session, None),
+            _ => self
+                .capture_pane_last_line(tmux_session)
+                .is_some_and(|line| matches!(line.trim(), ">" | "❯")),
+        }
+    }
+
+    pub fn session_has_attached_clients(&self, tmux_session: &str) -> Result<bool> {
+        let output = self
+            .tmux_command(["list-clients", "-t", tmux_session, "-F", "#{client_name}"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .context("failed to list tmux clients")?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    }
+
     pub fn capture_pane_tail(&self, tmux_session: &str, lines: usize) -> Option<String> {
         if lines == 0 {
             return Some(String::new());
@@ -1417,11 +1444,20 @@ fn hex_char(value: u8) -> char {
     }
 }
 
-fn managed_session_command(command: &str, session_id: &str) -> String {
+fn managed_session_command(
+    command: &str,
+    session_id: &str,
+    session_credential: Option<&str>,
+) -> String {
     let session_id = shell_quote(session_id);
+    let credential_export = session_credential
+        .map(shell_quote)
+        .map(|credential| format!("export SM_SESSION_CREDENTIAL={credential}; "))
+        .unwrap_or_default();
     format!(
         "export SESSION_MANAGER_ID={session_id}; \
          export CLAUDE_SESSION_MANAGER_ID={session_id}; \
+         {credential_export}\
          unset CLAUDECODE; \
          export ENABLE_TOOL_SEARCH=false; \
          {command}"
@@ -1492,9 +1528,10 @@ mod tests {
 
     #[test]
     fn managed_session_command_exports_canonical_and_legacy_session_ids() {
-        let command = managed_session_command("claude", "session'42");
+        let command = managed_session_command("claude", "session'42", Some("credential'42"));
         assert!(command.contains("export SESSION_MANAGER_ID='session'\\''42'"));
         assert!(command.contains("export CLAUDE_SESSION_MANAGER_ID='session'\\''42'"));
+        assert!(command.contains("export SM_SESSION_CREDENTIAL='credential'\\''42'"));
         assert!(command.contains("unset CLAUDECODE"));
         assert!(command.contains("export ENABLE_TOOL_SEARCH=false"));
         assert!(command.ends_with("; claude"));
@@ -1533,6 +1570,7 @@ mod tests {
         fs::create_dir_all(&working_dir).unwrap();
         let spec = TmuxSessionSpec {
             session_id: "abc12345".to_owned(),
+            session_credential: None,
             tmux_session: "sm-test".to_owned(),
             working_dir: working_dir.display().to_string(),
             log_file: temp_dir.join("session.log"),
@@ -1602,6 +1640,7 @@ mod tests {
         fs::create_dir_all(&working_dir).unwrap();
         let spec = TmuxSessionSpec {
             session_id: "abc12345".to_owned(),
+            session_credential: None,
             tmux_session: "sm-test".to_owned(),
             working_dir: working_dir.display().to_string(),
             log_file: temp_dir.join("session.log"),
@@ -1640,6 +1679,7 @@ mod tests {
         fs::create_dir_all(&working_dir).unwrap();
         let spec = TmuxSessionSpec {
             session_id: "abc12345".to_owned(),
+            session_credential: None,
             tmux_session: "sm-test".to_owned(),
             working_dir: working_dir.display().to_string(),
             log_file: temp_dir.join("session.log"),
@@ -1673,6 +1713,7 @@ mod tests {
         fs::create_dir_all(&working_dir).unwrap();
         let spec = TmuxSessionSpec {
             session_id: "abc12345".to_owned(),
+            session_credential: None,
             tmux_session: "sm-test".to_owned(),
             working_dir: working_dir.display().to_string(),
             log_file: temp_dir.join("session.log"),
