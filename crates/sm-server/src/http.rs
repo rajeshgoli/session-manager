@@ -422,6 +422,9 @@ impl AppState {
                 );
             session_store = session_store.with_usage_report_store(report_store);
         }
+        if let Err(error) = session_store.recover_session_runtime_launches() {
+            eprintln!("session runtime launch recovery failed: {error:#}");
+        }
         if let Err(error) = session_store.recover_pending_codex_fork_handoffs() {
             eprintln!("codex-fork handoff recovery failed: {error:#}");
         }

@@ -884,6 +884,28 @@ impl TmuxRuntime {
         Some(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    pub fn session_input_ready(&self, tmux_session: &str, provider: &str) -> bool {
+        match provider {
+            "codex" | "codex-fork" => self.codex_composer_is_ready(tmux_session, None),
+            _ => self
+                .capture_pane_last_line(tmux_session)
+                .is_some_and(|line| matches!(line.trim(), ">" | "❯")),
+        }
+    }
+
+    pub fn session_has_attached_clients(&self, tmux_session: &str) -> Result<bool> {
+        let output = self
+            .tmux_command(["list-clients", "-t", tmux_session, "-F", "#{client_name}"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .context("failed to list tmux clients")?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    }
+
     pub fn capture_pane_tail(&self, tmux_session: &str, lines: usize) -> Option<String> {
         if lines == 0 {
             return Some(String::new());

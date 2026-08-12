@@ -70,6 +70,7 @@ pub struct SessionStore {
     delivery_runtime: Option<TmuxRuntime>,
     codex_fork_handoff_monitors: Arc<Mutex<BTreeSet<String>>>,
     claude_handoff_workers: Arc<Mutex<BTreeSet<String>>>,
+    credential_rotation_workers: Arc<Mutex<BTreeSet<String>>>,
     seat_session_appends: Arc<Mutex<BTreeSet<(String, String, String)>>>,
     clear_operation_locks: Arc<Mutex<BTreeMap<String, Weak<SessionClearLock>>>>,
     seat_session_store: SeatSessionStore,
@@ -124,6 +125,7 @@ impl SessionStore {
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
             claude_handoff_workers: Arc::new(Mutex::new(BTreeSet::new())),
+            credential_rotation_workers: Arc::new(Mutex::new(BTreeSet::new())),
             seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
@@ -654,6 +656,137 @@ impl SessionStore {
         self
     }
 
+    pub fn recover_session_runtime_launches(&self) -> Result<()> {
+        loop {
+            let launch_id = {
+                let _guard = self.write_guard()?;
+                let state = self.load_raw_json_value()?;
+                session_runtime_launch_records(&state)?
+                    .into_iter()
+                    .find(|record| matches!(record.status.as_str(), "prepared" | "launching"))
+                    .map(|record| record.id)
+            };
+            let Some(launch_id) = launch_id else {
+                return Ok(());
+            };
+            self.recover_session_runtime_launch(&launch_id)?;
+        }
+    }
+
+    fn recover_session_runtime_launch(&self, launch_id: &str) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let Some(mut launch) = session_runtime_launch_records(&state)?
+            .into_iter()
+            .find(|record| record.id == launch_id)
+        else {
+            return Ok(());
+        };
+        if !matches!(launch.status.as_str(), "prepared" | "launching") {
+            return Ok(());
+        }
+        let Some(runtime) = self.delivery_runtime.as_ref() else {
+            mark_runtime_launch_failed(
+                &mut state,
+                launch_id,
+                &launch.session_id,
+                launch.operation_kind == "create",
+                "runtime launch recovery is disabled",
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(());
+        };
+        let session_runtime = runtime.for_socket_name(launch.tmux_socket_name.as_deref());
+        let credential = generate_session_credential();
+        let credential_sha256 = sha256_text(&credential);
+        launch.credential_sha256 = credential_sha256.clone();
+        launch.status = "launching".to_owned();
+        launch.updated_at = now_rfc3339();
+        launch.failure_reason = None;
+        let mut records = session_runtime_launch_records(&state)?;
+        let Some(stored_launch) = records.iter_mut().find(|record| record.id == launch_id) else {
+            return Ok(());
+        };
+        *stored_launch = launch.clone();
+        store_session_runtime_launch_records(&mut state, &records)?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, &launch.session_id) else {
+            mark_runtime_launch_failed(
+                &mut state,
+                launch_id,
+                &launch.session_id,
+                false,
+                "runtime launch session is missing",
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(());
+        };
+        session.insert(
+            "session_credential_sha256".to_owned(),
+            Value::String(credential_sha256),
+        );
+        session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+        session.insert("stopped_at".to_owned(), Value::String(now_rfc3339()));
+        self.write_raw_json_value(&state)?;
+
+        let spec = TmuxSessionSpec {
+            session_id: launch.session_id.clone(),
+            session_credential: Some(credential),
+            tmux_session: launch.tmux_session.clone(),
+            working_dir: launch.working_dir.clone(),
+            log_file: PathBuf::from(&launch.log_file),
+            provider: launch.provider.clone(),
+            initial_message: launch.initial_message.clone(),
+            model: launch.model.clone(),
+            reasoning_effort: launch.reasoning_effort.clone(),
+        };
+        let result = (|| -> Result<()> {
+            if session_runtime.session_exists(&launch.tmux_session)? {
+                session_runtime.kill_session(&launch.tmux_session)?;
+            }
+            if launch.operation_kind == "create" {
+                session_runtime.create_session(&spec)
+            } else {
+                session_runtime.restore_session(
+                    &spec,
+                    &launch.provider,
+                    launch.provider_resume_id.as_deref(),
+                )
+            }
+        })();
+        if let Err(error) = result {
+            mark_runtime_launch_failed(
+                &mut state,
+                launch_id,
+                &launch.session_id,
+                launch.operation_kind == "create",
+                &error.to_string(),
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(());
+        }
+
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, &launch.session_id) else {
+            let _ = session_runtime.kill_session(&launch.tmux_session);
+            mark_runtime_launch_failed(
+                &mut state,
+                launch_id,
+                &launch.session_id,
+                false,
+                "runtime launch session disappeared after recovery",
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(());
+        };
+        session.insert("status".to_owned(), Value::String("running".to_owned()));
+        session.insert("stopped_at".to_owned(), Value::Null);
+        session.insert("last_activity".to_owned(), Value::String(now_rfc3339()));
+        mark_runtime_launch_applied(&mut state, launch_id, launch.provider_resume_id.as_deref())?;
+        self.write_raw_json_value(&state)?;
+        Ok(())
+    }
+
     #[cfg(test)]
     fn new_with_legacy_fallback(state_file: PathBuf, legacy_state_file: PathBuf) -> Self {
         let seat_session_store = SeatSessionStore::for_state_file(&state_file);
@@ -668,6 +801,7 @@ impl SessionStore {
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
             claude_handoff_workers: Arc::new(Mutex::new(BTreeSet::new())),
+            credential_rotation_workers: Arc::new(Mutex::new(BTreeSet::new())),
             seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
@@ -1462,16 +1596,19 @@ impl SessionStore {
             .transpose()?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let mut record = self.build_core_session_record(
-            sessions,
-            &request,
-            log_dir.as_deref(),
-            true,
-            runtime.socket_name(),
-        )?;
+        let mut record = {
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            self.build_core_session_record(
+                sessions,
+                &request,
+                log_dir.as_deref(),
+                true,
+                runtime.socket_name(),
+            )?
+        };
         let session_credential = generate_session_credential();
-        record.session_credential_sha256 = Some(sha256_text(&session_credential));
+        let credential_sha256 = sha256_text(&session_credential);
+        record.session_credential_sha256 = Some(credential_sha256.clone());
         if record.provider == "codex"
             && codex_cli_working_dir.as_deref() != Some(record.working_dir.as_str())
         {
@@ -1496,8 +1633,11 @@ impl SessionStore {
         };
         let codex_fork_artifacts = runtime.codex_fork_runtime_artifacts(&spec)?;
         let codex_cli_creation_binding = (record.provider == "codex").then(|| {
-            let mut excluded_ids = sessions
-                .iter()
+            let mut excluded_ids = state
+                .get("sessions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
                 .filter_map(|session| json_text(session.get("provider_resume_id")))
                 .collect::<BTreeSet<_>>();
             excluded_ids.extend(codex_cli_existing_session_ids(
@@ -1509,7 +1649,46 @@ impl SessionStore {
                 OffsetDateTime::now_utc().unix_timestamp_nanos(),
             )
         });
-        runtime.create_session(&spec)?;
+        let mut launch_records = session_runtime_launch_records(&state)?;
+        let launch_id = generate_unique_runtime_launch_id(&launch_records)?;
+        let launch_time = now_rfc3339();
+        launch_records.push(SessionRuntimeLaunchRecord {
+            id: launch_id.clone(),
+            operation_kind: "create".to_owned(),
+            session_id: record.id.clone(),
+            tmux_session: record.tmux_session.clone(),
+            tmux_socket_name: runtime.socket_name().map(ToOwned::to_owned),
+            working_dir: spec.working_dir.clone(),
+            log_file: spec.log_file.display().to_string(),
+            provider: record.provider.clone(),
+            provider_resume_id: None,
+            credential_rotation_id: None,
+            initial_message: request.initial_message.clone(),
+            model: request.model.clone(),
+            reasoning_effort: request.reasoning_effort.clone(),
+            credential_sha256,
+            status: "launching".to_owned(),
+            created_at: launch_time.clone(),
+            updated_at: launch_time,
+            failure_reason: None,
+        });
+        record.status = "stopped".to_owned();
+        record.stopped_at = Some(now_rfc3339());
+        ensure_sessions_array_mut(&mut state)?.push(serde_json::to_value(&record)?);
+        store_session_runtime_launch_records(&mut state, &launch_records)?;
+        self.write_raw_json_value(&state)?;
+
+        if let Err(error) = runtime.create_session(&spec) {
+            mark_runtime_launch_failed(
+                &mut state,
+                &launch_id,
+                &record.id,
+                true,
+                &error.to_string(),
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Err(error);
+        }
         if let Some((excluded_ids, launched_at_ns)) = codex_cli_creation_binding.as_ref() {
             record.provider_resume_id = wait_for_codex_cli_provider_resume_id(
                 &record,
@@ -1529,6 +1708,14 @@ impl SessionStore {
                 }
                 Err(error) => {
                     let _ = runtime.kill_session(&record.tmux_session);
+                    mark_runtime_launch_failed(
+                        &mut state,
+                        &launch_id,
+                        &record.id,
+                        true,
+                        &error.to_string(),
+                    )?;
+                    self.write_raw_json_value(&state)?;
                     return Err(error).with_context(|| {
                         format!(
                             "codex-fork session {} did not publish a provider resume id",
@@ -1538,7 +1725,18 @@ impl SessionStore {
                 }
             }
         }
-        sessions.push(serde_json::to_value(&record)?);
+        record.status = "running".to_owned();
+        record.stopped_at = None;
+        record.last_activity = now_rfc3339();
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = sessions
+            .iter_mut()
+            .find(|session| session.get("id").and_then(Value::as_str) == Some(record.id.as_str()))
+        else {
+            anyhow::bail!("provisional runtime session {} disappeared", record.id);
+        };
+        *session = serde_json::to_value(&record)?;
+        mark_runtime_launch_applied(&mut state, &launch_id, record.provider_resume_id.as_deref())?;
         if let Err(error) = self.write_raw_json_value(&state) {
             let _ = runtime.kill_session(&record.tmux_session);
             return Err(error);
@@ -2451,12 +2649,11 @@ impl SessionStore {
         else {
             return Err(anyhow::anyhow!("session {session_id} missing log_file"));
         };
-        if session_runtime.session_exists(&record.tmux_session)? {
-            let _ = session_runtime.kill_session(&record.tmux_session)?;
-        }
+        let session_credential = generate_session_credential();
+        let credential_sha256 = sha256_text(&session_credential);
         let spec = TmuxSessionSpec {
             session_id: record.id.clone(),
-            session_credential: Some(generate_session_credential()),
+            session_credential: Some(session_credential),
             tmux_session: record.tmux_session.clone(),
             working_dir: expand_home(&record.working_dir).display().to_string(),
             log_file,
@@ -2466,7 +2663,82 @@ impl SessionStore {
             reasoning_effort: record.reasoning_effort.clone(),
         };
         let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
-        session_runtime.restore_session(&spec, &record.provider, provider_resume_id.as_deref())?;
+        let mut launch_records = session_runtime_launch_records(&state)?;
+        let launch_id = generate_unique_runtime_launch_id(&launch_records)?;
+        let launch_time = now_rfc3339();
+        launch_records.push(SessionRuntimeLaunchRecord {
+            id: launch_id.clone(),
+            operation_kind: "restore".to_owned(),
+            session_id: record.id.clone(),
+            tmux_session: record.tmux_session.clone(),
+            tmux_socket_name: session_runtime.socket_name().map(ToOwned::to_owned),
+            working_dir: spec.working_dir.clone(),
+            log_file: spec.log_file.display().to_string(),
+            provider: record.provider.clone(),
+            provider_resume_id: provider_resume_id.clone(),
+            credential_rotation_id: None,
+            initial_message: None,
+            model: record.model.clone(),
+            reasoning_effort: record.reasoning_effort.clone(),
+            credential_sha256: credential_sha256.clone(),
+            status: "launching".to_owned(),
+            created_at: launch_time.clone(),
+            updated_at: launch_time,
+            failure_reason: None,
+        });
+        {
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(None);
+            };
+            session.insert(
+                "session_credential_sha256".to_owned(),
+                Value::String(credential_sha256),
+            );
+            if stored_provider_resume_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                != provider_resume_id.as_deref()
+            {
+                if let Some(provider_resume_id) = provider_resume_id.as_deref() {
+                    session.insert(
+                        "provider_resume_id".to_owned(),
+                        Value::String(provider_resume_id.to_owned()),
+                    );
+                }
+            }
+            if let Some(transcript_path) = record
+                .transcript_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                session.insert(
+                    "transcript_path".to_owned(),
+                    Value::String(transcript_path.to_owned()),
+                );
+            }
+        }
+        store_session_runtime_launch_records(&mut state, &launch_records)?;
+        self.write_raw_json_value(&state)?;
+
+        if session_runtime.session_exists(&record.tmux_session)? {
+            let _ = session_runtime.kill_session(&record.tmux_session)?;
+        }
+        if let Err(error) =
+            session_runtime.restore_session(&spec, &record.provider, provider_resume_id.as_deref())
+        {
+            mark_runtime_launch_failed(
+                &mut state,
+                &launch_id,
+                &record.id,
+                false,
+                &error.to_string(),
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Err(error);
+        }
 
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = session_object_mut(sessions, session_id) else {
@@ -2480,12 +2752,6 @@ impl SessionStore {
         session.insert("completed_at".to_owned(), Value::Null);
         session.insert("agent_task_completed_at".to_owned(), Value::Null);
         session.insert("last_activity".to_owned(), Value::String(now));
-        session.insert(
-            "session_credential_sha256".to_owned(),
-            Value::String(sha256_text(
-                spec.session_credential.as_deref().unwrap_or_default(),
-            )),
-        );
         if let Some(socket_name) = session_runtime.socket_name() {
             session.insert(
                 "tmux_socket_name".to_owned(),
@@ -2498,10 +2764,10 @@ impl SessionStore {
             .filter(|value| !value.is_empty())
             != provider_resume_id.as_deref()
         {
-            if let Some(provider_resume_id) = provider_resume_id {
+            if let Some(provider_resume_id) = provider_resume_id.as_deref() {
                 session.insert(
                     "provider_resume_id".to_owned(),
-                    Value::String(provider_resume_id),
+                    Value::String(provider_resume_id.to_owned()),
                 );
             }
         }
@@ -2517,6 +2783,7 @@ impl SessionStore {
             );
         }
         let restored = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
+        mark_runtime_launch_applied(&mut state, &launch_id, provider_resume_id.as_deref())?;
         self.write_raw_json_value(&state)?;
         if let Some(provider_resume_id) = provider_resume_id_for_restore(&restored) {
             self.append_seat_session(
@@ -5975,6 +6242,15 @@ pub enum ReparentMutationOutcome {
     Expired,
 }
 
+#[derive(Debug, Clone)]
+pub enum CredentialRotationOutcome {
+    Created(SessionCredentialRotationRecord),
+    Existing(SessionCredentialRotationRecord),
+    SessionNotFound,
+    BadRequest(String),
+    Conflict(String),
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HandoffResult {
     pub status: String,
@@ -8880,6 +9156,28 @@ fn generate_unique_reparent_request_id(records: &[ReparentRequestRecord]) -> Res
     anyhow::bail!("failed to generate unique reparent request id after 64 attempts")
 }
 
+fn generate_unique_runtime_launch_id(records: &[SessionRuntimeLaunchRecord]) -> Result<String> {
+    for _ in 0..64 {
+        let id = generate_session_id();
+        if !records.iter().any(|record| record.id == id) {
+            return Ok(id);
+        }
+    }
+    anyhow::bail!("failed to generate unique runtime launch id after 64 attempts")
+}
+
+fn generate_unique_credential_rotation_id(
+    records: &[SessionCredentialRotationRecord],
+) -> Result<String> {
+    for _ in 0..64 {
+        let id = generate_session_id();
+        if !records.iter().any(|record| record.id == id) {
+            return Ok(id);
+        }
+    }
+    anyhow::bail!("failed to generate unique credential rotation id after 64 attempts")
+}
+
 fn generate_session_credential() -> String {
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
@@ -8962,6 +9260,113 @@ fn store_reparent_request_records(
         "reparent_requests".to_owned(),
         serde_json::to_value(records)?,
     );
+    Ok(())
+}
+
+fn session_runtime_launch_records(state: &Value) -> Result<Vec<SessionRuntimeLaunchRecord>> {
+    state
+        .get("session_runtime_launches")
+        .and_then(Value::as_array)
+        .map(|records| {
+            records
+                .iter()
+                .map(|record| {
+                    serde_json::from_value(record.clone())
+                        .context("failed to parse session runtime launch record")
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn store_session_runtime_launch_records(
+    state: &mut Value,
+    records: &[SessionRuntimeLaunchRecord],
+) -> Result<()> {
+    let object = state
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("session state root must be an object"))?;
+    object.insert(
+        "session_runtime_launches".to_owned(),
+        serde_json::to_value(records)?,
+    );
+    Ok(())
+}
+
+fn session_credential_rotation_records(
+    state: &Value,
+) -> Result<Vec<SessionCredentialRotationRecord>> {
+    state
+        .get("session_credential_rotations")
+        .and_then(Value::as_array)
+        .map(|records| {
+            records
+                .iter()
+                .map(|record| {
+                    serde_json::from_value(record.clone())
+                        .context("failed to parse session credential rotation record")
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| Ok(Vec::new()))
+}
+
+fn store_session_credential_rotation_records(
+    state: &mut Value,
+    records: &[SessionCredentialRotationRecord],
+) -> Result<()> {
+    let object = state
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("session state root must be an object"))?;
+    object.insert(
+        "session_credential_rotations".to_owned(),
+        serde_json::to_value(records)?,
+    );
+    Ok(())
+}
+
+fn mark_runtime_launch_applied(
+    state: &mut Value,
+    launch_id: &str,
+    provider_resume_id: Option<&str>,
+) -> Result<()> {
+    let mut records = session_runtime_launch_records(state)?;
+    let record = records
+        .iter_mut()
+        .find(|record| record.id == launch_id)
+        .ok_or_else(|| anyhow::anyhow!("runtime launch {launch_id} disappeared"))?;
+    record.status = "applied".to_owned();
+    record.updated_at = now_rfc3339();
+    record.failure_reason = None;
+    if let Some(provider_resume_id) = provider_resume_id {
+        record.provider_resume_id = Some(provider_resume_id.to_owned());
+    }
+    store_session_runtime_launch_records(state, &records)
+}
+
+fn mark_runtime_launch_failed(
+    state: &mut Value,
+    launch_id: &str,
+    session_id: &str,
+    remove_provisional_session: bool,
+    failure_reason: &str,
+) -> Result<()> {
+    let mut records = session_runtime_launch_records(state)?;
+    let record = records
+        .iter_mut()
+        .find(|record| record.id == launch_id)
+        .ok_or_else(|| anyhow::anyhow!("runtime launch {launch_id} disappeared"))?;
+    record.status = "failed".to_owned();
+    record.updated_at = now_rfc3339();
+    record.failure_reason = Some(failure_reason.to_owned());
+    store_session_runtime_launch_records(state, &records)?;
+    let sessions = ensure_sessions_array_mut(state)?;
+    if remove_provisional_session {
+        sessions.retain(|session| session.get("id").and_then(Value::as_str) != Some(session_id));
+    } else if let Some(session) = session_object_mut(sessions, session_id) {
+        session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+        session.insert("stopped_at".to_owned(), Value::String(now_rfc3339()));
+    }
     Ok(())
 }
 
@@ -9508,6 +9913,58 @@ pub struct ReparentRequestRecord {
     pub deferred_routing_intents: Vec<ReparentDeferredRoutingIntent>,
     #[serde(default)]
     pub repair_history: Vec<ReparentRepairRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SessionRuntimeLaunchRecord {
+    pub id: String,
+    pub operation_kind: String,
+    pub session_id: String,
+    pub tmux_session: String,
+    #[serde(default)]
+    pub tmux_socket_name: Option<String>,
+    pub working_dir: String,
+    pub log_file: String,
+    pub provider: String,
+    #[serde(default)]
+    pub provider_resume_id: Option<String>,
+    #[serde(default)]
+    pub credential_rotation_id: Option<String>,
+    #[serde(default)]
+    pub initial_message: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    pub credential_sha256: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SessionCredentialRotationRecord {
+    pub id: String,
+    pub session_id: String,
+    pub provider: String,
+    pub provider_resume_id: String,
+    pub tmux_session: String,
+    #[serde(default)]
+    pub tmux_socket_name: Option<String>,
+    pub request_actor: String,
+    pub status: String,
+    pub requested_at: String,
+    #[serde(default)]
+    pub idle_proof_at: Option<String>,
+    #[serde(default)]
+    pub runtime_launch_id: Option<String>,
+    pub updated_at: String,
+    #[serde(default)]
+    pub applied_at: Option<String>,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
 }
 
 impl ReparentRequestRecord {

@@ -12103,7 +12103,7 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
             .as_nanos()
     );
     let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let app = router(AppState::new(AppConfig {
+    let config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
         },
@@ -12128,7 +12128,8 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
             ..RustCoreConfig::default()
         },
         ..AppConfig::default()
-    }));
+    };
+    let app = router(AppState::new(config.clone()));
 
     let (status, payload) = post_json(
         app.clone(),
@@ -12154,6 +12155,17 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
         .unwrap()
         .to_owned();
     assert_eq!(created_credential_hash.len(), 64);
+    assert_eq!(
+        created_state["session_runtime_launches"][0]["status"],
+        "applied"
+    );
+    assert_eq!(
+        created_state["session_runtime_launches"][0]["credential_sha256"],
+        created_credential_hash
+    );
+    assert!(!fs::read_to_string(&state_file)
+        .unwrap()
+        .contains("SM_SESSION_CREDENTIAL"));
     let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
 
     let payload =
@@ -12270,7 +12282,61 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["delivered"], true);
-    wait_for_output_contains(app, "runtimecore", "runtime:restored runtime message").await;
+    wait_for_output_contains(
+        app.clone(),
+        "runtimecore",
+        "runtime:restored runtime message",
+    )
+    .await;
+
+    let mut interrupted_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let launches = interrupted_state["session_runtime_launches"]
+        .as_array_mut()
+        .unwrap();
+    assert_eq!(launches.len(), 2);
+    launches[1]["status"] = json!("launching");
+    launches[1]["updated_at"] = json!("2026-08-11T00:00:00Z");
+    fs::write(
+        &state_file,
+        serde_json::to_vec_pretty(&interrupted_state).unwrap(),
+    )
+    .unwrap();
+    drop(app);
+
+    let recovered_app = router(AppState::new(config));
+    let recovered_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let recovered_hash = recovered_state["sessions"][0]["session_credential_sha256"]
+        .as_str()
+        .unwrap();
+    assert_ne!(recovered_hash, restored_credential_hash);
+    assert_eq!(
+        recovered_state["session_runtime_launches"][1]["status"],
+        "applied"
+    );
+    assert_eq!(
+        recovered_state["session_runtime_launches"][1]["credential_sha256"],
+        recovered_hash
+    );
+    assert!(tmux_session_exists(&tmux_socket, &tmux_session));
+    let (status, payload) = post_json(
+        recovered_app.clone(),
+        "/sessions/runtimecore/input",
+        json!({
+            "text": "recovered launch message",
+            "delivery_mode": "sequential"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    wait_for_output_contains(
+        recovered_app,
+        "runtimecore",
+        "runtime:recovered launch message",
+    )
+    .await;
 }
 
 #[tokio::test]
