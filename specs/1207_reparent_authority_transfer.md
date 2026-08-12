@@ -35,6 +35,8 @@ sm reparent reject <request-id>
 sm reparent status [request-id]
 sm reparent repair <request-id> --resume
 sm reparent repair <request-id> --rollback-precommit
+sm recredential <session>
+sm recredential --all-live
 sm adopt <child>
 ```
 
@@ -106,9 +108,31 @@ impersonate an agent approval.
 The same per-session credential gate applies to request creation. Credential
 material is never returned by session/list APIs, written to logs, included in
 notifications, or persisted in plaintext. Existing live sessions without a
-verifier cannot approve after deployment until Session Manager rotates a
-credential into that runtime; rollout must provide an explicit credential
-rotation path and must not fall back to trusting an ID-only payload.
+verifier cannot approve after deployment until Session Manager relaunches that
+runtime with a credential. The operator-authenticated `sm recredential` command
+provides that path; it never falls back to trusting an ID-only payload.
+
+Recredentialing is a durable, idle-only relaunch of the same seat and provider
+thread, not an attempt to mutate a running process environment. Before stopping
+anything, the server must prove the provider has resumable identity, persist a
+rotation record, acquire the session input fence, and verify that the provider
+turn is idle and its input queue is drained. Idle proof must be observed after
+the rotation was requested (a fresh Claude prompt/Stop boundary or Codex
+lifecycle event), not inferred from a stale projected status. Busy or unproven
+seats remain `waiting_idle` and are retried by the provider Stop/event path.
+The relaunch preserves the Session Manager ID, parent graph, task metadata, and
+provider resume ID; it rotates the runtime credential and verifier. A crash
+after the old runtime is
+stopped resumes the recorded relaunch on startup. If resumability or readiness
+cannot be established, the old runtime remains untouched and the rotation
+fails closed. There is no force-active mode in this epic.
+
+Deployment does not silently relaunch the fleet. After the merged server is
+healthy, the maintainer runs `sm recredential --all-live`; the command reports
+which seats were rotated, waiting for idle, already credentialed, or failed.
+Until a legacy seat completes this bootstrap, reparent commands fail with the
+exact `sm recredential <session>` remediation. Newly created and normally
+restored seats already receive credentials and need no bootstrap.
 
 Session Manager agents share one operating-system account and filesystem. A
 hostile same-UID process with arbitrary process-inspection capability is outside
@@ -131,8 +155,8 @@ conflicting or unauthorized decisions fail.
 Requests expire after 24 hours by default. Expiration and staleness are evaluated
 under the session-state write lock before every read that claims actionability
 and before every decision or pre-quiesce apply attempt. An `applying` request at
-or beyond `routing_quiesced` never expires; recovery must finish its immutable
-transaction.
+or beyond `json_routing_quiesced` never expires; recovery must finish its
+immutable transaction.
 
 ## Durable model
 
@@ -157,8 +181,9 @@ decided_at
 applied_at
 failure_reason
 topology_fingerprint
-apply_stage                nullable | routing_quiesced |
-                           authority_committed | repair_rolled_back
+apply_stage                nullable | json_routing_quiesced |
+                           routing_quiesced | authority_committed |
+                           repair_rolled_back
 apply_plan                 nullable while pending; immutable once applying
 notification_intents[]     deterministic event/recipient delivery records
 repair_history[]           actor, action, prior failure, timestamp,
@@ -184,6 +209,8 @@ of parent-derived wake/message metadata for that child is deferred behind the
 transaction. After `authority_committed`, deferred creation derives the new
 canonical parent. Every parent-derived route creation path must use this fence;
 direct queue-table writes are not permitted.
+Parent-derived route reads and mutations, including task-complete fallback and
+deactivation, use the same fence; it is not limited to creation.
 
 The topology fingerprint is a canonical hash over operation kind, subject,
 target, expected parent, and sorted frozen live children. Revalidation compares
@@ -196,6 +223,14 @@ requests with reason `legacy proposal requires a new consent request`, or are
 left read-only while the new projection exposes the same reason. Either shape
 must preserve the old data and prevent old one-party approvals from becoming
 new authority.
+
+Credential bootstrap uses a separate top-level
+`session_credential_rotations` collection. Each record freezes the session ID,
+provider, provider resume ID, original tmux/runtime identity, request actor,
+status (`waiting_idle | relaunching | applied | failed`), requested event
+cursor/timestamp, later idle proof, timestamps, and failure reason. It never
+contains the plaintext credential. Only one active rotation may cover a seat,
+and successful records are idempotent audit history.
 
 ## Validation
 
@@ -212,7 +247,7 @@ Request creation and apply both reject:
 - tree promotion where target is not source's live direct child;
 - duplicate active requests whose affected edge sets overlap;
 - any request whose affected edge set overlaps a `failed` transaction that
-  reached `routing_quiesced` or later and has not been explicitly repaired;
+  reached `json_routing_quiesced` or later and has not been explicitly repaired;
 - a topology that changed after request creation.
 
 Apply revalidates all identities, liveness, topology, consent, and cycle
@@ -256,21 +291,25 @@ therefore a recoverable, fail-closed staged operation:
 1. Under the session write lock, revalidate and persist `status=applying` with
    the complete immutable plan. Parent edges remain unchanged.
 2. Through the queue coordinator's routing fence, stop and remove each affected
-   in-memory parent-wake task/registration, then in one SQLite transaction
-   idempotently quiesce affected parent-derived wake registrations and pending
-   wake metadata. Persist
-   `apply_stage=routing_quiesced` in JSON. A replay accepts either each plan
-   entry's recorded pre-state or its exact already-quiesced state; any third
-   state fails closed. On process restart, inactive SQLite rows cannot recreate
-   the stopped runtime tasks.
+   in-memory parent-wake task/registration. Under the session-state lock,
+   atomically mark every affected retained JSON parent-wake registration
+   inactive and persist `apply_stage=json_routing_quiesced`. Task-complete and
+   all other fallback reads treat that record as inactive, so they cannot route
+   to the old parent. Then, in one SQLite transaction, idempotently quiesce
+   affected parent-derived wake registrations and pending wake metadata and
+   persist `apply_stage=routing_quiesced` in JSON. A replay accepts either each
+   plan entry's recorded pre-state or its exact already-quiesced state; any
+   third state fails closed. On process restart, inactive JSON and SQLite rows
+   cannot recreate the stopped runtime tasks.
 3. In one atomic JSON replacement, update all parent edges and JSON-backed
    routing, and persist `apply_stage=authority_committed`. Dynamic
    task-complete and wait-monitor delivery now resolves this canonical edge.
 4. In one idempotent SQLite transaction, retarget and reactivate affected
-   parent-derived routes, then recreate their in-memory registrations/tasks
-   with the new target under the routing fence and mark the JSON request
-   `applied`. Replay accepts an already-correct runtime registration and never
-   starts a duplicate task.
+   parent-derived routes. Under the state lock, retarget and reactivate the
+   retained JSON registrations, then recreate their in-memory tasks with the
+   new target under the routing fence and mark the JSON request `applied`.
+   Replay accepts an already-correct runtime registration and never starts a
+   duplicate task.
 
 An interruption before step 3 exposes no new destructive authority and leaves
 old-parent routing paused rather than misdirected. An interruption after step 3
@@ -283,10 +322,10 @@ recorded transaction or reports a durable `failed` state requiring operator
 repair; it never silently rolls authority back to a topology that may already
 have been observed.
 
-A `failed` request at or beyond `routing_quiesced` remains a durable quarantine,
-not a released terminal edge. Its complete affected edge set stays reserved by
-the overlap fence, parent-derived route creation remains deferred for those
-children, and no later request may include any reserved edge. Only an
+A `failed` request at or beyond `json_routing_quiesced` remains a durable
+quarantine, not a released terminal edge. Its complete affected edge set stays
+reserved by the overlap fence, parent-derived route creation remains deferred
+for those children, and no later request may include any reserved edge. Only an
 authenticated operator repair action may either resume the immutable plan or
 restore and verify its exact pre-commit state before clearing the quarantine.
 Merely rejecting, expiring, deleting, or recreating the request cannot release
@@ -296,9 +335,10 @@ The authenticated human repair route supports exactly two audited actions:
 
 1. `resume` records a repair attempt, changes `failed` back to `applying`, and
    retries the same immutable plan from its persisted stage. It never replans.
-2. `rollback_precommit` is accepted only from `routing_quiesced`, before
-   `authority_committed`. Under the routing fence, the server restores every
-   route to the apply plan's exact recorded pre-state, verifies all parent edges
+2. `rollback_precommit` is accepted only from `json_routing_quiesced` or
+   `routing_quiesced`, before `authority_committed`. Under the routing fence,
+   the server restores every route to the apply plan's exact recorded
+   pre-state, verifies all parent edges
    still match the old topology and all runtime/JSON/SQLite routes match that
    pre-state, then atomically records `status=repaired` and
    `apply_stage=repair_rolled_back`. Any mismatch leaves the request failed and
@@ -346,6 +386,8 @@ POST /reparent-requests/{request_id}/reject
 POST /reparent-requests/{request_id}/human-approve
 POST /reparent-requests/{request_id}/human-reject
 POST /reparent-requests/{request_id}/repair
+POST /sessions/{session_id}/credential-rotation
+GET  /session-credential-rotations
 ```
 
 Creation payloads carry `requester_session_id`; decision payloads carry the same
@@ -355,6 +397,9 @@ Operator watch can list all pending human-gated requests.
 The repair route is operator-authenticated only and accepts
 `action=resume|rollback_precommit`; an agent session credential cannot invoke
 it. `sm watch` exposes the same actions with the stage-specific safety text.
+Credential-rotation routes are also operator-authenticated only. The create
+route returns the durable rotation state; repeated calls return the existing
+active or already-applied record rather than scheduling a second relaunch.
 
 HTTP status conventions:
 
@@ -396,7 +441,9 @@ events retain the parent/seat metadata recorded when they occurred.
 
 Add the durable request schema, legacy migration/projection, topology planning,
 consent state machine, expiry/staleness handling, read/decision HTTP API, and
-focused tests. No request may apply yet.
+focused tests. Add runtime credential issue/verification plus the durable
+idle-only credential-rotation API and recovery path. No reparent request may
+apply yet.
 
 ### Phase 1 - #1208
 
@@ -432,6 +479,9 @@ PR targets `main`. Partial phases are not deployed.
   durable stage.
 - Post-quiesce failures retain their overlap/routing fence; only a successful
   immutable-plan retry or verified pre-commit rollback releases it.
+- A pre-deployment live seat is recredentialed only after it becomes idle, keeps
+  its seat and provider-thread identity, and recovers a crash after stop without
+  accepting input under two runtimes.
 - Legacy pending adoption records cannot auto-apply.
 - Rust CLI parser/dispatch and Python watch interaction tests pass.
 - Full Rust and retained Python test suites pass, or any demonstrably preexisting
