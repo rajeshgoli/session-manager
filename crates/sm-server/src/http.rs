@@ -525,18 +525,84 @@ struct GhPrViewPayload {
     state: Option<String>,
 }
 
+const GH_TRANSPORT_ATTEMPTS: usize = 3;
+const GH_TRANSPORT_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+fn github_transport_error(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    [
+        "x509:",
+        "tls:",
+        "failed to verify certificate",
+        "certificate signed by unknown authority",
+        "could not resolve host",
+        "temporary failure in name resolution",
+        "connection reset",
+        "connection refused",
+        "connection timed out",
+        "network is unreachable",
+        "unexpected eof",
+        "context deadline exceeded",
+        "timed out after",
+    ]
+    .iter()
+    .any(|needle| detail.contains(needle))
+}
+
+fn retry_github_transport<F, S>(
+    mut operation: F,
+    mut sleep_before_retry: S,
+) -> Result<Output, String>
+where
+    F: FnMut() -> Result<Output, String>,
+    S: FnMut(),
+{
+    for attempt in 1..=GH_TRANSPORT_ATTEMPTS {
+        let result = operation();
+        let transport_detail = match &result {
+            Ok(output) if !output.status.success() => {
+                let detail = command_stderr(output);
+                github_transport_error(&detail).then_some(detail)
+            }
+            Err(error) => Some(error.clone()),
+            _ => None,
+        };
+        if let Some(detail) = transport_detail {
+            if attempt < GH_TRANSPORT_ATTEMPTS {
+                sleep_before_retry();
+                continue;
+            }
+            return Err(format!(
+                "GitHub transport failure after {GH_TRANSPORT_ATTEMPTS} attempts: {detail}"
+            ));
+        }
+        return result;
+    }
+    unreachable!("GitHub transport retry loop always returns")
+}
+
+fn gh_command_output(args: &[String], timeout_duration: Duration) -> Result<Output, String> {
+    retry_github_transport(
+        || {
+            let mut command = Command::new("gh");
+            command.args(args);
+            command_output_with_timeout(command, timeout_duration)
+        },
+        || thread::sleep(GH_TRANSPORT_RETRY_DELAY),
+    )
+}
+
 fn validate_open_pr_with_gh(repo: &str, pr_number: i64) -> Result<(), String> {
-    let mut command = Command::new("gh");
-    command.args([
-        "pr",
-        "view",
-        &pr_number.to_string(),
-        "--repo",
-        repo,
-        "--json",
-        "number,state,title,url",
-    ]);
-    let output = command_output_with_timeout(command, Duration::from_secs(10))
+    let args = vec![
+        "pr".to_owned(),
+        "view".to_owned(),
+        pr_number.to_string(),
+        "--repo".to_owned(),
+        repo.to_owned(),
+        "--json".to_owned(),
+        "number,state,title,url".to_owned(),
+    ];
+    let output = gh_command_output(&args, Duration::from_secs(10))
         .map_err(|error| format!("gh pr view failed: {error}"))?;
     if !output.status.success() {
         return Err(format!(
@@ -567,17 +633,16 @@ fn post_pr_review_comment_with_gh(
         Some(steer) => format!("@codex review for {steer}"),
         None => "@codex review".to_owned(),
     };
-    let mut command = Command::new("gh");
-    command.args([
-        "pr",
-        "comment",
-        &pr_number.to_string(),
-        "--repo",
-        repo,
-        "--body",
-        &body,
-    ]);
-    let output = command_output_with_timeout(command, Duration::from_secs(30))
+    let args = vec![
+        "pr".to_owned(),
+        "comment".to_owned(),
+        pr_number.to_string(),
+        "--repo".to_owned(),
+        repo.to_owned(),
+        "--body".to_owned(),
+        body,
+    ];
+    let output = gh_command_output(&args, Duration::from_secs(30))
         .map_err(|error| format!("gh pr comment failed: {error}"))?;
     if !output.status.success() {
         return Err(format!("gh pr comment failed: {}", command_stderr(&output)));
@@ -626,22 +691,21 @@ fn command_output_with_timeout(
 
 fn gh_api_json(repo: &str, endpoint: &str, paginate: bool) -> Result<Value, String> {
     let (owner, repo_name) = split_github_repo(repo)?;
-    let mut command = Command::new("gh");
-    command.args([
-        "api",
-        &format!(
+    let mut args = vec![
+        "api".to_owned(),
+        format!(
             "repos/{}/{}/{}",
             owner,
             repo_name,
             endpoint.trim_start_matches('/')
         ),
-        "-H",
-        "Accept: application/vnd.github+json",
-    ]);
+        "-H".to_owned(),
+        "Accept: application/vnd.github+json".to_owned(),
+    ];
     if paginate {
-        command.args(["--paginate", "--slurp"]);
+        args.extend(["--paginate".to_owned(), "--slurp".to_owned()]);
     }
-    let output = command_output_with_timeout(command, Duration::from_secs(30))
+    let output = gh_command_output(&args, Duration::from_secs(30))
         .map_err(|error| format!("gh api failed: {error}"))?;
     if !output.status.success() {
         return Err(format!("gh api failed: {}", command_stderr(&output)));
@@ -801,17 +865,16 @@ fn find_fresh_codex_review_or_comment_with_gh_filtered(
 }
 
 fn latest_codex_review_snapshot(repo: &str, pr_number: i64) -> Result<Option<Value>, String> {
-    let mut command = Command::new("gh");
-    command.args([
-        "pr",
-        "view",
-        &pr_number.to_string(),
-        "--repo",
-        repo,
-        "--json",
-        "url,latestReviews",
-    ]);
-    let output = command_output_with_timeout(command, Duration::from_secs(30))
+    let args = vec![
+        "pr".to_owned(),
+        "view".to_owned(),
+        pr_number.to_string(),
+        "--repo".to_owned(),
+        repo.to_owned(),
+        "--json".to_owned(),
+        "url,latestReviews".to_owned(),
+    ];
+    let output = gh_command_output(&args, Duration::from_secs(30))
         .map_err(|error| format!("gh pr view failed: {error}"))?;
     if !output.status.success() {
         return Err(format!("gh pr view failed: {}", command_stderr(&output)));
@@ -967,6 +1030,19 @@ fn codex_review_store_error(error: anyhow::Error) -> ApiError {
     ApiError::Status {
         status: StatusCode::BAD_GATEWAY,
         detail: format!("Failed to request Codex review: {detail}"),
+    }
+}
+
+fn codex_review_poster_error(error: String) -> ApiError {
+    if error.contains("GitHub transport failure after") {
+        return ApiError::Status {
+            status: StatusCode::BAD_GATEWAY,
+            detail: error,
+        };
+    }
+    ApiError::Status {
+        status: StatusCode::BAD_REQUEST,
+        detail: error,
     }
 }
 
@@ -4137,10 +4213,7 @@ async fn create_codex_review_request(
             status: StatusCode::BAD_GATEWAY,
             detail: format!("Failed to request Codex review: {error}"),
         })?
-        .map_err(|error| ApiError::Status {
-            status: StatusCode::BAD_REQUEST,
-            detail: error,
-        })?;
+        .map_err(codex_review_poster_error)?;
 
         let registration = RetainedQueueStore::create_codex_review_request_in_path(
             &queue_db_path,
@@ -13216,6 +13289,67 @@ mod tests {
         let mut disabled_custom = UsageConfig::default();
         disabled_custom.db_path = "/tmp/custom-usage.db".to_owned();
         assert!(should_use_configured_usage_db_path(&disabled_custom));
+    }
+
+    #[test]
+    fn github_transport_retry_recovers_and_preserves_semantic_failures() {
+        let mut attempts = 0;
+        let recovered = retry_github_transport(
+            || {
+                attempts += 1;
+                if attempts < 3 {
+                    Err("tls: failed to verify certificate: x509: certificate signed by unknown authority".to_owned())
+                } else {
+                    Command::new("/usr/bin/true")
+                        .output()
+                        .map_err(|error| error.to_string())
+                }
+            },
+            || {},
+        )
+        .unwrap();
+        assert!(recovered.status.success());
+        assert_eq!(attempts, 3);
+
+        attempts = 0;
+        let semantic = retry_github_transport(
+            || {
+                attempts += 1;
+                Command::new("/usr/bin/false")
+                    .output()
+                    .map_err(|error| error.to_string())
+            },
+            || {},
+        )
+        .unwrap();
+        assert!(!semantic.status.success());
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn github_transport_retry_exhaustion_leads_with_the_transport_cause() {
+        let mut attempts = 0;
+        let error = retry_github_transport(
+            || {
+                attempts += 1;
+                Err("Post api.github.com: connection reset by peer".to_owned())
+            },
+            || {},
+        )
+        .unwrap_err();
+
+        assert_eq!(attempts, GH_TRANSPORT_ATTEMPTS);
+        assert_eq!(
+            error,
+            "GitHub transport failure after 3 attempts: Post api.github.com: connection reset by peer"
+        );
+        assert!(matches!(
+            codex_review_poster_error(error),
+            ApiError::Status {
+                status: StatusCode::BAD_GATEWAY,
+                ..
+            }
+        ));
     }
 
     #[test]
