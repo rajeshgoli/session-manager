@@ -2234,11 +2234,12 @@ impl SessionStore {
                 }
             }
         }
-        if self
+        let repaired = self
             .get_reparent_request(request_id)?
-            .is_some_and(|record| matches!(record.status.as_str(), "applied" | "repaired"))
-        {
+            .filter(|record| matches!(record.status.as_str(), "applied" | "repaired"));
+        if repaired.is_some() {
             self.verify_reparent_repair(request_id, &attempted_at)?;
+            self.reconcile_reparent_requests()?;
         }
         Ok(self
             .get_reparent_request(request_id)?
@@ -2280,23 +2281,21 @@ impl SessionStore {
         let queue_projection = if let (Some(queue), Some(plan)) =
             (self.queue_store.as_ref(), record.apply_plan.as_ref())
         {
-            let parent = plan
+            let change = plan
                 .edge_changes
                 .first()
-                .and_then(|change| {
-                    if record.status == "repaired" {
-                        change.expected_parent_session_id.as_deref()
-                    } else {
-                        change.new_parent_session_id.as_deref()
-                    }
-                })
-                .context("verified reparent plan has no resolved parent")?;
-            let child = plan
-                .edge_changes
-                .first()
-                .map(|change| change.session_id.as_str())
                 .context("verified reparent plan has no subject")?;
-            serde_json::to_value(queue.snapshot_parent_routing(child, parent)?)?
+            let parent = if record.status == "repaired" {
+                change.expected_parent_session_id.as_deref()
+            } else {
+                change.new_parent_session_id.as_deref()
+            };
+            match parent {
+                Some(parent) => serde_json::to_value(
+                    queue.snapshot_parent_routing(&change.session_id, parent)?,
+                )?,
+                None => serde_json::to_value(ParentRoutingSnapshot::default())?,
+            }
         } else {
             Value::Null
         };
@@ -3015,18 +3014,27 @@ impl SessionStore {
             let old_parent = plan
                 .edge_changes
                 .first()
-                .and_then(|change| change.expected_parent_session_id.clone())
-                .context("pre-commit rollback requires an old parent")?;
+                .context("reparent apply plan has no edge changes")?
+                .expected_parent_session_id
+                .clone();
             (plan.clone(), queue_snapshot_from_plan(&plan)?, old_parent)
         };
-        let delivered_message_rows = if let Some(queue) = self.queue_store.as_ref() {
-            queue
-                .retarget_parent_routing(&snapshot, &old_parent)?
-                .delivered_message_rows
-        } else if !snapshot.wake_rows.is_empty() || !snapshot.message_rows.is_empty() {
-            anyhow::bail!("reparent plan requires the retained queue store")
-        } else {
-            Vec::new()
+        let delivered_message_rows = match (self.queue_store.as_ref(), old_parent.as_deref()) {
+            (Some(queue), Some(old_parent)) => {
+                queue
+                    .retarget_parent_routing(&snapshot, old_parent)?
+                    .delivered_message_rows
+            }
+            (_, None) if snapshot.wake_rows.is_empty() && snapshot.message_rows.is_empty() => {
+                Vec::new()
+            }
+            (_, None) => anyhow::bail!("parentless reparent plan contains old-parent routes"),
+            (None, Some(_))
+                if !snapshot.wake_rows.is_empty() || !snapshot.message_rows.is_empty() =>
+            {
+                anyhow::bail!("reparent plan requires the retained queue store")
+            }
+            (None, Some(_)) => Vec::new(),
         };
         self.persist_delivered_reparent_wake_intents(request_id, &delivered_message_rows)?;
         {
@@ -3510,6 +3518,8 @@ impl SessionStore {
             if let Some(request_id) = active_reparent_route_request_for_session(&state, session_id)?
             {
                 let key = format!("parent-input:{}", generate_session_id());
+                let metadata =
+                    queue_metadata_for_send_request(&state, session_id, &request, sender_name);
                 persist_deferred_parent_input_intent(
                     &mut state,
                     &request_id,
@@ -3517,8 +3527,7 @@ impl SessionStore {
                     session_id,
                     &queued_text,
                     &delivery_mode,
-                    &request,
-                    sender_name.as_deref(),
+                    &metadata,
                 )?;
                 self.write_raw_json_value(&state)?;
                 return Ok(Some(CoreInputResult {
@@ -8520,8 +8529,7 @@ fn persist_deferred_parent_input_intent(
     target_session_id: &str,
     text: &str,
     delivery_mode: &str,
-    request: &SendCoreInputRequest,
-    sender_name: Option<&str>,
+    metadata: &QueueMessageMetadata,
 ) -> Result<()> {
     let mut records = reparent_request_records(state)?;
     let record = records
@@ -8542,16 +8550,16 @@ fn persist_deferred_parent_input_intent(
                 payload: json!({
                     "text": text,
                     "delivery_mode": delivery_mode,
-                    "sender_session_id": request.sender_session_id,
-                    "sender_name": sender_name,
-                    "from_sm_send": request.from_sm_send,
-                    "timeout_seconds": request.timeout_seconds,
-                    "notify_on_delivery": request.notify_on_delivery,
-                    "notify_after_seconds": request.notify_after_seconds,
-                    "notify_on_stop": request.notify_on_stop,
-                    "remind_soft_threshold": request.remind_soft_threshold,
-                    "remind_hard_threshold": request.remind_hard_threshold,
-                    "remind_cancel_on_reply_session_id": request.remind_cancel_on_reply_session_id,
+                    "sender_session_id": metadata.sender_session_id,
+                    "sender_name": metadata.sender_name,
+                    "from_sm_send": metadata.from_sm_send,
+                    "timeout_seconds": metadata.timeout_seconds,
+                    "notify_on_delivery": metadata.notify_on_delivery,
+                    "notify_after_seconds": metadata.notify_after_seconds,
+                    "notify_on_stop": metadata.notify_on_stop,
+                    "remind_soft_threshold": metadata.remind_soft_threshold,
+                    "remind_hard_threshold": metadata.remind_hard_threshold,
+                    "remind_cancel_on_reply_session_id": metadata.remind_cancel_on_reply_session_id,
                 }),
                 created_at: now_rfc3339(),
                 replayed_at: None,
@@ -17517,6 +17525,86 @@ mod tests {
     }
 
     #[test]
+    fn parentless_precommit_reparent_rolls_back_without_stranding_the_lease() {
+        let state_file = unique_temp_path("reparent-parentless-rollback");
+        let queue_db = state_file.with_extension("db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("newpar01", None, "new-parent-secret"),
+                    reparent_test_session("child001", None, "child-secret")
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue.ensure_schema().unwrap();
+        let store = SessionStore::new_with_queue(state_file.clone(), queue_db.clone());
+        let request = match store
+            .create_reparent_request(
+                "child001",
+                CreateReparentRequest {
+                    requester_session_id: "newpar01".to_owned(),
+                    target_parent_session_id: "newpar01".to_owned(),
+                },
+                "new-parent-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Created(record) => record,
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            let mut records = reparent_request_records(&state).unwrap();
+            let record = records
+                .iter_mut()
+                .find(|record| record.id == request.id)
+                .unwrap();
+            record.approvals.push(ReparentApprovalRecord {
+                actor_kind: "human".to_owned(),
+                actor_id: "owner@example.com".to_owned(),
+                decision: "approved".to_owned(),
+                decided_at: now_rfc3339(),
+            });
+            record.ready_to_apply = true;
+            store_reparent_request_records(&mut state, &records).unwrap();
+            store.write_raw_json_value(&state).unwrap();
+        }
+
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request.id).unwrap();
+        store.quiesce_reparent_queue_routing(&request.id).unwrap();
+        store
+            .fail_reparent_apply(&request.id, "injected parentless failure")
+            .unwrap();
+        let repaired = store
+            .repair_reparent_request(
+                &request.id,
+                "owner@example.com",
+                ReparentRepairAction::RollbackPrecommit,
+            )
+            .unwrap();
+        assert!(matches!(repaired, ReparentMutationOutcome::Updated(_)));
+
+        let state = store.load_raw_json_value().unwrap();
+        assert!(state["reparent_apply_lease"].is_null());
+        assert!(raw_session_object(&state, "child001")
+            .unwrap()
+            .get("parent_session_id")
+            .is_none_or(Value::is_null));
+        let record = store.get_reparent_request(&request.id).unwrap().unwrap();
+        assert_eq!(record.status, "repaired");
+        assert_eq!(record.apply_stage.as_deref(), Some("repair_rolled_back"));
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
     fn authority_committed_reparent_resumes_forward_from_immutable_plan() {
         let (store, queue, state_file, queue_db, request_id) =
             prepared_reparent_transaction("reparent-forward-recovery");
@@ -17647,9 +17735,9 @@ mod tests {
                     sender_session_id: None,
                     from_sm_send: false,
                     timeout_seconds: None,
-                    notify_on_delivery: false,
-                    notify_after_seconds: None,
-                    notify_on_stop: false,
+                    notify_on_delivery: true,
+                    notify_after_seconds: Some(15),
+                    notify_on_stop: true,
                     remind_soft_threshold: Some(600),
                     remind_hard_threshold: None,
                     remind_cancel_on_reply_session_id: None,
@@ -17671,6 +17759,9 @@ mod tests {
         let messages = queue.pending_messages_for_target("child001", 10).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].parent_session_id.as_deref(), Some("newpar01"));
+        assert!(!messages[0].notify_on_delivery);
+        assert_eq!(messages[0].notify_after_seconds, None);
+        assert!(!messages[0].notify_on_stop);
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }
