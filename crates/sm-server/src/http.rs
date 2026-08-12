@@ -120,13 +120,13 @@ use crate::sessions::{
     ContextMonitorRequest, ContextSnapshotResponse, ContextUsageEvent, ContextUsageOutcome,
     CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
     CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, CreateReparentRequest,
-    DecideReparentRequest, HandoffOutcome, HandoffRequest, MaintainerMutationOutcome,
-    RegistryMutationOutcome, ReparentDecision, ReparentMutationOutcome, RoleRegistrationRequest,
-    SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest, SendCoreInputRequest,
-    SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
-    SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest, SubagentStartOutcome,
-    SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest, TaskCompleteOutcome,
-    TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
+    CredentialRotationOutcome, DecideReparentRequest, HandoffOutcome, HandoffRequest,
+    MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision, ReparentMutationOutcome,
+    RoleRegistrationRequest, SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest,
+    SendCoreInputRequest, SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore,
+    SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest,
+    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
+    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
 };
 
 use crate::studio_ssh::{self, StudioSshStatus};
@@ -424,6 +424,9 @@ impl AppState {
         }
         if let Err(error) = session_store.recover_session_runtime_launches() {
             eprintln!("session runtime launch recovery failed: {error:#}");
+        }
+        if let Err(error) = session_store.recover_session_credential_rotation_workers() {
+            eprintln!("session credential rotation recovery failed: {error:#}");
         }
         if let Err(error) = session_store.recover_pending_codex_fork_handoffs() {
             eprintln!("codex-fork handoff recovery failed: {error:#}");
@@ -1045,6 +1048,10 @@ pub fn router(state: AppState) -> Router {
         .route("/usage/accounts", get(get_account_usage))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/reparent-requests", get(list_reparent_requests))
+        .route(
+            "/session-credential-rotations",
+            get(list_session_credential_rotations),
+        )
         .route("/reparent-requests/{request_id}", get(get_reparent_request))
         .route(
             "/reparent-requests/{request_id}/approve",
@@ -1066,6 +1073,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/sessions/{session_id}/reparent-requests",
             post(create_reparent_request),
+        )
+        .route(
+            "/sessions/{session_id}/credential-rotation",
+            post(create_session_credential_rotation),
         )
         .route("/sessions/{session_id}/usage", get(get_session_usage))
         .route("/sessions/{session_id}/review", post(start_session_review))
@@ -2847,6 +2858,56 @@ async fn list_reparent_requests(
     Ok(Json(json!({
         "requests": state.session_store.list_reparent_requests()?,
     })))
+}
+
+async fn list_session_credential_rotations(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    if request_actor_email(&state.config, &request).is_none() {
+        return Err(ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Operator authentication is required".to_owned(),
+        });
+    }
+    Ok(Json(json!({
+        "rotations": state.session_store.list_session_credential_rotations()?,
+    })))
+}
+
+async fn create_session_credential_rotation(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(&state)?;
+    ensure_session_read_allowed(&state, &request)?;
+    let request_actor =
+        request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Operator authentication is required".to_owned(),
+        })?;
+    match state
+        .session_store
+        .create_session_credential_rotation(&session_id, &request_actor)?
+    {
+        CredentialRotationOutcome::Created(record) => {
+            Ok((StatusCode::CREATED, Json(serde_json::to_value(record)?)).into_response())
+        }
+        CredentialRotationOutcome::Existing(record) => {
+            Ok(Json(serde_json::to_value(record)?).into_response())
+        }
+        CredentialRotationOutcome::SessionNotFound => Err(ApiError::NotFound("Session not found")),
+        CredentialRotationOutcome::BadRequest(detail) => Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail,
+        }),
+        CredentialRotationOutcome::Conflict(detail) => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail,
+        }),
+    }
 }
 
 async fn get_reparent_request(

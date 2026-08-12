@@ -49,7 +49,7 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tower::ServiceExt;
 
@@ -12117,7 +12117,7 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
             log_dir: Some(log_dir.display().to_string()),
             tmux_socket_name: Some(tmux_socket.clone()),
             runtime_command: Some(
-                r#"/bin/sh -lc 'while IFS= read -r line; do printf "argv:%s\nids:%s:%s:%s\nruntime:%s\n" "$*" "$SESSION_MANAGER_ID" "$CLAUDE_SESSION_MANAGER_ID" "$ENABLE_TOOL_SEARCH" "$line"; done' runtime-sh"#
+                r#"/bin/sh -lc 'while IFS= read -r line; do printf "argv:%s\nids:%s:%s:%s\nruntime:%s\n>\n" "$*" "$SESSION_MANAGER_ID" "$CLAUDE_SESSION_MANAGER_ID" "$ENABLE_TOOL_SEARCH" "$line"; done' runtime-sh"#
                     .to_owned(),
             ),
             runtime_prompt_mode: Some("stdin".to_owned()),
@@ -12297,6 +12297,7 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     assert_eq!(launches.len(), 2);
     launches[1]["status"] = json!("launching");
     launches[1]["updated_at"] = json!("2026-08-11T00:00:00Z");
+    interrupted_state["sessions"][0]["provider_resume_id"] = json!("runtime-thread-1");
     fs::write(
         &state_file,
         serde_json::to_vec_pretty(&interrupted_state).unwrap(),
@@ -12304,7 +12305,7 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     .unwrap();
     drop(app);
 
-    let recovered_app = router(AppState::new(config));
+    let recovered_app = router(AppState::new(config.clone()));
     let recovered_state: Value =
         serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
     let recovered_hash = recovered_state["sessions"][0]["session_credential_sha256"]
@@ -12332,11 +12333,133 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["delivered"], true);
     wait_for_output_contains(
-        recovered_app,
+        recovered_app.clone(),
         "runtimecore",
         "runtime:recovered launch message",
     )
     .await;
+
+    let hash_before_rotation = recovered_hash.to_owned();
+    let (status, rotation) = post_json_with_headers_and_peer(
+        recovered_app.clone(),
+        "/sessions/runtimecore/credential-rotation",
+        json!({}),
+        &[("host", "127.0.0.1")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(rotation["status"], "waiting_idle");
+    let waiting_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert_eq!(
+        waiting_state["sessions"][0]["session_credential_sha256"],
+        hash_before_rotation
+    );
+
+    let (status, payload) = post_json(
+        recovered_app.clone(),
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "runtimecore"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload, json!({ "status": "ok" }));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let rotated_state = loop {
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        if state["session_credential_rotations"][0]["status"] == "applied" {
+            break state;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "credential rotation did not apply"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let rotated_hash = rotated_state["sessions"][0]["session_credential_sha256"]
+        .as_str()
+        .unwrap();
+    assert_ne!(rotated_hash, hash_before_rotation);
+    assert_eq!(
+        rotated_state["session_runtime_launches"][2]["operation_kind"],
+        "recredential"
+    );
+    assert_eq!(
+        rotated_state["session_runtime_launches"][2]["status"],
+        "applied"
+    );
+    assert_eq!(
+        rotated_state["session_runtime_launches"][2]["credential_rotation_id"],
+        rotation["id"]
+    );
+    assert_eq!(
+        rotated_state["session_credential_rotations"][0]["runtime_launch_id"],
+        rotated_state["session_runtime_launches"][2]["id"]
+    );
+    let (status, repeated_rotation) = post_json_with_headers_and_peer(
+        recovered_app.clone(),
+        "/sessions/runtimecore/credential-rotation",
+        json!({}),
+        &[("host", "127.0.0.1")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(repeated_rotation["id"], rotation["id"]);
+    let (status, rotations) = json_request_with_headers_and_peer(
+        recovered_app.clone(),
+        "GET",
+        "/session-credential-rotations",
+        Value::Null,
+        &[("host", "127.0.0.1")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rotations["rotations"][0]["id"], rotation["id"]);
+    let (status, _) = json_request_with_headers_and_peer(
+        recovered_app.clone(),
+        "GET",
+        "/session-credential-rotations",
+        Value::Null,
+        &[("host", "sm.example.com")],
+        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let hash_after_rotation = rotated_hash.to_owned();
+    let mut interrupted_rotation = rotated_state;
+    interrupted_rotation["session_runtime_launches"][2]["status"] = json!("launching");
+    interrupted_rotation["session_credential_rotations"][0]["status"] = json!("relaunching");
+    interrupted_rotation["session_credential_rotations"][0]["applied_at"] = Value::Null;
+    fs::write(
+        &state_file,
+        serde_json::to_vec_pretty(&interrupted_rotation).unwrap(),
+    )
+    .unwrap();
+    drop(recovered_app);
+
+    let _recovered_rotation_app = router(AppState::new(config));
+    let recovered_rotation: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert_eq!(
+        recovered_rotation["session_runtime_launches"][2]["status"],
+        "applied"
+    );
+    assert_eq!(
+        recovered_rotation["session_credential_rotations"][0]["status"],
+        "applied"
+    );
+    assert!(recovered_rotation["session_credential_rotations"][0]["applied_at"].is_string());
+    assert_ne!(
+        recovered_rotation["sessions"][0]["session_credential_sha256"],
+        hash_after_rotation
+    );
 }
 
 #[tokio::test]

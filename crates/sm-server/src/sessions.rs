@@ -787,6 +787,261 @@ impl SessionStore {
         Ok(())
     }
 
+    fn start_credential_rotation_worker(&self, session_id: String) -> Result<()> {
+        {
+            let mut workers = self
+                .credential_rotation_workers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("credential rotation worker registry poisoned"))?;
+            if !workers.insert(session_id.clone()) {
+                return Ok(());
+            }
+        }
+        let store = self.clone();
+        let worker_session_id = session_id.clone();
+        let spawn_result = thread::Builder::new()
+            .name(format!(
+                "sm-recredential-{}",
+                sanitize_path_component(&session_id)
+            ))
+            .spawn(move || {
+                loop {
+                    match store.try_apply_waiting_credential_rotation(&worker_session_id) {
+                        Ok(true) => break,
+                        Ok(false) => thread::sleep(Duration::from_secs(1)),
+                        Err(error) => {
+                            eprintln!(
+                                "credential rotation worker failed for {worker_session_id}: {error:#}"
+                            );
+                            break;
+                        }
+                    }
+                }
+                if let Ok(mut workers) = store.credential_rotation_workers.lock() {
+                    workers.remove(&worker_session_id);
+                }
+            });
+        if let Err(error) = spawn_result {
+            if let Ok(mut workers) = self.credential_rotation_workers.lock() {
+                workers.remove(&session_id);
+            }
+            return Err(error).context("failed to start credential rotation worker");
+        }
+        Ok(())
+    }
+
+    fn try_apply_waiting_credential_rotation(&self, session_id: &str) -> Result<bool> {
+        let (rotation, session) = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            let Some(rotation) = session_credential_rotation_records(&state)?
+                .into_iter()
+                .find(|record| record.session_id == session_id && record.status == "waiting_idle")
+            else {
+                return Ok(true);
+            };
+            let Some(session) = snapshot_from_raw_value(&state)?
+                .sessions
+                .into_iter()
+                .find(|session| session.id == session_id)
+            else {
+                return Ok(true);
+            };
+            (rotation, session)
+        };
+        let Some(runtime) = self.delivery_runtime.as_ref() else {
+            return Ok(true);
+        };
+        let session_runtime = runtime.for_socket_name(rotation.tmux_socket_name.as_deref());
+        if !credential_rotation_has_fresh_idle_proof(&rotation, &session)
+            || !session_runtime.session_exists(&rotation.tmux_session)?
+            || session_runtime.session_has_attached_clients(&rotation.tmux_session)?
+            || !session_runtime.session_input_ready(&rotation.tmux_session, &rotation.provider)
+            || !self.credential_rotation_queue_is_drained(session_id)?
+        {
+            return Ok(false);
+        }
+
+        let _guard = self.write_guard()?;
+        let _input_guard = session_runtime.lock_session_input(&rotation.tmux_session)?;
+        let mut state = self.load_raw_json_value()?;
+        let mut rotations = session_credential_rotation_records(&state)?;
+        let Some(rotation_index) = rotations
+            .iter()
+            .position(|record| record.id == rotation.id && record.status == "waiting_idle")
+        else {
+            return Ok(true);
+        };
+        let snapshot = snapshot_from_raw_value(&state)?;
+        let Some(session) = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .cloned()
+        else {
+            rotations[rotation_index].status = "failed".to_owned();
+            rotations[rotation_index].updated_at = now_rfc3339();
+            rotations[rotation_index].failure_reason = Some("session disappeared".to_owned());
+            store_session_credential_rotation_records(&mut state, &rotations)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(true);
+        };
+        if !session.is_live_for_registry()
+            || session.provider != rotation.provider
+            || session.tmux_session != rotation.tmux_session
+            || session.tmux_socket_name != rotation.tmux_socket_name
+            || provider_resume_id_for_restore(&session).as_deref()
+                != Some(rotation.provider_resume_id.as_str())
+        {
+            rotations[rotation_index].status = "failed".to_owned();
+            rotations[rotation_index].updated_at = now_rfc3339();
+            rotations[rotation_index].failure_reason =
+                Some("session runtime identity changed while waiting for idle".to_owned());
+            store_session_credential_rotation_records(&mut state, &rotations)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(true);
+        }
+        let raw_session = raw_session_object(&state, session_id)
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared"))?;
+        if !credential_rotation_has_fresh_idle_proof(&rotations[rotation_index], &session)
+            || json_text(raw_session.get("pending_handoff_path")).is_some()
+            || json_text(raw_session.get("claude_handoff_in_progress_at")).is_some()
+            || !self.credential_rotation_queue_is_drained(session_id)?
+            || session_runtime.session_has_attached_clients(&rotation.tmux_session)?
+            || !session_runtime.session_input_ready(&rotation.tmux_session, &rotation.provider)
+        {
+            return Ok(false);
+        }
+
+        let Some(log_file) = session
+            .log_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(expand_home)
+        else {
+            rotations[rotation_index].status = "failed".to_owned();
+            rotations[rotation_index].updated_at = now_rfc3339();
+            rotations[rotation_index].failure_reason =
+                Some("session log file is missing".to_owned());
+            store_session_credential_rotation_records(&mut state, &rotations)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(true);
+        };
+        let credential = generate_session_credential();
+        let credential_sha256 = sha256_text(&credential);
+        let spec = TmuxSessionSpec {
+            session_id: session.id.clone(),
+            session_credential: Some(credential),
+            tmux_session: session.tmux_session.clone(),
+            working_dir: expand_home(&session.working_dir).display().to_string(),
+            log_file,
+            provider: session.provider.clone(),
+            initial_message: None,
+            model: session.model.clone(),
+            reasoning_effort: session.reasoning_effort.clone(),
+        };
+        let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
+        let mut launches = session_runtime_launch_records(&state)?;
+        let launch_id = generate_unique_runtime_launch_id(&launches)?;
+        let now = now_rfc3339();
+        launches.push(SessionRuntimeLaunchRecord {
+            id: launch_id.clone(),
+            operation_kind: "recredential".to_owned(),
+            session_id: session.id.clone(),
+            tmux_session: session.tmux_session.clone(),
+            tmux_socket_name: session_runtime.socket_name().map(ToOwned::to_owned),
+            working_dir: spec.working_dir.clone(),
+            log_file: spec.log_file.display().to_string(),
+            provider: session.provider.clone(),
+            provider_resume_id: Some(rotation.provider_resume_id.clone()),
+            credential_rotation_id: Some(rotation.id.clone()),
+            initial_message: None,
+            model: session.model.clone(),
+            reasoning_effort: session.reasoning_effort.clone(),
+            credential_sha256: credential_sha256.clone(),
+            status: "launching".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            failure_reason: None,
+        });
+        rotations[rotation_index].status = "relaunching".to_owned();
+        rotations[rotation_index].idle_proof_at = Some(now.clone());
+        rotations[rotation_index].runtime_launch_id = Some(launch_id.clone());
+        rotations[rotation_index].updated_at = now;
+        {
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let raw_session = session_object_mut(sessions, session_id)
+                .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared"))?;
+            raw_session.insert(
+                "session_credential_sha256".to_owned(),
+                Value::String(credential_sha256),
+            );
+            raw_session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+            raw_session.insert("stopped_at".to_owned(), Value::String(now_rfc3339()));
+        }
+        store_session_runtime_launch_records(&mut state, &launches)?;
+        store_session_credential_rotation_records(&mut state, &rotations)?;
+        self.write_raw_json_value(&state)?;
+
+        let relaunch_result = (|| -> Result<()> {
+            if session_runtime.session_exists(&session.tmux_session)? {
+                session_runtime.kill_session(&session.tmux_session)?;
+            }
+            session_runtime.restore_session(
+                &spec,
+                &session.provider,
+                Some(&rotation.provider_resume_id),
+            )
+        })();
+        if let Err(error) = relaunch_result {
+            mark_runtime_launch_failed(
+                &mut state,
+                &launch_id,
+                session_id,
+                false,
+                &error.to_string(),
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(true);
+        }
+
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(raw_session) = session_object_mut(sessions, session_id) else {
+            let _ = session_runtime.kill_session(&session.tmux_session);
+            mark_runtime_launch_failed(
+                &mut state,
+                &launch_id,
+                session_id,
+                false,
+                "session disappeared after credential relaunch",
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(true);
+        };
+        raw_session.insert("status".to_owned(), Value::String("running".to_owned()));
+        raw_session.insert("stopped_at".to_owned(), Value::Null);
+        raw_session.insert("last_activity".to_owned(), Value::String(now_rfc3339()));
+        mark_runtime_launch_applied(&mut state, &launch_id, Some(&rotation.provider_resume_id))?;
+        self.write_raw_json_value(&state)?;
+        drop(_guard);
+        if let Some(artifacts) = codex_fork_artifacts {
+            self.start_codex_fork_event_monitor(session.id, artifacts.event_stream_path)?;
+        }
+        Ok(true)
+    }
+
+    fn credential_rotation_queue_is_drained(&self, session_id: &str) -> Result<bool> {
+        self.queue_store
+            .as_ref()
+            .map(|queue| {
+                queue
+                    .pending_messages_for_target(session_id, 1)
+                    .map(|messages| messages.is_empty())
+            })
+            .unwrap_or(Ok(true))
+    }
+
     #[cfg(test)]
     fn new_with_legacy_fallback(state_file: PathBuf, legacy_state_file: PathBuf) -> Self {
         let seat_session_store = SeatSessionStore::for_state_file(&state_file);
@@ -1536,6 +1791,124 @@ impl SessionStore {
             (&left.created_at, &left.id).cmp(&(&right.created_at, &right.id))
         });
         Ok(records)
+    }
+
+    pub fn create_session_credential_rotation(
+        &self,
+        session_id: &str,
+        request_actor: &str,
+    ) -> Result<CredentialRotationOutcome> {
+        let session_id = session_id.trim();
+        let request_actor = request_actor.trim();
+        if session_id.is_empty() || request_actor.is_empty() {
+            return Ok(CredentialRotationOutcome::BadRequest(
+                "session ID and authenticated request actor are required".to_owned(),
+            ));
+        }
+        if self.delivery_runtime.is_none() {
+            return Ok(CredentialRotationOutcome::BadRequest(
+                "runtime-backed sessions are disabled".to_owned(),
+            ));
+        }
+
+        let record = {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            let snapshot = snapshot_from_raw_value(&state)?;
+            let Some(session) = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+            else {
+                return Ok(CredentialRotationOutcome::SessionNotFound);
+            };
+            if !session.is_live_for_registry() {
+                return Ok(CredentialRotationOutcome::BadRequest(format!(
+                    "session {session_id} is stopped"
+                )));
+            }
+            if !is_primary_node(&session.node) {
+                return Ok(CredentialRotationOutcome::BadRequest(format!(
+                    "session {session_id} belongs to remote node {}",
+                    session.node
+                )));
+            }
+            if !matches!(session.provider.as_str(), "claude" | "codex" | "codex-fork") {
+                return Ok(CredentialRotationOutcome::BadRequest(format!(
+                    "provider {} does not support credential rotation",
+                    session.provider
+                )));
+            }
+            let Some(provider_resume_id) = provider_resume_id_for_restore(session) else {
+                return Ok(CredentialRotationOutcome::BadRequest(format!(
+                    "session {session_id} has no resumable provider identity"
+                )));
+            };
+            let mut rotations = session_credential_rotation_records(&state)?;
+            rotations.sort_by(|left, right| {
+                (&left.requested_at, &left.id).cmp(&(&right.requested_at, &right.id))
+            });
+            if let Some(existing) = rotations.iter().rev().find(|rotation| {
+                rotation.session_id == session_id
+                    && matches!(
+                        rotation.status.as_str(),
+                        "waiting_idle" | "relaunching" | "applied"
+                    )
+            }) {
+                return Ok(CredentialRotationOutcome::Existing(existing.clone()));
+            }
+            let now = now_rfc3339();
+            let rotation = SessionCredentialRotationRecord {
+                id: generate_unique_credential_rotation_id(&rotations)?,
+                session_id: session.id.clone(),
+                provider: session.provider.clone(),
+                provider_resume_id,
+                tmux_session: session.tmux_session.clone(),
+                tmux_socket_name: session.tmux_socket_name.clone(),
+                request_actor: request_actor.to_owned(),
+                status: "waiting_idle".to_owned(),
+                requested_at: now.clone(),
+                idle_proof_at: None,
+                runtime_launch_id: None,
+                updated_at: now,
+                applied_at: None,
+                failure_reason: None,
+            };
+            rotations.push(rotation.clone());
+            store_session_credential_rotation_records(&mut state, &rotations)?;
+            self.write_raw_json_value(&state)?;
+            rotation
+        };
+        self.start_credential_rotation_worker(record.session_id.clone())?;
+        Ok(CredentialRotationOutcome::Created(record))
+    }
+
+    pub fn list_session_credential_rotations(
+        &self,
+    ) -> Result<Vec<SessionCredentialRotationRecord>> {
+        let _guard = self.write_guard()?;
+        let state = self.load_raw_json_value()?;
+        let mut records = session_credential_rotation_records(&state)?;
+        records.sort_by(|left, right| {
+            (&left.requested_at, &left.id).cmp(&(&right.requested_at, &right.id))
+        });
+        Ok(records)
+    }
+
+    pub fn recover_session_credential_rotation_workers(&self) -> Result<usize> {
+        let session_ids = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            session_credential_rotation_records(&state)?
+                .into_iter()
+                .filter(|record| record.status == "waiting_idle")
+                .map(|record| record.session_id)
+                .collect::<BTreeSet<_>>()
+        };
+        for session_id in &session_ids {
+            self.start_credential_rotation_worker(session_id.clone())?;
+        }
+        Ok(session_ids.len())
     }
 
     pub fn create_core_session(
@@ -9227,6 +9600,21 @@ fn session_credential_matches(
     constant_time_text_eq(expected, &sha256_text(credential))
 }
 
+fn credential_rotation_has_fresh_idle_proof(
+    rotation: &SessionCredentialRotationRecord,
+    session: &SessionRecord,
+) -> bool {
+    if normalized_status(&session.status) != "idle" {
+        return false;
+    }
+    let proof_at = if session.provider == "claude" {
+        session.activity_hook_at.as_deref()
+    } else {
+        Some(session.last_activity.as_str())
+    };
+    proof_at.is_some_and(|proof_at| timestamp_is_after(proof_at, &rotation.requested_at))
+}
+
 fn session_id_exists(sessions: &[Value], session_id: &str) -> bool {
     sessions
         .iter()
@@ -9341,7 +9729,27 @@ fn mark_runtime_launch_applied(
     if let Some(provider_resume_id) = provider_resume_id {
         record.provider_resume_id = Some(provider_resume_id.to_owned());
     }
-    store_session_runtime_launch_records(state, &records)
+    let credential_rotation_id = record.credential_rotation_id.clone();
+    store_session_runtime_launch_records(state, &records)?;
+    if let Some(credential_rotation_id) = credential_rotation_id {
+        let mut rotations = session_credential_rotation_records(state)?;
+        let rotation = rotations
+            .iter_mut()
+            .find(|rotation| rotation.id == credential_rotation_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "credential rotation {credential_rotation_id} disappeared during launch"
+                )
+            })?;
+        let now = now_rfc3339();
+        rotation.status = "applied".to_owned();
+        rotation.updated_at = now.clone();
+        rotation.applied_at = Some(now);
+        rotation.failure_reason = None;
+        rotation.runtime_launch_id = Some(launch_id.to_owned());
+        store_session_credential_rotation_records(state, &rotations)?;
+    }
+    Ok(())
 }
 
 fn mark_runtime_launch_failed(
@@ -9359,7 +9767,21 @@ fn mark_runtime_launch_failed(
     record.status = "failed".to_owned();
     record.updated_at = now_rfc3339();
     record.failure_reason = Some(failure_reason.to_owned());
+    let credential_rotation_id = record.credential_rotation_id.clone();
     store_session_runtime_launch_records(state, &records)?;
+    if let Some(credential_rotation_id) = credential_rotation_id {
+        let mut rotations = session_credential_rotation_records(state)?;
+        if let Some(rotation) = rotations
+            .iter_mut()
+            .find(|rotation| rotation.id == credential_rotation_id)
+        {
+            rotation.status = "failed".to_owned();
+            rotation.updated_at = now_rfc3339();
+            rotation.failure_reason = Some(failure_reason.to_owned());
+            rotation.runtime_launch_id = Some(launch_id.to_owned());
+            store_session_credential_rotation_records(state, &rotations)?;
+        }
+    }
     let sessions = ensure_sessions_array_mut(state)?;
     if remove_provisional_session {
         sessions.retain(|session| session.get("id").and_then(Value::as_str) != Some(session_id));
