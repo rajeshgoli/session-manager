@@ -2404,7 +2404,7 @@ impl SessionStore {
     }
 
     pub fn reconcile_reparent_notifications(&self) -> Result<()> {
-        let pending = {
+        let (pending, recipients) = {
             let _guard = self.write_guard()?;
             let mut state = self.load_raw_json_value()?;
             let sessions = snapshot_from_raw_value(&state)?.into_sessions();
@@ -2428,7 +2428,7 @@ impl SessionStore {
                 store_reparent_request_records(&mut state, &records)?;
                 self.write_raw_json_value(&state)?;
             }
-            records
+            let pending = records
                 .iter()
                 .flat_map(|record| {
                     desired_reparent_notifications(record)
@@ -2439,7 +2439,17 @@ impl SessionStore {
                             })
                         })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            let recipients = records
+                .iter()
+                .flat_map(|record| {
+                    record
+                        .notification_intents
+                        .iter()
+                        .map(|intent| intent.recipient_session_id.clone())
+                })
+                .collect::<BTreeSet<_>>();
+            (pending, recipients)
         };
         for desired in pending {
             let queue = self
@@ -2474,6 +2484,25 @@ impl SessionStore {
                 intent.enqueued_at = Some(now_rfc3339());
                 store_reparent_request_records(&mut state, &records)?;
                 self.write_raw_json_value(&state)?;
+            }
+        }
+        if let Some(runtime) = self.delivery_runtime.as_ref() {
+            let mut first_error = None;
+            for recipient in recipients {
+                if let Err(error) = self.drain_runtime_pending_messages_for_session_category(
+                    &recipient,
+                    runtime,
+                    Some("reparent"),
+                ) {
+                    if first_error.is_none() {
+                        first_error = Some(error.context(format!(
+                            "failed to deliver reparent notifications to {recipient}"
+                        )));
+                    }
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
             }
         }
         Ok(())

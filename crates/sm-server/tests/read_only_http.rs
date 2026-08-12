@@ -16995,6 +16995,105 @@ async fn reparent_request_creation_persists_and_queues_exact_actionable_notifica
 }
 
 #[tokio::test]
+async fn reparent_request_immediately_delivers_approval_prompt_to_an_idle_runtime() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let queue_db = queue_db_path_for_state_file(&state_file);
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-reparent-notify-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    for (id, parent) in [
+        ("notifyold", None),
+        ("notifynew", None),
+        ("notifychild", Some("notifyold")),
+    ] {
+        let mut payload = json!({
+            "id": id,
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": format!("initial {id}")
+        });
+        if let Some(parent) = parent {
+            payload["parent_session_id"] = json!(parent);
+        }
+        let (status, _) = post_json(app.clone(), "/sessions", payload).await;
+        assert_eq!(status, StatusCode::OK);
+        wait_for_output_contains(app.clone(), id, &format!("runtime:initial {id}")).await;
+    }
+
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    for session in state["sessions"].as_array_mut().unwrap() {
+        let credential = match session["id"].as_str().unwrap() {
+            "notifyold" => "notify-old-token",
+            "notifynew" => "notify-new-token",
+            "notifychild" => "notify-child-token",
+            other => panic!("unexpected session {other}"),
+        };
+        session["session_credential_sha256"] = json!(session_credential_hash(credential));
+    }
+    fs::write(&state_file, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let (status, _) = post_json(
+        app.clone(),
+        "/hooks/claude",
+        json!({
+            "hook_event_name": "Stop",
+            "session_manager_id": "notifynew"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, created) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/notifychild/reparent-requests",
+        json!({
+            "requester_session_id": "notifyold",
+            "target_parent_session_id": "notifynew"
+        }),
+        &[("x-sm-session-credential", "notify-old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let request_id = created["id"].as_str().unwrap();
+    wait_for_output_contains(
+        app,
+        "notifynew",
+        &format!("sm reparent approve {request_id}"),
+    )
+    .await;
+
+    let delivered: (i64, String) = Connection::open(queue_db)
+        .unwrap()
+        .query_row(
+            r#"
+            SELECT delivered_at IS NOT NULL, message_category
+            FROM message_queue
+            WHERE target_session_id = 'notifynew'
+              AND message_category = 'reparent'
+            "#,
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(delivered, (1, "reparent".to_owned()));
+}
+
+#[tokio::test]
 async fn reparent_tree_dry_run_reports_exact_plan_without_persisting_a_request() {
     let state_file = write_reparent_tree_fixture();
     let mut config = config_with_state_file(&state_file);
