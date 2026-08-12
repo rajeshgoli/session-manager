@@ -16942,6 +16942,314 @@ async fn reparent_request_read_marks_changed_topology_stale() {
         .contains("parent changed"));
 }
 
+#[tokio::test]
+async fn reparent_tree_dry_run_reports_exact_plan_without_persisting_a_request() {
+    let state_file = write_reparent_tree_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, preview) = post_json_with_headers_and_peer(
+        app,
+        "/sessions/source01/reparent-tree-requests",
+        json!({
+            "requester_session_id": "source01",
+            "target_session_id": "target01",
+            "dry_run": true
+        }),
+        &[("x-sm-session-credential", "source-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(preview["kind"], "tree");
+    assert_eq!(
+        preview["frozen_live_child_ids"],
+        json!(["target01", "sibling01"])
+    );
+    assert_eq!(
+        preview["edge_changes"],
+        json!([
+            {
+                "session_id": "target01",
+                "expected_parent_session_id": "source01",
+                "new_parent_session_id": "grand001"
+            },
+            {
+                "session_id": "source01",
+                "expected_parent_session_id": "grand001",
+                "new_parent_session_id": "target01"
+            },
+            {
+                "session_id": "sibling01",
+                "expected_parent_session_id": "source01",
+                "new_parent_session_id": "target01"
+            }
+        ])
+    );
+    assert_eq!(
+        preview["required_agent_approvals"],
+        json!(["grand001", "source01", "target01"])
+    );
+    assert_eq!(preview["required_human_approval"], false);
+    assert!(preview["blockers"].as_array().unwrap().is_empty());
+    assert_eq!(preview["json_routing_changes"].as_array().unwrap().len(), 6);
+    assert!(preview["queue_routing_changes"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert!(state["reparent_requests"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reparent_tree_dry_run_rejects_an_unrelated_authenticated_session() {
+    let state_file = write_reparent_tree_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    state["sessions"].as_array_mut().unwrap().push(json!({
+        "id": "outsider",
+        "name": "claude-outsider",
+        "working_dir": "/repo",
+        "tmux_session": "claude-outsider",
+        "provider": "claude",
+        "status": "running",
+        "created_at": "2026-06-01T00:00:00Z",
+        "last_activity": "2026-06-01T00:01:00Z",
+        "session_credential_sha256": session_credential_hash("outsider-token")
+    }));
+    fs::write(&state_file, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/sessions/source01/reparent-tree-requests",
+        json!({
+            "requester_session_id": "outsider",
+            "target_session_id": "target01",
+            "dry_run": true
+        }),
+        &[("x-sm-session-credential", "outsider-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .contains("source, target, or live source parent"));
+}
+
+#[tokio::test]
+async fn reparent_tree_requires_all_agents_and_moves_only_frozen_live_children() {
+    let state_file = write_reparent_tree_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, created) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/source01/reparent-tree-requests",
+        json!({
+            "requester_session_id": "source01",
+            "target_session_id": "target01"
+        }),
+        &[("x-sm-session-credential", "source-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["ready_to_apply"], false);
+    let request_id = created["id"].as_str().unwrap();
+
+    let (status, target_approved) = post_json_with_headers_and_peer(
+        app.clone(),
+        &format!("/reparent-requests/{request_id}/approve"),
+        json!({ "requester_session_id": "target01" }),
+        &[("x-sm-session-credential", "target-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(target_approved["status"], "pending");
+
+    let (status, applied) = post_json_with_headers_and_peer(
+        app,
+        &format!("/reparent-requests/{request_id}/approve"),
+        json!({ "requester_session_id": "grand001" }),
+        &[("x-sm-session-credential", "grand-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(applied["status"], "applied");
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let parent = |id: &str| {
+        state["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == id)
+            .and_then(|session| session["parent_session_id"].as_str())
+    };
+    assert_eq!(parent("target01"), Some("grand001"));
+    assert_eq!(parent("source01"), Some("target01"));
+    assert_eq!(parent("sibling01"), Some("target01"));
+    assert_eq!(parent("stopped01"), Some("source01"));
+    for (child, expected) in [
+        ("target01", "grand001"),
+        ("source01", "target01"),
+        ("sibling01", "target01"),
+    ] {
+        let session = state["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == child)
+            .unwrap();
+        assert_eq!(session["context_monitor_notify"], expected);
+        assert_eq!(session["context_monitor_enabled"], true);
+        let wake = state["retained_parent_wake_registrations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|wake| wake["child_session_id"] == child)
+            .unwrap();
+        assert_eq!(wake["parent_session_id"], expected);
+        assert_eq!(wake["is_active"], true);
+    }
+}
+
+#[tokio::test]
+async fn reparent_tree_stales_when_the_frozen_live_child_set_changes() {
+    let state_file = write_reparent_tree_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, created) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/source01/reparent-tree-requests",
+        json!({
+            "requester_session_id": "source01",
+            "target_session_id": "target01"
+        }),
+        &[("x-sm-session-credential", "source-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    state["sessions"].as_array_mut().unwrap().push(json!({
+        "id": "latechild",
+        "name": "claude-latechild",
+        "working_dir": "/repo",
+        "tmux_session": "claude-latechild",
+        "provider": "claude",
+        "status": "running",
+        "created_at": "2026-06-01T00:00:00Z",
+        "last_activity": "2026-06-01T00:01:00Z",
+        "parent_session_id": "source01"
+    }));
+    fs::write(&state_file, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let (status, record) = get_json(
+        app,
+        &format!("/reparent-requests/{}", created["id"].as_str().unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(record["status"], "stale");
+    assert!(record["failure_reason"]
+        .as_str()
+        .unwrap()
+        .contains("live-child set changed"));
+}
+
+#[tokio::test]
+async fn reparent_tree_promotes_a_root_child_without_stranding_parent_routes() {
+    let state_file = write_reparent_tree_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let source = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "source01")
+        .unwrap();
+    source["parent_session_id"] = Value::Null;
+    source["context_monitor_enabled"] = json!(false);
+    source["context_monitor_notify"] = Value::Null;
+    state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|session| session["id"] != "grand001");
+    state["retained_parent_wake_registrations"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|wake| wake["child_session_id"] != "source01");
+    fs::write(&state_file, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+    let (status, created) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/source01/reparent-tree-requests",
+        json!({
+            "requester_session_id": "source01",
+            "target_session_id": "target01"
+        }),
+        &[("x-sm-session-credential", "source-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        created["required_agent_approvals"],
+        json!(["source01", "target01"])
+    );
+    assert_eq!(created["required_human_approval"], false);
+
+    let (status, applied) = post_json_with_headers_and_peer(
+        app,
+        &format!(
+            "/reparent-requests/{}/approve",
+            created["id"].as_str().unwrap()
+        ),
+        json!({ "requester_session_id": "target01" }),
+        &[("x-sm-session-credential", "target-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(applied["status"], "applied");
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let target = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "target01")
+        .unwrap();
+    assert!(target["parent_session_id"].is_null());
+    assert!(target["context_monitor_notify"].is_null());
+    assert_eq!(target["context_monitor_enabled"], false);
+    let target_wake = state["retained_parent_wake_registrations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|wake| wake["child_session_id"] == "target01")
+        .unwrap();
+    assert_eq!(target_wake["parent_session_id"], "source01");
+    assert_eq!(target_wake["is_active"], false);
+}
+
 fn config_with_state_file(state_file: &PathBuf) -> AppConfig {
     AppConfig {
         paths: PathsConfig {
@@ -17749,6 +18057,71 @@ fn write_reparent_fixture() -> PathBuf {
                     "created_at": "2026-06-01T00:02:00Z",
                     "status": "pending",
                     "decided_at": null
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    path
+}
+
+fn write_reparent_tree_fixture() -> PathBuf {
+    let path = unique_temp_path();
+    let session = |id: &str, status: &str, parent_session_id: Option<&str>, credential: &str| {
+        let mut value = json!({
+            "id": id,
+            "name": format!("claude-{id}"),
+            "working_dir": "/repo",
+            "tmux_session": format!("claude-{id}"),
+            "log_file": format!("/tmp/{id}.log"),
+            "provider": "claude",
+            "status": status,
+            "created_at": "2026-06-01T00:00:00Z",
+            "last_activity": "2026-06-01T00:01:00Z",
+            "session_credential_sha256": session_credential_hash(credential)
+        });
+        if let Some(parent_session_id) = parent_session_id {
+            value["parent_session_id"] = json!(parent_session_id);
+            if status == "running" {
+                value["context_monitor_enabled"] = json!(true);
+                value["context_monitor_notify"] = json!(parent_session_id);
+                value["context_monitor_notify_source"] = json!("parent_derived");
+            }
+        }
+        value
+    };
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({
+            "sessions": [
+                session("grand001", "running", None, "grand-token"),
+                session("source01", "running", Some("grand001"), "source-token"),
+                session("target01", "running", Some("source01"), "target-token"),
+                session("sibling01", "running", Some("source01"), "sibling-token"),
+                session("stopped01", "stopped", Some("source01"), "stopped-token")
+            ],
+            "retained_parent_wake_registrations": [
+                {
+                    "id": "wake-source01",
+                    "child_session_id": "source01",
+                    "parent_session_id": "grand001",
+                    "period_seconds": 600,
+                    "is_active": true
+                },
+                {
+                    "id": "wake-target01",
+                    "child_session_id": "target01",
+                    "parent_session_id": "source01",
+                    "period_seconds": 600,
+                    "is_active": true
+                },
+                {
+                    "id": "wake-sibling01",
+                    "child_session_id": "sibling01",
+                    "parent_session_id": "source01",
+                    "period_seconds": 600,
+                    "is_active": true
                 }
             ]
         }))
