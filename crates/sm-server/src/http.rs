@@ -3663,15 +3663,14 @@ fn queue_wait_notification(state: &AppState, watcher_session_id: &str, text: Str
 }
 
 fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_seconds: u64) {
-    let Some(parent_session_id) = child
+    if child
         .parent_session_id
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-    else {
+        .is_none_or(str::is_empty)
+    {
         return;
-    };
+    }
     let child_session_id = child.id.clone();
 
     tokio::spawn(async move {
@@ -3705,39 +3704,24 @@ fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_sec
             let Some(completion_message) = completion_message else {
                 continue;
             };
-
             let notification = format!(
                 "Child {} ({}) completed: {}",
                 child_display_name(&child),
                 short_session_id(&child_session_id),
                 completion_message
             );
-            let request = SendCoreInputRequest {
-                text: notification,
-                delivery_mode: "sequential".to_owned(),
-                sender_session_id: None,
-                from_sm_send: false,
-                timeout_seconds: None,
-                notify_on_delivery: false,
-                notify_after_seconds: None,
-                notify_on_stop: false,
-                remind_soft_threshold: None,
-                remind_hard_threshold: None,
-                remind_cancel_on_reply_session_id: None,
-                parent_session_id: None,
-            };
-            let _ = if state.config.rust_core.runtime_enabled {
-                let runtime = TmuxRuntime::from_app_config(&state.config);
-                state.session_store.send_core_input_with_runtime(
-                    &parent_session_id,
-                    request,
-                    &runtime,
-                )
-            } else {
-                state
-                    .session_store
-                    .send_core_input(&parent_session_id, request)
-            };
+            let runtime = state
+                .config
+                .rust_core
+                .runtime_enabled
+                .then(|| TmuxRuntime::from_app_config(&state.config));
+            let _ = state.session_store.send_parent_notification(
+                &child_session_id,
+                &notification,
+                "sequential",
+                "child_wait",
+                runtime.as_ref(),
+            );
             break;
         }
     });

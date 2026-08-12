@@ -2086,6 +2086,47 @@ impl SessionStore {
         Ok(records)
     }
 
+    pub fn send_parent_notification(
+        &self,
+        child_session_id: &str,
+        text: &str,
+        delivery_mode: &str,
+        message_category: &str,
+        runtime: Option<&TmuxRuntime>,
+    ) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        if let Some(request_id) =
+            active_reparent_route_request_for_session(&state, child_session_id)?
+        {
+            persist_deferred_parent_message_intent(
+                &mut state,
+                &request_id,
+                &format!("{message_category}:{child_session_id}:{}", now_rfc3339()),
+                child_session_id,
+                text,
+                delivery_mode,
+                message_category,
+            )?;
+            return self.write_raw_json_value(&state);
+        }
+        let Some(parent_session_id) = raw_session_object(&state, child_session_id)
+            .and_then(|session| json_text(session.get("parent_session_id")))
+        else {
+            return Ok(());
+        };
+        self.queue_parent_message(
+            &mut state,
+            child_session_id,
+            &parent_session_id,
+            text,
+            delivery_mode,
+            message_category,
+            runtime,
+        )?;
+        self.write_raw_json_value(&state)
+    }
+
     pub fn reconcile_reparent_requests(&self) -> Result<Option<ReparentRequestRecord>> {
         let mut first = None;
         loop {
@@ -2598,7 +2639,7 @@ impl SessionStore {
             Vec::new()
         };
         self.persist_delivered_reparent_wake_intents(request_id, &delivered_message_rows)?;
-        self.replay_deferred_reparent_routes(request_id, false)?;
+        let replay_targets = self.replay_deferred_reparent_routes(request_id, false)?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let mut records = reparent_request_records(&state)?;
@@ -2615,15 +2656,19 @@ impl SessionStore {
         record.failure_reason = None;
         store_reparent_request_records(&mut state, &records)?;
         store_reparent_apply_lease(&mut state, None)?;
-        self.write_raw_json_value(&state)
+        self.write_raw_json_value(&state)?;
+        drop(_guard);
+        self.drain_reparent_replay_targets(&replay_targets);
+        Ok(())
     }
 
     fn replay_deferred_reparent_routes(
         &self,
         request_id: &str,
         reapply_completed: bool,
-    ) -> Result<()> {
+    ) -> Result<BTreeSet<String>> {
         let mut reapplied = BTreeSet::new();
+        let mut replay_targets = BTreeSet::new();
         loop {
             let intent = {
                 let _guard = self.write_guard()?;
@@ -2639,7 +2684,7 @@ impl SessionStore {
                     .cloned()
             };
             let Some(intent) = intent else {
-                return Ok(());
+                return Ok(replay_targets);
             };
             let resolved_parent_session_id = {
                 let _guard = self.write_guard()?;
@@ -2689,8 +2734,70 @@ impl SessionStore {
                             },
                         )?;
                         queue.cancel_parent_wake(&intent.child_session_id)?;
+                        replay_targets.insert(resolved_parent_session_id.clone());
                     } else {
                         anyhow::bail!("deferred task-complete requires the retained queue store")
+                    }
+                }
+                "parent_message" => {
+                    let text = intent
+                        .payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .context("deferred parent message has no text")?;
+                    let delivery_mode = intent
+                        .payload
+                        .get("delivery_mode")
+                        .and_then(Value::as_str)
+                        .context("deferred parent message has no delivery mode")?;
+                    let category = intent
+                        .payload
+                        .get("message_category")
+                        .and_then(Value::as_str)
+                        .context("deferred parent message has no category")?;
+                    let message_id = deferred_parent_message_id(request_id, &intent.key);
+                    if let Some(queue) = self.queue_store.as_ref() {
+                        queue.enqueue_message_once_with_metadata(
+                            &message_id,
+                            &resolved_parent_session_id,
+                            text,
+                            delivery_mode,
+                            QueueMessageMetadata {
+                                sender_session_id: Some(intent.child_session_id.clone()),
+                                message_category: Some(category.to_owned()),
+                                ..QueueMessageMetadata::default()
+                            },
+                        )?;
+                        replay_targets.insert(resolved_parent_session_id.clone());
+                    } else {
+                        anyhow::bail!("deferred parent message requires the retained queue store")
+                    }
+                }
+                "parent_input" => {
+                    let text = intent
+                        .payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .context("deferred parent input has no text")?;
+                    let delivery_mode = intent
+                        .payload
+                        .get("delivery_mode")
+                        .and_then(Value::as_str)
+                        .context("deferred parent input has no delivery mode")?;
+                    let message_id = deferred_parent_message_id(request_id, &intent.key);
+                    let metadata =
+                        deferred_parent_input_metadata(&intent, &resolved_parent_session_id)?;
+                    if let Some(queue) = self.queue_store.as_ref() {
+                        queue.enqueue_message_once_with_metadata(
+                            &message_id,
+                            &intent.child_session_id,
+                            text,
+                            delivery_mode,
+                            metadata,
+                        )?;
+                        replay_targets.insert(intent.child_session_id.clone());
+                    } else {
+                        anyhow::bail!("deferred parent input requires the retained queue store")
                     }
                 }
                 other => anyhow::bail!("unsupported deferred routing operation {other}"),
@@ -2735,6 +2842,33 @@ impl SessionStore {
                     )?;
                     deactivate_parent_wake_raw(&mut state, &intent.child_session_id)?;
                 }
+                "parent_message" => {
+                    let text = intent
+                        .payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .context("deferred parent message has no text")?;
+                    let delivery_mode = intent
+                        .payload
+                        .get("delivery_mode")
+                        .and_then(Value::as_str)
+                        .context("deferred parent message has no delivery mode")?;
+                    let category = intent
+                        .payload
+                        .get("message_category")
+                        .and_then(Value::as_str)
+                        .context("deferred parent message has no category")?;
+                    let message_id = deferred_parent_message_id(request_id, &intent.key);
+                    push_retained_message_once_raw(
+                        &mut state,
+                        &message_id,
+                        &resolved_parent_session_id,
+                        text,
+                        delivery_mode,
+                        Some(category),
+                    )?;
+                }
+                "parent_input" => {}
                 other => anyhow::bail!("unsupported deferred routing operation {other}"),
             }
             if current.replayed_at.is_none() {
@@ -2744,6 +2878,32 @@ impl SessionStore {
             store_reparent_request_records(&mut state, &records)?;
             self.write_raw_json_value(&state)?;
             reapplied.insert(intent.key);
+        }
+    }
+
+    fn drain_reparent_replay_targets(&self, targets: &BTreeSet<String>) {
+        let (Some(runtime), Some(queue)) =
+            (self.delivery_runtime.as_ref(), self.queue_store.as_ref())
+        else {
+            return;
+        };
+        let result = (|| -> Result<()> {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            for target in targets {
+                let node = raw_session_object(&state, target)
+                    .and_then(|session| json_text(session.get("node")))
+                    .unwrap_or_else(default_node);
+                if is_primary_node(&node) {
+                    drain_pending_runtime_messages_raw(
+                        self, &mut state, target, runtime, queue, None, None, None,
+                    )?;
+                }
+            }
+            self.write_raw_json_value(&state)
+        })();
+        if let Err(error) = result {
+            eprintln!("deferred reparent message drain will retry on later traffic: {error:#}");
         }
     }
 
@@ -2814,7 +2974,7 @@ impl SessionStore {
     }
 
     fn complete_reparent_prequiesce_abort(&self, request_id: &str) -> Result<()> {
-        self.replay_deferred_reparent_routes(request_id, true)?;
+        let replay_targets = self.replay_deferred_reparent_routes(request_id, true)?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let mut records = reparent_request_records(&state)?;
@@ -2826,7 +2986,10 @@ impl SessionStore {
         record.apply_stage = Some("prequiesce_aborted".to_owned());
         store_reparent_request_records(&mut state, &records)?;
         store_reparent_apply_lease(&mut state, None)?;
-        self.write_raw_json_value(&state)
+        self.write_raw_json_value(&state)?;
+        drop(_guard);
+        self.drain_reparent_replay_targets(&replay_targets);
+        Ok(())
     }
 
     fn rollback_reparent_precommit(
@@ -2875,7 +3038,7 @@ impl SessionStore {
             verify_old_reparent_edges(&state, &plan)?;
             self.write_raw_json_value(&state)?;
         }
-        self.replay_deferred_reparent_routes(request_id, true)?;
+        let replay_targets = self.replay_deferred_reparent_routes(request_id, true)?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let mut records = reparent_request_records(&state)?;
@@ -2895,7 +3058,10 @@ impl SessionStore {
         record.decided_at = Some(now_rfc3339());
         store_reparent_request_records(&mut state, &records)?;
         store_reparent_apply_lease(&mut state, None)?;
-        self.write_raw_json_value(&state)
+        self.write_raw_json_value(&state)?;
+        drop(_guard);
+        self.drain_reparent_replay_targets(&replay_targets);
+        Ok(())
     }
 
     pub fn create_session_credential_rotation(
@@ -3340,6 +3506,31 @@ impl SessionStore {
 
         let delivery_mode = normalized_delivery_mode(&request.delivery_mode);
         let (queued_text, sender_name) = format_send_input_text_raw(&state, &request);
+        if request.parent_session_id.is_some() {
+            if let Some(request_id) = active_reparent_route_request_for_session(&state, session_id)?
+            {
+                let key = format!("parent-input:{}", generate_session_id());
+                persist_deferred_parent_input_intent(
+                    &mut state,
+                    &request_id,
+                    &key,
+                    session_id,
+                    &queued_text,
+                    &delivery_mode,
+                    &request,
+                    sender_name.as_deref(),
+                )?;
+                self.write_raw_json_value(&state)?;
+                return Ok(Some(CoreInputResult {
+                    ok: true,
+                    session_id: session_id.to_owned(),
+                    delivered: false,
+                    delivery_mode: request.delivery_mode,
+                    notify_after_seconds: request.notify_after_seconds,
+                    status: initial_status,
+                }));
+            }
+        }
         if should_persist_runtime_send(&delivery_mode) {
             if let Some(queue) = &self.queue_store {
                 let metadata =
@@ -4584,14 +4775,27 @@ impl SessionStore {
                 "[sm context] Compaction fired for {label} ({session_id}). \
                  Context was compacted — agent is still running."
             );
-            self.queue_context_monitor_message(
-                state,
-                session_id,
-                &notify_target,
-                &text,
-                "sequential",
-                runtime,
-            )?;
+            if let Some(request_id) = active_reparent_route_request_for_session(state, session_id)?
+            {
+                persist_deferred_parent_message_intent(
+                    state,
+                    &request_id,
+                    &format!("context-compaction:{session_id}:{}", now_rfc3339()),
+                    session_id,
+                    &text,
+                    "sequential",
+                    "context_monitor",
+                )?;
+            } else {
+                self.queue_context_monitor_message(
+                    state,
+                    session_id,
+                    &notify_target,
+                    &text,
+                    "sequential",
+                    runtime,
+                )?;
+            }
         }
 
         if informational_only {
@@ -4836,6 +5040,27 @@ impl SessionStore {
         delivery_mode: &str,
         runtime: Option<&TmuxRuntime>,
     ) -> Result<()> {
+        self.queue_parent_message(
+            state,
+            sender_session_id,
+            notify_target,
+            text,
+            delivery_mode,
+            "context_monitor",
+            runtime,
+        )
+    }
+
+    fn queue_parent_message(
+        &self,
+        state: &mut Value,
+        sender_session_id: &str,
+        notify_target: &str,
+        text: &str,
+        delivery_mode: &str,
+        message_category: &str,
+        runtime: Option<&TmuxRuntime>,
+    ) -> Result<()> {
         if raw_session_object(state, notify_target).is_none() {
             return Ok(());
         }
@@ -4846,7 +5071,7 @@ impl SessionStore {
                 delivery_mode,
                 QueueMessageMetadata {
                     sender_session_id: Some(sender_session_id.to_owned()),
-                    message_category: Some("context_monitor".to_owned()),
+                    message_category: Some(message_category.to_owned()),
                     ..QueueMessageMetadata::default()
                 },
             )?;
@@ -4873,7 +5098,7 @@ impl SessionStore {
             notify_target,
             text,
             delivery_mode,
-            Some("context_monitor"),
+            Some(message_category),
         )?;
         Ok(())
     }
@@ -8240,6 +8465,156 @@ fn deferred_task_complete_message_id(request_id: &str, intent_key: &str) -> Stri
     digest.update(b"\0");
     digest.update(intent_key.as_bytes());
     format!("reparent-task-complete-{:x}", digest.finalize())
+}
+
+fn deferred_parent_message_id(request_id: &str, intent_key: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(request_id.as_bytes());
+    digest.update(b"\0parent-message\0");
+    digest.update(intent_key.as_bytes());
+    format!("reparent-parent-message-{:x}", digest.finalize())
+}
+
+fn persist_deferred_parent_message_intent(
+    state: &mut Value,
+    request_id: &str,
+    key: &str,
+    child_session_id: &str,
+    text: &str,
+    delivery_mode: &str,
+    message_category: &str,
+) -> Result<()> {
+    let mut records = reparent_request_records(state)?;
+    let record = records
+        .iter_mut()
+        .find(|record| record.id == request_id)
+        .with_context(|| format!("reparent request {request_id} disappeared"))?;
+    if !record
+        .deferred_routing_intents
+        .iter()
+        .any(|intent| intent.key == key)
+    {
+        record
+            .deferred_routing_intents
+            .push(ReparentDeferredRoutingIntent {
+                key: key.to_owned(),
+                operation: "parent_message".to_owned(),
+                child_session_id: child_session_id.to_owned(),
+                payload: json!({
+                    "text": text,
+                    "delivery_mode": delivery_mode,
+                    "message_category": message_category,
+                }),
+                created_at: now_rfc3339(),
+                replayed_at: None,
+                resolved_parent_session_id: None,
+            });
+    }
+    store_reparent_request_records(state, &records)
+}
+
+fn persist_deferred_parent_input_intent(
+    state: &mut Value,
+    request_id: &str,
+    key: &str,
+    target_session_id: &str,
+    text: &str,
+    delivery_mode: &str,
+    request: &SendCoreInputRequest,
+    sender_name: Option<&str>,
+) -> Result<()> {
+    let mut records = reparent_request_records(state)?;
+    let record = records
+        .iter_mut()
+        .find(|record| record.id == request_id)
+        .with_context(|| format!("reparent request {request_id} disappeared"))?;
+    if !record
+        .deferred_routing_intents
+        .iter()
+        .any(|intent| intent.key == key)
+    {
+        record
+            .deferred_routing_intents
+            .push(ReparentDeferredRoutingIntent {
+                key: key.to_owned(),
+                operation: "parent_input".to_owned(),
+                child_session_id: target_session_id.to_owned(),
+                payload: json!({
+                    "text": text,
+                    "delivery_mode": delivery_mode,
+                    "sender_session_id": request.sender_session_id,
+                    "sender_name": sender_name,
+                    "from_sm_send": request.from_sm_send,
+                    "timeout_seconds": request.timeout_seconds,
+                    "notify_on_delivery": request.notify_on_delivery,
+                    "notify_after_seconds": request.notify_after_seconds,
+                    "notify_on_stop": request.notify_on_stop,
+                    "remind_soft_threshold": request.remind_soft_threshold,
+                    "remind_hard_threshold": request.remind_hard_threshold,
+                    "remind_cancel_on_reply_session_id": request.remind_cancel_on_reply_session_id,
+                }),
+                created_at: now_rfc3339(),
+                replayed_at: None,
+                resolved_parent_session_id: None,
+            });
+    }
+    store_reparent_request_records(state, &records)
+}
+
+fn deferred_parent_input_metadata(
+    intent: &ReparentDeferredRoutingIntent,
+    parent_session_id: &str,
+) -> Result<QueueMessageMetadata> {
+    Ok(QueueMessageMetadata {
+        sender_session_id: intent
+            .payload
+            .get("sender_session_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        sender_name: intent
+            .payload
+            .get("sender_name")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        from_sm_send: intent
+            .payload
+            .get("from_sm_send")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        timeout_seconds: intent
+            .payload
+            .get("timeout_seconds")
+            .and_then(Value::as_u64),
+        notify_on_delivery: intent
+            .payload
+            .get("notify_on_delivery")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        notify_after_seconds: intent
+            .payload
+            .get("notify_after_seconds")
+            .and_then(Value::as_u64),
+        notify_on_stop: intent
+            .payload
+            .get("notify_on_stop")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        remind_soft_threshold: intent
+            .payload
+            .get("remind_soft_threshold")
+            .and_then(Value::as_u64),
+        remind_hard_threshold: intent
+            .payload
+            .get("remind_hard_threshold")
+            .and_then(Value::as_u64),
+        remind_cancel_on_reply_session_id: intent
+            .payload
+            .get("remind_cancel_on_reply_session_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        parent_session_id: Some(parent_session_id.to_owned()),
+        ..QueueMessageMetadata::default()
+    })
 }
 
 fn upsert_remind_raw(
@@ -17251,6 +17626,121 @@ mod tests {
 
         let record = store.get_reparent_request(&request_id).unwrap().unwrap();
         assert!(record.deferred_routing_intents.is_empty());
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn parent_derived_input_created_during_reparent_replays_with_new_parent() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-parent-input");
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request_id).unwrap();
+        store.quiesce_reparent_queue_routing(&request_id).unwrap();
+
+        let outcome = store
+            .send_core_input_with_runtime(
+                "child001",
+                SendCoreInputRequest {
+                    text: "queued during reparent".to_owned(),
+                    delivery_mode: "important".to_owned(),
+                    sender_session_id: None,
+                    from_sm_send: false,
+                    timeout_seconds: None,
+                    notify_on_delivery: false,
+                    notify_after_seconds: None,
+                    notify_on_stop: false,
+                    remind_soft_threshold: Some(600),
+                    remind_hard_threshold: None,
+                    remind_cancel_on_reply_session_id: None,
+                    parent_session_id: Some("oldpar01".to_owned()),
+                },
+                &TmuxRuntime::from_config(&crate::config::RustCoreConfig::default()),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!outcome.delivered);
+        assert!(queue
+            .pending_messages_for_target("child001", 10)
+            .unwrap()
+            .is_empty());
+
+        store.commit_reparent_authority(&request_id).unwrap();
+        store.finish_reparent_routing(&request_id).unwrap();
+
+        let messages = queue.pending_messages_for_target("child001", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].parent_session_id.as_deref(), Some("newpar01"));
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn compaction_during_reparent_notifies_only_the_committed_parent() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-compaction");
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request_id).unwrap();
+        store.quiesce_reparent_queue_routing(&request_id).unwrap();
+
+        assert_eq!(
+            store
+                .apply_context_usage_event(&lifecycle_event("child001", "compaction"), None)
+                .unwrap(),
+            ContextUsageOutcome::CompactionLogged
+        );
+        assert!(queue
+            .pending_messages_for_target("oldpar01", 10)
+            .unwrap()
+            .is_empty());
+        let record = store.get_reparent_request(&request_id).unwrap().unwrap();
+        assert_eq!(record.deferred_routing_intents.len(), 1);
+        assert_eq!(
+            record.deferred_routing_intents[0].operation,
+            "parent_message"
+        );
+
+        store.commit_reparent_authority(&request_id).unwrap();
+        store.finish_reparent_routing(&request_id).unwrap();
+
+        let messages = queue.pending_messages_for_target("newpar01", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].message_category.as_deref(),
+            Some("context_monitor")
+        );
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn child_wait_notification_resolves_parent_after_reparent_commit() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-child-wait");
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request_id).unwrap();
+        store.quiesce_reparent_queue_routing(&request_id).unwrap();
+
+        store
+            .send_parent_notification(
+                "child001",
+                "Child child001 completed: Session exited",
+                "sequential",
+                "child_wait",
+                None,
+            )
+            .unwrap();
+        assert!(queue
+            .pending_messages_for_target("oldpar01", 10)
+            .unwrap()
+            .is_empty());
+
+        store.commit_reparent_authority(&request_id).unwrap();
+        store.finish_reparent_routing(&request_id).unwrap();
+
+        let messages = queue.pending_messages_for_target("newpar01", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_category.as_deref(), Some("child_wait"));
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }
