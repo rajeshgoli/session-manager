@@ -18,6 +18,7 @@ use rusqlite::{
     types::{Value as SqlValue, ValueRef},
     Connection, OpenFlags, OptionalExtension,
 };
+use serde::Serialize;
 use serde_json::{Number as JsonNumber, Value as JsonValue};
 use time::{
     format_description::well_known::Rfc3339, macros::format_description, Duration, OffsetDateTime,
@@ -254,7 +255,7 @@ pub struct StopNotifyState {
     pub delay_seconds: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ParentRoutingWakeRow {
     pub id: String,
     pub child_session_id: String,
@@ -263,17 +264,23 @@ pub struct ParentRoutingWakeRow {
     pub is_active: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ParentRoutingMessageRow {
     pub id: String,
     pub child_session_id: String,
     pub parent_session_id: String,
+    pub creates_parent_wake: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ParentRoutingSnapshot {
     pub wake_rows: Vec<ParentRoutingWakeRow>,
     pub message_rows: Vec<ParentRoutingMessageRow>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParentRoutingRetargetResult {
+    pub delivered_message_rows: Vec<ParentRoutingMessageRow>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1227,17 +1234,19 @@ impl RetainedQueueStore {
                     )?;
                 }
                 for message in &snapshot.message_rows {
-                    let (current_child, current_parent) = parent_routing_message_state_conn(
-                        conn,
-                        &message.id,
-                    )?
-                        .with_context(|| format!("queue message {} disappeared", message.id))?;
+                    let (current_child, current_parent, delivered) =
+                        parent_routing_message_state_conn(conn, &message.id)?.with_context(|| {
+                            format!("queue message {} disappeared", message.id)
+                        })?;
                     if current_child != message.child_session_id
                         || (current_parent.as_deref()
                             != Some(message.parent_session_id.as_str())
                             && current_parent.is_some())
                     {
                         anyhow::bail!("queue message {} changed after planning", message.id);
+                    }
+                    if delivered {
+                        anyhow::bail!("queue message {} delivered before quiesce", message.id);
                     }
                     conn.execute(
                         "UPDATE message_queue SET parent_session_id = NULL WHERE id = ?1 AND delivered_at IS NULL",
@@ -1253,9 +1262,10 @@ impl RetainedQueueStore {
         &self,
         snapshot: &ParentRoutingSnapshot,
         new_parent_session_id: &str,
-    ) -> Result<()> {
+    ) -> Result<ParentRoutingRetargetResult> {
         self.with_connection(|conn| {
             with_immediate_transaction(conn, |conn| {
+                let mut result = ParentRoutingRetargetResult::default();
                 for wake in &snapshot.wake_rows {
                     let current = parent_routing_wake_row_conn(conn, &wake.id)?
                         .with_context(|| format!("parent wake {} disappeared", wake.id))?;
@@ -1276,11 +1286,10 @@ impl RetainedQueueStore {
                     )?;
                 }
                 for message in &snapshot.message_rows {
-                    let (current_child, current_parent) = parent_routing_message_state_conn(
-                        conn,
-                        &message.id,
-                    )?
-                        .with_context(|| format!("queue message {} disappeared", message.id))?;
+                    let (current_child, current_parent, delivered) =
+                        parent_routing_message_state_conn(conn, &message.id)?.with_context(|| {
+                            format!("queue message {} disappeared", message.id)
+                        })?;
                     if current_child != message.child_session_id
                         || (current_parent.as_deref()
                             != Some(message.parent_session_id.as_str())
@@ -1289,12 +1298,16 @@ impl RetainedQueueStore {
                     {
                         anyhow::bail!("queue message {} changed after planning", message.id);
                     }
+                    if delivered {
+                        result.delivered_message_rows.push(message.clone());
+                        continue;
+                    }
                     conn.execute(
                         "UPDATE message_queue SET parent_session_id = ?2 WHERE id = ?1 AND delivered_at IS NULL",
                         params![message.id, new_parent_session_id],
                     )?;
                 }
-                Ok(())
+                Ok(result)
             })
         })
     }
@@ -1916,7 +1929,8 @@ fn snapshot_parent_routing_conn(
 
     let mut message_statement = conn.prepare(
         r#"
-        SELECT id, target_session_id, parent_session_id
+        SELECT id, target_session_id, parent_session_id,
+               remind_soft_threshold IS NOT NULL
         FROM message_queue
         WHERE target_session_id = ?1
           AND parent_session_id = ?2
@@ -1932,6 +1946,7 @@ fn snapshot_parent_routing_conn(
                     id: row.get(0)?,
                     child_session_id: row.get(1)?,
                     parent_session_id: row.get(2)?,
+                    creates_parent_wake: row.get::<_, i64>(3)? != 0,
                 })
             },
         )?
@@ -1970,15 +1985,15 @@ fn parent_routing_wake_row_conn(
 fn parent_routing_message_state_conn(
     conn: &Connection,
     record_id: &str,
-) -> Result<Option<(String, Option<String>)>> {
+) -> Result<Option<(String, Option<String>, bool)>> {
     conn.query_row(
         r#"
-        SELECT target_session_id, parent_session_id
+        SELECT target_session_id, parent_session_id, delivered_at IS NOT NULL
         FROM message_queue
-        WHERE id = ?1 AND delivered_at IS NULL
+        WHERE id = ?1
         "#,
         params![record_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
     )
     .optional()
     .map_err(Into::into)
@@ -4304,6 +4319,54 @@ mod tests {
             store.active_parent_wake_parent("child001").unwrap(),
             Some("parent-old".to_owned())
         );
+    }
+
+    #[test]
+    fn parent_routing_retarget_preserves_messages_delivered_while_quiesced() {
+        let db_path = unique_temp_path("parent-routing-delivery-race");
+        let store = RetainedQueueStore::new(db_path);
+        store.ensure_schema().unwrap();
+        let message_id = store
+            .enqueue_message_with_metadata(
+                "child001",
+                "delivered during reparent",
+                "important",
+                QueueMessageMetadata {
+                    remind_soft_threshold: Some(600),
+                    parent_session_id: Some("parent-old".to_owned()),
+                    ..QueueMessageMetadata::default()
+                },
+            )
+            .unwrap();
+        let snapshot = store
+            .snapshot_parent_routing("child001", "parent-old")
+            .unwrap();
+        assert!(snapshot.message_rows[0].creates_parent_wake);
+
+        store.quiesce_parent_routing(&snapshot).unwrap();
+        let message = store
+            .pending_messages_for_target("child001", 10)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.id == message_id)
+            .unwrap();
+        assert!(message.parent_session_id.is_none());
+        store
+            .mark_delivered_and_apply_side_effects(&message)
+            .unwrap();
+        assert!(store
+            .active_parent_wake_parent("child001")
+            .unwrap()
+            .is_none());
+        let result = store
+            .retarget_parent_routing(&snapshot, "parent-new")
+            .unwrap();
+
+        assert_eq!(result.delivered_message_rows, snapshot.message_rows);
+        assert!(store
+            .pending_messages_for_target("child001", 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
