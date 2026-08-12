@@ -1764,6 +1764,91 @@ impl SessionStore {
         Ok(ReparentMutationOutcome::Updated(updated))
     }
 
+    pub fn decide_reparent_request_as_human(
+        &self,
+        request_id: &str,
+        actor_id: &str,
+        decision: ReparentDecision,
+    ) -> Result<ReparentMutationOutcome> {
+        let request_id = request_id.trim();
+        let actor_id = actor_id.trim();
+        if request_id.is_empty() || actor_id.is_empty() {
+            return Ok(ReparentMutationOutcome::BadRequest(
+                "request ID and authenticated human actor are required".to_owned(),
+            ));
+        }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        let mut records = reparent_request_records(&state)?;
+        let now = OffsetDateTime::now_utc();
+        let refreshed = refresh_reparent_requests(&mut records, &sessions, now);
+        let Some(index) = records.iter().position(|record| record.id == request_id) else {
+            if refreshed {
+                store_reparent_request_records(&mut state, &records)?;
+                self.write_raw_json_value(&state)?;
+            }
+            return Ok(ReparentMutationOutcome::RequestNotFound);
+        };
+        let record = &mut records[index];
+        if !record.required_human_approval {
+            return Ok(ReparentMutationOutcome::Forbidden(format!(
+                "request {request_id} does not require human approval"
+            )));
+        }
+        if let Some(existing) = record
+            .approvals
+            .iter()
+            .find(|approval| approval.actor_kind == "human")
+        {
+            if existing.actor_id == actor_id && existing.decision == decision.as_str() {
+                let updated = record.clone();
+                if refreshed {
+                    store_reparent_request_records(&mut state, &records)?;
+                    self.write_raw_json_value(&state)?;
+                }
+                return Ok(ReparentMutationOutcome::Updated(updated));
+            }
+            return Ok(ReparentMutationOutcome::Conflict(format!(
+                "human actor {} already {} request {request_id}",
+                existing.actor_id, existing.decision
+            )));
+        }
+        if record.status == "expired" {
+            store_reparent_request_records(&mut state, &records)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(ReparentMutationOutcome::Expired);
+        }
+        if record.status != "pending" {
+            return Ok(ReparentMutationOutcome::Conflict(format!(
+                "request {} is already {}",
+                record.id, record.status
+            )));
+        }
+        let decided_at = now.format(&Rfc3339)?;
+        record.approvals.push(ReparentApprovalRecord {
+            actor_kind: "human".to_owned(),
+            actor_id: actor_id.to_owned(),
+            decision: decision.as_str().to_owned(),
+            decided_at: decided_at.clone(),
+        });
+        if decision == ReparentDecision::Rejected {
+            record.status = "rejected".to_owned();
+            record.decided_at = Some(decided_at);
+            record.ready_to_apply = false;
+        } else {
+            record.ready_to_apply = approvals_satisfied(
+                &record.required_agent_approvals,
+                record.required_human_approval,
+                &record.approvals,
+            );
+        }
+        let updated = record.clone();
+        store_reparent_request_records(&mut state, &records)?;
+        self.write_raw_json_value(&state)?;
+        Ok(ReparentMutationOutcome::Updated(updated))
+    }
+
     pub fn get_reparent_request(&self, request_id: &str) -> Result<Option<ReparentRequestRecord>> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;

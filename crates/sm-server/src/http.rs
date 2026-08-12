@@ -1061,6 +1061,14 @@ pub fn router(state: AppState) -> Router {
             "/reparent-requests/{request_id}/reject",
             post(reject_reparent_request),
         )
+        .route(
+            "/reparent-requests/{request_id}/human-approve",
+            post(human_approve_reparent_request),
+        )
+        .route(
+            "/reparent-requests/{request_id}/human-reject",
+            post(human_reject_reparent_request),
+        )
         .route("/sessions/input-batch", post(send_session_input_batch))
         .route("/sessions/spawn", post(spawn_session))
         .route("/sessions/review", post(spawn_review_session))
@@ -2968,6 +2976,41 @@ async fn reject_reparent_request(
         ReparentDecision::Rejected,
         &credential,
     )?)
+}
+
+async fn human_approve_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    human_decide_reparent_request(&state, &request_id, &request, ReparentDecision::Approved)
+}
+
+async fn human_reject_reparent_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    human_decide_reparent_request(&state, &request_id, &request, ReparentDecision::Rejected)
+}
+
+fn human_decide_reparent_request(
+    state: &AppState,
+    request_id: &str,
+    request: &Request,
+    decision: ReparentDecision,
+) -> Result<Response, ApiError> {
+    ensure_core_writes_enabled(state)?;
+    ensure_session_read_allowed(state, request)?;
+    let actor_id = request_actor_email(&state.config, request).ok_or_else(|| ApiError::Status {
+        status: StatusCode::UNAUTHORIZED,
+        detail: "Operator authentication is required".to_owned(),
+    })?;
+    reparent_mutation_response(
+        state
+            .session_store
+            .decide_reparent_request_as_human(request_id, &actor_id, decision)?,
+    )
 }
 
 fn reparent_session_credential(headers: &HeaderMap) -> Result<String, ApiError> {

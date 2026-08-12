@@ -16530,8 +16530,46 @@ async fn reparent_request_uses_human_gate_when_the_recorded_parent_is_not_live()
     assert_eq!(repeated["status"], "pending");
     assert_eq!(repeated["ready_to_apply"], false);
 
+    let (status, unauthorized) = post_json_with_headers_and_peer(
+        app.clone(),
+        &format!("/reparent-requests/{request_id}/human-approve"),
+        json!({}),
+        &[("host", "sm.example.com")],
+        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unauthorized["detail"],
+        "Operator authentication is required"
+    );
+
+    let (status, human_approved) = post_json_with_headers_and_peer(
+        app.clone(),
+        &format!("/reparent-requests/{request_id}/human-approve"),
+        json!({}),
+        &[("host", "127.0.0.1")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(human_approved["ready_to_apply"], true);
+    assert_eq!(human_approved["approvals"][1]["actor_kind"], "human");
+    assert_eq!(human_approved["approvals"][1]["actor_id"], "local_bypass");
+
+    let (status, repeated_human) = post_json_with_headers_and_peer(
+        app.clone(),
+        &format!("/reparent-requests/{request_id}/human-approve"),
+        json!({}),
+        &[("host", "127.0.0.1")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(repeated_human["approvals"].as_array().unwrap().len(), 2);
+
     let (status, conflicting) = post_json_with_headers_and_peer(
-        app,
+        app.clone(),
         &format!("/reparent-requests/{request_id}/reject"),
         json!({ "requester_session_id": "newparent" }),
         &[("x-sm-session-credential", "new-token")],
@@ -16540,6 +16578,20 @@ async fn reparent_request_uses_human_gate_when_the_recorded_parent_is_not_live()
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(conflicting["detail"]
+        .as_str()
+        .unwrap()
+        .contains("already approved"));
+
+    let (status, conflicting_human) = post_json_with_headers_and_peer(
+        app,
+        &format!("/reparent-requests/{request_id}/human-reject"),
+        json!({}),
+        &[("host", "127.0.0.1")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(conflicting_human["detail"]
         .as_str()
         .unwrap()
         .contains("already approved"));
