@@ -970,24 +970,46 @@ impl SessionStore {
     }
 
     fn try_apply_waiting_credential_rotation(&self, session_id: &str) -> Result<bool> {
-        let (rotation, session) = {
+        let (rotation, session, recovering_launch_id) = {
             let _guard = self.write_guard()?;
             let state = self.load_raw_json_value()?;
-            let Some(rotation) = session_credential_rotation_records(&state)?
-                .into_iter()
-                .find(|record| record.session_id == session_id && record.status == "waiting_idle")
-            else {
-                return Ok(true);
-            };
-            let Some(session) = snapshot_from_raw_value(&state)?
-                .sessions
-                .into_iter()
-                .find(|session| session.id == session_id)
-            else {
-                return Ok(true);
-            };
-            (rotation, session)
+            let rotations = session_credential_rotation_records(&state)?;
+            let recovering_launch_id = rotations
+                .iter()
+                .find(|record| record.session_id == session_id && record.status == "relaunching")
+                .map(|rotation| {
+                    rotation.runtime_launch_id.clone().with_context(|| {
+                        format!(
+                            "relaunching credential rotation {} has no runtime launch",
+                            rotation.id
+                        )
+                    })
+                })
+                .transpose()?;
+            if recovering_launch_id.is_some() {
+                (None, None, recovering_launch_id)
+            } else {
+                let Some(rotation) = rotations.into_iter().find(|record| {
+                    record.session_id == session_id && record.status == "waiting_idle"
+                }) else {
+                    return Ok(true);
+                };
+                let Some(session) = snapshot_from_raw_value(&state)?
+                    .sessions
+                    .into_iter()
+                    .find(|session| session.id == session_id)
+                else {
+                    return Ok(true);
+                };
+                (Some(rotation), Some(session), None)
+            }
         };
+        if let Some(launch_id) = recovering_launch_id {
+            self.recover_session_runtime_launch(&launch_id)?;
+            return Ok(true);
+        }
+        let rotation = rotation.expect("waiting rotation checked above");
+        let session = session.expect("waiting rotation session checked above");
         let Some(runtime) = self.delivery_runtime.as_ref() else {
             return Ok(true);
         };
@@ -1749,6 +1771,11 @@ impl SessionStore {
                 "target parent session {target_parent_session_id} is stopped"
             )));
         }
+        if !session_supports_reparent_consent(target_parent) {
+            return Ok(ReparentMutationOutcome::BadRequest(format!(
+                "target parent session {target_parent_session_id} cannot participate in credential-bound consent"
+            )));
+        }
         if subject.parent_session_id.as_deref() == Some(target_parent_session_id) {
             return Ok(ReparentMutationOutcome::BadRequest(format!(
                 "session {subject_session_id} is already a child of {target_parent_session_id}"
@@ -1770,6 +1797,18 @@ impl SessionStore {
                 "only the live current parent or proposed new parent may request reparenting"
                     .to_owned(),
             ));
+        }
+        if expected_parent_is_live {
+            let expected_parent = sessions
+                .iter()
+                .find(|session| Some(session.id.as_str()) == expected_parent_session_id.as_deref())
+                .expect("live expected parent checked above");
+            if !session_supports_reparent_consent(expected_parent) {
+                return Ok(ReparentMutationOutcome::BadRequest(format!(
+                    "current parent session {} cannot participate in credential-bound consent",
+                    expected_parent.id
+                )));
+            }
         }
         if reparent_would_create_cycle(&sessions, subject_session_id, target_parent_session_id) {
             return Ok(ReparentMutationOutcome::Conflict(
@@ -1903,6 +1942,16 @@ impl SessionStore {
         if !target.is_live_for_registry() {
             blockers.push(format!("target session {target_session_id} is stopped"));
         }
+        if !session_supports_reparent_consent(source) {
+            blockers.push(format!(
+                "source session {source_session_id} cannot participate in credential-bound consent"
+            ));
+        }
+        if !session_supports_reparent_consent(target) {
+            blockers.push(format!(
+                "target session {target_session_id} cannot participate in credential-bound consent"
+            ));
+        }
         if target.parent_session_id.as_deref() != Some(source_session_id) {
             blockers.push(format!(
                 "target session {target_session_id} is not a live direct child of {source_session_id}"
@@ -1915,6 +1964,18 @@ impl SessionStore {
                 .find(|session| session.id == id)
                 .is_some_and(SessionRecord::is_live_for_registry)
         });
+        if expected_parent_is_live {
+            let expected_parent = sessions
+                .iter()
+                .find(|session| Some(session.id.as_str()) == expected_parent_session_id.as_deref())
+                .expect("live expected parent checked above");
+            if !session_supports_reparent_consent(expected_parent) {
+                blockers.push(format!(
+                    "current parent session {} cannot participate in credential-bound consent",
+                    expected_parent.id
+                ));
+            }
+        }
         let initiator_allowed = requester_session_id == source_session_id
             || requester_session_id == target_session_id
             || (expected_parent_is_live
@@ -13237,7 +13298,12 @@ impl ReparentRequestRecord {
             || (self.status == "failed"
                 && matches!(
                     self.apply_stage.as_deref(),
-                    Some("json_routing_quiesced" | "routing_quiesced" | "authority_committed")
+                    Some(
+                        "prequiesce_aborting"
+                            | "json_routing_quiesced"
+                            | "routing_quiesced"
+                            | "authority_committed"
+                    )
                 ))
     }
 
@@ -14008,6 +14074,13 @@ fn provider_manages_context_inline(provider: &str) -> bool {
     matches!(provider.trim(), "codex" | "codex-fork" | "codex-app")
 }
 
+fn session_supports_reparent_consent(session: &SessionRecord) -> bool {
+    is_primary_node(&session.node)
+        && matches!(session.provider.as_str(), "claude" | "codex" | "codex-fork")
+        && (session.session_credential_sha256.is_some()
+            || provider_resume_id_for_restore(session).is_some())
+}
+
 fn default_delivery_mode() -> String {
     "sequential".to_owned()
 }
@@ -14227,6 +14300,60 @@ mod tests {
             &rotation,
             &stock_codex
         ));
+    }
+
+    #[test]
+    fn credential_rotation_worker_recovers_a_relaunching_runtime_transaction() {
+        let state_file = unique_temp_path("credential-rotation-relaunch-recovery");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [reparent_test_session("rotate01", None, "old-secret")],
+                "session_runtime_launches": [{
+                    "id": "launch01",
+                    "operation_kind": "recredential",
+                    "session_id": "rotate01",
+                    "tmux_session": "claude-rotate01",
+                    "working_dir": "/repo",
+                    "log_file": "/tmp/rotate01.log",
+                    "provider": "claude",
+                    "provider_resume_id": "provider-thread",
+                    "credential_rotation_id": "rotation01",
+                    "credential_sha256": sha256_text("new-secret"),
+                    "status": "launching",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "updated_at": "2026-06-01T00:00:01Z"
+                }],
+                "session_credential_rotations": [{
+                    "id": "rotation01",
+                    "session_id": "rotate01",
+                    "provider": "claude",
+                    "provider_resume_id": "provider-thread",
+                    "tmux_session": "claude-rotate01",
+                    "request_actor": "operator",
+                    "status": "relaunching",
+                    "requested_at": "2026-06-01T00:00:00Z",
+                    "runtime_launch_id": "launch01",
+                    "updated_at": "2026-06-01T00:00:01Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(state_file.clone());
+
+        assert!(store
+            .try_apply_waiting_credential_rotation("rotate01")
+            .unwrap());
+
+        let state = store.load_raw_json_value().unwrap();
+        assert_eq!(state["session_runtime_launches"][0]["status"], "failed");
+        assert_eq!(state["session_credential_rotations"][0]["status"], "failed");
+        assert_ne!(
+            state["session_credential_rotations"][0]["status"],
+            "relaunching"
+        );
+        let _ = fs::remove_file(state_file);
     }
 
     #[test]
@@ -18214,6 +18341,122 @@ mod tests {
             Ok(CoreRetireOutcome::Retired(_))
         ));
 
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn reparent_request_rejects_a_remote_required_approver() {
+        let state_file = unique_temp_path("reparent-remote-approver");
+        let mut target = reparent_test_session("newpar01", None, "new-secret");
+        target["node"] = json!("remote-builder");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("oldpar01", None, "old-secret"),
+                    target,
+                    reparent_test_session("child001", Some("oldpar01"), "child-secret")
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(state_file.clone());
+
+        let outcome = store
+            .create_reparent_request(
+                "child001",
+                CreateReparentRequest {
+                    requester_session_id: "oldpar01".to_owned(),
+                    target_parent_session_id: "newpar01".to_owned(),
+                },
+                "old-secret",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ReparentMutationOutcome::BadRequest(message)
+                if message.contains("cannot participate in credential-bound consent")
+        ));
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn reparent_tree_preview_reports_unsupported_approver_provider() {
+        let state_file = unique_temp_path("reparent-tree-unsupported-approver");
+        let mut target = reparent_test_session("target01", Some("source01"), "target-secret");
+        target["provider"] = json!("codex-app");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("source01", None, "source-secret"),
+                    target
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(state_file.clone());
+
+        let outcome = store
+            .create_reparent_tree_request(
+                "source01",
+                CreateReparentTreeRequest {
+                    requester_session_id: "source01".to_owned(),
+                    target_session_id: "target01".to_owned(),
+                    dry_run: true,
+                },
+                "source-secret",
+            )
+            .unwrap();
+
+        let ReparentMutationOutcome::Preview(preview) = outcome else {
+            panic!("unexpected tree preview outcome: {outcome:?}");
+        };
+        assert!(preview.blockers.iter().any(|blocker| {
+            blocker.contains("target session target01")
+                && blocker.contains("cannot participate in credential-bound consent")
+        }));
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn prequiesce_abort_failure_keeps_reparent_exclusivity() {
+        let (store, _queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-prequiesce-exclusivity");
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            let mut records = reparent_request_records(&state).unwrap();
+            let record = records
+                .iter_mut()
+                .find(|record| record.id == request_id)
+                .unwrap();
+            record.status = "failed".to_owned();
+            record.apply_stage = Some("prequiesce_aborting".to_owned());
+            record.failure_reason = Some("injected abort failure".to_owned());
+            store_reparent_request_records(&mut state, &records).unwrap();
+            store.write_raw_json_value(&state).unwrap();
+        }
+
+        let outcome = store
+            .create_reparent_request(
+                "child001",
+                CreateReparentRequest {
+                    requester_session_id: "oldpar01".to_owned(),
+                    target_parent_session_id: "newpar01".to_owned(),
+                },
+                "old-parent-secret",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            ReparentMutationOutcome::Conflict(message) if message.contains(&request_id)
+        ));
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }
