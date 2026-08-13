@@ -1009,7 +1009,7 @@ impl UsageLedgerStore {
         for (index, window) in windows.into_iter().enumerate() {
             let ids = self.pending_message_ids_for_window(&window)?;
             summary.messages_selected += ids.len();
-            self.materialize_window_messages(&ids)?;
+            self.materialize_window_messages(&window, &ids)?;
             self.mark_burn_window_materialized(&window)?;
             if index + 1 < window_count {
                 thread::sleep(MATERIALIZATION_BATCH_PAUSE);
@@ -1100,16 +1100,20 @@ impl UsageLedgerStore {
         Ok(ids)
     }
 
-    fn materialize_window_messages(&self, ids: &[i64]) -> Result<()> {
+    fn materialize_window_messages(&self, window: &BurnWindow, ids: &[i64]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
+        let message_window = MessageWindow {
+            kind: window.kind.clone(),
+            start: window.start.clone(),
+        };
         let mut connection = self.open()?;
         for (index, batch) in ids.chunks(LEDGER_WRITE_BATCH_SIZE).enumerate() {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             for msg_id in batch {
                 let contribution = load_contribution(&tx, *msg_id)?;
-                materialize_contribution(&tx, *msg_id, &contribution)?;
+                materialize_contribution_for_window(&tx, *msg_id, &contribution, &message_window)?;
             }
             tx.commit()?;
             if index + 1 < ids.len().div_ceil(LEDGER_WRITE_BATCH_SIZE) {
@@ -1961,13 +1965,23 @@ fn load_contribution(tx: &Transaction<'_>, msg_id: i64) -> Result<Contribution> 
 
 fn materialize_contribution(tx: &Transaction<'_>, msg_id: i64, value: &Contribution) -> Result<()> {
     for window in windows_for(tx, value)? {
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO message_window (msg_id, window_kind, window_start) VALUES (?1, ?2, ?3)",
-            params![msg_id, window.kind, window.start],
-        )?;
-        if inserted > 0 && value.model != "<synthetic>" {
-            apply_rollup(tx, value, &window, 1)?;
-        }
+        materialize_contribution_for_window(tx, msg_id, value, &window)?;
+    }
+    Ok(())
+}
+
+fn materialize_contribution_for_window(
+    tx: &Transaction<'_>,
+    msg_id: i64,
+    value: &Contribution,
+    window: &MessageWindow,
+) -> Result<()> {
+    let inserted = tx.execute(
+        "INSERT OR IGNORE INTO message_window (msg_id, window_kind, window_start) VALUES (?1, ?2, ?3)",
+        params![msg_id, window.kind, window.start],
+    )?;
+    if inserted > 0 && value.model != "<synthetic>" {
+        apply_rollup(tx, value, window, 1)?;
     }
     Ok(())
 }
@@ -2895,7 +2909,7 @@ mod tests {
         let window = store.pending_burn_windows().unwrap().pop().unwrap();
         let ids = store.pending_message_ids_for_window(&window).unwrap();
         assert_eq!(ids.len(), 1);
-        store.materialize_window_messages(&ids).unwrap();
+        store.materialize_window_messages(&window, &ids).unwrap();
         let checkpoint_count: i64 = Connection::open(&db_path)
             .unwrap()
             .query_row(
@@ -2977,6 +2991,67 @@ mod tests {
         assert!(started_at.elapsed() < Duration::from_millis(250));
         let summary = handle.join().unwrap().unwrap();
         assert_eq!(summary.messages_selected, 512);
+    }
+
+    #[test]
+    fn pending_window_materialization_does_not_expand_into_overlapping_windows() {
+        let dir = TestDir::new("materialization-exact-window");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Claude,
+            "account-one",
+            "max",
+            "session_5h",
+            300,
+        );
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        let mut connection = Connection::open(&db_path).unwrap();
+        let tx = connection.transaction().unwrap();
+        ingest_contribution(
+            &tx,
+            &contribution_at("eligible", "eligible-request", "2026-08-10T16:00:00Z"),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        store.materialize_pending_windows().unwrap();
+
+        record_window(
+            &db_path,
+            "weekly_all",
+            300,
+            "2026-08-10T18:00:00Z",
+            "test-first-overlap",
+        );
+        record_window(
+            &db_path,
+            "codex_10080",
+            300,
+            "2026-08-10T18:00:00Z",
+            "test-second-overlap",
+        );
+        let windows = store.pending_burn_windows().unwrap();
+        assert_eq!(windows.len(), 2);
+        let first = &windows[0];
+        let ids = store.pending_message_ids_for_window(first).unwrap();
+        assert_eq!(ids.len(), 1);
+        store.materialize_window_messages(first, &ids).unwrap();
+
+        let connection = Connection::open(&db_path).unwrap();
+        let mapped = connection
+            .prepare(
+                "SELECT window_kind FROM message_window WHERE msg_id = ?1 ORDER BY window_kind",
+            )
+            .unwrap()
+            .query_map([ids[0]], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let mut expected = vec!["session_5h".to_owned(), first.kind.clone()];
+        expected.sort();
+        assert_eq!(mapped, expected);
+        let second_ids = store.pending_message_ids_for_window(&windows[1]).unwrap();
+        assert_eq!(second_ids, ids);
     }
 
     #[test]
