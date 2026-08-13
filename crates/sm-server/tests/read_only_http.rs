@@ -7772,6 +7772,83 @@ async fn context_usage_hook_records_claude_rate_limits_in_the_configured_usage_d
 }
 
 #[tokio::test]
+async fn context_usage_hook_normalizes_numeric_rate_limit_timestamps_and_isolates_malformed_windows(
+) {
+    let state_file = write_session_fixture();
+    let usage_db_path = unique_temp_path().with_extension("usage.db");
+    let now = time::OffsetDateTime::now_utc();
+    let identity_store = UsageIdentityStore::new(&usage_db_path).unwrap();
+    identity_store
+        .record_observation(
+            Provider::Claude,
+            Some(&AccountIdentity {
+                provider: Provider::Claude,
+                external_id: "claude-numeric-account".to_owned(),
+                label: None,
+                plan_tier: None,
+                extra_usage_enabled: Some(true),
+            }),
+            now - time::Duration::minutes(1),
+            None,
+            None,
+        )
+        .unwrap();
+    let mut config = config_with_state_file(&state_file);
+    config.usage.enabled = true;
+    config.usage.db_path = usage_db_path.display().to_string();
+    let app = router(AppState::new(config));
+    let numeric_reset = now + time::Duration::hours(5);
+
+    let (status, payload) = post_json(
+        app,
+        "/hooks/context-usage",
+        json!({
+            "session_id": "run12345",
+            "rate_limits": {
+                "five_hour": {
+                    "used_percentage": 12.0,
+                    "resets_at": numeric_reset.unix_timestamp()
+                },
+                "seven_day": {
+                    "used_percentage": 34.0,
+                    "resets_at": "not-a-timestamp"
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(
+        payload["warnings"],
+        json!(["seven_day.resets_at is not a valid RFC3339 string or Unix epoch second"])
+    );
+
+    let connection = Connection::open(usage_db_path).unwrap();
+    let rows = connection
+        .prepare("SELECT window_kind, percent, resets_at FROM burn_samples ORDER BY window_kind")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "session_5h");
+    assert_eq!(rows[0].1, 12.0);
+    assert_eq!(
+        time::OffsetDateTime::parse(&rows[0].2, &time::format_description::well_known::Rfc3339)
+            .unwrap(),
+        time::OffsetDateTime::from_unix_timestamp(numeric_reset.unix_timestamp()).unwrap()
+    );
+}
+
+#[tokio::test]
 async fn usage_routes_preserve_exact_account_burn_and_optionally_include_children() {
     let state_file = unique_temp_path();
     fs::write(
