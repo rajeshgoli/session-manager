@@ -22,6 +22,7 @@ use crate::{
 const USAGE_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const PROJECT_KEY_GIT_TIMEOUT: Duration = Duration::from_secs(1);
 const LEDGER_WRITE_BATCH_SIZE: usize = 16;
+const MATERIALIZATION_BATCH_PAUSE: Duration = Duration::from_millis(1);
 const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
     "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z"
 );
@@ -111,6 +112,21 @@ pub struct ScanSummary {
     pub messages_inserted: usize,
     pub messages_replaced: usize,
     pub messages_ignored: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MaterializationSummary {
+    windows_examined: usize,
+    messages_selected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BurnWindow {
+    account_key: String,
+    kind: String,
+    scope: String,
+    start: String,
+    resets_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +261,8 @@ impl UsageLedgerStore {
                   ON message_ledger(message_id);
                 CREATE INDEX IF NOT EXISTS idx_ledger_rollup
                   ON message_ledger(account_key, bucket_ts);
+                CREATE INDEX IF NOT EXISTS idx_ledger_window_materialization
+                  ON message_ledger(account_key, recorded_at);
 
                 CREATE TABLE IF NOT EXISTS message_window (
                   msg_id       INTEGER NOT NULL REFERENCES message_ledger(msg_id) ON DELETE CASCADE,
@@ -254,6 +272,22 @@ impl UsageLedgerStore {
                 );
                 CREATE INDEX IF NOT EXISTS idx_mw_rollup
                   ON message_window(window_kind, window_start);
+
+                CREATE TABLE IF NOT EXISTS burn_window_materialization (
+                  account_key  TEXT NOT NULL,
+                  window_kind  TEXT NOT NULL,
+                  window_scope TEXT NOT NULL,
+                  window_start TEXT NOT NULL,
+                  resets_at    TEXT NOT NULL,
+                  materialized_at TEXT NOT NULL,
+                  PRIMARY KEY (
+                    account_key, window_kind, window_scope, window_start, resets_at
+                  )
+                );
+                CREATE INDEX IF NOT EXISTS idx_burn_window_materialization_source
+                  ON burn_samples(
+                    account_key, window_kind, window_scope, window_start, resets_at
+                  );
 
                 CREATE TABLE IF NOT EXISTS message_alias (
                   lookup_key TEXT PRIMARY KEY,
@@ -473,6 +507,7 @@ impl UsageLedgerStore {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM seat_tokens", [])?;
         tx.execute("DELETE FROM message_window", [])?;
+        tx.execute("DELETE FROM burn_window_materialization", [])?;
         let ids = tx
             .prepare("SELECT msg_id FROM message_ledger ORDER BY msg_id")?
             .query_map([], |row| row.get::<_, i64>(0))?
@@ -491,6 +526,7 @@ impl UsageLedgerStore {
         tx.execute("DELETE FROM seat_tokens", [])?;
         tx.execute("DELETE FROM message_alias", [])?;
         tx.execute("DELETE FROM message_window", [])?;
+        tx.execute("DELETE FROM burn_window_materialization", [])?;
         tx.execute("DELETE FROM message_ledger", [])?;
         tx.execute("DELETE FROM scan_offsets", [])?;
         tx.execute("DELETE FROM codex_thread_cursor", [])?;
@@ -963,22 +999,145 @@ impl UsageLedgerStore {
         normalized_model(value)
     }
 
-    fn materialize_pending_windows(&self) -> Result<()> {
+    fn materialize_pending_windows(&self) -> Result<MaterializationSummary> {
+        let windows = self.pending_burn_windows()?;
+        let mut summary = MaterializationSummary {
+            windows_examined: windows.len(),
+            ..MaterializationSummary::default()
+        };
+        let window_count = windows.len();
+        for (index, window) in windows.into_iter().enumerate() {
+            let ids = self.pending_message_ids_for_window(&window)?;
+            summary.messages_selected += ids.len();
+            self.materialize_window_messages(&ids)?;
+            self.mark_burn_window_materialized(&window)?;
+            if index + 1 < window_count {
+                thread::sleep(MATERIALIZATION_BATCH_PAUSE);
+            }
+        }
+        Ok(summary)
+    }
+
+    fn pending_burn_windows(&self) -> Result<Vec<BurnWindow>> {
         let connection = self.open()?;
-        let ids = connection
-            .prepare("SELECT msg_id FROM message_ledger ORDER BY msg_id")?
-            .query_map([], |row| row.get::<_, i64>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(connection);
+        let mut statement = connection.prepare(
+            r#"
+                SELECT b.account_key, b.window_kind, COALESCE(b.window_scope, ''),
+                       b.window_start, b.resets_at
+                FROM burn_samples AS b
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM burn_window_materialization AS completed
+                    WHERE completed.account_key = b.account_key
+                      AND completed.window_kind = b.window_kind
+                      AND completed.window_scope = COALESCE(b.window_scope, '')
+                      AND completed.window_start = b.window_start
+                      AND completed.resets_at = b.resets_at
+                )
+                GROUP BY b.account_key, b.window_kind, COALESCE(b.window_scope, ''),
+                         b.window_start, b.resets_at
+                ORDER BY b.account_key, b.window_start, b.window_kind, b.window_scope
+                "#,
+        )?;
+        let windows = statement
+            .query_map([], |row| {
+                Ok(BurnWindow {
+                    account_key: row.get(0)?,
+                    kind: row.get(1)?,
+                    scope: row.get(2)?,
+                    start: row.get(3)?,
+                    resets_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(windows)
+    }
+
+    fn pending_message_ids_for_window(&self, window: &BurnWindow) -> Result<Vec<i64>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            r#"
+                SELECT ledger.msg_id
+                FROM message_ledger AS ledger INDEXED BY idx_ledger_window_materialization
+                WHERE ledger.account_key = ?1
+                  AND ledger.recorded_at >= ?2
+                  AND ledger.recorded_at < ?3
+                  AND (
+                        ?4 != 'weekly_scoped'
+                     OR (
+                          ?5 != ''
+                      AND (
+                             LOWER(ledger.model) = LOWER(?5)
+                          OR INSTR(LOWER(ledger.model), LOWER(?5)) > 0
+                          OR INSTR(LOWER(?5), LOWER(ledger.model)) > 0
+                      )
+                     )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM message_window AS mapped
+                      WHERE mapped.msg_id = ledger.msg_id
+                        AND mapped.window_kind = ?4
+                        AND mapped.window_start = ?2
+                  )
+                ORDER BY ledger.recorded_at, ledger.msg_id
+                "#,
+        )?;
+        let ids = statement
+            .query_map(
+                params![
+                    window.account_key,
+                    window.start,
+                    window.resets_at,
+                    window.kind,
+                    window.scope,
+                ],
+                |row| row.get::<_, i64>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(ids)
+    }
+
+    fn materialize_window_messages(&self, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
         let mut connection = self.open()?;
-        for batch in ids.chunks(LEDGER_WRITE_BATCH_SIZE) {
+        for (index, batch) in ids.chunks(LEDGER_WRITE_BATCH_SIZE).enumerate() {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             for msg_id in batch {
                 let contribution = load_contribution(&tx, *msg_id)?;
                 materialize_contribution(&tx, *msg_id, &contribution)?;
             }
             tx.commit()?;
+            if index + 1 < ids.len().div_ceil(LEDGER_WRITE_BATCH_SIZE) {
+                thread::sleep(MATERIALIZATION_BATCH_PAUSE);
+            }
         }
+        Ok(())
+    }
+
+    fn mark_burn_window_materialized(&self, window: &BurnWindow) -> Result<()> {
+        let mut connection = self.open()?;
+        let tx = connection.transaction()?;
+        tx.execute(
+            r#"
+            INSERT OR IGNORE INTO burn_window_materialization (
+              account_key, window_kind, window_scope, window_start, resets_at, materialized_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                window.account_key,
+                window.kind,
+                window.scope,
+                window.start,
+                window.resets_at,
+                format_timestamp(OffsetDateTime::now_utc())?,
+            ],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 }
@@ -2425,6 +2584,9 @@ mod tests {
     use std::{
         io::Write,
         sync::atomic::{AtomicU64, Ordering},
+        sync::mpsc,
+        thread,
+        time::{Duration, Instant},
     };
 
     use serde_json::json;
@@ -2541,6 +2703,280 @@ mod tests {
             tokens,
             credit_metered: false,
         }
+    }
+
+    fn contribution_at(message_id: &str, request_id: &str, timestamp: &str) -> Contribution {
+        let mut value = contribution(message_id, request_id, false, false, 10);
+        value.timestamp = at(timestamp);
+        value.bucket_ts = minute_timestamp(value.timestamp).unwrap();
+        value
+    }
+
+    fn record_window(
+        db_path: &Path,
+        kind: &str,
+        duration_minutes: i64,
+        resets_at: &str,
+        source: &str,
+    ) {
+        UsageBurnStore::new(db_path)
+            .unwrap()
+            .record_for_account(
+                "claude:account-one",
+                &[BurnWindowSample {
+                    window_kind: kind.to_owned(),
+                    window_scope: None,
+                    duration_minutes,
+                    percent: 10.0,
+                    resets_at: at(resets_at),
+                    severity: None,
+                    is_active: Some(true),
+                }],
+                source,
+                at("2026-08-10T15:30:00Z"),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn no_change_materialization_scan_does_not_rematerialize_ledger_rows() {
+        let dir = TestDir::new("materialization-no-change");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Claude,
+            "account-one",
+            "max",
+            "session_5h",
+            300,
+        );
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        let mut connection = Connection::open(&db_path).unwrap();
+        let tx = connection.transaction().unwrap();
+        for index in 0..64 {
+            ingest_contribution(
+                &tx,
+                &contribution_at(
+                    &format!("message-{index}"),
+                    &format!("request-{index}"),
+                    "2026-08-10T16:00:00Z",
+                ),
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        // Existing message-window rows are backfilled into the durable window checkpoint
+        // without rewriting a rollup. Every later scan skips the window entirely.
+        assert_eq!(
+            store.materialize_pending_windows().unwrap(),
+            MaterializationSummary {
+                windows_examined: 1,
+                messages_selected: 0,
+            }
+        );
+        let before: i64 = Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT SUM(message_count) FROM seat_tokens", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(before, 64);
+        assert_eq!(
+            store.materialize_pending_windows().unwrap(),
+            MaterializationSummary::default()
+        );
+        let after: i64 = Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT SUM(message_count) FROM seat_tokens", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn new_burn_window_materializes_each_eligible_message_once() {
+        let dir = TestDir::new("materialization-new-window");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Claude,
+            "account-one",
+            "max",
+            "session_5h",
+            300,
+        );
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        let mut connection = Connection::open(&db_path).unwrap();
+        let tx = connection.transaction().unwrap();
+        ingest_contribution(
+            &tx,
+            &contribution_at("eligible", "eligible-request", "2026-08-10T16:00:00Z"),
+        )
+        .unwrap();
+        ingest_contribution(
+            &tx,
+            &contribution_at("outside", "outside-request", "2026-08-10T19:00:00Z"),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        store.materialize_pending_windows().unwrap();
+
+        record_window(
+            &db_path,
+            "weekly_all",
+            300,
+            "2026-08-10T18:00:00Z",
+            "test-new-window",
+        );
+        assert_eq!(
+            store.materialize_pending_windows().unwrap(),
+            MaterializationSummary {
+                windows_examined: 1,
+                messages_selected: 1,
+            }
+        );
+        let connection = Connection::open(&db_path).unwrap();
+        let mapped = connection
+            .prepare(
+                "SELECT message_id FROM message_ledger JOIN message_window USING(msg_id) WHERE window_kind = 'weekly_all' ORDER BY message_id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(mapped, vec!["eligible"]);
+        let rollup_messages: i64 = connection
+            .query_row(
+                "SELECT SUM(message_count) FROM seat_tokens WHERE window_kind = 'weekly_all'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rollup_messages, 1);
+        assert_eq!(
+            store.materialize_pending_windows().unwrap(),
+            MaterializationSummary::default()
+        );
+    }
+
+    #[test]
+    fn interrupted_window_materialization_restarts_without_duplicate_rollups() {
+        let dir = TestDir::new("materialization-restart");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Claude,
+            "account-one",
+            "max",
+            "session_5h",
+            300,
+        );
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        let mut connection = Connection::open(&db_path).unwrap();
+        let tx = connection.transaction().unwrap();
+        ingest_contribution(
+            &tx,
+            &contribution_at("eligible", "eligible-request", "2026-08-10T16:00:00Z"),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        store.materialize_pending_windows().unwrap();
+        record_window(
+            &db_path,
+            "weekly_all",
+            300,
+            "2026-08-10T18:00:00Z",
+            "test-restart-window",
+        );
+
+        let window = store.pending_burn_windows().unwrap().pop().unwrap();
+        let ids = store.pending_message_ids_for_window(&window).unwrap();
+        assert_eq!(ids.len(), 1);
+        store.materialize_window_messages(&ids).unwrap();
+        let checkpoint_count: i64 = Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_window_materialization WHERE window_kind = 'weekly_all'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(checkpoint_count, 0);
+
+        let restarted = UsageLedgerStore::new(&db_path).unwrap();
+        assert_eq!(
+            restarted.materialize_pending_windows().unwrap(),
+            MaterializationSummary {
+                windows_examined: 1,
+                messages_selected: 0,
+            }
+        );
+        let rollup_messages: i64 = Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT SUM(message_count) FROM seat_tokens WHERE window_kind = 'weekly_all'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rollup_messages, 1);
+    }
+
+    #[test]
+    fn historical_window_materialization_yields_to_live_seat_session_writers() {
+        let dir = TestDir::new("materialization-live-writer");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Claude,
+            "account-one",
+            "max",
+            "session_5h",
+            300,
+        );
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        let mut connection = Connection::open(&db_path).unwrap();
+        let tx = connection.transaction().unwrap();
+        for index in 0..512 {
+            ingest_contribution(
+                &tx,
+                &contribution_at(
+                    &format!("message-{index}"),
+                    &format!("request-{index}"),
+                    "2026-08-10T16:00:00Z",
+                ),
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        store.materialize_pending_windows().unwrap();
+        record_window(
+            &db_path,
+            "weekly_all",
+            300,
+            "2026-08-10T18:00:00Z",
+            "test-large-window",
+        );
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let scanner = store.clone();
+        let handle = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            scanner.materialize_pending_windows()
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        thread::sleep(Duration::from_millis(5));
+
+        let started_at = Instant::now();
+        SeatSessionStore::new(&db_path)
+            .append("live-seat", "claude", "live-session", None)
+            .unwrap();
+        assert!(started_at.elapsed() < Duration::from_millis(250));
+        let summary = handle.join().unwrap().unwrap();
+        assert_eq!(summary.messages_selected, 512);
     }
 
     #[test]
