@@ -355,6 +355,7 @@ impl UsageLedgerStore {
             .map(|seat| (seat.seat_id.clone(), seat.clone()))
             .collect::<BTreeMap<_, _>>();
         self.rebind_provisional_messages(&bindings, &seat_meta)?;
+        self.reconcile_unknown_models(&seat_meta)?;
         let artifacts = expand_artifacts(&bindings);
         let mut summary = ScanSummary::default();
         let mut errors = Vec::new();
@@ -495,11 +496,56 @@ impl UsageLedgerStore {
                 let mut rebound = incumbent;
                 rebound.seat_id = binding.seat_id.clone();
                 rebound.project_key = metadata.project_key.clone();
+                if rebound.model == "unknown" {
+                    rebound.model = normalized_model(metadata.model.as_deref())
+                        .or_else(|| self.default_model(&binding.provider))
+                        .unwrap_or(rebound.model);
+                }
                 overwrite_contribution(&tx, msg_id, &rebound)?;
                 materialize_contribution(&tx, msg_id, &rebound)?;
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    fn reconcile_unknown_models(
+        &self,
+        seat_meta: &BTreeMap<String, UsageSeatMetadata>,
+    ) -> Result<()> {
+        let connection = self.open()?;
+        let ids = connection
+            .prepare(
+                "SELECT msg_id FROM message_ledger WHERE model = 'unknown' AND seat_id != 'unassigned' ORDER BY msg_id",
+            )?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(connection);
+
+        let mut connection = self.open()?;
+        for (index, batch) in ids.chunks(LEDGER_WRITE_BATCH_SIZE).enumerate() {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for msg_id in batch {
+                let incumbent = load_contribution(&tx, *msg_id)?;
+                let Some(metadata) = seat_meta.get(&incumbent.seat_id) else {
+                    continue;
+                };
+                let Some(model) = normalized_model(metadata.model.as_deref())
+                    .or_else(|| self.default_model(&metadata.provider))
+                else {
+                    continue;
+                };
+                reverse_contribution(&tx, *msg_id, &incumbent)?;
+                let mut reconciled = incumbent;
+                reconciled.model = model;
+                overwrite_contribution(&tx, *msg_id, &reconciled)?;
+                materialize_contribution(&tx, *msg_id, &reconciled)?;
+            }
+            tx.commit()?;
+            if index + 1 < ids.len().div_ceil(LEDGER_WRITE_BATCH_SIZE) {
+                thread::sleep(LEDGER_BATCH_PAUSE);
+            }
+        }
         Ok(())
     }
 
@@ -4177,7 +4223,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(model, "unknown");
-        assert_eq!(offset, fs::metadata(artifact).unwrap().len());
+        assert_eq!(offset, fs::metadata(&artifact).unwrap().len());
+
+        let resolved_seat = UsageSeatMetadata {
+            seat_id: "seat-one".to_owned(),
+            friendly_name: None,
+            provider: "codex-fork".to_owned(),
+            model: Some("gpt-5.6-terra".to_owned()),
+            effort: None,
+            working_dir: "/repo".to_owned(),
+            parent_seat_id: None,
+            root_seat_id: Some("seat-one".to_owned()),
+            project_key: "/repo".to_owned(),
+        };
+        SeatSessionStore::new(&db_path)
+            .append("seat-one", "codex-fork", "thread-one", artifact.to_str())
+            .unwrap();
+        store.scan(&[resolved_seat]).unwrap();
+
+        let connection = Connection::open(&db_path).unwrap();
+        let (seat_id, model): (String, String) = connection
+            .query_row(
+                "SELECT seat_id, model FROM message_ledger LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(seat_id, "seat-one");
+        assert_eq!(model, "gpt-5.6-terra");
     }
 
     #[test]
