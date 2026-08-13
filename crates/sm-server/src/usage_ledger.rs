@@ -22,6 +22,7 @@ use crate::{
 const USAGE_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const PROJECT_KEY_GIT_TIMEOUT: Duration = Duration::from_secs(1);
 const LEDGER_WRITE_BATCH_SIZE: usize = 16;
+const LEDGER_BATCH_PAUSE: Duration = Duration::from_millis(1);
 const MATERIALIZATION_BATCH_PAUSE: Duration = Duration::from_millis(1);
 const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
     "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z"
@@ -736,6 +737,7 @@ impl UsageLedgerStore {
             if batch_lines >= LEDGER_WRITE_BATCH_SIZE {
                 save_scan_offset(&tx, &artifact.path, line_offset, mtime_ns)?;
                 tx.commit()?;
+                thread::sleep(LEDGER_BATCH_PAUSE);
                 tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 ensure_codex_cursor_baselines(&tx, artifact)?;
                 batch_lines = 0;
@@ -942,7 +944,7 @@ impl UsageLedgerStore {
                     .map(|(model, _)| model.clone())
                     .or_else(|| seat.and_then(|seat| normalized_model(seat.model.as_deref())))
                     .or_else(|| self.default_model(raw_provider))
-                    .context("Codex token event has no resolvable model")?;
+                    .unwrap_or_else(|| "unknown".to_owned());
                 let effort = settings
                     .and_then(|(_, effort)| effort)
                     .or_else(|| seat.and_then(|seat| seat.effort.clone()));
@@ -2994,6 +2996,88 @@ mod tests {
     }
 
     #[test]
+    fn historical_artifact_scan_yields_to_live_seat_session_writers() {
+        let dir = TestDir::new("artifact-scan-live-writer");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Claude,
+            "account-one",
+            "max",
+            "session_5h",
+            300,
+        );
+        let transcript = dir.0.join("session-one.jsonl");
+        let mut file = fs::File::create(&transcript).unwrap();
+        for index in 0..4096 {
+            writeln!(
+                file,
+                "{}",
+                json!({
+                    "timestamp": "2026-08-10T16:30:00Z",
+                    "sessionId": "session-one",
+                    "requestId": format!("request-{index}"),
+                    "cwd": "/repo",
+                    "version": "1.0.0",
+                    "message": {
+                        "id": format!("message-{index}"),
+                        "model": "claude-sonnet-5",
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 5,
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0
+                        }
+                    }
+                })
+            )
+            .unwrap();
+        }
+        drop(file);
+        SeatSessionStore::new(&db_path)
+            .append("seat-one", "claude", "session-one", transcript.to_str())
+            .unwrap();
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        let scanner = store.clone();
+        let handle = thread::spawn(move || {
+            scanner.scan(&[UsageSeatMetadata {
+                seat_id: "seat-one".to_owned(),
+                friendly_name: None,
+                provider: "claude".to_owned(),
+                model: Some("claude-sonnet-5".to_owned()),
+                effort: None,
+                working_dir: "/repo".to_owned(),
+                parent_seat_id: None,
+                root_seat_id: Some("seat-one".to_owned()),
+                project_key: "/repo".to_owned(),
+            }])
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let count: i64 = Connection::open(&db_path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM message_ledger", [], |row| row.get(0))
+                .unwrap();
+            if count >= LEDGER_WRITE_BATCH_SIZE as i64 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "artifact scan did not start");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !handle.is_finished(),
+            "artifact scan finished before the writer probe"
+        );
+        let started_at = Instant::now();
+        SeatSessionStore::new(&db_path)
+            .append("live-seat", "claude", "live-session", None)
+            .unwrap();
+        assert!(started_at.elapsed() < Duration::from_millis(250));
+        handle.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn pending_window_materialization_does_not_expand_into_overlapping_windows() {
         let dir = TestDir::new("materialization-exact-window");
         let db_path = dir.0.join("usage.db");
@@ -4053,6 +4137,47 @@ mod tests {
             .resolve_seat_models(&[seat_preferred])
             .unwrap();
         assert_eq!(resolved[0].model.as_deref(), Some("seat-model"));
+    }
+
+    #[test]
+    fn codex_events_without_model_metadata_are_checkpointed_as_unknown() {
+        let dir = TestDir::new("model-fallback-unknown");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Codex,
+            "codex-account",
+            "pro",
+            "codex_300",
+            300,
+        );
+        let artifact = dir.0.join("codex.jsonl");
+        fs::write(
+            &artifact,
+            "{\"event_type\":\"thread/tokenUsage/updated\",\"seq\":1,\"ts\":\"2026-08-10T16:00:00Z\",\"payload\":{\"threadId\":\"thread-one\",\"tokenUsage\":{\"total\":{\"inputTokens\":80,\"cachedInputTokens\":60,\"cacheWriteInputTokens\":0,\"outputTokens\":20,\"reasoningOutputTokens\":5,\"totalTokens\":100}}}}\n",
+        )
+        .unwrap();
+        SeatSessionStore::new(&db_path)
+            .append("unassigned", "codex-fork", "thread-one", artifact.to_str())
+            .unwrap();
+
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        store.scan(&[]).unwrap();
+
+        let connection = Connection::open(&db_path).unwrap();
+        let (model, offset): (String, u64) = connection
+            .query_row(
+                r#"
+                SELECT
+                  (SELECT model FROM message_ledger LIMIT 1),
+                  (SELECT byte_offset FROM scan_offsets WHERE artifact_path = ?1)
+                "#,
+                [artifact.to_string_lossy().as_ref()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(model, "unknown");
+        assert_eq!(offset, fs::metadata(artifact).unwrap().len());
     }
 
     #[test]
