@@ -1620,6 +1620,41 @@ fn hook_emitted_at(payload: &Value) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
+/// Normalize Claude's provider-native reset timestamp while preserving the
+/// RFC3339 string form used by older hooks.
+fn normalize_rate_limit_reset_at(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => {
+            let value = value.trim();
+            (!value.is_empty() && OffsetDateTime::parse(value, &Rfc3339).is_ok())
+                .then(|| value.to_owned())
+        }
+        Value::Number(value) => {
+            let timestamp = value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))?;
+            OffsetDateTime::from_unix_timestamp(timestamp)
+                .ok()?
+                .format(&Rfc3339)
+                .ok()
+        }
+        _ => None,
+    }
+}
+
+fn rate_limit_reset_at(
+    payload: &Value,
+    window: Option<&serde_json::Map<String, Value>>,
+    legacy_key: &str,
+) -> (Option<String>, bool) {
+    let value = window
+        .and_then(|window| window.get("resets_at"))
+        .or_else(|| payload.get(legacy_key));
+    let normalized = value.and_then(normalize_rate_limit_reset_at);
+    let invalid = value.is_some() && normalized.is_none();
+    (normalized, invalid)
+}
+
 /// Context monitor producer hooks (sm#203): the Claude status line posts usage
 /// samples here, and `PreCompact`/`SessionStart` post lifecycle events.
 async fn context_usage_hook(
@@ -1653,6 +1688,10 @@ async fn context_usage_hook(
     let seven_day = rate_limits
         .and_then(|limits| limits.get("seven_day"))
         .and_then(Value::as_object);
+    let (five_hour_resets_at, five_hour_reset_invalid) =
+        rate_limit_reset_at(&payload, five_hour, "five_hour_resets_at");
+    let (seven_day_resets_at, seven_day_reset_invalid) =
+        rate_limit_reset_at(&payload, seven_day, "seven_day_resets_at");
     let event = ContextUsageEvent {
         session_id,
         event: payload
@@ -1667,20 +1706,12 @@ async fn context_usage_hook(
             .and_then(|window| window.get("used_percentage"))
             .and_then(Value::as_f64)
             .or_else(|| payload.get("five_hour_percent").and_then(Value::as_f64)),
-        five_hour_resets_at: five_hour
-            .and_then(|window| window.get("resets_at"))
-            .or_else(|| payload.get("five_hour_resets_at"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        five_hour_resets_at,
         seven_day_percent: seven_day
             .and_then(|window| window.get("used_percentage"))
             .and_then(Value::as_f64)
             .or_else(|| payload.get("seven_day_percent").and_then(Value::as_f64)),
-        seven_day_resets_at: seven_day
-            .and_then(|window| window.get("resets_at"))
-            .or_else(|| payload.get("seven_day_resets_at"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        seven_day_resets_at,
         emitted_at: hook_emitted_at(&payload).map(ToOwned::to_owned),
     };
 
@@ -1699,6 +1730,21 @@ async fn context_usage_hook(
     }
 
     let mut body = json!({ "status": outcome.status() });
+    let mut warnings = Vec::new();
+    if five_hour_reset_invalid {
+        warnings.push("five_hour.resets_at is not a valid RFC3339 string or Unix epoch second");
+    }
+    if seven_day_reset_invalid {
+        warnings.push("seven_day.resets_at is not a valid RFC3339 string or Unix epoch second");
+    }
+    if !warnings.is_empty() {
+        eprintln!(
+            "Claude status-line quota window rejected for {}: {}",
+            event.session_id,
+            warnings.join("; ")
+        );
+        body["warnings"] = json!(warnings);
+    }
     match &outcome {
         ContextUsageOutcome::Recorded { used_percentage } => {
             body["used_percentage"] = json!(used_percentage);
