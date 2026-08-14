@@ -49,6 +49,8 @@ const CODEX_CLI_SESSION_BIND_POLL: Duration = Duration::from_millis(50);
 const CODEX_FORK_THREAD_STARTED_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_FORK_EVENT_MONITOR_POLL: Duration = Duration::from_millis(250);
 const CODEX_FORK_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+const CODEX_FORK_CONTROL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);
+const CODEX_FORK_CONTROL_RECOVERY_POLL: Duration = Duration::from_millis(50);
 const SEAT_SESSION_RETRY_ATTEMPTS: usize = 20;
 const SEAT_SESSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 const REPARENT_REQUEST_TTL_HOURS: i64 = 24;
@@ -7448,6 +7450,25 @@ impl SessionStore {
         }
 
         let mut changed = false;
+        if let Some(event_type) = codex_fork_event_type(event)
+            .map(|value| normalize_codex_fork_event_type(&value.replace('/', "_")))
+        {
+            match event_type.as_str() {
+                "control_socket_degraded" => {
+                    let reason = event
+                        .get("payload")
+                        .and_then(Value::as_object)
+                        .and_then(|payload| json_text(payload.get("reason")))
+                        .unwrap_or_else(|| "control socket supervisor is recovering".to_owned());
+                    mark_codex_fork_control_degraded_raw(session, &reason);
+                    changed = true;
+                }
+                "control_socket_started" | "control_socket_restarted" => {
+                    changed |= clear_codex_fork_control_degraded_raw(session);
+                }
+                _ => {}
+            }
+        }
         let provider_resume_id = codex_fork_provider_resume_id(event);
         let provider_resume_id_changed = provider_resume_id.as_deref().is_some_and(|value| {
             json_text(session.get("provider_resume_id")).as_deref() != Some(value)
@@ -9683,13 +9704,6 @@ fn codex_fork_spec_for_session_raw(
 }
 
 fn codex_fork_submit_message(control_socket_path: &Path, text: &str) -> Result<()> {
-    if !control_socket_path.exists() {
-        return Err(anyhow::anyhow!(
-            "control socket not found: {}",
-            control_socket_path.display()
-        ));
-    }
-
     let mut epoch = codex_fork_refresh_control_epoch(control_socket_path)?;
     let mut response =
         codex_fork_send_control_command(control_socket_path, "submit_message", &epoch, text)?;
@@ -9730,12 +9744,6 @@ pub fn submit_codex_fork_btw(
     let artifacts = runtime
         .codex_fork_runtime_artifacts(&spec)?
         .ok_or_else(|| anyhow::anyhow!("codex-fork runtime artifacts unavailable"))?;
-    if !artifacts.control_socket_path.exists() {
-        anyhow::bail!(
-            "control socket not found: {}",
-            artifacts.control_socket_path.display()
-        );
-    }
     codex_fork_submit_btw(&artifacts.control_socket_path, request_id, prompt)?;
     Ok(artifacts.event_stream_path)
 }
@@ -9765,13 +9773,6 @@ fn codex_fork_submit_btw(control_socket_path: &Path, request_id: &str, prompt: &
 }
 
 fn codex_fork_set_thread_name(control_socket_path: &Path, friendly_name: &str) -> Result<()> {
-    if !control_socket_path.exists() {
-        return Err(anyhow::anyhow!(
-            "control socket not found: {}",
-            control_socket_path.display()
-        ));
-    }
-
     let mut epoch = codex_fork_refresh_control_epoch(control_socket_path)?;
     let mut response = codex_fork_send_control_command_payload(
         control_socket_path,
@@ -9862,6 +9863,22 @@ fn codex_fork_send_control_command_payload_with_request_id(
 
 #[cfg(unix)]
 fn codex_fork_control_roundtrip(control_socket_path: &Path, request: &Value) -> Result<Value> {
+    let deadline = Instant::now() + CODEX_FORK_CONTROL_RECOVERY_TIMEOUT;
+    loop {
+        match codex_fork_control_roundtrip_once(control_socket_path, request) {
+            Ok(response) => return Ok(response),
+            Err(error)
+                if codex_fork_control_error_is_transient(&error) && Instant::now() < deadline =>
+            {
+                thread::sleep(CODEX_FORK_CONTROL_RECOVERY_POLL);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn codex_fork_control_roundtrip_once(control_socket_path: &Path, request: &Value) -> Result<Value> {
     let mut stream = UnixStream::connect(control_socket_path).with_context(|| {
         format!(
             "failed to connect control socket {}",
@@ -9892,6 +9909,23 @@ fn codex_fork_control_roundtrip(control_socket_path: &Path, request: &Value) -> 
         return Err(anyhow::anyhow!("control socket closed without response"));
     }
     serde_json::from_str(&raw_response).with_context(|| "control socket returned invalid JSON")
+}
+
+#[cfg(unix)]
+fn codex_fork_control_error_is_transient(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::UnexpectedEof
+            )
+        })
+    })
 }
 
 #[cfg(not(unix))]
@@ -9954,13 +9988,14 @@ fn mark_codex_fork_control_degraded_raw(session: &mut Map<String, Value>, reason
     );
 }
 
-fn clear_codex_fork_control_degraded_raw(session: &mut Map<String, Value>) {
+fn clear_codex_fork_control_degraded_raw(session: &mut Map<String, Value>) -> bool {
     let is_degraded_error = json_text(session.get("error_message"))
         .as_deref()
         .is_some_and(|message| message.starts_with("codex_fork_control_degraded:"));
     if is_degraded_error {
         session.insert("error_message".to_owned(), Value::Null);
     }
+    is_degraded_error
 }
 
 fn clear_codex_fork_handoff_error_raw(session: &mut Map<String, Value>) {
@@ -14492,6 +14527,51 @@ mod tests {
         let _ = fs::remove_file(socket_path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn codex_fork_btw_waits_for_control_socket_recovery() {
+        use std::os::unix::net::UnixListener;
+
+        let socket_path =
+            env::temp_dir().join(format!("sm-btw-recovery-{}.sock", generate_session_id()));
+        let server_path = socket_path.clone();
+        let server = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            let listener = UnixListener::bind(&server_path).unwrap();
+            let mut requests = Vec::new();
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut raw_request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut raw_request)
+                    .unwrap();
+                requests.push(serde_json::from_str::<Value>(&raw_request).unwrap());
+                let response = if index == 0 {
+                    json!({
+                        "ok": true,
+                        "epoch": "epoch-recovered",
+                        "result": { "epoch": "epoch-recovered" }
+                    })
+                } else {
+                    json!({
+                        "ok": true,
+                        "epoch": "epoch-recovered",
+                        "result": {}
+                    })
+                };
+                writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+            }
+            requests
+        });
+
+        codex_fork_submit_btw(&socket_path, "btw-recovery", "summarize").unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests[0]["command"], "get_epoch");
+        assert_eq!(requests[1]["command"], "submit_btw");
+        assert_eq!(requests[1]["request_id"], "btw-recovery");
+        let _ = fs::remove_file(socket_path);
+    }
+
     fn session_record(status: &str) -> SessionRecord {
         SessionRecord {
             id: "abc12345".to_owned(),
@@ -15403,6 +15483,55 @@ mod tests {
             store.get_session("codex001").unwrap().unwrap().status,
             "running"
         );
+    }
+
+    #[test]
+    fn codex_fork_control_lifecycle_events_track_and_clear_degradation() {
+        let state_file = unique_temp_path("codex-control-lifecycle");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file.clone());
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"control_socket_degraded","payload":{"reason":"socket path disappeared"}}"#,
+            )
+            .unwrap();
+        let degraded = store.load_raw_json_value().unwrap();
+        assert_eq!(
+            raw_session_object(&degraded, "codex001")
+                .and_then(|session| json_text(session.get("error_message")))
+                .as_deref(),
+            Some("codex_fork_control_degraded: socket path disappeared")
+        );
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"control_socket_restarted","payload":{"generation":2}}"#,
+            )
+            .unwrap();
+        let recovered = store.load_raw_json_value().unwrap();
+        assert!(raw_session_object(&recovered, "codex001")
+            .and_then(|session| json_text(session.get("error_message")))
+            .is_none());
+        let _ = fs::remove_file(state_file);
     }
 
     #[test]
