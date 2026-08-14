@@ -11417,7 +11417,7 @@ fn historical_codex_fork_seat_sessions(
                 serde_json::from_str::<Value>(&line).ok().and_then(|value| {
                     value
                         .as_object()
-                        .and_then(extract_codex_fork_thread_started)
+                        .and_then(extract_any_codex_fork_thread_started)
                 })
             else {
                 continue;
@@ -16051,6 +16051,7 @@ mod tests {
             &artifacts.event_stream_path,
             concat!(
                 "{\"event_type\":\"thread/started\",\"payload\":{\"thread\":{\"id\":\"historical-thread\"}}}\n",
+                "{\"event_type\":\"thread/started\",\"payload\":{\"thread\":{\"id\":\"historical-child\",\"parentThreadId\":\"historical-thread\",\"threadSource\":\"subagent\"}}}\n",
                 "{\"event_type\":\"thread/started\",\"payload\":{\"thread\":{\"id\":\"current-thread\"}}}\n"
             ),
         )
@@ -16074,8 +16075,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 2);
-        assert_eq!(paths, 2);
+        assert_eq!(count, 3);
+        assert_eq!(paths, 3);
     }
 
     #[test]
