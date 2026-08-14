@@ -7469,7 +7469,11 @@ impl SessionStore {
                 _ => {}
             }
         }
+        // The stream multiplexes root and descendant threads. Only root lifecycle events may
+        // change what `sm restore` resumes, while every observed thread still belongs in the
+        // attribution ledger.
         let provider_resume_id = codex_fork_provider_resume_id(event);
+        let observed_provider_session_id = codex_fork_observed_provider_session_id(event);
         let provider_resume_id_changed = provider_resume_id.as_deref().is_some_and(|value| {
             json_text(session.get("provider_resume_id")).as_deref() != Some(value)
         });
@@ -7582,7 +7586,7 @@ impl SessionStore {
             self.write_raw_json_value(&state)?;
         }
         drop(_guard);
-        if let Some(provider_resume_id) = provider_resume_id {
+        if let Some(provider_resume_id) = observed_provider_session_id {
             self.append_seat_session(
                 session_id,
                 &provider,
@@ -7813,19 +7817,52 @@ fn split_complete_event_lines(buffer: &mut String, chunk: &str) -> Vec<String> {
 }
 
 fn codex_fork_provider_resume_id(event: &Map<String, Value>) -> Option<String> {
-    extract_codex_fork_thread_started(event).or_else(|| {
-        event
-            .get("session_id")
+    let event_type =
+        normalize_codex_fork_event_type(&codex_fork_event_type(event)?.replace('/', "_"));
+    match event_type.as_str() {
+        "thread_started" => extract_codex_fork_thread_started(event),
+        "session_configured" => codex_fork_payload(event)
+            .and_then(|payload| payload.get("session_id"))
             .and_then(non_unknown_json_text)
-            .or_else(|| {
-                codex_fork_payload(event)
-                    .and_then(|payload| payload.get("session_id"))
-                    .and_then(non_unknown_json_text)
-            })
-    })
+            .or_else(|| event.get("session_id").and_then(non_unknown_json_text)),
+        _ => None,
+    }
+}
+
+fn codex_fork_observed_provider_session_id(event: &Map<String, Value>) -> Option<String> {
+    event
+        .get("session_id")
+        .and_then(non_unknown_json_text)
+        .or_else(|| extract_any_codex_fork_thread_started(event))
+        .or_else(|| {
+            codex_fork_payload(event)
+                .and_then(|payload| payload.get("session_id"))
+                .and_then(non_unknown_json_text)
+        })
 }
 
 fn extract_codex_fork_thread_started(event: &Map<String, Value>) -> Option<String> {
+    let thread_payload = codex_fork_thread_started_payload(event)?;
+    let parent_thread_id = thread_payload
+        .get("parentThreadId")
+        .or_else(|| thread_payload.get("parent_thread_id"))
+        .and_then(non_unknown_json_text);
+    let thread_source = thread_payload
+        .get("threadSource")
+        .or_else(|| thread_payload.get("thread_source"))
+        .and_then(Value::as_str)
+        .map(str::trim);
+    if parent_thread_id.is_some() || thread_source == Some("subagent") {
+        return None;
+    }
+    codex_fork_thread_id(thread_payload)
+}
+
+fn extract_any_codex_fork_thread_started(event: &Map<String, Value>) -> Option<String> {
+    codex_fork_thread_id(codex_fork_thread_started_payload(event)?)
+}
+
+fn codex_fork_thread_started_payload(event: &Map<String, Value>) -> Option<&Map<String, Value>> {
     let raw_event_type = codex_fork_event_type(event)?;
     let normalized_event_type = normalize_codex_fork_event_type(&raw_event_type.replace('/', "_"));
     if raw_event_type != "thread/started"
@@ -7835,10 +7872,15 @@ fn extract_codex_fork_thread_started(event: &Map<String, Value>) -> Option<Strin
         return None;
     }
     let payload = codex_fork_payload(event)?;
-    let thread_payload = payload
-        .get("thread")
-        .and_then(Value::as_object)
-        .unwrap_or(payload);
+    Some(
+        payload
+            .get("thread")
+            .and_then(Value::as_object)
+            .unwrap_or(payload),
+    )
+}
+
+fn codex_fork_thread_id(thread_payload: &Map<String, Value>) -> Option<String> {
     thread_payload
         .get("id")
         .and_then(non_unknown_json_text)
@@ -7847,8 +7889,11 @@ fn extract_codex_fork_thread_started(event: &Map<String, Value>) -> Option<Strin
                 .get("thread_id")
                 .and_then(non_unknown_json_text)
         })
-        .or_else(|| payload.get("thread_id").and_then(non_unknown_json_text))
-        .or_else(|| payload.get("session_id").and_then(non_unknown_json_text))
+        .or_else(|| {
+            thread_payload
+                .get("session_id")
+                .and_then(non_unknown_json_text)
+        })
 }
 
 pub(crate) fn codex_fork_status_for_event_line(line: &str) -> Option<&'static str> {
@@ -11372,7 +11417,7 @@ fn historical_codex_fork_seat_sessions(
                 serde_json::from_str::<Value>(&line).ok().and_then(|value| {
                     value
                         .as_object()
-                        .and_then(extract_codex_fork_thread_started)
+                        .and_then(extract_any_codex_fork_thread_started)
                 })
             else {
                 continue;
@@ -15602,6 +15647,63 @@ mod tests {
     }
 
     #[test]
+    fn codex_fork_subagent_events_do_not_replace_the_resumable_root_thread() {
+        let state_file = unique_temp_path("codex-subagent-root-binding");
+        let usage_db_path = state_file.with_extension("usage.db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "provider_resume_id": "root-thread",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"thread/started","session_id":"child-thread","payload":{"thread":{"id":"child-thread","parentThreadId":"root-thread","threadSource":"subagent"}}}"#,
+            )
+            .unwrap();
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"turn_started","session_id":"child-thread","payload":{"turn_id":"child-turn"}}"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_session("codex001")
+                .unwrap()
+                .unwrap()
+                .provider_resume_id
+                .as_deref(),
+            Some("root-thread")
+        );
+        let connection = rusqlite::Connection::open(usage_db_path).unwrap();
+        let child_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'codex001' AND provider_session_id = 'child-thread'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_count, 1);
+    }
+
+    #[test]
     fn repeated_codex_session_identity_does_not_rewrite_the_provider_chain() {
         let state_file = unique_temp_path("codex-session-chain-repeat");
         let usage_db_path = state_file.with_extension("usage.db");
@@ -15949,6 +16051,7 @@ mod tests {
             &artifacts.event_stream_path,
             concat!(
                 "{\"event_type\":\"thread/started\",\"payload\":{\"thread\":{\"id\":\"historical-thread\"}}}\n",
+                "{\"event_type\":\"thread/started\",\"payload\":{\"thread\":{\"id\":\"historical-child\",\"parentThreadId\":\"historical-thread\",\"threadSource\":\"subagent\"}}}\n",
                 "{\"event_type\":\"thread/started\",\"payload\":{\"thread\":{\"id\":\"current-thread\"}}}\n"
             ),
         )
@@ -15972,8 +16075,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(count, 2);
-        assert_eq!(paths, 2);
+        assert_eq!(count, 3);
+        assert_eq!(paths, 3);
     }
 
     #[test]
@@ -16232,6 +16335,30 @@ mod tests {
             )
             .unwrap(),
             "new-thread"
+        );
+        let _ = fs::remove_file(event_stream_path);
+    }
+
+    #[test]
+    fn codex_fork_binding_wait_skips_subagent_thread_started_events() {
+        let event_stream_path = unique_temp_path("codex-root-bind-events");
+        fs::write(
+            &event_stream_path,
+            concat!(
+                "{\"event_type\":\"thread/started\",\"session_id\":\"child-thread\",\"payload\":{\"thread\":{\"id\":\"child-thread\",\"parentThreadId\":\"root-thread\",\"threadSource\":\"subagent\"}}}\n",
+                "{\"event_type\":\"thread/started\",\"session_id\":\"root-thread\",\"payload\":{\"thread\":{\"id\":\"root-thread\",\"parentThreadId\":null,\"threadSource\":\"user\"}}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            wait_for_codex_fork_provider_resume_id_after_offset(
+                &event_stream_path,
+                0,
+                Duration::ZERO,
+            )
+            .unwrap(),
+            "root-thread"
         );
         let _ = fs::remove_file(event_stream_path);
     }
