@@ -7802,7 +7802,9 @@ where
                 }
             }
         }
-        directory_trust_accepted |= handle_startup_prompt()?;
+        if !directory_trust_accepted {
+            directory_trust_accepted = handle_startup_prompt()?;
+        }
         if started.elapsed() >= timeout {
             if directory_trust_accepted {
                 anyhow::bail!(
@@ -16403,6 +16405,15 @@ mod tests {
     fn codex_fork_launch_binding_accepts_trust_before_root_thread_starts() {
         let event_stream_path = unique_temp_path("codex-trust-bind-events");
         fs::write(&event_stream_path, "").unwrap();
+        let writer_path = event_stream_path.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(125));
+            fs::write(
+                writer_path,
+                "{\"event_type\":\"thread/started\",\"payload\":{\"thread\":{\"id\":\"trusted-root\",\"parentThreadId\":null,\"threadSource\":\"user\"}}}\n",
+            )
+            .unwrap();
+        });
         let mut prompt_checks = 0;
 
         let provider_resume_id = wait_for_codex_fork_provider_resume_id_after_offset_with_startup(
@@ -16411,20 +16422,14 @@ mod tests {
             Duration::from_secs(1),
             || {
                 prompt_checks += 1;
-                if prompt_checks == 1 {
-                    fs::write(
-                        &event_stream_path,
-                        "{\"event_type\":\"thread/started\",\"payload\":{\"thread\":{\"id\":\"trusted-root\",\"parentThreadId\":null,\"threadSource\":\"user\"}}}\n",
-                    )?;
-                    return Ok(true);
-                }
-                Ok(false)
+                Ok(true)
             },
         )
         .unwrap();
 
         assert_eq!(provider_resume_id, "trusted-root");
-        assert!(prompt_checks >= 1);
+        assert_eq!(prompt_checks, 1);
+        writer.join().unwrap();
         let _ = fs::remove_file(event_stream_path);
     }
 
