@@ -1,12 +1,12 @@
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 use std::{
     collections::HashMap,
     env, fs,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{Arc, Condvar, Mutex, OnceLock, Weak},
+    sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak},
     thread,
     time::{Duration, Instant},
 };
@@ -22,6 +22,7 @@ const DEFAULT_SEND_KEYS_SETTLE_MAX_MS: f64 = 900.0;
 const DEFAULT_SEND_KEYS_SETTLE_PER_KI_MS: f64 = 60.0;
 const DEFAULT_SEND_KEYS_SETTLE_PER_EXTRA_LINE_MS: f64 = 15.0;
 const DEFAULT_SEND_KEYS_MAX_CHUNK_CHARS: usize = 4096;
+const CODEX_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 static SESSION_INPUT_LOCKS: OnceLock<Mutex<HashMap<String, Weak<SessionInputLock>>>> =
     OnceLock::new();
 
@@ -98,6 +99,36 @@ pub struct CodexForkRuntimeArtifacts {
     pub event_stream_path: PathBuf,
     pub control_socket_path: PathBuf,
 }
+
+#[derive(Debug)]
+pub enum CodexModelValidationError {
+    Unsupported {
+        requested: String,
+        supported: Vec<String>,
+    },
+    DiscoveryUnavailable(String),
+}
+
+impl std::fmt::Display for CodexModelValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported {
+                requested,
+                supported,
+            } => write!(
+                formatter,
+                "Unsupported Codex model: {requested}. Supported models: {}",
+                supported.join(", ")
+            ),
+            Self::DiscoveryUnavailable(detail) => write!(
+                formatter,
+                "Could not validate the requested Codex model because model discovery failed: {detail}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CodexModelValidationError {}
 
 impl TmuxRuntime {
     pub fn from_config(config: &RustCoreConfig) -> Self {
@@ -204,6 +235,81 @@ impl TmuxRuntime {
 
     pub fn codex_fork_control_tmux_fallback_enabled(&self) -> bool {
         self.codex_fork_control_tmux_fallback_enabled
+    }
+
+    pub fn validate_codex_fork_model(&self, requested: &str, working_dir: &Path) -> Result<()> {
+        self.validate_codex_fork_model_with_timeout(
+            requested,
+            working_dir,
+            CODEX_MODEL_DISCOVERY_TIMEOUT,
+        )
+    }
+
+    fn validate_codex_fork_model_with_timeout(
+        &self,
+        requested: &str,
+        working_dir: &Path,
+        timeout: Duration,
+    ) -> Result<()> {
+        let executable = resolve_launch_command(&self.codex_fork_command, working_dir)
+            .map_err(|error| CodexModelValidationError::DiscoveryUnavailable(error.to_string()))?;
+        let mut command = Command::new(executable);
+        command
+            .args(&self.codex_fork_args)
+            .args(["debug", "models"])
+            .current_dir(working_dir);
+        let output = command_output_with_timeout(command, timeout)
+            .map_err(|error| CodexModelValidationError::DiscoveryUnavailable(error.to_string()))?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr);
+            let detail = truncate_for_error(detail.trim(), 500);
+            let detail = if detail.is_empty() {
+                format!("model catalog command exited with {}", output.status)
+            } else {
+                format!(
+                    "model catalog command exited with {}: {detail}",
+                    output.status
+                )
+            };
+            return Err(CodexModelValidationError::DiscoveryUnavailable(detail).into());
+        }
+
+        let catalog: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+            CodexModelValidationError::DiscoveryUnavailable(format!(
+                "model catalog returned invalid JSON: {error}"
+            ))
+        })?;
+        let supported = catalog
+            .get("models")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                CodexModelValidationError::DiscoveryUnavailable(
+                    "model catalog response is missing the models array".to_owned(),
+                )
+            })?
+            .iter()
+            .filter(|model| model.get("visibility").and_then(Value::as_str) == Some("list"))
+            .filter_map(|model| model.get("slug").and_then(Value::as_str))
+            .fold(Vec::new(), |mut models, slug| {
+                if !models.iter().any(|model| model == slug) {
+                    models.push(slug.to_owned());
+                }
+                models
+            });
+        if supported.is_empty() {
+            return Err(CodexModelValidationError::DiscoveryUnavailable(
+                "model catalog returned no selectable models".to_owned(),
+            )
+            .into());
+        }
+        if supported.iter().any(|model| model == requested) {
+            return Ok(());
+        }
+        Err(CodexModelValidationError::Unsupported {
+            requested: requested.to_owned(),
+            supported,
+        }
+        .into())
     }
 
     pub fn allows_restore_without_resume_id(&self, provider: &str) -> bool {
@@ -1360,6 +1466,10 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
 }
 
 fn validate_launch_command(command: &str, working_dir: &Path) -> Result<()> {
+    resolve_launch_command(command, working_dir).map(|_| ())
+}
+
+fn resolve_launch_command(command: &str, working_dir: &Path) -> Result<PathBuf> {
     let command = command.trim();
     if command.is_empty() {
         bail!("Launch command is empty");
@@ -1375,12 +1485,131 @@ fn validate_launch_command(command: &str, working_dir: &Path) -> Result<()> {
         if !is_executable_file(&candidate) {
             bail!("Launch command is not executable: {}", candidate.display());
         }
-        return Ok(());
+        return fs::canonicalize(&candidate).with_context(|| {
+            format!(
+                "failed to resolve launch command to an absolute path: {}",
+                candidate.display()
+            )
+        });
     }
-    if find_in_path(command).is_none() {
-        bail!("Launch command not found on PATH: {command}");
+    let candidate = find_in_path(command)
+        .ok_or_else(|| anyhow::anyhow!("Launch command not found on PATH: {command}"))?;
+    fs::canonicalize(&candidate).with_context(|| {
+        format!(
+            "failed to resolve launch command to an absolute path: {}",
+            candidate.display()
+        )
+    })
+}
+
+fn command_output_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command
+        .spawn()
+        .context("failed to start model catalog command")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("model catalog stdout was not captured"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("model catalog stderr was not captured"))?;
+    let stdout_reader = spawn_stream_reader(stdout);
+    let stderr_reader = spawn_stream_reader(stderr);
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect model catalog command")?
+        {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            terminate_catalog_process(&mut child);
+            bail!(
+                "model catalog command timed out after {:.1}s",
+                timeout.as_secs_f64()
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout =
+        receive_stream_output(&stdout_reader, started, timeout, "stdout").map_err(|error| {
+            terminate_catalog_process(&mut child);
+            error
+        })?;
+    let stderr =
+        receive_stream_output(&stderr_reader, started, timeout, "stderr").map_err(|error| {
+            terminate_catalog_process(&mut child);
+            error
+        })?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn spawn_stream_reader(
+    mut stream: impl Read + Send + 'static,
+) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stream.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn receive_stream_output(
+    receiver: &mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    started: Instant,
+    timeout: Duration,
+    name: &str,
+) -> Result<Vec<u8>> {
+    let remaining = timeout.saturating_sub(started.elapsed());
+    receiver
+        .recv_timeout(remaining)
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => anyhow::anyhow!(
+                "model catalog command timed out after {:.1}s while draining {name}",
+                timeout.as_secs_f64()
+            ),
+            mpsc::RecvTimeoutError::Disconnected => {
+                anyhow::anyhow!("model catalog {name} reader stopped unexpectedly")
+            }
+        })?
+        .with_context(|| format!("failed to read model catalog {name}"))
+}
+
+fn terminate_catalog_process(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", &format!("-{}", child.id())])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
-    Ok(())
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn truncate_for_error(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let prefix = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
+    }
 }
 
 fn expand_launch_path(command: &str, working_dir: &Path) -> PathBuf {
@@ -1490,6 +1719,108 @@ fn is_codex_directory_trust_prompt(pane: &str) -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn codex_model_validation_uses_selectable_models_from_live_catalog() {
+        let (command, working_dir) = fake_codex_model_command(
+            r#"printf '%s' '{"models":[{"slug":"gpt-5.6-luna","visibility":"list"},{"slug":"hidden-review","visibility":"hide"},{"slug":"gpt-5.6-sol","visibility":"list"}]}'"#,
+        );
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.codex_fork_command = command.display().to_string();
+        runtime.codex_fork_args = vec!["--configured-arg".to_owned()];
+
+        runtime
+            .validate_codex_fork_model("gpt-5.6-luna", &working_dir)
+            .unwrap();
+        let error = runtime
+            .validate_codex_fork_model("luna", &working_dir)
+            .unwrap_err();
+        let validation = error.downcast_ref::<CodexModelValidationError>().unwrap();
+        assert!(matches!(
+            validation,
+            CodexModelValidationError::Unsupported { requested, supported }
+                if requested == "luna"
+                    && supported == &["gpt-5.6-luna".to_owned(), "gpt-5.6-sol".to_owned()]
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Unsupported Codex model: luna. Supported models: gpt-5.6-luna, gpt-5.6-sol"
+        );
+    }
+
+    #[test]
+    fn codex_model_validation_drains_large_catalog_output() {
+        let padding = "x".repeat(128 * 1024);
+        let script = format!(
+            "printf '%s' '{}'",
+            serde_json::json!({
+                "padding": padding,
+                "models": [{"slug": "gpt-5.6-terra", "visibility": "list"}],
+            })
+        );
+        let (command, working_dir) = fake_codex_model_command(&script);
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.codex_fork_command = command.display().to_string();
+
+        runtime
+            .validate_codex_fork_model("gpt-5.6-terra", &working_dir)
+            .unwrap();
+    }
+
+    #[test]
+    fn codex_model_validation_resolves_relative_command_before_changing_directory() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let relative_working_dir = PathBuf::from(format!(
+            "target/sm-relative-codex-models-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&relative_working_dir).unwrap();
+        let command = relative_working_dir.join("codex");
+        fs::write(
+            &command,
+            r#"#!/bin/sh
+printf '%s' '{"models":[{"slug":"gpt-5.6-luna","visibility":"list"}]}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&command).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&command, permissions).unwrap();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.codex_fork_command = "./codex".to_owned();
+
+        runtime
+            .validate_codex_fork_model("gpt-5.6-luna", &relative_working_dir)
+            .unwrap();
+
+        fs::remove_dir_all(relative_working_dir).unwrap();
+    }
+
+    #[test]
+    fn codex_model_validation_times_out() {
+        let (command, working_dir) = fake_codex_model_command("sleep 1 & wait");
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.codex_fork_command = command.display().to_string();
+        let started = Instant::now();
+
+        let error = runtime
+            .validate_codex_fork_model_with_timeout(
+                "gpt-5.6-luna",
+                &working_dir,
+                Duration::from_millis(25),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<CodexModelValidationError>(),
+            Some(CodexModelValidationError::DiscoveryUnavailable(detail))
+                if detail.contains("timed out")
+        ));
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
 
     #[test]
     fn split_send_text_chunks_prefers_newline_after_half_chunk() {
@@ -2037,6 +2368,24 @@ esac
 
     fn fake_tmux_binary() -> (PathBuf, PathBuf, PathBuf) {
         fake_tmux_binary_with_has_session(true)
+    }
+
+    fn fake_codex_model_command(script_body: &str) -> (PathBuf, PathBuf) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sm-runtime-fake-codex-models-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let command = temp_dir.join("codex");
+        fs::write(&command, format!("#!/bin/sh\n{script_body}\n")).unwrap();
+        let mut permissions = fs::metadata(&command).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&command, permissions).unwrap();
+        (command, temp_dir)
     }
 
     fn fake_tmux_binary_with_has_session(has_session: bool) -> (PathBuf, PathBuf, PathBuf) {

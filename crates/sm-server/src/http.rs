@@ -110,7 +110,7 @@ use crate::queue::{
     QueueJobRecord, QueueMessageMetadata, RetainedQueueStore, RetryCodexReviewRequest,
     ScheduledReminder,
 };
-use crate::runtime::TmuxRuntime;
+use crate::runtime::{CodexModelValidationError, TmuxRuntime};
 #[cfg(test)]
 use crate::sessions::codex_fork_legacy_event_stream_path_from_log_file;
 use crate::sessions::{
@@ -3478,7 +3478,8 @@ async fn create_session(
         let runtime = TmuxRuntime::from_app_config(&state.config);
         state
             .session_store
-            .create_core_session_with_runtime(payload, log_dir, &runtime)?
+            .create_core_session_with_runtime(payload, log_dir, &runtime)
+            .map_err(core_session_create_api_error)?
     } else {
         state.session_store.create_core_session(payload, log_dir)?
     };
@@ -3546,7 +3547,8 @@ async fn spawn_session(
         let runtime = TmuxRuntime::from_app_config(&state.config);
         state
             .session_store
-            .create_core_session_with_runtime(create_payload, log_dir, &runtime)?
+            .create_core_session_with_runtime(create_payload, log_dir, &runtime)
+            .map_err(core_session_create_api_error)?
     } else {
         state
             .session_store
@@ -3685,7 +3687,8 @@ async fn spawn_review_session(
         ensure_core_runtime_request_node_supported(&state, &create_payload)?;
         state
             .session_store
-            .create_core_session_with_runtime(create_payload, log_dir, &runtime)?
+            .create_core_session_with_runtime(create_payload, log_dir, &runtime)
+            .map_err(core_session_create_api_error)?
     } else {
         state
             .session_store
@@ -11866,6 +11869,20 @@ enum ApiError {
     },
 }
 
+fn core_session_create_api_error(error: anyhow::Error) -> ApiError {
+    if let Some(validation) = error.downcast_ref::<CodexModelValidationError>() {
+        let status = match validation {
+            CodexModelValidationError::Unsupported { .. } => StatusCode::BAD_REQUEST,
+            CodexModelValidationError::DiscoveryUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        return ApiError::Status {
+            status,
+            detail: validation.to_string(),
+        };
+    }
+    error.into()
+}
+
 impl<E> From<E> for ApiError
 where
     E: Into<anyhow::Error>,
@@ -13323,6 +13340,36 @@ mod tests {
     use serde::Serialize;
     use std::{env, process};
     use tower::ServiceExt;
+
+    #[test]
+    fn codex_model_validation_errors_have_actionable_http_statuses() {
+        let unsupported = core_session_create_api_error(
+            CodexModelValidationError::Unsupported {
+                requested: "luna".to_owned(),
+                supported: vec!["gpt-5.6-luna".to_owned()],
+            }
+            .into(),
+        );
+        let unavailable = core_session_create_api_error(
+            CodexModelValidationError::DiscoveryUnavailable("timed out".to_owned()).into(),
+        );
+
+        assert_eq!(
+            api_error_status_detail(unsupported),
+            (
+                StatusCode::BAD_REQUEST,
+                "Unsupported Codex model: luna. Supported models: gpt-5.6-luna".to_owned()
+            )
+        );
+        assert_eq!(
+            api_error_status_detail(unavailable),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Could not validate the requested Codex model because model discovery failed: timed out"
+                    .to_owned()
+            )
+        );
+    }
 
     #[test]
     fn usage_db_override_policy_preserves_only_disabled_default_fixtures() {

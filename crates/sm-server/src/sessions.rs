@@ -3706,7 +3706,7 @@ impl SessionStore {
         log_dir: Option<PathBuf>,
         runtime: &TmuxRuntime,
     ) -> Result<SessionRecord> {
-        let codex_cli_working_dir = {
+        let (provider, working_dir) = {
             let _guard = self.write_guard()?;
             let state = self.load_raw_json_value()?;
             let sessions = state
@@ -3714,9 +3714,19 @@ impl SessionStore {
                 .and_then(Value::as_array)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            let (provider, working_dir) = core_session_provider_and_working_dir(sessions, &request);
-            (provider == "codex").then_some(working_dir)
+            core_session_provider_and_working_dir(sessions, &request)
         };
+        if provider == "codex-fork" {
+            if let Some(model) = request
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                runtime.validate_codex_fork_model(model, &expand_home(&working_dir))?;
+            }
+        }
+        let codex_cli_working_dir = (provider == "codex").then_some(working_dir);
         let codex_cli_binding_guard = codex_cli_working_dir
             .as_deref()
             .map(|working_dir| self.lock_codex_cli_binding_working_dir(working_dir))
@@ -14252,6 +14262,7 @@ fn extract_provider_native_rename_name(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AppConfig;
     use crate::usage_identity::{AccountIdentity, Provider, UsageIdentityStore};
     use rusqlite::Connection;
 
@@ -14292,6 +14303,46 @@ mod tests {
         assert_eq!(expand_home("~"), home);
         assert_eq!(expand_home("~/work"), home.join("work"));
         assert_eq!(expand_home("/tmp/work"), PathBuf::from("/tmp/work"));
+    }
+
+    #[test]
+    fn unsupported_codex_fork_model_fails_before_session_state_is_written() {
+        let state_file = unique_temp_path("unsupported-codex-fork-model");
+        let store = SessionStore::new(state_file.clone());
+        let mut config = AppConfig::default();
+        config.codex_fork.command = "/bin/sh".to_owned();
+        config.codex_fork.args = vec![
+            "-c".to_owned(),
+            "printf '%s' '{\"models\":[{\"slug\":\"gpt-5.6-luna\",\"visibility\":\"list\"}]}'"
+                .to_owned(),
+        ];
+        let runtime = TmuxRuntime::from_app_config(&config);
+        let request = CreateCoreSessionRequest {
+            id: Some("badmodel".to_owned()),
+            name: Some("bad-model".to_owned()),
+            working_dir: Some("/tmp".to_owned()),
+            provider: Some("codex-fork".to_owned()),
+            parent_session_id: None,
+            node: Some("primary".to_owned()),
+            initial_message: Some("stand by".to_owned()),
+            model: Some("luna".to_owned()),
+            reasoning_effort: None,
+            wait: None,
+        };
+
+        let error = store
+            .create_core_session_with_runtime(request, None, &runtime)
+            .unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<crate::runtime::CodexModelValidationError>(),
+            Some(crate::runtime::CodexModelValidationError::Unsupported { requested, .. })
+                if requested == "luna"
+        ));
+        assert!(store.list_sessions(true).unwrap().is_empty());
+        let state = store.load_raw_json_value().unwrap();
+        assert!(session_runtime_launch_records(&state).unwrap().is_empty());
+        let _ = fs::remove_file(state_file);
     }
 
     #[test]
