@@ -884,6 +884,21 @@ impl TmuxRuntime {
         Some(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    pub fn accept_codex_directory_trust_prompt(&self, tmux_session: &str) -> Result<bool> {
+        let _guard = self.lock_session_input(tmux_session)?;
+        if !self.session_exists(tmux_session)? {
+            return Ok(false);
+        }
+        let Some(pane) = self.capture_pane_text(tmux_session) else {
+            return Ok(false);
+        };
+        if !is_codex_directory_trust_prompt(&pane) {
+            return Ok(false);
+        }
+        self.send_key(tmux_session, "Enter")?;
+        Ok(true)
+    }
+
     pub fn session_input_ready(&self, tmux_session: &str, provider: &str) -> bool {
         match provider {
             "codex" | "codex-fork" => self.codex_composer_is_ready(tmux_session, None),
@@ -1464,6 +1479,13 @@ fn managed_session_command(
     )
 }
 
+fn is_codex_directory_trust_prompt(pane: &str) -> bool {
+    pane.contains("Do you trust the contents of this directory?")
+        && pane.contains("Yes, continue")
+        && pane.contains("No, quit")
+        && pane.contains("Press enter to continue")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1513,6 +1535,50 @@ mod tests {
         assert_eq!(output, ">\n");
         let log = fs::read_to_string(log_path).unwrap();
         assert!(log.contains("capture-pane -p -S -1 -t sm-test"));
+    }
+
+    #[test]
+    fn codex_directory_trust_prompt_is_accepted_without_matching_incidental_text() {
+        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary();
+        fs::write(
+            &tmux_binary,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> "{}"
+case "$1" in
+  has-session) exit 0 ;;
+  capture-pane)
+    printf '%s\n' '> You are in /repo' \
+      'Do you trust the contents of this directory?' \
+      '1. Yes, continue' '2. No, quit' 'Press enter to continue'
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+"#,
+                log_path.display(),
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux_binary, permissions).unwrap();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        assert!(runtime
+            .accept_codex_directory_trust_prompt("sm-test")
+            .unwrap());
+        assert!(fs::read_to_string(&log_path)
+            .unwrap()
+            .contains("send-keys -t sm-test Enter"));
+    }
+
+    #[test]
+    fn incidental_trust_text_does_not_submit_input() {
+        assert!(!is_codex_directory_trust_prompt(
+            "The docs ask: Do you trust the contents of this directory?"
+        ));
     }
 
     #[test]

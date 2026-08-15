@@ -824,9 +824,11 @@ impl SessionStore {
                 );
             }
             if let Some(artifacts) = codex_fork_artifacts.as_ref() {
-                match wait_for_codex_fork_provider_resume_id(
+                match wait_for_codex_fork_provider_resume_id_for_launch(
                     &artifacts.event_stream_path,
                     CODEX_FORK_THREAD_STARTED_TIMEOUT,
+                    &session_runtime,
+                    &launch.tmux_session,
                 ) {
                     Ok(provider_resume_id) => {
                         recovered_provider_resume_id = Some(provider_resume_id);
@@ -3827,9 +3829,11 @@ impl SessionStore {
             );
         }
         if let Some(artifacts) = &codex_fork_artifacts {
-            match wait_for_codex_fork_provider_resume_id(
+            match wait_for_codex_fork_provider_resume_id_for_launch(
                 &artifacts.event_stream_path,
                 CODEX_FORK_THREAD_STARTED_TIMEOUT,
+                runtime,
+                &record.tmux_session,
             ) {
                 Ok(provider_resume_id) => {
                     record.provider_resume_id = Some(provider_resume_id);
@@ -7726,11 +7730,18 @@ impl SessionStore {
     }
 }
 
-fn wait_for_codex_fork_provider_resume_id(
+fn wait_for_codex_fork_provider_resume_id_for_launch(
     event_stream_path: &Path,
     timeout: Duration,
+    runtime: &TmuxRuntime,
+    tmux_session: &str,
 ) -> Result<String> {
-    wait_for_codex_fork_provider_resume_id_after_offset(event_stream_path, 0, timeout)
+    wait_for_codex_fork_provider_resume_id_after_offset_with_startup(
+        event_stream_path,
+        0,
+        timeout,
+        || runtime.accept_codex_directory_trust_prompt(tmux_session),
+    )
 }
 
 fn usage_ledger_error_is_transient(error: &anyhow::Error) -> bool {
@@ -7756,9 +7767,27 @@ fn wait_for_codex_fork_provider_resume_id_after_offset(
     initial_offset: u64,
     timeout: Duration,
 ) -> Result<String> {
+    wait_for_codex_fork_provider_resume_id_after_offset_with_startup(
+        event_stream_path,
+        initial_offset,
+        timeout,
+        || Ok(false),
+    )
+}
+
+fn wait_for_codex_fork_provider_resume_id_after_offset_with_startup<F>(
+    event_stream_path: &Path,
+    initial_offset: u64,
+    timeout: Duration,
+    mut handle_startup_prompt: F,
+) -> Result<String>
+where
+    F: FnMut() -> Result<bool>,
+{
     let started = Instant::now();
     let mut offset = initial_offset;
     let mut buffer = String::new();
+    let mut directory_trust_accepted = false;
     loop {
         if let Ok(chunk) = read_file_from_offset(event_stream_path, &mut offset) {
             for line in split_complete_event_lines(&mut buffer, &chunk) {
@@ -7773,7 +7802,16 @@ fn wait_for_codex_fork_provider_resume_id_after_offset(
                 }
             }
         }
+        if !directory_trust_accepted {
+            directory_trust_accepted = handle_startup_prompt()?;
+        }
         if started.elapsed() >= timeout {
+            if directory_trust_accepted {
+                anyhow::bail!(
+                    "accepted the codex-fork directory trust prompt but timed out waiting for a new thread_started event in {}",
+                    event_stream_path.display()
+                );
+            }
             anyhow::bail!(
                 "timed out waiting for a new codex-fork thread_started event in {}",
                 event_stream_path.display()
@@ -16360,6 +16398,38 @@ mod tests {
             .unwrap(),
             "root-thread"
         );
+        let _ = fs::remove_file(event_stream_path);
+    }
+
+    #[test]
+    fn codex_fork_launch_binding_accepts_trust_before_root_thread_starts() {
+        let event_stream_path = unique_temp_path("codex-trust-bind-events");
+        fs::write(&event_stream_path, "").unwrap();
+        let writer_path = event_stream_path.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(125));
+            fs::write(
+                writer_path,
+                "{\"event_type\":\"thread/started\",\"payload\":{\"thread\":{\"id\":\"trusted-root\",\"parentThreadId\":null,\"threadSource\":\"user\"}}}\n",
+            )
+            .unwrap();
+        });
+        let mut prompt_checks = 0;
+
+        let provider_resume_id = wait_for_codex_fork_provider_resume_id_after_offset_with_startup(
+            &event_stream_path,
+            0,
+            Duration::from_secs(1),
+            || {
+                prompt_checks += 1;
+                Ok(true)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(provider_resume_id, "trusted-root");
+        assert_eq!(prompt_checks, 1);
+        writer.join().unwrap();
         let _ = fs::remove_file(event_stream_path);
     }
 
