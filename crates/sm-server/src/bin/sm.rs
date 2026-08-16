@@ -4799,7 +4799,11 @@ fn retired_command_message(command: &[&str]) -> Option<&'static str> {
     match command {
         ["kill", ..] => Some("removed: use sm retire instead of sm kill"),
         ["dispatch", ..] => Some("removed: dispatch is not part of the Rust cutover scope"),
-        ["watch-job", ..] => Some("removed: watch-job is not part of the Rust cutover scope"),
+        ["watch-job", ..] => Some(
+            "removed: watch-job is not available; start supervised commands with `sm queue run \
+             --notify <session> -- <command>` instead. Queue jobs automatically send an \
+             `[sm queue]` completion wake. Existing external processes cannot be registered.",
+        ),
         ["telegram", ..] | ["tg", ..] => {
             Some("removed: Telegram control is not part of the Rust cutover scope")
         }
@@ -4973,6 +4977,16 @@ mod tests {
         assert_eq!(cancel.delay_or_action, "cancel");
         assert_eq!(cancel.message_or_id, ["abc123"]);
         assert_eq!(retired_command_message(&["remind"]), None);
+    }
+
+    #[test]
+    fn watch_job_retirement_names_the_automatic_queue_replacement() {
+        let message = retired_command_message(&["watch-job", "add", "--help"]).unwrap();
+
+        assert!(message.contains("sm queue run"));
+        assert!(message.contains("automatically send"));
+        assert!(message.contains("[sm queue]"));
+        assert!(message.contains("external processes cannot be registered"));
     }
 
     #[test]
