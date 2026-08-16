@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 use sha2::{Digest, Sha256};
 
@@ -1019,11 +1019,20 @@ pub struct QueueRunnerConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct QueueRunnerTypesConfig {
-    #[serde(default = "default_queue_runner_tests_config")]
+    #[serde(
+        default = "default_queue_runner_tests_config",
+        deserialize_with = "deserialize_queue_runner_tests_config"
+    )]
     pub tests: QueueRunnerTypeConfig,
-    #[serde(default = "default_queue_runner_perf_config")]
+    #[serde(
+        default = "default_queue_runner_perf_config",
+        deserialize_with = "deserialize_queue_runner_perf_config"
+    )]
     pub perf: QueueRunnerTypeConfig,
-    #[serde(default = "default_queue_runner_background_config")]
+    #[serde(
+        default = "default_queue_runner_background_config",
+        deserialize_with = "deserialize_queue_runner_background_config"
+    )]
     pub background: QueueRunnerTypeConfig,
 }
 
@@ -1041,6 +1050,55 @@ impl Default for QueueRunnerTypesConfig {
 pub struct QueueRunnerTypeConfig {
     pub max_concurrent: usize,
     pub default_timeout_seconds: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueRunnerTypeConfigOverrides {
+    max_concurrent: Option<usize>,
+    default_timeout_seconds: Option<i64>,
+}
+
+fn deserialize_queue_runner_type_config<'de, D>(
+    deserializer: D,
+    defaults: QueueRunnerTypeConfig,
+) -> Result<QueueRunnerTypeConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let overrides = QueueRunnerTypeConfigOverrides::deserialize(deserializer)?;
+    Ok(QueueRunnerTypeConfig {
+        max_concurrent: overrides.max_concurrent.unwrap_or(defaults.max_concurrent),
+        default_timeout_seconds: overrides
+            .default_timeout_seconds
+            .unwrap_or(defaults.default_timeout_seconds),
+    })
+}
+
+fn deserialize_queue_runner_tests_config<'de, D>(
+    deserializer: D,
+) -> Result<QueueRunnerTypeConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_queue_runner_type_config(deserializer, default_queue_runner_tests_config())
+}
+
+fn deserialize_queue_runner_perf_config<'de, D>(
+    deserializer: D,
+) -> Result<QueueRunnerTypeConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_queue_runner_type_config(deserializer, default_queue_runner_perf_config())
+}
+
+fn deserialize_queue_runner_background_config<'de, D>(
+    deserializer: D,
+) -> Result<QueueRunnerTypeConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_queue_runner_type_config(deserializer, default_queue_runner_background_config())
 }
 
 impl Default for QueueRunnerConfig {
@@ -2412,6 +2470,34 @@ queue_runner:
         assert_eq!(
             config.queue_runner.types.background.default_timeout_seconds,
             0
+        );
+    }
+
+    #[test]
+    fn raw_config_merges_partial_queue_type_overrides_into_type_defaults() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+queue_runner:
+  types:
+    tests:
+      max_concurrent: 6
+    perf:
+      default_timeout_seconds: 7200
+    background:
+      max_concurrent: 3
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert_eq!(config.queue_runner.types.tests.max_concurrent, 6);
+        assert_eq!(config.queue_runner.types.tests.default_timeout_seconds, 900);
+        assert_eq!(config.queue_runner.types.perf.max_concurrent, 1);
+        assert_eq!(config.queue_runner.types.perf.default_timeout_seconds, 7200);
+        assert_eq!(config.queue_runner.types.background.max_concurrent, 3);
+        assert_eq!(
+            config.queue_runner.types.background.default_timeout_seconds,
+            3600
         );
     }
 
