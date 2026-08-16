@@ -15040,7 +15040,7 @@ async fn runtime_core_marks_missing_tmux_stopped_on_send_and_retire() {
 }
 
 #[tokio::test]
-async fn runtime_core_does_not_queue_sends_to_already_stopped_sessions() {
+async fn runtime_core_does_not_queue_sends_to_terminal_sessions_with_status_drift() {
     if !tmux_available() {
         return;
     }
@@ -15057,7 +15057,8 @@ async fn runtime_core_does_not_queue_sends_to_already_stopped_sessions() {
                     "node": "primary",
                     "provider": "claude",
                     "log_file": "/tmp/runtimestopped.log",
-                    "status": "stopped",
+                    "status": "idle",
+                    "completion_status": "killed",
                     "created_at": "2026-06-01T00:00:00",
                     "last_activity": "2026-06-01T00:01:00",
                     "stopped_at": "2026-06-01T00:02:00"

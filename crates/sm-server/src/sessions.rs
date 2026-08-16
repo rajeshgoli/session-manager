@@ -3948,8 +3948,8 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(None);
         };
-        let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
-        let delivered = normalized_status(&status) != "stopped";
+        let status = effective_raw_session_status(session);
+        let delivered = !raw_session_is_stopped(session);
         if delivered {
             let now = now_rfc3339();
             mark_session_followup_activity(session, &now);
@@ -9573,9 +9573,7 @@ fn runtime_session_status_raw(state: &mut Value, session_id: &str) -> Result<Opt
     ensure_runtime_local_node(&node)?;
     let _tmux_session = json_text(session.get("tmux_session"))
         .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
-    Ok(Some(
-        json_text(session.get("status")).unwrap_or_else(|| "running".to_owned()),
-    ))
+    Ok(Some(effective_raw_session_status(session)))
 }
 
 fn deliver_runtime_text_to_session_raw(
@@ -9589,7 +9587,10 @@ fn deliver_runtime_text_to_session_raw(
         .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
     let node = json_text(session.get("node")).unwrap_or_else(default_node);
     ensure_runtime_local_node(&node)?;
-    let mut status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+    let mut status = effective_raw_session_status(session);
+    if raw_session_is_stopped(session) {
+        return Ok((status, false));
+    }
     if claude_handoff_is_reserved_raw(session) {
         return Ok((status, false));
     }
@@ -9597,33 +9598,23 @@ fn deliver_runtime_text_to_session_raw(
         .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
     let session_socket_name = json_text(session.get("tmux_socket_name"));
     let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
-    let mut delivered = false;
-    let mut mark_stopped_on_failure = true;
-    if normalized_status(&status) != "stopped" {
+    let (delivered, mark_stopped_on_failure) =
         match deliver_codex_fork_control_text_to_session_raw(session_id, session, text, runtime)? {
-            Some(true) => {
-                delivered = true;
-            }
+            Some(true) => (true, true),
             Some(false) if runtime.codex_fork_control_tmux_fallback_enabled() => {
-                delivered = session_runtime.send_input(&tmux_session, text)?;
+                (session_runtime.send_input(&tmux_session, text)?, true)
             }
-            Some(false) => {
-                delivered = false;
-                mark_stopped_on_failure = false;
-            }
-            None => {
-                delivered = session_runtime.send_input(&tmux_session, text)?;
-            }
-        }
-        let now = now_rfc3339();
-        if delivered {
-            mark_session_followup_activity(session, &now);
-        } else if mark_stopped_on_failure {
-            status = "stopped".to_owned();
-            session.insert("status".to_owned(), Value::String(status.clone()));
-            session.insert("stopped_at".to_owned(), Value::String(now.clone()));
-            session.insert("last_activity".to_owned(), Value::String(now));
-        }
+            Some(false) => (false, false),
+            None => (session_runtime.send_input(&tmux_session, text)?, true),
+        };
+    let now = now_rfc3339();
+    if delivered {
+        mark_session_followup_activity(session, &now);
+    } else if mark_stopped_on_failure {
+        status = "stopped".to_owned();
+        session.insert("status".to_owned(), Value::String(status.clone()));
+        session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+        session.insert("last_activity".to_owned(), Value::String(now));
     }
     Ok((status, delivered))
 }
@@ -9639,7 +9630,10 @@ fn deliver_urgent_runtime_text_to_session_raw(
         .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
     let node = json_text(session.get("node")).unwrap_or_else(default_node);
     ensure_runtime_local_node(&node)?;
-    let mut status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+    let mut status = effective_raw_session_status(session);
+    if raw_session_is_stopped(session) {
+        return Ok((status, false));
+    }
     if claude_handoff_is_reserved_raw(session) {
         return Ok((status, false));
     }
@@ -9648,41 +9642,35 @@ fn deliver_urgent_runtime_text_to_session_raw(
     let provider = json_text(session.get("provider")).unwrap_or_else(|| "claude".to_owned());
     let session_socket_name = json_text(session.get("tmux_socket_name"));
     let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
-    let mut delivered = false;
-    let mut mark_stopped_on_failure = true;
-    if normalized_status(&status) != "stopped" {
+    let (delivered, mark_stopped_on_failure) =
         match deliver_codex_fork_control_text_to_session_raw(session_id, session, text, runtime)? {
-            Some(true) => {
-                delivered = true;
-            }
-            Some(false) if runtime.codex_fork_control_tmux_fallback_enabled() => {
-                delivered = session_runtime.send_urgent_input(
+            Some(true) => (true, true),
+            Some(false) if runtime.codex_fork_control_tmux_fallback_enabled() => (
+                session_runtime.send_urgent_input(
                     &tmux_session,
                     text,
                     provider.eq_ignore_ascii_case("claude"),
-                )?;
-            }
-            Some(false) => {
-                delivered = false;
-                mark_stopped_on_failure = false;
-            }
-            None => {
-                delivered = session_runtime.send_urgent_input(
+                )?,
+                true,
+            ),
+            Some(false) => (false, false),
+            None => (
+                session_runtime.send_urgent_input(
                     &tmux_session,
                     text,
                     provider.eq_ignore_ascii_case("claude"),
-                )?;
-            }
-        }
-        let now = now_rfc3339();
-        if delivered {
-            mark_session_followup_activity(session, &now);
-        } else if mark_stopped_on_failure {
-            status = "stopped".to_owned();
-            session.insert("status".to_owned(), Value::String(status.clone()));
-            session.insert("stopped_at".to_owned(), Value::String(now.clone()));
-            session.insert("last_activity".to_owned(), Value::String(now));
-        }
+                )?,
+                true,
+            ),
+        };
+    let now = now_rfc3339();
+    if delivered {
+        mark_session_followup_activity(session, &now);
+    } else if mark_stopped_on_failure {
+        status = "stopped".to_owned();
+        session.insert("status".to_owned(), Value::String(status.clone()));
+        session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+        session.insert("last_activity".to_owned(), Value::String(now));
     }
     Ok((status, delivered))
 }
@@ -9698,8 +9686,8 @@ fn deliver_runtime_native_rename_to_session_raw(
         .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
     let node = json_text(session.get("node")).unwrap_or_else(default_node);
     ensure_runtime_local_node(&node)?;
-    let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
-    if normalized_status(&status) == "stopped" {
+    let status = effective_raw_session_status(session);
+    if raw_session_is_stopped(session) {
         return Ok((status, false));
     }
     if claude_handoff_is_reserved_raw(session) {
@@ -13995,6 +13983,14 @@ fn raw_session_is_stopped(session: &Map<String, Value>) -> bool {
         || json_text(session.get("completion_status")).as_deref() == Some("killed")
 }
 
+fn effective_raw_session_status(session: &Map<String, Value>) -> String {
+    if raw_session_is_stopped(session) {
+        "stopped".to_owned()
+    } else {
+        json_text(session.get("status")).unwrap_or_else(|| "running".to_owned())
+    }
+}
+
 fn fallback_activity_state(status: &str) -> String {
     match status {
         "stopped" => "stopped".to_owned(),
@@ -15511,6 +15507,28 @@ mod tests {
         assert!(!store
             .apply_claude_user_prompt_submit_hook("retired1", None)
             .unwrap());
+        let input = store
+            .send_core_input(
+                "retired1",
+                SendCoreInputRequest {
+                    text: "must not deliver".to_owned(),
+                    delivery_mode: "sequential".to_owned(),
+                    sender_session_id: None,
+                    from_sm_send: false,
+                    timeout_seconds: None,
+                    notify_on_delivery: false,
+                    notify_after_seconds: None,
+                    notify_on_stop: false,
+                    remind_soft_threshold: None,
+                    remind_hard_threshold: None,
+                    remind_cancel_on_reply_session_id: None,
+                    parent_session_id: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!input.delivered);
+        assert_eq!(input.status, "stopped");
         assert_eq!(
             store
                 .get_context_snapshot("retired1")
