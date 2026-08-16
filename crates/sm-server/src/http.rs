@@ -5188,9 +5188,11 @@ async fn create_queue_job(
 
     let job_type = payload.job_type.trim();
     let default_timeout =
-        queue_job_default_timeout_seconds(job_type).ok_or_else(|| ApiError::Status {
-            status: StatusCode::BAD_REQUEST,
-            detail: format!("unknown queue job type: {job_type}"),
+        queue_job_default_timeout_seconds(&state.config, job_type).ok_or_else(|| {
+            ApiError::Status {
+                status: StatusCode::BAD_REQUEST,
+                detail: format!("unknown queue job type: {job_type}"),
+            }
         })?;
     let argv = payload
         .argv
@@ -5214,10 +5216,12 @@ async fn create_queue_job(
         });
     }
     let timeout_seconds = payload.timeout_seconds.unwrap_or(default_timeout);
-    if timeout_seconds <= 0 {
+    if timeout_seconds < 0 || (timeout_seconds == 0 && job_type != "background") {
         return Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
-            detail: "timeout_seconds must be greater than 0".to_owned(),
+            detail:
+                "timeout_seconds must be greater than 0; background jobs may use 0 for no timeout"
+                    .to_owned(),
         });
     }
     let label = payload
@@ -5319,6 +5323,9 @@ fn queue_admission_policy(config: &AppConfig) -> QueueAdmissionPolicy {
     QueueAdmissionPolicy {
         max_running_jobs: config.queue_runner.max_running_jobs,
         perf_cooldown_seconds: config.queue_runner.perf_cooldown_seconds,
+        tests_max_concurrent: config.queue_runner.types.tests.max_concurrent,
+        perf_max_concurrent: config.queue_runner.types.perf.max_concurrent,
+        background_max_concurrent: config.queue_runner.types.background.max_concurrent,
     }
 }
 
@@ -12635,11 +12642,11 @@ fn default_queue_job_type() -> String {
     "tests".to_owned()
 }
 
-fn queue_job_default_timeout_seconds(job_type: &str) -> Option<i64> {
+fn queue_job_default_timeout_seconds(config: &AppConfig, job_type: &str) -> Option<i64> {
     match job_type {
-        "tests" => Some(900),
-        "perf" => Some(2700),
-        "background" => Some(3600),
+        "tests" => Some(config.queue_runner.types.tests.default_timeout_seconds),
+        "perf" => Some(config.queue_runner.types.perf.default_timeout_seconds),
+        "background" => Some(config.queue_runner.types.background.default_timeout_seconds),
         _ => None,
     }
 }
@@ -13149,6 +13156,22 @@ fn queue_job_response(state: &AppState, job: QueueJobRecord) -> Result<Value, Ap
             .or_else(|| Some(session_id.to_owned())),
         None => None,
     };
+    let termination_reason = match job.state.as_str() {
+        "timed_out" => Some("timeout"),
+        "cancelled" => Some("cancelled"),
+        "displaced" => Some("perf_displacement"),
+        _ => None,
+    };
+    let exit_evidence = if job.exit_code.is_some() {
+        "recorded"
+    } else if matches!(
+        job.state.as_str(),
+        "succeeded" | "failed" | "timed_out" | "cancelled" | "displaced"
+    ) {
+        "missing_partial_output"
+    } else {
+        "pending"
+    };
     Ok(json!({
         "id": job.id,
         "type": job.job_type,
@@ -13169,6 +13192,8 @@ fn queue_job_response(state: &AppState, job: QueueJobRecord) -> Result<Value, Ap
         "pid": job.pid,
         "process_group_id": job.process_group_id,
         "exit_code": job.exit_code,
+        "exit_evidence": exit_evidence,
+        "termination_reason": termination_reason,
         "log_path": job.log_path,
     }))
 }

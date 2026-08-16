@@ -446,7 +446,7 @@ queue_runner:
       default_timeout_seconds: 2700
     background:
       max_concurrent: 2
-      default_timeout_seconds: 3600
+      default_timeout_seconds: 3600  # 0 disables timeout for background jobs
 
 # Session defaults
 sessions:

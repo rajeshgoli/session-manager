@@ -1011,8 +1011,36 @@ pub struct QueueRunnerConfig {
     pub max_running_jobs: i64,
     #[serde(default = "default_queue_runner_perf_cooldown_seconds")]
     pub perf_cooldown_seconds: i64,
+    #[serde(default)]
+    pub types: QueueRunnerTypesConfig,
     #[serde(skip)]
     pub configured: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueueRunnerTypesConfig {
+    #[serde(default = "default_queue_runner_tests_config")]
+    pub tests: QueueRunnerTypeConfig,
+    #[serde(default = "default_queue_runner_perf_config")]
+    pub perf: QueueRunnerTypeConfig,
+    #[serde(default = "default_queue_runner_background_config")]
+    pub background: QueueRunnerTypeConfig,
+}
+
+impl Default for QueueRunnerTypesConfig {
+    fn default() -> Self {
+        Self {
+            tests: default_queue_runner_tests_config(),
+            perf: default_queue_runner_perf_config(),
+            background: default_queue_runner_background_config(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueueRunnerTypeConfig {
+    pub max_concurrent: usize,
+    pub default_timeout_seconds: i64,
 }
 
 impl Default for QueueRunnerConfig {
@@ -1022,6 +1050,7 @@ impl Default for QueueRunnerConfig {
             cancel_grace_seconds: default_queue_runner_cancel_grace_seconds(),
             max_running_jobs: default_queue_runner_max_running_jobs(),
             perf_cooldown_seconds: default_queue_runner_perf_cooldown_seconds(),
+            types: QueueRunnerTypesConfig::default(),
             configured: false,
         }
     }
@@ -1043,6 +1072,27 @@ fn default_queue_runner_perf_cooldown_seconds() -> i64 {
     30
 }
 
+fn default_queue_runner_tests_config() -> QueueRunnerTypeConfig {
+    QueueRunnerTypeConfig {
+        max_concurrent: 2,
+        default_timeout_seconds: 900,
+    }
+}
+
+fn default_queue_runner_perf_config() -> QueueRunnerTypeConfig {
+    QueueRunnerTypeConfig {
+        max_concurrent: 1,
+        default_timeout_seconds: 2700,
+    }
+}
+
+fn default_queue_runner_background_config() -> QueueRunnerTypeConfig {
+    QueueRunnerTypeConfig {
+        max_concurrent: 2,
+        default_timeout_seconds: 3600,
+    }
+}
+
 fn queue_runner_config_for_state_file(state_file: &str) -> QueueRunnerConfig {
     if state_file == default_state_file() {
         return QueueRunnerConfig::default();
@@ -1054,6 +1104,7 @@ fn queue_runner_config_for_state_file(state_file: &str) -> QueueRunnerConfig {
         cancel_grace_seconds: default_queue_runner_cancel_grace_seconds(),
         max_running_jobs: default_queue_runner_max_running_jobs(),
         perf_cooldown_seconds: default_queue_runner_perf_cooldown_seconds(),
+        types: QueueRunnerTypesConfig::default(),
         configured: false,
     }
 }
@@ -2329,8 +2380,18 @@ cloudflare_access:
 queue_runner:
   state_dir: /tmp/custom-queue-runner
   cancel_grace_seconds: 3
-  max_running_jobs: 1
+  max_running_jobs: 8
   perf_cooldown_seconds: 7
+  types:
+    tests:
+      max_concurrent: 6
+      default_timeout_seconds: 1800
+    perf:
+      max_concurrent: 1
+      default_timeout_seconds: 7200
+    background:
+      max_concurrent: 3
+      default_timeout_seconds: 0
 "#,
         )
         .unwrap();
@@ -2338,8 +2399,20 @@ queue_runner:
 
         assert_eq!(config.queue_runner.state_dir, "/tmp/custom-queue-runner");
         assert_eq!(config.queue_runner.cancel_grace_seconds, 3);
-        assert_eq!(config.queue_runner.max_running_jobs, 1);
+        assert_eq!(config.queue_runner.max_running_jobs, 8);
         assert_eq!(config.queue_runner.perf_cooldown_seconds, 7);
+        assert_eq!(config.queue_runner.types.tests.max_concurrent, 6);
+        assert_eq!(
+            config.queue_runner.types.tests.default_timeout_seconds,
+            1800
+        );
+        assert_eq!(config.queue_runner.types.perf.max_concurrent, 1);
+        assert_eq!(config.queue_runner.types.perf.default_timeout_seconds, 7200);
+        assert_eq!(config.queue_runner.types.background.max_concurrent, 3);
+        assert_eq!(
+            config.queue_runner.types.background.default_timeout_seconds,
+            0
+        );
     }
 
     #[test]
