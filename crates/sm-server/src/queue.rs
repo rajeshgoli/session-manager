@@ -163,6 +163,9 @@ pub struct QueueJobRecord {
 pub struct QueueAdmissionPolicy {
     pub max_running_jobs: i64,
     pub perf_cooldown_seconds: i64,
+    pub tests_max_concurrent: usize,
+    pub perf_max_concurrent: usize,
+    pub background_max_concurrent: usize,
 }
 
 impl Default for QueueAdmissionPolicy {
@@ -170,6 +173,9 @@ impl Default for QueueAdmissionPolicy {
         Self {
             max_running_jobs: DEFAULT_MAX_RUNNING_QUEUE_JOBS,
             perf_cooldown_seconds: DEFAULT_PERF_COOLDOWN_SECONDS,
+            tests_max_concurrent: 2,
+            perf_max_concurrent: 1,
+            background_max_concurrent: 2,
         }
     }
 }
@@ -712,7 +718,7 @@ impl RetainedQueueStore {
         let monitor_state_dir = state_dir.to_path_buf();
         let monitor_message_queue_db_path = message_queue_db_path.to_path_buf();
         let monitor_job_id = job_id.to_owned();
-        let timeout_seconds = job.timeout_seconds.max(1) as u64;
+        let timeout_seconds = job.timeout_seconds;
         thread::spawn(move || {
             monitor_queue_job_completion(
                 monitor_state_dir,
@@ -2617,16 +2623,37 @@ fn admit_pending_queue_jobs_conn(
         if !jobs.iter().any(|job| job.state == "pending") {
             break;
         }
-        if running_queue_job_count(&jobs, None) as i64 >= admission_policy.max_running_jobs {
-            if displace_background_for_perf_conn(
-                conn,
-                &jobs,
-                message_queue_db_path,
-                cancel_grace_seconds,
-                admission_policy,
-            )? {
-                continue;
+        if running_queue_job_count(&jobs, Some("perf")) > 0 {
+            summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "perf_running")?;
+            break;
+        }
+        let perf_waiting_for_quiet_window = oldest_pending_queue_job(&jobs, "perf").is_some()
+            && !perf_blocked_by_tests_after_perf(&jobs);
+        if perf_waiting_for_quiet_window {
+            if running_queue_job_count(&jobs, Some("tests")) > 0 {
+                summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "awaiting_tests")?;
+                break;
             }
+            if let Some(remaining) = perf_cooldown_remaining_seconds(&jobs, admission_policy) {
+                summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "perf_cooldown")?;
+                summary.retry_after_seconds = Some(
+                    summary
+                        .retry_after_seconds
+                        .map_or(remaining, |current| current.min(remaining)),
+                );
+                break;
+            }
+        }
+        if displace_background_for_perf_conn(
+            conn,
+            &jobs,
+            message_queue_db_path,
+            cancel_grace_seconds,
+            admission_policy,
+        )? {
+            continue;
+        }
+        if running_queue_job_count(&jobs, None) as i64 >= admission_policy.max_running_jobs {
             summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "concurrency_cap")?;
             break;
         }
@@ -2702,7 +2729,9 @@ fn next_admissible_queue_job_id_conn(
         let Some(job) = oldest_pending_queue_job(jobs, job_type) else {
             continue;
         };
-        if running_queue_job_count(jobs, Some(job_type)) >= max_concurrent_queue_jobs(job_type) {
+        if running_queue_job_count(jobs, Some(job_type))
+            >= admission_policy.max_concurrent_jobs(job_type)
+        {
             summary.held +=
                 mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), "concurrency_cap")?;
             continue;
@@ -2739,10 +2768,13 @@ fn displace_background_for_perf_conn(
     if oldest_pending_queue_job(jobs, "perf").is_none() {
         return Ok(false);
     }
-    if running_queue_job_count(jobs, Some("perf")) >= max_concurrent_queue_jobs("perf") {
+    if running_queue_job_count(jobs, Some("perf")) >= admission_policy.max_concurrent_jobs("perf") {
         return Ok(false);
     }
     if perf_cooldown_active(jobs, admission_policy) || perf_blocked_by_tests_after_perf(jobs) {
+        return Ok(false);
+    }
+    if running_queue_job_count(jobs, Some("tests")) > 0 {
         return Ok(false);
     }
     let Some(background) = jobs
@@ -2791,11 +2823,14 @@ fn running_queue_job_count(jobs: &[QueueJobRuntimeRecord], job_type: Option<&str
         .count()
 }
 
-fn max_concurrent_queue_jobs(job_type: &str) -> usize {
-    match job_type {
-        "perf" => 1,
-        "tests" | "background" => 2,
-        _ => 1,
+impl QueueAdmissionPolicy {
+    fn max_concurrent_jobs(self, job_type: &str) -> usize {
+        match job_type {
+            "tests" => self.tests_max_concurrent,
+            "perf" => self.perf_max_concurrent,
+            "background" => self.background_max_concurrent,
+            _ => 1,
+        }
     }
 }
 
@@ -2921,12 +2956,12 @@ fn monitor_queue_job_completion(
     message_queue_db_path: PathBuf,
     job_id: String,
     mut child: Child,
-    timeout_seconds: u64,
+    timeout_seconds: i64,
     cancel_grace_seconds: u64,
     admission_policy: QueueAdmissionPolicy,
 ) {
     let started = Instant::now();
-    let timeout = StdDuration::from_secs(timeout_seconds.max(1));
+    let timeout = (timeout_seconds > 0).then(|| StdDuration::from_secs(timeout_seconds as u64));
     let pgid = i64::from(child.id());
     loop {
         let child_status = match child.try_wait() {
@@ -2968,7 +3003,7 @@ fn monitor_queue_job_completion(
                 return;
             }
         }
-        if started.elapsed() >= timeout {
+        if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
             terminate_child_process_group_with_grace(&mut child, pgid, cancel_grace_seconds);
             let exit_code = read_queue_job_exit_code_from_state_dir(&state_dir, &job_id);
             let _ = finish_queue_job_in_state_dir_if_running(
@@ -3166,13 +3201,16 @@ fn queue_job_timed_out(job: &QueueJobRuntimeRecord) -> bool {
 }
 
 fn queue_job_timed_out_at(job: &QueueJobRuntimeRecord, now_utc: OffsetDateTime) -> bool {
+    if job.timeout_seconds <= 0 {
+        return false;
+    }
     let Some(started_at) = job.started_at.as_deref() else {
         return false;
     };
     let Some(elapsed_seconds) = queue_elapsed_since(started_at, now_utc) else {
         return false;
     };
-    elapsed_seconds >= job.timeout_seconds.max(1)
+    elapsed_seconds >= job.timeout_seconds
 }
 
 fn queue_elapsed_since(value: &str, now_utc: OffsetDateTime) -> Option<i64> {
@@ -3415,13 +3453,21 @@ fn queue_job_completion_text(
     let runtime = queue_duration_text(job.started_at.as_deref(), Some(finished_at));
     let queue_end = job.started_at.as_deref().unwrap_or(finished_at);
     let queued = queue_duration_text(Some(&job.queued_at), Some(queue_end));
-    let exit_text = exit_code
-        .map(|code| format!(" exit={code}"))
-        .unwrap_or_default();
+    let termination_text = match state {
+        "timed_out" => " termination=timeout",
+        "cancelled" => " termination=cancelled",
+        "displaced" => " termination=perf_displacement",
+        _ => "",
+    };
+    let exit_text = exit_code.map_or_else(
+        || " exit=unknown (no exit receipt; output is partial/non-evidence)".to_owned(),
+        |code| format!(" exit={code}"),
+    );
     let mut text = format!(
-        "[sm queue] {} completed: {}{} runtime={} queue={}. Log: {}",
+        "[sm queue] {} completed: {}{}{} runtime={} queue={}. Log: {}",
         job.id,
         state,
+        termination_text,
         exit_text,
         runtime,
         queued,
@@ -4208,6 +4254,63 @@ mod tests {
     use time::Duration;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn queue_completion_without_exit_receipt_is_explicitly_non_evidence() {
+        let job = QueueJobRuntimeRecord {
+            id: "job_missing_exit".to_owned(),
+            job_type: "tests".to_owned(),
+            state: "running".to_owned(),
+            notify_session_id: Some("run12345".to_owned()),
+            queued_at: "2026-08-16T20:00:00Z".to_owned(),
+            started_at: Some("2026-08-16T20:00:01Z".to_owned()),
+            finished_at: None,
+            holding_reason: None,
+            wrapper_path: None,
+            log_path: Some("/tmp/job_missing_exit.log".to_owned()),
+            exit_code_path: None,
+            timeout_seconds: 900,
+            pid: None,
+            process_group_id: None,
+            exit_code: None,
+            completion_notified_at: None,
+        };
+
+        let failed = queue_job_completion_text(&job, "failed", None, "2026-08-16T20:04:24Z");
+        assert!(failed.contains("completed: failed exit=unknown"));
+        assert!(failed.contains("output is partial/non-evidence"));
+
+        let displaced = queue_job_completion_text(&job, "displaced", None, "2026-08-16T20:04:24Z");
+        assert!(displaced.contains("termination=perf_displacement"));
+        assert!(displaced.contains("exit=unknown"));
+    }
+
+    #[test]
+    fn zero_timeout_never_expires() {
+        let mut job = QueueJobRuntimeRecord {
+            id: "job_unbounded".to_owned(),
+            job_type: "background".to_owned(),
+            state: "running".to_owned(),
+            notify_session_id: None,
+            queued_at: "2026-08-16T20:00:00Z".to_owned(),
+            started_at: Some("2026-08-16T20:00:01Z".to_owned()),
+            finished_at: None,
+            holding_reason: None,
+            wrapper_path: None,
+            log_path: None,
+            exit_code_path: None,
+            timeout_seconds: 0,
+            pid: None,
+            process_group_id: None,
+            exit_code: None,
+            completion_notified_at: None,
+        };
+        let much_later = OffsetDateTime::parse("2026-08-17T20:00:01Z", &Rfc3339).unwrap();
+        assert!(!queue_job_timed_out_at(&job, much_later));
+
+        job.timeout_seconds = 10;
+        assert!(queue_job_timed_out_at(&job, much_later));
+    }
 
     #[test]
     fn queue_store_creates_schema_and_writes_retained_rows() {

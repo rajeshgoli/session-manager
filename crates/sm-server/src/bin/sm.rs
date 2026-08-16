@@ -387,7 +387,7 @@ struct QueueRunArgs {
     label: Option<String>,
     #[arg(long)]
     cwd: Option<String>,
-    #[arg(long)]
+    #[arg(long, value_name = "DURATION|none")]
     timeout: Option<String>,
     #[arg(long = "env")]
     env_pairs: Vec<String>,
@@ -1330,7 +1330,7 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
     let timeout_seconds = args
         .timeout
         .as_deref()
-        .map(parse_duration_seconds)
+        .map(parse_queue_timeout_seconds)
         .transpose()?;
     let mut body = json!({
         "type": args.job_type,
@@ -1432,12 +1432,10 @@ fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
         "Holding: {}",
         payload["holding_reason"].as_str().unwrap_or("-")
     );
+    println!("Exit: {}", queue_exit_text(&payload));
     println!(
-        "Exit: {}",
-        payload["exit_code"]
-            .as_i64()
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "-".to_owned())
+        "Termination: {}",
+        payload["termination_reason"].as_str().unwrap_or("-")
     );
     println!("Log: {}", payload["log_path"].as_str().unwrap_or("-"));
     Ok(())
@@ -2069,7 +2067,9 @@ fn print_queue_jobs(jobs: &[Value]) {
         println!("No queue jobs.");
         return;
     }
-    let headers = ["ID", "Type", "State", "Notify", "Label", "Holding", "Log"];
+    let headers = [
+        "ID", "Type", "State", "Exit", "Notify", "Label", "Holding", "Log",
+    ];
     let rows = jobs
         .iter()
         .map(|job| {
@@ -2077,6 +2077,7 @@ fn print_queue_jobs(jobs: &[Value]) {
                 json_string(job, "id"),
                 json_string(job, "type"),
                 json_string(job, "state"),
+                queue_exit_text(job),
                 job["notify_name"]
                     .as_str()
                     .or_else(|| job["notify_session_id"].as_str())
@@ -2089,6 +2090,16 @@ fn print_queue_jobs(jobs: &[Value]) {
         })
         .collect::<Vec<_>>();
     print_table(&headers, &rows);
+}
+
+fn queue_exit_text(job: &Value) -> String {
+    if let Some(exit_code) = job["exit_code"].as_i64() {
+        return exit_code.to_string();
+    }
+    match job["exit_evidence"].as_str() {
+        Some("missing_partial_output") => "unknown (partial/non-evidence)".to_owned(),
+        _ => "-".to_owned(),
+    }
 }
 
 fn run_remove_device(client: &ApiClient, args: RemoveDeviceArgs) -> Result<()> {
@@ -4606,6 +4617,13 @@ fn parse_duration_seconds(value: &str) -> Result<i64> {
     Ok(total)
 }
 
+fn parse_queue_timeout_seconds(value: &str) -> Result<i64> {
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(0);
+    }
+    parse_duration_seconds(value)
+}
+
 fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u16)> {
     let default_port = default_port.to_string();
     let (host, port) = authority
@@ -5938,6 +5956,8 @@ mod tests {
         assert_eq!(parse_duration_seconds("10m").unwrap(), 600);
         assert_eq!(parse_duration_seconds("2h30m").unwrap(), 9000);
         assert_eq!(parse_duration_seconds("1d").unwrap(), 86400);
+        assert_eq!(parse_queue_timeout_seconds("none").unwrap(), 0);
+        assert_eq!(parse_queue_timeout_seconds("2h").unwrap(), 7200);
     }
 
     #[test]
@@ -5950,6 +5970,24 @@ mod tests {
             panic!("expected queue cancel command");
         };
         assert_eq!(cancel_args.job_id, "job_123abc");
+    }
+
+    #[test]
+    fn queue_exit_text_marks_missing_terminal_receipt_as_non_evidence() {
+        assert_eq!(
+            queue_exit_text(&json!({
+                "exit_code": null,
+                "exit_evidence": "missing_partial_output"
+            })),
+            "unknown (partial/non-evidence)"
+        );
+        assert_eq!(
+            queue_exit_text(&json!({
+                "exit_code": 143,
+                "exit_evidence": "recorded"
+            })),
+            "143"
+        );
     }
 
     #[test]

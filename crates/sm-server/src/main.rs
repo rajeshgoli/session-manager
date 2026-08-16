@@ -82,6 +82,9 @@ async fn main() -> Result<()> {
         let admission_policy = QueueAdmissionPolicy {
             max_running_jobs: config.queue_runner.max_running_jobs,
             perf_cooldown_seconds: config.queue_runner.perf_cooldown_seconds,
+            tests_max_concurrent: config.queue_runner.types.tests.max_concurrent,
+            perf_max_concurrent: config.queue_runner.types.perf.max_concurrent,
+            background_max_concurrent: config.queue_runner.types.background.max_concurrent,
         };
         thread::spawn(move || {
             match RetainedQueueStore::recover_queue_jobs_in_state_dir_with_policy(

@@ -119,6 +119,8 @@ EOF
 
 Submission exits with code `0` when SM accepts the job, even if the command later fails. Submission exits non-zero only for invalid input or SM unavailability. The managed command's exit code is reported by `sm queue status` and the completion notification.
 
+Pass `--timeout none` only for a `background` job that is intentionally long-lived. This stores a zero timeout and disables scheduler timeout enforcement; the job remains explicitly cancellable and may still be displaced by ready performance work. Tests and performance jobs must always have a positive timeout.
+
 ## Workload Types
 
 V1 ships three built-in workload types. Their defaults are configurable in `config.yaml`, but the type names are stable CLI/API values.
@@ -127,7 +129,7 @@ V1 ships three built-in workload types. Their defaults are configurable in `conf
 | --- | ---: | --- | --- | --- | --- |
 | `tests` | 2 | no | no | 15m | Output is content-deterministic and multiple instances can run safely. |
 | `perf` | 1 | `background` only | no | 45m | Output is wall-time-derived, such as benchmarks or latency measurements, and needs a quiet measurement window. |
-| `background` | 2 | no | yes | 60m | Work is long-running, content-producing, and safe to cancel/retry, such as corpus prep or fixture generation. |
+| `background` | 2 | no | yes | 60m (or explicit `none`) | Work is long-running, content-producing, and safe to cancel/retry, such as corpus prep or fixture generation. |
 
 Unknown types are rejected in v1. If operators need more classes later, add config-defined custom types as a follow-up after the core queue is stable.
 
@@ -143,6 +145,8 @@ Jobs start when all of these are true:
 4. Global resource gates pass.
 5. A `perf` job is not blocked by cooldown.
 
+A ready `perf` job drains running tests without signalling them, prevents new tests/background jobs from starting, displaces running background jobs, and then runs alone. This makes `perf` the only globally serialized workload class while ordinary tests use their configured concurrency on capable hosts.
+
 Within each type, ordering is FIFO by accepted timestamp.
 
 Cross-type admission order:
@@ -155,7 +159,7 @@ This gives clean benchmark windows priority while still bounding test starvation
 
 ## Displacement
 
-When a `perf` job is ready but all runnable capacity is occupied by `background` jobs, SM may displace the oldest running `background` job.
+When a `perf` job is ready, SM displaces running `background` jobs before starting the measurement. It never displaces `tests`; it waits for them to finish.
 
 Displacement behavior:
 
@@ -166,6 +170,8 @@ Displacement behavior:
 5. Notify the requester that the job was displaced and must be resubmitted manually if still needed.
 
 V1 does not automatically resubmit displaced jobs. Manual resubmission is clearer and avoids surprising repeated resource churn from work that may not be safe to restart.
+
+Completion notifications name scheduler-controlled termination (`timeout`, `cancelled`, or `perf_displacement`). If the wrapper did not persist an exit receipt, the notification reports `exit=unknown` and labels the captured output partial/non-evidence; lines in that log must not be treated as a completed test result.
 
 ## Resource Gates
 
