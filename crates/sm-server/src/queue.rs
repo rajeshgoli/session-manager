@@ -2948,22 +2948,8 @@ fn monitor_queue_job_completion(
         if queue_job_is_cancelled_in_state_dir(&state_dir, &job_id) {
             return;
         }
-        if started.elapsed() >= timeout {
-            terminate_child_process_group_with_grace(&mut child, pgid, cancel_grace_seconds);
-            let exit_code = read_queue_job_exit_code_from_state_dir(&state_dir, &job_id);
-            let _ = finish_queue_job_in_state_dir_if_running(
-                &state_dir,
-                &message_queue_db_path,
-                &job_id,
-                "timed_out",
-                exit_code,
-                cancel_grace_seconds,
-                admission_policy,
-            );
-            return;
-        }
-        match child_status {
-            Some(status) if !process_group_exists(pgid) => {
+        if let Some(status) = child_status {
+            if !process_group_exists(pgid) {
                 let exit_code = status.code().map(i64::from);
                 let state = if exit_code == Some(0) {
                     "succeeded"
@@ -2981,8 +2967,22 @@ fn monitor_queue_job_completion(
                 );
                 return;
             }
-            Some(_) | None => thread::sleep(StdDuration::from_millis(100)),
         }
+        if started.elapsed() >= timeout {
+            terminate_child_process_group_with_grace(&mut child, pgid, cancel_grace_seconds);
+            let exit_code = read_queue_job_exit_code_from_state_dir(&state_dir, &job_id);
+            let _ = finish_queue_job_in_state_dir_if_running(
+                &state_dir,
+                &message_queue_db_path,
+                &job_id,
+                "timed_out",
+                exit_code,
+                cancel_grace_seconds,
+                admission_policy,
+            );
+            return;
+        }
+        thread::sleep(StdDuration::from_millis(100));
     }
 }
 
