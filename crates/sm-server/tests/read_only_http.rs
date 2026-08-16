@@ -4506,6 +4506,63 @@ async fn queue_runtime_recovery_starts_pending_job() {
     assert!(notifications[0].contains("log tail:\nrecovered-pending"));
 }
 
+#[test]
+fn queue_runtime_retries_durable_terminal_completion_wakes_once() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-retry-completions");
+    let message_queue_db = state_file.with_extension("queue-retry-completions-message-queue.db");
+    create_queue_jobs_fixture_db(&queue_state_dir);
+
+    let historical_notified =
+        RetainedQueueStore::retry_unnotified_queue_job_completions_in_state_dir(
+            &queue_state_dir,
+            &message_queue_db,
+        )
+        .unwrap();
+    assert_eq!(historical_notified, 0);
+    assert!(!message_queue_db.exists());
+
+    let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
+    conn.execute(
+        "UPDATE queue_jobs SET completion_notification_required = 1 WHERE state IN ('succeeded', 'failed')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    fs::create_dir_all(&message_queue_db).unwrap();
+    assert!(
+        RetainedQueueStore::retry_unnotified_queue_job_completions_in_state_dir(
+            &queue_state_dir,
+            &message_queue_db,
+        )
+        .is_err()
+    );
+    assert!(queue_job_completion_notified_at(&queue_state_dir, "job-succeeded").is_none());
+    assert!(queue_job_completion_notified_at(&queue_state_dir, "job-failed").is_none());
+    fs::remove_dir(&message_queue_db).unwrap();
+
+    let notified = RetainedQueueStore::retry_unnotified_queue_job_completions_in_state_dir(
+        &queue_state_dir,
+        &message_queue_db,
+    )
+    .unwrap();
+    assert_eq!(notified, 2);
+    assert!(queue_job_completion_notified_at(&queue_state_dir, "job-succeeded").is_some());
+    assert!(queue_job_completion_notified_at(&queue_state_dir, "job-failed").is_some());
+    assert_eq!(queued_message_texts(&message_queue_db, "notify1").len(), 1);
+    assert_eq!(queued_message_texts(&message_queue_db, "notify2").len(), 1);
+
+    let notified_again = RetainedQueueStore::retry_unnotified_queue_job_completions_in_state_dir(
+        &queue_state_dir,
+        &message_queue_db,
+    )
+    .unwrap();
+    assert_eq!(notified_again, 0);
+    assert_eq!(queued_message_texts(&message_queue_db, "notify1").len(), 1);
+    assert_eq!(queued_message_texts(&message_queue_db, "notify2").len(), 1);
+}
+
 #[tokio::test]
 async fn queue_runtime_recovery_continues_after_bad_pending_job() {
     let state_file = write_session_fixture();

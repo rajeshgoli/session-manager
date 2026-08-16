@@ -20,6 +20,7 @@ use tokio::net::TcpListener;
 
 /// How often the Studio SSH reconcile loop repairs toward the desired state.
 const STUDIO_SSH_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+const QUEUE_COMPLETION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Rust Session Manager server scaffold")]
@@ -82,8 +83,8 @@ async fn main() -> Result<()> {
             max_running_jobs: config.queue_runner.max_running_jobs,
             perf_cooldown_seconds: config.queue_runner.perf_cooldown_seconds,
         };
-        thread::spawn(
-            move || match RetainedQueueStore::recover_queue_jobs_in_state_dir_with_policy(
+        thread::spawn(move || {
+            match RetainedQueueStore::recover_queue_jobs_in_state_dir_with_policy(
                 &queue_state_dir,
                 &message_queue_db_path,
                 cancel_grace_seconds,
@@ -94,8 +95,19 @@ async fn main() -> Result<()> {
                 }
                 Ok(_) => {}
                 Err(error) => eprintln!("queue runtime recovery failed: {error:#}"),
-            },
-        );
+            }
+            loop {
+                thread::sleep(QUEUE_COMPLETION_RETRY_INTERVAL);
+                if let Err(error) =
+                    RetainedQueueStore::retry_unnotified_queue_job_completions_in_state_dir(
+                        &queue_state_dir,
+                        &message_queue_db_path,
+                    )
+                {
+                    eprintln!("queue completion wake retry failed: {error:#}");
+                }
+            }
+        });
     }
 
     let state = AppState::try_new(config).context("failed to initialize server state")?;

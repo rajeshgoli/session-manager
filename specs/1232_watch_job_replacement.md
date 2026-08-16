@@ -14,6 +14,9 @@ managed session pass `--notify <session>`. When the job reaches a terminal
 state, Session Manager queues an `[sm queue]` message containing the state,
 exit code when available, runtime, queue time, log path, and bounded log tail.
 The caller goes idle after submission; it does not poll or add another watch.
+Terminal jobs retain a notification-pending marker until that message is
+durably queued. A service-owned retry loop reattempts unnotified completions,
+including across restarts, using an idempotent message ID.
 
 Processes started outside `sm queue run` cannot be registered after launch.
 Work that needs durable Session Manager supervision must be submitted through
@@ -30,6 +33,8 @@ owner-approved Rust cutover boundary without leaving callers at a dead end.
 Live smoke job `job_d3d77198345e` completed with exit code 0 and woke its notify
 target with the expected `[sm queue]` terminal message. CLI coverage locks the
 replacement guidance for every `watch-job` invocation, including `add --help`.
+Recovery coverage proves that marked terminal jobs are retried exactly once and
+that historical terminal rows are not replayed during migration.
 
 ## Classification
 
