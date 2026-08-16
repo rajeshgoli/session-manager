@@ -86,8 +86,23 @@ Only the source, target, or source's live parent may initiate a tree request.
 The source and target must approve. When source has a live parent, that
 grandparent must approve because its own direct-child edge changes. A root
 source needs no extra human approval: source explicitly approves its own
-demotion. If source has a recorded but non-live parent, user approval replaces
-the unavailable grandparent approval.
+demotion. A recorded but non-live parent is historical lineage, not live
+authority: the request retains that old edge as an apply precondition, promotes
+the target to a true root, and requires no human replacement for the unavailable
+grandparent. The source and target approvals authorize the complete live-tree
+move, including every frozen live child. Consecutive tree rotations therefore
+do not carry a stopped ancestor forward or repeatedly ask the user to approve
+it.
+
+For a stopped or missing recorded grandparent, the live result is instead:
+
+```text
+target
+target -> source
+target -> child-a
+target -> child-b
+source -> stopped-child
+```
 
 `--dry-run` creates no durable request. It prints the exact edge changes,
 routing changes, required approvers, and any condition that would prevent a
@@ -574,8 +589,9 @@ HTTP route; Phase 3 adds their CLI/watch UX.
 
 ### Phase 2 - #1211
 
-Add tree-promotion planning/apply, dry-run, frozen child-set validation,
-grandparent consent, stopped-child preservation, and recovery tests.
+Add tree-promotion planning/apply, dry-run, frozen child-set validation, live
+grandparent consent, non-live ancestor detachment, stopped-child preservation,
+consecutive-rotation coverage, and recovery tests.
 
 ### Phase 3 - #1210
 
