@@ -43,7 +43,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener},
     path::PathBuf,
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc, Arc, Mutex,
@@ -4071,6 +4071,70 @@ async fn queue_job_runtime_persists_failure_and_timeout() {
     assert!(notifications[0].contains(&format!("[sm queue] {failed_id} completed: failed")));
     assert!(notifications[0].contains(" exit=7 "));
     assert!(notifications[1].contains(&format!("[sm queue] {timeout_id} completed: timed_out")));
+}
+
+#[tokio::test]
+async fn queue_timeout_waits_for_process_group_cleanup_after_wrapper_exits() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-timeout-group-accounting");
+    let message_queue_db =
+        state_file.with_extension("queue-timeout-group-accounting-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let cleanup_marker = working_dir.join("cleanup-complete");
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            cancel_grace_seconds: 3,
+            configured: true,
+            ..QueueRunnerConfig::default()
+        },
+        sm_send: SmSendConfig {
+            db_path: message_queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.runtime_enabled = true;
+    let app = router(AppState::new(config));
+    let script = format!(
+        "trap 'sleep 1; printf cleanup-complete > {}; exit 143' TERM\nwhile true; do sleep 1; done",
+        cleanup_marker.display()
+    );
+
+    let (status, timed_out) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "tests",
+            "label": "timeout group accounting",
+            "script": script,
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345",
+            "timeout_seconds": 1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let job_id = timed_out["id"].as_str().unwrap().to_owned();
+
+    let final_job = wait_for_queue_job_state(app, &job_id, &["timed_out"]).await;
+    assert_eq!(final_job["state"], "timed_out");
+    assert_eq!(
+        fs::read_to_string(cleanup_marker).unwrap(),
+        "cleanup-complete"
+    );
+    let pgid = final_job["process_group_id"].as_i64().unwrap();
+    let group_probe = Command::new("/bin/kill")
+        .args(["-0", &format!("-{pgid}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!group_probe.success());
 }
 
 #[tokio::test]

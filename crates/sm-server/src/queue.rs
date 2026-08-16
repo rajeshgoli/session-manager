@@ -2927,9 +2927,43 @@ fn monitor_queue_job_completion(
 ) {
     let started = Instant::now();
     let timeout = StdDuration::from_secs(timeout_seconds.max(1));
+    let pgid = i64::from(child.id());
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
+        let child_status = match child.try_wait() {
+            Ok(status) => status,
+            Err(_) => {
+                terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+                let _ = finish_queue_job_in_state_dir_if_running(
+                    &state_dir,
+                    &message_queue_db_path,
+                    &job_id,
+                    "failed",
+                    None,
+                    cancel_grace_seconds,
+                    admission_policy,
+                );
+                return;
+            }
+        };
+        if queue_job_is_cancelled_in_state_dir(&state_dir, &job_id) {
+            return;
+        }
+        if started.elapsed() >= timeout {
+            terminate_child_process_group_with_grace(&mut child, pgid, cancel_grace_seconds);
+            let exit_code = read_queue_job_exit_code_from_state_dir(&state_dir, &job_id);
+            let _ = finish_queue_job_in_state_dir_if_running(
+                &state_dir,
+                &message_queue_db_path,
+                &job_id,
+                "timed_out",
+                exit_code,
+                cancel_grace_seconds,
+                admission_policy,
+            );
+            return;
+        }
+        match child_status {
+            Some(status) if !process_group_exists(pgid) => {
                 let exit_code = status.code().map(i64::from);
                 let state = if exit_code == Some(0) {
                     "succeeded"
@@ -2947,65 +2981,7 @@ fn monitor_queue_job_completion(
                 );
                 return;
             }
-            Ok(None) if queue_job_is_cancelled_in_state_dir(&state_dir, &job_id) => {
-                let pgid = i64::from(child.id());
-                terminate_process_group(pgid, false);
-                let grace_deadline = Instant::now() + StdDuration::from_secs(cancel_grace_seconds);
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(_status)) => break,
-                        Ok(None) if Instant::now() >= grace_deadline => {
-                            terminate_process_group(pgid, true);
-                            let _ = child.wait();
-                            break;
-                        }
-                        Ok(None) => thread::sleep(StdDuration::from_millis(100)),
-                        Err(_) => break,
-                    }
-                }
-                return;
-            }
-            Ok(None) if started.elapsed() >= timeout => {
-                let pgid = i64::from(child.id());
-                terminate_process_group(pgid, false);
-                let grace_deadline = Instant::now() + StdDuration::from_secs(cancel_grace_seconds);
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(_status)) => break,
-                        Ok(None) if Instant::now() >= grace_deadline => {
-                            terminate_process_group(pgid, true);
-                            let _ = child.wait();
-                            break;
-                        }
-                        Ok(None) => thread::sleep(StdDuration::from_millis(100)),
-                        Err(_) => break,
-                    }
-                }
-                let exit_code = read_queue_job_exit_code_from_state_dir(&state_dir, &job_id);
-                let _ = finish_queue_job_in_state_dir_if_running(
-                    &state_dir,
-                    &message_queue_db_path,
-                    &job_id,
-                    "timed_out",
-                    exit_code,
-                    cancel_grace_seconds,
-                    admission_policy,
-                );
-                return;
-            }
-            Ok(None) => thread::sleep(StdDuration::from_millis(100)),
-            Err(_) => {
-                let _ = finish_queue_job_in_state_dir_if_running(
-                    &state_dir,
-                    &message_queue_db_path,
-                    &job_id,
-                    "failed",
-                    None,
-                    cancel_grace_seconds,
-                    admission_policy,
-                );
-                return;
-            }
+            Some(_) | None => thread::sleep(StdDuration::from_millis(100)),
         }
     }
 }
@@ -3541,7 +3517,27 @@ fn terminate_process_group_with_grace(pgid: i64, grace_seconds: u64) {
     while process_group_exists(pgid) {
         if Instant::now() >= deadline {
             terminate_process_group(pgid, true);
+            break;
+        }
+        thread::sleep(StdDuration::from_millis(100));
+    }
+    while process_group_exists(pgid) {
+        thread::sleep(StdDuration::from_millis(100));
+    }
+}
+
+fn terminate_child_process_group_with_grace(child: &mut Child, pgid: i64, grace_seconds: u64) {
+    terminate_process_group(pgid, false);
+    let deadline = Instant::now() + StdDuration::from_secs(grace_seconds);
+    let mut force_sent = false;
+    loop {
+        let _ = child.try_wait();
+        if !process_group_exists(pgid) {
             return;
+        }
+        if !force_sent && Instant::now() >= deadline {
+            terminate_process_group(pgid, true);
+            force_sent = true;
         }
         thread::sleep(StdDuration::from_millis(100));
     }
