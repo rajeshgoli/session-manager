@@ -2042,12 +2042,7 @@ impl SessionStore {
             .edge_changes
             .iter()
             .map(|change| change.session_id.clone())
-            .chain(
-                expected_parent_session_id
-                    .iter()
-                    .filter(|_| expected_parent_is_live)
-                    .cloned(),
-            )
+            .chain(expected_parent_session_id.iter().cloned())
             .collect::<BTreeSet<_>>();
         let active_conflict = records.iter().find(|record| {
             record.is_active() && !record.affected_session_ids().is_disjoint(&affected_ids)
@@ -13468,10 +13463,8 @@ impl ReparentRequestRecord {
             .collect::<BTreeSet<_>>();
         affected.insert(self.subject_session_id.clone());
         affected.insert(self.target_parent_session_id.clone());
-        if self.kind != "tree" || tree_target_parent_session_id(self).is_some() {
-            if let Some(parent_id) = self.expected_parent_session_id.as_ref() {
-                affected.insert(parent_id.clone());
-            }
+        if let Some(parent_id) = self.expected_parent_session_id.as_ref() {
+            affected.insert(parent_id.clone());
         }
         if let Some(plan) = self.apply_plan.as_ref() {
             affected.extend(
