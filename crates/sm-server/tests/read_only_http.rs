@@ -4478,7 +4478,7 @@ async fn queue_runtime_admission_displaces_background_for_ready_perf_job() {
 }
 
 #[tokio::test]
-async fn queue_runtime_perf_waits_for_tests_and_blocks_new_test_admission() {
+async fn queue_runtime_perf_waits_for_tests_and_blocks_new_tests_through_cooldown() {
     let state_file = write_session_fixture();
     let queue_state_dir = state_file.with_extension("queue-runner-perf-waits-tests");
     let message_queue_db = state_file.with_extension("queue-perf-waits-tests-message-queue.db");
@@ -4492,7 +4492,7 @@ async fn queue_runtime_perf_waits_for_tests_and_blocks_new_test_admission() {
             state_dir: queue_state_dir.display().to_string(),
             cancel_grace_seconds: 0,
             max_running_jobs: 4,
-            perf_cooldown_seconds: 0,
+            perf_cooldown_seconds: 2,
             configured: true,
             ..QueueRunnerConfig::default()
         },

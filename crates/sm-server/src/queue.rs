@@ -2627,13 +2627,22 @@ fn admit_pending_queue_jobs_conn(
             summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "perf_running")?;
             break;
         }
-        let ready_perf_waiting_for_tests = oldest_pending_queue_job(&jobs, "perf").is_some()
-            && !perf_cooldown_active(&jobs, admission_policy)
-            && !perf_blocked_by_tests_after_perf(&jobs)
-            && running_queue_job_count(&jobs, Some("tests")) > 0;
-        if ready_perf_waiting_for_tests {
-            summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "awaiting_tests")?;
-            break;
+        let perf_waiting_for_quiet_window = oldest_pending_queue_job(&jobs, "perf").is_some()
+            && !perf_blocked_by_tests_after_perf(&jobs);
+        if perf_waiting_for_quiet_window {
+            if running_queue_job_count(&jobs, Some("tests")) > 0 {
+                summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "awaiting_tests")?;
+                break;
+            }
+            if let Some(remaining) = perf_cooldown_remaining_seconds(&jobs, admission_policy) {
+                summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "perf_cooldown")?;
+                summary.retry_after_seconds = Some(
+                    summary
+                        .retry_after_seconds
+                        .map_or(remaining, |current| current.min(remaining)),
+                );
+                break;
+            }
         }
         if displace_background_for_perf_conn(
             conn,
