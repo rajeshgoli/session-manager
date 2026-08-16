@@ -3824,23 +3824,22 @@ fn spawn_session_wait_monitor(
                 idle_since = Instant::now();
             }
             let target_name = child_display_name(&target);
-            let notification = if session_status_is_stopped(&target.status)
-                || runtime_child_session_exited(&state, &target)
-            {
-                Some(format!(
-                    "[sm wait] {target_name} reached stopped (waited {elapsed}s)"
-                ))
-            } else if idle_since.elapsed() >= REVIEW_WAIT_IDLE_THRESHOLD {
-                Some(format!(
-                    "[sm wait] {target_name} is now idle (waited {elapsed}s)"
-                ))
-            } else if elapsed >= wait_seconds {
-                Some(format!(
-                    "[sm wait] Timeout: {target_name} still active after {wait_seconds}s"
-                ))
-            } else {
-                None
-            };
+            let notification =
+                if target.is_stopped() || runtime_child_session_exited(&state, &target) {
+                    Some(format!(
+                        "[sm wait] {target_name} reached stopped (waited {elapsed}s)"
+                    ))
+                } else if idle_since.elapsed() >= REVIEW_WAIT_IDLE_THRESHOLD {
+                    Some(format!(
+                        "[sm wait] {target_name} is now idle (waited {elapsed}s)"
+                    ))
+                } else if elapsed >= wait_seconds {
+                    Some(format!(
+                        "[sm wait] Timeout: {target_name} still active after {wait_seconds}s"
+                    ))
+                } else {
+                    None
+                };
             if let Some(notification) = notification {
                 queue_wait_notification(&state, &watcher_session_id, notification);
                 break;
@@ -3903,18 +3902,17 @@ fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_sec
                 idle_since = Instant::now();
             }
 
-            let completion_message = if session_status_is_stopped(&child.status)
-                || runtime_child_session_exited(&state, &child)
-            {
-                Some("Session exited".to_owned())
-            } else {
-                Some(idle_since.elapsed().as_secs())
-                    .filter(|idle_seconds| *idle_seconds >= wait_seconds)
-                    .map(|idle_seconds| {
-                        completion_summary(&state.session_store, &child_session_id)
-                            .unwrap_or_else(|| format!("Idle for {idle_seconds}s"))
-                    })
-            };
+            let completion_message =
+                if child.is_stopped() || runtime_child_session_exited(&state, &child) {
+                    Some("Session exited".to_owned())
+                } else {
+                    Some(idle_since.elapsed().as_secs())
+                        .filter(|idle_seconds| *idle_seconds >= wait_seconds)
+                        .map(|idle_seconds| {
+                            completion_summary(&state.session_store, &child_session_id)
+                                .unwrap_or_else(|| format!("Idle for {idle_seconds}s"))
+                        })
+                };
             let Some(completion_message) = completion_message else {
                 continue;
             };
@@ -3939,13 +3937,6 @@ fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_sec
             break;
         }
     });
-}
-
-fn session_status_is_stopped(status: &str) -> bool {
-    matches!(
-        status.trim().to_ascii_lowercase().as_str(),
-        "stopped" | "killed"
-    )
 }
 
 fn runtime_child_session_exited(state: &AppState, child: &SessionRecord) -> bool {

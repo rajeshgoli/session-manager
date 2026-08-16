@@ -1458,7 +1458,7 @@ impl SessionStore {
                 transcript_path.map(ToOwned::to_owned),
             ));
         }
-        if normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped" {
+        if raw_session_is_stopped(session) {
             drop(_guard);
             for (provider_resume_id, artifact_path) in seat_session_appends {
                 self.append_seat_session(
@@ -1589,7 +1589,7 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(false);
         };
-        if normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped" {
+        if raw_session_is_stopped(session) {
             return Ok(false);
         }
 
@@ -1635,7 +1635,7 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(false);
         };
-        if normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped" {
+        if raw_session_is_stopped(session) {
             return Ok(false);
         }
 
@@ -5755,8 +5755,7 @@ impl SessionStore {
             .filter(|session| {
                 json_text(session.get("provider")).as_deref() == Some("claude")
                     && is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
-                    && normalized_status(&json_text(session.get("status")).unwrap_or_default())
-                        != "stopped"
+                    && !raw_session_is_stopped(session)
                     && json_text(session.get("pending_handoff_path")).is_some()
                     && json_text(session.get("pending_handoff_recorded_at")).is_some()
                     && (json_text(session.get("claude_handoff_in_progress_at")).is_some()
@@ -5788,7 +5787,7 @@ impl SessionStore {
                 let eligible = json_text(session.get("provider")).as_deref() == Some("claude")
                     && file_path.is_some()
                     && recorded_at.is_some()
-                    && normalized_status(&status) != "stopped"
+                    && !raw_session_is_stopped(session)
                     && is_primary_node(
                         &json_text(session.get("node")).unwrap_or_else(default_node),
                     );
@@ -5977,8 +5976,7 @@ impl SessionStore {
             return Ok(false);
         };
         let matches = json_text(session.get("provider")).as_deref() == Some("claude")
-            && normalized_status(&json_text(session.get("status")).unwrap_or_default())
-                != "stopped"
+            && !raw_session_is_stopped(session)
             && is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
             && json_text(session.get("tmux_session")).as_deref() == Some(tmux_session)
             && json_text(session.get("tmux_socket_name")).as_deref() == socket_name.as_deref()
@@ -6003,8 +6001,7 @@ impl SessionStore {
                 return Ok(false);
             };
             if json_text(session.get("provider")).as_deref() != Some("claude")
-                || normalized_status(&json_text(session.get("status")).unwrap_or_default())
-                    == "stopped"
+                || raw_session_is_stopped(session)
             {
                 return Ok(false);
             }
@@ -6111,9 +6108,8 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(false);
         };
-        let current_status = json_text(session.get("status")).unwrap_or_default();
         let still_same_session = json_text(session.get("provider")).as_deref() == Some("claude")
-            && normalized_status(&current_status) != "stopped"
+            && !raw_session_is_stopped(session)
             && is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
             && json_text(session.get("tmux_session")).as_deref() == Some(tmux_session.as_str())
             && json_text(session.get("tmux_socket_name")) == socket_name;
@@ -6407,6 +6403,9 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(false);
         };
+        if raw_session_is_stopped(session) {
+            return Ok(false);
+        }
         match result {
             Ok(provider_resume_id) => {
                 session.insert(
@@ -7428,8 +7427,7 @@ impl SessionStore {
         if provider != "codex-fork" {
             return Ok(false);
         }
-        let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
-        Ok(normalized_status(&status) != "stopped")
+        Ok(!session.as_object().is_some_and(raw_session_is_stopped))
     }
 
     #[cfg(test)]
@@ -7465,7 +7463,7 @@ impl SessionStore {
             return Ok(());
         }
         let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
-        if normalized_status(&status) == "stopped" {
+        if raw_session_is_stopped(session) {
             return Ok(());
         }
 
@@ -8626,6 +8624,7 @@ pub struct ContextSnapshotResponse {
     pub used_percentage: Option<f64>,
     pub total_input_tokens: Option<i64>,
     pub sampled_at: Option<String>,
+    pub lifecycle_status: String,
     pub state: String,
     pub warning_percentage: f64,
     pub critical_percentage: f64,
@@ -8639,6 +8638,12 @@ impl ContextSnapshotResponse {
     fn from_session(session: SessionRecord, config: &ContextMonitorConfig) -> Self {
         let used_percentage = session.context_used_percentage;
         let compaction_active = session.context_compaction_active;
+        let lifecycle_status = if session.is_stopped() {
+            "stopped"
+        } else {
+            normalized_status(&session.status)
+        }
+        .to_owned();
         let friendly_name = session.cached_display_name();
         let provider = non_empty_or(session.provider, "claude");
         let informational_only = provider_manages_context_inline(&provider);
@@ -8664,6 +8669,7 @@ impl ContextSnapshotResponse {
             used_percentage,
             total_input_tokens: session.context_total_input_tokens,
             sampled_at: session.context_sampled_at,
+            lifecycle_status,
             state,
             warning_percentage: config.warning_percentage,
             critical_percentage: config.critical_percentage,
@@ -10127,7 +10133,7 @@ fn claude_handoff_reservation_replaced_raw(
     reservation_at: &str,
 ) -> bool {
     if json_text(session.get("provider")).as_deref() != Some("claude")
-        || normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped"
+        || raw_session_is_stopped(session)
         || !is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
     {
         return false;
@@ -13665,8 +13671,11 @@ fn root_seat_id(record: &SessionRecord, records: &BTreeMap<&str, &SessionRecord>
 }
 
 impl SessionRecord {
-    fn is_stopped(&self) -> bool {
+    pub(crate) fn is_stopped(&self) -> bool {
+        // Retirement persists both fields. Keep the terminal marker authoritative
+        // if a delayed status-only writer leaves the activity status behind.
         normalized_status(&self.status) == "stopped"
+            || self.completion_status.as_deref() == Some("killed")
     }
 
     fn is_live_for_registry(&self) -> bool {
@@ -13979,6 +13988,11 @@ fn normalized_status(status: &str) -> &str {
         "running" | "idle" | "stopped" => status,
         _ => status,
     }
+}
+
+fn raw_session_is_stopped(session: &Map<String, Value>) -> bool {
+    normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped"
+        || json_text(session.get("completion_status")).as_deref() == Some("killed")
 }
 
 fn fallback_activity_state(status: &str) -> String {
@@ -15458,6 +15472,59 @@ mod tests {
         session.activity_hook_at = Some("2026-06-01T00:01:00Z".to_owned());
 
         assert_eq!(claude_hook_gate(&session), ClaudeHookGate::Stale);
+    }
+
+    #[test]
+    fn killed_completion_marker_keeps_status_drift_out_of_the_live_roster() {
+        let state_file = unique_temp_path("killed-status-drift");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "retired1",
+                    "name": "claude-retired1",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-retired1",
+                    "provider": "claude",
+                    "status": "idle",
+                    "completion_status": "killed",
+                    "completed_at": "2026-06-01T00:02:00Z",
+                    "stopped_at": "2026-06-01T00:02:00Z",
+                    "context_used_percentage": 38.0,
+                    "context_sampled_at": "2026-06-01T00:01:00Z",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:02:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(state_file.clone());
+
+        assert!(store.list_sessions(false).unwrap().is_empty());
+        let retained = store.list_sessions(true).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].is_stopped());
+        assert!(!store
+            .apply_claude_pre_tool_use_hook("retired1", Some("Bash"))
+            .unwrap());
+        assert!(!store
+            .apply_claude_user_prompt_submit_hook("retired1", None)
+            .unwrap());
+        assert_eq!(
+            store
+                .get_context_snapshot("retired1")
+                .unwrap()
+                .unwrap()
+                .lifecycle_status,
+            "stopped"
+        );
+        assert_eq!(
+            store.get_session("retired1").unwrap().unwrap().status,
+            "idle"
+        );
+
+        let _ = fs::remove_file(state_file);
     }
 
     #[test]

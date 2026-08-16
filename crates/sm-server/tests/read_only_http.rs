@@ -7995,6 +7995,32 @@ async fn sessions_lists_running_sessions_and_filters_stopped_by_default() {
 }
 
 #[tokio::test]
+async fn sessions_excludes_killed_completion_even_if_status_drifted_idle() {
+    let state_file = write_session_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "oldstate")
+        .unwrap();
+    session["status"] = json!("idle");
+    session["completion_status"] = json!("killed");
+    session["stopped_at"] = json!("2026-06-01T00:02:00Z");
+    fs::write(&state_file, state.to_string()).unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|session| session["id"] != "oldstate"));
+}
+
+#[tokio::test]
 async fn context_usage_hook_is_served_and_records_tokens() {
     // The route existed only in the Python server until #1132, so every status
     // line post 404'd and tokens_used stayed at its fixture value forever.
@@ -8024,6 +8050,7 @@ async fn context_usage_hook_is_served_and_records_tokens() {
     assert_eq!(payload["session_id"], "run12345");
     assert_eq!(payload["used_percentage"], json!(41.5));
     assert_eq!(payload["total_input_tokens"], json!(83_000));
+    assert_eq!(payload["lifecycle_status"], "running");
     assert_eq!(payload["state"], "normal");
     assert_eq!(payload["context_monitor_enabled"], true);
 

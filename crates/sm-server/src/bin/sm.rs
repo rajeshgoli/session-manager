@@ -15,6 +15,7 @@ use sm_server::{config::AppConfig, mobile_devices};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8420";
+const CONTEXT_COMPACT_STALE_SECONDS: i64 = 10 * 60;
 const CODEX_CONTEXT_MONITOR_FYI: &str =
     "Context monitoring is FYI only for Codex agents; they manage compaction inline.";
 const CLIENT_CONFIG_ENV: &str = "SM_CLIENT_CONFIG";
@@ -3650,7 +3651,15 @@ fn run_context(client: &ApiClient, args: ContextArgs) -> Result<()> {
 
     let percentage = format_context_percentage(payload.get("used_percentage"));
     if !(args.details || args.detailed) {
-        println!("{percentage}");
+        println!(
+            "{}",
+            format_compact_context(
+                &percentage,
+                payload["sampled_at"].as_str(),
+                payload["lifecycle_status"].as_str(),
+                OffsetDateTime::now_utc(),
+            )
+        );
         return Ok(());
     }
 
@@ -3687,8 +3696,12 @@ fn run_context(client: &ApiClient, args: ContextArgs) -> Result<()> {
 
     println!("Context: {percentage}{token_text}");
     println!(
-        "Sample: {}",
+        "Sample: {} (cached telemetry, not liveness)",
         format_context_sample_age(payload["sampled_at"].as_str())
+    );
+    println!(
+        "Lifecycle: {}",
+        payload["lifecycle_status"].as_str().unwrap_or("unknown")
     );
     println!("State: {state} (warning {warning}, critical {critical})");
     println!("Monitor: {monitor}, alerts -> {notify_text}");
@@ -3724,13 +3737,57 @@ fn format_context_percentage(value: Option<&Value>) -> String {
 }
 
 fn format_context_sample_age(sampled_at: Option<&str>) -> String {
+    format_context_sample_age_at(sampled_at, OffsetDateTime::now_utc())
+}
+
+fn format_compact_context(
+    percentage: &str,
+    sampled_at: Option<&str>,
+    lifecycle_status: Option<&str>,
+    now: OffsetDateTime,
+) -> String {
+    if percentage == "unknown" {
+        return percentage.to_owned();
+    }
+    let stopped = lifecycle_status == Some("stopped");
+    let sampled = sampled_at
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        .map(|timestamp| ((now - timestamp).whole_seconds()).max(0));
+    let stale = sampled.is_none_or(|seconds| seconds >= CONTEXT_COMPACT_STALE_SECONDS);
+    // Preserve the terse percentage for fresh live telemetry, but make cached
+    // or terminal snapshots impossible to mistake for a heartbeat.
+    if !stopped && !stale {
+        return percentage.to_owned();
+    }
+
+    let mut notes = Vec::new();
+    if stale {
+        let age = format_context_sample_age_at(sampled_at, now);
+        notes.push(if age == "unknown" {
+            "cached sample age unknown".to_owned()
+        } else {
+            format!("cached {age}")
+        });
+    } else {
+        notes.push("cached".to_owned());
+    }
+    if stopped {
+        notes.push("session stopped".to_owned());
+    }
+    format!("{percentage} ({})", notes.join("; "))
+}
+
+fn format_context_sample_age_at(sampled_at: Option<&str>, now: OffsetDateTime) -> String {
     let Some(sampled_at) = sampled_at else {
         return "unknown".to_owned();
     };
     let Ok(timestamp) = OffsetDateTime::parse(sampled_at, &Rfc3339) else {
         return "unknown".to_owned();
     };
-    let mut seconds = (OffsetDateTime::now_utc() - timestamp).whole_seconds();
+    format_elapsed_context_age((now - timestamp).whole_seconds())
+}
+
+fn format_elapsed_context_age(mut seconds: i64) -> String {
     if seconds < 0 {
         seconds = 0;
     }
@@ -5198,6 +5255,28 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "Invalid retire response for session child001"
+        );
+    }
+
+    #[test]
+    fn compact_context_marks_stale_or_stopped_samples_as_cached() {
+        let now = OffsetDateTime::parse("2026-08-16T23:00:00Z", &Rfc3339).unwrap();
+
+        assert_eq!(
+            format_compact_context("43%", Some("2026-08-16T22:59:30Z"), Some("running"), now,),
+            "43%"
+        );
+        assert_eq!(
+            format_compact_context("38%", Some("2026-08-16T22:45:00Z"), Some("running"), now,),
+            "38% (cached 15min ago)"
+        );
+        assert_eq!(
+            format_compact_context("38%", Some("2026-08-16T22:59:30Z"), Some("stopped"), now,),
+            "38% (cached; session stopped)"
+        );
+        assert_eq!(
+            format_compact_context("unknown", None, Some("stopped"), now),
+            "unknown"
         );
     }
 
