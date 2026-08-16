@@ -17578,6 +17578,141 @@ async fn reparent_tree_promotes_a_root_child_without_stranding_parent_routes() {
     assert_eq!(target_wake["is_active"], false);
 }
 
+#[tokio::test]
+async fn reparent_tree_detaches_a_stopped_parent_and_consecutive_rotations_need_no_human() {
+    let state_file = write_reparent_tree_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let grandparent = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "grand001")
+        .unwrap();
+    grandparent["status"] = json!("stopped");
+    fs::write(&state_file, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, preview) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/source01/reparent-tree-requests",
+        json!({
+            "requester_session_id": "source01",
+            "target_session_id": "target01",
+            "dry_run": true
+        }),
+        &[("x-sm-session-credential", "source-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(preview["required_human_approval"], false);
+    assert_eq!(
+        preview["required_agent_approvals"],
+        json!(["source01", "target01"])
+    );
+    assert_eq!(
+        preview["edge_changes"][0]["new_parent_session_id"],
+        Value::Null
+    );
+    assert_eq!(
+        preview["edge_changes"][1]["expected_parent_session_id"],
+        "grand001"
+    );
+
+    let (status, first) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/source01/reparent-tree-requests",
+        json!({
+            "requester_session_id": "source01",
+            "target_session_id": "target01"
+        }),
+        &[("x-sm-session-credential", "source-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(first["required_human_approval"], false);
+    assert_eq!(
+        first["required_agent_approvals"],
+        json!(["source01", "target01"])
+    );
+    assert_eq!(first["expected_parent_session_id"], "grand001");
+    assert_eq!(first["expected_parent_is_live"], false);
+    assert_eq!(first["detach_non_live_parent"], true);
+
+    let (status, first_applied) = post_json_with_headers_and_peer(
+        app.clone(),
+        &format!(
+            "/reparent-requests/{}/approve",
+            first["id"].as_str().unwrap()
+        ),
+        json!({ "requester_session_id": "target01" }),
+        &[("x-sm-session-credential", "target-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first_applied["status"], "applied");
+
+    let (status, second) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/target01/reparent-tree-requests",
+        json!({
+            "requester_session_id": "target01",
+            "target_session_id": "sibling01"
+        }),
+        &[("x-sm-session-credential", "target-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(second["required_human_approval"], false);
+    assert_eq!(
+        second["required_agent_approvals"],
+        json!(["sibling01", "target01"])
+    );
+    assert_eq!(second["expected_parent_session_id"], Value::Null);
+
+    let (status, second_applied) = post_json_with_headers_and_peer(
+        app,
+        &format!(
+            "/reparent-requests/{}/approve",
+            second["id"].as_str().unwrap()
+        ),
+        json!({ "requester_session_id": "sibling01" }),
+        &[("x-sm-session-credential", "sibling-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second_applied["status"], "applied");
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let parent = |id: &str| {
+        state["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == id)
+            .and_then(|session| session["parent_session_id"].as_str())
+    };
+    assert_eq!(parent("sibling01"), None);
+    assert_eq!(parent("target01"), Some("sibling01"));
+    assert_eq!(parent("source01"), Some("sibling01"));
+    assert_eq!(
+        state["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == "grand001")
+            .unwrap()["status"],
+        "stopped"
+    );
+}
+
 fn config_with_state_file(state_file: &PathBuf) -> AppConfig {
     AppConfig {
         paths: PathsConfig {

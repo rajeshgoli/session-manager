@@ -1872,6 +1872,7 @@ impl SessionStore {
             target_parent_session_id: target_parent_session_id.to_owned(),
             expected_parent_session_id,
             expected_parent_is_live,
+            detach_non_live_parent: false,
             frozen_live_child_ids: Vec::new(),
             initiator_session_id: requester_session_id.to_owned(),
             required_agent_approvals,
@@ -1998,10 +1999,14 @@ impl SessionStore {
             })
             .map(|session| session.id.clone())
             .collect::<Vec<_>>();
+        let target_parent_session_id = expected_parent_session_id
+            .as_deref()
+            .filter(|_| expected_parent_is_live);
         let edge_changes = tree_reparent_edge_changes(
             source_session_id,
             target_session_id,
             expected_parent_session_id.as_deref(),
+            target_parent_session_id,
             &frozen_live_child_ids,
         );
         if reparent_plan_would_create_cycle(&sessions, &edge_changes) {
@@ -2017,8 +2022,7 @@ impl SessionStore {
             }
         }
         let required_agent_approvals = required_agent_approvals.into_iter().collect::<Vec<_>>();
-        let required_human_approval =
-            expected_parent_session_id.is_some() && !expected_parent_is_live;
+        let required_human_approval = false;
         let preview = ReparentTreePreview {
             kind: "tree".to_owned(),
             source_session_id: source_session_id.to_owned(),
@@ -2104,6 +2108,7 @@ impl SessionStore {
             target_parent_session_id: target_session_id.to_owned(),
             expected_parent_session_id,
             expected_parent_is_live,
+            detach_non_live_parent: true,
             frozen_live_child_ids,
             initiator_session_id: requester_session_id.to_owned(),
             required_agent_approvals: required_agent_approvals.clone(),
@@ -2804,6 +2809,7 @@ impl SessionStore {
                 &record.subject_session_id,
                 &record.target_parent_session_id,
                 record.expected_parent_session_id.as_deref(),
+                tree_target_parent_session_id(record),
                 &record.frozen_live_child_ids,
             )
         } else {
@@ -12695,6 +12701,7 @@ fn reparent_stale_reason(
             &record.subject_session_id,
             &record.target_parent_session_id,
             record.expected_parent_session_id.as_deref(),
+            tree_target_parent_session_id(record),
             &record.frozen_live_child_ids,
         );
         if reparent_plan_would_create_cycle(sessions, &changes) {
@@ -12713,18 +12720,19 @@ fn reparent_stale_reason(
 fn tree_reparent_edge_changes(
     source_session_id: &str,
     target_session_id: &str,
-    source_parent_session_id: Option<&str>,
+    expected_source_parent_session_id: Option<&str>,
+    target_parent_session_id: Option<&str>,
     frozen_live_child_ids: &[String],
 ) -> Vec<ReparentEdgeChange> {
     let mut changes = vec![
         ReparentEdgeChange {
             session_id: target_session_id.to_owned(),
             expected_parent_session_id: Some(source_session_id.to_owned()),
-            new_parent_session_id: source_parent_session_id.map(ToOwned::to_owned),
+            new_parent_session_id: target_parent_session_id.map(ToOwned::to_owned),
         },
         ReparentEdgeChange {
             session_id: source_session_id.to_owned(),
-            expected_parent_session_id: source_parent_session_id.map(ToOwned::to_owned),
+            expected_parent_session_id: expected_source_parent_session_id.map(ToOwned::to_owned),
             new_parent_session_id: Some(target_session_id.to_owned()),
         },
     ];
@@ -12739,6 +12747,15 @@ fn tree_reparent_edge_changes(
             }),
     );
     changes
+}
+
+fn tree_target_parent_session_id(record: &ReparentRequestRecord) -> Option<&str> {
+    // Older persisted requests omit this flag and retain their immutable plan.
+    if record.detach_non_live_parent && !record.expected_parent_is_live {
+        None
+    } else {
+        record.expected_parent_session_id.as_deref()
+    }
 }
 
 fn reparent_plan_would_create_cycle(
@@ -13276,6 +13293,7 @@ fn reparent_edge_summary(record: &ReparentRequestRecord) -> String {
                     &record.subject_session_id,
                     &record.target_parent_session_id,
                     record.expected_parent_session_id.as_deref(),
+                    tree_target_parent_session_id(record),
                     &record.frozen_live_child_ids,
                 )
             } else {
@@ -13335,6 +13353,8 @@ pub struct ReparentRequestRecord {
     pub expected_parent_session_id: Option<String>,
     #[serde(default)]
     pub expected_parent_is_live: bool,
+    #[serde(default)]
+    pub detach_non_live_parent: bool,
     #[serde(default)]
     pub frozen_live_child_ids: Vec<String>,
     pub initiator_session_id: String,
@@ -18591,6 +18611,36 @@ mod tests {
         assert!(provider_manages_context_inline("codex-fork"));
         assert!(provider_manages_context_inline("codex-app"));
         assert!(!provider_manages_context_inline("claude"));
+    }
+
+    #[test]
+    fn legacy_tree_requests_preserve_their_persisted_stopped_parent_plan() {
+        let legacy: ReparentRequestRecord = serde_json::from_value(json!({
+            "id": "legacy01",
+            "kind": "tree",
+            "subject_session_id": "source01",
+            "target_parent_session_id": "target01",
+            "expected_parent_session_id": "stopped01",
+            "expected_parent_is_live": false,
+            "frozen_live_child_ids": ["target01"],
+            "initiator_session_id": "source01",
+            "required_agent_approvals": ["source01", "target01"],
+            "required_human_approval": true,
+            "status": "pending",
+            "ready_to_apply": false,
+            "created_at": "2026-08-16T00:00:00Z",
+            "expires_at": "2026-08-17T00:00:00Z",
+            "topology_fingerprint": "legacy"
+        }))
+        .unwrap();
+
+        assert!(!legacy.detach_non_live_parent);
+        assert_eq!(tree_target_parent_session_id(&legacy), Some("stopped01"));
+
+        let mut current = legacy;
+        current.detach_non_live_parent = true;
+        current.required_human_approval = false;
+        assert_eq!(tree_target_parent_session_id(&current), None);
     }
 
     #[test]
