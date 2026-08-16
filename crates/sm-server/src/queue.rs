@@ -177,6 +177,7 @@ impl Default for QueueAdmissionPolicy {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueueRecoverySummary {
     pub recovered_running: usize,
+    pub retried_completion_notifications: usize,
     pub started_pending: usize,
     pub requeued_pending: usize,
     pub held_pending: usize,
@@ -204,6 +205,7 @@ struct QueueJobRuntimeRecord {
     timeout_seconds: i64,
     pid: Option<i64>,
     process_group_id: Option<i64>,
+    exit_code: Option<i64>,
     completion_notified_at: Option<String>,
 }
 
@@ -915,7 +917,22 @@ impl RetainedQueueStore {
         summary.requeued_pending += admission.requeued;
         summary.held_pending += admission.held;
         summary.finished_failed += admission.failed_start;
+        summary.retried_completion_notifications +=
+            retry_unnotified_queue_job_completions_conn(&conn, message_queue_db_path)?;
         Ok(summary)
+    }
+
+    pub fn retry_unnotified_queue_job_completions_in_state_dir(
+        state_dir: &Path,
+        message_queue_db_path: &Path,
+    ) -> Result<usize> {
+        let db_path = state_dir.join("queue_runner.db");
+        if !db_path.exists() {
+            return Ok(0);
+        }
+        let conn = open_queue_jobs_connection(&db_path)?;
+        init_queue_jobs_schema(&conn)?;
+        retry_unnotified_queue_job_completions_conn(&conn, message_queue_db_path)
     }
 
     pub fn ensure_schema(&self) -> Result<()> {
@@ -2274,6 +2291,7 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
             wrapper_path TEXT,
             queued_notified_at TEXT,
             started_notified_at TEXT,
+            completion_notification_required INTEGER NOT NULL DEFAULT 0,
             completion_notified_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_queue_jobs_state_type_queued
@@ -2296,6 +2314,12 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
     )?;
     ensure_column(conn, "queue_jobs", "queued_notified_at", "TEXT")?;
     ensure_column(conn, "queue_jobs", "started_notified_at", "TEXT")?;
+    ensure_column(
+        conn,
+        "queue_jobs",
+        "completion_notification_required",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_column(conn, "queue_jobs", "completion_notified_at", "TEXT")?;
     Ok(())
 }
@@ -2486,7 +2510,7 @@ fn get_queue_job_runtime_conn(
         r#"
         SELECT id, type, state, notify_session_id, queued_at, started_at, finished_at,
                holding_reason, wrapper_path, log_path, exit_code_path, timeout_seconds,
-               pid, process_group_id, completion_notified_at
+               pid, process_group_id, exit_code, completion_notified_at
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -2517,7 +2541,8 @@ fn get_queue_job_runtime_conn(
                 timeout_seconds: row.get(11)?,
                 pid: row.get(12)?,
                 process_group_id: row.get(13)?,
-                completion_notified_at: row.get(14)?,
+                exit_code: row.get(14)?,
+                completion_notified_at: row.get(15)?,
             })
         })
         .optional()
@@ -2529,7 +2554,7 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
         r#"
         SELECT id, type, state, notify_session_id, queued_at, started_at, finished_at,
                holding_reason, wrapper_path, log_path, exit_code_path, timeout_seconds,
-               pid, process_group_id, completion_notified_at
+               pid, process_group_id, exit_code, completion_notified_at
         FROM queue_jobs
         ORDER BY queued_at, id
         "#,
@@ -2551,7 +2576,8 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                 timeout_seconds: row.get(11)?,
                 pid: row.get(12)?,
                 process_group_id: row.get(13)?,
-                completion_notified_at: row.get(14)?,
+                exit_code: row.get(14)?,
+                completion_notified_at: row.get(15)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3280,7 +3306,8 @@ fn finish_queue_job_conn(
         SET state = ?2,
             holding_reason = NULL,
             finished_at = ?3,
-            exit_code = ?4
+            exit_code = ?4,
+            completion_notification_required = 1
         WHERE id = ?1 AND state NOT IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'displaced')
         "#,
         params![job.id, state, finished_at, exit_code],
@@ -3288,19 +3315,83 @@ fn finish_queue_job_conn(
     if changed == 0 {
         return Ok(());
     }
-    if let Some(completion_notified_at) =
-        queue_job_completion_notified_at(job, state, exit_code, &finished_at, message_queue_db_path)
-    {
-        conn.execute(
-            r#"
-            UPDATE queue_jobs
-            SET completion_notified_at = COALESCE(completion_notified_at, ?2)
-            WHERE id = ?1
-            "#,
-            params![job.id, completion_notified_at],
-        )?;
-    }
+    record_queue_job_completion_notification_conn(
+        conn,
+        job,
+        state,
+        exit_code,
+        &finished_at,
+        message_queue_db_path,
+    )?;
     Ok(())
+}
+
+fn retry_unnotified_queue_job_completions_conn(
+    conn: &Connection,
+    message_queue_db_path: &Path,
+) -> Result<usize> {
+    let mut statement = conn.prepare(
+        r#"
+        SELECT id
+        FROM queue_jobs
+        WHERE state IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'displaced')
+          AND completion_notification_required = 1
+          AND completion_notified_at IS NULL
+        ORDER BY finished_at, id
+        "#,
+    )?;
+    let job_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    let mut notified = 0;
+    for job_id in job_ids {
+        let Some(job) = get_queue_job_runtime_conn(conn, &job_id)? else {
+            continue;
+        };
+        let finished_at = job.finished_at.as_deref().unwrap_or(&job.queued_at);
+        if record_queue_job_completion_notification_conn(
+            conn,
+            &job,
+            &job.state,
+            job.exit_code,
+            finished_at,
+            Some(message_queue_db_path),
+        )? {
+            notified += 1;
+        }
+    }
+    Ok(notified)
+}
+
+fn record_queue_job_completion_notification_conn(
+    conn: &Connection,
+    job: &QueueJobRuntimeRecord,
+    state: &str,
+    exit_code: Option<i64>,
+    finished_at: &str,
+    message_queue_db_path: Option<&Path>,
+) -> Result<bool> {
+    let Some(completion_notified_at) = queue_job_completion_notified_at(
+        job,
+        state,
+        exit_code,
+        finished_at,
+        message_queue_db_path,
+    )?
+    else {
+        return Ok(false);
+    };
+    let changed = conn.execute(
+        r#"
+        UPDATE queue_jobs
+        SET completion_notified_at = COALESCE(completion_notified_at, ?2)
+        WHERE id = ?1
+        "#,
+        params![job.id, completion_notified_at],
+    )?;
+    Ok(changed == 1)
 }
 
 fn queue_job_completion_notified_at(
@@ -3309,9 +3400,9 @@ fn queue_job_completion_notified_at(
     exit_code: Option<i64>,
     finished_at: &str,
     message_queue_db_path: Option<&Path>,
-) -> Option<String> {
+) -> Result<Option<String>> {
     if job.completion_notified_at.is_some() {
-        return None;
+        return Ok(None);
     }
     let Some(target_session_id) = job
         .notify_session_id
@@ -3319,17 +3410,24 @@ fn queue_job_completion_notified_at(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return Some(now_rfc3339());
+        return Ok(Some(now_rfc3339()));
     };
     let Some(message_queue_db_path) = message_queue_db_path else {
-        return None;
+        return Ok(None);
     };
     let text = queue_job_completion_text(job, state, exit_code, finished_at);
     let queue = RetainedQueueStore::new(message_queue_db_path.to_path_buf());
-    match queue.enqueue_message(target_session_id, &text, "sequential", None) {
-        Ok(_) => Some(now_rfc3339()),
-        Err(_) => None,
-    }
+    queue.enqueue_message_once_with_metadata(
+        &format!("queue-completion-{}", job.id),
+        target_session_id,
+        &text,
+        "sequential",
+        QueueMessageMetadata {
+            message_category: Some("queue-completion".to_owned()),
+            ..QueueMessageMetadata::default()
+        },
+    )?;
+    Ok(Some(now_rfc3339()))
 }
 
 fn queue_job_completion_text(
@@ -4838,6 +4936,7 @@ mod tests {
             timeout_seconds: 120,
             pid: None,
             process_group_id: None,
+            exit_code: None,
             completion_notified_at: None,
         };
 
