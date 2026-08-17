@@ -205,6 +205,8 @@ creates a durable request bound to:
   and lane;
 - prompt digest and launch-intent ID;
 - policy version;
+- policy-relevant topology/capacity version and any concurrency, budget, or
+  role-capacity reservation lease; and
 - requested name, vehicle, provider/model/effort, cwd, and node.
 
 The only temporary exception to the parent-seat fields is the D4
@@ -212,10 +214,20 @@ maintainer-incarnation canary defined under Bootstrap authority. It uses the
 explicit `incarnation_bootstrap` binding there; no other policy-enabled caller
 may omit a seat key and generation.
 
-No child is allocated while policy is pending. A changed parent, prompt, policy,
-or topology stales the request. The request ID is internal: from the calling
-agent's perspective `sm spawn` is atomic and returns either the final child ID
-or an actionable rejection/rewrite reason.
+No child is allocated while policy is pending. Evaluation records the topology
+and capacity version it observed. Before provisional child allocation, SM
+atomically revalidates that version and either acquires/consumes a bounded
+request lease or stales and re-evaluates the request. The lease and provisional
+child record commit together, so concurrent requests cannot both consume one
+available concurrency, role, or budget slot. Launch rejection, expiry, and
+cancel release the lease idempotently. A changed parent, prompt, policy, or
+policy-relevant topology stales the request.
+
+From the calling agent's perspective `sm spawn` remains atomic and never returns
+a pending handle: success returns the final child ID. A terminal rewrite/block
+returns the actionable reason plus an opaque request ID embedded in a complete
+ready-to-run scoped override command. The caller need not poll or reconstruct
+internal request state, but can invoke the exact escape hatch the result names.
 
 The parent incarnation is point-in-time launch evidence. Routing, ownership,
 and later lifecycle decisions derive from the parent seat key and generation,
@@ -455,13 +467,13 @@ The initial requirement-effect ledger includes:
 
 | Requirement family | Incremental cost boundary | Immediate benefit evidence |
 |---|---|---|
-| Spawn intent and model/vehicle policy | classifier plus injected rewrite and any retry | corrected provider/model/vehicle, prevented invalid launch, retry/rework rate |
+| Spawn intent, model/vehicle, and capacity policy | classifier, reservation acquire/release, injected rewrite, and same-request re-admission | corrected provider/model/vehicle, prevented invalid or over-capacity launch, retry/rework rate |
 | Stable seats, holder liveness, and rotation fencing | resolution/alarm/queued-delivery operations plus fence wait, stale-snapshot abort, provisional-successor rollback, commit, and post-commit verification | stale-holder deliveries prevented, manual re-points avoided, topology races rejected, provisional successor leaks prevented, eventual delivery success |
 | Context profiles and rotation thresholds | preflight, handoff, orientation, probe, and retirement spans | quota/tokens per completed unit of work, threshold overrides, rotation failures, time to productive successor |
 | Handoff summary and directed probe | summary and probe spans reported separately | novel actionable items, corrections to the summary, ruled-out paths preserved, successor actions attributable to each item |
 | Codex native-compaction snapshots | each snapshot and restore/reconstruction attempt | successful restore, reconstruction time avoided, state-loss incidents |
 | Cleanup manifests and workspace relocation | closeout classification, verification, relocation, and cleanup spans | owned resources removed, ambiguous cleanup blocked, separate cleanup jobs avoided, successful later restore |
-| Refusal, recusal, conflicts, overrides, and reclassification | decision/escalation plus replacement work | accepted corrections, conflicted work avoided, owner reversals, reassignment/rework avoided |
+| Refusal, recusal, conflicts, overrides, and reclassification | decision/escalation, override write/re-admission, plus replacement work | accepted corrections, conflicted work avoided, owner reversals, reassignment/rework avoided |
 | Model attestation and provider-outage disposition | attestation, provisional-runtime cleanup, or failed launch path | mis-tiered launches caught, orphan runtimes prevented, cleanup latency/failures, hidden provider failures surfaced, unstaffed intervals made explicit |
 | Coverage-counted sweeps and baseline revalidation | sweep/revalidation runtime and any evaluator use | partial sweeps detected, stale baselines rejected, false-clean reports prevented |
 
@@ -753,6 +765,15 @@ or apply to another request. The broader role/task/issue scopes and watch UX in
 dogfoods model selection, concurrency, budget, and intent handling without
 exposing lane 355 to an unproven implementation.
 
+Writing a valid override appends an `override_authorized` transition to that
+same frozen request and starts one D3 re-admission attempt; it does not create a
+new request or erase the prior terminal decision. D3 reuses the frozen
+classification, applies the override, revalidates current policy/topology, and
+atomically acquires capacity before consuming the single-use override. If a
+bound input changed, the old override remains inapplicable and the caller
+receives a new request/rewrite result. A failed re-admission appends its own
+terminal event and does not loop automatically.
+
 D4 deploys an exact reviewed commit behind a canary scope that matches only the
 bound maintainer lane/incarnation. The evidence record includes source commit,
 built binary hash/signing identity, configuration digest, service restart and
@@ -826,8 +847,10 @@ without first obtaining trial evidence.
 #### Economy controls
 
 - Use the deterministic path before any model call. An immutable request gets
-  at most one `/btw`; retries reuse its terminal decision unless a bound input
-  changed and therefore created a new request.
+  at most one `/btw`; ordinary retries reuse its terminal decision unless a
+  bound input changed and therefore created a new request. The sole exception is
+  the explicit same-request `override_authorized` re-admission above, which
+  reuses the frozen classification and makes no second evaluator call.
 - Select policy clauses by stable ID and scope. Do not inject unchanged policy
   history, unrelated lane clauses, or an arbitrary transcript tail.
 - Reuse the existing SQLite/event, HTTP, CLI, `sm watch`, #1264 transport, and
