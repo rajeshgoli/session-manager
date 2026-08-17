@@ -165,6 +165,14 @@ holder-liveness alarm. Lifecycle history distinguishes at least `incoming`,
 `live`, `stopped-but-restorable`, `retired`, and `unretirable` rather than
 collapsing every non-live state into retired.
 
+Creating a seat with no historical holder also creates an initial-assignment
+fence at generation 0. Ordinary seat-relative operations accepted before the
+first holder retain seat intent and attach to that fence without an agent ID.
+The first-holder transaction atomically claims the complete unacknowledged set,
+commits generation 1, binds the operations to that holder, and then releases
+them for idempotent delivery. An aborted assignment retains the fence and queue;
+it never resolves them to a provisional or failed holder.
+
 Detecting unplanned holder loss atomically installs a dead-holder recovery fence
 for the observed seat generation. In the same transaction it claims every
 ordinary seat-relative operation for that generation that lacks a durable
@@ -1098,8 +1106,8 @@ agent.
 
 | ID | Owner | Work | Dependency | Parallelism |
 |---|---|---|---|---|
-| 4A | Sol/high | Policy-authorized rotation transaction: evidence-graded handoff, named-direction probe/addendum, transition windows, successor readiness, fenced seat/children/routes transfer, verified retirement, idempotency, rollback, and restart recovery | 2B, 3A, 3B, 3D, 3E | Critical path |
-| 4B | Terra/high | Scoped override command/API/watch UX, draining presentation, audit history, expiry and consumption semantics | 1A, 2A, 3A | Parallel with early 4A |
+| 4A | Sol/high | Policy-authorized rotation transaction: evidence-graded handoff, named-direction probe/addendum, transition windows, successor readiness, fenced seat/children/routes transfer, verified retirement, idempotency, rollback, and restart recovery | 2B, 3A, 3B, 3D, 3E, 4B | Critical path after override UX |
+| 4B | Terra/high | Scoped override command/API/watch UX, draining presentation, audit history, expiry and consumption semantics | 1A, 2A, 3A | Must merge before 4A activation |
 | 4C | Terra/high | Hostile and restart matrix for partial spawn, stale holder, duplicate commit, route delivery during transfer, and recovery after each transaction boundary | 4A contract; implementation follows incrementally | Test lane |
 
 ### Continuous measured rollout
@@ -1114,8 +1122,11 @@ the later waves; it is not a final phase that waits for stable seats or rotation
    result remains overridable by the seat holder with a durable scoped reason.
 2. After at least three governed package spawns produce complete decision,
    launch-attestation, token, lifecycle, and forecast rows with no P1 admission
-   defect, enable the proven capability subset for lane 355. This is a promotion
-   of reviewed deployed code, not a second implementation or a shadow run.
+   defect, and after 1B stable-seat identity plus 2B stable-seat caller binding
+   are reviewed and deployed, enable the proven capability subset for lane 355.
+   This is a promotion of reviewed deployed code, not a second implementation or
+   a shadow run. The maintainer-only bootstrap incarnation binding is never
+   widened or reused for lane 355.
    Lane-declared P0 artifacts and incident scopes are excluded from automatic
    gating or mutation; during a declared incident the canary fails closed and
    escalates rather than converting unavailable evidence into allow.
