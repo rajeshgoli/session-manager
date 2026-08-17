@@ -145,6 +145,8 @@ const SESSION_COOKIE_NAME: &str = "sm_auth";
 const SESSION_COOKIE_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
 const SHADOW_ENVELOPE_MAX_BYTES: usize = 1024 * 1024;
 const CODEX_FORK_ACTIVITY_EVENT_TAIL_BYTES: u64 = 256 * 1024;
+const DEFAULT_QUEUE_LOG_LINES: usize = 200;
+const MAX_QUEUE_LOG_LINES: usize = 10_000;
 const EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS: i64 = 8;
 const SCHEDULED_REMINDER_COMPACTION_WAIT_SECONDS: i64 = 300;
 const REQUEST_STATUS_PROMPT: &str = "[sm] user requests status, please update now using sm status";
@@ -472,6 +474,11 @@ impl AppState {
             studio_ssh_enabled: Arc::new(AtomicBool::new(studio_ssh_enabled)),
             mobile_terminal_secret,
         })
+    }
+
+    pub fn drain_queue_completion_wakes(&self) -> anyhow::Result<usize> {
+        self.session_store
+            .drain_runtime_pending_message_targets_by_category("queue-completion")
     }
 
     pub fn with_github_review_poster(mut self, poster: Arc<dyn GitHubReviewPoster>) -> Self {
@@ -1104,6 +1111,7 @@ pub fn router(state: AppState) -> Router {
             "/queue-jobs/{job_id}",
             get(get_queue_job).delete(cancel_queue_job),
         )
+        .route("/queue-jobs/{job_id}/log", get(get_queue_job_log))
         .route(
             "/codex-review-requests",
             get(list_codex_review_requests).post(create_codex_review_request),
@@ -5162,6 +5170,53 @@ async fn get_queue_job(
         return Err(ApiError::NotFound("Queue job not found"));
     };
     Ok(Json(queue_job_response(&state, job)?))
+}
+
+async fn get_queue_job_log(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+    Query(query): Query<QueueJobLogQuery>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let lines = query.lines.unwrap_or(DEFAULT_QUEUE_LOG_LINES);
+    if !(1..=MAX_QUEUE_LOG_LINES).contains(&lines) {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("lines must be between 1 and {MAX_QUEUE_LOG_LINES}"),
+        });
+    }
+    let queue_state_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
+    let queue_db_path = queue_state_dir.join("queue_runner.db");
+    let Some(job) = RetainedQueueStore::get_queue_job_from_path(&queue_db_path, &job_id)? else {
+        return Err(ApiError::NotFound("Queue job not found"));
+    };
+    if !job
+        .id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        return Err(ApiError::Internal(anyhow::anyhow!(
+            "queue job {} has an unsafe durable id",
+            job.id
+        )));
+    }
+    let log_path = queue_state_dir.join("logs").join(format!("{}.log", job.id));
+    let text = match crate::sessions::read_tail_lines(&log_path, lines) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ApiError::NotFound("Queue job log not found"));
+        }
+        Err(error) => {
+            return Err(ApiError::Internal(error.into()));
+        }
+    };
+    Ok(Json(json!({
+        "job_id": job.id,
+        "lines": lines,
+        "log_path": log_path,
+        "text": text,
+    })))
 }
 
 async fn create_queue_job(
@@ -12602,6 +12657,12 @@ struct ListQueueJobsQuery {
     state: Option<String>,
     #[serde(default)]
     include_terminal: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct QueueJobLogQuery {
+    #[serde(default)]
+    lines: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]

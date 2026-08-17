@@ -377,6 +377,7 @@ enum QueueCommand {
     Run(QueueRunArgs),
     List(QueueListArgs),
     Status(QueueStatusArgs),
+    Log(QueueLogArgs),
     Cancel(QueueCancelArgs),
 }
 
@@ -419,6 +420,13 @@ struct QueueStatusArgs {
     job_id: String,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args)]
+struct QueueLogArgs {
+    job_id: String,
+    #[arg(long, default_value_t = 200, value_parser = parse_queue_log_lines)]
+    lines: usize,
 }
 
 #[derive(Args)]
@@ -1277,6 +1285,7 @@ fn run_queue(client: &ApiClient, args: QueueArgs) -> Result<()> {
     match args.command {
         QueueCommand::List(args) => run_queue_list(client, args),
         QueueCommand::Status(args) => run_queue_status(client, args),
+        QueueCommand::Log(args) => run_queue_log(client, args),
         QueueCommand::Run(args) => run_queue_run(client, args),
         QueueCommand::Cancel(args) => run_queue_cancel(client, args),
     }
@@ -1439,6 +1448,24 @@ fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
         payload["termination_reason"].as_str().unwrap_or("-")
     );
     println!("Log: {}", payload["log_path"].as_str().unwrap_or("-"));
+    Ok(())
+}
+
+fn run_queue_log(client: &ApiClient, args: QueueLogArgs) -> Result<()> {
+    let job_id = args.job_id.trim();
+    if job_id.is_empty() {
+        bail!("job id is required");
+    }
+    let payload = client.get_json(&format!(
+        "/queue-jobs/{}/log?lines={}",
+        encode_path_segment(job_id),
+        args.lines
+    ))?;
+    let text = payload["text"]
+        .as_str()
+        .ok_or_else(|| anyhow!("queue log response is missing text"))?;
+    print!("{text}");
+    io::stdout().flush()?;
     Ok(())
 }
 
@@ -4681,6 +4708,16 @@ fn parse_queue_timeout_seconds(value: &str) -> Result<i64> {
     parse_duration_seconds(value)
 }
 
+fn parse_queue_log_lines(value: &str) -> std::result::Result<usize, String> {
+    let lines = value
+        .parse::<usize>()
+        .map_err(|_| "lines must be an integer between 1 and 10000".to_owned())?;
+    if !(1..=10_000).contains(&lines) {
+        return Err("lines must be between 1 and 10000".to_owned());
+    }
+    Ok(lines)
+}
+
 fn parse_authority(authority: &str, default_port: u16) -> Result<(String, u16)> {
     let default_port = default_port.to_string();
     let (host, port) = authority
@@ -6049,6 +6086,23 @@ mod tests {
             panic!("expected queue cancel command");
         };
         assert_eq!(cancel_args.job_id, "job_123abc");
+    }
+
+    #[test]
+    fn queue_log_cli_parses_bounded_tail_request() {
+        let cli =
+            Cli::try_parse_from(["sm", "queue", "log", "job_123abc", "--lines", "75"]).unwrap();
+        let Command::Queue(queue_args) = cli.command else {
+            panic!("expected queue command");
+        };
+        let QueueCommand::Log(log_args) = queue_args.command else {
+            panic!("expected queue log command");
+        };
+        assert_eq!(log_args.job_id, "job_123abc");
+        assert_eq!(log_args.lines, 75);
+        assert!(
+            Cli::try_parse_from(["sm", "queue", "log", "job_123abc", "--lines", "10001",]).is_err()
+        );
     }
 
     #[test]

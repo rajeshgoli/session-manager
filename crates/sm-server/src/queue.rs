@@ -1415,6 +1415,29 @@ impl RetainedQueueStore {
         })
     }
 
+    pub fn pending_target_session_ids_by_category(
+        &self,
+        message_category: &str,
+    ) -> Result<Vec<String>> {
+        self.with_connection(|conn| {
+            let mut statement = conn.prepare(
+                r#"
+                SELECT target_session_id
+                FROM message_queue
+                WHERE delivered_at IS NULL
+                    AND message_category = ?1
+                    AND trim(target_session_id) != ''
+                GROUP BY target_session_id
+                ORDER BY MIN(queued_at), target_session_id
+                "#,
+            )?;
+            let targets = statement
+                .query_map(params![message_category], |row| row.get(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(targets)
+        })
+    }
+
     pub fn pending_messages_for_target_by_mode(
         &self,
         target_session_id: &str,
@@ -4664,6 +4687,44 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn pending_category_targets_are_distinct_and_ordered_by_oldest_message() {
+        let db_path = unique_temp_path("pending-category-targets");
+        let store = RetainedQueueStore::new(db_path);
+        for (id, target, category) in [
+            ("completion-1", "target-b", "queue-completion"),
+            ("completion-2", "target-a", "queue-completion"),
+            ("completion-3", "target-b", "queue-completion"),
+            ("other-1", "target-c", "other"),
+        ] {
+            store
+                .enqueue_message_once_with_metadata(
+                    id,
+                    target,
+                    id,
+                    "sequential",
+                    QueueMessageMetadata {
+                        message_category: Some(category.to_owned()),
+                        ..QueueMessageMetadata::default()
+                    },
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .pending_target_session_ids_by_category("queue-completion")
+                .unwrap(),
+            vec!["target-b", "target-a"]
+        );
+        assert_eq!(
+            store
+                .pending_target_session_ids_by_category("other")
+                .unwrap(),
+            vec!["target-c"]
         );
     }
 

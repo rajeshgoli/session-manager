@@ -123,6 +123,15 @@ async fn main() -> Result<()> {
     }
 
     let state = AppState::try_new(config).context("failed to initialize server state")?;
+    if state.config().rust_core.runtime_enabled {
+        let queue_delivery_state = state.clone();
+        thread::spawn(move || loop {
+            if let Err(error) = queue_delivery_state.drain_queue_completion_wakes() {
+                eprintln!("queue completion delivery retry failed: {error:#}");
+            }
+            thread::sleep(QUEUE_COMPLETION_RETRY_INTERVAL);
+        });
+    }
     // Capture the artifact boundary before serving. The background scan may run
     // alongside live creates, but it must not attribute their new artifacts
     // against this startup snapshot of the seat registry.
