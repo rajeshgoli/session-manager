@@ -4065,7 +4065,7 @@ async fn list_node_restore_candidates(
         .session_store
         .list_sessions(true)?
         .into_iter()
-        .filter(|session| session.status.trim() == "stopped")
+        .filter(SessionRecord::is_stopped)
         .filter(|session| is_primary_node(&session.node))
         .map(|session| node_restore_candidate_value(session, &node_id))
         .collect::<Result<Vec<_>, _>>()?;
@@ -4104,7 +4104,7 @@ async fn restore_node_restore_candidate(
             detail: "Session not found".to_owned(),
         });
     };
-    if session.status.trim() != "stopped" {
+    if !session.is_stopped() {
         return Err(ApiError::Status {
             status: StatusCode::CONFLICT,
             detail: "Session is not stopped".to_owned(),
@@ -13077,6 +13077,7 @@ fn node_restore_candidate_value(session: SessionRecord, node_id: &str) -> Result
             .to_owned(),
         ),
     );
+    object.insert("status".to_owned(), Value::String("stopped".to_owned()));
     object.insert(
         "activity_state".to_owned(),
         Value::String("stopped".to_owned()),

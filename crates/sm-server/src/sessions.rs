@@ -4743,8 +4743,7 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(None);
         };
-        let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
-        if normalized_status(&status) != "stopped" {
+        if !raw_session_is_stopped(session) {
             return Ok(Some(CoreRestoreOutcome::NotStopped));
         }
         let now = now_rfc3339();
@@ -4783,7 +4782,7 @@ impl SessionStore {
         else {
             return Ok(None);
         };
-        if normalized_status(&record.status) != "stopped" {
+        if !record.is_stopped() {
             return Ok(Some(CoreRestoreOutcome::NotStopped));
         }
         if !is_primary_node(&record.node) {
@@ -15541,6 +15540,13 @@ mod tests {
             store.get_session("retired1").unwrap().unwrap().status,
             "idle"
         );
+        let restored = store.restore_core_session("retired1").unwrap().unwrap();
+        let CoreRestoreOutcome::Restored(restored) = restored else {
+            panic!("killed-marker session should be restorable");
+        };
+        assert_eq!(restored.status, "running");
+        assert_eq!(restored.completion_status, None);
+        assert_eq!(store.list_sessions(false).unwrap().len(), 1);
 
         let _ = fs::remove_file(state_file);
     }

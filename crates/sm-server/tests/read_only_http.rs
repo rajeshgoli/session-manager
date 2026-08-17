@@ -870,6 +870,16 @@ nodes:
 #[tokio::test]
 async fn node_restore_candidates_project_primary_stopped_sessions() {
     let state_file = write_session_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let stopped = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "stop1234")
+        .unwrap();
+    stopped["status"] = json!("idle");
+    stopped["completion_status"] = json!("killed");
+    fs::write(&state_file, state.to_string()).unwrap();
     let app = router(AppState::new(config_with_state_file(&state_file)));
 
     let (status, payload) = get_json(app, "/nodes/primary/restore-candidates?refresh=true").await;
@@ -925,6 +935,16 @@ nodes:
 #[tokio::test]
 async fn node_restore_candidate_restore_round_trips_primary_fixture() {
     let state_file = write_session_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let stopped = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "stop1234")
+        .unwrap();
+    stopped["status"] = json!("idle");
+    stopped["completion_status"] = json!("killed");
+    fs::write(&state_file, state.to_string()).unwrap();
     let mut config = config_with_state_file(&state_file);
     config.rust_core.fixture_writes_enabled = true;
     let app = router(AppState::new(config));
@@ -15168,6 +15188,10 @@ async fn runtime_core_restores_codex_session() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "killed");
     assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
+
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    state["sessions"][0]["status"] = json!("idle");
+    fs::write(&state_file, state.to_string()).unwrap();
 
     let day_dir = state_file
         .with_extension("codex-home")
