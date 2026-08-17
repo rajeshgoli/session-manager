@@ -208,6 +208,14 @@ All spawned workers remain SM-managed. `ephemeral_task_worker` means a
 short-lived SM child with automatic completion cleanup, not a Claude/Codex
 private subagent.
 
+Evaluation is demand-driven. Named roles, explicit task types, and spawn
+requests whose frozen fields satisfy deterministic clauses do not invoke
+`/btw`; they record the deterministic decision and zero evaluator tokens.
+Generic or conflicting intent invokes at most one evaluator for the immutable
+request. SM injects only applicable clause IDs/text and the bounded current-turn
+delta, reuses the provider's completed-context cache, and never resubmits the
+whole policy document merely because another spawn occurs.
+
 #### Ephemeral worker closeout
 
 An ephemeral worker receives a durable lifecycle and cleanup manifest when SM
@@ -575,6 +583,146 @@ provider process or a success notification is not verified absence.
 
 ## Execution plan
 
+### Fast vertical slice and self-dogfood
+
+The 2-to-4-day estimate below is full-epic completion, not time to first useful
+trial. The first implementation objective is a narrow vertical slice that can
+govern this epic's own subsequent spawns on the same day.
+
+The slice reuses #1264 immutable prompt transport and #1265 isolated `/btw` and
+contains only:
+
+- an approved policy version plus the minimal materialized clauses needed for
+  spawn provider/model/effort and budget/concurrency decisions;
+- deterministic classification for explicit/named work, with `/btw` only for a
+  genuinely ambiguous frozen request;
+- atomic allow/rewrite/block before child allocation;
+- actual provider/model/effort attestation after launch;
+- linked decision, token, wall-time, child-lifecycle, forecast, and breaker
+  evidence; and
+- read-only owner/maintainer inspection surfaces.
+
+Stable cross-lane seats, generalized routing, cleanup/relocation, context
+profiles, and rotation are not prerequisites for this first slice. They remain
+in the full plan and are added to the live canary only after their own review.
+This avoids paying for the complete identity and lifecycle substrate before the
+spawn-policy hypothesis produces evidence.
+
+#### Bootstrap authority
+
+The slice cannot authorize its own creation. PR #1269 plus the owner-approved
+0F budget is the immutable bootstrap authority. Work performed before the slice
+deploys may be imported as `bootstrap_observation` evidence, but SM must not
+claim it was policy-enforced retroactively.
+
+After the slice is reviewed and deployed, the next implementation spawn from
+the canonical maintainer is the first active dogfood event. Capability N may
+govern capability N+1 only after N has passed its own tests/review/deployment;
+no capability supplies evidence for its own approval. Initially the canary is
+bound to this maintainer incarnation and lane `sm-policy-1268`. Once stable-seat
+identity lands, that binding migrates to the durable `maintainer` seat without
+changing historical event ownership.
+
+Every later package spawn is then atomic and active: the policy either returns
+the child ID or an actionable rewrite/block. The maintainer may use a durable
+scoped override, but the override and its forecast impact are part of the same
+event. This dogfoods model selection, concurrency, budget, and intent handling
+without exposing lane 355 to an unproven implementation.
+
+D4 deploys an exact reviewed commit behind a canary scope that matches only the
+bound maintainer lane/incarnation. The evidence record includes source commit,
+built binary hash/signing identity, configuration digest, service restart and
+health result, and prior rollback target. A canary fault restores the prior
+binary/configuration without deleting the failed decision or usage evidence.
+
+#### Inspectable evidence
+
+The dogfood event chain is append-only and links:
+
+1. frozen request, caller incarnation/seat, prompt digest, policy version, and
+   applicable stable clause IDs;
+2. extraction evidence, deterministic or `/btw` path, allow/rewrite/block,
+   latency, and any override;
+3. allocated child and provider-side model/effort attestation;
+4. per-span input/cache-read/cache-write/output/reasoning tokens, dollar/quota
+   estimate, queue wait, and active/elapsed wall time;
+5. child completion, review rounds/findings, merge or retained-work outcome,
+   cleanup state, and forecast delta; and
+6. immediate machine benefit evidence followed by the Luna/high
+   keep/change/remove assessment at its declared horizon.
+
+Machine observations are visible immediately and labeled provisional until the
+child reaches a terminal lifecycle point. Benefit judgments are separate
+append-only records; they never rewrite the measured operation.
+
+The initial read surfaces are deliberately small and reuse the existing CLI/API
+rather than waiting for a new dashboard:
+
+- `sm policy status --lane sm-policy-1268` shows active policy, canary scope,
+  package state, actual/forecast tokens and time, and breaker state;
+- `sm policy explain <decision-id>` shows the immutable request, evidence,
+  clauses, decision, actual launch, and override;
+- `sm policy events --lane sm-policy-1268 --json` exposes the append-only event
+  stream for independent inspection;
+- `sm policy trial --lane sm-policy-1268 --csv` emits per-requirement cost and
+  benefit comparisons; and
+- `sm watch` projects the same status, decisions requiring owner action, and
+  warning/breaker events.
+
+The registered owner can inspect every event and approve policy changes or hard
+breaker continuation through the operator channel. The named maintainer can
+read and explain all evidence for its own epic and issue ordinary scoped
+overrides, but cannot impersonate owner approval or rewrite measured history.
+
+#### Slice schedule and breaker
+
+These are slices of the existing 1A/1C/2A/2B packages, not additional packages
+or throwaway implementations:
+
+| ID | Owner | Work | Dependency | Target |
+|---|---|---|---|---|
+| D0 | Maintainer Sol/high | Freeze policy-kernel, event, and admission interfaces plus dogfood fixtures | approved spec/0F | 30-60 min |
+| D1 | Terra/high | Minimal policy store/projection and deterministic decision kernel | D0 | 1.5-3 h; parallel |
+| D2 | Terra/high | Append-only evidence ledger, forecast/breaker rows, and read-only CLI/API | D0 | 1.5-3 h; parallel |
+| D3 | Sol/high | Atomic spawn admission and provider attestation using D0 interfaces | D0; integrates D1/D2 | 2.5-5 h; parallel start |
+| D4 | Maintainer Sol/high | Integrate, run review protocol, deploy, and execute first governed spawn | D1-D3 | 1-2 h |
+
+Target first dogfood is 4-8 elapsed hours, central estimate 6 hours, using at
+most two Terra and one Sol implementation seat plus the maintainer. The slice's
+incremental envelope is 100M-220M Codex tokens and no more than two bounded
+Claude live probes. It is included inside the full-epic envelope below.
+
+At 6 elapsed hours or 75% of the token envelope, SM/maintainer publishes a
+same-day estimate-to-complete. At 8 hours, 220M tokens, or two failed integration
+attempts without a governable spawn, the slice breaker fires: stop dispatch,
+preserve evidence, and either simplify the slice or amend the spec with owner
+approval. The response is not to continue toward the full 2-to-4-day build
+without first obtaining trial evidence.
+
+#### Economy controls
+
+- Use the deterministic path before any model call. An immutable request gets
+  at most one `/btw`; retries reuse its terminal decision unless a bound input
+  changed and therefore created a new request.
+- Select policy clauses by stable ID and scope. Do not inject unchanged policy
+  history, unrelated lane clauses, or an arbitrary transcript tail.
+- Reuse the existing SQLite/event, HTTP, CLI, `sm watch`, #1264 transport, and
+  #1265 sidechain infrastructure in D0-D4. A new dashboard, generalized rule
+  language, and cross-lane migration are outside the first slice.
+- Freeze D0 interfaces before parallel dispatch so D1-D3 integrate rather than
+  reimplement one another. An interface change invalidating two active packages
+  fires the slice re-plan trigger.
+- Treat the detailed rows below as 16 work items, not 16 mandatory PRs. Closely
+  owned work with identical dependencies may share one bounded package; target
+  10-12 reviewed merge packages for the full epic, including D1-D3.
+- Run focused gates while iterating, full applicable package gates once at the
+  exact review head, and the full integration matrix once at the epic head.
+  A changed head reruns the gates affected by its delta; unchanged full suites
+  are not repeated for ceremony.
+- Do not repeat full role-context forks on a cadence. Luna/high reads frozen
+  event/handoff artifacts first and requests a role fork only when a declared
+  benefit question cannot be answered from machine evidence.
+
 ### Epic budget and completion forecast
 
 The policy epic itself is governed by the same cost/execution tradeoff it adds
@@ -617,9 +765,10 @@ projection, including that sunk work, is 0.57B to 0.97B Codex tokens and 18M to
 55M Claude tokens. Breakers compare both total-epic and remaining-work views so
 already consumed budget cannot disappear at the implementation checkpoint.
 
-The approved plan has 16 implementation packages: 4 Sol, 10 Terra, and 2 Luna,
-plus maintainer integration and final review. Based on the observed package
-distribution and added complexity, the initial remaining-work envelope is:
+The approved plan has 16 implementation work items: 4 Sol, 10 Terra, and 2
+Luna, grouped into approximately 10-12 merge packages plus maintainer
+integration and final review. Based on the observed package distribution and
+added complexity, the initial remaining-work envelope is:
 
 - **Codex tokens:** 0.45B to 0.85B, central estimate 0.62B;
 - **Codex quota equivalent:** about 0.7 to 1.3 points using this maintainer's
@@ -627,6 +776,8 @@ distribution and added complexity, the initial remaining-work envelope is:
   arrives;
 - **Claude live-path/review tokens:** 10M to 40M cache-weighted tokens, with no
   repeat full-role fork unless its benefit review requires one;
+- **first active dogfood:** central 6 hours, bounded at 8 hours and 220M Codex
+  tokens as specified above;
 - **active critical-path work:** 15 to 24 hours; and
 - **elapsed completion:** 2 to 4 calendar days with the stated four-agent cap,
   prompt owner checkpoints, and no external outage: approximately 2026-08-19
@@ -734,17 +885,17 @@ files.
 
 | ID | Owner | Work | Dependency | Output |
 |---|---|---|---|---|
-| 1A | Maintainer Sol/high | Human-readable policy history, stable clause IDs, scoped rulings, operator-only approval, conflicts, and materialized enforceable effects | approved spec | Policy authority/store API |
+| 1A | Maintainer Sol/high | Extend D1 into complete human-readable policy history, stable clause IDs, scoped rulings, operator-only approval, conflicts, and materialized enforceable effects | D1 dogfood evidence | Complete policy authority/store API |
 | 1B | Sol/high | Lane-scoped seat identity, holder incarnations, dead-holder behavior, durable-artifact resolver, historical lifecycle, and migration compatibility | approved spec | Seat registry and resolver |
-| 1C | Terra/high | Requirement-effect ledger, linked non-overlapping spans, epic estimate-to-complete/breaker records, evaluation/rotation records, direct/estimated token counters, bounds/calibration, quota snapshots, JSON/CSV surfaces | 0C, 0F evidence | Telemetry API and CLI |
+| 1C | Terra/high | Extend D2 into the complete requirement-effect ledger, linked spans, epic estimate-to-complete/breakers, evaluation/rotation records, calibrated counters, quota snapshots, JSON/CSV surfaces | D2 dogfood evidence, 0C, 0F | Complete telemetry API and CLI |
 | 1D | Luna/high | Golden corpus harness, hostile/conflicting policy fixtures, coverage-counted sweeps, and restart/test scaffolding using frozen contracts | 0D corpus | Reusable test substrate |
 
 ### Wave 2 - spawn policy path
 
 | ID | Owner | Work | Dependency | Parallelism |
 |---|---|---|---|---|
-| 2A | Terra/high | Pure deterministic decision engine for named seats, ephemeral workers, model/effort, role/provider context profiles (including Codex native-compaction seats), precedence, and scoped overrides | 1A, 1D | Starts first |
-| 2B | Sol/high | Atomic `sm spawn` policy runner: caller binding, current-turn delta, native `/btw`, strict parsing, restart recovery, and no-child-on-reject | 0A, 1A, 1B, 1C, 2A | Critical path |
+| 2A | Terra/high | Extend D1 decision kernel for all named seats, ephemeral workers, role/provider context profiles (including Codex native-compaction seats), precedence, and scoped overrides | D1, 1A, 1D | Uses live dogfood findings |
+| 2B | Sol/high | Extend D3 atomic `sm spawn` runner to stable-seat caller binding, generic current-turn delta, native `/btw`, strict parsing, and restart recovery | D3, 1A, 1B, 1C, 2A | Critical path generalization |
 | 2C | Terra/high | `sm watch` policy document diff approval, decision explanation, and per-evaluation telemetry views | 1A, 1C | Parallel with 2A/2B behind API contracts |
 | 2D | Terra/high | Existing-seat assignment gate, refusal/recusal, work reclassification, and one-shot evaluator-outage override surfaces | 1A, 2A, 2B | Parallel after 2B contract lands |
 
@@ -777,28 +928,33 @@ agent.
 
 ### Continuous measured rollout
 
-This begins with the first safe Wave 2 end-to-end slice and continues through
-the later waves; it is not a final phase that waits for rotation support.
+This begins with D4 before the full Wave 1/2 generalization and continues through
+the later waves; it is not a final phase that waits for stable seats or rotation.
 
-1. As soon as the first end-to-end slice is deployable, the maintainer enables
-   it for lane 355 as an **active, overridable canary**. The caller receives the
-   real allow/rewrite/block result; every policy result remains overridable by
-   the seat holder with a durable scoped reason.
+1. D4 enables the first end-to-end slice for `sm-policy-1268`, this maintainer's
+   own implementation epic, as an **active, overridable canary**. The caller
+   receives the real allow/rewrite/block result, and every subsequent package
+   contributes evidence while building the remaining capabilities. Every policy
+   result remains overridable by the seat holder with a durable scoped reason.
+2. After at least three governed package spawns produce complete decision,
+   launch-attestation, token, lifecycle, and forecast rows with no P1 admission
+   defect, enable the proven capability subset for lane 355. This is a promotion
+   of reviewed deployed code, not a second implementation or a shadow run.
    Lane-declared P0 artifacts and incident scopes are excluded from automatic
    gating or mutation; during a declared incident the canary fails closed and
    escalates rather than converting unavailable evidence into allow.
-2. Add capabilities to the same live canary as their dependencies land:
+3. Add capabilities to the live canaries as their dependencies land:
    deterministic named-seat/model rules first, generic spawn classification
    second, context/draining third, workspace relocation/cleanup when available,
    and automatic rotation last. Do not wait for the complete epic before using
    an independently safe primitive. This capability order is binding; a later
    capability cannot be enabled before its listed dependencies and live gates.
-3. Every attempted operation records the actual decision, override, resulting
+4. Every attempted operation records the actual decision, override, resulting
    provider/model/effort, agent behavior, latency, token estimates or direct
    counters, and requirement-effect rows. Each newly enabled requirement must
    produce both an incremental-cost comparison and its declared workflow-benefit
    evidence. There is no separate counterfactual-only or shadow execution path.
-4. Luna/high analyzes telemetry continuously. An initial 20-30-event sample is
+5. Luna/high analyzes telemetry continuously. An initial 20-30-event sample is
    a useful optimization checkpoint, not an admission gate for unrelated work:
    report cache reads, latency, model mix, repeated-context amplification,
    overrides, policy/actual disagreement, golden-decision agreement, and a
@@ -806,20 +962,20 @@ the later waves; it is not a final phase that waits for rotation support.
    handoffs, report summary and directed-probe costs separately and classify the
    probe's incremental findings and downstream actions. Sol/high adjudicates
    only semantic misses.
-5. The maintainer also publishes actual versus forecast epic tokens, active
+6. The maintainer also publishes actual versus forecast epic tokens, active
    work, elapsed time, completion date, and estimate-to-complete after each
    package. Warning/breaker state is visible in the same owner view as policy
    benefit telemetry.
-6. Owner reviews decisions and telemetry on a rolling basis. A bad rule can be
+7. Owner reviews decisions and telemetry on a rolling basis. A bad rule can be
    overridden immediately, amended conversationally, and re-approved without
    disabling already sound enforcement elsewhere in the lane.
-7. Open one epic-to-main PR. The maintainer runs the full review protocol,
+8. Open one epic-to-main PR. The maintainer runs the full review protocol,
    deploys only after it exits, verifies Claude and Codex live paths, then
    removes all phase worktrees and retires all implementation seats.
 
 ### Expected critical path
 
-`#1265 -> spec and 0F budget approval -> 1A/1B -> 2A -> 2B -> active canary -> 3A/3B/3D/3E -> 4A`
+`#1265 -> spec and 0F approval -> D0 -> D1/D2/D3 -> D4 own-epic canary -> 1A/1B/1C/1D -> 2A/2B -> lane-355 promotion -> 3A/3B/3D/3E -> 4A`
 
 Telemetry (1C), corpus/tests (1D), watch UX (2C), routing audit (3C), and
 override UX (4B) run beside that path. This preserves wall-clock parallelism
