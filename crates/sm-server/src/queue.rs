@@ -137,9 +137,10 @@ pub struct QueueJobFilters {
     pub include_terminal: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QueueJobRecord {
     pub id: String,
+    #[serde(rename = "type")]
     pub job_type: String,
     pub label: String,
     pub requester_session_id: Option<String>,
@@ -629,13 +630,21 @@ impl RetainedQueueStore {
     }
 
     pub fn get_queue_job_from_path(db_path: &Path, job_id: &str) -> Result<Option<QueueJobRecord>> {
+        match Self::get_queue_job_strict_from_path(db_path, job_id) {
+            Ok(job) => Ok(job),
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub fn get_queue_job_strict_from_path(
+        db_path: &Path,
+        job_id: &str,
+    ) -> Result<Option<QueueJobRecord>> {
         if !db_path.exists() {
             return Ok(None);
         }
-        let conn = match Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-            Ok(conn) => conn,
-            Err(_) => return Ok(None),
-        };
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("failed to open queue runner db {}", db_path.display()))?;
         get_queue_job_conn(&conn, job_id)
     }
 

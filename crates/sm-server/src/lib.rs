@@ -12,6 +12,7 @@ pub mod http;
 pub mod mobile_analytics;
 pub mod mobile_devices;
 pub mod queue;
+pub mod queue_authority;
 pub mod runtime;
 pub mod seat_sessions;
 pub mod sessions;
