@@ -116,20 +116,20 @@ use crate::sessions::codex_fork_legacy_event_stream_path_from_log_file;
 use crate::sessions::{
     claude_hook_gate, codex_fork_event_line_matches_root_thread, codex_fork_event_line_starts_turn,
     codex_fork_newest_event_stream_path, codex_fork_status_for_event_line, expand_home,
-    is_primary_node, submit_codex_fork_btw, AgentRegistrationResponse, AgentStatusRequest,
-    ArmStopNotifyOutcome, ArmStopNotifyRequest, ChildSessionResponse, ClaudeHookGate,
-    ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest,
-    ContextSnapshotResponse, ContextUsageEvent, ContextUsageOutcome, CoreClearOutcome,
-    CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome, CoreRetireOutcome,
-    CoreReviewOutcome, CreateCoreSessionRequest, CreateReparentRequest, CreateReparentTreeRequest,
-    CredentialRotationOutcome, DecideReparentRequest, HandoffOutcome, HandoffRequest,
-    MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision, ReparentMutationOutcome,
-    ReparentRepairAction, RoleRegistrationRequest, SeatSessionReconciliationSnapshot,
-    SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
-    SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
-    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
-    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
-    UpdateSessionMetadataRequest,
+    is_primary_node, submit_codex_fork_btw, AcceptSpawnBriefRequest, AgentRegistrationResponse,
+    AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest, ChildSessionResponse,
+    ClaudeHookGate, ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome,
+    ContextMonitorRequest, ContextSnapshotResponse, ContextUsageEvent, ContextUsageOutcome,
+    CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
+    CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, CreateReparentRequest,
+    CreateReparentTreeRequest, CredentialRotationOutcome, DecideReparentRequest, HandoffOutcome,
+    HandoffRequest, MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision,
+    ReparentMutationOutcome, ReparentRepairAction, RoleRegistrationRequest,
+    SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest, SendCoreInputRequest,
+    SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
+    SetMaintainerRequest, SpawnBriefSource, SpawnReviewRequest, StartReviewRequest,
+    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
+    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
 };
 
 use crate::studio_ssh::{self, StudioSshStatus};
@@ -3478,10 +3478,32 @@ async fn create_session(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(payload): Json<CreateCoreSessionRequest>,
+    Json(mut payload): Json<CreateCoreSessionRequest>,
 ) -> Result<Json<SessionResponse>, ApiError> {
     ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/sessions")?;
     ensure_core_writes_enabled(&state)?;
+    if let Some(source) = payload.spawn_prompt_source.take() {
+        let accepted = accept_spawn_brief(
+            &state,
+            payload.initial_message.as_deref(),
+            source,
+            payload
+                .provider
+                .clone()
+                .unwrap_or_else(|| "claude".to_owned()),
+            payload.model.clone(),
+            payload.reasoning_effort.clone(),
+            payload.name.clone(),
+            payload.parent_session_id.clone(),
+            payload.node.clone(),
+            payload.working_dir.clone(),
+        )?;
+        payload.initial_message = Some(accepted.0);
+        payload.spawn_launch_intent_id = Some(accepted.1);
+        payload.spawn_brief_sha256 = Some(accepted.2);
+        payload.spawn_brief_path = Some(accepted.3);
+    }
+    let spawn_launch_intent_id = payload.spawn_launch_intent_id.clone();
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
     let session = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_provider_supported(&payload)?;
@@ -3494,7 +3516,60 @@ async fn create_session(
     } else {
         state.session_store.create_core_session(payload, log_dir)?
     };
+    if let Some(intent_id) = spawn_launch_intent_id {
+        state
+            .session_store
+            .bind_spawn_launch_intent(&intent_id, &session.id)
+            .map_err(core_session_create_api_error)?;
+    }
     Ok(Json(session_response_with_live_activity(&state, session)))
+}
+
+/// Accept a textual brief durably before session creation.  The returned prompt
+/// is read back from the artifact so the runtime never launches from mutable
+/// caller input.
+fn accept_spawn_brief(
+    state: &AppState,
+    prompt: Option<&str>,
+    source: SpawnBriefSource,
+    requested_provider: String,
+    requested_model: Option<String>,
+    requested_reasoning_effort: Option<String>,
+    requested_name: Option<String>,
+    parent_session_id: Option<String>,
+    requested_node: Option<String>,
+    requested_working_dir: Option<String>,
+) -> Result<(String, String, String, String), ApiError> {
+    let Some(prompt) = prompt else {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "spawn prompt is required when spawn prompt source is supplied".to_owned(),
+        });
+    };
+    let intent = state
+        .session_store
+        .accept_spawn_brief(AcceptSpawnBriefRequest {
+            prompt: prompt.to_owned(),
+            source,
+            requested_provider,
+            requested_model,
+            requested_reasoning_effort,
+            requested_name,
+            parent_session_id,
+            requested_node,
+            requested_working_dir,
+        })
+        .map_err(core_session_create_api_error)?;
+    let accepted_prompt = state
+        .session_store
+        .read_spawn_brief(&intent.artifact)
+        .map_err(core_session_create_api_error)?;
+    Ok((
+        accepted_prompt,
+        intent.id,
+        intent.artifact.sha256,
+        intent.artifact.path,
+    ))
 }
 
 async fn spawn_session(
@@ -3539,6 +3614,21 @@ async fn spawn_session(
         .filter(|value| !value.is_empty())
         .unwrap_or(parent.node.as_str())
         .to_owned();
+    let accepted = accept_spawn_brief(
+        &state,
+        Some(&payload.prompt),
+        payload.prompt_source.unwrap_or(SpawnBriefSource {
+            kind: "positional".to_owned(),
+            path: None,
+        }),
+        provider.clone(),
+        payload.model.clone(),
+        payload.reasoning_effort.clone(),
+        payload.name.clone(),
+        Some(parent.id.clone()),
+        Some(node.clone()),
+        Some(working_dir.clone()),
+    )?;
     let create_payload = CreateCoreSessionRequest {
         id: payload.id,
         name: payload.name,
@@ -3546,10 +3636,14 @@ async fn spawn_session(
         provider: Some(provider),
         parent_session_id: Some(parent.id.clone()),
         node: Some(node),
-        initial_message: Some(payload.prompt),
+        initial_message: Some(accepted.0),
         model: payload.model,
         reasoning_effort: payload.reasoning_effort,
         wait: wait_seconds,
+        spawn_prompt_source: None,
+        spawn_launch_intent_id: Some(accepted.1.clone()),
+        spawn_brief_sha256: Some(accepted.2),
+        spawn_brief_path: Some(accepted.3),
     };
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
     let child = if state.config.rust_core.runtime_enabled {
@@ -3565,6 +3659,10 @@ async fn spawn_session(
             .session_store
             .create_core_session(create_payload, log_dir)?
     };
+    state
+        .session_store
+        .bind_spawn_launch_intent(&accepted.1, &child.id)
+        .map_err(core_session_create_api_error)?;
     if parent.is_em && child.provider != "codex-fork" {
         let _ = state.session_store.arm_stop_notify(
             &child.id,
@@ -3690,6 +3788,10 @@ async fn spawn_review_session(
         model: payload.model.clone(),
         reasoning_effort: None,
         wait: None,
+        spawn_prompt_source: None,
+        spawn_launch_intent_id: None,
+        spawn_brief_sha256: None,
+        spawn_brief_path: None,
     };
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
     let runtime = TmuxRuntime::from_app_config(&state.config);
@@ -13072,6 +13174,8 @@ struct SpawnCoreSessionRequest {
     id: Option<String>,
     parent_session_id: String,
     prompt: String,
+    #[serde(default)]
+    prompt_source: Option<SpawnBriefSource>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]

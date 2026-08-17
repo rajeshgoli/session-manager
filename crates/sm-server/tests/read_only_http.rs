@@ -14738,7 +14738,7 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
     wait_for_output_contains(
         app.clone(),
         "runtimechild",
-        "runtime:spawn endpoint runtime prompt",
+        "runtime:[Session Manager] Read the immutable launch brief at",
     )
     .await;
     wait_for_output_contains(
@@ -14760,6 +14760,29 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
         .unwrap();
     assert_eq!(runtime_child["model"], "opus");
     assert_eq!(runtime_child["reasoning_effort"], "xhigh");
+    let intent = state["spawn_launch_intents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|intent| intent["session_id"] == "runtimechild")
+        .unwrap();
+    let launch = state["session_runtime_launches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|launch| launch["session_id"] == "runtimechild")
+        .unwrap();
+    assert_eq!(intent["artifact"]["source"]["kind"], "positional");
+    assert_eq!(launch["spawn_launch_intent_id"], intent["id"]);
+    assert_eq!(launch["spawn_brief_sha256"], intent["artifact"]["sha256"]);
+    assert!(launch["initial_message"]
+        .as_str()
+        .unwrap()
+        .contains(intent["artifact"]["path"].as_str().unwrap()));
+    assert_eq!(
+        fs::read_to_string(intent["artifact"]["path"].as_str().unwrap()).unwrap(),
+        "spawn endpoint runtime prompt"
+    );
 
     let (status, payload) =
         post_json(app.clone(), "/sessions/runtimechild/retire", json!({})).await;
