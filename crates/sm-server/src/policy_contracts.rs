@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 pub const SPAWN_REQUEST_SCHEMA: &str = "sm.policy.spawn_request.v1";
 pub const DECISION_SCHEMA: &str = "sm.policy.decision.v1";
@@ -151,6 +152,7 @@ impl PolicyCapacityClaim {
 #[serde(deny_unknown_fields)]
 pub struct PolicyCapacityLease {
     pub lease_id: String,
+    pub request_id: String,
     pub topology_version: u64,
     pub capacity_version: u64,
     pub claims: Vec<PolicyCapacityClaim>,
@@ -160,6 +162,7 @@ pub struct PolicyCapacityLease {
 impl PolicyCapacityLease {
     pub fn validate(&self) -> Result<(), PolicyContractError> {
         require_nonempty("capacity_lease.lease_id", &self.lease_id)?;
+        require_nonempty("capacity_lease.request_id", &self.request_id)?;
         if self.claims.is_empty() {
             return Err(PolicyContractError::new(
                 "missing_capacity_claims",
@@ -201,6 +204,17 @@ impl PolicySpawnRequest {
         self.requested.validate()?;
         require_nonempty("created_at", &self.created_at)
     }
+
+    pub fn canonical_digest(&self) -> Result<String, PolicyContractError> {
+        self.validate()?;
+        let encoded = serde_json::to_vec(self).map_err(|error| {
+            PolicyContractError::new(
+                "request_encoding_failed",
+                format!("failed to encode frozen spawn request: {error}"),
+            )
+        })?;
+        Ok(format!("{:x}", Sha256::digest(encoded)))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +254,7 @@ pub struct PolicyDecision {
     pub request_id: String,
     pub attempt: u32,
     pub policy_version: String,
+    pub policy_digest: String,
     pub outcome: PolicyDecisionOutcome,
     pub classification: PolicyClassification,
     pub applicable_clause_ids: Vec<String>,
@@ -265,6 +280,7 @@ impl PolicyDecision {
             ));
         }
         require_nonempty("policy_version", &self.policy_version)?;
+        require_sha256("policy_digest", &self.policy_digest)?;
         self.classification.validate()?;
         if self.applicable_clause_ids.is_empty() {
             return Err(PolicyContractError::new(
@@ -334,8 +350,15 @@ impl PolicyDecision {
                 "decision policy version does not match the frozen spawn request",
             ));
         }
+        if self.policy_digest != request.policy_digest {
+            return Err(PolicyContractError::new(
+                "decision_policy_digest_mismatch",
+                "decision policy digest does not match the frozen spawn request",
+            ));
+        }
         if let Some(lease) = &self.capacity_lease {
-            if lease.topology_version != request.topology_version
+            if lease.request_id != request.request_id
+                || lease.topology_version != request.topology_version
                 || lease.capacity_version != request.capacity_version
             {
                 return Err(PolicyContractError::new(
@@ -402,6 +425,57 @@ impl PolicyOverrideRecord {
         }
         Ok(())
     }
+
+    pub fn validate_for_consumption(
+        &self,
+        request: &PolicySpawnRequest,
+        decision: &PolicyDecision,
+    ) -> Result<(), PolicyContractError> {
+        self.validate()?;
+        decision.validate_for_request(request)?;
+        if !matches!(
+            decision.outcome,
+            PolicyDecisionOutcome::Rewrite | PolicyDecisionOutcome::Block
+        ) {
+            return Err(PolicyContractError::new(
+                "override_decision_not_rejected",
+                "override must bind to a rewrite or block decision",
+            ));
+        }
+        if !matches!(self.state, PolicyOverrideState::Authorized) {
+            return Err(PolicyContractError::new(
+                "override_not_authorized",
+                "only an authorized override may be consumed",
+            ));
+        }
+        if self.request_id != request.request_id
+            || self.request_digest != request.canonical_digest()?
+        {
+            return Err(PolicyContractError::new(
+                "override_request_mismatch",
+                "override does not match the frozen spawn request",
+            ));
+        }
+        if self.decision_id != decision.decision_id {
+            return Err(PolicyContractError::new(
+                "override_decision_mismatch",
+                "override does not match the request's terminal decision",
+            ));
+        }
+        if self.policy_version != request.policy_version {
+            return Err(PolicyContractError::new(
+                "override_policy_mismatch",
+                "override policy version does not match the frozen spawn request",
+            ));
+        }
+        if self.issuer != request.caller {
+            return Err(PolicyContractError::new(
+                "override_issuer_mismatch",
+                "override issuer does not match the frozen request caller",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -440,8 +514,17 @@ impl PolicyRuntimeAttestation {
         require_nonempty("observed_at", &self.observed_at)
     }
 
-    pub fn matches(&self, expected: &PolicyLaunchProfile) -> bool {
-        self.provider == expected.provider
+    pub fn matches_launch(
+        &self,
+        expected: &PolicyLaunchProfile,
+        decision_id: &str,
+        launch_intent_id: &str,
+        session_id: &str,
+    ) -> bool {
+        self.decision_id == decision_id
+            && self.launch_intent_id == launch_intent_id
+            && self.session_id == session_id
+            && self.provider == expected.provider
             && self.model == expected.model
             && self.effort == expected.effort
     }
@@ -710,9 +793,10 @@ mod tests {
         std::iter::repeat_n(character, 64).collect()
     }
 
-    fn lease() -> PolicyCapacityLease {
+    fn lease(request_id: &str) -> PolicyCapacityLease {
         PolicyCapacityLease {
             lease_id: "lease-1".to_owned(),
+            request_id: request_id.to_owned(),
             topology_version: 7,
             capacity_version: 11,
             claims: vec![PolicyCapacityClaim {
@@ -773,6 +857,7 @@ mod tests {
             request_id: request.request_id.clone(),
             attempt: 1,
             policy_version: request.policy_version.clone(),
+            policy_digest: request.policy_digest.clone(),
             outcome: PolicyDecisionOutcome::Allow,
             classification: PolicyClassification {
                 class_id: "named_role".to_owned(),
@@ -785,7 +870,7 @@ mod tests {
             resolved_profile: Some(resolved),
             reason: "named role has a deterministic profile".to_owned(),
             override_command: None,
-            capacity_lease: Some(lease()),
+            capacity_lease: Some(lease(&request.request_id)),
             decided_at: "2026-08-17T22:00:01Z".to_owned(),
         }
     }
@@ -845,6 +930,7 @@ mod tests {
             request_id: request.request_id.clone(),
             attempt: 1,
             policy_version: request.policy_version.clone(),
+            policy_digest: request.policy_digest.clone(),
             outcome: PolicyDecisionOutcome::Rewrite,
             classification: PolicyClassification {
                 class_id: "named_role".to_owned(),
@@ -899,7 +985,12 @@ mod tests {
 
         assert!(request.requested.model.is_none());
         observed.validate().unwrap();
-        assert!(!observed.matches(&expected));
+        assert!(!observed.matches_launch(
+            &expected,
+            "decision-aa6c1120",
+            &request.launch_intent_id,
+            "aa6c1120"
+        ));
     }
 
     #[test]
@@ -924,7 +1015,81 @@ mod tests {
 
         assert!(request.requested.model.is_none());
         observed.validate().unwrap();
-        assert!(!observed.matches(&expected));
+        assert!(!observed.matches_launch(
+            &expected,
+            &decision.decision_id,
+            &request.launch_intent_id,
+            "2260296e"
+        ));
+    }
+
+    #[test]
+    fn runtime_attestation_rejects_same_profile_from_another_launch() {
+        let request = request("355-root", Some("opus"));
+        let expected = profile("opus");
+        let decision = allow_decision(&request, expected.clone());
+        let observed = PolicyRuntimeAttestation {
+            schema: ATTESTATION_SCHEMA.to_owned(),
+            decision_id: decision.decision_id.clone(),
+            launch_intent_id: request.launch_intent_id.clone(),
+            session_id: "different-child".to_owned(),
+            provider: expected.provider.clone(),
+            model: expected.model.clone(),
+            effort: expected.effort.clone(),
+            evidence: RuntimeAttestationEvidence::ProviderEvent,
+            evidence_id: "event-different-child-1".to_owned(),
+            observed_at: "2026-08-17T22:00:02Z".to_owned(),
+        };
+
+        observed.validate().unwrap();
+        assert!(!observed.matches_launch(
+            &expected,
+            &decision.decision_id,
+            &request.launch_intent_id,
+            "expected-child"
+        ));
+    }
+
+    #[test]
+    fn override_consumption_rejects_another_frozen_request() {
+        let request = request("355-root", None);
+        let mut decision = allow_decision(&request, profile("opus"));
+        decision.outcome = PolicyDecisionOutcome::Rewrite;
+        decision.capacity_lease = None;
+        decision.override_command = Some(format!(
+            "sm policy override --request {} --reason <text>",
+            request.request_id
+        ));
+        let record = PolicyOverrideRecord {
+            schema: OVERRIDE_SCHEMA.to_owned(),
+            override_id: "override-1".to_owned(),
+            request_id: request.request_id.clone(),
+            request_digest: request.canonical_digest().unwrap(),
+            decision_id: decision.decision_id.clone(),
+            policy_version: request.policy_version.clone(),
+            issuer: request.caller.clone(),
+            reason: "owner-approved exception".to_owned(),
+            self_benefiting: true,
+            state: PolicyOverrideState::Authorized,
+            created_at: "2026-08-17T22:00:03Z".to_owned(),
+            expires_at: "2026-08-17T22:30:03Z".to_owned(),
+            consumed_at: None,
+        };
+        let mut another_request = request.clone();
+        another_request.launch_intent_id = "another-intent".to_owned();
+        let mut another_decision = decision.clone();
+        another_decision.request_id = another_request.request_id.clone();
+
+        record
+            .validate_for_consumption(&request, &decision)
+            .unwrap();
+        assert_eq!(
+            record
+                .validate_for_consumption(&another_request, &another_decision)
+                .unwrap_err()
+                .code,
+            "override_request_mismatch"
+        );
     }
 
     #[test]
