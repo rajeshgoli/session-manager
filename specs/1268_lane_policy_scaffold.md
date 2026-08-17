@@ -605,12 +605,14 @@ because identity and behavior changes must not be implicit:
 1. At preflight, the outgoing holder receives a control message stating the
    measured context, target threshold, that new discretionary work will pause,
    and the exact scoped-override command. It may finish its current atomic work.
-2. At the next safe boundary, SM runs the handoff `/btw` invisibly. Its prompt
-   and answer do not enter the outgoing main thread; this avoids polluting the
-   context merely to extract state.
-3. SM installs the draining/ownership fence, records the frozen topology version
-   and complete proposed before/after ownership edge list, then starts the
-   successor in provisional `incoming` state with one immutable
+2. At the next safe boundary, SM installs the draining/ownership fence and
+   records the frozen topology version and complete proposed before/after
+   ownership edge list. It then runs the handoff `/btw` invisibly using those
+   frozen child, route, registration, and task facts. Its prompt and answer do
+   not enter the outgoing main thread; this avoids polluting the context merely
+   to extract state. Failure releases the fence under recorded recovery rules
+   without changing ownership.
+3. SM starts the successor in provisional `incoming` state with one immutable
    initial brief containing the target seat, predecessor agent ID, handoff
    artifact, policy version, current children, pending routed events, open
    review/cleanup manifests, and an instruction to verify identity with
