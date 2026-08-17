@@ -68,7 +68,13 @@ def query_attested_queue_job(
             {"schema": REQUEST_SCHEMA, "job_id": job_id}, separators=(",", ":")
         ).encode("utf-8")
         connection.sendall(request + b"\n")
-        payload = json.loads(_read_response(connection))
+        try:
+            payload = json.loads(_read_response(connection))
+        except json.JSONDecodeError as error:
+            raise AuthorityVerificationError("authority response is not valid JSON") from error
+
+    if not isinstance(payload, dict):
+        raise AuthorityVerificationError("authority response must be a JSON object")
 
     if payload.get("schema") != RESPONSE_SCHEMA:
         raise AuthorityVerificationError("authority response schema mismatch")
@@ -143,6 +149,8 @@ def _read_response(connection: socket.socket) -> str:
         newline = chunk.find(b"\n")
         if newline >= 0:
             response.extend(chunk[:newline])
+            if len(response) > MAX_RESPONSE_BYTES:
+                raise AuthorityVerificationError("authority response exceeds size limit")
             if any(not chr(byte).isspace() for byte in chunk[newline + 1 :]):
                 raise AuthorityVerificationError("authority returned more than one response")
             break

@@ -55,6 +55,21 @@ def test_query_rejects_peer_identity_mismatch(mismatch):
         _cleanup(path, listener, server)
 
 
+def test_response_limit_applies_to_the_final_newline_chunk():
+    class OversizedResponse:
+        remaining = verifier.MAX_RESPONSE_BYTES
+
+        def recv(self, size):
+            if self.remaining:
+                length = min(size, self.remaining)
+                self.remaining -= length
+                return b"x" * length
+            return b"x\n"
+
+    with pytest.raises(verifier.AuthorityVerificationError, match="size limit"):
+        verifier._read_response(OversizedResponse())
+
+
 def _listener():
     path = Path("/tmp") / f"sm-auth-test-{uuid.uuid4().hex}.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
