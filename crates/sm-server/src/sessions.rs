@@ -4058,17 +4058,44 @@ impl SessionStore {
         }
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        record.status = "running".to_owned();
-        record.stopped_at = None;
-        record.last_activity = now_rfc3339();
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = sessions
             .iter_mut()
             .find(|session| session.get("id").and_then(Value::as_str) == Some(record.id.as_str()))
         else {
+            let _ = runtime.kill_session(&record.tmux_session);
+            mark_runtime_launch_failed(
+                &mut state,
+                &launch_id,
+                &record.id,
+                false,
+                "provisional runtime session disappeared while waiting for provider startup",
+            )?;
+            self.write_raw_json_value(&state)?;
             anyhow::bail!("provisional runtime session {} disappeared", record.id);
         };
-        *session = serde_json::to_value(&record)?;
+        if completion_status_is_retired(json_text(session.get("completion_status")).as_deref()) {
+            let _ = runtime.kill_session(&record.tmux_session);
+            mark_runtime_launch_failed(
+                &mut state,
+                &launch_id,
+                &record.id,
+                false,
+                "session was retired while waiting for provider startup",
+            )?;
+            self.write_raw_json_value(&state)?;
+            anyhow::bail!(
+                "session {} was retired while waiting for provider startup",
+                record.id
+            );
+        }
+        let mut current_record = serde_json::from_value::<SessionRecord>(session.clone())?;
+        current_record.provider_resume_id = record.provider_resume_id.clone();
+        current_record.status = "running".to_owned();
+        current_record.stopped_at = None;
+        current_record.last_activity = now_rfc3339();
+        *session = serde_json::to_value(&current_record)?;
+        record = current_record;
         mark_runtime_launch_applied(&mut state, &launch_id, record.provider_resume_id.as_deref())?;
         if let Err(error) = self.write_raw_json_value(&state) {
             let _ = runtime.kill_session(&record.tmux_session);
