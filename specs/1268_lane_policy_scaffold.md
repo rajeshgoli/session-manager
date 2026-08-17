@@ -3,8 +3,7 @@
 - **Issue:** [#1268](https://github.com/rajeshgoli/session-manager/issues/1268)
 - **Status:** Draft for owner review
 - **Scope:** Specification and execution plan only; no runtime implementation
-- **Prerequisites:** #1264 merged and deployed; #1265 must merge before the
-  policy evaluator is enforced
+- **Prerequisites:** #1264 and #1265 merged, deployed, and live-verified
 
 ## Goal
 
@@ -41,10 +40,10 @@ Claude main-thread answer:
 
 The accidental Claude result is not valid evidence for true `/btw`. Controlled
 isolated runs subsequently proved that `/btw` can execute concurrently with a
-foreground shell tool, but sees only completed parent context. Issue #1265 must
-still fix arbitrary busy-state safety and terminal request behavior before this
-mechanism is enforced. Larger replay tails and a warm external classifier did
-not provide a reliable authority boundary.
+foreground shell tool, but sees only completed parent context. Issue #1265 and
+follow-up #1271 now provide verified idle-composer admission, durable recovery
+stages, and fail-closed ambiguous-state handling. Larger replay tails and a
+warm external classifier did not provide a reliable authority boundary.
 
 ## Core design
 
@@ -228,8 +227,7 @@ its provider session ID. A durable scoped override may defer rotation.
 ### Delivery topology and controls
 
 - #1264 atomic prompt transport is merged and deployed.
-- #1265 safe Claude `/btw` isolation is the remaining implementation
-  prerequisite.
+- #1265 safe Claude `/btw` isolation is merged, deployed, and live-verified.
 - First open a spec-only PR to `main`. No policy implementation starts before
   owner approval, except read-only spikes and fixture collection.
 - After approval, create one epic branch. Every package uses its own worktree
