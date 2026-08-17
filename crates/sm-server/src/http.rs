@@ -9864,9 +9864,14 @@ fn codex_fork_event_stream_activity(
     session: &SessionRecord,
 ) -> Option<CodexForkActivitySignal> {
     let event_stream_path = codex_fork_event_stream_path_for_session(state, session)?;
+    let persisted_activity = match session.lifecycle_status() {
+        "idle" | "stopped" => codex_fork_activity_for_status(session.lifecycle_status()),
+        _ => None,
+    };
     codex_fork_event_stream_signal_from_path(
         event_stream_path,
         session.provider_resume_id.as_deref(),
+        persisted_activity,
     )
 }
 
@@ -9906,7 +9911,7 @@ fn codex_fork_event_stream_path_for_session(
 
 #[cfg(test)]
 fn codex_fork_event_stream_activity_from_path(path: PathBuf) -> Option<&'static str> {
-    codex_fork_event_stream_signal_from_path(path, None).map(|signal| signal.activity)
+    codex_fork_event_stream_signal_from_path(path, None, None).map(|signal| signal.activity)
 }
 
 #[cfg(test)]
@@ -9914,13 +9919,24 @@ fn codex_fork_event_stream_activity_from_path_for_root(
     path: PathBuf,
     root_thread_id: &str,
 ) -> Option<&'static str> {
-    codex_fork_event_stream_signal_from_path(path, Some(root_thread_id))
+    codex_fork_event_stream_signal_from_path(path, Some(root_thread_id), None)
+        .map(|signal| signal.activity)
+}
+
+#[cfg(test)]
+fn codex_fork_event_stream_activity_from_path_with_seed(
+    path: PathBuf,
+    root_thread_id: &str,
+    persisted_activity: &'static str,
+) -> Option<&'static str> {
+    codex_fork_event_stream_signal_from_path(path, Some(root_thread_id), Some(persisted_activity))
         .map(|signal| signal.activity)
 }
 
 fn codex_fork_event_stream_signal_from_path(
     path: PathBuf,
     root_thread_id: Option<&str>,
+    persisted_activity: Option<&'static str>,
 ) -> Option<CodexForkActivitySignal> {
     let mut file = fs::File::open(path).ok()?;
     let metadata = file.metadata().ok()?;
@@ -9939,7 +9955,11 @@ fn codex_fork_event_stream_signal_from_path(
         }
     }
 
-    let mut latest_activity: Option<CodexForkActivitySignal> = None;
+    let mut latest_activity = persisted_activity.map(|activity| CodexForkActivitySignal {
+        activity,
+        observed_at: None,
+        undated_status_is_latest_event: false,
+    });
     for line in chunk.lines() {
         if codex_fork_event_line_is_json(line) {
             if let Some(signal) = latest_activity.as_mut() {
@@ -14421,6 +14441,39 @@ mod tests {
 
         assert_eq!(
             codex_fork_event_stream_activity_from_path_for_root(event_stream, "root-thread"),
+            Some("idle")
+        );
+    }
+
+    #[test]
+    fn codex_fork_event_stream_activity_seeds_truncated_tail_with_persisted_idle() {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-codex-truncated-idle-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let event_stream = dir.join("events.jsonl");
+        let mut events = concat!(
+            "{\"event_type\":\"thread/status/changed\",\"session_id\":\"root-thread\",\"payload\":{\"threadId\":\"root-thread\",\"status\":{\"type\":\"idle\"}}}\n"
+        )
+        .as_bytes()
+        .to_vec();
+        events.extend(std::iter::repeat_n(
+            b'x',
+            CODEX_FORK_ACTIVITY_EVENT_TAIL_BYTES as usize + 1024,
+        ));
+        events.extend_from_slice(
+            b"\n{\"event_type\":\"item/completed\",\"session_id\":\"root-thread\",\"payload\":{\"threadId\":\"root-thread\",\"item\":{\"type\":\"commandExecution\",\"status\":\"completed\"}}}\n",
+        );
+        fs::write(&event_stream, events).unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path_with_seed(
+                event_stream,
+                "root-thread",
+                "idle"
+            ),
             Some("idle")
         );
     }

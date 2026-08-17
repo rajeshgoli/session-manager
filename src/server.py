@@ -8112,7 +8112,6 @@ Provide ONLY the summary, no preamble or questions."""
         return {"codex_launch_gates": payload}
 
     @app.post("/sessions/{target_session_id}/retire")
-    @app.post("/sessions/{target_session_id}/kill")
     async def retire_session_with_check(target_session_id: str, request: KillSessionRequest):
         """Retire a session with parent-child ownership check."""
         if not app.state.session_manager:
@@ -8150,6 +8149,16 @@ Provide ONLY the summary, no preamble or questions."""
                 return {"error": "Failed to finalize session cleanup"}
 
         return {"status": "retired", "session_id": target_session_id}
+
+    @app.post("/sessions/{target_session_id}/kill")
+    async def retire_session_legacy_with_check(
+        target_session_id: str,
+        request: KillSessionRequest,
+    ):
+        response = await retire_session_with_check(target_session_id, request)
+        if response.get("status") == "retired":
+            response["status"] = "killed"
+        return response
 
     @app.post("/sessions/{session_id}/handoff")
     async def schedule_handoff(session_id: str, request: HandoffRequest):

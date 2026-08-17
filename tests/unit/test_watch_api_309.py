@@ -229,3 +229,15 @@ def test_kill_endpoint_returns_error_when_cleanup_fails():
 
     assert resp.status_code == 200
     assert resp.json()["error"] == "Failed to finalize session cleanup"
+
+
+def test_legacy_kill_endpoint_preserves_deployed_client_response():
+    session = _make_session("legacy1234")
+    sm = _make_sm(session)
+    sm.kill_session = MagicMock(return_value=True)
+    client = TestClient(create_app(session_manager=sm))
+
+    response = client.post(f"/sessions/{session.id}/kill", json={})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "killed"
