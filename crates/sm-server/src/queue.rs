@@ -137,9 +137,10 @@ pub struct QueueJobFilters {
     pub include_terminal: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QueueJobRecord {
     pub id: String,
+    #[serde(rename = "type")]
     pub job_type: String,
     pub label: String,
     pub requester_session_id: Option<String>,

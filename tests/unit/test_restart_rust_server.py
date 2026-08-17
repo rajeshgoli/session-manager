@@ -9,7 +9,9 @@ registered path at the time, which is how the install boundary is asserted.
 """
 
 import os
+import socket
 import subprocess
+import uuid
 from pathlib import Path
 
 import pytest
@@ -58,7 +60,7 @@ def _fake(env, marker: str) -> str:
 
 
 @pytest.fixture
-def env(tmp_path):
+def env(tmp_path, request):
     """A sandbox with stubbed cargo, codesign, launchctl, curl, and cutover."""
     bin_dir = tmp_path / "bin"
     state = tmp_path / "state"
@@ -94,6 +96,11 @@ def env(tmp_path):
     (state / "job_program").write_text(str(installed))
     (state / "supports_check_config").write_text("1")
     (state / "check_config_rc").write_text("0")
+    (state / "authority_rc").write_text("0")
+    (state / "authority_payload").write_text(
+        '{"schema":"sm.queue_authority.response.v1","ok":false,'
+        '"error":{"code": "not_found"}}\n'
+    )
     # What a successful `cargo build` drops at the cargo output path.
     _write(state / "rebuilt-binary", fake_binary(state, "REBUILT"))
 
@@ -188,6 +195,20 @@ exit 0
 """,
         executable=True,
     )
+    authority_verifier = _write(
+        bin_dir / "verify-queue-authority",
+        f"""#!/usr/bin/env python3
+import pathlib
+import sys
+
+state = pathlib.Path({str(state)!r})
+with pathlib.Path({str(log)!r}).open("a") as handle:
+    handle.write("verify-queue-authority " + " ".join(sys.argv[1:]) + "\\n")
+sys.stdout.write((state / "authority_payload").read_text())
+raise SystemExit(int((state / "authority_rc").read_text()))
+""",
+        executable=True,
+    )
     # stop-rust unloads the label, start-rust loads it back, mirroring what the
     # real cutover does to the launchd registration.
     cutover = _write(
@@ -218,6 +239,15 @@ exit 0
     config = _write(tmp_path / "config.yaml", "server:\n  port: 8420\n")
     # Matches the stub's render-plist output, so there is no divergence by default.
     plist = _write(tmp_path / "service.plist", "<plist>canned</plist>\n")
+    authority_socket_path = Path("/tmp") / f"sm-rst-{uuid.uuid4().hex}.sock"
+    authority_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    authority_socket.bind(str(authority_socket_path))
+
+    def cleanup_authority_socket():
+        authority_socket.close()
+        authority_socket_path.unlink(missing_ok=True)
+
+    request.addfinalizer(cleanup_authority_socket)
 
     return {
         "tmp": tmp_path,
@@ -226,12 +256,33 @@ exit 0
         "installed": installed,
         "cargo_output": cargo_output,
         "plist": plist,
+        "authority_socket": authority_socket,
+        "authority_socket_path": authority_socket_path,
+        "authority_verifier": authority_verifier,
         "lock": installed.parent / "restart.lock",
-        "run": _make_runner(bin_dir, cutover, installed, cargo_output, config, plist),
+        "run": _make_runner(
+            bin_dir,
+            cutover,
+            installed,
+            cargo_output,
+            config,
+            plist,
+            authority_socket_path,
+            authority_verifier,
+        ),
     }
 
 
-def _make_runner(bin_dir, cutover, installed, cargo_output, config, plist):
+def _make_runner(
+    bin_dir,
+    cutover,
+    installed,
+    cargo_output,
+    config,
+    plist,
+    authority_socket_path,
+    authority_verifier,
+):
     binary_dir_lock = installed.parent / "restart.lock"
     def run(*args, **overrides):
         environ = {
@@ -251,6 +302,8 @@ def _make_runner(bin_dir, cutover, installed, cargo_output, config, plist):
             "SM_UNLOAD_TIMEOUT": "2",
             "SM_LABEL": LABEL,
             "SM_LOCK": str(binary_dir_lock),
+            "SM_QUEUE_AUTHORITY_SOCKET": str(authority_socket_path),
+            "SM_QUEUE_AUTHORITY_VERIFIER": str(authority_verifier),
         }
         environ.update(overrides)
         return subprocess.run(
@@ -982,6 +1035,42 @@ def test_happy_path_succeeds(env):
     assert result.returncode == 0, result.stderr
     assert "session count ok (12 -> 12)" in result.stdout
     assert "pid 4242 stable" in result.stdout
+    assert "queue authority peer verified" in result.stdout
+    assert (
+        f"verify-queue-authority job_000000000000 --socket "
+        f"{env['authority_socket_path']} --executable {env['installed']} "
+        f"--launchd-label {LABEL} --signing-id com.rajeshgoli.sm-server"
+    ) in calls(env)
+
+
+def test_missing_queue_authority_socket_fails_after_restart(env):
+    env["authority_socket"].close()
+    env["authority_socket_path"].unlink()
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "queue authority socket is missing" in result.stderr
+
+
+def test_queue_authority_peer_attestation_failure_is_reported(env):
+    (env["state"] / "authority_rc").write_text("1")
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "queue authority peer attestation failed" in result.stderr
+
+
+def test_queue_authority_probe_must_return_not_found(env):
+    (env["state"] / "authority_payload").write_text(
+        '{"schema":"sm.queue_authority.response.v1","ok":true}\n'
+    )
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "unexpected probe response" in result.stderr
 
 
 def test_unhealthy_after_restart_fails(env):

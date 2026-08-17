@@ -83,6 +83,8 @@ else
   SM_BASE_URL="http://$SM_PROBE_HOST:$SM_PORT"
 fi
 SM_SIGN_IDENTIFIER="${SM_SIGN_IDENTIFIER:-com.rajeshgoli.sm-server}"
+SM_QUEUE_AUTHORITY_SOCKET="${SM_QUEUE_AUTHORITY_SOCKET:-$HOME/.local/share/claude-sessions/queue-runner/authority.sock}"
+SM_QUEUE_AUTHORITY_VERIFIER="${SM_QUEUE_AUTHORITY_VERIFIER:-$REPO_ROOT/scripts/verify_queue_authority.py}"
 SM_HEALTH_TIMEOUT="${SM_HEALTH_TIMEOUT:-60}"
 SM_PID_SETTLE_SECONDS="${SM_PID_SETTLE_SECONDS:-20}"
 SM_UNLOAD_TIMEOUT="${SM_UNLOAD_TIMEOUT:-10}"
@@ -123,7 +125,8 @@ Options:
 Environment overrides: SM_LABEL, SM_BINARY, SM_TARGET_DIR, SM_CARGO_OUTPUT,
 SM_CUTOVER, SM_CONFIG, SM_LOCAL_ENV, SM_LOG_DIR, SM_PLIST, SM_HOST, SM_PORT,
 SM_PYTHON_LABELS (extra labels), SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT,
-SM_PID_SETTLE_SECONDS, SM_UNLOAD_TIMEOUT, SM_ALLOW_SESSION_DROP, SM_LOCK.
+SM_QUEUE_AUTHORITY_SOCKET, SM_QUEUE_AUTHORITY_VERIFIER, SM_PID_SETTLE_SECONDS,
+SM_UNLOAD_TIMEOUT, SM_ALLOW_SESSION_DROP, SM_LOCK.
 
 SM_LABEL, SM_BINARY, SM_CONFIG, SM_LOCAL_ENV, SM_LOG_DIR, SM_PLIST, SM_HOST, and
 SM_PORT are forwarded to the cutover script, so both phases act on the same
@@ -620,6 +623,19 @@ while (( SECONDS < settle_deadline )); do
     || fail "pid changed $first_pid -> $now_pid: the service is restarting under us (crash loop)"
 done
 echo "pid $first_pid stable, state running"
+
+step "Verifying kernel-bound queue authority"
+[[ -S "$SM_QUEUE_AUTHORITY_SOCKET" ]] \
+  || fail "queue authority socket is missing: $SM_QUEUE_AUTHORITY_SOCKET"
+authority_payload="$(/usr/bin/python3 "$SM_QUEUE_AUTHORITY_VERIFIER" job_000000000000 \
+  --socket "$SM_QUEUE_AUTHORITY_SOCKET" \
+  --executable "$SM_BINARY" \
+  --launchd-label "$SM_LABEL" \
+  --signing-id "$SM_SIGN_IDENTIFIER")" \
+  || fail "queue authority peer attestation failed"
+[[ "$authority_payload" == *'"code": "not_found"'* ]] \
+  || fail "queue authority verification returned an unexpected probe response"
+echo "queue authority peer verified"
 
 step "Comparing session count"
 AFTER_SESSIONS="$(session_count || true)"

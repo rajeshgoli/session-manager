@@ -12,6 +12,7 @@ use sm_server::{
     config::AppConfig,
     http::{router, AppState},
     queue::{QueueAdmissionPolicy, QueueRecoverySummary, RetainedQueueStore},
+    queue_authority::{QueueAuthorityServer, QueueAuthorityServiceIdentity},
     sessions::expand_home,
     studio_ssh,
     usage_identity::IdentityPoller,
@@ -74,9 +75,17 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {address}"))?;
 
+    let queue_state_dir_config = config.queue_runner_state_dir();
+    let queue_state_dir = expand_home(&queue_state_dir_config.to_string_lossy());
+    let authority_server =
+        QueueAuthorityServer::bind(&queue_state_dir, QueueAuthorityServiceIdentity::current()?)?;
+    eprintln!(
+        "sm-server queue authority on {}",
+        authority_server.socket_path().display()
+    );
+    authority_server.spawn();
+
     if config.rust_core.runtime_enabled {
-        let queue_state_dir_config = config.queue_runner_state_dir();
-        let queue_state_dir = expand_home(&queue_state_dir_config.to_string_lossy());
         let message_queue_db_path = expand_home(&config.sm_send.db_path);
         let cancel_grace_seconds = config.queue_runner.cancel_grace_seconds;
         let admission_policy = QueueAdmissionPolicy {
