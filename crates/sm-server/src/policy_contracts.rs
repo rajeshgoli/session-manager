@@ -5,6 +5,7 @@ pub const SPAWN_REQUEST_SCHEMA: &str = "sm.policy.spawn_request.v1";
 pub const DECISION_SCHEMA: &str = "sm.policy.decision.v1";
 pub const OVERRIDE_SCHEMA: &str = "sm.policy.override.v1";
 pub const ATTESTATION_SCHEMA: &str = "sm.policy.runtime_attestation.v1";
+pub const ADMISSION_RESULT_SCHEMA: &str = "sm.policy.admission_result.v1";
 pub const EVENT_SCHEMA: &str = "sm.policy.event.v1";
 pub const USAGE_SCHEMA: &str = "sm.policy.usage.v1";
 
@@ -265,6 +266,15 @@ impl PolicyDecision {
         }
         require_nonempty("policy_version", &self.policy_version)?;
         self.classification.validate()?;
+        if self.applicable_clause_ids.is_empty() {
+            return Err(PolicyContractError::new(
+                "missing_applicable_clauses",
+                "policy decisions require at least one applicable clause ID",
+            ));
+        }
+        for clause_id in &self.applicable_clause_ids {
+            require_nonempty("applicable_clause_ids", clause_id)?;
+        }
         require_nonempty("reason", &self.reason)?;
         require_nonempty("decided_at", &self.decided_at)?;
         match self.outcome {
@@ -301,6 +311,37 @@ impl PolicyDecision {
                     "override_command",
                     self.override_command.as_deref().unwrap_or_default(),
                 )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_request(
+        &self,
+        request: &PolicySpawnRequest,
+    ) -> Result<(), PolicyContractError> {
+        request.validate()?;
+        self.validate()?;
+        if self.request_id != request.request_id {
+            return Err(PolicyContractError::new(
+                "decision_request_mismatch",
+                "decision request ID does not match the frozen spawn request",
+            ));
+        }
+        if self.policy_version != request.policy_version {
+            return Err(PolicyContractError::new(
+                "decision_policy_mismatch",
+                "decision policy version does not match the frozen spawn request",
+            ));
+        }
+        if let Some(lease) = &self.capacity_lease {
+            if lease.topology_version != request.topology_version
+                || lease.capacity_version != request.capacity_version
+            {
+                return Err(PolicyContractError::new(
+                    "capacity_lease_version_mismatch",
+                    "capacity lease versions do not match the frozen spawn request",
+                ));
             }
         }
         Ok(())
@@ -407,8 +448,15 @@ impl PolicyRuntimeAttestation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyAdmissionResult {
+    pub schema: String,
+    pub outcome: PolicyAdmissionOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PolicyAdmissionResult {
+pub enum PolicyAdmissionOutcome {
     Allowed {
         decision_id: String,
         child_session_id: String,
@@ -431,8 +479,9 @@ pub enum PolicyAdmissionResult {
 
 impl PolicyAdmissionResult {
     pub fn validate(&self) -> Result<(), PolicyContractError> {
-        match self {
-            Self::Allowed {
+        require_schema(&self.schema, ADMISSION_RESULT_SCHEMA)?;
+        match &self.outcome {
+            PolicyAdmissionOutcome::Allowed {
                 decision_id,
                 child_session_id,
                 profile,
@@ -441,7 +490,7 @@ impl PolicyAdmissionResult {
                 require_nonempty("child_session_id", child_session_id)?;
                 profile.validate()
             }
-            Self::Rejected {
+            PolicyAdmissionOutcome::Rejected {
                 decision_id,
                 request_id,
                 outcome,
@@ -459,7 +508,7 @@ impl PolicyAdmissionResult {
                 require_nonempty("reason", reason)?;
                 require_nonempty("override_command", override_command)
             }
-            Self::Failed {
+            PolicyAdmissionOutcome::Failed {
                 request_id,
                 code,
                 detail,
@@ -766,6 +815,28 @@ mod tests {
     }
 
     #[test]
+    fn allow_lease_versions_must_match_the_frozen_request() {
+        let request = request("355-root", Some("opus"));
+        let mut decision = allow_decision(&request, profile("opus"));
+        decision.capacity_lease.as_mut().unwrap().capacity_version += 1;
+
+        let error = decision.validate_for_request(&request).unwrap_err();
+
+        assert_eq!(error.code, "capacity_lease_version_mismatch");
+    }
+
+    #[test]
+    fn decision_requires_a_nonempty_stable_clause_id() {
+        let request = request("355-root", Some("opus"));
+        let mut decision = allow_decision(&request, profile("opus"));
+        decision.applicable_clause_ids = vec![" ".to_owned()];
+
+        let error = decision.validate().unwrap_err();
+
+        assert_eq!(error.code, "missing_field");
+    }
+
+    #[test]
     fn rewrite_returns_an_executable_scoped_override() {
         let request = request("355-root", None);
         let decision = PolicyDecision {
@@ -901,18 +972,37 @@ mod tests {
 
     #[test]
     fn rejected_admission_cannot_claim_allow() {
-        let admission = PolicyAdmissionResult::Rejected {
-            decision_id: "decision-1".to_owned(),
-            request_id: "request-1".to_owned(),
-            outcome: PolicyDecisionOutcome::Allow,
-            reason: "contradictory fixture".to_owned(),
-            override_command: "sm policy override --request request-1 --reason <text>".to_owned(),
+        let admission = PolicyAdmissionResult {
+            schema: ADMISSION_RESULT_SCHEMA.to_owned(),
+            outcome: PolicyAdmissionOutcome::Rejected {
+                decision_id: "decision-1".to_owned(),
+                request_id: "request-1".to_owned(),
+                outcome: PolicyDecisionOutcome::Allow,
+                reason: "contradictory fixture".to_owned(),
+                override_command: "sm policy override --request request-1 --reason <text>"
+                    .to_owned(),
+            },
         };
 
         assert_eq!(
             admission.validate().unwrap_err().code,
             "invalid_rejection_outcome"
         );
+    }
+
+    #[test]
+    fn admission_result_rejects_an_unknown_schema() {
+        let admission = PolicyAdmissionResult {
+            schema: "sm.policy.admission_result.v2".to_owned(),
+            outcome: PolicyAdmissionOutcome::Failed {
+                request_id: "request-1".to_owned(),
+                code: "launch_failed".to_owned(),
+                detail: "provider did not acknowledge the launch".to_owned(),
+                recoverable: true,
+            },
+        };
+
+        assert_eq!(admission.validate().unwrap_err().code, "unsupported_schema");
     }
 
     #[test]
