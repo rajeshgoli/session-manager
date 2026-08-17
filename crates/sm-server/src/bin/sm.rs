@@ -728,8 +728,9 @@ fn run() -> Result<()> {
             let parent_session_id = optional_current_session_id();
             let provider = launch_provider_for_alias(&args.provider)?;
             let payload = if let Some(parent_session_id) = parent_session_id {
-                client.post_json(
-                    "/sessions/spawn",
+                let credential = current_session_credential(&parent_session_id)?;
+                post_managed_spawn(
+                    &client,
                     json!({
                         "id": args.id,
                         "parent_session_id": parent_session_id,
@@ -743,6 +744,7 @@ fn run() -> Result<()> {
                         "provider": provider,
                         "node": args.node
                     }),
+                    &credential,
                 )?
             } else {
                 client.post_json(
@@ -2948,6 +2950,10 @@ fn current_session_credential(session_id: &str) -> Result<String> {
         })
 }
 
+fn post_managed_spawn(client: &ApiClient, payload: Value, credential: &str) -> Result<Value> {
+    client.post_json_with_session_credential("/sessions/spawn", payload, credential)
+}
+
 fn get_reparent_json(client: &ApiClient, path: &str) -> Result<Value> {
     let Some(session_id) = optional_current_session_id() else {
         return client.get_json(path);
@@ -5099,9 +5105,29 @@ mod tests {
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                 .unwrap();
-            let mut buffer = [0_u8; 8192];
-            let bytes_read = stream.read(&mut buffer).unwrap();
-            let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            let mut content_length = 0_usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() {
+                    break;
+                }
+                request.push_str(&line);
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                if let Some((name, value)) = trimmed.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                if trimmed.is_empty() {
+                    break;
+                }
+            }
+            let mut request_body = vec![0_u8; content_length];
+            reader.read_exact(&mut request_body).unwrap();
+            request.push_str(&String::from_utf8(request_body).unwrap());
             let reason = if status == 200 { "OK" } else { "Error" };
             let response = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -5618,6 +5644,28 @@ mod tests {
         let requests = handle.join().unwrap();
         assert!(requests[0].contains("X-SM-Session-Credential: opaque-secret\r\n"));
         assert!(!requests[0].contains("\"opaque-secret\""));
+    }
+
+    #[test]
+    fn managed_spawn_sends_caller_credential_only_in_the_header() {
+        let (client, handle) = single_request_server(200, r#"{"session_id":"child1"}"#);
+
+        let response = post_managed_spawn(
+            &client,
+            json!({
+                "parent_session_id": "parent1",
+                "prompt": "review this",
+                "provider": "codex-fork"
+            }),
+            "spawn-secret",
+        )
+        .unwrap();
+
+        assert_eq!(response["session_id"], "child1");
+        let requests = handle.join().unwrap();
+        assert!(requests[0].starts_with("POST /sessions/spawn HTTP/1.1\r\n"));
+        assert!(requests[0].contains("X-SM-Session-Credential: spawn-secret\r\n"));
+        assert!(!requests[0].contains("\"spawn-secret\""));
     }
 
     #[test]
