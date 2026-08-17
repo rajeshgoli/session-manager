@@ -70,6 +70,16 @@ The fixture records avoided wrong-tier tokens as the benefit. It also records
 any bootstrap/attestation tokens consumed, so preventing a 19.8M-token default
 mistake is compared against the policy gate's actual cost rather than asserted.
 
+The named-seat counterpart is `355-root-26` (`2260296e`). It was created as the
+lane orchestrator without an explicit model and inherited provider state: direct
+usage records show 164 Fable messages with about 28.1M cache-read tokens plus
+later Sonnet activity. The `355-root` clause fixes Claude Opus/high, so this case
+requires no intent evaluator and consumes zero classification tokens. Admission
+must write explicit Opus/high into the launch request and reject an adapter
+payload that permits last-used/default model inheritance. The trial reports the
+avoided 28.1M wrong-tier cache reads against the deterministic gate's latency
+and zero-model-call cost.
+
 ## Role-context review results
 
 Read-only Claude-native forks of the current lane-355 orchestrator, Fable spec
