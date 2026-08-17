@@ -114,21 +114,21 @@ use crate::runtime::{CodexModelValidationError, TmuxRuntime};
 #[cfg(test)]
 use crate::sessions::codex_fork_legacy_event_stream_path_from_log_file;
 use crate::sessions::{
-    claude_hook_gate, codex_fork_newest_event_stream_path, codex_fork_status_for_event_line,
-    expand_home, is_primary_node, submit_codex_fork_btw, AgentRegistrationResponse,
-    AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest, ChildSessionResponse,
-    ClaudeHookGate, ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome,
-    ContextMonitorRequest, ContextSnapshotResponse, ContextUsageEvent, ContextUsageOutcome,
-    CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
-    CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, CreateReparentRequest,
-    CreateReparentTreeRequest, CredentialRotationOutcome, DecideReparentRequest, HandoffOutcome,
-    HandoffRequest, MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision,
-    ReparentMutationOutcome, ReparentRepairAction, RoleRegistrationRequest,
-    SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest, SendCoreInputRequest,
-    SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
-    SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest, SubagentStartOutcome,
-    SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest, TaskCompleteOutcome,
-    TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
+    claude_hook_gate, codex_fork_event_line_starts_turn, codex_fork_newest_event_stream_path,
+    codex_fork_status_for_event_line, expand_home, is_primary_node, submit_codex_fork_btw,
+    AgentRegistrationResponse, AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest,
+    ChildSessionResponse, ClaudeHookGate, ClearSessionRequest, ClientSessionResponse,
+    ContextMonitorOutcome, ContextMonitorRequest, ContextSnapshotResponse, ContextUsageEvent,
+    ContextUsageOutcome, CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult,
+    CoreRestoreOutcome, CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest,
+    CreateReparentRequest, CreateReparentTreeRequest, CredentialRotationOutcome,
+    DecideReparentRequest, HandoffOutcome, HandoffRequest, MaintainerMutationOutcome,
+    RegistryMutationOutcome, ReparentDecision, ReparentMutationOutcome, ReparentRepairAction,
+    RoleRegistrationRequest, SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest,
+    SendCoreInputRequest, SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore,
+    SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest,
+    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
+    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
 };
 
 use crate::studio_ssh::{self, StudioSshStatus};
@@ -9917,6 +9917,14 @@ fn codex_fork_event_stream_signal_from_path(path: PathBuf) -> Option<CodexForkAc
         if let Some(activity) =
             codex_fork_status_for_event_line(line).and_then(codex_fork_activity_for_status)
         {
+            if activity == "working"
+                && latest_activity
+                    .as_ref()
+                    .is_some_and(|signal| matches!(signal.activity, "idle" | "stopped"))
+                && !codex_fork_event_line_starts_turn(line)
+            {
+                continue;
+            }
             latest_activity = Some(CodexForkActivitySignal {
                 activity,
                 observed_at: codex_fork_event_line_timestamp(line),
@@ -14298,6 +14306,48 @@ mod tests {
         assert_eq!(
             codex_fork_event_stream_activity_from_path(event_stream),
             Some("idle")
+        );
+    }
+
+    #[test]
+    fn codex_fork_event_stream_activity_keeps_idle_after_late_command_completion() {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-codex-late-command-idle-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let event_stream = dir.join("events.jsonl");
+        fs::write(
+            &event_stream,
+            concat!(
+                "{\"event_type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"active\"}}}\n",
+                "{\"event_type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"idle\"}}}\n",
+                "{\"event_type\":\"turn_complete\",\"payload\":{}}\n",
+                "{\"event_type\":\"item/commandExecution/outputDelta\",\"payload\":{}}\n",
+                "{\"event_type\":\"item/completed\",\"payload\":{\"item\":{\"type\":\"commandExecution\",\"status\":\"completed\"}}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path(event_stream.clone()),
+            Some("idle")
+        );
+
+        let mut events = fs::read(&event_stream).unwrap();
+        events.extend_from_slice(
+            concat!(
+                "{\"event_type\":\"turn_started\",\"payload\":{}}\n",
+                "{\"event_type\":\"item/completed\",\"payload\":{\"item\":{\"type\":\"commandExecution\",\"status\":\"completed\"}}}\n"
+            )
+            .as_bytes(),
+        );
+        fs::write(&event_stream, events).unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path(event_stream),
+            Some("working")
         );
     }
 

@@ -7564,7 +7564,9 @@ impl SessionStore {
             }
         }
 
-        if let Some(next_status) = codex_fork_status_for_event(event) {
+        if let Some(next_status) = codex_fork_status_for_event(event).filter(|next_status| {
+            status != "idle" || *next_status != "running" || codex_fork_event_starts_turn(event)
+        }) {
             if status != next_status {
                 session.insert("status".to_owned(), Value::String(next_status.to_owned()));
             }
@@ -8017,6 +8019,13 @@ pub(crate) fn codex_fork_status_for_event_line(line: &str) -> Option<&'static st
     codex_fork_status_for_event(event)
 }
 
+pub(crate) fn codex_fork_event_line_starts_turn(line: &str) -> bool {
+    let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
+        return false;
+    };
+    event.as_object().is_some_and(codex_fork_event_starts_turn)
+}
+
 fn codex_fork_event_is_turn_complete(line: &str) -> bool {
     let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
         return false;
@@ -8068,6 +8077,19 @@ fn codex_fork_status_for_event(event: &Map<String, Value>) -> Option<&'static st
         "shutdown_complete" | "stream_error" | "thread_started" | "thread_name_updated" => None,
         other if other.ends_with("_begin") => Some("running"),
         _ => None,
+    }
+}
+
+fn codex_fork_event_starts_turn(event: &Map<String, Value>) -> bool {
+    let Some(event_type) = codex_fork_event_type(event)
+        .map(|value| normalize_codex_fork_event_type(&value.replace('/', "_")))
+    else {
+        return false;
+    };
+    match event_type.as_str() {
+        "turn_started" => true,
+        "thread_status_changed" => codex_fork_thread_status(event) == Some("running"),
+        _ => false,
     }
 }
 
@@ -17481,6 +17503,53 @@ mod tests {
         assert_eq!(codex_fork_status_for_event_line(active), Some("running"));
         assert_eq!(codex_fork_status_for_event_line(idle), Some("idle"));
         assert_eq!(codex_fork_status_for_event_line(unknown), None);
+        assert!(codex_fork_event_line_starts_turn(active));
+        assert!(!codex_fork_event_line_starts_turn(idle));
+    }
+
+    #[test]
+    fn codex_fork_late_command_completion_does_not_reopen_idle_session() {
+        let state_file = unique_temp_path("codex-late-command-idle");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "idle",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"item/completed","payload":{"item":{"type":"commandExecution","status":"completed"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().status,
+            "idle"
+        );
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"turn_started","payload":{}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().status,
+            "running"
+        );
     }
 
     #[test]
