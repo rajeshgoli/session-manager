@@ -652,6 +652,16 @@ async fn what_request_is_durably_accepted_and_pollable() {
 #[tokio::test]
 async fn what_request_rejects_unsafe_prompt_and_stopped_target() {
     let state_file = write_session_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let stopped = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "stop1234")
+        .unwrap();
+    stopped["status"] = json!("idle");
+    stopped["completion_status"] = json!("killed");
+    fs::write(&state_file, state.to_string()).unwrap();
     let mut config = config_with_state_file_and_queue(&state_file);
     config.rust_core.fixture_writes_enabled = true;
     let app = router(AppState::new(config));
@@ -870,6 +880,16 @@ nodes:
 #[tokio::test]
 async fn node_restore_candidates_project_primary_stopped_sessions() {
     let state_file = write_session_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let stopped = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "stop1234")
+        .unwrap();
+    stopped["status"] = json!("idle");
+    stopped["completion_status"] = json!("killed");
+    fs::write(&state_file, state.to_string()).unwrap();
     let app = router(AppState::new(config_with_state_file(&state_file)));
 
     let (status, payload) = get_json(app, "/nodes/primary/restore-candidates?refresh=true").await;
@@ -925,6 +945,16 @@ nodes:
 #[tokio::test]
 async fn node_restore_candidate_restore_round_trips_primary_fixture() {
     let state_file = write_session_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let stopped = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "stop1234")
+        .unwrap();
+    stopped["status"] = json!("idle");
+    stopped["completion_status"] = json!("killed");
+    fs::write(&state_file, state.to_string()).unwrap();
     let mut config = config_with_state_file(&state_file);
     config.rust_core.fixture_writes_enabled = true;
     let app = router(AppState::new(config));
@@ -1727,6 +1757,17 @@ async fn explicit_human_email_is_required_for_human_recipients() {
 #[tokio::test]
 async fn inbound_email_requires_worker_proof_and_delivers_to_session() {
     let state_file = write_session_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let stopped = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    stopped["status"] = json!("idle");
+    stopped["completion_status"] = json!("killed");
+    stopped["stopped_at"] = json!("2026-06-01T00:02:00");
+    fs::write(&state_file, state.to_string()).unwrap();
     let bridge_config = write_email_bridge_config(None, Some("worker-secret"));
     let app = router(AppState::new(config_with_state_file_and_email(
         &state_file,
@@ -1803,7 +1844,7 @@ async fn inbound_email_requires_worker_proof_and_delivers_to_session() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "sent");
     assert_eq!(payload["session_id"], "run12345");
-    assert_eq!(payload["restored"], false);
+    assert_eq!(payload["restored"], true);
     assert_eq!(payload["delivery_result"], "delivered");
 
     let (_status, output) = get_json(app.clone(), "/sessions/run12345/output?lines=5").await;
@@ -5798,6 +5839,24 @@ async fn tmux_client_hook_revives_stopped_codex_fork_with_live_tmux_session() {
                     "last_activity": "2026-06-17T20:16:56Z"
                 },
                 {
+                    "id": "retired-local",
+                    "name": "codex-fork-retired-local",
+                    "working_dir": working_dir.display().to_string(),
+                    "tmux_session": tmux_session,
+                    "tmux_socket_name": tmux_socket,
+                    "provider": "codex-fork",
+                    "log_file": log_dir.join("retired-local.log").display().to_string(),
+                    "provider_resume_id": "retired-thread-123",
+                    "friendly_name": "retired-local-agent",
+                    "status": "stopped",
+                    "stopped_at": "2026-06-17T20:16:56Z",
+                    "completion_status": "killed",
+                    "completion_message": "Terminated via sm kill",
+                    "completed_at": "2026-06-17T20:16:56Z",
+                    "created_at": "2026-06-17T19:00:00Z",
+                    "last_activity": "2026-06-17T20:16:56Z"
+                },
+                {
                     "id": "revive1",
                     "name": "codex-fork-revive",
                     "working_dir": working_dir.display().to_string(),
@@ -5809,9 +5868,9 @@ async fn tmux_client_hook_revives_stopped_codex_fork_with_live_tmux_session() {
                     "friendly_name": "hidden-live-agent",
                     "status": "stopped",
                     "stopped_at": "2026-06-17T20:16:56Z",
-                    "completion_status": "killed",
-                    "completion_message": "retry error",
-                    "completed_at": "2026-06-17T20:16:56Z",
+                    "completion_status": null,
+                    "completion_message": null,
+                    "completed_at": null,
                     "error_message": "codex_fork_control_degraded: stale control socket",
                     "created_at": "2026-06-17T19:00:00Z",
                     "last_activity": "2026-06-17T20:16:56Z"
@@ -5877,6 +5936,14 @@ async fn tmux_client_hook_revives_stopped_codex_fork_with_live_tmux_session() {
         .unwrap();
     assert_eq!(remote["status"], "stopped");
     assert_eq!(remote["node"], "macbook");
+    let retired = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "retired-local")
+        .unwrap();
+    assert_eq!(retired["status"], "stopped");
+    assert_eq!(retired["completion_status"], "killed");
     let restored = state["sessions"]
         .as_array()
         .unwrap()
@@ -7995,6 +8062,32 @@ async fn sessions_lists_running_sessions_and_filters_stopped_by_default() {
 }
 
 #[tokio::test]
+async fn sessions_excludes_killed_completion_even_if_status_drifted_idle() {
+    let state_file = write_session_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "oldstate")
+        .unwrap();
+    session["status"] = json!("idle");
+    session["completion_status"] = json!("killed");
+    session["stopped_at"] = json!("2026-06-01T00:02:00Z");
+    fs::write(&state_file, state.to_string()).unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app, "/sessions").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|session| session["id"] != "oldstate"));
+}
+
+#[tokio::test]
 async fn context_usage_hook_is_served_and_records_tokens() {
     // The route existed only in the Python server until #1132, so every status
     // line post 404'd and tokens_used stayed at its fixture value forever.
@@ -8024,6 +8117,7 @@ async fn context_usage_hook_is_served_and_records_tokens() {
     assert_eq!(payload["session_id"], "run12345");
     assert_eq!(payload["used_percentage"], json!(41.5));
     assert_eq!(payload["total_input_tokens"], json!(83_000));
+    assert_eq!(payload["lifecycle_status"], "running");
     assert_eq!(payload["state"], "normal");
     assert_eq!(payload["context_monitor_enabled"], true);
 
@@ -9504,13 +9598,25 @@ async fn client_session_detail_explains_mobile_terminal_auth_gap_without_actor()
 #[tokio::test]
 async fn client_session_detail_preserves_attach_unsupported_primary_action_reason() {
     let state_file = write_session_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let stopped = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "stop1234")
+        .unwrap();
+    stopped["status"] = json!("idle");
+    stopped["completion_status"] = json!("killed");
+    fs::write(&state_file, state.to_string()).unwrap();
     let app = router(AppState::new(config_with_state_file(&state_file)));
 
     let (status, payload) = get_json(app, "/client/sessions/stop1234").await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["id"], "stop1234");
+    assert_eq!(payload["status"], "stopped");
     assert_eq!(payload["attach_descriptor"]["attach_supported"], false);
+    assert_eq!(payload["attach_descriptor"]["lifecycle_state"], "stopped");
     assert_eq!(
         payload["attach_descriptor"]["message"],
         "Session is stopped"
@@ -15013,7 +15119,7 @@ async fn runtime_core_marks_missing_tmux_stopped_on_send_and_retire() {
 }
 
 #[tokio::test]
-async fn runtime_core_does_not_queue_sends_to_already_stopped_sessions() {
+async fn runtime_core_does_not_queue_sends_to_terminal_sessions_with_status_drift() {
     if !tmux_available() {
         return;
     }
@@ -15030,7 +15136,8 @@ async fn runtime_core_does_not_queue_sends_to_already_stopped_sessions() {
                     "node": "primary",
                     "provider": "claude",
                     "log_file": "/tmp/runtimestopped.log",
-                    "status": "stopped",
+                    "status": "idle",
+                    "completion_status": "killed",
                     "created_at": "2026-06-01T00:00:00",
                     "last_activity": "2026-06-01T00:01:00",
                     "stopped_at": "2026-06-01T00:02:00"
@@ -15141,6 +15248,10 @@ async fn runtime_core_restores_codex_session() {
     assert_eq!(payload["status"], "killed");
     assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
 
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    state["sessions"][0]["status"] = json!("idle");
+    fs::write(&state_file, state.to_string()).unwrap();
+
     let day_dir = state_file
         .with_extension("codex-home")
         .join("sessions")
@@ -15235,6 +15346,44 @@ async fn runtime_core_starts_review_on_existing_codex_session() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "reviewcodex")
+        .unwrap();
+    session["status"] = json!("idle");
+    session["completion_status"] = json!("killed");
+    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/reviewcodex/review",
+        json!({
+            "mode": "custom",
+            "custom_prompt": "must not dispatch to a retired session"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({ "error": "Session is stopped. Restore it before starting a review." })
+    );
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "reviewcodex")
+        .unwrap();
+    assert_eq!(session["status"], "idle");
+    assert_eq!(session["completion_status"], "killed");
+    assert!(session.get("review_config").is_none() || session["review_config"].is_null());
+    session["completion_status"] = Value::Null;
+    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
     let (status, payload) = post_json(
         app.clone(),
         "/sessions/reviewcodex/review",
@@ -15257,6 +15406,11 @@ async fn runtime_core_starts_review_on_existing_codex_session() {
         "runtime:/review inspect retained review route",
     )
     .await;
+    let (_status, output) = get_json(app.clone(), "/sessions/reviewcodex/output?lines=20").await;
+    assert!(!output["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("must not dispatch to a retired session"));
     wait_for_output_contains(
         app.clone(),
         "reviewwatcher",

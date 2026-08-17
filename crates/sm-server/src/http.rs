@@ -2514,7 +2514,7 @@ async fn inbound_email_webhook(
         return Err(ApiError::NotFound("Session not found"));
     };
     let mut restored = false;
-    if matches!(session.status.as_str(), "stopped" | "killed") {
+    if session.is_stopped() {
         let outcome = if state.config.rust_core.runtime_enabled {
             let runtime = TmuxRuntime::from_app_config(&state.config);
             state
@@ -3824,23 +3824,22 @@ fn spawn_session_wait_monitor(
                 idle_since = Instant::now();
             }
             let target_name = child_display_name(&target);
-            let notification = if session_status_is_stopped(&target.status)
-                || runtime_child_session_exited(&state, &target)
-            {
-                Some(format!(
-                    "[sm wait] {target_name} reached stopped (waited {elapsed}s)"
-                ))
-            } else if idle_since.elapsed() >= REVIEW_WAIT_IDLE_THRESHOLD {
-                Some(format!(
-                    "[sm wait] {target_name} is now idle (waited {elapsed}s)"
-                ))
-            } else if elapsed >= wait_seconds {
-                Some(format!(
-                    "[sm wait] Timeout: {target_name} still active after {wait_seconds}s"
-                ))
-            } else {
-                None
-            };
+            let notification =
+                if target.is_stopped() || runtime_child_session_exited(&state, &target) {
+                    Some(format!(
+                        "[sm wait] {target_name} reached stopped (waited {elapsed}s)"
+                    ))
+                } else if idle_since.elapsed() >= REVIEW_WAIT_IDLE_THRESHOLD {
+                    Some(format!(
+                        "[sm wait] {target_name} is now idle (waited {elapsed}s)"
+                    ))
+                } else if elapsed >= wait_seconds {
+                    Some(format!(
+                        "[sm wait] Timeout: {target_name} still active after {wait_seconds}s"
+                    ))
+                } else {
+                    None
+                };
             if let Some(notification) = notification {
                 queue_wait_notification(&state, &watcher_session_id, notification);
                 break;
@@ -3903,18 +3902,17 @@ fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_sec
                 idle_since = Instant::now();
             }
 
-            let completion_message = if session_status_is_stopped(&child.status)
-                || runtime_child_session_exited(&state, &child)
-            {
-                Some("Session exited".to_owned())
-            } else {
-                Some(idle_since.elapsed().as_secs())
-                    .filter(|idle_seconds| *idle_seconds >= wait_seconds)
-                    .map(|idle_seconds| {
-                        completion_summary(&state.session_store, &child_session_id)
-                            .unwrap_or_else(|| format!("Idle for {idle_seconds}s"))
-                    })
-            };
+            let completion_message =
+                if child.is_stopped() || runtime_child_session_exited(&state, &child) {
+                    Some("Session exited".to_owned())
+                } else {
+                    Some(idle_since.elapsed().as_secs())
+                        .filter(|idle_seconds| *idle_seconds >= wait_seconds)
+                        .map(|idle_seconds| {
+                            completion_summary(&state.session_store, &child_session_id)
+                                .unwrap_or_else(|| format!("Idle for {idle_seconds}s"))
+                        })
+                };
             let Some(completion_message) = completion_message else {
                 continue;
             };
@@ -3939,13 +3937,6 @@ fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_sec
             break;
         }
     });
-}
-
-fn session_status_is_stopped(status: &str) -> bool {
-    matches!(
-        status.trim().to_ascii_lowercase().as_str(),
-        "stopped" | "killed"
-    )
 }
 
 fn runtime_child_session_exited(state: &AppState, child: &SessionRecord) -> bool {
@@ -4074,7 +4065,7 @@ async fn list_node_restore_candidates(
         .session_store
         .list_sessions(true)?
         .into_iter()
-        .filter(|session| session.status.trim() == "stopped")
+        .filter(SessionRecord::is_stopped)
         .filter(|session| is_primary_node(&session.node))
         .map(|session| node_restore_candidate_value(session, &node_id))
         .collect::<Result<Vec<_>, _>>()?;
@@ -4113,7 +4104,7 @@ async fn restore_node_restore_candidate(
             detail: "Session not found".to_owned(),
         });
     };
-    if session.status.trim() != "stopped" {
+    if !session.is_stopped() {
         return Err(ApiError::Status {
             status: StatusCode::CONFLICT,
             detail: "Session is not stopped".to_owned(),
@@ -4855,10 +4846,7 @@ fn dispatch_due_scheduled_reminders(
         let target = state
             .session_store
             .get_session(&reminder.target_session_id)?;
-        if target
-            .as_ref()
-            .is_none_or(|session| session.status.trim().eq_ignore_ascii_case("stopped"))
-        {
+        if target.as_ref().is_none_or(SessionRecord::is_stopped) {
             queue.deactivate_scheduled_reminder(&reminder.id)?;
             continue;
         }
@@ -4886,6 +4874,15 @@ fn dispatch_due_scheduled_reminders(
                     anyhow::anyhow!("scheduled reminder compaction wait lock was poisoned")
                 })?
                 .remove(&reminder.id);
+        }
+        if state
+            .session_store
+            .get_session(&reminder.target_session_id)?
+            .as_ref()
+            .is_none_or(SessionRecord::is_stopped)
+        {
+            queue.deactivate_scheduled_reminder(&reminder.id)?;
+            continue;
         }
         let delivery = match queue.claim_due_scheduled_reminder(&reminder.id, now) {
             Ok(Some(delivery)) => delivery,
@@ -4944,7 +4941,7 @@ async fn schedule_reminder(
     let Some(session) = state.session_store.get_session(&payload.session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
-    if session.status.trim().eq_ignore_ascii_case("stopped") {
+    if session.is_stopped() {
         return Err(ApiError::Status {
             status: StatusCode::CONFLICT,
             detail: "Cannot schedule a reminder for a stopped session".to_owned(),
@@ -7418,10 +7415,12 @@ fn teardown_btw_requests_for_session(state: &AppState, session_id: &str) -> anyh
 }
 
 fn ensure_btw_session_live(session: &SessionRecord, label: &str) -> Result<(), ApiError> {
-    if matches!(
-        session.status.trim().to_ascii_lowercase().as_str(),
-        "stopped" | "killed" | "completed" | "error"
-    ) {
+    if session.is_stopped()
+        || matches!(
+            session.status.trim().to_ascii_lowercase().as_str(),
+            "completed" | "error"
+        )
+    {
         return Err(ApiError::Status {
             status: StatusCode::CONFLICT,
             detail: format!("{label} session is not live"),
@@ -7845,6 +7844,10 @@ async fn clear_session(
     match result {
         CoreClearOutcome::Cleared(result) => Ok(Json(serde_json::to_value(result)?)),
         CoreClearOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
+        CoreClearOutcome::NotRunning => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Session is stopped; restore it before clearing".to_owned(),
+        }),
         CoreClearOutcome::Unauthorized(detail) => Err(ApiError::Status {
             status: StatusCode::FORBIDDEN,
             detail,
@@ -9289,10 +9292,8 @@ fn client_bootstrap_response(
 
 fn attach_descriptor_payload(session: SessionRecord) -> Value {
     let provider = session.provider.clone();
-    let is_stopped = matches!(
-        session.status.trim().to_ascii_lowercase().as_str(),
-        "stopped" | "killed"
-    );
+    let lifecycle_state = session.lifecycle_status().to_owned();
+    let is_stopped = session.is_stopped();
     let has_tmux_session = !session.tmux_session.trim().is_empty();
     let (attach_supported, message) = if is_stopped {
         (false, Some("Session is stopped".to_owned()))
@@ -9313,7 +9314,7 @@ fn attach_descriptor_payload(session: SessionRecord) -> Value {
         "tmux_session": session.tmux_session,
         "tmux_socket_name": session.tmux_socket_name,
         "runtime_id": null,
-        "lifecycle_state": session.status,
+        "lifecycle_state": lifecycle_state,
         "message": message,
     })
 }
@@ -10036,10 +10037,7 @@ fn authorize_mobile_terminal_ticket_request(
             detail: "Mobile terminal attach is disabled".to_owned(),
         });
     }
-    if matches!(
-        session.status.trim().to_ascii_lowercase().as_str(),
-        "stopped" | "killed"
-    ) {
+    if session.is_stopped() {
         return Err(ApiError::Status {
             status: StatusCode::CONFLICT,
             detail: "Session is not running".to_owned(),
@@ -11376,10 +11374,7 @@ fn consume_mobile_terminal_ticket(
             detail: "Session is no longer attachable".to_owned(),
         });
     };
-    if matches!(
-        session.status.trim().to_ascii_lowercase().as_str(),
-        "stopped" | "killed"
-    ) {
+    if session.is_stopped() {
         return Err(ApiError::Status {
             status: StatusCode::CONFLICT,
             detail: "Session is no longer attachable".to_owned(),
@@ -13086,6 +13081,7 @@ fn node_restore_candidate_value(session: SessionRecord, node_id: &str) -> Result
             .to_owned(),
         ),
     );
+    object.insert("status".to_owned(), Value::String("stopped".to_owned()));
     object.insert(
         "activity_state".to_owned(),
         Value::String("stopped".to_owned()),
@@ -14428,6 +14424,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reminder_http_rejects_killed_target_with_status_drift() {
+        let (config, queue_path) = reminder_test_config("idle");
+        let state_path = PathBuf::from(&config.paths.state_file);
+        let mut session_state: Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        session_state["sessions"][0]["completion_status"] = json!("killed");
+        fs::write(&state_path, serde_json::to_vec(&session_state).unwrap()).unwrap();
+        let app = router(AppState::new(config));
+
+        let response = app
+            .oneshot(local_request(
+                Method::POST,
+                "/scheduler/remind?session_id=reminder-agent&delay_seconds=60&message=Must%20not%20schedule",
+                Body::from("{}"),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let count: i64 = Connection::open(queue_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM scheduled_reminders", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
     async fn read_only_router_does_not_claim_or_dispatch_reminders() {
         let (mut config, queue_path) = reminder_test_config("running");
         let queue = RetainedQueueStore::new(queue_path.clone());
@@ -14469,7 +14494,12 @@ mod tests {
 
     #[test]
     fn reminder_dispatch_deactivates_stopped_targets_without_queueing() {
-        let (config, queue_path) = reminder_test_config("stopped");
+        let (config, queue_path) = reminder_test_config("idle");
+        let state_path = PathBuf::from(&config.paths.state_file);
+        let mut session_state: Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        session_state["sessions"][0]["completion_status"] = json!("killed");
+        fs::write(&state_path, serde_json::to_vec(&session_state).unwrap()).unwrap();
         let state = AppState::new(config);
         let queue = RetainedQueueStore::new(queue_path.clone());
         let reminder = queue
@@ -15277,6 +15307,28 @@ mod tests {
             .as_str()
             .unwrap()
             .contains(body["ticket_secret"].as_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn mobile_attach_ticket_rejects_killed_session_with_status_drift() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let config = mobile_ticket_config(&signing_key);
+        let state_path = PathBuf::from(&config.paths.state_file);
+        let mut session_state: Value =
+            serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+        session_state["sessions"][0]["status"] = json!("idle");
+        session_state["sessions"][0]["completion_status"] = json!("killed");
+        fs::write(&state_path, serde_json::to_vec(&session_state).unwrap()).unwrap();
+        let app = router(AppState::new(config));
+
+        let response = app
+            .oneshot(attach_ticket_request(&signing_key, "terminal-nonce"))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["detail"], "Session is not running");
     }
 
     #[tokio::test]

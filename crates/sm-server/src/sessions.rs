@@ -1349,7 +1349,9 @@ impl SessionStore {
             .filter(|value| !value.is_empty() && *value != "all");
         if let Some(status_filter) = status_filter {
             children.retain(|session| match status_filter {
-                "running" => normalized_status(&session.status) == "running",
+                "running" => {
+                    !session.is_stopped() && normalized_status(&session.status) == "running"
+                }
                 "completed" => session.completion_status.as_deref() == Some("completed"),
                 "error" => session.completion_status.as_deref() == Some("error"),
                 _ => true,
@@ -1458,7 +1460,7 @@ impl SessionStore {
                 transcript_path.map(ToOwned::to_owned),
             ));
         }
-        if normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped" {
+        if raw_session_is_stopped(session) {
             drop(_guard);
             for (provider_resume_id, artifact_path) in seat_session_appends {
                 self.append_seat_session(
@@ -1589,7 +1591,7 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(false);
         };
-        if normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped" {
+        if raw_session_is_stopped(session) {
             return Ok(false);
         }
 
@@ -1635,7 +1637,7 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(false);
         };
-        if normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped" {
+        if raw_session_is_stopped(session) {
             return Ok(false);
         }
 
@@ -3948,8 +3950,8 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(None);
         };
-        let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
-        let delivered = normalized_status(&status) != "stopped";
+        let status = effective_raw_session_status(session);
+        let delivered = !raw_session_is_stopped(session);
         if delivered {
             let now = now_rfc3339();
             mark_session_followup_activity(session, &now);
@@ -4113,6 +4115,11 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(CoreReviewOutcome::NotFound);
         };
+        if raw_session_is_stopped(session) {
+            return Ok(CoreReviewOutcome::Error(
+                "Session is stopped. Restore it before starting a review.".to_owned(),
+            ));
+        }
 
         let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
         if !matches!(provider.as_str(), "codex" | "codex-fork" | "codex-app") {
@@ -4360,6 +4367,9 @@ impl SessionStore {
         {
             return Ok(CoreClearOutcome::Unauthorized(message));
         }
+        if raw_session_is_stopped(session) {
+            return Ok(CoreClearOutcome::NotRunning);
+        }
         let now = now_rfc3339();
         reset_session_after_clear(session, &now);
         self.cancel_context_monitor_alerts(session_id)?;
@@ -4418,6 +4428,9 @@ impl SessionStore {
                 clear_authorization_error(session, request.requester_session_id.as_deref())
             {
                 return Ok(CoreClearOutcome::Unauthorized(message));
+            }
+            if raw_session_is_stopped(session) {
+                return Ok(CoreClearOutcome::NotRunning);
             }
             let node = json_text(session.get("node")).unwrap_or_else(default_node);
             ensure_runtime_local_node(&node)?;
@@ -4556,15 +4569,13 @@ impl SessionStore {
             let current_socket_name = json_text(session.get("tmux_socket_name"));
             let current_provider =
                 json_text(session.get("provider")).unwrap_or_else(default_provider);
-            let current_status =
-                json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
             if current_tmux_session.as_deref() != Some(tmux_session.as_str())
                 || current_socket_name != session_socket_name
                 || current_provider != provider
             {
                 anyhow::bail!("session {session_id} changed while clear was in progress");
             }
-            if normalized_status(&current_status) == "stopped" {
+            if raw_session_is_stopped(session) {
                 anyhow::bail!("session {session_id} stopped while clear was in progress");
             }
             if let Some((provider_resume_id, _)) = replacement_provider_resume_id.as_ref() {
@@ -4649,9 +4660,8 @@ impl SessionStore {
                 return Ok(false);
             };
             let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
-            let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
             if provider != "codex"
-                || normalized_status(&status) == "stopped"
+                || raw_session_is_stopped(session)
                 || json_text(session.get("provider_resume_id")).as_deref()
                     != expected_provider_resume_id
             {
@@ -4743,8 +4753,7 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(None);
         };
-        let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
-        if normalized_status(&status) != "stopped" {
+        if !raw_session_is_stopped(session) {
             return Ok(Some(CoreRestoreOutcome::NotStopped));
         }
         let now = now_rfc3339();
@@ -4783,7 +4792,7 @@ impl SessionStore {
         else {
             return Ok(None);
         };
-        if normalized_status(&record.status) != "stopped" {
+        if !record.is_stopped() {
             return Ok(Some(CoreRestoreOutcome::NotStopped));
         }
         if !is_primary_node(&record.node) {
@@ -5026,6 +5035,7 @@ impl SessionStore {
                 && json_text(session.get("status"))
                     .as_deref()
                     .is_some_and(|status| normalized_status(status) == "stopped")
+                && json_text(session.get("completion_status")).as_deref() != Some("killed")
         }) else {
             return Ok(None);
         };
@@ -5755,8 +5765,7 @@ impl SessionStore {
             .filter(|session| {
                 json_text(session.get("provider")).as_deref() == Some("claude")
                     && is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
-                    && normalized_status(&json_text(session.get("status")).unwrap_or_default())
-                        != "stopped"
+                    && !raw_session_is_stopped(session)
                     && json_text(session.get("pending_handoff_path")).is_some()
                     && json_text(session.get("pending_handoff_recorded_at")).is_some()
                     && (json_text(session.get("claude_handoff_in_progress_at")).is_some()
@@ -5788,7 +5797,7 @@ impl SessionStore {
                 let eligible = json_text(session.get("provider")).as_deref() == Some("claude")
                     && file_path.is_some()
                     && recorded_at.is_some()
-                    && normalized_status(&status) != "stopped"
+                    && !raw_session_is_stopped(session)
                     && is_primary_node(
                         &json_text(session.get("node")).unwrap_or_else(default_node),
                     );
@@ -5977,8 +5986,7 @@ impl SessionStore {
             return Ok(false);
         };
         let matches = json_text(session.get("provider")).as_deref() == Some("claude")
-            && normalized_status(&json_text(session.get("status")).unwrap_or_default())
-                != "stopped"
+            && !raw_session_is_stopped(session)
             && is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
             && json_text(session.get("tmux_session")).as_deref() == Some(tmux_session)
             && json_text(session.get("tmux_socket_name")).as_deref() == socket_name.as_deref()
@@ -6003,8 +6011,7 @@ impl SessionStore {
                 return Ok(false);
             };
             if json_text(session.get("provider")).as_deref() != Some("claude")
-                || normalized_status(&json_text(session.get("status")).unwrap_or_default())
-                    == "stopped"
+                || raw_session_is_stopped(session)
             {
                 return Ok(false);
             }
@@ -6111,9 +6118,8 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(false);
         };
-        let current_status = json_text(session.get("status")).unwrap_or_default();
         let still_same_session = json_text(session.get("provider")).as_deref() == Some("claude")
-            && normalized_status(&current_status) != "stopped"
+            && !raw_session_is_stopped(session)
             && is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
             && json_text(session.get("tmux_session")).as_deref() == Some(tmux_session.as_str())
             && json_text(session.get("tmux_socket_name")) == socket_name;
@@ -6242,7 +6248,7 @@ impl SessionStore {
             .filter(|session| {
                 session.provider == "codex-fork"
                     && is_primary_node(&session.node)
-                    && normalized_status(&session.status) != "stopped"
+                    && !session.is_stopped()
             })
             .filter_map(|session| {
                 codex_fork_event_stream_path(&session, runtime)
@@ -6407,6 +6413,9 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(false);
         };
+        if raw_session_is_stopped(session) {
+            return Ok(false);
+        }
         match result {
             Ok(provider_resume_id) => {
                 session.insert(
@@ -7428,8 +7437,7 @@ impl SessionStore {
         if provider != "codex-fork" {
             return Ok(false);
         }
-        let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
-        Ok(normalized_status(&status) != "stopped")
+        Ok(!session.as_object().is_some_and(raw_session_is_stopped))
     }
 
     #[cfg(test)]
@@ -7465,7 +7473,7 @@ impl SessionStore {
             return Ok(());
         }
         let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
-        if normalized_status(&status) == "stopped" {
+        if raw_session_is_stopped(session) {
             return Ok(());
         }
 
@@ -8592,6 +8600,7 @@ pub struct CoreClearResult {
 pub enum CoreClearOutcome {
     Cleared(CoreClearResult),
     NotFound,
+    NotRunning,
     Unauthorized(String),
 }
 
@@ -8626,6 +8635,7 @@ pub struct ContextSnapshotResponse {
     pub used_percentage: Option<f64>,
     pub total_input_tokens: Option<i64>,
     pub sampled_at: Option<String>,
+    pub lifecycle_status: String,
     pub state: String,
     pub warning_percentage: f64,
     pub critical_percentage: f64,
@@ -8639,6 +8649,7 @@ impl ContextSnapshotResponse {
     fn from_session(session: SessionRecord, config: &ContextMonitorConfig) -> Self {
         let used_percentage = session.context_used_percentage;
         let compaction_active = session.context_compaction_active;
+        let lifecycle_status = session.lifecycle_status().to_owned();
         let friendly_name = session.cached_display_name();
         let provider = non_empty_or(session.provider, "claude");
         let informational_only = provider_manages_context_inline(&provider);
@@ -8664,6 +8675,7 @@ impl ContextSnapshotResponse {
             used_percentage,
             total_input_tokens: session.context_total_input_tokens,
             sampled_at: session.context_sampled_at,
+            lifecycle_status,
             state,
             warning_percentage: config.warning_percentage,
             critical_percentage: config.critical_percentage,
@@ -9567,9 +9579,7 @@ fn runtime_session_status_raw(state: &mut Value, session_id: &str) -> Result<Opt
     ensure_runtime_local_node(&node)?;
     let _tmux_session = json_text(session.get("tmux_session"))
         .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
-    Ok(Some(
-        json_text(session.get("status")).unwrap_or_else(|| "running".to_owned()),
-    ))
+    Ok(Some(effective_raw_session_status(session)))
 }
 
 fn deliver_runtime_text_to_session_raw(
@@ -9583,7 +9593,10 @@ fn deliver_runtime_text_to_session_raw(
         .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
     let node = json_text(session.get("node")).unwrap_or_else(default_node);
     ensure_runtime_local_node(&node)?;
-    let mut status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+    let mut status = effective_raw_session_status(session);
+    if raw_session_is_stopped(session) {
+        return Ok((status, false));
+    }
     if claude_handoff_is_reserved_raw(session) {
         return Ok((status, false));
     }
@@ -9591,33 +9604,23 @@ fn deliver_runtime_text_to_session_raw(
         .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
     let session_socket_name = json_text(session.get("tmux_socket_name"));
     let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
-    let mut delivered = false;
-    let mut mark_stopped_on_failure = true;
-    if normalized_status(&status) != "stopped" {
+    let (delivered, mark_stopped_on_failure) =
         match deliver_codex_fork_control_text_to_session_raw(session_id, session, text, runtime)? {
-            Some(true) => {
-                delivered = true;
-            }
+            Some(true) => (true, true),
             Some(false) if runtime.codex_fork_control_tmux_fallback_enabled() => {
-                delivered = session_runtime.send_input(&tmux_session, text)?;
+                (session_runtime.send_input(&tmux_session, text)?, true)
             }
-            Some(false) => {
-                delivered = false;
-                mark_stopped_on_failure = false;
-            }
-            None => {
-                delivered = session_runtime.send_input(&tmux_session, text)?;
-            }
-        }
-        let now = now_rfc3339();
-        if delivered {
-            mark_session_followup_activity(session, &now);
-        } else if mark_stopped_on_failure {
-            status = "stopped".to_owned();
-            session.insert("status".to_owned(), Value::String(status.clone()));
-            session.insert("stopped_at".to_owned(), Value::String(now.clone()));
-            session.insert("last_activity".to_owned(), Value::String(now));
-        }
+            Some(false) => (false, false),
+            None => (session_runtime.send_input(&tmux_session, text)?, true),
+        };
+    let now = now_rfc3339();
+    if delivered {
+        mark_session_followup_activity(session, &now);
+    } else if mark_stopped_on_failure {
+        status = "stopped".to_owned();
+        session.insert("status".to_owned(), Value::String(status.clone()));
+        session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+        session.insert("last_activity".to_owned(), Value::String(now));
     }
     Ok((status, delivered))
 }
@@ -9633,7 +9636,10 @@ fn deliver_urgent_runtime_text_to_session_raw(
         .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
     let node = json_text(session.get("node")).unwrap_or_else(default_node);
     ensure_runtime_local_node(&node)?;
-    let mut status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
+    let mut status = effective_raw_session_status(session);
+    if raw_session_is_stopped(session) {
+        return Ok((status, false));
+    }
     if claude_handoff_is_reserved_raw(session) {
         return Ok((status, false));
     }
@@ -9642,41 +9648,35 @@ fn deliver_urgent_runtime_text_to_session_raw(
     let provider = json_text(session.get("provider")).unwrap_or_else(|| "claude".to_owned());
     let session_socket_name = json_text(session.get("tmux_socket_name"));
     let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
-    let mut delivered = false;
-    let mut mark_stopped_on_failure = true;
-    if normalized_status(&status) != "stopped" {
+    let (delivered, mark_stopped_on_failure) =
         match deliver_codex_fork_control_text_to_session_raw(session_id, session, text, runtime)? {
-            Some(true) => {
-                delivered = true;
-            }
-            Some(false) if runtime.codex_fork_control_tmux_fallback_enabled() => {
-                delivered = session_runtime.send_urgent_input(
+            Some(true) => (true, true),
+            Some(false) if runtime.codex_fork_control_tmux_fallback_enabled() => (
+                session_runtime.send_urgent_input(
                     &tmux_session,
                     text,
                     provider.eq_ignore_ascii_case("claude"),
-                )?;
-            }
-            Some(false) => {
-                delivered = false;
-                mark_stopped_on_failure = false;
-            }
-            None => {
-                delivered = session_runtime.send_urgent_input(
+                )?,
+                true,
+            ),
+            Some(false) => (false, false),
+            None => (
+                session_runtime.send_urgent_input(
                     &tmux_session,
                     text,
                     provider.eq_ignore_ascii_case("claude"),
-                )?;
-            }
-        }
-        let now = now_rfc3339();
-        if delivered {
-            mark_session_followup_activity(session, &now);
-        } else if mark_stopped_on_failure {
-            status = "stopped".to_owned();
-            session.insert("status".to_owned(), Value::String(status.clone()));
-            session.insert("stopped_at".to_owned(), Value::String(now.clone()));
-            session.insert("last_activity".to_owned(), Value::String(now));
-        }
+                )?,
+                true,
+            ),
+        };
+    let now = now_rfc3339();
+    if delivered {
+        mark_session_followup_activity(session, &now);
+    } else if mark_stopped_on_failure {
+        status = "stopped".to_owned();
+        session.insert("status".to_owned(), Value::String(status.clone()));
+        session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+        session.insert("last_activity".to_owned(), Value::String(now));
     }
     Ok((status, delivered))
 }
@@ -9692,8 +9692,8 @@ fn deliver_runtime_native_rename_to_session_raw(
         .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
     let node = json_text(session.get("node")).unwrap_or_else(default_node);
     ensure_runtime_local_node(&node)?;
-    let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
-    if normalized_status(&status) == "stopped" {
+    let status = effective_raw_session_status(session);
+    if raw_session_is_stopped(session) {
         return Ok((status, false));
     }
     if claude_handoff_is_reserved_raw(session) {
@@ -10127,7 +10127,7 @@ fn claude_handoff_reservation_replaced_raw(
     reservation_at: &str,
 ) -> bool {
     if json_text(session.get("provider")).as_deref() != Some("claude")
-        || normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped"
+        || raw_session_is_stopped(session)
         || !is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
     {
         return false;
@@ -10877,7 +10877,7 @@ fn agent_registration_response(
     session: &SessionRecord,
     created_at: Option<&str>,
 ) -> AgentRegistrationResponse {
-    let status = normalized_status(&session.status);
+    let status = session.lifecycle_status();
     let activity_state = projected_activity_state(session, status);
     AgentRegistrationResponse {
         role: normalize_role(role),
@@ -11560,7 +11560,7 @@ fn session_lifetime_overlaps(
     let Some(seat_start) = parse_timestamp_ns(&session.created_at) else {
         return false;
     };
-    let seat_end = if normalized_status(&session.status) == "stopped" {
+    let seat_end = if session.is_stopped() {
         session
             .stopped_at
             .as_deref()
@@ -11949,7 +11949,7 @@ fn credential_rotation_has_fresh_idle_proof(
     rotation: &SessionCredentialRotationRecord,
     session: &SessionRecord,
 ) -> bool {
-    if normalized_status(&session.status) == "stopped" {
+    if session.is_stopped() {
         return false;
     }
     match session.provider.as_str() {
@@ -13665,8 +13665,19 @@ fn root_seat_id(record: &SessionRecord, records: &BTreeMap<&str, &SessionRecord>
 }
 
 impl SessionRecord {
-    fn is_stopped(&self) -> bool {
+    pub(crate) fn lifecycle_status(&self) -> &str {
+        if self.is_stopped() {
+            "stopped"
+        } else {
+            normalized_status(&self.status)
+        }
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        // Retirement persists both fields. Keep the terminal marker authoritative
+        // if a delayed status-only writer leaves the activity status behind.
         normalized_status(&self.status) == "stopped"
+            || self.completion_status.as_deref() == Some("killed")
     }
 
     fn is_live_for_registry(&self) -> bool {
@@ -13798,16 +13809,16 @@ pub struct SessionResponse {
 
 impl From<SessionRecord> for SessionResponse {
     fn from(session: SessionRecord) -> Self {
-        let status = normalized_status(&session.status);
+        let status = session.lifecycle_status().to_owned();
         let friendly_name = session.cached_display_name();
         let is_maintainer = session.aliases.iter().any(|alias| alias == "maintainer");
         let telegram_thread_id = session.resolved_telegram_thread_id();
-        let activity_state = projected_activity_state(&session, status);
+        let activity_state = projected_activity_state(&session, &status);
         Self {
             id: session.id,
             name: session.name,
             working_dir: session.working_dir,
-            status: status.to_owned(),
+            status,
             created_at: session.created_at,
             last_activity: session.last_activity,
             completed_at: session.completed_at,
@@ -13878,7 +13889,7 @@ pub struct ChildSessionResponse {
 
 impl From<SessionRecord> for ChildSessionResponse {
     fn from(session: SessionRecord) -> Self {
-        let status = normalized_status(&session.status).to_owned();
+        let status = session.lifecycle_status().to_owned();
         let friendly_name = session.cached_display_name();
         let spawned_at = session
             .spawned_at
@@ -13978,6 +13989,19 @@ fn normalized_status(status: &str) -> &str {
         "waiting_input" | "waiting_permission" | "error" => "idle",
         "running" | "idle" | "stopped" => status,
         _ => status,
+    }
+}
+
+fn raw_session_is_stopped(session: &Map<String, Value>) -> bool {
+    normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped"
+        || json_text(session.get("completion_status")).as_deref() == Some("killed")
+}
+
+fn effective_raw_session_status(session: &Map<String, Value>) -> String {
+    if raw_session_is_stopped(session) {
+        "stopped".to_owned()
+    } else {
+        json_text(session.get("status")).unwrap_or_else(|| "running".to_owned())
     }
 }
 
@@ -15458,6 +15482,109 @@ mod tests {
         session.activity_hook_at = Some("2026-06-01T00:01:00Z".to_owned());
 
         assert_eq!(claude_hook_gate(&session), ClaudeHookGate::Stale);
+    }
+
+    #[test]
+    fn killed_completion_marker_keeps_status_drift_out_of_the_live_roster() {
+        let state_file = unique_temp_path("killed-status-drift");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "retired1",
+                    "name": "claude-retired1",
+                    "working_dir": "/repo",
+                    "tmux_session": "claude-retired1",
+                    "provider": "claude",
+                    "parent_session_id": "parent1",
+                    "status": "idle",
+                    "completion_status": "killed",
+                    "completed_at": "2026-06-01T00:02:00Z",
+                    "stopped_at": "2026-06-01T00:02:00Z",
+                    "context_used_percentage": 38.0,
+                    "context_sampled_at": "2026-06-01T00:01:00Z",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:02:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(state_file.clone());
+
+        assert!(store.list_sessions(false).unwrap().is_empty());
+        let retained = store.list_sessions(true).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert!(retained[0].is_stopped());
+        assert!(!store
+            .apply_claude_pre_tool_use_hook("retired1", Some("Bash"))
+            .unwrap());
+        assert!(!store
+            .apply_claude_user_prompt_submit_hook("retired1", None)
+            .unwrap());
+        let input = store
+            .send_core_input(
+                "retired1",
+                SendCoreInputRequest {
+                    text: "must not deliver".to_owned(),
+                    delivery_mode: "sequential".to_owned(),
+                    sender_session_id: None,
+                    from_sm_send: false,
+                    timeout_seconds: None,
+                    notify_on_delivery: false,
+                    notify_after_seconds: None,
+                    notify_on_stop: false,
+                    remind_soft_threshold: None,
+                    remind_hard_threshold: None,
+                    remind_cancel_on_reply_session_id: None,
+                    parent_session_id: None,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!input.delivered);
+        assert_eq!(input.status, "stopped");
+        let clear_request = ClearSessionRequest {
+            prompt: None,
+            requester_session_id: Some("parent1".to_owned()),
+        };
+        assert!(matches!(
+            store
+                .clear_core_session("retired1", clear_request.clone())
+                .unwrap(),
+            CoreClearOutcome::NotRunning
+        ));
+        assert!(matches!(
+            store
+                .clear_core_session_with_runtime(
+                    "retired1",
+                    clear_request,
+                    &TmuxRuntime::from_config(&crate::config::RustCoreConfig::default()),
+                )
+                .unwrap(),
+            CoreClearOutcome::NotRunning
+        ));
+        assert_eq!(
+            store
+                .get_context_snapshot("retired1")
+                .unwrap()
+                .unwrap()
+                .lifecycle_status,
+            "stopped"
+        );
+        assert_eq!(
+            store.get_session("retired1").unwrap().unwrap().status,
+            "idle"
+        );
+        let restored = store.restore_core_session("retired1").unwrap().unwrap();
+        let CoreRestoreOutcome::Restored(restored) = restored else {
+            panic!("killed-marker session should be restorable");
+        };
+        assert_eq!(restored.status, "running");
+        assert_eq!(restored.completion_status, None);
+        assert_eq!(store.list_sessions(false).unwrap().len(), 1);
+
+        let _ = fs::remove_file(state_file);
     }
 
     #[test]
