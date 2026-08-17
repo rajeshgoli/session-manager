@@ -86,6 +86,20 @@ reminders, and ownership relationships. A provider session ID remains usable
 for explicit diagnostics or consultation with an old incarnation. Historical
 holder records remain durable.
 
+Addressing is explicit:
+
+- `355-root` resolves to the current holder at operation acceptance time;
+- `355-root@previous` resolves to the immediately preceding incarnation and is
+  frozen to its agent ID before delivery;
+- an exact agent ID addresses that specific incarnation, regardless of which
+  seat it formerly held; and
+- `sm seat history 355-root` lists holder agent IDs, acquisition/release times,
+  and current lifecycle state so any older predecessor can be selected.
+
+Seat-relative selectors are conveniences, not mutable aliases carried inside a
+queued message. The accepted message stores the resolved seat generation and
+agent ID, preventing a later rotation from silently changing its recipient.
+
 ### 3. Immutable spawn request
 
 Issue #1264 supplies an immutable prompt artifact. A policy-enabled spawn
@@ -139,6 +153,45 @@ fallback to ordinary main-thread delivery or arbitrary transcript-tail replay.
 All spawned workers remain SM-managed. `ephemeral_task_worker` means a
 short-lived SM child with automatic completion cleanup, not a Claude/Codex
 private subagent.
+
+#### Ephemeral worker closeout
+
+An ephemeral worker receives a durable lifecycle and cleanup manifest when SM
+creates it. The manifest distinguishes resources SM owns from paths or branches
+the worker merely borrows, and records:
+
+- repository identity, working directory, and owned worktree path;
+- base/head commits and local/remote branch ownership;
+- linked issue IDs, PR ID/head/base, and the exact closing-reference contract;
+- current review request and whether a successor is expected to handle it;
+- artifacts that must be retained; and
+- cleanup owner, state, and completed actions.
+
+At provider Stop, task-complete, PR/review wake, and context-rotation boundaries,
+SM deterministically checks known Git/GitHub/session facts. If task state is
+still semantically ambiguous, SM invokes isolated `/btw` on the worker with the
+manifest and applicable policy, asking for a structured closeout claim: work
+complete, awaiting review, awaiting external input, or follow-up required, plus
+the claimed cleanup actions. The claim is evidence, not authority; SM verifies
+each action before performing it.
+
+Automatic cleanup requires all applicable checks:
+
+- the worktree is SM-owned and `git status --porcelain` is empty;
+- no unpushed commit or unretained artifact would become unreachable;
+- the recorded PR is merged/closed, or the no-PR completion contract is met;
+- only the recorded owned local/remote branch is selected for deletion; and
+- issue closure is observed through the recorded PR closing reference or an
+  explicit policy-authorized action, never inferred from a branch name.
+
+Dirty, shared, unpushed, ambiguous, or still-in-review state fails closed. SM
+keeps the worker and resources, records the exact blocker, and routes the
+follow-up to that worker or a policy-selected successor. If review is pending,
+the task identity and cleanup manifest transfer to the successor so cleanup is
+part of completing the task, not a separate fleet-wide cleanup job. Once facts
+verify clean completion, SM removes owned worktree/branches and retires the
+ephemeral incarnation under policy authority; the worker need not remember a
+self-retirement command.
 
 ### 5. Deterministic decision
 
@@ -222,6 +275,46 @@ children, the stable seat, monitor routes, and lane-owned registrations;
 predecessor becomes the successor's child and remains directly addressable by
 its provider session ID. A durable scoped override may defer rotation.
 
+The handoff prompt is assembled by SM, not authored solely by the policy
+document. A fixed versioned prompt template supplies the structured output
+contract. SM adds the applicable rotation/role clauses from the approved policy
+document, current seat/child/routing/task facts, the completed-context identity,
+and the bounded active-turn delta. `/btw` summarizes the main thread against
+those requirements into an immutable handoff artifact. Policy controls what the
+handoff must preserve; SM supplies machine facts and verifies identifiers.
+
+#### Rotation message streams
+
+The outgoing and incoming incarnations receive different visible messages
+because identity and behavior changes must not be implicit:
+
+1. At preflight, the outgoing holder receives a control message stating the
+   measured context, target threshold, that new discretionary work will pause,
+   and the exact scoped-override command. It may finish its current atomic work.
+2. At the next safe boundary, SM runs the handoff `/btw` invisibly. Its prompt
+   and answer do not enter the outgoing main thread; this avoids polluting the
+   context merely to extract state.
+3. SM starts the successor in provisional `incoming` state with one immutable
+   initial brief containing the target seat, predecessor agent ID, handoff
+   artifact, policy version, current children, pending routed events, open
+   review/cleanup manifests, and an instruction to verify identity with
+   `sm me`. It cannot accept seat-routed discretionary work before commit.
+4. Provider readiness and completion of that first orientation turn are
+   observed by SM hooks; the successor does not need to remember an approval or
+   ready command. Failure leaves the predecessor holding the seat.
+5. The atomic commit changes the seat generation and routes, reparents the
+   frozen child set, and attaches the predecessor beneath the successor.
+6. The successor receives a visible commit message naming the seat and
+   generation it now holds, the predecessor ID, and transferred responsibilities.
+   Queued seat work is then released to it.
+7. The predecessor receives a direct agent-ID message stating that rotation
+   completed, naming the successor and its new consult-only/cleanup obligations.
+
+Visible control messages are used only where an agent's identity, authority, or
+required behavior changes. Hidden `/btw` is used for state extraction. The owner
+is notified only on failure, an override, or a policy-defined escalation; normal
+policy-authorized rotation requires no human or per-agent approval.
+
 ## Execution plan
 
 ### Delivery topology and controls
@@ -296,6 +389,7 @@ and one terminal telemetry row per attempted spawn.
 | 3A | Terra/high | Context profiles, initial-task to follow-up transitions, preflight/rotation/draining thresholds, and control-plane exceptions | 1A, 2A | Parallel |
 | 3B | Terra/high | Route sends, monitors, email replies, queue/review wakes, reminders, and ownership through stable seat keys while preserving direct agent-ID addressing | 1B | Parallel |
 | 3C | Luna/high | Inventory every persisted target/owner field and add mechanical routing/compatibility fixtures; report omissions to 3B | 1B | Parallel scout/test lane |
+| 3D | Terra/high | Ephemeral-worker lifecycle and verified cleanup manifests, including review-pending succession and fail-closed Git/GitHub checks | 1B, 2A, 2B | Parallel after contracts land |
 
 Sol/high maintainer performs the cross-subsystem integration review after 3A
 and 3B merge; this is review/integration work, not a separate implementation
@@ -313,23 +407,30 @@ agent.
 
 1. Maintainer deploys lane 355 in **shadow mode**. Deterministic named-seat
    checks and generic `/btw` classifications run and record telemetry, but do
-   not reject or rewrite launches.
-2. Collect 20-30 real spawn evaluations. Luna/high performs mechanical
-   analysis of cache reads, latency, model mix, repeated-context amplification,
-   and golden-decision agreement; Sol/high adjudicates only semantic misses.
-3. Owner checkpoint: review decisions and telemetry. Choose optimizations from
-   measured data rather than precommitting to summary caching or a cheaper
-   evaluator.
-4. Enable deterministic named-seat/model enforcement first, generic spawn
+   not initially reject or rewrite launches.
+2. Keep shadow evaluation running continuously while steps 3-5 proceed. It
+   records both the policy counterfactual and actual agent behavior, including
+   caller overrides, so implementation and staged enforcement generate useful
+   telemetry rather than waiting for a separate observation phase.
+3. Luna/high analyzes a rolling sample, with an initial target of 20-30 real
+   spawn evaluations: cache reads, latency, model mix, repeated-context
+   amplification, policy/actual disagreement, and golden-decision agreement.
+   Sol/high adjudicates only semantic misses. This analysis runs alongside the
+   remaining implementation work.
+4. Owner reviews decisions and telemetry on a rolling basis. Optimization
+   choices remain data-driven, but review does not pause unrelated implementation
+   or deterministic enforcement.
+5. Enable deterministic named-seat/model enforcement first, generic spawn
    classification second, context/draining third, and automatic rotation last.
-   Every stage retains a durable seat-holder override reason.
-5. Open one epic-to-main PR. The maintainer runs the full review protocol,
+   Shadow records continue beside every stage, and every enforced stage retains
+   a durable seat-holder override reason.
+6. Open one epic-to-main PR. The maintainer runs the full review protocol,
    deploys only after it exits, verifies Claude and Codex live paths, then
    removes all phase worktrees and retires all implementation seats.
 
 ### Expected critical path
 
-`#1265 -> spec approval -> 1A/1B -> 2A -> 2B -> 3A/3B -> 4A -> shadow data -> owner enforcement approval`
+`#1265 -> spec approval -> 1A/1B -> 2A -> 2B -> 3A/3B/3D -> 4A -> staged live rollout`
 
 Telemetry (1C), corpus/tests (1D), watch UX (2C), routing audit (3C), and
 override UX (4B) run beside that path. This preserves wall-clock parallelism
