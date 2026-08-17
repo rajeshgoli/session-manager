@@ -4009,7 +4009,15 @@ impl SessionStore {
                 .as_deref()
                 .map(|detail| format!("{error_message}; {detail}"))
                 .unwrap_or_else(|| error_message.clone());
-            mark_runtime_launch_failed(&mut state, &launch_id, &record.id, true, &failure_reason)?;
+            let remove_provisional_session =
+                remove_failed_provisional_runtime_session(&state, &record.id);
+            mark_runtime_launch_failed(
+                &mut state,
+                &launch_id,
+                &record.id,
+                remove_provisional_session,
+                &failure_reason,
+            )?;
             self.write_raw_json_value(&state)?;
             return Err(match recovery_detail {
                 Some(detail) => error.context(format!("{error_message}; {detail}")),
@@ -4039,11 +4047,13 @@ impl SessionStore {
                     let _ = runtime.kill_session(&record.tmux_session);
                     let _guard = self.write_guard()?;
                     let mut state = self.load_raw_json_value()?;
+                    let remove_provisional_session =
+                        remove_failed_provisional_runtime_session(&state, &record.id);
                     mark_runtime_launch_failed(
                         &mut state,
                         &launch_id,
                         &record.id,
-                        true,
+                        remove_provisional_session,
                         &error.to_string(),
                     )?;
                     self.write_raw_json_value(&state)?;
@@ -13057,6 +13067,20 @@ fn mark_runtime_launch_applied(
     Ok(())
 }
 
+fn remove_failed_provisional_runtime_session(state: &Value, session_id: &str) -> bool {
+    !state
+        .get("sessions")
+        .and_then(Value::as_array)
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session.get("id").and_then(Value::as_str) == Some(session_id))
+        })
+        .is_some_and(|session| {
+            completion_status_is_retired(json_text(session.get("completion_status")).as_deref())
+        })
+}
+
 fn mark_runtime_launch_failed(
     state: &mut Value,
     launch_id: &str,
@@ -14931,6 +14955,54 @@ mod tests {
         .unwrap();
 
         assert!(request.spawn_brief.is_none());
+    }
+
+    #[test]
+    fn failed_create_launch_preserves_a_concurrently_retired_session() {
+        let mut retired = reparent_test_session("retired01", None, "secret");
+        let retired = retired.as_object_mut().unwrap();
+        retired.insert("status".to_owned(), Value::String("stopped".to_owned()));
+        retired.insert(
+            "completion_status".to_owned(),
+            Value::String("retired".to_owned()),
+        );
+        retired.insert(
+            "stopped_at".to_owned(),
+            Value::String("2026-06-01T00:02:00Z".to_owned()),
+        );
+        let mut state = json!({
+            "sessions": [retired],
+            "session_runtime_launches": [{
+                "id": "launch01",
+                "operation_kind": "create",
+                "session_id": "retired01",
+                "tmux_session": "claude-retired01",
+                "working_dir": "/repo",
+                "log_file": "/tmp/retired01.log",
+                "provider": "codex-fork",
+                "credential_sha256": sha256_text("secret"),
+                "status": "launching",
+                "created_at": "2026-06-01T00:00:00Z",
+                "updated_at": "2026-06-01T00:00:00Z"
+            }]
+        });
+
+        assert!(!remove_failed_provisional_runtime_session(
+            &state,
+            "retired01"
+        ));
+        mark_runtime_launch_failed(
+            &mut state,
+            "launch01",
+            "retired01",
+            false,
+            "runtime exited during startup",
+        )
+        .unwrap();
+
+        assert_eq!(state["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(state["sessions"][0]["completion_status"], "retired");
+        assert_eq!(state["session_runtime_launches"][0]["status"], "failed");
     }
 
     static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
