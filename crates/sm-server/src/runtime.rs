@@ -1450,15 +1450,8 @@ fn codex_event_stream_has_user_turn(path: &Path, initial_offset: u64, prompt: &s
         let legacy_user_turn_matches = event
             .get("payload")
             .and_then(|payload| payload.get("UserTurn"))
-            .and_then(|turn| turn.get("items"))
-            .and_then(Value::as_array)
-            .is_some_and(|items| {
-                items.iter().any(|item| {
-                    item.get("text")
-                        .and_then(Value::as_str)
-                        .is_some_and(|text| codex_brief_text_matches(text, prompt))
-                })
-            });
+            .and_then(codex_user_turn_text)
+            .is_some_and(|text| codex_brief_text_matches(&text, prompt));
         let schema_v2_user_message_matches = event.get("schema_version").and_then(Value::as_u64)
             == Some(2)
             && event.get("event_type").and_then(Value::as_str) == Some("item/started")
@@ -1493,15 +1486,27 @@ fn codex_brief_text_matches(provider_text: &str, submitted_brief: &str) -> bool 
 fn codex_user_message_text(content: &Value) -> Option<String> {
     match content {
         Value::String(text) => Some(text.clone()),
-        Value::Array(parts) => parts.iter().try_fold(String::new(), |mut text, part| {
-            if part.get("type").and_then(Value::as_str) != Some("text") {
-                return None;
-            }
-            text.push_str(part.get("text").and_then(Value::as_str)?);
-            Some(text)
-        }),
+        Value::Array(parts) => codex_text_parts(parts),
         _ => None,
     }
+}
+
+/// Return the complete text represented by a retained legacy `UserTurn`.
+fn codex_user_turn_text(turn: &Value) -> Option<String> {
+    turn.get("items")
+        .and_then(Value::as_array)
+        .and_then(|parts| codex_text_parts(parts))
+}
+
+/// Normalize text-only event parts without accepting a matching fragment.
+fn codex_text_parts(parts: &[Value]) -> Option<String> {
+    parts.iter().try_fold(String::new(), |mut text, part| {
+        if part.get("type").and_then(Value::as_str) != Some("text") {
+            return None;
+        }
+        text.push_str(part.get("text").and_then(Value::as_str)?);
+        Some(text)
+    })
 }
 
 fn split_send_text_chunks(text: &str, max_chunk_chars: usize) -> Vec<&str> {
@@ -2666,6 +2671,14 @@ esac
             "handoff prompt",
             "handoff prompt \n"
         ));
+        let fragmented_legacy_turn = serde_json::json!({
+            "items": [
+                {"type": "text", "text": "handoff prompt"},
+                {"type": "text", "text": " unexpected suffix"}
+            ]
+        });
+        assert!(!codex_user_turn_text(&fragmented_legacy_turn)
+            .is_some_and(|text| codex_brief_text_matches(&text, "handoff prompt\n")));
 
         let (_tmux_binary, _log_path, temp_dir) = fake_tmux_binary();
         let legacy_events = temp_dir.join("legacy-events.jsonl");
