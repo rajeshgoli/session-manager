@@ -3978,8 +3978,14 @@ impl SessionStore {
         }
         store_session_runtime_launch_records(&mut state, &launch_records)?;
         self.write_raw_json_value(&state)?;
+        // Runtime startup and provider acknowledgement can wait for tens of
+        // seconds. The launch record is durable now, so never retain the
+        // global state mutex while waiting for external provider progress.
+        drop(_guard);
 
         if let Err(error) = runtime.create_session(&spec) {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
             let error_message = error.to_string();
             let recovery_detail = request.spawn_brief.as_ref().and_then(|brief| {
                 state
@@ -4031,6 +4037,8 @@ impl SessionStore {
                 }
                 Err(error) => {
                     let _ = runtime.kill_session(&record.tmux_session);
+                    let _guard = self.write_guard()?;
+                    let mut state = self.load_raw_json_value()?;
                     mark_runtime_launch_failed(
                         &mut state,
                         &launch_id,
@@ -4048,6 +4056,8 @@ impl SessionStore {
                 }
             }
         }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
         record.status = "running".to_owned();
         record.stopped_at = None;
         record.last_activity = now_rfc3339();
