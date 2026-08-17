@@ -110,7 +110,7 @@ use crate::queue::{
     QueueJobRecord, QueueMessageMetadata, RetainedQueueStore, RetryCodexReviewRequest,
     ScheduledReminder,
 };
-use crate::runtime::{CodexModelValidationError, TmuxRuntime};
+use crate::runtime::{CodexModelValidationError, InitialBriefDeliveryError, TmuxRuntime};
 #[cfg(test)]
 use crate::sessions::codex_fork_legacy_event_stream_path_from_log_file;
 use crate::sessions::{
@@ -3512,11 +3512,7 @@ async fn create_session(
     let session = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_provider_supported(&payload)?;
         ensure_core_runtime_request_node_supported(&state, &payload)?;
-        let runtime = TmuxRuntime::from_app_config(&state.config);
-        state
-            .session_store
-            .create_core_session_with_runtime(payload, log_dir, &runtime)
-            .map_err(core_session_create_api_error)?
+        create_runtime_core_session(state.clone(), payload, log_dir).await?
     } else {
         state.session_store.create_core_session(payload, log_dir)?
     };
@@ -3643,11 +3639,7 @@ async fn spawn_session(
     let child = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_provider_supported(&create_payload)?;
         ensure_core_runtime_request_node_supported(&state, &create_payload)?;
-        let runtime = TmuxRuntime::from_app_config(&state.config);
-        state
-            .session_store
-            .create_core_session_with_runtime(create_payload, log_dir, &runtime)
-            .map_err(core_session_create_api_error)?
+        create_runtime_core_session(state.clone(), create_payload, log_dir).await?
     } else {
         state
             .session_store
@@ -3669,6 +3661,27 @@ async fn spawn_session(
     Ok(Json(serde_json::to_value(SpawnSessionResponse::from(
         child,
     ))?))
+}
+
+/// Runtime creation includes tmux and provider polling. Keep it off Axum's
+/// async workers; its launch record is made durable before those waits begin.
+async fn create_runtime_core_session(
+    state: Arc<AppState>,
+    payload: CreateCoreSessionRequest,
+    log_dir: Option<PathBuf>,
+) -> Result<SessionRecord, ApiError> {
+    let runtime = TmuxRuntime::from_app_config(&state.config);
+    let store = state.session_store.clone();
+    tokio::task::spawn_blocking(move || {
+        store.create_core_session_with_runtime(payload, log_dir, &runtime)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::Internal(anyhow::anyhow!(
+            "runtime session creation worker failed: {error}"
+        ))
+    })?
+    .map_err(core_session_create_api_error)
 }
 
 async fn start_session_review(
@@ -12165,6 +12178,17 @@ fn core_session_create_api_error(error: anyhow::Error) -> ApiError {
         return ApiError::Status {
             status,
             detail: validation.to_string(),
+        };
+    }
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<InitialBriefDeliveryError>().is_some())
+    {
+        return ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: format!(
+                "{error}. The immutable accepted brief and its launch record were retained; retry only after confirming provider state."
+            ),
         };
     }
     error.into()

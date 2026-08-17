@@ -1242,6 +1242,10 @@ pub struct RustCoreConfig {
     #[serde(default)]
     pub runtime_start_settle_ms: Option<u64>,
     #[serde(default)]
+    pub runtime_initial_brief_ready_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub runtime_initial_brief_ack_timeout_ms: Option<u64>,
+    #[serde(default)]
     pub send_keys_settle_ms: Option<f64>,
     #[serde(default)]
     pub send_keys_settle_max_ms: Option<f64>,
