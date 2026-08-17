@@ -19,7 +19,9 @@ incomplete for remote clients and forces local agents to bypass the API.
    pending `queue-completion` messages after recovery and every completion retry
    interval. Target discovery is category-specific, but delivery drains the
    target's normal queue in FIFO order so a completion cannot bypass an older
-   sequential message. Busy sessions retain the message for a later attempt.
+   sequential message. Background delivery requires both an idle durable
+   lifecycle state and a fresh provider-specific input-ready observation. Busy
+   or non-writable sessions retain the full queue for a later attempt.
 2. Delivery remains idempotent through the existing durable message ID
    `queue-completion-<job-id>` and `delivered_at` marker.
 3. One target's delivery failure must not discard another target's pending wake.
