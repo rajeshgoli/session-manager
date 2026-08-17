@@ -428,7 +428,7 @@ The initial requirement-effect ledger includes:
 | Requirement family | Incremental cost boundary | Immediate benefit evidence |
 |---|---|---|
 | Spawn intent and model/vehicle policy | classifier plus injected rewrite and any retry | corrected provider/model/vehicle, prevented invalid launch, retry/rework rate |
-| Stable seats, holder liveness, and rotation fencing | resolution/alarm/queued-delivery operations plus fence wait, stale-snapshot abort, commit, and post-commit verification | stale-holder deliveries prevented, manual re-points avoided, topology races rejected, eventual delivery success |
+| Stable seats, holder liveness, and rotation fencing | resolution/alarm/queued-delivery operations plus fence wait, stale-snapshot abort, provisional-successor rollback, commit, and post-commit verification | stale-holder deliveries prevented, manual re-points avoided, topology races rejected, provisional successor leaks prevented, eventual delivery success |
 | Context profiles and rotation thresholds | preflight, handoff, orientation, probe, and retirement spans | quota/tokens per completed unit of work, threshold overrides, rotation failures, time to productive successor |
 | Handoff summary and directed probe | summary and probe spans reported separately | novel actionable items, corrections to the summary, ruled-out paths preserved, successor actions attributable to each item |
 | Codex native-compaction snapshots | each snapshot and restore/reconstruction attempt | successful restore, reconstruction time avoided, state-loss incidents |
@@ -621,7 +621,13 @@ because identity and behavior changes must not be implicit:
    observed by SM hooks. During orientation, the successor verifies the frozen
    proposed edge set and machine facts; it does not claim the mutation already
    occurred and does not need to remember an approval or ready command. Failure
-   leaves the predecessor holding the seat.
+   leaves the predecessor holding the seat and triggers provisional-successor
+   rollback before a retry: SM stops or terminalizes the successor, removes its
+   provisional hierarchy, alias, route, queue, and monitor state, retains a
+   `rotation_orientation_rejected` audit row, and releases the ownership fence
+   under recorded recovery rules. If terminalization or fence release cannot be
+   proved, rotation remains fail-closed with an explicit recovery blocker; it
+   does not launch another successor or return a completed rotation.
 5. The atomic commit compare-and-swaps the frozen topology version, changes the
    seat generation and routes, reparents exactly the frozen child set, and
    attaches the predecessor beneath the successor. Any topology drift aborts
