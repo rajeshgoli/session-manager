@@ -596,9 +596,11 @@ compare-and-swap on the same topology version and transfers exactly the frozen
 children, stable seat, monitor routes, and lane-owned registrations;
 predecessor becomes the successor's child and remains directly addressable by
 its provider session ID. A version mismatch aborts the provisional transition,
-retains the fence for retry or resolves it through the explicit rebinding rule
-below, and requires a fresh snapshot and orientation. A durable scoped override
-may defer rotation.
+terminalizes any oriented provisional successor, closes its pending transition,
+then retains the claimed seat-intent set under a reconstructed fence or resolves
+it through the explicit rebinding rule below. A retry requires a new transition
+ID, fresh snapshot, handoff, successor, and orientation; the stale successor is
+never reused or rebriefed. A durable scoped override may defer rotation.
 
 Every pre-commit abort resolves the claimed operation set explicitly. An
 immediate retry retains the same fence and frozen seat-intent set while creating
@@ -695,7 +697,10 @@ because identity and behavior changes must not be implicit:
 5. The atomic commit compare-and-swaps the frozen topology version, changes the
    seat generation and routes, reparents exactly the frozen child set, and
    attaches the predecessor beneath the successor. Any topology drift aborts
-   before ownership changes and starts a newly oriented attempt.
+   before ownership changes, stops or terminalizes the oriented successor,
+   removes its pending hierarchy/route state, and records
+   `rotation_commit_stale`. Only after that rollback is proved may recovery
+   reconstruct the fence and start the wholly new transition described above.
 6. The successor receives a visible commit message naming the seat and
    generation it now holds, the predecessor ID, transferred responsibilities,
    and the complete before/after ownership edge list. It then independently
