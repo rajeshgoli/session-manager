@@ -48,6 +48,28 @@ follow-up #1271 now provide verified idle-composer admission, durable recovery
 stages, and fail-closed ambiguous-state handling. Larger replay tails and a
 warm external classifier did not provide a reliable authority boundary.
 
+### Live omitted-tier fixture
+
+Session `355-617-death-1` (`aa6c1120`) was spawned for an engineer task without
+an explicit tier and began on the Claude default. Direct provider usage records
+show 96 Fable messages with about 19.8M cache-read tokens before later Opus
+activity; the projected `seat_meta.model` simultaneously reported `sonnet`.
+This is a binding hostile fixture for both admission and attestation:
+
+- policy must classify the frozen task as routine/Sonnet or complex/Opus from
+  evidence and pass an explicit canonical model/effort to the launch adapter;
+- a policy-governed engineer spawn may never inherit the provider default merely
+  because the caller omitted `--model`;
+- synchronous launch validation rejects an absent, unsupported, or noncanonical
+  model before child allocation; and
+- provider-event attestation, not the projected roster model field or agent
+  self-report, verifies what actually ran and stops a mismatch before the child
+  accepts further work.
+
+The fixture records avoided wrong-tier tokens as the benefit. It also records
+any bootstrap/attestation tokens consumed, so preventing a 19.8M-token default
+mistake is compared against the policy gate's actual cost rather than asserted.
+
 ## Role-context review results
 
 Read-only Claude-native forks of the current lane-355 orchestrator, Fable spec
@@ -681,7 +703,7 @@ or throwaway implementations:
 
 | ID | Owner | Work | Dependency | Target |
 |---|---|---|---|---|
-| D0 | Maintainer Sol/high | Freeze policy-kernel, event, and admission interfaces plus dogfood fixtures | approved spec/0F | 30-60 min |
+| D0 | Maintainer Sol/high | Freeze policy-kernel, event, and admission interfaces plus dogfood fixtures, including `aa6c1120` omitted-tier/misreport evidence | approved spec/0F | 30-60 min |
 | D1 | Terra/high | Minimal policy store/projection and deterministic decision kernel | D0 | 1.5-3 h; parallel |
 | D2 | Terra/high | Append-only evidence ledger, forecast/breaker rows, and read-only CLI/API | D0 | 1.5-3 h; parallel |
 | D3 | Sol/high | Atomic spawn admission and provider attestation using D0 interfaces | D0; integrates D1/D2 | 2.5-5 h; parallel start |
