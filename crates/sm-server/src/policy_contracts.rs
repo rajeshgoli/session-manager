@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const SPAWN_REQUEST_SCHEMA: &str = "sm.policy.spawn_request.v1";
 pub const DECISION_SCHEMA: &str = "sm.policy.decision.v1";
@@ -430,6 +431,7 @@ impl PolicyOverrideRecord {
         &self,
         request: &PolicySpawnRequest,
         decision: &PolicyDecision,
+        now: OffsetDateTime,
     ) -> Result<(), PolicyContractError> {
         self.validate()?;
         decision.validate_for_request(request)?;
@@ -446,6 +448,13 @@ impl PolicyOverrideRecord {
             return Err(PolicyContractError::new(
                 "override_not_authorized",
                 "only an authorized override may be consumed",
+            ));
+        }
+        let expires_at = parse_timestamp("override.expires_at", &self.expires_at)?;
+        if now >= expires_at {
+            return Err(PolicyContractError::new(
+                "override_expired",
+                "override expired before atomic consumption",
             ));
         }
         if self.request_id != request.request_id
@@ -603,6 +612,58 @@ impl PolicyAdmissionResult {
             }
         }
     }
+
+    pub fn validate_allowed_launch(
+        &self,
+        request: &PolicySpawnRequest,
+        decision: &PolicyDecision,
+        attestation: &PolicyRuntimeAttestation,
+    ) -> Result<(), PolicyContractError> {
+        self.validate()?;
+        decision.validate_for_request(request)?;
+        attestation.validate()?;
+        let PolicyAdmissionOutcome::Allowed {
+            decision_id,
+            child_session_id,
+            profile,
+        } = &self.outcome
+        else {
+            return Err(PolicyContractError::new(
+                "admission_not_allowed",
+                "only an allowed admission can validate a launched child",
+            ));
+        };
+        if !matches!(decision.outcome, PolicyDecisionOutcome::Allow) {
+            return Err(PolicyContractError::new(
+                "admission_decision_not_allow",
+                "allowed admission must bind to an allow decision",
+            ));
+        }
+        let expected_profile = decision.resolved_profile.as_ref().ok_or_else(|| {
+            PolicyContractError::new(
+                "missing_resolved_profile",
+                "allow decision is missing its resolved profile",
+            )
+        })?;
+        if decision_id != &decision.decision_id || profile != expected_profile {
+            return Err(PolicyContractError::new(
+                "admission_decision_mismatch",
+                "allowed admission does not match its allow decision",
+            ));
+        }
+        if !attestation.matches_launch(
+            expected_profile,
+            &decision.decision_id,
+            &request.launch_intent_id,
+            child_session_id,
+        ) {
+            return Err(PolicyContractError::new(
+                "admission_attestation_mismatch",
+                "allowed admission does not have matching provider runtime evidence",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -611,6 +672,8 @@ pub struct EstimatedCounter {
     pub value: u64,
     pub lower_bound: u64,
     pub upper_bound: u64,
+    pub source: String,
+    pub estimated: bool,
     pub method: String,
     pub confidence: String,
 }
@@ -623,6 +686,7 @@ impl EstimatedCounter {
                 "estimated counter must fall within its lower and upper bounds",
             ));
         }
+        require_nonempty("counter.source", &self.source)?;
         require_nonempty("counter.method", &self.method)?;
         require_nonempty("counter.confidence", &self.confidence)
     }
@@ -635,6 +699,8 @@ pub struct EstimatedAmount {
     pub lower_bound: f64,
     pub upper_bound: f64,
     pub unit: String,
+    pub source: String,
+    pub estimated: bool,
     pub method: String,
     pub confidence: String,
 }
@@ -654,6 +720,7 @@ impl EstimatedAmount {
             ));
         }
         require_nonempty("amount.unit", &self.unit)?;
+        require_nonempty("amount.source", &self.source)?;
         require_nonempty("amount.method", &self.method)?;
         require_nonempty("amount.confidence", &self.confidence)
     }
@@ -783,6 +850,18 @@ fn require_sha256(field: &'static str, value: &str) -> Result<(), PolicyContract
             format!("{field} must be a 64-character hexadecimal SHA-256 digest"),
         ))
     }
+}
+
+fn parse_timestamp(
+    field: &'static str,
+    value: &str,
+) -> Result<OffsetDateTime, PolicyContractError> {
+    OffsetDateTime::parse(value, &Rfc3339).map_err(|error| {
+        PolicyContractError::new(
+            "invalid_timestamp",
+            format!("{field} must be an RFC 3339 timestamp: {error}"),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1081,14 +1160,100 @@ mod tests {
         another_decision.request_id = another_request.request_id.clone();
 
         record
-            .validate_for_consumption(&request, &decision)
+            .validate_for_consumption(
+                &request,
+                &decision,
+                OffsetDateTime::parse("2026-08-17T22:10:00Z", &Rfc3339).unwrap(),
+            )
             .unwrap();
         assert_eq!(
             record
-                .validate_for_consumption(&another_request, &another_decision)
+                .validate_for_consumption(
+                    &another_request,
+                    &another_decision,
+                    OffsetDateTime::parse("2026-08-17T22:10:00Z", &Rfc3339).unwrap(),
+                )
                 .unwrap_err()
                 .code,
             "override_request_mismatch"
+        );
+    }
+
+    #[test]
+    fn override_consumption_rejects_an_expired_authorization() {
+        let request = request("355-root", None);
+        let mut decision = allow_decision(&request, profile("opus"));
+        decision.outcome = PolicyDecisionOutcome::Rewrite;
+        decision.capacity_lease = None;
+        decision.override_command = Some(format!(
+            "sm policy override --request {} --reason <text>",
+            request.request_id
+        ));
+        let record = PolicyOverrideRecord {
+            schema: OVERRIDE_SCHEMA.to_owned(),
+            override_id: "override-expired".to_owned(),
+            request_id: request.request_id.clone(),
+            request_digest: request.canonical_digest().unwrap(),
+            decision_id: decision.decision_id.clone(),
+            policy_version: request.policy_version.clone(),
+            issuer: request.caller.clone(),
+            reason: "temporary exception".to_owned(),
+            self_benefiting: false,
+            state: PolicyOverrideState::Authorized,
+            created_at: "2026-08-17T22:00:03Z".to_owned(),
+            expires_at: "2026-08-17T22:30:03Z".to_owned(),
+            consumed_at: None,
+        };
+
+        assert_eq!(
+            record
+                .validate_for_consumption(
+                    &request,
+                    &decision,
+                    OffsetDateTime::parse("2026-08-17T22:30:03Z", &Rfc3339).unwrap(),
+                )
+                .unwrap_err()
+                .code,
+            "override_expired"
+        );
+    }
+
+    #[test]
+    fn allowed_admission_requires_the_matching_attested_child() {
+        let request = request("355-root", Some("opus"));
+        let expected = profile("opus");
+        let decision = allow_decision(&request, expected.clone());
+        let admission = PolicyAdmissionResult {
+            schema: ADMISSION_RESULT_SCHEMA.to_owned(),
+            outcome: PolicyAdmissionOutcome::Allowed {
+                decision_id: decision.decision_id.clone(),
+                child_session_id: "child-expected".to_owned(),
+                profile: expected.clone(),
+            },
+        };
+        let mut attestation = PolicyRuntimeAttestation {
+            schema: ATTESTATION_SCHEMA.to_owned(),
+            decision_id: decision.decision_id.clone(),
+            launch_intent_id: request.launch_intent_id.clone(),
+            session_id: "child-expected".to_owned(),
+            provider: expected.provider.clone(),
+            model: expected.model.clone(),
+            effort: expected.effort.clone(),
+            evidence: RuntimeAttestationEvidence::ProviderEvent,
+            evidence_id: "event-child-expected-1".to_owned(),
+            observed_at: "2026-08-17T22:00:02Z".to_owned(),
+        };
+
+        admission
+            .validate_allowed_launch(&request, &decision, &attestation)
+            .unwrap();
+        attestation.session_id = "child-other".to_owned();
+        assert_eq!(
+            admission
+                .validate_allowed_launch(&request, &decision, &attestation)
+                .unwrap_err()
+                .code,
+            "admission_attestation_mismatch"
         );
     }
 
@@ -1098,6 +1263,8 @@ mod tests {
             value: 100,
             lower_bound: 80,
             upper_bound: 140,
+            source: "before_after_window".to_owned(),
+            estimated: true,
             method: "before_after_residual".to_owned(),
             confidence: "medium".to_owned(),
         };
@@ -1120,6 +1287,8 @@ mod tests {
             lower_bound: 0.31,
             upper_bound: 0.58,
             unit: "usd".to_owned(),
+            source: "claude_rate_card".to_owned(),
+            estimated: true,
             method: "rate_card".to_owned(),
             confidence: "medium".to_owned(),
         };
