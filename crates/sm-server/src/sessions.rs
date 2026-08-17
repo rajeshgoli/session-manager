@@ -3980,15 +3980,35 @@ impl SessionStore {
         self.write_raw_json_value(&state)?;
 
         if let Err(error) = runtime.create_session(&spec) {
-            mark_runtime_launch_failed(
-                &mut state,
-                &launch_id,
-                &record.id,
-                true,
-                &error.to_string(),
-            )?;
+            let error_message = error.to_string();
+            let recovery_detail = request.spawn_brief.as_ref().and_then(|brief| {
+                state
+                    .get("spawn_launch_intents")
+                    .and_then(Value::as_array)
+                    .and_then(|intents| {
+                        intents.iter().find(|intent| {
+                            intent.get("id").and_then(Value::as_str) == Some(brief.intent_id.as_str())
+                        })
+                    })
+                    .and_then(|intent| intent.get("artifact"))
+                    .and_then(|artifact| {
+                        let path = artifact.get("path").and_then(Value::as_str)?;
+                        let sha256 = artifact.get("sha256").and_then(Value::as_str)?;
+                        Some(format!(
+                            "accepted brief retained at {path} (sha256 {sha256}); inspect provider state before manually recovering it"
+                        ))
+                    })
+            });
+            let failure_reason = recovery_detail
+                .as_deref()
+                .map(|detail| format!("{error_message}; {detail}"))
+                .unwrap_or_else(|| error_message.clone());
+            mark_runtime_launch_failed(&mut state, &launch_id, &record.id, true, &failure_reason)?;
             self.write_raw_json_value(&state)?;
-            return Err(error);
+            return Err(match recovery_detail {
+                Some(detail) => error.context(format!("{error_message}; {detail}")),
+                None => error,
+            });
         }
         if let Some((excluded_ids, launched_at_ns)) = codex_cli_creation_binding.as_ref() {
             record.provider_resume_id = wait_for_codex_cli_provider_resume_id(

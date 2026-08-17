@@ -23,6 +23,8 @@ const DEFAULT_SEND_KEYS_SETTLE_PER_KI_MS: f64 = 60.0;
 const DEFAULT_SEND_KEYS_SETTLE_PER_EXTRA_LINE_MS: f64 = 15.0;
 const DEFAULT_SEND_KEYS_MAX_CHUNK_CHARS: usize = 4096;
 const CODEX_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_INITIAL_BRIEF_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_INITIAL_BRIEF_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 static SESSION_INPUT_LOCKS: OnceLock<Mutex<HashMap<String, Weak<SessionInputLock>>>> =
     OnceLock::new();
 
@@ -65,6 +67,8 @@ pub struct TmuxRuntime {
     tmux_history_limit: Option<u64>,
     prompt_mode: String,
     start_settle_ms: u64,
+    initial_brief_ready_timeout: Duration,
+    initial_brief_ack_timeout: Duration,
     send_keys_settle_ms: f64,
     send_keys_settle_max_ms: f64,
     send_keys_settle_per_ki_ms: f64,
@@ -111,6 +115,41 @@ pub enum CodexModelValidationError {
     },
     DiscoveryUnavailable(String),
 }
+
+/// A spawn brief reached the runtime but could not be proved accepted by its
+/// provider. The immutable artifact remains recorded for recovery.
+#[derive(Debug)]
+pub enum InitialBriefDeliveryError {
+    ProviderAcknowledgementUnavailable { provider: String },
+    ProviderReadinessTimedOut { provider: String },
+    ProviderAcceptanceTimedOut { provider: String },
+    SessionExited { provider: String },
+}
+
+impl std::fmt::Display for InitialBriefDeliveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProviderAcknowledgementUnavailable { provider } => write!(
+                formatter,
+                "initial spawn brief delivery is unverified for {provider}: this provider has no equivalent provider-originated acknowledgement"
+            ),
+            Self::ProviderReadinessTimedOut { provider } => write!(
+                formatter,
+                "timed out waiting for {provider} to become ready for the initial spawn brief"
+            ),
+            Self::ProviderAcceptanceTimedOut { provider } => write!(
+                formatter,
+                "timed out waiting for {provider} to acknowledge the initial spawn brief; it was not resent to avoid duplicate work"
+            ),
+            Self::SessionExited { provider } => write!(
+                formatter,
+                "{provider} exited before the initial spawn brief could be delivered"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for InitialBriefDeliveryError {}
 
 impl std::fmt::Display for CodexModelValidationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -178,6 +217,14 @@ impl TmuxRuntime {
                 .unwrap_or("argv")
                 .to_owned(),
             start_settle_ms: config.runtime_start_settle_ms.unwrap_or(300),
+            initial_brief_ready_timeout: config
+                .runtime_initial_brief_ready_timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_INITIAL_BRIEF_READY_TIMEOUT),
+            initial_brief_ack_timeout: config
+                .runtime_initial_brief_ack_timeout_ms
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_INITIAL_BRIEF_ACK_TIMEOUT),
             send_keys_settle_ms: finite_nonnegative_or_default(
                 config.send_keys_settle_ms,
                 DEFAULT_SEND_KEYS_SETTLE_MS,
@@ -1228,19 +1275,123 @@ impl TmuxRuntime {
         }
 
         if let Some(initial_message) = initial_stdin_prompt {
-            thread::sleep(Duration::from_millis(self.start_settle_ms));
-            match self.send_input(&spec.tmux_session, initial_message) {
-                Ok(true) => {}
-                Ok(false) => {
-                    bail!("tmux session exited before initial prompt could be delivered");
+            if spec.force_initial_prompt_stdin {
+                self.deliver_verified_initial_brief(spec, initial_message)?;
+            } else {
+                thread::sleep(Duration::from_millis(self.start_settle_ms));
+                match self.send_input(&spec.tmux_session, initial_message) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        bail!("tmux session exited before initial prompt could be delivered");
+                    }
+                    Err(error) if is_tmux_session_gone_error(&error) => {
+                        bail!("tmux session exited before initial prompt could be delivered");
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) if is_tmux_session_gone_error(&error) => {
-                    bail!("tmux session exited before initial prompt could be delivered");
-                }
-                Err(error) => return Err(error),
             }
         }
         Ok(())
+    }
+
+    /// Deliver an immutable spawn brief only after the provider exposes a
+    /// usable composer, and only report success after provider-side evidence.
+    ///
+    /// This deliberately does not retry after submission: a missing event can
+    /// mean the first submission was accepted, so another paste could run the
+    /// brief twice.
+    fn deliver_verified_initial_brief(&self, spec: &TmuxSessionSpec, prompt: &str) -> Result<()> {
+        let _guard = self.lock_session_input(&spec.tmux_session)?;
+        self.wait_for_initial_brief_readiness(&spec.tmux_session, &spec.provider)?;
+
+        if spec.provider != "codex-fork" {
+            return Err(
+                InitialBriefDeliveryError::ProviderAcknowledgementUnavailable {
+                    provider: spec.provider.clone(),
+                }
+                .into(),
+            );
+        }
+
+        let artifacts = self
+            .codex_fork_runtime_artifacts(spec)?
+            .expect("codex-fork must have runtime artifacts");
+        let initial_event_offset = fs::metadata(&artifacts.event_stream_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if !self.session_exists(&spec.tmux_session)? {
+            return Err(InitialBriefDeliveryError::SessionExited {
+                provider: spec.provider.clone(),
+            }
+            .into());
+        }
+        self.send_text_then_enter(&spec.tmux_session, prompt)?;
+        self.wait_for_codex_fork_initial_brief_acceptance(
+            &spec.tmux_session,
+            &artifacts.event_stream_path,
+            initial_event_offset,
+            prompt,
+        )
+    }
+
+    fn wait_for_initial_brief_readiness(&self, tmux_session: &str, provider: &str) -> Result<()> {
+        let deadline = Instant::now() + self.initial_brief_ready_timeout;
+        let mut directory_trust_accepted = false;
+        loop {
+            if !self.session_exists(tmux_session)? {
+                return Err(InitialBriefDeliveryError::SessionExited {
+                    provider: provider.to_owned(),
+                }
+                .into());
+            }
+            if !directory_trust_accepted && matches!(provider, "codex" | "codex-fork") {
+                if self
+                    .capture_pane_text(tmux_session)
+                    .is_some_and(|pane| is_codex_directory_trust_prompt(&pane))
+                {
+                    self.send_key(tmux_session, "Enter")?;
+                    directory_trust_accepted = true;
+                }
+            }
+            if self.session_input_ready(tmux_session, provider) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(InitialBriefDeliveryError::ProviderReadinessTimedOut {
+                    provider: provider.to_owned(),
+                }
+                .into());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn wait_for_codex_fork_initial_brief_acceptance(
+        &self,
+        tmux_session: &str,
+        event_stream_path: &Path,
+        initial_event_offset: u64,
+        prompt: &str,
+    ) -> Result<()> {
+        let deadline = Instant::now() + self.initial_brief_ack_timeout;
+        loop {
+            if codex_event_stream_has_user_turn(event_stream_path, initial_event_offset, prompt) {
+                return Ok(());
+            }
+            if !self.session_exists(tmux_session)? {
+                return Err(InitialBriefDeliveryError::SessionExited {
+                    provider: "codex-fork".to_owned(),
+                }
+                .into());
+            }
+            if Instant::now() >= deadline {
+                return Err(InitialBriefDeliveryError::ProviderAcceptanceTimedOut {
+                    provider: "codex-fork".to_owned(),
+                }
+                .into());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn compute_settle_delay(&self, text: &str) -> Duration {

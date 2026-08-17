@@ -110,7 +110,7 @@ use crate::queue::{
     QueueJobRecord, QueueMessageMetadata, RetainedQueueStore, RetryCodexReviewRequest,
     ScheduledReminder,
 };
-use crate::runtime::{CodexModelValidationError, TmuxRuntime};
+use crate::runtime::{CodexModelValidationError, InitialBriefDeliveryError, TmuxRuntime};
 #[cfg(test)]
 use crate::sessions::codex_fork_legacy_event_stream_path_from_log_file;
 use crate::sessions::{
@@ -12165,6 +12165,17 @@ fn core_session_create_api_error(error: anyhow::Error) -> ApiError {
         return ApiError::Status {
             status,
             detail: validation.to_string(),
+        };
+    }
+    if error
+        .chain()
+        .any(|cause| cause.downcast_ref::<InitialBriefDeliveryError>().is_some())
+    {
+        return ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: format!(
+                "{error}. The immutable accepted brief and its launch record were retained; retry only after confirming provider state."
+            ),
         };
     }
     error.into()

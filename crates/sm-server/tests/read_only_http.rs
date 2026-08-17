@@ -14685,7 +14685,14 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
             .as_nanos()
     );
     let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+    let app = runtime_app_with_codex_fork_initial_brief_provider(
+        &state_file,
+        &log_dir,
+        &tmux_socket,
+        true,
+        Duration::from_millis(200),
+        true,
+    );
 
     let (status, parent_payload) = post_json(
         app.clone(),
@@ -14718,33 +14725,28 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
             "name": "runtime-child",
             "model": "opus",
             "reasoning_effort": "xhigh",
+            "provider": "codex-fork",
             "wait": 5
         }),
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::OK, "{payload}");
     assert_eq!(payload["session_id"], "runtimechild");
     assert_eq!(payload["friendly_name"], "runtime-child");
     assert_eq!(payload["parent_session_id"], "runtimeparent");
     assert_eq!(payload["working_dir"], parent_dir.display().to_string());
     assert_eq!(payload["node"], "primary");
-    assert_eq!(payload["provider"], "claude");
+    assert_eq!(payload["provider"], "codex-fork");
     assert_eq!(payload["model"], "opus");
     assert_eq!(payload["reasoning_effort"], "xhigh");
     let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
-    assert!(tmux_session.starts_with("sm-rust-claude-runtimechild-"));
+    assert!(tmux_session.starts_with("sm-rust-codex-fork-runtimechild-"));
 
     wait_for_output_contains(
         app.clone(),
         "runtimechild",
-        "runtime:spawn endpoint runtime prompt",
-    )
-    .await;
-    wait_for_output_contains(
-        app.clone(),
-        "runtimechild",
-        "argv:--model opus --effort xhigh",
+        "received:spawn endpoint runtime prompt",
     )
     .await;
 
@@ -14803,6 +14805,201 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
 }
 
 #[tokio::test]
+async fn runtime_core_spawn_brief_accepts_file_and_stdin_sources_after_delayed_composer_ready() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-spawn-brief-sources-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app_with_codex_fork_initial_brief_provider(
+        &state_file,
+        &log_dir,
+        &tmux_socket,
+        false,
+        Duration::from_millis(200),
+        true,
+    );
+
+    for (id, prompt, source) in [
+        (
+            "brieffile",
+            "FILE_BRIEF_SENTINEL",
+            json!({"kind": "file", "path": "/tmp/brief.md"}),
+        ),
+        (
+            "briefstdin",
+            "STDIN_BRIEF_SENTINEL",
+            json!({"kind": "stdin"}),
+        ),
+    ] {
+        let (status, payload) = post_json(
+            app.clone(),
+            "/sessions",
+            json!({
+                "id": id,
+                "name": id,
+                "working_dir": working_dir.display().to_string(),
+                "provider": "codex-fork",
+                "initial_message": prompt,
+                "spawn_prompt_source": source
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        wait_for_output_contains(app.clone(), id, &format!("received:{prompt}")).await;
+    }
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let intents = state["spawn_launch_intents"].as_array().unwrap();
+    assert_eq!(intents.len(), 2);
+    for (intent, source) in intents.iter().zip(["file", "stdin"]) {
+        assert_eq!(intent["artifact"]["source"]["kind"], source);
+        assert!(intent["session_id"].is_string());
+        assert!(fs::metadata(intent["artifact"]["path"].as_str().unwrap()).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn runtime_core_spawn_brief_ack_timeout_is_recoverable_and_never_retries() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-spawn-brief-timeout-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app_with_codex_fork_initial_brief_provider(
+        &state_file,
+        &log_dir,
+        &tmux_socket,
+        false,
+        Duration::ZERO,
+        false,
+    );
+
+    let (status, payload) = post_json(
+        app,
+        "/sessions",
+        json!({
+            "id": "briefnoack",
+            "name": "brief-no-ack",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "codex-fork",
+            "initial_message": "ACK_TIMEOUT_SENTINEL",
+            "spawn_prompt_source": {"kind": "stdin"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let detail = payload["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("not resent to avoid duplicate work"),
+        "{detail}"
+    );
+    assert!(detail.contains("accepted brief retained at"), "{detail}");
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert!(state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|session| session["id"] != "briefnoack"));
+    let intent = &state["spawn_launch_intents"][0];
+    assert_eq!(
+        fs::read_to_string(intent["artifact"]["path"].as_str().unwrap()).unwrap(),
+        "ACK_TIMEOUT_SENTINEL"
+    );
+    let launch = &state["session_runtime_launches"][0];
+    assert_eq!(launch["status"], "failed");
+    assert!(launch["failure_reason"]
+        .as_str()
+        .unwrap()
+        .contains("accepted brief retained at"));
+    let logs = fs::read_to_string(
+        state["session_runtime_launches"][0]["log_file"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap_or_default();
+    assert_eq!(
+        logs.matches("received:ACK_TIMEOUT_SENTINEL").count(),
+        1,
+        "{logs}"
+    );
+}
+
+#[tokio::test]
+async fn runtime_core_spawn_brief_fails_closed_when_provider_has_no_acknowledgement() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-spawn-brief-unverified-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app_with_command(
+        &state_file,
+        &log_dir,
+        &tmux_socket,
+        r#"/bin/sh -lc 'printf ">\n"; while IFS= read -r line; do printf "received:%s\n>\n" "$line"; done' runtime-sh"#,
+    );
+
+    let (status, payload) = post_json(
+        app,
+        "/sessions",
+        json!({
+            "id": "briefunverified",
+            "name": "brief-unverified",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "UNVERIFIED_SENTINEL",
+            "spawn_prompt_source": {"kind": "positional"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{payload}");
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .contains("no equivalent provider-originated acknowledgement"));
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let launch = &state["session_runtime_launches"][0];
+    assert_eq!(launch["status"], "failed");
+    assert!(!fs::read_to_string(launch["log_file"].as_str().unwrap())
+        .unwrap_or_default()
+        .contains("UNVERIFIED_SENTINEL"));
+}
+
+#[tokio::test]
 async fn runtime_core_spawn_wait_detects_naturally_exited_tmux_child() {
     if !tmux_available() {
         return;
@@ -14820,11 +15017,13 @@ async fn runtime_core_spawn_wait_detects_naturally_exited_tmux_child() {
             .as_nanos()
     );
     let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let app = runtime_app_with_command(
+    let app = runtime_app_with_codex_fork_initial_brief_provider(
         &state_file,
         &log_dir,
         &tmux_socket,
-        r#"/bin/sh -lc 'while IFS= read -r line; do printf "runtime:%s\n" "$line"; case "$line" in natural-child-prompt) exit 0;; esac; done' runtime-sh"#,
+        false,
+        Duration::ZERO,
+        true,
     );
 
     let (status, parent_payload) = post_json(
@@ -14851,6 +15050,7 @@ async fn runtime_core_spawn_wait_detects_naturally_exited_tmux_child() {
             "parent_session_id": "naturalparent",
             "prompt": "natural-child-prompt",
             "name": "natural-child",
+            "provider": "codex-fork",
             "wait": 10
         }),
     )
@@ -14891,11 +15091,13 @@ async fn runtime_core_spawn_wait_uses_runtime_output_as_activity() {
             .as_nanos()
     );
     let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let app = runtime_app_with_command(
+    let app = runtime_app_with_codex_fork_initial_brief_provider(
         &state_file,
         &log_dir,
         &tmux_socket,
-        r#"/bin/sh -lc 'while IFS= read -r line; do case "$line" in active-child-prompt) for i in 1 2 3 4 5 6 7 8; do printf "runtime:heartbeat-%s\n" "$i"; sleep 0.2; done; exit 0;; *) printf "runtime:%s\n" "$line";; esac; done' runtime-sh"#,
+        false,
+        Duration::ZERO,
+        true,
     );
 
     let (status, parent_payload) = post_json(
@@ -14922,6 +15124,7 @@ async fn runtime_core_spawn_wait_uses_runtime_output_as_activity() {
             "parent_session_id": "activeparent",
             "prompt": "active-child-prompt",
             "name": "active-child",
+            "provider": "codex-fork",
             "wait": 1
         }),
     )
@@ -19389,6 +19592,82 @@ fn runtime_app(state_file: &PathBuf, log_dir: &PathBuf, tmux_socket: &str) -> ax
         tmux_socket,
         r#"/bin/sh -lc 'while IFS= read -r line; do printf "argv:%s\nids:%s:%s:%s\nruntime:%s\n" "$*" "$SESSION_MANAGER_ID" "$CLAUDE_SESSION_MANAGER_ID" "$ENABLE_TOOL_SEARCH" "$line"; done' runtime-sh"#,
     )
+}
+
+fn runtime_app_with_codex_fork_initial_brief_provider(
+    state_file: &PathBuf,
+    log_dir: &PathBuf,
+    tmux_socket: &str,
+    directory_trust: bool,
+    composer_delay: Duration,
+    acknowledge: bool,
+) -> axum::Router {
+    fs::create_dir_all(log_dir).unwrap();
+    let provider = log_dir.join("fake-codex-fork-initial-brief");
+    let trust = if directory_trust {
+        "printf 'Do you trust the contents of this directory?\\nYes, continue\\nNo, quit\\nPress enter to continue\\n'; IFS= read -r ignored;\n"
+    } else {
+        ""
+    };
+    let delay = if composer_delay.is_zero() {
+        "".to_owned()
+    } else {
+        format!("sleep {}\n", composer_delay.as_secs_f64())
+    };
+    let acknowledgement = if acknowledge {
+        r#"printf '{"event_type":"op_submitted","payload":{"UserTurn":{"items":[{"type":"text","text":"%s"}]}}}\n' "$line" >> "$event_stream"
+"#
+    } else {
+        ""
+    };
+    let script = [
+        "#!/bin/sh\nif [ \"$1\" = \"debug\" ] && [ \"$2\" = \"models\" ]; then printf '{\"models\":[{\"slug\":\"opus\",\"visibility\":\"list\"}]}' ; exit 0; fi\nevent_stream=''\nprevious=''\nfor arg in \"$@\"; do\n  if [ \"$previous\" = \"--event-stream\" ]; then event_stream=\"$arg\"; fi\n  previous=\"$arg\"\ndone\nprintf '{\"event_type\":\"thread/started\",\"payload\":{\"thread\":{\"id\":\"initial-brief-thread\"}}}\n' >> \"$event_stream\"\n",
+        trust,
+        delay.as_str(),
+        "printf '› '\nwhile IFS= read -r line; do\n  printf 'received:%s\\n' \"$line\"\n",
+        acknowledgement,
+        "  case \"$line\" in\n    natural-child-prompt) exit 0 ;;\n    active-child-prompt) for i in 1 2 3 4 5 6 7 8; do printf 'runtime:heartbeat-%s\\n' \"$i\"; sleep 0.2; done; exit 0 ;;\n  esac\n  printf '› '\ndone\n",
+    ]
+    .concat();
+    fs::write(&provider, script).unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&provider).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&provider, permissions).unwrap();
+    }
+    let runtime_command = r#"/bin/sh -lc 'while IFS= read -r line; do printf "runtime:%s\n" "$line"; done' runtime-sh"#;
+    router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db_path_for_state_file(state_file)
+                .display()
+                .to_string(),
+        },
+        codex_fork: CodexForkLaunchConfig {
+            command: provider.display().to_string(),
+            args: Vec::new(),
+            default_model: None,
+            event_schema_version: 2,
+            control_tmux_fallback_enabled: true,
+        },
+        rust_core: RustCoreConfig {
+            runtime_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            tmux_socket_name: Some(tmux_socket.to_owned()),
+            runtime_command: Some(runtime_command.to_owned()),
+            runtime_prompt_mode: Some("stdin".to_owned()),
+            runtime_initial_brief_ready_timeout_ms: Some(2_000),
+            runtime_initial_brief_ack_timeout_ms: Some(300),
+            send_keys_settle_ms: Some(10.0),
+            send_keys_settle_max_ms: Some(50.0),
+            send_keys_max_chunk_chars: Some(128),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }))
 }
 
 fn runtime_app_with_codex_composer(
