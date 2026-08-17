@@ -575,6 +575,115 @@ provider process or a success notification is not verified absence.
 
 ## Execution plan
 
+### Epic budget and completion forecast
+
+The policy epic itself is governed by the same cost/execution tradeoff it adds
+to SM. Before implementation dispatch, the maintainer publishes an immutable
+baseline containing:
+
+- the package DAG, tier and owner for each package, concurrency assumptions,
+  critical path, and expected review iterations;
+- projected agent-active, queue-wait, review-wait, maintainer-integration, and
+  elapsed wall time;
+- projected input, cache-read, cache-write, output/reasoning, dollar, and quota
+  consumption by provider/model/tier; and
+- explicit contingency and the evidence range used for each estimate.
+
+The forecast is recomputed after every completed package and at every wave
+boundary using actual child and maintainer telemetry. Original and revised
+baselines remain visible; reforecasting never erases an overrun.
+
+#### Initial planning baseline (2026-08-17)
+
+The closest measured work from this maintainer tree is:
+
+- three merged/deployed Terra packages (#1264, #1252, and #1265) took 20.7 to
+  63.6 agent-minutes each, consumed 6.0M to 31.2M directly attributed tokens
+  each, and together used 51.3M tokens over about 105 minutes of elapsed time
+  with overlap;
+- this maintainer recorded 67.2M directly attributed Sol tokens during the
+  same policy/prerequisite work interval; its broader current-window total is
+  2.858B and is retained only as an upper-scale historical proxy, not charged
+  entirely to this epic; and
+- the orchestrator role-review fork recorded 3.6M direct Claude tokens. The two
+  other native forks currently lose exact fork-seat attribution; their session
+  counters and the measured fork ratio produce an 8M to 15M best estimate for
+  all three reviews rather than an `unknown` value. This attribution defect is
+  part of telemetry work, not a reason to omit the cost.
+
+Completed policy/prerequisite work is therefore 118.5M directly attributed
+Codex tokens plus an estimated 8M to 15M Claude tokens. The initial total-epic
+projection, including that sunk work, is 0.57B to 0.97B Codex tokens and 18M to
+55M Claude tokens. Breakers compare both total-epic and remaining-work views so
+already consumed budget cannot disappear at the implementation checkpoint.
+
+The approved plan has 16 implementation packages: 4 Sol, 10 Terra, and 2 Luna,
+plus maintainer integration and final review. Based on the observed package
+distribution and added complexity, the initial remaining-work envelope is:
+
+- **Codex tokens:** 0.45B to 0.85B, central estimate 0.62B;
+- **Codex quota equivalent:** about 0.7 to 1.3 points using this maintainer's
+  current 2.858B-token/4.3-point calibration, revised as tier-specific evidence
+  arrives;
+- **Claude live-path/review tokens:** 10M to 40M cache-weighted tokens, with no
+  repeat full-role fork unless its benefit review requires one;
+- **active critical-path work:** 15 to 24 hours; and
+- **elapsed completion:** 2 to 4 calendar days with the stated four-agent cap,
+  prompt owner checkpoints, and no external outage: approximately 2026-08-19
+  through 2026-08-21 PDT if approved on 2026-08-17.
+
+Owner approval time and external service outages are excluded from active-work
+efficiency but remain explicit additions to the elapsed-date forecast. Each
+forecast includes a projected completion timestamp, not only duration.
+
+The current Codex account reading is 66% consumed with 34 points nominally
+free, but its low-confidence fleet projection reaches about 100.9% at reset.
+Before every wave, SM compares the epic's upper estimate-to-complete plus 25%
+reserve against free quota after the measured fleet forecast. Insufficient
+headroom blocks new dispatch and proposes rescheduling or a cheaper valid tier;
+nominal account free space alone is not authorization to spend it.
+
+#### Breakers and variance response
+
+SM evaluates both token and elapsed-time forecasts continuously:
+
+1. **Warning:** at 75% of either baseline, or whenever actual plus estimate-to-
+   complete exceeds 110%, surface the variance and revised completion forecast
+   in `sm watch`. Existing work may finish, but no new discretionary package is
+   added without recording the forecast impact.
+2. **Breaker:** when actual plus estimate-to-complete exceeds 125% of either
+   approved envelope, or a critical-path package exceeds twice its estimate
+   without a usable artifact, stop new implementation dispatch. Control-plane,
+   cleanup, evidence preservation, and completion of the current atomic action
+   continue. Resumption requires an owner-approved rebaseline or scope change.
+3. **Hard overrun:** at 150% of either original envelope, the default action is
+   to pause the epic even if a prior rebaseline would permit more. The owner
+   must approve a new bounded phase with an explicit benefit case; an ordinary
+   seat-holder override is insufficient.
+
+Every breaker produces a variance report assigning the miss to one or more of:
+estimate error, scope growth, architecture/specification error, agent/package
+shape, review churn, telemetry failure, or external wait. The response follows
+the cause:
+
+- an invalid architecture or policy assumption amends this spec and repeats the
+  owner checkpoint before dependent work resumes;
+- scope growth is split, deferred, or added as a separately approved bounded
+  phase rather than silently absorbed;
+- an agent/package-shape miss changes tier, divides the package, or reduces
+  concurrency without rewriting an otherwise valid contract;
+- telemetry failure pauses the affected trial comparison until attribution is
+  repaired; and
+- external wait pauses the active-work clock but continues to move and report
+  the calendar completion forecast.
+
+For active-canary requirements, a cost overrun with demonstrated workflow
+benefit triggers simplification or narrower scope. A requirement with high cost
+and `no_observed_benefit` is disabled or removed by policy amendment. A workflow
+regression is rolled back even when it saves tokens. This keeps project
+completion bounded without treating either cost or execution quality as the
+sole objective.
+
 ### Delivery topology and controls
 
 - #1264 atomic prompt transport is merged and deployed.
@@ -612,9 +721,10 @@ Agent tiers:
 | 0C | Terra/high | Read-only spike to locate direct Claude/Codex sidechain usage events and calibratable fallback inputs | none; parallel with 0B review | Evidence report, no production code |
 | 0D | Luna/high | Build a sanitized corpus of 15-25 historical spawn decisions, including sparse briefs and scoped owner rulings | none; parallel with 0B review | Golden fixture inputs and expected decisions |
 | 0E | Maintainer-owned Claude forks | Fork the latest lane orchestrator, Fable spec owner, and Opus engineer as read-only children; ask each to review policy adherence, operational pain, and token reduction from its lived role | 0B draft | Role-context findings folded into owner review; originals unchanged |
+| 0F | Maintainer Sol/high | Publish the immutable token/wall-time baseline, completion timestamp, breaker thresholds, and current quota fit from maintainer-tree telemetry | 0B, current telemetry | Owner-approved epic execution envelope |
 
-Owner checkpoint: approve the spec and fixture/ruling interpretation before an
-epic branch is created.
+Owner checkpoint: approve the spec, fixture/ruling interpretation, and bounded
+epic execution envelope before an epic branch is created.
 
 ### Wave 1 - independent foundations
 
@@ -626,7 +736,7 @@ files.
 |---|---|---|---|---|
 | 1A | Maintainer Sol/high | Human-readable policy history, stable clause IDs, scoped rulings, operator-only approval, conflicts, and materialized enforceable effects | approved spec | Policy authority/store API |
 | 1B | Sol/high | Lane-scoped seat identity, holder incarnations, dead-holder behavior, durable-artifact resolver, historical lifecycle, and migration compatibility | approved spec | Seat registry and resolver |
-| 1C | Terra/high | Requirement-effect ledger, linked non-overlapping spans, evaluation/rotation records, direct/estimated token counters, bounds/calibration, quota snapshots, JSON/CSV surfaces | 0C evidence | Telemetry API and CLI |
+| 1C | Terra/high | Requirement-effect ledger, linked non-overlapping spans, epic estimate-to-complete/breaker records, evaluation/rotation records, direct/estimated token counters, bounds/calibration, quota snapshots, JSON/CSV surfaces | 0C, 0F evidence | Telemetry API and CLI |
 | 1D | Luna/high | Golden corpus harness, hostile/conflicting policy fixtures, coverage-counted sweeps, and restart/test scaffolding using frozen contracts | 0D corpus | Reusable test substrate |
 
 ### Wave 2 - spawn policy path
@@ -696,16 +806,20 @@ the later waves; it is not a final phase that waits for rotation support.
    handoffs, report summary and directed-probe costs separately and classify the
    probe's incremental findings and downstream actions. Sol/high adjudicates
    only semantic misses.
-5. Owner reviews decisions and telemetry on a rolling basis. A bad rule can be
+5. The maintainer also publishes actual versus forecast epic tokens, active
+   work, elapsed time, completion date, and estimate-to-complete after each
+   package. Warning/breaker state is visible in the same owner view as policy
+   benefit telemetry.
+6. Owner reviews decisions and telemetry on a rolling basis. A bad rule can be
    overridden immediately, amended conversationally, and re-approved without
    disabling already sound enforcement elsewhere in the lane.
-6. Open one epic-to-main PR. The maintainer runs the full review protocol,
+7. Open one epic-to-main PR. The maintainer runs the full review protocol,
    deploys only after it exits, verifies Claude and Codex live paths, then
    removes all phase worktrees and retires all implementation seats.
 
 ### Expected critical path
 
-`#1265 -> spec approval -> 1A/1B -> 2A -> 2B -> active canary -> 3A/3B/3D/3E -> 4A`
+`#1265 -> spec and 0F budget approval -> 1A/1B -> 2A -> 2B -> active canary -> 3A/3B/3D/3E -> 4A`
 
 Telemetry (1C), corpus/tests (1D), watch UX (2C), routing audit (3C), and
 override UX (4B) run beside that path. This preserves wall-clock parallelism
