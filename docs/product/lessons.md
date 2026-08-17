@@ -37,6 +37,7 @@ Durable lessons from maintainer sessions. Read this before handling the maintain
 - Explicit session restore should clear `agent_task_completed_at` along with other completion metadata. Otherwise a revived auto-bootstrapped service session can inherit stale `task-complete` state and get auto-retired again seconds later.
 - Do not tombstone a Telegram forum topic locally until `deleteForumTopic` has actually succeeded. Marking closed topics as deleted before remote deletion completes makes the stale-topic sweeper skip them forever, which can leave thousands of closed topics in Telegram.
 - Plain `codex` sessions can briefly report `status=idle` immediately after a Stop hook even while work is still active. List/watch surfaces need a short recent-activity grace window before projecting them inactive.
+- Codex-fork background command events may finish after the foreground stream has emitted `thread/status/changed: idle` and `turn_complete`. Once idle is conclusive, item/tool events must not reopen the seat; require a new `turn_started` or active thread-status event before projecting working again.
 - Android/Termux attach readiness must verify the public `cloudflared access ssh` path, not just whether `com.rajesh.sm-android-tunnel` is running. A live tunnel process can still leave the public SSH route unhealthy and produce `websocket: bad handshake` or banner timeouts.
 - Read surfaces that accept durable service-role identifiers should resolve live registry aliases such as `maintainer` before returning 404. Clients do treat `/sessions/maintainer` as a stable session reference even when the concrete session ID changes.
 - Android-native watch fixes are not live when the PR merges unless `data/apps/session-manager-android/latest.apk` is rebuilt and redeployed. Check `data/apps/session-manager-android/meta.json` and the served artifact hash before telling users a mobile fix shipped.
@@ -88,3 +89,9 @@ Durable lessons from maintainer sessions. Read this before handling the maintain
 - A durable completion message is not a delivered completion wake. Background producers must also trigger runtime queue reconciliation, preserve FIFO ordering, and keep busy targets pending until the provider is writable.
 - A queue wrapper PID is not the job lifecycle. Timeout, cancellation, terminal state, and capacity release must account the persisted process group; an exited wrapper can leave descendants performing signal cleanup. Application-owned locks still require application-owned recovery.
 - Before attributing a queue-job death to perf displacement, compare persisted timestamps and workload types. Perf displacement is restricted to `background`; a `tests` job that ended before the cited perf submission has an external or unknown cause, regardless of how plausible cross-epic contention appears.
+- Agent retirement is reversible lifecycle state, not elimination. User-facing commands,
+  responses, errors, and newly persisted completion metadata must say `retire`/`retired`;
+  accept historical `killed` markers only as a read-compatibility boundary.
+- A codex-fork event stream can multiplex the root thread and descendant threads. Project
+  seat activity from events matching the stored root provider thread; a descendant idle or
+  completion event must never make the root seat writable.

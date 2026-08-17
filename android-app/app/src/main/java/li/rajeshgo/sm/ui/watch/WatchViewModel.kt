@@ -347,14 +347,14 @@ class WatchViewModel(application: Application) : AndroidViewModel(application) {
         )
     }
 
-    fun killSession(sessionId: String, onComplete: (Result<Unit>) -> Unit) {
+    fun retireSession(sessionId: String, onComplete: (Result<Unit>) -> Unit) {
         viewModelScope.launch {
             val serverUrl = settingsRepository.serverUrl.first()
             val accessToken = settingsRepository.accessToken.first()
             val result = if (serverUrl.isBlank() || accessToken.isBlank()) {
                 Result.failure(IllegalStateException(SIGN_IN_TO_RETIRE_SESSIONS_MESSAGE))
             } else {
-                sessionRepository.killSession(serverUrl, accessToken, sessionId)
+                sessionRepository.retireSession(serverUrl, accessToken, sessionId)
             }
             if (result.exceptionOrNull() is SessionManagerAuthException) {
                 settingsRepository.clearAuth()

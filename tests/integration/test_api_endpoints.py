@@ -1441,8 +1441,8 @@ class TestEmailBridgeEndpoints:
         assert response.status_code == 400
         assert "not supported" in response.json()["detail"]
 
-    def test_kill_session(self, test_client, mock_session_manager, sample_session, mock_output_monitor):
-        """DELETE /sessions/{id} kills session."""
+    def test_retire_session(self, test_client, mock_session_manager, sample_session, mock_output_monitor):
+        """DELETE /sessions/{id} retires a session."""
         mock_session_manager.get_session.return_value = sample_session
         mock_session_manager.kill_session.return_value = True
 
@@ -1450,7 +1450,7 @@ class TestEmailBridgeEndpoints:
         assert response.status_code == 200
 
         data = response.json()
-        assert data["status"] == "killed"
+        assert data["status"] == "retired"
         assert data["session_id"] == "test123"
         mock_output_monitor.cleanup_session.assert_awaited_once_with(sample_session, preserve_record=True)
 

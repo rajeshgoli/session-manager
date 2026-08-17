@@ -255,10 +255,10 @@ class SessionManagerRepository(
         executeReadRequest(baseUrl, token) { it.getAnalyticsSummary() }
     }
 
-    suspend fun killSession(baseUrl: String, token: String, sessionId: String): Result<Unit> = withContext(Dispatchers.IO) {
+    suspend fun retireSession(baseUrl: String, token: String, sessionId: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
-            val response = api(baseUrl, token).killSession(sessionId)
-            check(response.status == "killed") { response.error ?: RETIRE_REQUEST_FAILED_MESSAGE }
+            val response = api(baseUrl, token).retireSession(sessionId)
+            check(response.status == "retired") { response.error ?: RETIRE_REQUEST_FAILED_MESSAGE }
         }.mapFailure(::classifyWriteFailure)
     }
 

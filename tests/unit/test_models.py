@@ -414,6 +414,7 @@ class TestEnums:
         assert CompletionStatus.ERROR.value == "error"
         assert CompletionStatus.ABANDONED.value == "abandoned"
         assert CompletionStatus.KILLED.value == "killed"
+        assert CompletionStatus.RETIRED.value == "retired"
 
     def test_notification_channel_values(self):
         """NotificationChannel has all expected values."""

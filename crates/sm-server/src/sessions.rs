@@ -1358,7 +1358,9 @@ impl SessionStore {
             });
         }
         if !include_terminated {
-            children.retain(|session| session.completion_status.as_deref() != Some("killed"));
+            children.retain(|session| {
+                !completion_status_is_retired(session.completion_status.as_deref())
+            });
         }
 
         Ok(children)
@@ -5084,7 +5086,9 @@ impl SessionStore {
                 && json_text(session.get("status"))
                     .as_deref()
                     .is_some_and(|status| normalized_status(status) == "stopped")
-                && json_text(session.get("completion_status")).as_deref() != Some("killed")
+                && !completion_status_is_retired(
+                    json_text(session.get("completion_status")).as_deref(),
+                )
         }) else {
             return Ok(None);
         };
@@ -6855,7 +6859,7 @@ impl SessionStore {
             let recipient_name = raw_session_display_name(session, session_id);
             let now = now_rfc3339();
             session.insert("status".to_owned(), Value::String("stopped".to_owned()));
-            mark_session_killed(session, &now);
+            mark_session_retired(session, &now);
             session.insert("stopped_at".to_owned(), Value::String(now.clone()));
             session.insert("last_activity".to_owned(), Value::String(now));
             if let Some(log_file) = json_text(session.get("log_file")) {
@@ -6868,7 +6872,7 @@ impl SessionStore {
         Ok(CoreRetireOutcome::Retired(CoreRetireResult {
             ok: true,
             session_id: session_id.to_owned(),
-            status: "killed".to_owned(),
+            status: "retired".to_owned(),
         }))
     }
 
@@ -6911,7 +6915,7 @@ impl SessionStore {
         let session = session_object_mut(sessions, session_id)
             .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during retire"))?;
         session.insert("status".to_owned(), Value::String("stopped".to_owned()));
-        mark_session_killed(session, &now);
+        mark_session_retired(session, &now);
         session.insert("stopped_at".to_owned(), Value::String(now.clone()));
         session.insert("last_activity".to_owned(), Value::String(now));
         complete_stop_notify_after_stop_raw(
@@ -6925,7 +6929,7 @@ impl SessionStore {
         Ok(CoreRetireOutcome::Retired(CoreRetireResult {
             ok: true,
             session_id: session_id.to_owned(),
-            status: "killed".to_owned(),
+            status: "retired".to_owned(),
         }))
     }
 
@@ -7564,7 +7568,13 @@ impl SessionStore {
             }
         }
 
-        if let Some(next_status) = codex_fork_status_for_event(event) {
+        let root_provider_resume_id = json_text(session.get("provider_resume_id"));
+        if let Some(next_status) = codex_fork_status_for_event(event).filter(|next_status| {
+            codex_fork_event_matches_root_thread(event, root_provider_resume_id.as_deref())
+                && (status != "idle"
+                    || *next_status != "running"
+                    || codex_fork_event_starts_turn(event))
+        }) {
             if status != next_status {
                 session.insert("status".to_owned(), Value::String(next_status.to_owned()));
             }
@@ -8017,6 +8027,25 @@ pub(crate) fn codex_fork_status_for_event_line(line: &str) -> Option<&'static st
     codex_fork_status_for_event(event)
 }
 
+pub(crate) fn codex_fork_event_line_starts_turn(line: &str) -> bool {
+    let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
+        return false;
+    };
+    event.as_object().is_some_and(codex_fork_event_starts_turn)
+}
+
+pub(crate) fn codex_fork_event_line_matches_root_thread(
+    line: &str,
+    root_thread_id: Option<&str>,
+) -> bool {
+    let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
+        return false;
+    };
+    event
+        .as_object()
+        .is_some_and(|event| codex_fork_event_matches_root_thread(event, root_thread_id))
+}
+
 fn codex_fork_event_is_turn_complete(line: &str) -> bool {
     let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
         return false;
@@ -8069,6 +8098,55 @@ fn codex_fork_status_for_event(event: &Map<String, Value>) -> Option<&'static st
         other if other.ends_with("_begin") => Some("running"),
         _ => None,
     }
+}
+
+fn codex_fork_event_starts_turn(event: &Map<String, Value>) -> bool {
+    let Some(event_type) = codex_fork_event_type(event)
+        .map(|value| normalize_codex_fork_event_type(&value.replace('/', "_")))
+    else {
+        return false;
+    };
+    match event_type.as_str() {
+        "turn_started" => true,
+        "thread_status_changed" => codex_fork_thread_status(event) == Some("running"),
+        _ => false,
+    }
+}
+
+fn codex_fork_event_matches_root_thread(
+    event: &Map<String, Value>,
+    root_thread_id: Option<&str>,
+) -> bool {
+    let Some(root_thread_id) = root_thread_id else {
+        return true;
+    };
+    codex_fork_event_thread_id(event)
+        .as_deref()
+        .is_none_or(|event_thread_id| event_thread_id == root_thread_id)
+}
+
+fn codex_fork_event_thread_id(event: &Map<String, Value>) -> Option<String> {
+    let payload = codex_fork_payload(event);
+    payload
+        .and_then(|payload| {
+            payload
+                .get("threadId")
+                .or_else(|| payload.get("thread_id"))
+                .and_then(non_unknown_json_text)
+        })
+        .or_else(|| {
+            payload
+                .and_then(|payload| payload.get("thread"))
+                .and_then(Value::as_object)
+                .and_then(codex_fork_thread_id)
+        })
+        .or_else(|| {
+            event
+                .get("threadId")
+                .or_else(|| event.get("thread_id"))
+                .and_then(non_unknown_json_text)
+        })
+        .or_else(|| event.get("session_id").and_then(non_unknown_json_text))
 }
 
 struct CodexContextUsage {
@@ -11036,14 +11114,14 @@ fn mark_session_followup_activity(session: &mut Map<String, Value>, now: &str) {
     session.insert("last_activity".to_owned(), Value::String(now.to_owned()));
 }
 
-fn mark_session_killed(session: &mut Map<String, Value>, now: &str) {
+fn mark_session_retired(session: &mut Map<String, Value>, now: &str) {
     session.insert(
         "completion_status".to_owned(),
-        Value::String("killed".to_owned()),
+        Value::String("retired".to_owned()),
     );
     session.insert(
         "completion_message".to_owned(),
-        Value::String("Terminated via sm kill".to_owned()),
+        Value::String("Retired via sm retire".to_owned()),
     );
     session.insert("completed_at".to_owned(), Value::String(now.to_owned()));
 }
@@ -13751,7 +13829,7 @@ impl SessionRecord {
         // Retirement persists both fields. Keep the terminal marker authoritative
         // if a delayed status-only writer leaves the activity status behind.
         normalized_status(&self.status) == "stopped"
-            || self.completion_status.as_deref() == Some("killed")
+            || completion_status_is_retired(self.completion_status.as_deref())
     }
 
     fn is_live_for_registry(&self) -> bool {
@@ -14066,9 +14144,13 @@ fn normalized_status(status: &str) -> &str {
     }
 }
 
+fn completion_status_is_retired(status: Option<&str>) -> bool {
+    matches!(status, Some("retired" | "killed"))
+}
+
 fn raw_session_is_stopped(session: &Map<String, Value>) -> bool {
     normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped"
-        || json_text(session.get("completion_status")).as_deref() == Some("killed")
+        || completion_status_is_retired(json_text(session.get("completion_status")).as_deref())
 }
 
 fn effective_raw_session_status(session: &Map<String, Value>) -> String {
@@ -14092,7 +14174,7 @@ fn projected_activity_state(session: &SessionRecord, status: &str) -> String {
     if status == "stopped" {
         return "stopped".to_owned();
     }
-    if session.completion_status.as_deref() == Some("killed") {
+    if completion_status_is_retired(session.completion_status.as_deref()) {
         return "stopped".to_owned();
     }
     if session.completion_status.is_some() {
@@ -17481,6 +17563,99 @@ mod tests {
         assert_eq!(codex_fork_status_for_event_line(active), Some("running"));
         assert_eq!(codex_fork_status_for_event_line(idle), Some("idle"));
         assert_eq!(codex_fork_status_for_event_line(unknown), None);
+        assert!(codex_fork_event_line_starts_turn(active));
+        assert!(!codex_fork_event_line_starts_turn(idle));
+    }
+
+    #[test]
+    fn codex_fork_late_command_completion_does_not_reopen_idle_session() {
+        let state_file = unique_temp_path("codex-late-command-idle");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "idle",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"item/completed","payload":{"item":{"type":"commandExecution","status":"completed"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().status,
+            "idle"
+        );
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"turn_started","payload":{}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().status,
+            "running"
+        );
+    }
+
+    #[test]
+    fn codex_fork_descendant_idle_does_not_stop_active_root_turn() {
+        let state_file = unique_temp_path("codex-descendant-idle");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "provider_resume_id": "root-thread",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"thread/status/changed","session_id":"child-thread","payload":{"threadId":"child-thread","status":{"type":"idle"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().status,
+            "running"
+        );
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"thread/status/changed","session_id":"root-thread","payload":{"threadId":"root-thread","status":{"type":"idle"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().status,
+            "idle"
+        );
     }
 
     #[test]

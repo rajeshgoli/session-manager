@@ -11,8 +11,8 @@ import li.rajeshgo.sm.data.model.DeviceGoogleAuthRequest
 import li.rajeshgo.sm.data.model.DeviceGoogleAuthResponse
 import li.rajeshgo.sm.data.model.EnsureMaintainerRequest
 import li.rajeshgo.sm.data.model.EnsureMaintainerResponse
-import li.rajeshgo.sm.data.model.KillSessionRequest
-import li.rajeshgo.sm.data.model.KillSessionResponse
+import li.rajeshgo.sm.data.model.RetireSessionRequest
+import li.rajeshgo.sm.data.model.RetireSessionResponse
 import li.rajeshgo.sm.data.model.MobileAttachTicketRequest
 import li.rajeshgo.sm.data.model.MobileAttachTicketResponse
 import li.rajeshgo.sm.data.model.OutputResponse
@@ -100,11 +100,11 @@ interface ApiService {
         @Query("limit") limit: Int = 10,
     ): ActivityActionsResponse
 
-    @POST("sessions/{session_id}/kill")
-    suspend fun killSession(
+    @POST("sessions/{session_id}/retire")
+    suspend fun retireSession(
         @Path("session_id") sessionId: String,
-        @Body request: KillSessionRequest = KillSessionRequest(),
-    ): KillSessionResponse
+        @Body request: RetireSessionRequest = RetireSessionRequest(),
+    ): RetireSessionResponse
 
     @POST("sessions/{session_id}/what")
     suspend fun createWhatRequest(

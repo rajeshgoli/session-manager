@@ -99,7 +99,7 @@ async function startServer() {
     res.json({ status: "ok" });
   });
 
-  app.post("/api/sessions/:id/kill", (req, res) => {
+  app.post("/api/sessions/:id/retire", (req, res) => {
     const { id } = req.params;
     sessions = sessions.filter(s => s.id !== id);
     // Broadcast update

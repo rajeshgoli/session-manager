@@ -390,13 +390,13 @@ data class ActivityActionRow(
 )
 
 @Serializable
-data class KillSessionResponse(
+data class RetireSessionResponse(
     val status: String? = null,
     val error: String? = null,
 )
 
 @Serializable
-data class KillSessionRequest(
+data class RetireSessionRequest(
     @SerialName("requester_session_id")
     val requesterSessionId: String? = null,
 )

@@ -1153,7 +1153,7 @@ class SessionManagerClient:
 
         data, success, unavailable = self._request(
             "POST",
-            f"/sessions/{target_session_id}/kill",
+            f"/sessions/{target_session_id}/retire",
             payload,
             timeout=KILL_TIMEOUT,
         )

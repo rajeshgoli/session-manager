@@ -114,21 +114,22 @@ use crate::runtime::{CodexModelValidationError, TmuxRuntime};
 #[cfg(test)]
 use crate::sessions::codex_fork_legacy_event_stream_path_from_log_file;
 use crate::sessions::{
-    claude_hook_gate, codex_fork_newest_event_stream_path, codex_fork_status_for_event_line,
-    expand_home, is_primary_node, submit_codex_fork_btw, AgentRegistrationResponse,
-    AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest, ChildSessionResponse,
-    ClaudeHookGate, ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome,
-    ContextMonitorRequest, ContextSnapshotResponse, ContextUsageEvent, ContextUsageOutcome,
-    CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
-    CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, CreateReparentRequest,
-    CreateReparentTreeRequest, CredentialRotationOutcome, DecideReparentRequest, HandoffOutcome,
-    HandoffRequest, MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision,
-    ReparentMutationOutcome, ReparentRepairAction, RoleRegistrationRequest,
-    SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest, SendCoreInputRequest,
-    SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
-    SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest, SubagentStartOutcome,
-    SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest, TaskCompleteOutcome,
-    TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
+    claude_hook_gate, codex_fork_event_line_matches_root_thread, codex_fork_event_line_starts_turn,
+    codex_fork_newest_event_stream_path, codex_fork_status_for_event_line, expand_home,
+    is_primary_node, submit_codex_fork_btw, AgentRegistrationResponse, AgentStatusRequest,
+    ArmStopNotifyOutcome, ArmStopNotifyRequest, ChildSessionResponse, ClaudeHookGate,
+    ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest,
+    ContextSnapshotResponse, ContextUsageEvent, ContextUsageOutcome, CoreClearOutcome,
+    CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome, CoreRetireOutcome,
+    CoreReviewOutcome, CreateCoreSessionRequest, CreateReparentRequest, CreateReparentTreeRequest,
+    CredentialRotationOutcome, DecideReparentRequest, HandoffOutcome, HandoffRequest,
+    MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision, ReparentMutationOutcome,
+    ReparentRepairAction, RoleRegistrationRequest, SeatSessionReconciliationSnapshot,
+    SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
+    SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
+    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
+    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
+    UpdateSessionMetadataRequest,
 };
 
 use crate::studio_ssh::{self, StudioSshStatus};
@@ -1225,7 +1226,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/sessions/{session_id}/input", post(send_session_input))
         .route("/sessions/{session_id}/what", post(create_btw_request))
-        .route("/sessions/{session_id}/kill", post(retire_session))
+        .route("/sessions/{session_id}/retire", post(retire_session))
+        // Compatibility for clients deployed before the retire terminology migration.
+        .route("/sessions/{session_id}/kill", post(retire_session_legacy))
         .route("/sessions/{session_id}/restore", post(restore_session))
         .route("/sessions/{session_id}/clear", post(clear_session))
         .route("/sessions/{session_id}/handoff", post(schedule_handoff))
@@ -2138,7 +2141,7 @@ async fn client_request_status(
         };
         match outcome {
             Some(result) if result.delivered => delivered_count += 1,
-            Some(result) if !matches!(result.status.as_str(), "stopped" | "killed") => {
+            Some(result) if !matches!(result.status.as_str(), "stopped" | "retired" | "killed") => {
                 queued_count += 1
             }
             _ => failed_count += 1,
@@ -2589,7 +2592,7 @@ async fn inbound_email_webhook(
     let Some(outcome) = outcome else {
         return Err(ApiError::NotFound("Session not found"));
     };
-    if !outcome.delivered && matches!(outcome.status.as_str(), "stopped" | "killed") {
+    if !outcome.delivered && matches!(outcome.status.as_str(), "stopped" | "retired" | "killed") {
         return Err(ApiError::Status {
             status: StatusCode::CONFLICT,
             detail: "Failed to deliver inbound email to session".to_owned(),
@@ -2663,7 +2666,7 @@ fn notify_maintainer_of_bug_report(
     if outcome.delivered {
         return Ok((true, "delivered".to_owned()));
     }
-    if matches!(outcome.status.as_str(), "stopped" | "killed") {
+    if matches!(outcome.status.as_str(), "stopped" | "retired" | "killed") {
         return Ok((false, outcome.status));
     }
     Ok((true, "queued".to_owned()))
@@ -7590,7 +7593,7 @@ fn send_session_input_batch_one(
             "Session not found".to_owned(),
         ));
     };
-    if !outcome.delivered && matches!(outcome.status.as_str(), "stopped" | "killed") {
+    if !outcome.delivered && matches!(outcome.status.as_str(), "stopped" | "retired" | "killed") {
         return Ok(failed_batch_result(
             identifier,
             Some(outcome.session_id),
@@ -7771,13 +7774,13 @@ async fn retire_session(
     Path(session_id): Path<String>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(payload): Json<KillSessionRequest>,
+    Json(payload): Json<RetireSessionRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_allowed_from_parts(
         &state.config,
         &headers,
         Some(peer_addr),
-        &format!("/sessions/{session_id}/kill"),
+        &format!("/sessions/{session_id}/retire"),
     )?;
     ensure_core_writes_enabled(&state)?;
     let requester_session_id = payload
@@ -7814,13 +7817,27 @@ async fn retire_session(
             "error": format!("Session {session_id} not found")
         }))),
         CoreRetireOutcome::NotChild => Ok(Json(json!({
-            "error": format!("Cannot kill session {session_id} - not your child session")
+            "error": format!("Cannot retire session {session_id} - not your child session")
         }))),
         CoreRetireOutcome::UnsupportedNode(node) => Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
             detail: format!("Rust runtime does not support remote node {node}"),
         }),
     }
+}
+
+async fn retire_session_legacy(
+    state: State<Arc<AppState>>,
+    session_id: Path<String>,
+    peer_addr: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    payload: Json<RetireSessionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(mut response) = retire_session(state, session_id, peer_addr, headers, payload).await?;
+    if response.get("status").and_then(Value::as_str) == Some("retired") {
+        response["status"] = Value::String("killed".to_owned());
+    }
+    Ok(Json(response))
 }
 
 async fn restore_session(
@@ -9847,7 +9864,15 @@ fn codex_fork_event_stream_activity(
     session: &SessionRecord,
 ) -> Option<CodexForkActivitySignal> {
     let event_stream_path = codex_fork_event_stream_path_for_session(state, session)?;
-    codex_fork_event_stream_signal_from_path(event_stream_path)
+    let persisted_activity = match session.lifecycle_status() {
+        "idle" | "stopped" => codex_fork_activity_for_status(session.lifecycle_status()),
+        _ => None,
+    };
+    codex_fork_event_stream_signal_from_path(
+        event_stream_path,
+        session.provider_resume_id.as_deref(),
+        persisted_activity,
+    )
 }
 
 fn codex_fork_event_stream_path_for_session(
@@ -9886,10 +9911,33 @@ fn codex_fork_event_stream_path_for_session(
 
 #[cfg(test)]
 fn codex_fork_event_stream_activity_from_path(path: PathBuf) -> Option<&'static str> {
-    codex_fork_event_stream_signal_from_path(path).map(|signal| signal.activity)
+    codex_fork_event_stream_signal_from_path(path, None, None).map(|signal| signal.activity)
 }
 
-fn codex_fork_event_stream_signal_from_path(path: PathBuf) -> Option<CodexForkActivitySignal> {
+#[cfg(test)]
+fn codex_fork_event_stream_activity_from_path_for_root(
+    path: PathBuf,
+    root_thread_id: &str,
+) -> Option<&'static str> {
+    codex_fork_event_stream_signal_from_path(path, Some(root_thread_id), None)
+        .map(|signal| signal.activity)
+}
+
+#[cfg(test)]
+fn codex_fork_event_stream_activity_from_path_with_seed(
+    path: PathBuf,
+    root_thread_id: &str,
+    persisted_activity: &'static str,
+) -> Option<&'static str> {
+    codex_fork_event_stream_signal_from_path(path, Some(root_thread_id), Some(persisted_activity))
+        .map(|signal| signal.activity)
+}
+
+fn codex_fork_event_stream_signal_from_path(
+    path: PathBuf,
+    root_thread_id: Option<&str>,
+    persisted_activity: Option<&'static str>,
+) -> Option<CodexForkActivitySignal> {
     let mut file = fs::File::open(path).ok()?;
     let metadata = file.metadata().ok()?;
     let len = metadata.len();
@@ -9907,7 +9955,11 @@ fn codex_fork_event_stream_signal_from_path(path: PathBuf) -> Option<CodexForkAc
         }
     }
 
-    let mut latest_activity: Option<CodexForkActivitySignal> = None;
+    let mut latest_activity = persisted_activity.map(|activity| CodexForkActivitySignal {
+        activity,
+        observed_at: None,
+        undated_status_is_latest_event: false,
+    });
     for line in chunk.lines() {
         if codex_fork_event_line_is_json(line) {
             if let Some(signal) = latest_activity.as_mut() {
@@ -9917,6 +9969,17 @@ fn codex_fork_event_stream_signal_from_path(path: PathBuf) -> Option<CodexForkAc
         if let Some(activity) =
             codex_fork_status_for_event_line(line).and_then(codex_fork_activity_for_status)
         {
+            if !codex_fork_event_line_matches_root_thread(line, root_thread_id) {
+                continue;
+            }
+            if activity == "working"
+                && latest_activity
+                    .as_ref()
+                    .is_some_and(|signal| matches!(signal.activity, "idle" | "stopped"))
+                && !codex_fork_event_line_starts_turn(line)
+            {
+                continue;
+            }
             latest_activity = Some(CodexForkActivitySignal {
                 activity,
                 observed_at: codex_fork_event_line_timestamp(line),
@@ -12858,7 +12921,7 @@ fn decoded_last_query_value(query_string: &str, key: &str) -> Result<Option<Stri
 }
 
 #[derive(Debug, Deserialize)]
-struct KillSessionRequest {
+struct RetireSessionRequest {
     #[serde(default)]
     requester_session_id: Option<String>,
 }
@@ -14297,6 +14360,120 @@ mod tests {
 
         assert_eq!(
             codex_fork_event_stream_activity_from_path(event_stream),
+            Some("idle")
+        );
+    }
+
+    #[test]
+    fn codex_fork_event_stream_activity_keeps_idle_after_late_command_completion() {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-codex-late-command-idle-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let event_stream = dir.join("events.jsonl");
+        fs::write(
+            &event_stream,
+            concat!(
+                "{\"event_type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"active\"}}}\n",
+                "{\"event_type\":\"thread/status/changed\",\"payload\":{\"status\":{\"type\":\"idle\"}}}\n",
+                "{\"event_type\":\"turn_complete\",\"payload\":{}}\n",
+                "{\"event_type\":\"item/commandExecution/outputDelta\",\"payload\":{}}\n",
+                "{\"event_type\":\"item/completed\",\"payload\":{\"item\":{\"type\":\"commandExecution\",\"status\":\"completed\"}}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path(event_stream.clone()),
+            Some("idle")
+        );
+
+        let mut events = fs::read(&event_stream).unwrap();
+        events.extend_from_slice(
+            concat!(
+                "{\"event_type\":\"turn_started\",\"payload\":{}}\n",
+                "{\"event_type\":\"item/completed\",\"payload\":{\"item\":{\"type\":\"commandExecution\",\"status\":\"completed\"}}}\n"
+            )
+            .as_bytes(),
+        );
+        fs::write(&event_stream, events).unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path(event_stream),
+            Some("working")
+        );
+    }
+
+    #[test]
+    fn codex_fork_event_stream_activity_ignores_descendant_idle() {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-codex-descendant-idle-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let event_stream = dir.join("events.jsonl");
+        fs::write(
+            &event_stream,
+            concat!(
+                "{\"event_type\":\"thread/status/changed\",\"session_id\":\"root-thread\",\"payload\":{\"threadId\":\"root-thread\",\"status\":{\"type\":\"active\"}}}\n",
+                "{\"event_type\":\"thread/status/changed\",\"session_id\":\"child-thread\",\"payload\":{\"threadId\":\"child-thread\",\"status\":{\"type\":\"idle\"}}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path_for_root(
+                event_stream.clone(),
+                "root-thread"
+            ),
+            Some("working")
+        );
+
+        let mut events = fs::read(&event_stream).unwrap();
+        events.extend_from_slice(
+            "{\"event_type\":\"thread/status/changed\",\"session_id\":\"root-thread\",\"payload\":{\"threadId\":\"root-thread\",\"status\":{\"type\":\"idle\"}}}\n"
+                .as_bytes(),
+        );
+        fs::write(&event_stream, events).unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path_for_root(event_stream, "root-thread"),
+            Some("idle")
+        );
+    }
+
+    #[test]
+    fn codex_fork_event_stream_activity_seeds_truncated_tail_with_persisted_idle() {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-codex-truncated-idle-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let event_stream = dir.join("events.jsonl");
+        let mut events = concat!(
+            "{\"event_type\":\"thread/status/changed\",\"session_id\":\"root-thread\",\"payload\":{\"threadId\":\"root-thread\",\"status\":{\"type\":\"idle\"}}}\n"
+        )
+        .as_bytes()
+        .to_vec();
+        events.extend(std::iter::repeat_n(
+            b'x',
+            CODEX_FORK_ACTIVITY_EVENT_TAIL_BYTES as usize + 1024,
+        ));
+        events.extend_from_slice(
+            b"\n{\"event_type\":\"item/completed\",\"session_id\":\"root-thread\",\"payload\":{\"threadId\":\"root-thread\",\"item\":{\"type\":\"commandExecution\",\"status\":\"completed\"}}}\n",
+        );
+        fs::write(&event_stream, events).unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path_with_seed(
+                event_stream,
+                "root-thread",
+                "idle"
+            ),
             Some("idle")
         );
     }

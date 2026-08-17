@@ -3008,7 +3008,7 @@ def cmd_kill(
         print(f"Error: {result['error']}", file=sys.stderr)
         return 1
 
-    if result.get("status") != "killed":
+    if result.get("status") not in ("retired", "killed"):
         # FastAPI validation errors commonly return {"detail": ...}
         detail = result.get("detail")
         if detail:

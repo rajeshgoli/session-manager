@@ -1951,7 +1951,7 @@ def run_watch_tui(
                         continue
                     retire_confirmation = None
                     result = client.kill_session(None, selected_session_id)
-                    if result and result.get("status") == "killed":
+                    if result and result.get("status") in ("retired", "killed"):
                         flash_message = f"Retired {selected_session_id}"
                     elif result is None:
                         flash_message = "Session manager unavailable"

@@ -857,7 +857,7 @@ fn run() -> Result<()> {
         Command::Retire(args) => {
             let requester_session_id = optional_current_session_id();
             let payload = client.post_json(
-                &format!("/sessions/{}/kill", args.session_id),
+                &format!("/sessions/{}/retire", args.session_id),
                 retire_request_payload(requester_session_id),
             )?;
             println!("{}", retire_response_status(&payload, &args.session_id)?);
@@ -1153,13 +1153,14 @@ fn retire_request_payload(requester_session_id: Option<String>) -> Value {
     json!({ "requester_session_id": requester_session_id })
 }
 
-fn retire_response_status<'a>(payload: &'a Value, target_session_id: &str) -> Result<&'a str> {
+fn retire_response_status(payload: &Value, target_session_id: &str) -> Result<&'static str> {
     if let Some(error) = payload["error"].as_str() {
         bail!("{error}");
     }
-    payload["status"]
-        .as_str()
-        .ok_or_else(|| anyhow!("Invalid retire response for session {target_session_id}"))
+    match payload["status"].as_str() {
+        Some("retired" | "killed") => Ok("retired"),
+        _ => bail!("Invalid retire response for session {target_session_id}"),
+    }
 }
 
 fn run_email(client: &ApiClient, args: EmailArgs) -> Result<()> {
@@ -4909,7 +4910,7 @@ fn retire_removed_surface_if_requested() {
 
 fn retired_command_message(command: &[&str]) -> Option<&'static str> {
     match command {
-        ["kill", ..] => Some("removed: use sm retire instead of sm kill"),
+        ["kill", ..] => Some("removed: use sm retire"),
         ["dispatch", ..] => Some("removed: dispatch is not part of the Rust cutover scope"),
         ["watch-job", ..] => Some(
             "removed: watch-job is not available; start supervised commands with `sm queue run \
@@ -5276,16 +5277,20 @@ mod tests {
         );
         assert_eq!(
             retire_response_status(&json!({ "status": "killed" }), "child001").unwrap(),
-            "killed"
+            "retired"
+        );
+        assert_eq!(
+            retire_response_status(&json!({ "status": "retired" }), "child001").unwrap(),
+            "retired"
         );
         assert_eq!(
             retire_response_status(
-                &json!({ "error": "Cannot kill session child001 - not your child session" }),
+                &json!({ "error": "Cannot retire session child001 - not your child session" }),
                 "child001"
             )
             .unwrap_err()
             .to_string(),
-            "Cannot kill session child001 - not your child session"
+            "Cannot retire session child001 - not your child session"
         );
         assert_eq!(
             retire_response_status(&json!({}), "child001")

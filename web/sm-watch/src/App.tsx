@@ -32,7 +32,7 @@ import { WatchTable } from './components/WatchTable';
 const API_PATHS = ['/client/sessions', '/sessions', '/api/sessions'];
 const POLL_MS = 4000;
 const DETAIL_STALE_MS = 12000;
-const KILL_PATH = '/sessions/{id}/kill';
+const RETIRE_PATH = '/sessions/{id}/retire';
 const BUG_REPORT_PATH = '/client/bug-reports';
 const MAINTAINER_ENSURE_PATH = '/maintainer/ensure';
 const STUDIO_SSH_PATH = '/admin/studio-ssh';
@@ -345,8 +345,8 @@ export default function App() {
     }
   };
 
-  const postKill = async (id: string) => {
-    const path = KILL_PATH.replace('{id}', encodeURIComponent(id));
+  const postRetire = async (id: string) => {
+    const path = RETIRE_PATH.replace('{id}', encodeURIComponent(id));
     const response = await fetch(path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -363,15 +363,15 @@ export default function App() {
     return {
       ok: response.ok,
       httpStatus: response.status,
-      killed: payload?.status === 'killed',
+      retired: payload?.status === 'retired',
       error: payload?.error,
     };
   };
 
-  const handleKillSession = async (id: string, event: React.MouseEvent) => {
+  const handleRetireSession = async (id: string, event: React.MouseEvent) => {
     event.stopPropagation();
     try {
-      const result = await postKill(id);
+      const result = await postRetire(id);
       if (!result.ok) {
         if (result.httpStatus === 422) {
           showToast('Retire request rejected by API payload validation.');
@@ -380,7 +380,7 @@ export default function App() {
         showToast('Retire request failed. Session manager endpoint not reachable.');
         return;
       }
-      if (!result.killed) {
+      if (!result.retired) {
         showToast(result.error || 'Retire request failed.');
         return;
       }
@@ -732,7 +732,7 @@ export default function App() {
             copiedAttachSessionId={copiedAttachSessionId}
             onToggleExpand={toggleExpand}
             onOpenTelegram={handleOpenTelegram}
-            onKillSession={handleKillSession}
+            onRetireSession={handleRetireSession}
             onCopyAttach={handleCopyAttach}
             onReportBug={(session) => openBugReport(session.id)}
           />

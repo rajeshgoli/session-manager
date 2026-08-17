@@ -17,7 +17,7 @@ interface WatchTableProps {
   copiedAttachSessionId: string | null;
   onToggleExpand: (sessionId: string) => void;
   onOpenTelegram: (session: Session) => void;
-  onKillSession: (id: string, event: React.MouseEvent) => Promise<void>;
+  onRetireSession: (id: string, event: React.MouseEvent) => Promise<void>;
   onCopyAttach: (session: Session) => Promise<void>;
   onReportBug: (session: Session) => void;
 }
@@ -111,7 +111,7 @@ function SessionDetailBlock({
   copiedAttachSessionId,
   isOpeningTelegram,
   onOpenTelegram,
-  onKillSession,
+  onRetireSession,
   onCopyAttach,
   onReportBug,
 }: {
@@ -120,7 +120,7 @@ function SessionDetailBlock({
   copiedAttachSessionId: string | null;
   isOpeningTelegram: string | null;
   onOpenTelegram: (session: Session) => void;
-  onKillSession: (id: string, event: React.MouseEvent) => Promise<void>;
+  onRetireSession: (id: string, event: React.MouseEvent) => Promise<void>;
   onCopyAttach: (session: Session) => Promise<void>;
   onReportBug: (session: Session) => void;
 }) {
@@ -150,7 +150,7 @@ function SessionDetailBlock({
         </button>
         <button
           type="button"
-          onClick={(event) => void onKillSession(session.id, event)}
+          onClick={(event) => void onRetireSession(session.id, event)}
           className="inline-flex items-center gap-2 rounded-full border border-rose-500/30 bg-rose-500/10 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.18em] text-rose-200 transition hover:border-rose-400/60"
         >
           <Trash2 size={13} />
@@ -188,7 +188,7 @@ export function WatchTable({
   copiedAttachSessionId,
   onToggleExpand,
   onOpenTelegram,
-  onKillSession,
+  onRetireSession,
   onCopyAttach,
   onReportBug,
 }: WatchTableProps) {
@@ -245,7 +245,7 @@ export function WatchTable({
                         copiedAttachSessionId={copiedAttachSessionId}
                         isOpeningTelegram={isOpeningTelegram}
                         onOpenTelegram={onOpenTelegram}
-                        onKillSession={onKillSession}
+                        onRetireSession={onRetireSession}
                         onCopyAttach={onCopyAttach}
                         onReportBug={onReportBug}
                       />
