@@ -1453,20 +1453,35 @@ fn codex_event_stream_has_user_turn(path: &Path, initial_offset: u64, prompt: &s
             .and_then(|turn| turn.get("items"))
             .and_then(Value::as_array)
             .is_some_and(|items| {
-                items
-                    .iter()
-                    .any(|item| item.get("text").and_then(Value::as_str) == Some(prompt))
+                items.iter().any(|item| {
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| codex_brief_text_matches(text, prompt))
+                })
             });
-        let schema_v2_user_message_matches = event.get("event_type").and_then(Value::as_str)
-            == Some("item/started")
+        let schema_v2_user_message_matches = event.get("schema_version").and_then(Value::as_u64)
+            == Some(2)
+            && event.get("event_type").and_then(Value::as_str) == Some("item/started")
             && event.pointer("/payload/item/type").and_then(Value::as_str) == Some("userMessage")
             && event
                 .pointer("/payload/item/content")
                 .and_then(codex_user_message_text)
-                .is_some_and(|text| text == prompt);
+                .is_some_and(|text| codex_brief_text_matches(&text, prompt));
 
         legacy_user_turn_matches || schema_v2_user_message_matches
     })
+}
+
+/// Match a provider acknowledgement to the immutable submitted brief.
+///
+/// Codex currently normalizes one terminal line-feed out of initial prompts.
+/// Accept that one observed normalization and nothing broader: a provider value
+/// otherwise has to equal the entire submitted brief exactly.
+fn codex_brief_text_matches(provider_text: &str, submitted_brief: &str) -> bool {
+    provider_text == submitted_brief
+        || submitted_brief
+            .strip_suffix('\n')
+            .is_some_and(|without_terminal_newline| provider_text == without_terminal_newline)
 }
 
 /// Return the complete textual content of a schema-v2 `userMessage` item.
@@ -2638,11 +2653,69 @@ esac
     }
 
     #[test]
+    fn codex_prompt_confirmation_allows_only_one_terminal_newline_omission() {
+        assert!(codex_brief_text_matches(
+            "handoff prompt",
+            "handoff prompt\n"
+        ));
+        assert!(!codex_brief_text_matches(
+            "handoff prompt",
+            "handoff prompt\n\n"
+        ));
+        assert!(!codex_brief_text_matches(
+            "handoff prompt",
+            "handoff prompt \n"
+        ));
+
+        let (_tmux_binary, _log_path, temp_dir) = fake_tmux_binary();
+        let legacy_events = temp_dir.join("legacy-events.jsonl");
+        let legacy_prefix = r#"{"event_type":"op_submitted","payload":{"ListSkills":{}}}"#;
+        let legacy_acknowledgement = serde_json::json!({
+            "event_type": "op_submitted",
+            "payload": {"UserTurn": {"items": [{"type": "text", "text": "handoff prompt"}]}}
+        });
+        fs::write(
+            &legacy_events,
+            format!(
+                "{legacy_prefix}\n{}\n",
+                serde_json::to_string(&legacy_acknowledgement).unwrap()
+            ),
+        )
+        .unwrap();
+        assert!(codex_event_stream_has_user_turn(
+            &legacy_events,
+            legacy_prefix.len() as u64 + 1,
+            "handoff prompt\n"
+        ));
+
+        let schema_v2_events = temp_dir.join("schema-v2-events.jsonl");
+        let schema_v2_prefix = r#"{"schema_version":2,"event_type":"thread/started","payload":{}}"#;
+        let schema_v2_acknowledgement = serde_json::json!({
+            "schema_version": 2,
+            "event_type": "item/started",
+            "payload": {"item": {"type": "userMessage", "content": [{"type": "text", "text": "handoff prompt"}]}}
+        });
+        fs::write(
+            &schema_v2_events,
+            format!(
+                "{schema_v2_prefix}\n{}\n",
+                serde_json::to_string(&schema_v2_acknowledgement).unwrap()
+            ),
+        )
+        .unwrap();
+        assert!(codex_event_stream_has_user_turn(
+            &schema_v2_events,
+            schema_v2_prefix.len() as u64 + 1,
+            "handoff prompt\n"
+        ));
+    }
+
+    #[test]
     fn codex_prompt_confirmation_accepts_exact_schema_v2_large_user_message_after_offset() {
         let (_tmux_binary, _log_path, temp_dir) = fake_tmux_binary();
         let events = temp_dir.join("events.jsonl");
         let prompt = format!(
-            "# Large immutable brief\n\n{}\n\nfinal acceptance sentinel",
+            "# Large immutable brief\n\n{}\n\nfinal acceptance sentinel\n",
             "multiline evidence paragraph\n".repeat(512)
         );
         let pre_offset = serde_json::json!({
@@ -2661,11 +2734,19 @@ esac
             "event_type": "item/started",
             "payload": {"item": {"type": "userMessage", "content": [{"type": "text", "text": &prompt[..32]}]}}
         });
+        let unversioned_full_user_message = serde_json::json!({
+            "event_type": "item/started",
+            "payload": {"item": {"type": "userMessage", "content": [{"type": "text", "text": prompt.strip_suffix('\n').unwrap()}]}}
+        });
         let agent_echo_line = serde_json::to_string(&agent_echo).unwrap();
         let partial_user_message_line = serde_json::to_string(&partial_user_message).unwrap();
+        let unversioned_full_user_message_line =
+            serde_json::to_string(&unversioned_full_user_message).unwrap();
         fs::write(
             &events,
-            format!("{pre_offset_line}\n{agent_echo_line}\n{partial_user_message_line}\n",),
+            format!(
+                "{pre_offset_line}\n{agent_echo_line}\n{partial_user_message_line}\n{unversioned_full_user_message_line}\n",
+            ),
         )
         .unwrap();
         assert!(!codex_event_stream_has_user_turn(&events, offset, &prompt));
@@ -2673,13 +2754,13 @@ esac
         let exact_user_message = serde_json::json!({
             "schema_version": 2,
             "event_type": "item/started",
-            "payload": {"item": {"type": "userMessage", "content": [{"type": "text", "text": prompt}]}}
+            "payload": {"item": {"type": "userMessage", "content": [{"type": "text", "text": prompt.strip_suffix('\n').unwrap()}]}}
         });
         let exact_user_message_line = serde_json::to_string(&exact_user_message).unwrap();
         fs::write(
             &events,
             format!(
-                "{pre_offset_line}\n{agent_echo_line}\n{partial_user_message_line}\n{exact_user_message_line}\n"
+                "{pre_offset_line}\n{agent_echo_line}\n{partial_user_message_line}\n{unversioned_full_user_message_line}\n{exact_user_message_line}\n"
             ),
         )
         .unwrap();
