@@ -14826,7 +14826,7 @@ async fn runtime_core_spawn_wait_detects_naturally_exited_tmux_child() {
         &state_file,
         &log_dir,
         &tmux_socket,
-        r#"/bin/sh -lc 'while IFS= read -r line; do printf "runtime:%s\n" "$line"; case "$line" in *natural-child-prompt*) exit 0;; esac; done' runtime-sh"#,
+        r#"/bin/sh -lc 'while IFS= read -r line; do printf "runtime:%s\n" "$line"; case "$line" in *"[Session Manager] Read the immutable launch brief at"*) exit 0;; esac; done' runtime-sh"#,
     );
 
     let (status, parent_payload) = post_json(
@@ -14897,7 +14897,7 @@ async fn runtime_core_spawn_wait_uses_runtime_output_as_activity() {
         &state_file,
         &log_dir,
         &tmux_socket,
-        r#"/bin/sh -lc 'while IFS= read -r line; do case "$line" in *active-child-prompt*) for i in 1 2 3 4 5 6 7 8; do printf "runtime:heartbeat-%s\n" "$i"; sleep 0.2; done; exit 0;; *) printf "runtime:%s\n" "$line";; esac; done' runtime-sh"#,
+        r#"/bin/sh -lc 'while IFS= read -r line; do case "$line" in *"[Session Manager] Read the immutable launch brief at"*) for i in 1 2 3 4 5 6 7 8; do printf "runtime:heartbeat-%s\n" "$i"; sleep 0.2; done; exit 0;; *) printf "runtime:%s\n" "$line";; esac; done' runtime-sh"#,
     );
 
     let (status, parent_payload) = post_json(

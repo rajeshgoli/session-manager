@@ -12252,37 +12252,78 @@ fn persist_spawn_brief_artifact(
     fs::set_permissions(&artifact_dir, fs::Permissions::from_mode(0o700))?;
     let sha256 = sha256_bytes(bytes);
     let path = artifact_dir.join(format!("{sha256}.md"));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    match options.open(&path) {
-        Ok(mut file) => {
-            file.write_all(bytes)
-                .with_context(|| format!("failed to write spawn brief {}", path.display()))?;
-            file.sync_all()
-                .with_context(|| format!("failed to sync spawn brief {}", path.display()))?;
-        }
+    match write_and_publish_spawn_brief(&artifact_dir, &path, bytes) {
+        Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let existing = fs::read(&path)
-                .with_context(|| format!("failed to verify spawn brief {}", path.display()))?;
-            if existing != bytes {
-                anyhow::bail!("existing spawn brief artifact digest does not match its contents");
-            }
+            verify_spawn_brief_artifact(&path, bytes)?;
         }
         Err(error) => {
             return Err(error)
-                .with_context(|| format!("failed to create spawn brief {}", path.display()));
+                .with_context(|| format!("failed to publish spawn brief {}", path.display()));
         }
     }
     #[cfg(unix)]
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o400))?;
     Ok(SpawnBriefArtifact {
         sha256,
         path: path.display().to_string(),
         byte_length: bytes.len(),
         source,
     })
+}
+
+fn write_and_publish_spawn_brief(artifact_dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let (temporary_path, mut file) = (0..32)
+        .find_map(|_| {
+            let mut random = [0_u8; 8];
+            OsRng.fill_bytes(&mut random);
+            let temporary_path = artifact_dir.join(format!(
+                ".spawn-brief-{:016x}.tmp",
+                u64::from_be_bytes(random)
+            ));
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            match options.open(&temporary_path) {
+                Ok(file) => Some(Ok((temporary_path, file))),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not reserve spawn brief temporary path",
+            )
+        })?;
+
+    let write_result = (|| -> io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        fs::set_permissions(&temporary_path, fs::Permissions::from_mode(0o400))?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+
+    let publish_result = fs::hard_link(&temporary_path, path);
+    let _ = fs::remove_file(&temporary_path);
+    publish_result
+}
+
+fn verify_spawn_brief_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
+    let existing = fs::read(path)
+        .with_context(|| format!("failed to verify spawn brief {}", path.display()))?;
+    if existing != bytes {
+        anyhow::bail!("existing spawn brief artifact digest does not match its contents");
+    }
+    Ok(())
 }
 
 fn generate_unique_spawn_launch_intent_id(intents: &[Value]) -> Result<String> {
@@ -14742,7 +14783,7 @@ mod tests {
                 .permissions()
                 .mode()
                 & 0o777,
-            0o600
+            0o400
         );
 
         store
