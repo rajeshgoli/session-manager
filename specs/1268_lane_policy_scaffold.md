@@ -1030,12 +1030,59 @@ sole objective.
   review, before its consumer starts.
 - Each implementation agent owns its focused tests, full applicable gates,
   `docs/working/pr_review_process.md`, merge to the epic branch, and worktree
-  cleanup. Only P1 findings require another Codex review round.
+  cleanup. Codex review follows the bounded protocol below; a P1 blocks merge
+  but does not authorize indefinite review rounds.
 - Limit active implementation to four agents: at most two Sol, two Terra, and
   one Luna where the wave permits. More parallelism would increase merge and
   review overhead faster than it reduces wall time.
 - The canonical maintainer owns contracts, dependency ordering, integration,
   active canary deployment, final epic review, and production rollout.
+
+#### Bounded Codex review protocol
+
+Codex review is a sampled engineering gate, not a proof obtained by repeatedly
+requesting reviews until one happens to return no finding. Each package or final
+integration PR is limited to one deployable capability and receives at most
+three exact-head review rounds:
+
+1. **Broad review.** Review the current capability for correctness, concurrency,
+   authority, recovery, security, and missing tests.
+2. **Root-cause verification.** After one batched repair, verify every accepted
+   finding and search the touched subsystem for sibling instances of the same
+   failure class. The steer excludes unrelated roadmap and disabled capabilities.
+3. **Current-capability gate.** Run only when round 2 retains or introduces a
+   reachable P0/P1. Review the enabled path, rollback, and tests; do not reopen
+   future-wave design.
+
+Every round records requested/reviewed head, steer and scope, queue/review wait,
+estimated or direct token counters, findings, disposition, and resulting head.
+Unchanged heads are not re-requested. A head-expanding refactor discovered
+during review becomes a separate package rather than silently enlarging the
+review surface.
+
+At the three-round cap:
+
+- a reachable P0/P1 means the package is not mergeable; simplify, revert, split,
+  or block it with the residual finding and evidence;
+- a finding that can only affect a disabled or later capability becomes a
+  linked issue and acceptance criterion for that capability, not a blocker for
+  the current package;
+- each P2/P3 is fixed, explicitly accepted with rationale, or filed; and
+- no fourth round starts automatically. The owner may authorize one additional
+  bounded round with a stated benefit and token/time budget. That extension is
+  never recursively extended; another reachable P0/P1 forces split or redesign.
+
+For an unusually high-risk transaction, up to two focused specialist reviews
+may run in parallel against the same immutable head and be aggregated as one
+round. Their token costs remain separate. This option trades tokens for wall
+time and requires the maintainer to freeze scope and deduplicate findings before
+one repair batch.
+
+The default per-package wall breaker is 30 minutes of review wait after round 1.
+Crossing it does not waive findings: the maintainer publishes the review ledger
+and either continues within the remaining approved round budget, pauses, or
+splits the package. Review cost and benefit appear in the same epic telemetry as
+implementation work.
 
 Agent tiers:
 
