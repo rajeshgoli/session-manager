@@ -7568,8 +7568,12 @@ impl SessionStore {
             }
         }
 
+        let root_provider_resume_id = json_text(session.get("provider_resume_id"));
         if let Some(next_status) = codex_fork_status_for_event(event).filter(|next_status| {
-            status != "idle" || *next_status != "running" || codex_fork_event_starts_turn(event)
+            codex_fork_event_matches_root_thread(event, root_provider_resume_id.as_deref())
+                && (status != "idle"
+                    || *next_status != "running"
+                    || codex_fork_event_starts_turn(event))
         }) {
             if status != next_status {
                 session.insert("status".to_owned(), Value::String(next_status.to_owned()));
@@ -8030,6 +8034,18 @@ pub(crate) fn codex_fork_event_line_starts_turn(line: &str) -> bool {
     event.as_object().is_some_and(codex_fork_event_starts_turn)
 }
 
+pub(crate) fn codex_fork_event_line_matches_root_thread(
+    line: &str,
+    root_thread_id: Option<&str>,
+) -> bool {
+    let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
+        return false;
+    };
+    event
+        .as_object()
+        .is_some_and(|event| codex_fork_event_matches_root_thread(event, root_thread_id))
+}
+
 fn codex_fork_event_is_turn_complete(line: &str) -> bool {
     let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
         return false;
@@ -8095,6 +8111,42 @@ fn codex_fork_event_starts_turn(event: &Map<String, Value>) -> bool {
         "thread_status_changed" => codex_fork_thread_status(event) == Some("running"),
         _ => false,
     }
+}
+
+fn codex_fork_event_matches_root_thread(
+    event: &Map<String, Value>,
+    root_thread_id: Option<&str>,
+) -> bool {
+    let Some(root_thread_id) = root_thread_id else {
+        return true;
+    };
+    codex_fork_event_thread_id(event)
+        .as_deref()
+        .is_none_or(|event_thread_id| event_thread_id == root_thread_id)
+}
+
+fn codex_fork_event_thread_id(event: &Map<String, Value>) -> Option<String> {
+    let payload = codex_fork_payload(event);
+    payload
+        .and_then(|payload| {
+            payload
+                .get("threadId")
+                .or_else(|| payload.get("thread_id"))
+                .and_then(non_unknown_json_text)
+        })
+        .or_else(|| {
+            payload
+                .and_then(|payload| payload.get("thread"))
+                .and_then(Value::as_object)
+                .and_then(codex_fork_thread_id)
+        })
+        .or_else(|| {
+            event
+                .get("threadId")
+                .or_else(|| event.get("thread_id"))
+                .and_then(non_unknown_json_text)
+        })
+        .or_else(|| event.get("session_id").and_then(non_unknown_json_text))
 }
 
 struct CodexContextUsage {
@@ -17557,6 +17609,52 @@ mod tests {
         assert_eq!(
             store.get_session("codex001").unwrap().unwrap().status,
             "running"
+        );
+    }
+
+    #[test]
+    fn codex_fork_descendant_idle_does_not_stop_active_root_turn() {
+        let state_file = unique_temp_path("codex-descendant-idle");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "codex001",
+                    "name": "codex-codex001",
+                    "provider": "codex-fork",
+                    "provider_resume_id": "root-thread",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-codex001",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"thread/status/changed","session_id":"child-thread","payload":{"threadId":"child-thread","status":{"type":"idle"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().status,
+            "running"
+        );
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"thread/status/changed","session_id":"root-thread","payload":{"threadId":"root-thread","status":{"type":"idle"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().status,
+            "idle"
         );
     }
 

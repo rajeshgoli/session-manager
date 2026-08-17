@@ -316,7 +316,7 @@ fun WatchScreen(
                             onUpdateWhat = viewModel::updateWhat,
                             onRegenerateWhat = viewModel::regenerateWhat,
                             onKill = { session ->
-                                viewModel.killSession(session.id) { result ->
+                                viewModel.retireSession(session.id) { result ->
                                     toast = result.exceptionOrNull()?.message ?: "Retired ${session.id}"
                                 }
                             },
@@ -366,7 +366,7 @@ fun WatchScreen(
                             onUpdateWhat = viewModel::updateWhat,
                             onRegenerateWhat = viewModel::regenerateWhat,
                             onKill = { session ->
-                                viewModel.killSession(session.id) { result ->
+                                viewModel.retireSession(session.id) { result ->
                                     toast = result.exceptionOrNull()?.message ?: "Retired ${session.id}"
                                 }
                             },

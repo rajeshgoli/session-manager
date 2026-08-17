@@ -707,7 +707,7 @@ async fn session_teardown_fails_requested_what_and_marks_response_undeliverable(
 }
 
 #[tokio::test]
-async fn legacy_kill_route_uses_retired_response_language() {
+async fn legacy_kill_route_preserves_deployed_client_response() {
     let state_file = write_session_fixture();
     let mut config = config_with_state_file_and_queue(&state_file);
     config.rust_core.fixture_writes_enabled = true;
@@ -715,7 +715,7 @@ async fn legacy_kill_route_uses_retired_response_language() {
 
     let (status, payload) = post_json(app, "/sessions/run12345/kill", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "retired");
+    assert_eq!(payload["status"], "killed");
 }
 
 #[tokio::test]

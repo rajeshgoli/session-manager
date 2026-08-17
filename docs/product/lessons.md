@@ -92,3 +92,6 @@ Durable lessons from maintainer sessions. Read this before handling the maintain
 - Agent retirement is reversible lifecycle state, not elimination. User-facing commands,
   responses, errors, and newly persisted completion metadata must say `retire`/`retired`;
   accept historical `killed` markers only as a read-compatibility boundary.
+- A codex-fork event stream can multiplex the root thread and descendant threads. Project
+  seat activity from events matching the stored root provider thread; a descendant idle or
+  completion event must never make the root seat writable.

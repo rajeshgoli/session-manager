@@ -114,21 +114,22 @@ use crate::runtime::{CodexModelValidationError, TmuxRuntime};
 #[cfg(test)]
 use crate::sessions::codex_fork_legacy_event_stream_path_from_log_file;
 use crate::sessions::{
-    claude_hook_gate, codex_fork_event_line_starts_turn, codex_fork_newest_event_stream_path,
-    codex_fork_status_for_event_line, expand_home, is_primary_node, submit_codex_fork_btw,
-    AgentRegistrationResponse, AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest,
-    ChildSessionResponse, ClaudeHookGate, ClearSessionRequest, ClientSessionResponse,
-    ContextMonitorOutcome, ContextMonitorRequest, ContextSnapshotResponse, ContextUsageEvent,
-    ContextUsageOutcome, CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult,
-    CoreRestoreOutcome, CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest,
-    CreateReparentRequest, CreateReparentTreeRequest, CredentialRotationOutcome,
-    DecideReparentRequest, HandoffOutcome, HandoffRequest, MaintainerMutationOutcome,
-    RegistryMutationOutcome, ReparentDecision, ReparentMutationOutcome, ReparentRepairAction,
-    RoleRegistrationRequest, SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest,
-    SendCoreInputRequest, SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore,
-    SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest, StartReviewRequest,
-    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
-    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
+    claude_hook_gate, codex_fork_event_line_matches_root_thread, codex_fork_event_line_starts_turn,
+    codex_fork_newest_event_stream_path, codex_fork_status_for_event_line, expand_home,
+    is_primary_node, submit_codex_fork_btw, AgentRegistrationResponse, AgentStatusRequest,
+    ArmStopNotifyOutcome, ArmStopNotifyRequest, ChildSessionResponse, ClaudeHookGate,
+    ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest,
+    ContextSnapshotResponse, ContextUsageEvent, ContextUsageOutcome, CoreClearOutcome,
+    CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome, CoreRetireOutcome,
+    CoreReviewOutcome, CreateCoreSessionRequest, CreateReparentRequest, CreateReparentTreeRequest,
+    CredentialRotationOutcome, DecideReparentRequest, HandoffOutcome, HandoffRequest,
+    MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision, ReparentMutationOutcome,
+    ReparentRepairAction, RoleRegistrationRequest, SeatSessionReconciliationSnapshot,
+    SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
+    SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnReviewRequest,
+    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
+    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
+    UpdateSessionMetadataRequest,
 };
 
 use crate::studio_ssh::{self, StudioSshStatus};
@@ -1227,7 +1228,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{session_id}/what", post(create_btw_request))
         .route("/sessions/{session_id}/retire", post(retire_session))
         // Compatibility for clients deployed before the retire terminology migration.
-        .route("/sessions/{session_id}/kill", post(retire_session))
+        .route("/sessions/{session_id}/kill", post(retire_session_legacy))
         .route("/sessions/{session_id}/restore", post(restore_session))
         .route("/sessions/{session_id}/clear", post(clear_session))
         .route("/sessions/{session_id}/handoff", post(schedule_handoff))
@@ -7825,6 +7826,20 @@ async fn retire_session(
     }
 }
 
+async fn retire_session_legacy(
+    state: State<Arc<AppState>>,
+    session_id: Path<String>,
+    peer_addr: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    payload: Json<RetireSessionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(mut response) = retire_session(state, session_id, peer_addr, headers, payload).await?;
+    if response.get("status").and_then(Value::as_str) == Some("retired") {
+        response["status"] = Value::String("killed".to_owned());
+    }
+    Ok(Json(response))
+}
+
 async fn restore_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -9849,7 +9864,10 @@ fn codex_fork_event_stream_activity(
     session: &SessionRecord,
 ) -> Option<CodexForkActivitySignal> {
     let event_stream_path = codex_fork_event_stream_path_for_session(state, session)?;
-    codex_fork_event_stream_signal_from_path(event_stream_path)
+    codex_fork_event_stream_signal_from_path(
+        event_stream_path,
+        session.provider_resume_id.as_deref(),
+    )
 }
 
 fn codex_fork_event_stream_path_for_session(
@@ -9888,10 +9906,22 @@ fn codex_fork_event_stream_path_for_session(
 
 #[cfg(test)]
 fn codex_fork_event_stream_activity_from_path(path: PathBuf) -> Option<&'static str> {
-    codex_fork_event_stream_signal_from_path(path).map(|signal| signal.activity)
+    codex_fork_event_stream_signal_from_path(path, None).map(|signal| signal.activity)
 }
 
-fn codex_fork_event_stream_signal_from_path(path: PathBuf) -> Option<CodexForkActivitySignal> {
+#[cfg(test)]
+fn codex_fork_event_stream_activity_from_path_for_root(
+    path: PathBuf,
+    root_thread_id: &str,
+) -> Option<&'static str> {
+    codex_fork_event_stream_signal_from_path(path, Some(root_thread_id))
+        .map(|signal| signal.activity)
+}
+
+fn codex_fork_event_stream_signal_from_path(
+    path: PathBuf,
+    root_thread_id: Option<&str>,
+) -> Option<CodexForkActivitySignal> {
     let mut file = fs::File::open(path).ok()?;
     let metadata = file.metadata().ok()?;
     let len = metadata.len();
@@ -9919,6 +9949,9 @@ fn codex_fork_event_stream_signal_from_path(path: PathBuf) -> Option<CodexForkAc
         if let Some(activity) =
             codex_fork_status_for_event_line(line).and_then(codex_fork_activity_for_status)
         {
+            if !codex_fork_event_line_matches_root_thread(line, root_thread_id) {
+                continue;
+            }
             if activity == "working"
                 && latest_activity
                     .as_ref()
@@ -14350,6 +14383,45 @@ mod tests {
         assert_eq!(
             codex_fork_event_stream_activity_from_path(event_stream),
             Some("working")
+        );
+    }
+
+    #[test]
+    fn codex_fork_event_stream_activity_ignores_descendant_idle() {
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-codex-descendant-idle-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let event_stream = dir.join("events.jsonl");
+        fs::write(
+            &event_stream,
+            concat!(
+                "{\"event_type\":\"thread/status/changed\",\"session_id\":\"root-thread\",\"payload\":{\"threadId\":\"root-thread\",\"status\":{\"type\":\"active\"}}}\n",
+                "{\"event_type\":\"thread/status/changed\",\"session_id\":\"child-thread\",\"payload\":{\"threadId\":\"child-thread\",\"status\":{\"type\":\"idle\"}}}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path_for_root(
+                event_stream.clone(),
+                "root-thread"
+            ),
+            Some("working")
+        );
+
+        let mut events = fs::read(&event_stream).unwrap();
+        events.extend_from_slice(
+            "{\"event_type\":\"thread/status/changed\",\"session_id\":\"root-thread\",\"payload\":{\"threadId\":\"root-thread\",\"status\":{\"type\":\"idle\"}}}\n"
+                .as_bytes(),
+        );
+        fs::write(&event_stream, events).unwrap();
+
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path_for_root(event_stream, "root-thread"),
+            Some("idle")
         );
     }
 
