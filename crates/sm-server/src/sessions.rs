@@ -1519,6 +1519,19 @@ impl SessionStore {
         }))
     }
 
+    pub fn verify_session_credential(
+        &self,
+        session_id: &str,
+        session_credential: &str,
+    ) -> Result<bool> {
+        let sessions = self.load_snapshot()?.into_sessions();
+        Ok(session_credential_matches(
+            &sessions,
+            session_id,
+            session_credential,
+        ))
+    }
+
     pub fn get_context_snapshot(
         &self,
         session_id: &str,
@@ -20950,6 +20963,37 @@ mod tests {
             "parent_session_id": parent,
             "session_credential_sha256": sha256_text(credential)
         })
+    }
+
+    #[test]
+    fn session_store_verifies_credentials_against_the_bound_session() {
+        let state_file = unique_temp_path("verify-session-credential");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("parent01", None, "parent-secret"),
+                    reparent_test_session("other001", None, "other-secret")
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(state_file);
+
+        assert!(store
+            .verify_session_credential("parent01", "parent-secret")
+            .unwrap());
+        assert!(!store
+            .verify_session_credential("parent01", "other-secret")
+            .unwrap());
+        assert!(!store
+            .verify_session_credential("other001", "parent-secret")
+            .unwrap());
+        assert!(!store
+            .verify_session_credential("missing", "secret")
+            .unwrap());
+        assert!(!store.verify_session_credential("parent01", "").unwrap());
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {
