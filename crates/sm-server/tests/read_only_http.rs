@@ -14760,6 +14760,27 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
         .unwrap();
     assert_eq!(runtime_child["model"], "opus");
     assert_eq!(runtime_child["reasoning_effort"], "xhigh");
+    let intent = state["spawn_launch_intents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|intent| intent["session_id"] == "runtimechild")
+        .unwrap();
+    let launch = state["session_runtime_launches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|launch| launch["session_id"] == "runtimechild")
+        .unwrap();
+    assert_eq!(intent["artifact"]["source"]["kind"], "positional");
+    assert_eq!(launch["spawn_launch_intent_id"], intent["id"]);
+    assert_eq!(launch["spawn_brief_sha256"], intent["artifact"]["sha256"]);
+    assert_eq!(launch["initial_message"], "spawn endpoint runtime prompt");
+    assert_eq!(launch["force_initial_prompt_stdin"], true);
+    assert_eq!(
+        fs::read_to_string(intent["artifact"]["path"].as_str().unwrap()).unwrap(),
+        "spawn endpoint runtime prompt"
+    );
 
     let (status, payload) =
         post_json(app.clone(), "/sessions/runtimechild/retire", json!({})).await;
@@ -14803,7 +14824,7 @@ async fn runtime_core_spawn_wait_detects_naturally_exited_tmux_child() {
         &state_file,
         &log_dir,
         &tmux_socket,
-        r#"/bin/sh -lc 'while IFS= read -r line; do printf "runtime:%s\n" "$line"; case "$line" in *natural-child-prompt*) exit 0;; esac; done' runtime-sh"#,
+        r#"/bin/sh -lc 'while IFS= read -r line; do printf "runtime:%s\n" "$line"; case "$line" in natural-child-prompt) exit 0;; esac; done' runtime-sh"#,
     );
 
     let (status, parent_payload) = post_json(
@@ -14874,7 +14895,7 @@ async fn runtime_core_spawn_wait_uses_runtime_output_as_activity() {
         &state_file,
         &log_dir,
         &tmux_socket,
-        r#"/bin/sh -lc 'while IFS= read -r line; do case "$line" in *active-child-prompt*) for i in 1 2 3 4 5 6 7 8; do printf "runtime:heartbeat-%s\n" "$i"; sleep 0.2; done; exit 0;; *) printf "runtime:%s\n" "$line";; esac; done' runtime-sh"#,
+        r#"/bin/sh -lc 'while IFS= read -r line; do case "$line" in active-child-prompt) for i in 1 2 3 4 5 6 7 8; do printf "runtime:heartbeat-%s\n" "$i"; sleep 0.2; done; exit 0;; *) printf "runtime:%s\n" "$line";; esac; done' runtime-sh"#,
     );
 
     let (status, parent_payload) = post_json(

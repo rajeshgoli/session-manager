@@ -1,4 +1,6 @@
 #[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -85,6 +87,63 @@ pub struct SessionStore {
     usage_project_keys: Arc<Mutex<BTreeMap<String, (String, String)>>>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SpawnBriefSource {
+    pub kind: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SpawnBriefArtifact {
+    pub sha256: String,
+    pub path: String,
+    pub byte_length: usize,
+    pub source: SpawnBriefSource,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SpawnLaunchIntentRecord {
+    pub id: String,
+    pub artifact: SpawnBriefArtifact,
+    pub requested_provider: String,
+    #[serde(default)]
+    pub requested_model: Option<String>,
+    #[serde(default)]
+    pub requested_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub requested_name: Option<String>,
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    #[serde(default)]
+    pub requested_node: Option<String>,
+    #[serde(default)]
+    pub requested_working_dir: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub accepted_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcceptSpawnBriefRequest {
+    pub prompt: String,
+    pub source: SpawnBriefSource,
+    pub requested_provider: String,
+    pub requested_model: Option<String>,
+    pub requested_reasoning_effort: Option<String>,
+    pub requested_name: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub requested_node: Option<String>,
+    pub requested_working_dir: Option<String>,
+}
+
+/// Set only by the HTTP handler after it has persisted and re-read the brief.
+#[derive(Debug, Clone)]
+pub struct SpawnBriefBinding {
+    pub intent_id: String,
+    pub sha256: String,
+}
+
 #[derive(Debug)]
 pub struct SeatSessionReconciliationSnapshot {
     records: Vec<SessionRecord>,
@@ -139,6 +198,67 @@ impl SessionStore {
             usage_report_store: None,
             usage_project_keys: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Durably accept a launch brief before a session ID or runtime is allocated.
+    /// The artifact is content-addressed and never rewritten after it is accepted.
+    pub fn accept_spawn_brief(
+        &self,
+        request: AcceptSpawnBriefRequest,
+    ) -> Result<SpawnLaunchIntentRecord> {
+        validate_spawn_brief_source(&request.source)?;
+        if request.prompt.trim().is_empty() {
+            anyhow::bail!("spawn prompt must not be empty");
+        }
+        let _guard = self.write_guard()?;
+        let artifact = persist_spawn_brief_artifact(
+            &self.state_file,
+            request.prompt.as_bytes(),
+            request.source,
+        )?;
+        let mut state = self.load_raw_json_value()?;
+        let intents = state
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("session state must be a JSON object"))?
+            .entry("spawn_launch_intents")
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| anyhow::anyhow!("spawn_launch_intents must be an array"))?;
+        let id = generate_unique_spawn_launch_intent_id(intents)?;
+        let intent = SpawnLaunchIntentRecord {
+            id,
+            artifact,
+            requested_provider: request.requested_provider,
+            requested_model: optional_trimmed(request.requested_model.as_deref()),
+            requested_reasoning_effort: optional_trimmed(
+                request.requested_reasoning_effort.as_deref(),
+            ),
+            requested_name: optional_trimmed(request.requested_name.as_deref()),
+            parent_session_id: optional_trimmed(request.parent_session_id.as_deref()),
+            requested_node: optional_trimmed(request.requested_node.as_deref()),
+            requested_working_dir: optional_trimmed(request.requested_working_dir.as_deref()),
+            session_id: None,
+            accepted_at: now_rfc3339(),
+        };
+        intents.push(serde_json::to_value(&intent)?);
+        self.write_raw_json_value(&state)?;
+        Ok(intent)
+    }
+
+    pub fn bind_spawn_launch_intent(&self, intent_id: &str, session_id: &str) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        bind_spawn_launch_intent_in_state(&mut state, intent_id, session_id)?;
+        self.write_raw_json_value(&state)
+    }
+
+    pub fn read_spawn_brief(&self, artifact: &SpawnBriefArtifact) -> Result<String> {
+        let bytes = fs::read(&artifact.path)
+            .with_context(|| format!("failed to read accepted spawn brief {}", artifact.path))?;
+        if bytes.len() != artifact.byte_length || sha256_bytes(&bytes) != artifact.sha256 {
+            anyhow::bail!("accepted spawn brief artifact failed integrity verification");
+        }
+        String::from_utf8(bytes).context("accepted spawn brief is not valid UTF-8 text")
     }
 
     pub fn new_with_queue(state_file: PathBuf, queue_db_path: PathBuf) -> Self {
@@ -753,6 +873,7 @@ impl SessionStore {
             log_file: PathBuf::from(&launch.log_file),
             provider: launch.provider.clone(),
             initial_message: launch.initial_message.clone(),
+            force_initial_prompt_stdin: launch.force_initial_prompt_stdin,
             model: launch.model.clone(),
             reasoning_effort: launch.reasoning_effort.clone(),
         };
@@ -1125,6 +1246,7 @@ impl SessionStore {
             log_file,
             provider: session.provider.clone(),
             initial_message: None,
+            force_initial_prompt_stdin: false,
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort.clone(),
         };
@@ -1146,6 +1268,9 @@ impl SessionStore {
             initial_message: None,
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort.clone(),
+            spawn_launch_intent_id: None,
+            spawn_brief_sha256: None,
+            force_initial_prompt_stdin: false,
             credential_sha256: credential_sha256.clone(),
             status: "launching".to_owned(),
             created_at: now.clone(),
@@ -3682,9 +3807,18 @@ impl SessionStore {
         if let Some(parent_id) = request.parent_session_id.as_deref() {
             ensure_session_not_reparent_fenced(&state, parent_id)?;
         }
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let record =
-            self.build_core_session_record(sessions, &request, log_dir.as_deref(), false, None)?;
+        let record = {
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let record = self.build_core_session_record(
+                sessions,
+                &request,
+                log_dir.as_deref(),
+                false,
+                None,
+            )?;
+            sessions.push(serde_json::to_value(&record)?);
+            record
+        };
         let log_file = record
             .log_file
             .as_deref()
@@ -3705,7 +3839,9 @@ impl SessionStore {
                 &format!("[sm-rust] fixture watch requested: {wait}s"),
             )?;
         }
-        sessions.push(serde_json::to_value(&record)?);
+        if let Some(brief) = request.spawn_brief.as_ref() {
+            bind_spawn_launch_intent_in_state(&mut state, &brief.intent_id, &record.id)?;
+        }
         self.write_raw_json_value(&state)?;
         Ok(record)
     }
@@ -3770,6 +3906,8 @@ impl SessionStore {
             .as_deref()
             .map(expand_home)
             .ok_or_else(|| anyhow::anyhow!("runtime session missing log file"))?;
+        let runtime_initial_message = request.initial_message.clone();
+        let force_initial_prompt_stdin = request.spawn_brief.is_some();
         let spec = TmuxSessionSpec {
             session_id: record.id.clone(),
             session_credential: Some(session_credential),
@@ -3777,7 +3915,8 @@ impl SessionStore {
             working_dir: expand_home(&record.working_dir).display().to_string(),
             log_file,
             provider: record.provider.clone(),
-            initial_message: request.initial_message.clone(),
+            initial_message: runtime_initial_message.clone(),
+            force_initial_prompt_stdin,
             model: request.model.clone(),
             reasoning_effort: request.reasoning_effort.clone(),
         };
@@ -3813,9 +3952,18 @@ impl SessionStore {
             provider: record.provider.clone(),
             provider_resume_id: None,
             credential_rotation_id: None,
-            initial_message: request.initial_message.clone(),
+            initial_message: runtime_initial_message,
             model: request.model.clone(),
             reasoning_effort: request.reasoning_effort.clone(),
+            spawn_launch_intent_id: request
+                .spawn_brief
+                .as_ref()
+                .map(|brief| brief.intent_id.clone()),
+            spawn_brief_sha256: request
+                .spawn_brief
+                .as_ref()
+                .map(|brief| brief.sha256.clone()),
+            force_initial_prompt_stdin,
             credential_sha256,
             status: "launching".to_owned(),
             created_at: launch_time.clone(),
@@ -3825,6 +3973,9 @@ impl SessionStore {
         record.status = "stopped".to_owned();
         record.stopped_at = Some(now_rfc3339());
         ensure_sessions_array_mut(&mut state)?.push(serde_json::to_value(&record)?);
+        if let Some(brief) = request.spawn_brief.as_ref() {
+            bind_spawn_launch_intent_in_state(&mut state, &brief.intent_id, &record.id)?;
+        }
         store_session_runtime_launch_records(&mut state, &launch_records)?;
         self.write_raw_json_value(&state)?;
 
@@ -4911,6 +5062,7 @@ impl SessionStore {
             log_file,
             provider: record.provider.clone(),
             initial_message: None,
+            force_initial_prompt_stdin: false,
             model: record.model.clone(),
             reasoning_effort: record.reasoning_effort.clone(),
         };
@@ -4932,6 +5084,9 @@ impl SessionStore {
             initial_message: None,
             model: record.model.clone(),
             reasoning_effort: record.reasoning_effort.clone(),
+            spawn_launch_intent_id: None,
+            spawn_brief_sha256: None,
+            force_initial_prompt_stdin: false,
             credential_sha256: credential_sha256.clone(),
             status: "launching".to_owned(),
             created_at: launch_time.clone(),
@@ -8332,6 +8487,10 @@ pub struct CreateCoreSessionRequest {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub wait: Option<u64>,
+    #[serde(default)]
+    pub spawn_prompt_source: Option<SpawnBriefSource>,
+    #[serde(skip)]
+    pub spawn_brief: Option<SpawnBriefBinding>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -9949,6 +10108,7 @@ fn codex_fork_spec_for_session_raw(
         log_file: expand_home(&log_file),
         provider: "codex-fork".to_owned(),
         initial_message: None,
+        force_initial_prompt_stdin: false,
         model: json_text(session.get("model")),
         reasoning_effort: json_text(session.get("reasoning_effort")),
     })
@@ -9989,6 +10149,7 @@ pub fn submit_codex_fork_btw(
             .ok_or_else(|| anyhow::anyhow!("session {} missing log_file", session.id))?,
         provider: "codex-fork".to_owned(),
         initial_message: None,
+        force_initial_prompt_stdin: false,
         model: session.model.clone(),
         reasoning_effort: session.reasoning_effort.clone(),
     };
@@ -11656,6 +11817,7 @@ fn codex_fork_event_stream_path(session: &SessionRecord, runtime: &TmuxRuntime) 
         log_file: log_file.clone(),
         provider: session.provider.clone(),
         initial_message: None,
+        force_initial_prompt_stdin: false,
         model: session.model.clone(),
         reasoning_effort: session.reasoning_effort.clone(),
     };
@@ -12062,6 +12224,181 @@ fn generate_session_credential() -> String {
 fn sha256_text(value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn sha256_bytes(value: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value);
+    format!("{:x}", hasher.finalize())
+}
+
+fn validate_spawn_brief_source(source: &SpawnBriefSource) -> Result<()> {
+    match source.kind.as_str() {
+        "positional" | "stdin" if source.path.is_none() => Ok(()),
+        "file"
+            if source
+                .path
+                .as_deref()
+                .is_some_and(|path| !path.trim().is_empty()) =>
+        {
+            Ok(())
+        }
+        _ => anyhow::bail!("invalid spawn prompt source metadata"),
+    }
+}
+
+fn persist_spawn_brief_artifact(
+    state_file: &Path,
+    bytes: &[u8],
+    source: SpawnBriefSource,
+) -> Result<SpawnBriefArtifact> {
+    let state_dir = state_file.parent().unwrap_or_else(|| Path::new("."));
+    let artifact_dir = state_dir.join("spawn-briefs");
+    fs::create_dir_all(&artifact_dir).with_context(|| {
+        format!(
+            "failed to create spawn brief directory {}",
+            artifact_dir.display()
+        )
+    })?;
+    #[cfg(unix)]
+    fs::set_permissions(&artifact_dir, fs::Permissions::from_mode(0o700))?;
+    let sha256 = sha256_bytes(bytes);
+    let path = artifact_dir.join(format!("{sha256}.md"));
+    match write_and_publish_spawn_brief(&artifact_dir, &path, bytes) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            verify_spawn_brief_artifact(&path, bytes)?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to publish spawn brief {}", path.display()));
+        }
+    }
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o400))?;
+    sync_spawn_brief_directory(&artifact_dir)?;
+    Ok(SpawnBriefArtifact {
+        sha256,
+        path: path.display().to_string(),
+        byte_length: bytes.len(),
+        source,
+    })
+}
+
+fn write_and_publish_spawn_brief(artifact_dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let (temporary_path, mut file) = (0..32)
+        .find_map(|_| {
+            let mut random = [0_u8; 8];
+            OsRng.fill_bytes(&mut random);
+            let temporary_path = artifact_dir.join(format!(
+                ".spawn-brief-{:016x}.tmp",
+                u64::from_be_bytes(random)
+            ));
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            match options.open(&temporary_path) {
+                Ok(file) => Some(Ok((temporary_path, file))),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "could not reserve spawn brief temporary path",
+            )
+        })?;
+
+    let write_result = (|| -> io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        fs::set_permissions(&temporary_path, fs::Permissions::from_mode(0o400))?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+
+    let publish_result = fs::hard_link(&temporary_path, path);
+    let _ = fs::remove_file(&temporary_path);
+    publish_result
+}
+
+fn verify_spawn_brief_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
+    let existing = fs::read(path)
+        .with_context(|| format!("failed to verify spawn brief {}", path.display()))?;
+    if existing != bytes {
+        anyhow::bail!("existing spawn brief artifact digest does not match its contents");
+    }
+    Ok(())
+}
+
+/// Persist the directory entry before its path is recorded in session state.
+/// Without this barrier, a machine crash could preserve the intent state while
+/// losing a just-published hard link.
+fn sync_spawn_brief_directory(directory: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(directory)
+            .with_context(|| {
+                format!(
+                    "failed to open spawn brief directory {}",
+                    directory.display()
+                )
+            })?
+            .sync_all()
+            .with_context(|| {
+                format!(
+                    "failed to sync spawn brief directory {}",
+                    directory.display()
+                )
+            })?;
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
+}
+
+fn bind_spawn_launch_intent_in_state(
+    state: &mut Value,
+    intent_id: &str,
+    session_id: &str,
+) -> Result<()> {
+    let Some(intents) = state
+        .get_mut("spawn_launch_intents")
+        .and_then(Value::as_array_mut)
+    else {
+        anyhow::bail!("spawn launch intent {intent_id} is missing");
+    };
+    let Some(intent) = intents
+        .iter_mut()
+        .find(|intent| intent.get("id").and_then(Value::as_str) == Some(intent_id))
+    else {
+        anyhow::bail!("spawn launch intent {intent_id} is missing");
+    };
+    intent["session_id"] = Value::String(session_id.to_owned());
+    Ok(())
+}
+
+fn generate_unique_spawn_launch_intent_id(intents: &[Value]) -> Result<String> {
+    for _ in 0..32 {
+        let mut bytes = [0_u8; 8];
+        OsRng.fill_bytes(&mut bytes);
+        let id = format!("spawn-brief-{:016x}", u64::from_be_bytes(bytes));
+        if !intents
+            .iter()
+            .any(|intent| intent.get("id").and_then(Value::as_str) == Some(id.as_str()))
+        {
+            return Ok(id);
+        }
+    }
+    anyhow::bail!("failed to generate a unique spawn launch intent ID")
 }
 
 fn constant_time_text_eq(left: &str, right: &str) -> bool {
@@ -13561,6 +13898,12 @@ pub struct SessionRuntimeLaunchRecord {
     pub model: Option<String>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub spawn_launch_intent_id: Option<String>,
+    #[serde(default)]
+    pub spawn_brief_sha256: Option<String>,
+    #[serde(default)]
+    pub force_initial_prompt_stdin: bool,
     pub credential_sha256: String,
     pub status: String,
     pub created_at: String,
@@ -14466,6 +14809,73 @@ mod tests {
     use crate::usage_identity::{AccountIdentity, Provider, UsageIdentityStore};
     use rusqlite::Connection;
 
+    #[test]
+    fn accepted_spawn_brief_is_private_immutable_and_records_launch_intent() {
+        let state_file = unique_temp_path("spawn-brief");
+        fs::write(&state_file, r#"{"sessions":[]}"#).unwrap();
+        let store = SessionStore::new(state_file.clone());
+        let prompt = "# Large brief\n\n`$(not executed)` 'quotes'\n日本語\n";
+        let mutable_source = unique_temp_path("mutable-spawn-brief");
+        fs::write(&mutable_source, prompt).unwrap();
+
+        let intent = store
+            .accept_spawn_brief(AcceptSpawnBriefRequest {
+                prompt: prompt.to_owned(),
+                source: SpawnBriefSource {
+                    kind: "file".to_owned(),
+                    path: Some(mutable_source.display().to_string()),
+                },
+                requested_provider: "codex-fork".to_owned(),
+                requested_model: Some("gpt-5.6".to_owned()),
+                requested_reasoning_effort: Some("high".to_owned()),
+                requested_name: Some("implementer".to_owned()),
+                parent_session_id: Some("parent001".to_owned()),
+                requested_node: Some("primary".to_owned()),
+                requested_working_dir: Some("/repo".to_owned()),
+            })
+            .unwrap();
+
+        fs::write(&mutable_source, "mutated after acceptance").unwrap();
+        assert_eq!(store.read_spawn_brief(&intent.artifact).unwrap(), prompt);
+        assert!(intent.artifact.path.contains("spawn-briefs"));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&intent.artifact.path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400
+        );
+
+        store
+            .bind_spawn_launch_intent(&intent.id, "child001")
+            .unwrap();
+        let state: Value = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+        let persisted = &state["spawn_launch_intents"][0];
+        assert_eq!(persisted["session_id"], "child001");
+        assert_eq!(persisted["artifact"]["sha256"], intent.artifact.sha256);
+        assert_eq!(persisted["requested_provider"], "codex-fork");
+        assert_eq!(fs::read_to_string(&intent.artifact.path).unwrap(), prompt);
+    }
+
+    #[test]
+    fn inbound_session_requests_cannot_supply_an_accepted_brief_binding() {
+        let request: CreateCoreSessionRequest = serde_json::from_value(json!({
+            "initial_message": "untrusted prompt",
+            "spawn_launch_intent_id": "forged-intent",
+            "spawn_brief_sha256": "forged-digest",
+            "spawn_brief_path": "/tmp/forged-brief",
+            "spawn_brief": {
+                "intent_id": "forged-intent",
+                "sha256": "forged-digest"
+            }
+        }))
+        .unwrap();
+
+        assert!(request.spawn_brief.is_none());
+    }
+
     static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvVarRestore {
@@ -14528,6 +14938,8 @@ mod tests {
             model: Some("luna".to_owned()),
             reasoning_effort: None,
             wait: None,
+            spawn_prompt_source: None,
+            spawn_brief: None,
         };
 
         let error = store
@@ -16548,6 +16960,7 @@ mod tests {
             log_file,
             provider: record.provider.clone(),
             initial_message: None,
+            force_initial_prompt_stdin: false,
             model: None,
             reasoning_effort: None,
         };

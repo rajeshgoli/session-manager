@@ -222,6 +222,8 @@ Use the Rust CLI:
 target/release/sm status
 target/release/sm spawn claude "say hello and exit" --name hello-agent
 target/release/sm spawn codex --model gpt-5.6-terra --effort high "review this change"
+target/release/sm spawn codex --prompt-file specs/1264_implementation_brief.md --name implementer
+generate-brief | target/release/sm spawn claude --prompt-stdin --name researcher
 target/release/sm all
 ```
 
@@ -236,7 +238,7 @@ If `target/release` is on your `PATH`, `sm` resolves to the Rust CLI.
 | `sm status` | Show your status and active sessions |
 | `sm me` | Show the current session identity |
 | `sm all` | List active sessions |
-| `sm spawn <provider> "<prompt>" [--model <model>] [--effort <level>]` | Start a managed agent with optional provider model and reasoning effort |
+| `sm spawn <provider> <prompt> \| --prompt-file <path> \| --prompt-stdin [--model <model>] [--effort <level>]` | Start a managed agent. File/stdin briefs are accepted atomically, copied into private durable state, then delivered to the runtime as the verified accepted bytes. |
 | `sm send <id> "<text>"` | Send input to an agent |
 | `sm what <id> [prompt]` / `sm btw ...` | Ask an agent for a provider-native context summary |
 | `sm wait <id> <seconds>` | Wait for a session state transition |
@@ -263,6 +265,12 @@ sm send agent "message"              # Sequential: wait for idle
 sm send agent "message" --important  # Queue behind current work
 sm send agent "message" --urgent     # Interrupt immediately
 ```
+
+For a multiline or large spawn brief, use `--prompt-file` or `--prompt-stdin`
+instead of a temporary stand-by prompt followed by `sm send`. The three prompt
+forms are mutually exclusive. The file/stdin content must be nonempty UTF-8;
+Session Manager records its SHA-256 and preserves the accepted bytes in its
+state directory before creating the child.
 
 The old transcript summarizer and its `--lines`/`--deep` options remain retired.
 `sm what` now delegates to the target provider's native `/btw` command. Use

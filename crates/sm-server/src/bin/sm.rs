@@ -215,7 +215,25 @@ struct WaitArgs {
 #[derive(Args)]
 struct SpawnArgs {
     provider: String,
+    /// Legacy shell-argument prompt. Prefer --prompt-file or --prompt-stdin for briefs.
+    #[arg(
+        value_name = "PROMPT",
+        help = "Initial prompt (legacy shell-argument form)"
+    )]
     prompt: Vec<String>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with = "prompt_stdin",
+        help = "Read the exact initial brief from a UTF-8 file"
+    )]
+    prompt_file: Option<PathBuf>,
+    #[arg(
+        long,
+        conflicts_with = "prompt_file",
+        help = "Read the exact initial brief from standard input"
+    )]
+    prompt_stdin: bool,
     #[arg(long)]
     name: Option<String>,
     #[arg(long, value_name = "SECONDS")]
@@ -232,6 +250,45 @@ struct SpawnArgs {
     json: bool,
     #[arg(long, hide = true)]
     id: Option<String>,
+}
+
+fn read_spawn_prompt(args: &SpawnArgs) -> Result<(String, Value)> {
+    let mut stdin = io::stdin();
+    read_spawn_prompt_from(args, &mut stdin)
+}
+
+fn read_spawn_prompt_from<R: Read>(args: &SpawnArgs, stdin: &mut R) -> Result<(String, Value)> {
+    let source_count = usize::from(!args.prompt.is_empty())
+        + usize::from(args.prompt_file.is_some())
+        + usize::from(args.prompt_stdin);
+    if source_count != 1 {
+        bail!("provide exactly one prompt source: positional PROMPT, --prompt-file PATH, or --prompt-stdin");
+    }
+
+    let (bytes, source) = if let Some(path) = args.prompt_file.as_ref() {
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read spawn prompt file {}", path.display()))?;
+        (
+            bytes,
+            json!({"kind": "file", "path": path.display().to_string()}),
+        )
+    } else if args.prompt_stdin {
+        let mut bytes = Vec::new();
+        stdin
+            .read_to_end(&mut bytes)
+            .context("failed to read spawn prompt from stdin")?;
+        (bytes, json!({"kind": "stdin"}))
+    } else {
+        (
+            args.prompt.join(" ").into_bytes(),
+            json!({"kind": "positional"}),
+        )
+    };
+    if bytes.is_empty() || String::from_utf8_lossy(&bytes).trim().is_empty() {
+        bail!("spawn prompt must not be empty");
+    }
+    let prompt = String::from_utf8(bytes).context("spawn prompt must be valid UTF-8 text")?;
+    Ok((prompt, source))
 }
 
 #[derive(Args)]
@@ -667,7 +724,7 @@ fn run() -> Result<()> {
             }
         }
         Command::Spawn(args) => {
-            let prompt = args.prompt.join(" ");
+            let (prompt, prompt_source) = read_spawn_prompt(&args)?;
             let parent_session_id = optional_current_session_id();
             let provider = launch_provider_for_alias(&args.provider)?;
             let payload = if let Some(parent_session_id) = parent_session_id {
@@ -677,6 +734,7 @@ fn run() -> Result<()> {
                         "id": args.id,
                         "parent_session_id": parent_session_id,
                         "prompt": prompt,
+                        "prompt_source": prompt_source,
                         "name": args.name,
                         "wait": args.wait,
                         "model": args.model,
@@ -696,6 +754,7 @@ fn run() -> Result<()> {
                         "provider": provider,
                         "node": args.node,
                         "initial_message": prompt,
+                        "spawn_prompt_source": prompt_source,
                         "model": args.model,
                         "reasoning_effort": args.effort,
                         "wait": args.wait
@@ -6734,6 +6793,84 @@ mod tests {
             launch_provider_for_alias(&args.provider).unwrap(),
             "codex-fork"
         );
+    }
+
+    #[test]
+    fn spawn_prompt_file_preserves_verbatim_unicode_markdown() {
+        let expected = "# Brief\n\nUse `$(never-run)` and 'apostrophes'.\n\nこんにちは 👋\n";
+        let path = write_temp_file("sm-rust-spawn-brief", ".md", expected);
+        let cli = Cli::try_parse_from([
+            "sm",
+            "spawn",
+            "claude",
+            "--prompt-file",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        let Command::Spawn(args) = cli.command else {
+            panic!("expected spawn command");
+        };
+
+        let (prompt, source) = read_spawn_prompt(&args).unwrap();
+        assert_eq!(prompt, expected);
+        assert_eq!(source["kind"], "file");
+        assert_eq!(source["path"], path.display().to_string());
+    }
+
+    #[test]
+    fn spawn_prompt_sources_are_exclusive_and_nonempty() {
+        let args = SpawnArgs {
+            provider: "claude".to_owned(),
+            prompt: vec!["stand by".to_owned()],
+            prompt_file: Some(PathBuf::from("brief.md")),
+            prompt_stdin: false,
+            name: None,
+            wait: None,
+            model: None,
+            effort: None,
+            working_dir: None,
+            node: None,
+            json: false,
+            id: None,
+        };
+        assert!(read_spawn_prompt(&args)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
+
+        let empty = SpawnArgs {
+            prompt: Vec::new(),
+            prompt_file: None,
+            ..args
+        };
+        assert!(read_spawn_prompt(&empty)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
+    }
+
+    #[test]
+    fn spawn_prompt_stdin_preserves_multiline_bytes() {
+        let args = SpawnArgs {
+            provider: "claude".to_owned(),
+            prompt: Vec::new(),
+            prompt_file: None,
+            prompt_stdin: true,
+            name: None,
+            wait: None,
+            model: None,
+            effort: None,
+            working_dir: None,
+            node: None,
+            json: false,
+            id: None,
+        };
+        let expected = "# Brief\n\nBackticks: `x`\n";
+        let mut input = io::Cursor::new(expected.as_bytes());
+        let (prompt, source) = read_spawn_prompt_from(&args, &mut input).unwrap();
+
+        assert_eq!(prompt, expected);
+        assert_eq!(source["kind"], "stdin");
     }
 
     #[test]
