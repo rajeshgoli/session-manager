@@ -1447,7 +1447,7 @@ fn codex_event_stream_has_user_turn(path: &Path, initial_offset: u64, prompt: &s
         let Ok(event) = serde_json::from_str::<Value>(line) else {
             return false;
         };
-        event
+        let legacy_user_turn_matches = event
             .get("payload")
             .and_then(|payload| payload.get("UserTurn"))
             .and_then(|turn| turn.get("items"))
@@ -1456,8 +1456,37 @@ fn codex_event_stream_has_user_turn(path: &Path, initial_offset: u64, prompt: &s
                 items
                     .iter()
                     .any(|item| item.get("text").and_then(Value::as_str) == Some(prompt))
-            })
+            });
+        let schema_v2_user_message_matches = event.get("event_type").and_then(Value::as_str)
+            == Some("item/started")
+            && event.pointer("/payload/item/type").and_then(Value::as_str) == Some("userMessage")
+            && event
+                .pointer("/payload/item/content")
+                .and_then(codex_user_message_text)
+                .is_some_and(|text| text == prompt);
+
+        legacy_user_turn_matches || schema_v2_user_message_matches
     })
+}
+
+/// Return the complete textual content of a schema-v2 `userMessage` item.
+///
+/// Acknowledgement is deliberately strict: every content part must be a text
+/// part, and their concatenation must equal the submitted brief. This prevents
+/// a matching substring, an agent message, or mixed content from confirming a
+/// different prompt.
+fn codex_user_message_text(content: &Value) -> Option<String> {
+    match content {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => parts.iter().try_fold(String::new(), |mut text, part| {
+            if part.get("type").and_then(Value::as_str) != Some("text") {
+                return None;
+            }
+            text.push_str(part.get("text").and_then(Value::as_str)?);
+            Some(text)
+        }),
+        _ => None,
+    }
 }
 
 fn split_send_text_chunks(text: &str, max_chunk_chars: usize) -> Vec<&str> {
@@ -2606,6 +2635,56 @@ esac
             offset - 3,
             "handoff prompt"
         ));
+    }
+
+    #[test]
+    fn codex_prompt_confirmation_accepts_exact_schema_v2_large_user_message_after_offset() {
+        let (_tmux_binary, _log_path, temp_dir) = fake_tmux_binary();
+        let events = temp_dir.join("events.jsonl");
+        let prompt = format!(
+            "# Large immutable brief\n\n{}\n\nfinal acceptance sentinel",
+            "multiline evidence paragraph\n".repeat(512)
+        );
+        let pre_offset = serde_json::json!({
+            "event_type": "item/started",
+            "payload": {"item": {"type": "userMessage", "content": [{"type": "text", "text": prompt}]}}
+        });
+        let pre_offset_line = serde_json::to_string(&pre_offset).unwrap();
+        fs::write(&events, format!("{pre_offset_line}\n")).unwrap();
+        let offset = fs::metadata(&events).unwrap().len();
+
+        let agent_echo = serde_json::json!({
+            "event_type": "item/started",
+            "payload": {"item": {"type": "agentMessage", "content": [{"type": "text", "text": prompt}]}}
+        });
+        let partial_user_message = serde_json::json!({
+            "event_type": "item/started",
+            "payload": {"item": {"type": "userMessage", "content": [{"type": "text", "text": &prompt[..32]}]}}
+        });
+        let agent_echo_line = serde_json::to_string(&agent_echo).unwrap();
+        let partial_user_message_line = serde_json::to_string(&partial_user_message).unwrap();
+        fs::write(
+            &events,
+            format!("{pre_offset_line}\n{agent_echo_line}\n{partial_user_message_line}\n",),
+        )
+        .unwrap();
+        assert!(!codex_event_stream_has_user_turn(&events, offset, &prompt));
+
+        let exact_user_message = serde_json::json!({
+            "schema_version": 2,
+            "event_type": "item/started",
+            "payload": {"item": {"type": "userMessage", "content": [{"type": "text", "text": prompt}]}}
+        });
+        let exact_user_message_line = serde_json::to_string(&exact_user_message).unwrap();
+        fs::write(
+            &events,
+            format!(
+                "{pre_offset_line}\n{agent_echo_line}\n{partial_user_message_line}\n{exact_user_message_line}\n"
+            ),
+        )
+        .unwrap();
+
+        assert!(codex_event_stream_has_user_turn(&events, offset, &prompt));
     }
 
     #[test]
