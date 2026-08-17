@@ -1328,16 +1328,12 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
     if argv.is_some() == script.is_some() {
         bail!("exactly one of command or --script-file is required");
     }
-    let mut env_values = BTreeMap::new();
-    for pair in args.env_pairs {
-        let (key, value) = pair
-            .split_once('=')
-            .ok_or_else(|| anyhow!("invalid --env value {pair:?}; expected KEY=VALUE"))?;
-        if key.trim().is_empty() {
-            bail!("invalid --env value {pair:?}; key is empty");
-        }
-        env_values.insert(key.to_owned(), value.to_owned());
-    }
+    // Queue jobs run from a deliberately cleared process environment. Capture
+    // the small, documented execution context at submission time so the job
+    // resolves the same managed-session tools without inheriting credentials
+    // or unrelated server state.
+    let env_values =
+        apply_queue_environment_overrides(captured_queue_environment(), args.env_pairs)?;
     let timeout_seconds = args
         .timeout
         .as_deref()
@@ -1369,6 +1365,41 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
         println!("Log: {log_path}");
     }
     Ok(())
+}
+
+fn apply_queue_environment_overrides(
+    mut env_values: BTreeMap<String, String>,
+    pairs: impl IntoIterator<Item = String>,
+) -> Result<BTreeMap<String, String>> {
+    for pair in pairs {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid --env value {pair:?}; expected KEY=VALUE"))?;
+        if key.trim().is_empty() {
+            bail!("invalid --env value {pair:?}; key is empty");
+        }
+        env_values.insert(key.to_owned(), value.to_owned());
+    }
+    Ok(env_values)
+}
+
+fn captured_queue_environment() -> BTreeMap<String, String> {
+    queue_environment_from(|key| env::var(key).ok())
+}
+
+fn queue_environment_from<F>(mut lookup: F) -> BTreeMap<String, String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    ["PATH"]
+        .into_iter()
+        .filter_map(|key| {
+            lookup(key)
+                .filter(|value| !value.is_empty())
+                .map(|value| (key, value))
+        })
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect()
 }
 
 fn run_queue_list(client: &ApiClient, args: QueueListArgs) -> Result<()> {
@@ -6079,6 +6110,26 @@ mod tests {
         assert_eq!(parse_duration_seconds("1d").unwrap(), 86400);
         assert_eq!(parse_queue_timeout_seconds("none").unwrap(), 0);
         assert_eq!(parse_queue_timeout_seconds("2h").unwrap(), 7200);
+    }
+
+    #[test]
+    fn queue_run_captures_only_path_and_allows_an_explicit_path_override() {
+        let captured = queue_environment_from(|key| match key {
+            "PATH" => Some("/opt/homebrew/bin:/usr/bin".to_owned()),
+            "PYTHONPATH" => Some("/workspace".to_owned()),
+            "VIRTUAL_ENV" => Some("/workspace/.venv".to_owned()),
+            _ => None,
+        });
+
+        assert_eq!(
+            captured,
+            BTreeMap::from([("PATH".to_owned(), "/opt/homebrew/bin:/usr/bin".to_owned())])
+        );
+        assert_eq!(
+            apply_queue_environment_overrides(captured, vec!["PATH=/custom/bin".to_owned()],)
+                .unwrap(),
+            BTreeMap::from([("PATH".to_owned(), "/custom/bin".to_owned())])
+        );
     }
 
     #[test]
