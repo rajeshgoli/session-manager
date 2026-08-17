@@ -336,6 +336,62 @@ to the frozen spawn brief), and retain whether several evaluations reused the
 same completed parent context. Expose per-evaluation JSON/CSV and aggregates by
 lane, seat, model, and policy version.
 
+Every enforceable or injected policy requirement has a measurement contract
+before it enters the active canary. The contract binds a stable requirement ID
+to:
+
+- the intervention event and its linked operation/seat/rotation trace;
+- the incremental cost boundary, including input, cache read, 5-minute and
+  1-hour cache write, output/reasoning tokens, dollar estimate, and latency;
+- a matched pre-policy baseline, earlier rollout cohort, or owner-approved
+  holdback when withholding the requirement is safe;
+- immediate machine-observable benefit metrics and the horizon over which they
+  are evaluated; and
+- a later Luna/high benefit review with evidence, confidence, and the resulting
+  keep/change/remove recommendation.
+
+Safety and authority invariants are never disabled merely to manufacture a
+control. Where no safe holdback exists, compare against matched historical
+operations and report the resulting wider confidence interval. Cost counters
+always receive a best estimate with bounds; an absent observed workflow benefit
+is recorded as `no_observed_benefit`, not silently omitted.
+
+One logical workflow is decomposed into linked, non-overlapping spans so shared
+provider counters are not charged twice. For example, a rotation records the
+outgoing `/btw` handoff summary, successor launch/orientation, directed
+predecessor probe, predecessor answer, and any addendum processing separately.
+Asking a 400k-context predecessor after already producing a `/btw` summary must
+therefore show exactly how much additional input/cache-read/cache-write/output
+and latency the probe consumed.
+
+The initial requirement-effect ledger includes:
+
+| Requirement family | Incremental cost boundary | Immediate benefit evidence |
+|---|---|---|
+| Spawn intent and model/vehicle policy | classifier plus injected rewrite and any retry | corrected provider/model/vehicle, prevented invalid launch, retry/rework rate |
+| Stable seats and holder liveness | resolution/alarm/queued-delivery operations | stale-holder deliveries prevented, manual re-points avoided, eventual delivery success |
+| Context profiles and rotation thresholds | preflight, handoff, orientation, probe, and retirement spans | quota/tokens per completed unit of work, threshold overrides, rotation failures, time to productive successor |
+| Handoff summary and directed probe | summary and probe spans reported separately | novel actionable items, corrections to the summary, ruled-out paths preserved, successor actions attributable to each item |
+| Codex native-compaction snapshots | each snapshot and restore/reconstruction attempt | successful restore, reconstruction time avoided, state-loss incidents |
+| Cleanup manifests and workspace relocation | closeout classification, verification, relocation, and cleanup spans | owned resources removed, ambiguous cleanup blocked, separate cleanup jobs avoided, successful later restore |
+| Refusal, recusal, conflicts, overrides, and reclassification | decision/escalation plus replacement work | accepted corrections, conflicted work avoided, owner reversals, reassignment/rework avoided |
+| Model attestation and provider-outage disposition | attestation or failed launch path | mis-tiered launches caught, hidden provider failures surfaced, unstaffed intervals made explicit |
+| Coverage-counted sweeps and baseline revalidation | sweep/revalidation runtime and any evaluator use | partial sweeps detected, stale baselines rejected, false-clean reports prevented |
+
+Per-requirement reports show the baseline and intervention side by side and
+derive benefit per million incremental tokens, benefit per dollar, and elapsed
+time saved or added where those units are meaningful. They also classify the
+observed tradeoff as `lower_cost`, `better_execution`, `both`, or `neither`;
+aggregate token savings cannot conceal a workflow regression, and a workflow
+improvement cannot conceal unbounded recurring token cost.
+
+Benefit attribution distinguishes direct observation from inference. A novel
+probe item is not automatically valuable: Luna/high classifies whether it was
+already present in the handoff, whether the successor acted on it, and whether
+it changed an outcome. The review may use later agent-role forks after the trial
+to assess workflow effects that counters cannot establish, but those reviews
+receive frozen artifacts and do not rewrite the measured event record.
+
 Rotation telemetry is first-class: trigger context, handoff/probe/successor
 tokens, latency, failure/override, generations per hour, and time to the next
 rotation. This is required to test whether a 35% target actually costs less
@@ -570,7 +626,7 @@ files.
 |---|---|---|---|---|
 | 1A | Maintainer Sol/high | Human-readable policy history, stable clause IDs, scoped rulings, operator-only approval, conflicts, and materialized enforceable effects | approved spec | Policy authority/store API |
 | 1B | Sol/high | Lane-scoped seat identity, holder incarnations, dead-holder behavior, durable-artifact resolver, historical lifecycle, and migration compatibility | approved spec | Seat registry and resolver |
-| 1C | Terra/high | Evaluation and rotation records, direct/estimated token counters, bounds/calibration, quota snapshots, JSON/CSV surfaces | 0C evidence | Telemetry API and CLI |
+| 1C | Terra/high | Requirement-effect ledger, linked non-overlapping spans, evaluation/rotation records, direct/estimated token counters, bounds/calibration, quota snapshots, JSON/CSV surfaces | 0C evidence | Telemetry API and CLI |
 | 1D | Luna/high | Golden corpus harness, hostile/conflicting policy fixtures, coverage-counted sweeps, and restart/test scaffolding using frozen contracts | 0D corpus | Reusable test substrate |
 
 ### Wave 2 - spawn policy path
@@ -584,7 +640,8 @@ files.
 
 Acceptance gate: active overridable decisions over the golden corpus and
 disposable live Claude/Codex sessions must produce no main-thread injection, no
-orphan child, and one terminal telemetry row per attempted spawn.
+orphan child, one terminal telemetry row per attempted spawn, and a complete
+cost/benefit measurement contract for every enabled requirement.
 
 ### Wave 3 - runtime profiles and routing
 
@@ -627,13 +684,18 @@ the later waves; it is not a final phase that waits for rotation support.
    an independently safe primitive. This capability order is binding; a later
    capability cannot be enabled before its listed dependencies and live gates.
 3. Every attempted operation records the actual decision, override, resulting
-   provider/model/effort, agent behavior, latency, and token estimates or direct
-   counters. There is no separate counterfactual-only or shadow execution path.
+   provider/model/effort, agent behavior, latency, token estimates or direct
+   counters, and requirement-effect rows. Each newly enabled requirement must
+   produce both an incremental-cost comparison and its declared workflow-benefit
+   evidence. There is no separate counterfactual-only or shadow execution path.
 4. Luna/high analyzes telemetry continuously. An initial 20-30-event sample is
    a useful optimization checkpoint, not an admission gate for unrelated work:
    report cache reads, latency, model mix, repeated-context amplification,
-   overrides, policy/actual disagreement, and golden-decision agreement as data
-   arrives. Sol/high adjudicates only semantic misses.
+   overrides, policy/actual disagreement, golden-decision agreement, and a
+   per-requirement keep/change/remove recommendation as data arrives. For
+   handoffs, report summary and directed-probe costs separately and classify the
+   probe's incremental findings and downstream actions. Sol/high adjudicates
+   only semantic misses.
 5. Owner reviews decisions and telemetry on a rolling basis. A bad rule can be
    overridden immediately, amended conversationally, and re-approved without
    disabling already sound enforcement elsewhere in the lane.
