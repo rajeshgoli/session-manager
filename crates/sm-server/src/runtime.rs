@@ -371,12 +371,7 @@ impl TmuxRuntime {
         if prompt_mode != "argv" && prompt_mode != "stdin" {
             bail!("unsupported runtime prompt mode: {}", self.prompt_mode);
         }
-        let has_initial_stdin_prompt = prompt_mode == "stdin"
-            && spec
-                .initial_message
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty());
+        let has_initial_stdin_prompt = initial_stdin_prompt(spec, &prompt_mode).is_some();
 
         let mut command = self.launch_command(spec, &prompt_mode)?;
         command = managed_session_command(
@@ -1218,14 +1213,7 @@ impl TmuxRuntime {
     }
 
     fn attach_session_log(&self, spec: &TmuxSessionSpec, prompt_mode: &str) -> Result<()> {
-        let initial_stdin_prompt = (prompt_mode == "stdin")
-            .then(|| {
-                spec.initial_message
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-            })
-            .flatten();
+        let initial_stdin_prompt = initial_stdin_prompt(spec, prompt_mode);
         let pipe_command = format!("cat >> {}", shell_quote_path(&spec.log_file));
         if let Err(error) = self.run_tmux([
             "pipe-pane",
@@ -1722,10 +1710,44 @@ fn is_codex_directory_trust_prompt(pane: &str) -> bool {
         && pane.contains("Press enter to continue")
 }
 
+fn initial_stdin_prompt<'a>(spec: &'a TmuxSessionSpec, prompt_mode: &str) -> Option<&'a str> {
+    if prompt_mode != "stdin" {
+        return None;
+    }
+    let prompt = spec.initial_message.as_deref()?;
+    if spec.force_initial_prompt_stdin {
+        // Accepted briefs have already been validated as non-blank. Do not
+        // trim them here: their recorded digest binds the exact UTF-8 bytes.
+        (!prompt.is_empty()).then_some(prompt)
+    } else {
+        let trimmed = prompt.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn verified_spawn_stdin_prompt_preserves_outer_whitespace() {
+        let prompt = "  # Exact brief\n\n  indented detail  \n";
+        let spec = TmuxSessionSpec {
+            session_id: "abc12345".to_owned(),
+            session_credential: None,
+            tmux_session: "sm-test".to_owned(),
+            working_dir: "/tmp".to_owned(),
+            log_file: PathBuf::from("/tmp/session.log"),
+            provider: "claude".to_owned(),
+            initial_message: Some(prompt.to_owned()),
+            force_initial_prompt_stdin: true,
+            model: None,
+            reasoning_effort: None,
+        };
+
+        assert_eq!(initial_stdin_prompt(&spec, "stdin"), Some(prompt));
+    }
 
     #[test]
     fn codex_model_validation_uses_selectable_models_from_live_catalog() {
