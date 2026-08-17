@@ -4328,6 +4328,35 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn drain_runtime_pending_message_targets_by_category(
+        &self,
+        message_category: &str,
+    ) -> Result<usize> {
+        let Some(runtime) = self.delivery_runtime.as_ref() else {
+            return Ok(0);
+        };
+        let Some(queue) = self.queue_store.as_ref() else {
+            return Ok(0);
+        };
+        let targets = queue.pending_target_session_ids_by_category(message_category)?;
+        let mut failures = Vec::new();
+        for target_session_id in &targets {
+            if let Err(error) =
+                self.drain_runtime_pending_messages_for_session(target_session_id, runtime)
+            {
+                failures.push(format!("{target_session_id}: {error:#}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(targets.len())
+        } else {
+            Err(anyhow::anyhow!(
+                "failed to drain {message_category} messages for {}",
+                failures.join("; ")
+            ))
+        }
+    }
+
     pub fn enqueue_stop_notification_for_session(
         &self,
         session_id: &str,
@@ -14195,7 +14224,7 @@ fn tail_lines(content: &str, lines: usize) -> String {
     output
 }
 
-fn read_tail_lines(path: &Path, lines: usize) -> io::Result<String> {
+pub(crate) fn read_tail_lines(path: &Path, lines: usize) -> io::Result<String> {
     if lines == 0 {
         return Ok(String::new());
     }
@@ -15585,6 +15614,61 @@ mod tests {
         assert_eq!(store.list_sessions(false).unwrap().len(), 1);
 
         let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn completion_reconciler_retains_messages_for_stopped_targets() {
+        let state_file = unique_temp_path("queue-completion-stopped-target");
+        let queue_db = state_file.with_extension("message-queue.db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "stopped1",
+                    "name": "codex-stopped1",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-stopped1",
+                    "provider": "codex-fork",
+                    "status": "stopped",
+                    "completion_status": "killed",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:01:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue
+            .enqueue_message_once_with_metadata(
+                "queue-completion-job-test",
+                "stopped1",
+                "[sm queue] job-test completed: failed",
+                "sequential",
+                QueueMessageMetadata {
+                    message_category: Some("queue-completion".to_owned()),
+                    ..QueueMessageMetadata::default()
+                },
+            )
+            .unwrap();
+        let store = SessionStore::new_with_queue(state_file.clone(), queue_db.clone())
+            .with_delivery_runtime(Some(TmuxRuntime::from_config(
+                &crate::config::RustCoreConfig::default(),
+            )));
+
+        assert_eq!(
+            store
+                .drain_runtime_pending_message_targets_by_category("queue-completion")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            queue
+                .pending_messages_for_target_by_category("stopped1", "queue-completion", 10,)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

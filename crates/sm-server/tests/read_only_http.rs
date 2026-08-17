@@ -3573,6 +3573,51 @@ async fn queue_jobs_lists_rows_with_filters_and_session_names() {
 }
 
 #[tokio::test]
+async fn queue_job_log_reads_a_bounded_derived_tail() {
+    let state_file = unique_temp_path();
+    let queue_state_dir = state_file.with_extension("queue-runner-log");
+    fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
+    create_queue_jobs_fixture_db(&queue_state_dir);
+    let logs_dir = queue_state_dir.join("logs");
+    fs::create_dir_all(&logs_dir).unwrap();
+    fs::write(logs_dir.join("job-pending.log"), "one\ntwo\nthree\n").unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            cancel_grace_seconds: 0,
+            configured: true,
+            ..QueueRunnerConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app.clone(), "/queue-jobs/job-pending/log?lines=2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["job_id"], "job-pending");
+    assert_eq!(payload["lines"], 2);
+    assert_eq!(payload["text"], "two\nthree\n");
+    assert_eq!(
+        payload["log_path"],
+        logs_dir.join("job-pending.log").display().to_string()
+    );
+
+    let (status, payload) = get_json(app.clone(), "/queue-jobs/job-pending/log?lines=0").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(payload["detail"], "lines must be between 1 and 10000");
+
+    let (status, payload) = get_json(app.clone(), "/queue-jobs/job-running/log").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Queue job log not found");
+
+    let (status, payload) = get_json(app, "/queue-jobs/missing/log").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Queue job not found");
+}
+
+#[tokio::test]
 async fn queue_jobs_uses_custom_state_file_relative_dir_by_default() {
     let base_dir = unique_temp_path().with_extension("queue-job-state-dir");
     fs::create_dir_all(&base_dir).unwrap();
