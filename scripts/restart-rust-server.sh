@@ -627,14 +627,13 @@ echo "pid $first_pid stable, state running"
 step "Verifying kernel-bound queue authority"
 [[ -S "$SM_QUEUE_AUTHORITY_SOCKET" ]] \
   || fail "queue authority socket is missing: $SM_QUEUE_AUTHORITY_SOCKET"
-authority_payload="$(/usr/bin/python3 "$SM_QUEUE_AUTHORITY_VERIFIER" job_000000000000 \
+/usr/bin/python3 "$SM_QUEUE_AUTHORITY_VERIFIER" job_000000000000 \
   --socket "$SM_QUEUE_AUTHORITY_SOCKET" \
   --executable "$SM_BINARY" \
   --launchd-label "$SM_LABEL" \
-  --signing-id "$SM_SIGN_IDENTIFIER")" \
-  || fail "queue authority peer attestation failed"
-[[ "$authority_payload" == *'"code": "not_found"'* ]] \
-  || fail "queue authority verification returned an unexpected probe response"
+  --signing-id "$SM_SIGN_IDENTIFIER" \
+  --expect-not-found >/dev/null \
+  || fail "queue authority peer attestation or exact probe validation failed"
 echo "queue authority peer verified"
 
 step "Comparing session count"

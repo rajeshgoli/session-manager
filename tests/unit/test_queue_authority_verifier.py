@@ -14,10 +14,11 @@ from scripts import verify_queue_authority as verifier
 pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="macOS peer attestation")
 
 
-def test_query_attests_kernel_peer_process_and_response_identity():
+def test_query_attests_kernel_peer_process_and_response_identity(monkeypatch):
     path, listener = _listener()
     peer_path = verifier._process_path(os.getpid())
     signing_id = verifier._code_sign_identifier(os.getpid())
+    monkeypatch.setattr(verifier, "_launchd_job_pid", lambda _label: os.getpid())
     server = _serve_one(listener, peer_path, signing_id)
 
     try:
@@ -33,14 +34,16 @@ def test_query_attests_kernel_peer_process_and_response_identity():
     assert payload["error"]["code"] == "not_found"
 
 
-@pytest.mark.parametrize("mismatch", ["executable", "signing_id"])
-def test_query_rejects_peer_identity_mismatch(mismatch):
+@pytest.mark.parametrize("mismatch", ["executable", "signing_id", "launchd_pid"])
+def test_query_rejects_peer_identity_mismatch(mismatch, monkeypatch):
     path, listener = _listener()
     peer_path = verifier._process_path(os.getpid())
     signing_id = verifier._code_sign_identifier(os.getpid())
     server = _serve_one(listener, peer_path, signing_id)
     expected_path = Path("/wrong/sm-server") if mismatch == "executable" else peer_path
     expected_signing_id = "wrong.signing.id" if mismatch == "signing_id" else signing_id
+    launchd_pid = os.getpid() + 1 if mismatch == "launchd_pid" else os.getpid()
+    monkeypatch.setattr(verifier, "_launchd_job_pid", lambda _label: launchd_pid)
 
     try:
         with pytest.raises(verifier.AuthorityVerificationError, match="mismatch"):
@@ -68,6 +71,26 @@ def test_response_limit_applies_to_the_final_newline_chunk():
 
     with pytest.raises(verifier.AuthorityVerificationError, match="size limit"):
         verifier._read_response(OversizedResponse())
+
+
+def test_csops_identity_skips_the_darwin_cs_identity_header():
+    libc = verifier.ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    buffer = verifier.ctypes.create_string_buffer(256)
+    assert libc.csops(os.getpid(), verifier.CS_OPS_IDENTITY, buffer, len(buffer)) == 0
+    assert buffer.raw[: verifier.CS_IDENTITY_HEADER_BYTES].split(b"\0", 1)[0] == b""
+    expected = buffer.raw[verifier.CS_IDENTITY_HEADER_BYTES :].split(b"\0", 1)[0]
+    assert expected
+    assert verifier._code_sign_identifier(os.getpid()) == expected.decode()
+
+
+def test_not_found_probe_requires_consistent_top_level_fields():
+    verifier._require_not_found_response(
+        {"ok": False, "job": None, "error": {"code": "not_found"}}
+    )
+    with pytest.raises(verifier.AuthorityVerificationError, match="exact not_found"):
+        verifier._require_not_found_response(
+            {"ok": True, "job": {"id": "job_000000000000"}, "error": {"code": "not_found"}}
+        )
 
 
 def _listener():

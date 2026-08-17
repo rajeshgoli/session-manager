@@ -99,7 +99,7 @@ def env(tmp_path, request):
     (state / "authority_rc").write_text("0")
     (state / "authority_payload").write_text(
         '{"schema":"sm.queue_authority.response.v1","ok":false,'
-        '"error":{"code": "not_found"}}\n'
+        '"job":null,"error":{"code": "not_found"}}\n'
     )
     # What a successful `cargo build` drops at the cargo output path.
     _write(state / "rebuilt-binary", fake_binary(state, "REBUILT"))
@@ -199,13 +199,27 @@ exit 0
         bin_dir / "verify-queue-authority",
         f"""#!/usr/bin/env python3
 import pathlib
+import json
 import sys
 
 state = pathlib.Path({str(state)!r})
 with pathlib.Path({str(log)!r}).open("a") as handle:
     handle.write("verify-queue-authority " + " ".join(sys.argv[1:]) + "\\n")
-sys.stdout.write((state / "authority_payload").read_text())
-raise SystemExit(int((state / "authority_rc").read_text()))
+payload_text = (state / "authority_payload").read_text()
+sys.stdout.write(payload_text)
+rc = int((state / "authority_rc").read_text())
+if rc:
+    raise SystemExit(rc)
+if "--expect-not-found" in sys.argv:
+    payload = json.loads(payload_text)
+    error = payload.get("error")
+    if not (
+        payload.get("ok") is False
+        and payload.get("job") is None
+        and isinstance(error, dict)
+        and error.get("code") == "not_found"
+    ):
+        raise SystemExit(3)
 """,
         executable=True,
     )
@@ -1039,7 +1053,8 @@ def test_happy_path_succeeds(env):
     assert (
         f"verify-queue-authority job_000000000000 --socket "
         f"{env['authority_socket_path']} --executable {env['installed']} "
-        f"--launchd-label {LABEL} --signing-id com.rajeshgoli.sm-server"
+        f"--launchd-label {LABEL} --signing-id com.rajeshgoli.sm-server "
+        f"--expect-not-found"
     ) in calls(env)
 
 
@@ -1059,7 +1074,7 @@ def test_queue_authority_peer_attestation_failure_is_reported(env):
     result = env["run"]()
 
     assert result.returncode != 0
-    assert "queue authority peer attestation failed" in result.stderr
+    assert "queue authority peer attestation or exact probe validation failed" in result.stderr
 
 
 def test_queue_authority_probe_must_return_not_found(env):
@@ -1070,7 +1085,7 @@ def test_queue_authority_probe_must_return_not_found(env):
     result = env["run"]()
 
     assert result.returncode != 0
-    assert "unexpected probe response" in result.stderr
+    assert "queue authority peer attestation or exact probe validation failed" in result.stderr
 
 
 def test_unhealthy_after_restart_fails(env):

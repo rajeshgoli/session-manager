@@ -153,7 +153,8 @@ fn handle_connection(
             "job_id must match job_<12 lowercase hex characters>".to_owned(),
         ),
         Ok(request) => {
-            match RetainedQueueStore::get_queue_job_from_path(queue_db_path, &request.job_id) {
+            match RetainedQueueStore::get_queue_job_strict_from_path(queue_db_path, &request.job_id)
+            {
                 Ok(Some(job)) => AuthorityResponse {
                     schema: RESPONSE_SCHEMA,
                     ok: true,
@@ -378,6 +379,16 @@ mod tests {
         assert_eq!(payload["ok"], false);
         assert_eq!(payload["error"]["code"], "not_found");
         assert!(payload["job"].is_null());
+
+        let broken_dir = unique_temp_dir("broken-db");
+        fs::create_dir(broken_dir.join("queue_runner.db")).unwrap();
+        let payload = round_trip(
+            &broken_dir,
+            &identity,
+            json!({ "schema": REQUEST_SCHEMA, "job_id": "job_0123456789ab" }),
+        );
+        assert_eq!(payload["ok"], false);
+        assert_eq!(payload["error"]["code"], "queue_read_failed");
     }
 
     #[test]

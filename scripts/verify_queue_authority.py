@@ -18,6 +18,9 @@ RESPONSE_SCHEMA = "sm.queue_authority.response.v1"
 SOL_LOCAL = 0
 LOCAL_PEERPID = 0x002
 CS_OPS_IDENTITY = 11
+CS_IDENTITY_HEADER_BYTES = 8
+CF_NUMBER_SINT64_TYPE = 4
+CF_STRING_ENCODING_UTF8 = 0x08000100
 MAX_RESPONSE_BYTES = 1024 * 1024
 
 
@@ -62,6 +65,12 @@ def query_attested_queue_job(
             raise AuthorityVerificationError(
                 "authority peer signing identifier mismatch: "
                 f"{signing_identifier!r} != {expected_code_sign_identifier!r}"
+            )
+        launchd_pid = _launchd_job_pid(expected_launchd_label)
+        if launchd_pid != peer_pid:
+            raise AuthorityVerificationError(
+                f"authority launchd job PID mismatch: peer {peer_pid}, "
+                f"{expected_launchd_label} pid {launchd_pid}"
             )
 
         request = json.dumps(
@@ -131,13 +140,93 @@ def _code_sign_identifier(pid: int) -> str:
     if libc.csops(pid, CS_OPS_IDENTITY, buffer, len(buffer)) != 0:
         error = ctypes.get_errno()
         raise AuthorityVerificationError(f"csops identity failed for {pid}: errno {error}")
-    identity = buffer.raw[8:].split(b"\0", 1)[0]
+    # CS_OPS_IDENTITY writes a cs_identity header before its NUL-terminated string.
+    identity = buffer.raw[CS_IDENTITY_HEADER_BYTES:].split(b"\0", 1)[0]
     if not identity:
         raise AuthorityVerificationError("csops returned an empty signing identifier")
     try:
         return identity.decode("utf-8")
     except UnicodeDecodeError as error:
         raise AuthorityVerificationError("csops returned a non-UTF-8 signing identifier") from error
+
+
+def _launchd_job_pid(label: str) -> int:
+    service_management = ctypes.CDLL(
+        "/System/Library/Frameworks/ServiceManagement.framework/ServiceManagement"
+    )
+    core_foundation = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    service_management.SMJobCopyDictionary.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    service_management.SMJobCopyDictionary.restype = ctypes.c_void_p
+    core_foundation.CFStringCreateWithCString.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_uint32,
+    ]
+    core_foundation.CFStringCreateWithCString.restype = ctypes.c_void_p
+    core_foundation.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    core_foundation.CFDictionaryGetValue.restype = ctypes.c_void_p
+    core_foundation.CFGetTypeID.argtypes = [ctypes.c_void_p]
+    core_foundation.CFGetTypeID.restype = ctypes.c_ulong
+    core_foundation.CFNumberGetTypeID.argtypes = []
+    core_foundation.CFNumberGetTypeID.restype = ctypes.c_ulong
+    core_foundation.CFNumberGetValue.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    core_foundation.CFNumberGetValue.restype = ctypes.c_bool
+    core_foundation.CFRelease.argtypes = [ctypes.c_void_p]
+    core_foundation.CFRelease.restype = None
+
+    try:
+        domain = ctypes.c_void_p.in_dll(
+            service_management, "kSMDomainUserLaunchd"
+        ).value
+    except ValueError as error:
+        raise AuthorityVerificationError("user launchd domain is unavailable") from error
+    if not domain:
+        raise AuthorityVerificationError("user launchd domain is null")
+
+    label_ref = core_foundation.CFStringCreateWithCString(
+        None, label.encode("utf-8"), CF_STRING_ENCODING_UTF8
+    )
+    if not label_ref:
+        raise AuthorityVerificationError("failed to encode launchd label")
+    try:
+        job = service_management.SMJobCopyDictionary(domain, label_ref)
+        if not job:
+            raise AuthorityVerificationError(f"launchd job {label} is not registered")
+        try:
+            pid_key = core_foundation.CFStringCreateWithCString(
+                None, b"PID", CF_STRING_ENCODING_UTF8
+            )
+            if not pid_key:
+                raise AuthorityVerificationError("failed to encode launchd PID key")
+            try:
+                pid_value = core_foundation.CFDictionaryGetValue(job, pid_key)
+            finally:
+                core_foundation.CFRelease(pid_key)
+            if not pid_value:
+                raise AuthorityVerificationError(f"launchd job {label} has no PID")
+            if (
+                core_foundation.CFGetTypeID(pid_value)
+                != core_foundation.CFNumberGetTypeID()
+            ):
+                raise AuthorityVerificationError(f"launchd job {label} PID is not numeric")
+            pid = ctypes.c_int64()
+            if not core_foundation.CFNumberGetValue(
+                pid_value, CF_NUMBER_SINT64_TYPE, ctypes.byref(pid)
+            ):
+                raise AuthorityVerificationError(f"launchd job {label} PID is unreadable")
+            if pid.value <= 0:
+                raise AuthorityVerificationError(f"launchd job {label} PID is invalid")
+            return pid.value
+        finally:
+            core_foundation.CFRelease(job)
+    finally:
+        core_foundation.CFRelease(label_ref)
 
 
 def _read_response(connection: socket.socket) -> str:
@@ -165,6 +254,19 @@ def _read_response(connection: socket.socket) -> str:
         raise AuthorityVerificationError("authority response is not UTF-8") from error
 
 
+def _require_not_found_response(payload: dict[str, Any]) -> None:
+    error = payload.get("error")
+    if not (
+        payload.get("ok") is False
+        and payload.get("job") is None
+        and isinstance(error, dict)
+        and error.get("code") == "not_found"
+    ):
+        raise AuthorityVerificationError(
+            "authority probe did not return exact not_found response"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("job_id")
@@ -172,6 +274,7 @@ def main() -> int:
     parser.add_argument("--executable", type=Path, required=True)
     parser.add_argument("--launchd-label", required=True)
     parser.add_argument("--signing-id", required=True)
+    parser.add_argument("--expect-not-found", action="store_true")
     args = parser.parse_args()
     payload = query_attested_queue_job(
         socket_path=args.socket,
@@ -180,6 +283,8 @@ def main() -> int:
         expected_launchd_label=args.launchd_label,
         expected_code_sign_identifier=args.signing_id,
     )
+    if args.expect_not_found:
+        _require_not_found_response(payload)
     print(json.dumps(payload, sort_keys=True))
     return 0
 
