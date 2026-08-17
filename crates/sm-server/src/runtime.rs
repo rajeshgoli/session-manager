@@ -1898,6 +1898,39 @@ printf '%s' '{"models":[{"slug":"gpt-5.6-luna","visibility":"list"}]}'
     }
 
     #[test]
+    fn claude_input_readiness_requires_the_live_composer_not_scrollback() {
+        let (tmux_binary, _log_path, temp_dir) = fake_tmux_binary();
+        let pane_path = temp_dir.join("pane");
+        fs::write(&pane_path, "❯ prior prompt\n✽ Thinking through the task…\n").unwrap();
+        fs::write(
+            &tmux_binary,
+            format!(
+                r#"#!/bin/sh
+if [ "$1" = "-L" ]; then
+  shift 2
+fi
+case "$1" in
+  capture-pane) cat "{}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+                pane_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux_binary, permissions).unwrap();
+
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.tmux_binary = tmux_binary.display().to_string();
+        assert!(!runtime.session_input_ready("sm-test", "claude"));
+
+        fs::write(&pane_path, "✻ Finished\n❯\n").unwrap();
+        assert!(runtime.session_input_ready("sm-test", "claude"));
+    }
+
+    #[test]
     fn codex_directory_trust_prompt_is_accepted_without_matching_incidental_text() {
         let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary();
         fs::write(

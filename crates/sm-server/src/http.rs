@@ -174,6 +174,9 @@ const REVIEW_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const BTW_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
 const BTW_PROVIDER_POLL: Duration = Duration::from_millis(250);
 static BTW_NATIVE_COPY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const CLAUDE_BTW_WAITING_PREFIX: &str = "claude:waiting:";
+const CLAUDE_BTW_SUBMITTING_PREFIX: &str = "claude:submitting:";
+const CLAUDE_BTW_SUBMITTED_PREFIX: &str = "claude:submitted:";
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -7156,33 +7159,53 @@ fn recover_btw_requests(state: Arc<AppState>) {
                 let pane = runtime
                     .capture_pane_tail(&target.tmux_session, 200)
                     .unwrap_or_default();
-                let recovered = match request.target_provider.as_str() {
-                    "claude" if pane.contains("c to copy") && pane.contains("Esc to close") => {
-                        recover_claude_btw(&runtime, &target).ok()
+                if request.target_provider == "claude" {
+                    if pane.contains("c to copy") && pane.contains("Esc to close") {
+                        if let Ok(result) = recover_claude_btw(&runtime, &target) {
+                            let _ = finish_btw_request(
+                                &worker_state,
+                                &worker_store,
+                                &request.request_id,
+                                Ok(result),
+                            );
+                            return;
+                        }
+                    } else if claude_btw_is_safe_to_retry_after_restart(&request) {
+                        // A request that was still waiting had not touched the
+                        // provider input. Resume waiting rather than injecting
+                        // it into a possibly busy main conversation.
+                        let _ = run_btw_request(&worker_state, &request.request_id);
+                        return;
                     }
-                    "codex"
-                        if pane.contains("Side from main thread")
-                            && pane.contains("Ctrl+C to return") =>
-                    {
-                        recover_stock_codex_btw(&runtime, &target, &request.prompt).ok()
-                    }
-                    _ => None,
-                };
-                if let Some(result) = recovered {
-                    let _ = finish_btw_request(
-                        &worker_state,
-                        &worker_store,
+
+                    // The old adapter and the narrow window around literal-key
+                    // submission cannot prove whether Claude accepted `/btw` as
+                    // a native side command. Never retry that command: replaying
+                    // it could create an ordinary main-thread turn.
+                    let _ = worker_store.fail(
                         &request.request_id,
-                        Ok(result),
+                        "session manager restarted before isolated /btw completion could be confirmed",
                     );
+                    let _ = deliver_btw_response(&worker_state, &worker_store, &request.request_id);
                     return;
                 }
-                let cleanup_key = if request.target_provider == "claude" {
-                    "Escape"
-                } else {
-                    "C-c"
-                };
-                let _ = runtime.send_key_input(&target.tmux_session, cleanup_key);
+
+                if request.target_provider == "codex"
+                    && pane.contains("Side from main thread")
+                    && pane.contains("Ctrl+C to return")
+                {
+                    if let Ok(result) = recover_stock_codex_btw(&runtime, &target, &request.prompt)
+                    {
+                        let _ = finish_btw_request(
+                            &worker_state,
+                            &worker_store,
+                            &request.request_id,
+                            Ok(result),
+                        );
+                        return;
+                    }
+                }
+                let _ = runtime.send_key_input(&target.tmux_session, "C-c");
             }
             let _ = worker_store.fail(&request.request_id, "session manager restarted during /btw");
             let _ = deliver_btw_response(&worker_state, &worker_store, &request.request_id);
@@ -7203,12 +7226,12 @@ fn run_btw_request(state: &AppState, request_id: &str) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("target session no longer exists"))?;
         let runtime = TmuxRuntime::from_app_config(&state.config)
             .for_socket_name(target.tmux_socket_name.as_deref());
-        if matches!(target.provider.as_str(), "claude" | "codex") {
+        if target.provider == "codex" {
             store.set_provider_correlation(request_id, &format!("tmux:{}", target.tmux_session))?;
         }
 
         match target.provider.as_str() {
-            "claude" => run_claude_btw(&runtime, &target, &request.prompt),
+            "claude" => run_claude_btw(&store, request_id, &runtime, &target, &request.prompt),
             "codex" => run_stock_codex_btw(&runtime, &target, &request.prompt),
             "codex-fork" => {
                 run_codex_fork_btw(&store, &runtime, &target, request_id, &request.prompt)
@@ -7271,29 +7294,85 @@ fn run_codex_fork_btw(
 }
 
 fn run_claude_btw(
+    store: &BtwStore,
+    request_id: &str,
     runtime: &TmuxRuntime,
     target: &SessionRecord,
     prompt: &str,
 ) -> anyhow::Result<String> {
-    let _input_guard = runtime.lock_session_input(&target.tmux_session)?;
-    let initial = runtime
-        .capture_pane_tail(&target.tmux_session, 80)
-        .ok_or_else(|| anyhow::anyhow!("unable to inspect Claude pane"))?;
-    if initial.contains("c to copy") && initial.contains("Esc to close") {
+    store.set_provider_correlation(
+        request_id,
+        &format!("{CLAUDE_BTW_WAITING_PREFIX}{}", target.tmux_session),
+    )?;
+    let deadline = Instant::now() + BTW_PROVIDER_TIMEOUT;
+    loop {
+        let initial = runtime
+            .capture_pane_tail(&target.tmux_session, 80)
+            .ok_or_else(|| anyhow::anyhow!("unable to inspect Claude pane"))?;
+        ensure_claude_btw_is_not_blocked(&initial)?;
+
+        if runtime.session_input_ready(&target.tmux_session, "claude") {
+            let input_guard = runtime.lock_session_input(&target.tmux_session)?;
+            let before_submit = runtime
+                .capture_pane_tail(&target.tmux_session, 80)
+                .ok_or_else(|| anyhow::anyhow!("unable to inspect Claude pane"))?;
+            ensure_claude_btw_is_not_blocked(&before_submit)?;
+
+            // Recheck under the session input lock. A busy Claude pane may show
+            // an old prompt in its scrollback, but only the live composer is a
+            // safe place for a standalone provider-native slash command.
+            if !runtime.session_input_ready(&target.tmux_session, "claude") {
+                drop(input_guard);
+                continue;
+            }
+
+            store.set_provider_correlation(
+                request_id,
+                &format!("{CLAUDE_BTW_SUBMITTING_PREFIX}{}", target.tmux_session),
+            )?;
+            let command = format!("/btw {prompt}");
+            if !runtime.send_input_while_locked(&target.tmux_session, &command)? {
+                anyhow::bail!("target tmux session is not running");
+            }
+            store.set_provider_correlation(
+                request_id,
+                &format!("{CLAUDE_BTW_SUBMITTED_PREFIX}{}", target.tmux_session),
+            )?;
+            // Keep the input lock through capture and cleanup. A concurrent
+            // manager delivery could otherwise change the Claude UI before the
+            // native side-result modal is correlated and dismissed.
+            let _input_guard = input_guard;
+            return capture_claude_btw_result(runtime, target);
+        }
+
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "provider timed out waiting for Claude to accept an isolated /btw command"
+            );
+        }
+        thread::sleep(BTW_PROVIDER_POLL);
+    }
+}
+
+fn ensure_claude_btw_is_not_blocked(pane: &str) -> anyhow::Result<()> {
+    if pane.contains("c to copy") && pane.contains("Esc to close") {
         anyhow::bail!("Claude is already displaying a /btw result");
     }
-    if initial.contains("Do you trust the files")
-        || initial.contains("Allow this action")
-        || initial.contains("Waiting for approval")
+    if pane.contains("Do you trust the files")
+        || pane.contains("Allow this action")
+        || pane.contains("Waiting for approval")
     {
         anyhow::bail!("Claude is not ready for a native /btw command");
     }
+    Ok(())
+}
 
-    let command = format!("/btw {prompt}");
-    if !runtime.send_input_while_locked(&target.tmux_session, &command)? {
-        anyhow::bail!("target tmux session is not running");
-    }
-    capture_claude_btw_result(runtime, target)
+fn claude_btw_is_safe_to_retry_after_restart(request: &BtwRequestRecord) -> bool {
+    request.status == "pending"
+        || request
+            .provider_correlation
+            .as_deref()
+            .is_some_and(|value| value.starts_with(CLAUDE_BTW_WAITING_PREFIX))
 }
 
 fn recover_claude_btw(runtime: &TmuxRuntime, target: &SessionRecord) -> anyhow::Result<String> {
@@ -13716,6 +13795,46 @@ mod tests {
   ⎿  ◻ Triage round-3 Codex review
 "#;
         assert_eq!(claude_live_activity_from_pane(Some(pane)), Some("working"));
+    }
+
+    #[test]
+    fn claude_btw_restart_retries_only_requests_known_not_to_be_submitted() {
+        let path = env::temp_dir().join(format!(
+            "sm-http-btw-restart-{}-{}.db",
+            process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let store = BtwStore::new(path.clone()).unwrap();
+        let request = store
+            .create(None, "target", "claude", "poll", "summary")
+            .unwrap();
+        assert!(claude_btw_is_safe_to_retry_after_restart(&request));
+
+        store
+            .mark_running(&request.request_id, Some("claude:waiting:target"))
+            .unwrap();
+        let waiting = store.get(&request.request_id).unwrap().unwrap();
+        assert!(claude_btw_is_safe_to_retry_after_restart(&waiting));
+
+        store
+            .set_provider_correlation(&request.request_id, "claude:submitting:target")
+            .unwrap();
+        let submitting = store.get(&request.request_id).unwrap().unwrap();
+        assert!(!claude_btw_is_safe_to_retry_after_restart(&submitting));
+
+        store
+            .set_provider_correlation(&request.request_id, "claude:submitted:target")
+            .unwrap();
+        let submitted = store.get(&request.request_id).unwrap().unwrap();
+        assert!(!claude_btw_is_safe_to_retry_after_restart(&submitted));
+        assert!(fs::remove_file(path).is_ok());
+    }
+
+    #[test]
+    fn claude_btw_rejects_modal_state_before_main_thread_injection() {
+        let result = ensure_claude_btw_is_not_blocked("Allow this action\n❯");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not ready"));
     }
 
     #[test]
