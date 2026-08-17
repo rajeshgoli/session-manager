@@ -15346,6 +15346,44 @@ async fn runtime_core_starts_review_on_existing_codex_session() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "reviewcodex")
+        .unwrap();
+    session["status"] = json!("idle");
+    session["completion_status"] = json!("killed");
+    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/reviewcodex/review",
+        json!({
+            "mode": "custom",
+            "custom_prompt": "must not dispatch to a retired session"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({ "error": "Session is stopped. Restore it before starting a review." })
+    );
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "reviewcodex")
+        .unwrap();
+    assert_eq!(session["status"], "idle");
+    assert_eq!(session["completion_status"], "killed");
+    assert!(session.get("review_config").is_none() || session["review_config"].is_null());
+    session["completion_status"] = Value::Null;
+    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+
     let (status, payload) = post_json(
         app.clone(),
         "/sessions/reviewcodex/review",
@@ -15368,6 +15406,11 @@ async fn runtime_core_starts_review_on_existing_codex_session() {
         "runtime:/review inspect retained review route",
     )
     .await;
+    let (_status, output) = get_json(app.clone(), "/sessions/reviewcodex/output?lines=20").await;
+    assert!(!output["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("must not dispatch to a retired session"));
     wait_for_output_contains(
         app.clone(),
         "reviewwatcher",

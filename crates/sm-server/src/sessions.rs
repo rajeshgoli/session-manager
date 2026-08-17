@@ -4115,6 +4115,11 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(CoreReviewOutcome::NotFound);
         };
+        if raw_session_is_stopped(session) {
+            return Ok(CoreReviewOutcome::Error(
+                "Session is stopped. Restore it before starting a review.".to_owned(),
+            ));
+        }
 
         let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
         if !matches!(provider.as_str(), "codex" | "codex-fork" | "codex-app") {
