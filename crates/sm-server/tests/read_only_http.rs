@@ -5818,6 +5818,24 @@ async fn tmux_client_hook_revives_stopped_codex_fork_with_live_tmux_session() {
                     "last_activity": "2026-06-17T20:16:56Z"
                 },
                 {
+                    "id": "retired-local",
+                    "name": "codex-fork-retired-local",
+                    "working_dir": working_dir.display().to_string(),
+                    "tmux_session": tmux_session,
+                    "tmux_socket_name": tmux_socket,
+                    "provider": "codex-fork",
+                    "log_file": log_dir.join("retired-local.log").display().to_string(),
+                    "provider_resume_id": "retired-thread-123",
+                    "friendly_name": "retired-local-agent",
+                    "status": "stopped",
+                    "stopped_at": "2026-06-17T20:16:56Z",
+                    "completion_status": "killed",
+                    "completion_message": "Terminated via sm kill",
+                    "completed_at": "2026-06-17T20:16:56Z",
+                    "created_at": "2026-06-17T19:00:00Z",
+                    "last_activity": "2026-06-17T20:16:56Z"
+                },
+                {
                     "id": "revive1",
                     "name": "codex-fork-revive",
                     "working_dir": working_dir.display().to_string(),
@@ -5829,9 +5847,9 @@ async fn tmux_client_hook_revives_stopped_codex_fork_with_live_tmux_session() {
                     "friendly_name": "hidden-live-agent",
                     "status": "stopped",
                     "stopped_at": "2026-06-17T20:16:56Z",
-                    "completion_status": "killed",
-                    "completion_message": "retry error",
-                    "completed_at": "2026-06-17T20:16:56Z",
+                    "completion_status": null,
+                    "completion_message": null,
+                    "completed_at": null,
                     "error_message": "codex_fork_control_degraded: stale control socket",
                     "created_at": "2026-06-17T19:00:00Z",
                     "last_activity": "2026-06-17T20:16:56Z"
@@ -5897,6 +5915,14 @@ async fn tmux_client_hook_revives_stopped_codex_fork_with_live_tmux_session() {
         .unwrap();
     assert_eq!(remote["status"], "stopped");
     assert_eq!(remote["node"], "macbook");
+    let retired = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "retired-local")
+        .unwrap();
+    assert_eq!(retired["status"], "stopped");
+    assert_eq!(retired["completion_status"], "killed");
     let restored = state["sessions"]
         .as_array()
         .unwrap()
@@ -9551,13 +9577,25 @@ async fn client_session_detail_explains_mobile_terminal_auth_gap_without_actor()
 #[tokio::test]
 async fn client_session_detail_preserves_attach_unsupported_primary_action_reason() {
     let state_file = write_session_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let stopped = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "stop1234")
+        .unwrap();
+    stopped["status"] = json!("idle");
+    stopped["completion_status"] = json!("killed");
+    fs::write(&state_file, state.to_string()).unwrap();
     let app = router(AppState::new(config_with_state_file(&state_file)));
 
     let (status, payload) = get_json(app, "/client/sessions/stop1234").await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["id"], "stop1234");
+    assert_eq!(payload["status"], "stopped");
     assert_eq!(payload["attach_descriptor"]["attach_supported"], false);
+    assert_eq!(payload["attach_descriptor"]["lifecycle_state"], "stopped");
     assert_eq!(
         payload["attach_descriptor"]["message"],
         "Session is stopped"

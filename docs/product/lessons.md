@@ -4,7 +4,7 @@ Durable lessons from maintainer sessions. Read this before handling the maintain
 
 ## Current Lessons
 
-- Treat `completion_status=killed` as a terminal lifecycle marker even if a stale status-only writer leaves `status=idle` or `running`. Live roster, hook, routing, and context surfaces must agree on that invariant; explicit restore is the only path that clears the terminal markers.
+- Treat `completion_status=killed` as a terminal lifecycle marker even if a stale status-only writer leaves `status=idle` or `running`. Live roster, hooks, routing, attach, reminders, and context surfaces must agree on that invariant; automatic tmux-client revival must skip killed records, and explicit restore is the only path that clears the terminal markers.
 - Provider-native `/btw` runs in an isolated side conversation. Default `sm what` prompts must explicitly ask for the main conversation thread and exclude the `/btw` side conversation, or the summary can truthfully but uselessly report that no work happened.
 - Cutover removal decisions must be revisited when live agent workflows prove a surface is still operationally required. Durable `sm remind --recurring` belongs in the Rust queue database and scheduler; launchd timers are not an acceptable substitute because they bypass session teardown, cancellation, restart recovery, and queue observability.
 - Claude Code UI forks can create a new Session Manager session ID while continuing in the same tmux runtime. When that happens, inherited recurring reminders need to be self-identifying so the active fork can cancel them directly.

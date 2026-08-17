@@ -1349,7 +1349,9 @@ impl SessionStore {
             .filter(|value| !value.is_empty() && *value != "all");
         if let Some(status_filter) = status_filter {
             children.retain(|session| match status_filter {
-                "running" => normalized_status(&session.status) == "running",
+                "running" => {
+                    !session.is_stopped() && normalized_status(&session.status) == "running"
+                }
                 "completed" => session.completion_status.as_deref() == Some("completed"),
                 "error" => session.completion_status.as_deref() == Some("error"),
                 _ => true,
@@ -4360,6 +4362,9 @@ impl SessionStore {
         {
             return Ok(CoreClearOutcome::Unauthorized(message));
         }
+        if raw_session_is_stopped(session) {
+            return Ok(CoreClearOutcome::NotRunning);
+        }
         let now = now_rfc3339();
         reset_session_after_clear(session, &now);
         self.cancel_context_monitor_alerts(session_id)?;
@@ -4418,6 +4423,9 @@ impl SessionStore {
                 clear_authorization_error(session, request.requester_session_id.as_deref())
             {
                 return Ok(CoreClearOutcome::Unauthorized(message));
+            }
+            if raw_session_is_stopped(session) {
+                return Ok(CoreClearOutcome::NotRunning);
             }
             let node = json_text(session.get("node")).unwrap_or_else(default_node);
             ensure_runtime_local_node(&node)?;
@@ -4556,15 +4564,13 @@ impl SessionStore {
             let current_socket_name = json_text(session.get("tmux_socket_name"));
             let current_provider =
                 json_text(session.get("provider")).unwrap_or_else(default_provider);
-            let current_status =
-                json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
             if current_tmux_session.as_deref() != Some(tmux_session.as_str())
                 || current_socket_name != session_socket_name
                 || current_provider != provider
             {
                 anyhow::bail!("session {session_id} changed while clear was in progress");
             }
-            if normalized_status(&current_status) == "stopped" {
+            if raw_session_is_stopped(session) {
                 anyhow::bail!("session {session_id} stopped while clear was in progress");
             }
             if let Some((provider_resume_id, _)) = replacement_provider_resume_id.as_ref() {
@@ -4649,9 +4655,8 @@ impl SessionStore {
                 return Ok(false);
             };
             let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
-            let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
             if provider != "codex"
-                || normalized_status(&status) == "stopped"
+                || raw_session_is_stopped(session)
                 || json_text(session.get("provider_resume_id")).as_deref()
                     != expected_provider_resume_id
             {
@@ -5025,6 +5030,7 @@ impl SessionStore {
                 && json_text(session.get("status"))
                     .as_deref()
                     .is_some_and(|status| normalized_status(status) == "stopped")
+                && json_text(session.get("completion_status")).as_deref() != Some("killed")
         }) else {
             return Ok(None);
         };
@@ -6237,7 +6243,7 @@ impl SessionStore {
             .filter(|session| {
                 session.provider == "codex-fork"
                     && is_primary_node(&session.node)
-                    && normalized_status(&session.status) != "stopped"
+                    && !session.is_stopped()
             })
             .filter_map(|session| {
                 codex_fork_event_stream_path(&session, runtime)
@@ -8589,6 +8595,7 @@ pub struct CoreClearResult {
 pub enum CoreClearOutcome {
     Cleared(CoreClearResult),
     NotFound,
+    NotRunning,
     Unauthorized(String),
 }
 
@@ -8637,12 +8644,7 @@ impl ContextSnapshotResponse {
     fn from_session(session: SessionRecord, config: &ContextMonitorConfig) -> Self {
         let used_percentage = session.context_used_percentage;
         let compaction_active = session.context_compaction_active;
-        let lifecycle_status = if session.is_stopped() {
-            "stopped"
-        } else {
-            normalized_status(&session.status)
-        }
-        .to_owned();
+        let lifecycle_status = session.lifecycle_status().to_owned();
         let friendly_name = session.cached_display_name();
         let provider = non_empty_or(session.provider, "claude");
         let informational_only = provider_manages_context_inline(&provider);
@@ -10870,7 +10872,7 @@ fn agent_registration_response(
     session: &SessionRecord,
     created_at: Option<&str>,
 ) -> AgentRegistrationResponse {
-    let status = normalized_status(&session.status);
+    let status = session.lifecycle_status();
     let activity_state = projected_activity_state(session, status);
     AgentRegistrationResponse {
         role: normalize_role(role),
@@ -11553,7 +11555,7 @@ fn session_lifetime_overlaps(
     let Some(seat_start) = parse_timestamp_ns(&session.created_at) else {
         return false;
     };
-    let seat_end = if normalized_status(&session.status) == "stopped" {
+    let seat_end = if session.is_stopped() {
         session
             .stopped_at
             .as_deref()
@@ -11942,7 +11944,7 @@ fn credential_rotation_has_fresh_idle_proof(
     rotation: &SessionCredentialRotationRecord,
     session: &SessionRecord,
 ) -> bool {
-    if normalized_status(&session.status) == "stopped" {
+    if session.is_stopped() {
         return false;
     }
     match session.provider.as_str() {
@@ -13658,6 +13660,14 @@ fn root_seat_id(record: &SessionRecord, records: &BTreeMap<&str, &SessionRecord>
 }
 
 impl SessionRecord {
+    pub(crate) fn lifecycle_status(&self) -> &str {
+        if self.is_stopped() {
+            "stopped"
+        } else {
+            normalized_status(&self.status)
+        }
+    }
+
     pub(crate) fn is_stopped(&self) -> bool {
         // Retirement persists both fields. Keep the terminal marker authoritative
         // if a delayed status-only writer leaves the activity status behind.
@@ -13794,16 +13804,16 @@ pub struct SessionResponse {
 
 impl From<SessionRecord> for SessionResponse {
     fn from(session: SessionRecord) -> Self {
-        let status = normalized_status(&session.status);
+        let status = session.lifecycle_status().to_owned();
         let friendly_name = session.cached_display_name();
         let is_maintainer = session.aliases.iter().any(|alias| alias == "maintainer");
         let telegram_thread_id = session.resolved_telegram_thread_id();
-        let activity_state = projected_activity_state(&session, status);
+        let activity_state = projected_activity_state(&session, &status);
         Self {
             id: session.id,
             name: session.name,
             working_dir: session.working_dir,
-            status: status.to_owned(),
+            status,
             created_at: session.created_at,
             last_activity: session.last_activity,
             completed_at: session.completed_at,
@@ -13874,7 +13884,7 @@ pub struct ChildSessionResponse {
 
 impl From<SessionRecord> for ChildSessionResponse {
     fn from(session: SessionRecord) -> Self {
-        let status = normalized_status(&session.status).to_owned();
+        let status = session.lifecycle_status().to_owned();
         let friendly_name = session.cached_display_name();
         let spawned_at = session
             .spawned_at
@@ -15481,6 +15491,7 @@ mod tests {
                     "working_dir": "/repo",
                     "tmux_session": "claude-retired1",
                     "provider": "claude",
+                    "parent_session_id": "parent1",
                     "status": "idle",
                     "completion_status": "killed",
                     "completed_at": "2026-06-01T00:02:00Z",
@@ -15528,6 +15539,26 @@ mod tests {
             .unwrap();
         assert!(!input.delivered);
         assert_eq!(input.status, "stopped");
+        let clear_request = ClearSessionRequest {
+            prompt: None,
+            requester_session_id: Some("parent1".to_owned()),
+        };
+        assert!(matches!(
+            store
+                .clear_core_session("retired1", clear_request.clone())
+                .unwrap(),
+            CoreClearOutcome::NotRunning
+        ));
+        assert!(matches!(
+            store
+                .clear_core_session_with_runtime(
+                    "retired1",
+                    clear_request,
+                    &TmuxRuntime::from_config(&crate::config::RustCoreConfig::default()),
+                )
+                .unwrap(),
+            CoreClearOutcome::NotRunning
+        ));
         assert_eq!(
             store
                 .get_context_snapshot("retired1")
