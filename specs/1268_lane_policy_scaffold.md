@@ -158,11 +158,22 @@ for explicit diagnostics or consultation with an old incarnation. Historical
 holder records remain durable.
 
 Resolution against a missing, dead, or not-yet-committed holder fails loudly,
-queues the operation against the seat generation, and escalates to the policy
-approver; it never falls back to a historical holder or drops the event. Every
-seat with active routing targets has a holder-liveness alarm. Lifecycle history
-distinguishes at least `incoming`, `live`, `stopped-but-restorable`, `retired`,
-and `unretirable` rather than collapsing every non-live state into retired.
+queues the operation with its seat intent and applicable transition/recovery
+fence, and escalates to the policy approver; it never falls back to a historical
+holder or drops the event. Every seat with active routing targets has a
+holder-liveness alarm. Lifecycle history distinguishes at least `incoming`,
+`live`, `stopped-but-restorable`, `retired`, and `unretirable` rather than
+collapsing every non-live state into retired.
+
+Detecting unplanned holder loss atomically installs a dead-holder recovery fence
+for the observed seat generation. New ordinary seat-relative operations retain
+their seat intent, observed generation, and recovery-fence ID without binding
+delivery to the dead agent. The recovery transaction may release them only to
+the same incarnation after provider liveness is re-attested at that generation,
+or to the replacement after a later generation commits; the chosen binding is
+recorded atomically before delivery. Recovery failure keeps them queued and
+escalated. Exact agent IDs and `@previous` remain frozen and are never rebound by
+this rule.
 
 Addressing is explicit:
 
@@ -319,7 +330,11 @@ self-retirement command.
 Policy may assign a stable seat or retained worker a durable workspace anchor
 and allow task-scoped worktrees as temporary locations. Before deleting an
 owned worktree that still contains a restorable session, SM performs one
-provider-neutral relocation transaction:
+provider-neutral relocation transaction. Before any external movement, it
+persists an intent containing provider session identity, source and target cwd,
+workspace/restore-plan versions, cleanup target, and transaction ID. Its durable
+stages are at least `prepared`, `provider_moved`, `metadata_committed`,
+`restore_plan_committed`, and `completed`:
 
 1. verify that the policy-selected anchor is absolute, exists, belongs to the
    expected repository, satisfies declared capabilities (remote/ref/read-only
@@ -333,6 +348,14 @@ provider-neutral relocation transaction:
 
 Provider cwd and SM metadata must agree before cleanup. Failure, ambiguity, or
 an unavailable anchor leaves the worktree intact and reports the exact blocker.
+After restart, SM resumes idempotently from the durable stage and queries the
+provider's effective cwd. If the provider is at the target, it completes the
+metadata and restore-plan compare-and-swaps; if it is provably at the source, it
+may retry or record compensation. Any other cwd, stale version, or unavailable
+provider fails closed for operator recovery. Compensation back to the source is
+permitted only while that source still exists and is verified; neither recovery
+path authorizes cleanup until `completed` is durable. Each stage, retry,
+compensation, and blocked interval is part of relocation cost/benefit telemetry.
 Anchor behavioral constraints, such as “never change git state in the owner's
 live checkout,” are injected at spawn and relocation.
 This generic primitive lets a later policy amendment change orchestrator homes
@@ -1024,7 +1047,7 @@ agent.
 | ID | Owner | Work | Dependency | Parallelism |
 |---|---|---|---|---|
 | 4A | Sol/high | Policy-authorized rotation transaction: evidence-graded handoff, named-direction probe/addendum, transition windows, successor readiness, fenced seat/children/routes transfer, verified retirement, idempotency, rollback, and restart recovery | 2B, 3A, 3B, 3D, 3E | Critical path |
-| 4B | Terra/high | Scoped override command/API/watch UX, draining presentation, audit history, expiry and consumption semantics | 1A, 3A | Parallel with early 4A |
+| 4B | Terra/high | Scoped override command/API/watch UX, draining presentation, audit history, expiry and consumption semantics | 1A, 2A, 3A | Parallel with early 4A |
 | 4C | Terra/high | Hostile and restart matrix for partial spawn, stale holder, duplicate commit, route delivery during transfer, and recovery after each transaction boundary | 4A contract; implementation follows incrementally | Test lane |
 
 ### Continuous measured rollout
