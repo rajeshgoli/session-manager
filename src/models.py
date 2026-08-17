@@ -47,6 +47,8 @@ class CompletionStatus(Enum):
     COMPLETED = "completed"
     ERROR = "error"
     ABANDONED = "abandoned"
+    RETIRED = "retired"
+    # Read compatibility for records written before retire terminology shipped.
     KILLED = "killed"
 
 

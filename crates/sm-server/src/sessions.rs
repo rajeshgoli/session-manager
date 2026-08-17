@@ -1358,7 +1358,9 @@ impl SessionStore {
             });
         }
         if !include_terminated {
-            children.retain(|session| session.completion_status.as_deref() != Some("killed"));
+            children.retain(|session| {
+                !completion_status_is_retired(session.completion_status.as_deref())
+            });
         }
 
         Ok(children)
@@ -5084,7 +5086,9 @@ impl SessionStore {
                 && json_text(session.get("status"))
                     .as_deref()
                     .is_some_and(|status| normalized_status(status) == "stopped")
-                && json_text(session.get("completion_status")).as_deref() != Some("killed")
+                && !completion_status_is_retired(
+                    json_text(session.get("completion_status")).as_deref(),
+                )
         }) else {
             return Ok(None);
         };
@@ -6855,7 +6859,7 @@ impl SessionStore {
             let recipient_name = raw_session_display_name(session, session_id);
             let now = now_rfc3339();
             session.insert("status".to_owned(), Value::String("stopped".to_owned()));
-            mark_session_killed(session, &now);
+            mark_session_retired(session, &now);
             session.insert("stopped_at".to_owned(), Value::String(now.clone()));
             session.insert("last_activity".to_owned(), Value::String(now));
             if let Some(log_file) = json_text(session.get("log_file")) {
@@ -6868,7 +6872,7 @@ impl SessionStore {
         Ok(CoreRetireOutcome::Retired(CoreRetireResult {
             ok: true,
             session_id: session_id.to_owned(),
-            status: "killed".to_owned(),
+            status: "retired".to_owned(),
         }))
     }
 
@@ -6911,7 +6915,7 @@ impl SessionStore {
         let session = session_object_mut(sessions, session_id)
             .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during retire"))?;
         session.insert("status".to_owned(), Value::String("stopped".to_owned()));
-        mark_session_killed(session, &now);
+        mark_session_retired(session, &now);
         session.insert("stopped_at".to_owned(), Value::String(now.clone()));
         session.insert("last_activity".to_owned(), Value::String(now));
         complete_stop_notify_after_stop_raw(
@@ -6925,7 +6929,7 @@ impl SessionStore {
         Ok(CoreRetireOutcome::Retired(CoreRetireResult {
             ok: true,
             session_id: session_id.to_owned(),
-            status: "killed".to_owned(),
+            status: "retired".to_owned(),
         }))
     }
 
@@ -11058,14 +11062,14 @@ fn mark_session_followup_activity(session: &mut Map<String, Value>, now: &str) {
     session.insert("last_activity".to_owned(), Value::String(now.to_owned()));
 }
 
-fn mark_session_killed(session: &mut Map<String, Value>, now: &str) {
+fn mark_session_retired(session: &mut Map<String, Value>, now: &str) {
     session.insert(
         "completion_status".to_owned(),
-        Value::String("killed".to_owned()),
+        Value::String("retired".to_owned()),
     );
     session.insert(
         "completion_message".to_owned(),
-        Value::String("Terminated via sm kill".to_owned()),
+        Value::String("Retired via sm retire".to_owned()),
     );
     session.insert("completed_at".to_owned(), Value::String(now.to_owned()));
 }
@@ -13773,7 +13777,7 @@ impl SessionRecord {
         // Retirement persists both fields. Keep the terminal marker authoritative
         // if a delayed status-only writer leaves the activity status behind.
         normalized_status(&self.status) == "stopped"
-            || self.completion_status.as_deref() == Some("killed")
+            || completion_status_is_retired(self.completion_status.as_deref())
     }
 
     fn is_live_for_registry(&self) -> bool {
@@ -14088,9 +14092,13 @@ fn normalized_status(status: &str) -> &str {
     }
 }
 
+fn completion_status_is_retired(status: Option<&str>) -> bool {
+    matches!(status, Some("retired" | "killed"))
+}
+
 fn raw_session_is_stopped(session: &Map<String, Value>) -> bool {
     normalized_status(&json_text(session.get("status")).unwrap_or_default()) == "stopped"
-        || json_text(session.get("completion_status")).as_deref() == Some("killed")
+        || completion_status_is_retired(json_text(session.get("completion_status")).as_deref())
 }
 
 fn effective_raw_session_status(session: &Map<String, Value>) -> String {
@@ -14114,7 +14122,7 @@ fn projected_activity_state(session: &SessionRecord, status: &str) -> String {
     if status == "stopped" {
         return "stopped".to_owned();
     }
-    if session.completion_status.as_deref() == Some("killed") {
+    if completion_status_is_retired(session.completion_status.as_deref()) {
         return "stopped".to_owned();
     }
     if session.completion_status.is_some() {

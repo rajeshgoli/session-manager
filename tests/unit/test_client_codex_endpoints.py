@@ -170,15 +170,15 @@ def test_get_tool_calls_success_with_timeout():
     req.assert_called_once_with("GET", "/sessions/abc123/tool-calls?limit=12", timeout=3)
 
 
-def test_kill_session_uses_longer_timeout():
+def test_retire_session_uses_longer_timeout():
     client = _make_client()
-    payload = {"status": "killed", "session_id": "abc123"}
+    payload = {"status": "retired", "session_id": "abc123"}
     with patch.object(client, "_request", return_value=(payload, True, False)) as req:
         result = client.kill_session(requester_session_id=None, target_session_id="abc123")
     assert result == payload
     req.assert_called_once_with(
         "POST",
-        "/sessions/abc123/kill",
+        "/sessions/abc123/retire",
         {},
         timeout=KILL_TIMEOUT,
     )

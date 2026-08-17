@@ -6913,7 +6913,7 @@ done
 
         now = datetime.now()
         session.status = SessionStatus.STOPPED
-        session.completion_status = CompletionStatus.KILLED
+        session.completion_status = CompletionStatus.RETIRED
         session.completion_message = reason
         session.error_message = reason
         session.last_activity = now
@@ -6986,7 +6986,7 @@ done
         if monitor_state and monitor_state.last_pattern == "permission":
             return ActivityState.WAITING_PERMISSION.value
 
-        if session.completion_status == CompletionStatus.KILLED:
+        if session.completion_status in (CompletionStatus.RETIRED, CompletionStatus.KILLED):
             return ActivityState.STOPPED.value
 
         if session.completion_status is not None:
@@ -7073,7 +7073,7 @@ done
 
     def _compute_codex_app_activity(self, session: Session) -> str:
         """Compute activity state for codex-app sessions (no tmux/output monitor)."""
-        if session.completion_status == CompletionStatus.KILLED:
+        if session.completion_status in (CompletionStatus.RETIRED, CompletionStatus.KILLED):
             return ActivityState.STOPPED.value
 
         if session.completion_status is not None:
@@ -7418,7 +7418,7 @@ done
                 self._set_codex_fork_lifecycle_state(
                     session_id=session_id,
                     state="shutdown",
-                    cause_event_type="session_killed",
+                    cause_event_type="session_retired",
                 )
             try:
                 self.tmux.kill_session(session.tmux_session)
@@ -7436,14 +7436,14 @@ done
                 raise
         now = datetime.now()
         session.status = SessionStatus.STOPPED
-        session.completion_status = CompletionStatus.KILLED
-        session.completion_message = "Terminated via sm kill"
+        session.completion_status = CompletionStatus.RETIRED
+        session.completion_message = "Retired via sm retire"
         session.completed_at = now
         session.stopped_at = now
         self.unregister_session_roles(session_id, persist=False)
         self._save_state()
 
-        logger.info(f"Killed session {session.name}")
+        logger.info(f"Retired session {session.name}")
         return True
 
     async def restore_session(self, session_id: str) -> tuple[bool, Optional[Session], Optional[str]]:

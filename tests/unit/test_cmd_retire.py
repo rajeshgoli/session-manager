@@ -5,7 +5,7 @@ from src.cli.commands import cmd_kill
 
 def test_cmd_kill_uses_retire_language(capsys):
     client = MagicMock()
-    client.kill_session.return_value = {"status": "killed", "session_id": "child123"}
+    client.kill_session.return_value = {"status": "retired", "session_id": "child123"}
 
     with patch(
         "src.cli.commands.resolve_session_id",

@@ -6578,8 +6578,8 @@ def create_app(
         return {"status": "invalidated", "session_id": session_id}
 
     @app.delete("/sessions/{session_id}")
-    async def kill_session(session_id: str):
-        """Kill a session."""
+    async def retire_session(session_id: str):
+        """Retire a session."""
         if not app.state.session_manager:
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
@@ -6587,23 +6587,23 @@ def create_app(
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
 
-        # Cancel periodic remind and parent wake before killing (#188, #225-C)
+        # Cancel periodic remind and parent wake before retirement (#188, #225-C)
         queue_mgr = app.state.session_manager.message_queue_manager
         if queue_mgr:
             queue_mgr.cancel_remind(session_id)
             queue_mgr.cancel_parent_wake(session_id)
 
-        # Kill tmux session
+        # Retire the managed session and its runtime.
         success = app.state.session_manager.kill_session(session_id)
 
         if not success:
-            raise HTTPException(status_code=500, detail="Failed to kill session")
+            raise HTTPException(status_code=500, detail="Failed to retire session")
 
         # Perform full cleanup (Telegram, monitoring, state)
         if app.state.output_monitor:
             await app.state.output_monitor.cleanup_session(session, preserve_record=True)
 
-        return {"status": "killed", "session_id": session_id}
+        return {"status": "retired", "session_id": session_id}
 
     @app.post("/sessions/{session_id}/restore", response_model=SessionResponse)
     async def restore_session(session_id: str):
@@ -8025,7 +8025,11 @@ Provide ONLY the summary, no preamble or questions."""
             children = all_descendants
 
         if not include_terminated:
-            children = [s for s in children if s.completion_status != CompletionStatus.KILLED]
+            children = [
+                s
+                for s in children
+                if s.completion_status not in (CompletionStatus.RETIRED, CompletionStatus.KILLED)
+            ]
 
         latest_action_getter = getattr(app.state.session_manager, "get_codex_latest_activity_action", None)
         codex_projection_enabled = _codex_rollout_enabled("enable_observability_projection")
@@ -8107,9 +8111,10 @@ Provide ONLY the summary, no preamble or questions."""
             raise HTTPException(status_code=500, detail="invalid codex launch gates payload")
         return {"codex_launch_gates": payload}
 
+    @app.post("/sessions/{target_session_id}/retire")
     @app.post("/sessions/{target_session_id}/kill")
-    async def kill_session_with_check(target_session_id: str, request: KillSessionRequest):
-        """Kill a session with parent-child ownership check."""
+    async def retire_session_with_check(target_session_id: str, request: KillSessionRequest):
+        """Retire a session with parent-child ownership check."""
         if not app.state.session_manager:
             raise HTTPException(status_code=503, detail="Session manager not configured")
 
@@ -8122,19 +8127,19 @@ Provide ONLY the summary, no preamble or questions."""
         if request.requester_session_id:
             # Requester must be the parent
             if target_session.parent_session_id != request.requester_session_id:
-                return {"error": f"Cannot kill session {target_session_id} - not your child session"}
+                return {"error": f"Cannot retire session {target_session_id} - not your child session"}
 
-        # Cancel periodic remind and parent wake before killing (#188, #225-C)
+        # Cancel periodic remind and parent wake before retirement (#188, #225-C)
         queue_mgr = app.state.session_manager.message_queue_manager
         if queue_mgr:
             queue_mgr.cancel_remind(target_session_id)
             queue_mgr.cancel_parent_wake(target_session_id)
 
-        # Kill the session
+        # Retire the managed session and its runtime.
         success = app.state.session_manager.kill_session(target_session_id)
 
         if not success:
-            return {"error": "Failed to kill session"}
+            return {"error": "Failed to retire session"}
 
         # Perform full cleanup (Telegram, monitoring, state)
         if app.state.output_monitor:
@@ -8144,7 +8149,7 @@ Provide ONLY the summary, no preamble or questions."""
                 logger.exception(f"cleanup_session failed for {target_session_id}")
                 return {"error": "Failed to finalize session cleanup"}
 
-        return {"status": "killed", "session_id": target_session_id}
+        return {"status": "retired", "session_id": target_session_id}
 
     @app.post("/sessions/{session_id}/handoff")
     async def schedule_handoff(session_id: str, request: HandoffRequest):

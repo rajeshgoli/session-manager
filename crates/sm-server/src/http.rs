@@ -1225,6 +1225,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/sessions/{session_id}/input", post(send_session_input))
         .route("/sessions/{session_id}/what", post(create_btw_request))
+        .route("/sessions/{session_id}/retire", post(retire_session))
+        // Compatibility for clients deployed before the retire terminology migration.
         .route("/sessions/{session_id}/kill", post(retire_session))
         .route("/sessions/{session_id}/restore", post(restore_session))
         .route("/sessions/{session_id}/clear", post(clear_session))
@@ -2138,7 +2140,7 @@ async fn client_request_status(
         };
         match outcome {
             Some(result) if result.delivered => delivered_count += 1,
-            Some(result) if !matches!(result.status.as_str(), "stopped" | "killed") => {
+            Some(result) if !matches!(result.status.as_str(), "stopped" | "retired" | "killed") => {
                 queued_count += 1
             }
             _ => failed_count += 1,
@@ -2589,7 +2591,7 @@ async fn inbound_email_webhook(
     let Some(outcome) = outcome else {
         return Err(ApiError::NotFound("Session not found"));
     };
-    if !outcome.delivered && matches!(outcome.status.as_str(), "stopped" | "killed") {
+    if !outcome.delivered && matches!(outcome.status.as_str(), "stopped" | "retired" | "killed") {
         return Err(ApiError::Status {
             status: StatusCode::CONFLICT,
             detail: "Failed to deliver inbound email to session".to_owned(),
@@ -2663,7 +2665,7 @@ fn notify_maintainer_of_bug_report(
     if outcome.delivered {
         return Ok((true, "delivered".to_owned()));
     }
-    if matches!(outcome.status.as_str(), "stopped" | "killed") {
+    if matches!(outcome.status.as_str(), "stopped" | "retired" | "killed") {
         return Ok((false, outcome.status));
     }
     Ok((true, "queued".to_owned()))
@@ -7590,7 +7592,7 @@ fn send_session_input_batch_one(
             "Session not found".to_owned(),
         ));
     };
-    if !outcome.delivered && matches!(outcome.status.as_str(), "stopped" | "killed") {
+    if !outcome.delivered && matches!(outcome.status.as_str(), "stopped" | "retired" | "killed") {
         return Ok(failed_batch_result(
             identifier,
             Some(outcome.session_id),
@@ -7771,13 +7773,13 @@ async fn retire_session(
     Path(session_id): Path<String>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(payload): Json<KillSessionRequest>,
+    Json(payload): Json<RetireSessionRequest>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_allowed_from_parts(
         &state.config,
         &headers,
         Some(peer_addr),
-        &format!("/sessions/{session_id}/kill"),
+        &format!("/sessions/{session_id}/retire"),
     )?;
     ensure_core_writes_enabled(&state)?;
     let requester_session_id = payload
@@ -7814,7 +7816,7 @@ async fn retire_session(
             "error": format!("Session {session_id} not found")
         }))),
         CoreRetireOutcome::NotChild => Ok(Json(json!({
-            "error": format!("Cannot kill session {session_id} - not your child session")
+            "error": format!("Cannot retire session {session_id} - not your child session")
         }))),
         CoreRetireOutcome::UnsupportedNode(node) => Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
@@ -12866,7 +12868,7 @@ fn decoded_last_query_value(query_string: &str, key: &str) -> Result<Option<Stri
 }
 
 #[derive(Debug, Deserialize)]
-struct KillSessionRequest {
+struct RetireSessionRequest {
     #[serde(default)]
     requester_session_id: Option<String>,
 }

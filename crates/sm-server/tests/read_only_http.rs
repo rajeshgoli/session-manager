@@ -697,13 +697,25 @@ async fn session_teardown_fails_requested_what_and_marks_response_undeliverable(
         .create(Some("run12345"), "oldstate", "claude", "session", "summary")
         .unwrap();
 
-    let (status, payload) = post_json(app, "/sessions/run12345/kill", json!({})).await;
+    let (status, payload) = post_json(app, "/sessions/run12345/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
     let request = store.get(&request.request_id).unwrap().unwrap();
     assert_eq!(request.status, "failed");
     assert!(request.response_undeliverable_at.is_some());
     assert!(store.list_recoverable().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn legacy_kill_route_uses_retired_response_language() {
+    let state_file = write_session_fixture();
+    let mut config = config_with_state_file_and_queue(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, payload) = post_json(app, "/sessions/run12345/kill", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "retired");
 }
 
 #[tokio::test]
@@ -10699,14 +10711,14 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
 
     let (status, payload) = post_json(
         app.clone(),
-        "/sessions/rustchild/kill",
+        "/sessions/rustchild/retire",
         json!({ "requester_session_id": "otherparent" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         payload["error"],
-        "Cannot kill session rustchild - not your child session"
+        "Cannot retire session rustchild - not your child session"
     );
 
     let (status, payload) = get_json(app.clone(), "/sessions/rustchild").await;
@@ -10715,26 +10727,26 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
 
     let (status, payload) = post_json(
         app.clone(),
-        "/sessions/rustcore/kill",
+        "/sessions/rustcore/retire",
         json!({ "requester_session_id": "rustcore" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         payload["error"],
-        "Cannot kill session rustcore - not your child session"
+        "Cannot retire session rustcore - not your child session"
     );
 
     let (status, payload) = post_json(
         app.clone(),
-        "/sessions/rustgrandchild/kill",
+        "/sessions/rustgrandchild/retire",
         json!({ "requester_session_id": "rustcore" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         payload["error"],
-        "Cannot kill session rustgrandchild - not your child session"
+        "Cannot retire session rustgrandchild - not your child session"
     );
 
     let (status, payload) = get_json(app.clone(), "/sessions/rustgrandchild").await;
@@ -10743,25 +10755,25 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
 
     let (status, payload) = post_json(
         app.clone(),
-        "/sessions/rustchild/kill",
+        "/sessions/rustchild/retire",
         json!({ "requester_session_id": "rustcore" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
     assert_eq!(payload["session_id"], "rustchild");
 
     let (status, payload) = get_json(app.clone(), "/sessions/rustchild").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "stopped");
 
-    let (status, payload) = post_json(app.clone(), "/sessions/missingcore/kill", json!({})).await;
+    let (status, payload) = post_json(app.clone(), "/sessions/missingcore/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["error"], "Session missingcore not found");
 
-    let (status, payload) = post_json(app.clone(), "/sessions/rustcore/kill", json!({})).await;
+    let (status, payload) = post_json(app.clone(), "/sessions/rustcore/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
 
     let (status, payload) = get_json(app, "/sessions?include_stopped=true").await;
     assert_eq!(status, StatusCode::OK);
@@ -10804,9 +10816,10 @@ async fn fixture_core_input_batch_reports_per_recipient_results() {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(payload["id"], id);
     }
-    let (status, payload) = post_json(app.clone(), "/sessions/batchstopped/kill", json!({})).await;
+    let (status, payload) =
+        post_json(app.clone(), "/sessions/batchstopped/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
 
     let (status, payload) = post_json(
         app.clone(),
@@ -11124,9 +11137,9 @@ async fn fixture_core_session_graph_endpoints_round_trip_state() {
         .unwrap();
     assert_eq!(graph_child["pending_handoff_path"], "/tmp/handoff.md");
 
-    let (status, payload) = post_json(app.clone(), "/sessions/graphchild/kill", json!({})).await;
+    let (status, payload) = post_json(app.clone(), "/sessions/graphchild/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
 
     let (status, payload) = get_json(app.clone(), "/sessions/graphparent/children").await;
     assert_eq!(status, StatusCode::OK);
@@ -11148,8 +11161,8 @@ async fn fixture_core_session_graph_endpoints_round_trip_state() {
         .iter()
         .find(|child| child["id"] == "graphchild")
         .unwrap();
-    assert_eq!(graphchild["completion_status"], "killed");
-    assert_eq!(graphchild["completion_message"], "Terminated via sm kill");
+    assert_eq!(graphchild["completion_status"], "retired");
+    assert_eq!(graphchild["completion_message"], "Retired via sm retire");
 
     let (status, payload) = get_json(app.clone(), "/sessions/graphchild/attach-descriptor").await;
     assert_eq!(status, StatusCode::OK);
@@ -11551,9 +11564,9 @@ async fn fixture_retire_honors_delayed_stop_notify_without_runtime() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "ok");
 
-    let (status, payload) = post_json(app.clone(), "/sessions/child001/kill", json!({})).await;
+    let (status, payload) = post_json(app.clone(), "/sessions/child001/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
 
     let queue_conn = Connection::open(&queue_db_path).unwrap();
     let immediate_count: i64 = queue_conn
@@ -12894,9 +12907,9 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     )
     .await;
 
-    let (status, payload) = post_json(app.clone(), "/sessions/runtimecore/kill", json!({})).await;
+    let (status, payload) = post_json(app.clone(), "/sessions/runtimecore/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
 
     let (status, payload) = get_json(app.clone(), "/sessions/runtimecore").await;
     assert_eq!(status, StatusCode::OK);
@@ -13684,9 +13697,9 @@ async fn runtime_core_retire_delivers_stop_notify_side_effects() {
     assert_eq!(payload["status"], "ok");
 
     let (status, payload) =
-        post_json(app.clone(), "/sessions/runtimestopchild/kill", json!({})).await;
+        post_json(app.clone(), "/sessions/runtimestopchild/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
     wait_for_output_contains(
         app.clone(),
         "runtimestopem",
@@ -13792,9 +13805,9 @@ async fn runtime_core_retire_delivers_stop_notify_side_effects() {
     .unwrap();
 
     let (status, payload) =
-        post_json(app.clone(), "/sessions/runtimeghostchild/kill", json!({})).await;
+        post_json(app.clone(), "/sessions/runtimeghostchild/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
     let stale_sender_notification_count: i64 = queue_conn
         .query_row(
             "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'runtimegoneem'",
@@ -14748,9 +14761,10 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
     assert_eq!(runtime_child["model"], "opus");
     assert_eq!(runtime_child["reasoning_effort"], "xhigh");
 
-    let (status, payload) = post_json(app.clone(), "/sessions/runtimechild/kill", json!({})).await;
+    let (status, payload) =
+        post_json(app.clone(), "/sessions/runtimechild/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
 
     wait_for_output_contains(
@@ -14760,9 +14774,10 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
     )
     .await;
 
-    let (status, payload) = post_json(app.clone(), "/sessions/runtimeparent/kill", json!({})).await;
+    let (status, payload) =
+        post_json(app.clone(), "/sessions/runtimeparent/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&tmux_socket, &parent_tmux_session));
 }
 
@@ -14830,9 +14845,10 @@ async fn runtime_core_spawn_wait_detects_naturally_exited_tmux_child() {
     .await;
     assert!(!tmux_session_exists(&tmux_socket, child_tmux_session));
 
-    let (status, payload) = post_json(app.clone(), "/sessions/naturalparent/kill", json!({})).await;
+    let (status, payload) =
+        post_json(app.clone(), "/sessions/naturalparent/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&tmux_socket, &parent_tmux_session));
 }
 
@@ -14904,9 +14920,10 @@ async fn runtime_core_spawn_wait_uses_runtime_output_as_activity() {
         .contains("Idle for"));
     assert!(!tmux_session_exists(&tmux_socket, child_tmux_session));
 
-    let (status, payload) = post_json(app.clone(), "/sessions/activeparent/kill", json!({})).await;
+    let (status, payload) =
+        post_json(app.clone(), "/sessions/activeparent/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&tmux_socket, &parent_tmux_session));
 }
 
@@ -14970,9 +14987,9 @@ async fn runtime_core_send_and_retire_use_persisted_tmux_socket() {
     )
     .await;
 
-    let (status, payload) = post_json(app_b, "/sessions/runtimepersisted/kill", json!({})).await;
+    let (status, payload) = post_json(app_b, "/sessions/runtimepersisted/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&socket_a, &tmux_session));
 }
 
@@ -15018,9 +15035,9 @@ async fn runtime_core_expands_bare_home_working_dir_for_tmux() {
         Some(home_path.as_path())
     );
 
-    let (status, payload) = post_json(app.clone(), "/sessions/runtimehome/kill", json!({})).await;
+    let (status, payload) = post_json(app.clone(), "/sessions/runtimehome/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
 
     let (status, payload) = post_json(app, "/sessions/runtimehome/restore", json!({})).await;
     assert_eq!(status, StatusCode::OK);
@@ -15150,12 +15167,12 @@ async fn runtime_core_marks_missing_tmux_stopped_on_send_and_retire() {
 
     let (status, payload) = post_json(
         app.clone(),
-        "/sessions/runtimemissingretire/kill",
+        "/sessions/runtimemissingretire/retire",
         json!({}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
 
     let (status, payload) = get_json(app, "/sessions/runtimemissingretire").await;
     assert_eq!(status, StatusCode::OK);
@@ -15288,9 +15305,10 @@ async fn runtime_core_restores_codex_session() {
     let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
     wait_for_output_contains(app.clone(), "runtimecodex", "stock codex initial prompt").await;
 
-    let (status, payload) = post_json(app.clone(), "/sessions/runtimecodex/kill", json!({})).await;
+    let (status, payload) =
+        post_json(app.clone(), "/sessions/runtimecodex/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
 
     let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
@@ -16438,9 +16456,9 @@ while true; do sleep 1; done
     }
 
     let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
-    let (status, payload) = post_json(app.clone(), "/sessions/runtimefork/kill", json!({})).await;
+    let (status, payload) = post_json(app.clone(), "/sessions/runtimefork/retire", json!({})).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "killed");
+    assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
     fs::write(&event_path, "stale event after stop").unwrap();
     let _ = fs::remove_file(&control_path);
@@ -16871,7 +16889,8 @@ async fn runtime_core_rejects_remote_node_send_and_retire_without_mutating_state
         json!({ "detail": "Rust runtime does not support remote node macbook" })
     );
 
-    let (status, payload) = post_json(app.clone(), "/sessions/remoteruntime/kill", json!({})).await;
+    let (status, payload) =
+        post_json(app.clone(), "/sessions/remoteruntime/retire", json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
         payload,

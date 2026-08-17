@@ -89,3 +89,6 @@ Durable lessons from maintainer sessions. Read this before handling the maintain
 - A durable completion message is not a delivered completion wake. Background producers must also trigger runtime queue reconciliation, preserve FIFO ordering, and keep busy targets pending until the provider is writable.
 - A queue wrapper PID is not the job lifecycle. Timeout, cancellation, terminal state, and capacity release must account the persisted process group; an exited wrapper can leave descendants performing signal cleanup. Application-owned locks still require application-owned recovery.
 - Before attributing a queue-job death to perf displacement, compare persisted timestamps and workload types. Perf displacement is restricted to `background`; a `tests` job that ended before the cited perf submission has an external or unknown cause, regardless of how plausible cross-epic contention appears.
+- Agent retirement is reversible lifecycle state, not elimination. User-facing commands,
+  responses, errors, and newly persisted completion metadata must say `retire`/`retired`;
+  accept historical `killed` markers only as a read-compatibility boundary.
