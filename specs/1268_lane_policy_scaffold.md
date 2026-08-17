@@ -174,9 +174,16 @@ Addressing is explicit:
 - `sm seat history 355-root` lists holder agent IDs, acquisition/release times,
   and current lifecycle state so any older predecessor can be selected.
 
-Seat-relative selectors are conveniences, not mutable aliases carried inside a
-queued message. The accepted message stores the resolved seat generation and
-agent ID, preventing a later rotation from silently changing its recipient.
+Exact-incarnation selectors are never mutable aliases: `@previous` and an exact
+agent ID freeze the selected incarnation before delivery. An ordinary
+seat-routed operation accepted while the holder is live records both its seat
+intent and the resolved generation. Once a draining fence is installed, new
+discretionary seat work retains its seat intent, is fenced to the next committed
+generation, and queues for the successor; it is not frozen to the predecessor.
+Control-plane traffic may still target either incarnation explicitly. Every
+queued record therefore preserves the original selector, routing fence, and
+resolved generation so recovery cannot silently retarget exact-incarnation work
+or strand successor-directed seat work on the outgoing holder.
 
 ### 3. Immutable spawn request
 
@@ -281,12 +288,17 @@ Automatic cleanup requires all applicable checks:
 - issue closure is observed through the recorded PR closing reference or an
   explicit policy-authorized action, never inferred from a branch name.
 
-Process cleanup derives ownership from durable launch records and kernel-held
-identity such as PID-file/FD evidence, never argv matching or a remembered
-partial list. A process or watch addressed to a retiring holder is stopped or
-retargeted to its seat key before holder retirement commits. Fleet sweeps record
-the expected population, items visited, items accepted, and errors; a zero from
-an incomplete sweep is not clean evidence.
+Process cleanup derives ownership from durable launch records and a
+non-reusable kernel process identity, never argv matching, a remembered partial
+list, or PID-file contents alone. Suitable evidence is a retained pidfd where
+available or an approved in-process query that binds PID/process group to an
+immutable process start identity such as start time or audit token. A PID file
+is only a locator. Before signaling, SM re-reads the live identity and compares
+it to the launch receipt; mismatch or unavailable identity fails closed. A
+process or watch addressed to a retiring holder is stopped or retargeted to its
+seat key before holder retirement commits. Fleet sweeps record the expected
+population, items visited, items accepted, and errors; a zero from an incomplete
+sweep is not clean evidence.
 
 Dirty, shared, unpushed, ambiguous, or still-in-review state fails closed. SM
 keeps the worker and resources, records the exact blocker, and routes the
@@ -351,10 +363,17 @@ where possible. A pinned baseline records its derivation evidence, verification
 time, and mandatory revalidation trigger; passing a stale startup-only baseline
 is not current policy evidence.
 
-The calling `sm spawn` returns a child ID only after `allow` allocates and
-launches it. `rewrite`/`block` returns exact amendments; terminal failure
-creates no child. Internal durable request state remains observable for
-recovery and diagnostics but is not the normal caller contract.
+The calling `sm spawn` returns a child ID only after `allow` allocates, launches,
+and attests it. `rewrite`/`block` returns exact amendments. A launched child
+remains provisional and non-routable until attestation succeeds. If launch or
+attestation fails, SM stops the provisional runtime, removes active hierarchy,
+alias, route, and queue ownership, and marks its retained audit row
+`launch_rejected`/stopped before returning terminal failure. The caller receives
+no child ID and no live or usable child remains. If cleanup cannot be proved,
+the request fails closed with an explicit recovery blocker rather than returning
+success. Internal request and rejected-launch evidence remains observable for
+recovery and diagnostics but is not an active child or the normal caller
+contract.
 
 ### 6. Evaluation telemetry
 
@@ -409,13 +428,13 @@ The initial requirement-effect ledger includes:
 | Requirement family | Incremental cost boundary | Immediate benefit evidence |
 |---|---|---|
 | Spawn intent and model/vehicle policy | classifier plus injected rewrite and any retry | corrected provider/model/vehicle, prevented invalid launch, retry/rework rate |
-| Stable seats and holder liveness | resolution/alarm/queued-delivery operations | stale-holder deliveries prevented, manual re-points avoided, eventual delivery success |
+| Stable seats, holder liveness, and rotation fencing | resolution/alarm/queued-delivery operations plus fence wait, stale-snapshot abort, commit, and post-commit verification | stale-holder deliveries prevented, manual re-points avoided, topology races rejected, eventual delivery success |
 | Context profiles and rotation thresholds | preflight, handoff, orientation, probe, and retirement spans | quota/tokens per completed unit of work, threshold overrides, rotation failures, time to productive successor |
 | Handoff summary and directed probe | summary and probe spans reported separately | novel actionable items, corrections to the summary, ruled-out paths preserved, successor actions attributable to each item |
 | Codex native-compaction snapshots | each snapshot and restore/reconstruction attempt | successful restore, reconstruction time avoided, state-loss incidents |
 | Cleanup manifests and workspace relocation | closeout classification, verification, relocation, and cleanup spans | owned resources removed, ambiguous cleanup blocked, separate cleanup jobs avoided, successful later restore |
 | Refusal, recusal, conflicts, overrides, and reclassification | decision/escalation plus replacement work | accepted corrections, conflicted work avoided, owner reversals, reassignment/rework avoided |
-| Model attestation and provider-outage disposition | attestation or failed launch path | mis-tiered launches caught, hidden provider failures surfaced, unstaffed intervals made explicit |
+| Model attestation and provider-outage disposition | attestation, provisional-runtime cleanup, or failed launch path | mis-tiered launches caught, orphan runtimes prevented, cleanup latency/failures, hidden provider failures surfaced, unstaffed intervals made explicit |
 | Coverage-counted sweeps and baseline revalidation | sweep/revalidation runtime and any evaluator use | partial sweeps detected, stale baselines rejected, false-clean reports prevented |
 
 Per-requirement reports show the baseline and intervention side by side and
@@ -515,13 +534,20 @@ and then deliver to the successor rather than being discarded.
 sample time, freshness, active profile, and next threshold. A cached percentage
 is labeled cached/stale and is never presented as a heartbeat.
 
-At a rotation threshold, after a safe turn boundary, SM obtains a compact
-handoff through isolated `/btw`, spawns the policy-defined successor, and
-commits one policy-authorized rotation transaction. The approved policy is the
-authority, so no per-rotation reparent approvals are required. Commit transfers
-children, the stable seat, monitor routes, and lane-owned registrations;
+At a rotation threshold, after a safe turn boundary, SM installs a
+seat-generation draining fence, obtains a compact handoff through isolated
+`/btw`, spawns the policy-defined successor, and commits one policy-authorized
+rotation transaction. The fence freezes the child/ownership edge set and a
+topology version before successor orientation. A reparent/adopt mutation that
+touches the predecessor or frozen children must complete before that snapshot or
+queue behind the fence; it cannot race orientation. The approved policy is the
+authority, so no per-rotation reparent approvals are required. Commit uses a
+compare-and-swap on the same topology version and transfers exactly the frozen
+children, stable seat, monitor routes, and lane-owned registrations;
 predecessor becomes the successor's child and remains directly addressable by
-its provider session ID. A durable scoped override may defer rotation.
+its provider session ID. A version mismatch aborts the provisional transition,
+releases or reconstructs the fence under recovery rules, and requires a fresh
+snapshot and orientation. A durable scoped override may defer rotation.
 
 The handoff prompt is assembled by SM, not authored solely by the policy
 document. A fixed versioned prompt template supplies the structured output
@@ -582,21 +608,28 @@ because identity and behavior changes must not be implicit:
 2. At the next safe boundary, SM runs the handoff `/btw` invisibly. Its prompt
    and answer do not enter the outgoing main thread; this avoids polluting the
    context merely to extract state.
-3. SM starts the successor in provisional `incoming` state with one immutable
+3. SM installs the draining/ownership fence, records the frozen topology version
+   and complete proposed before/after ownership edge list, then starts the
+   successor in provisional `incoming` state with one immutable
    initial brief containing the target seat, predecessor agent ID, handoff
    artifact, policy version, current children, pending routed events, open
    review/cleanup manifests, and an instruction to verify identity with
    `sm me`. It cannot accept seat-routed discretionary work before commit.
 4. Provider readiness and completion of that first orientation turn are
-   observed by SM hooks; the successor does not need to remember an approval or
-   ready command. Failure leaves the predecessor holding the seat.
-5. The atomic commit changes the seat generation and routes, reparents the
-   frozen child set, and attaches the predecessor beneath the successor.
+   observed by SM hooks. During orientation, the successor verifies the frozen
+   proposed edge set and machine facts; it does not claim the mutation already
+   occurred and does not need to remember an approval or ready command. Failure
+   leaves the predecessor holding the seat.
+5. The atomic commit compare-and-swaps the frozen topology version, changes the
+   seat generation and routes, reparents exactly the frozen child set, and
+   attaches the predecessor beneath the successor. Any topology drift aborts
+   before ownership changes and starts a newly oriented attempt.
 6. The successor receives a visible commit message naming the seat and
    generation it now holds, the predecessor ID, transferred responsibilities,
-   and the complete before/after ownership edge list. During orientation it
-   independently re-derives that edge list from SM state. Queued seat work is
-   then released to it.
+   and the complete before/after ownership edge list. It then independently
+   re-derives the actual post-commit graph from SM state and compares it to the
+   committed edge list. Only a match releases the fence and queued seat work;
+   mismatch enters fail-closed recovery while both snapshots remain inspectable.
 7. The predecessor receives a direct agent-ID message stating that rotation
    completed, naming the successor and its new consult-only/cleanup obligations.
 
@@ -652,8 +685,8 @@ the canonical maintainer is the first active dogfood event. Capability N may
 govern capability N+1 only after N has passed its own tests/review/deployment;
 no capability supplies evidence for its own approval. Initially the canary is
 bound to this maintainer incarnation and lane `sm-policy-1268`. Once stable-seat
-identity lands, that binding migrates to the durable `maintainer` seat without
-changing historical event ownership.
+identity lands, that binding migrates to the durable lane-prefixed
+`sm-policy-1268-maintainer` seat without changing historical event ownership.
 
 Every later package spawn is then atomic and active: the policy either returns
 the child ID or an actionable rewrite/block. The maintainer may use a durable
@@ -954,7 +987,7 @@ agent.
 
 | ID | Owner | Work | Dependency | Parallelism |
 |---|---|---|---|---|
-| 4A | Sol/high | Policy-authorized rotation transaction: evidence-graded handoff, named-direction probe/addendum, transition windows, successor readiness, seat/children/routes transfer, verified retirement, idempotency, rollback, and restart recovery | 2B, 3A, 3B | Critical path |
+| 4A | Sol/high | Policy-authorized rotation transaction: evidence-graded handoff, named-direction probe/addendum, transition windows, successor readiness, fenced seat/children/routes transfer, verified retirement, idempotency, rollback, and restart recovery | 2B, 3A, 3B, 3D, 3E | Critical path |
 | 4B | Terra/high | Scoped override command/API/watch UX, draining presentation, audit history, expiry and consumption semantics | 1A, 3A | Parallel with early 4A |
 | 4C | Terra/high | Hostile and restart matrix for partial spawn, stale holder, duplicate commit, route delivery during transfer, and recovery after each transaction boundary | 4A contract; implementation follows incrementally | Test lane |
 
