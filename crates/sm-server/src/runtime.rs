@@ -1011,8 +1011,8 @@ impl TmuxRuntime {
         match provider {
             "codex" | "codex-fork" => self.codex_composer_is_ready(tmux_session, None),
             _ => self
-                .capture_pane_last_line(tmux_session)
-                .is_some_and(|line| matches!(line.trim(), ">" | "❯")),
+                .capture_pane_text(tmux_session)
+                .is_some_and(|pane| claude_composer_is_ready(&pane)),
         }
     }
 
@@ -1405,6 +1405,55 @@ fn pane_last_line(text: &str) -> Option<String> {
         .last()
         .map(str::trim)
         .map(ToOwned::to_owned)
+}
+
+/// Claude renders a status/footer block below its live composer. Looking only
+/// at the final pane line therefore treats every normal idle Claude session as
+/// busy. A bare composer is live when it is either the final non-empty row or
+/// immediately followed by Claude's horizontal chrome divider; an older prompt
+/// followed by a spinner or response row is not a safe slash-command target.
+fn claude_composer_is_ready(pane: &str) -> bool {
+    let lines = pane.lines().map(str::trim).collect::<Vec<_>>();
+    let Some(composer_index) = lines.iter().rposition(|line| matches!(*line, ">" | "❯")) else {
+        return false;
+    };
+    let trailing = lines[composer_index + 1..]
+        .iter()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    match trailing.first() {
+        None => true,
+        Some(line) => {
+            claude_composer_footer_divider(line)
+                && trailing
+                    .iter()
+                    .skip(1)
+                    .all(|line| !claude_line_indicates_main_thread_activity(line))
+        }
+    }
+}
+
+fn claude_composer_footer_divider(line: &str) -> bool {
+    let non_whitespace = line
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<Vec<_>>();
+    non_whitespace.len() >= 3
+        && non_whitespace
+            .iter()
+            .all(|ch| matches!(ch, '-' | '─' | '━' | '═' | '╌' | '╍'))
+}
+
+fn claude_line_indicates_main_thread_activity(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.contains("esc to interrupt")
+        || trimmed.starts_with('⏺')
+        || trimmed.starts_with('⎿')
+        || trimmed.starts_with('·')
+        || trimmed
+            .chars()
+            .next()
+            .is_some_and(|ch| (0x2700..=0x27bf).contains(&(ch as u32)))
 }
 
 fn command_parts(command: &str, args: &[String]) -> Vec<String> {
@@ -1926,8 +1975,18 @@ esac
         runtime.tmux_binary = tmux_binary.display().to_string();
         assert!(!runtime.session_input_ready("sm-test", "claude"));
 
-        fs::write(&pane_path, "✻ Finished\n❯\n").unwrap();
+        fs::write(
+            &pane_path,
+            "✻ Finished\n────────────────────\n❯\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+        )
+        .unwrap();
         assert!(runtime.session_input_ready("sm-test", "claude"));
+    }
+
+    #[test]
+    fn claude_composer_readiness_rejects_a_stale_prompt_before_running_output() {
+        let pane = "❯\n────────────────────\nFable 5\n✽ Thinking through the task…\n";
+        assert!(!claude_composer_is_ready(pane));
     }
 
     #[test]
