@@ -1332,16 +1332,8 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
     // the small, documented execution context at submission time so the job
     // resolves the same managed-session tools without inheriting credentials
     // or unrelated server state.
-    let mut env_values = captured_queue_environment();
-    for pair in args.env_pairs {
-        let (key, value) = pair
-            .split_once('=')
-            .ok_or_else(|| anyhow!("invalid --env value {pair:?}; expected KEY=VALUE"))?;
-        if key.trim().is_empty() {
-            bail!("invalid --env value {pair:?}; key is empty");
-        }
-        env_values.insert(key.to_owned(), value.to_owned());
-    }
+    let env_values =
+        apply_queue_environment_overrides(captured_queue_environment(), args.env_pairs)?;
     let timeout_seconds = args
         .timeout
         .as_deref()
@@ -1375,6 +1367,22 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
     Ok(())
 }
 
+fn apply_queue_environment_overrides(
+    mut env_values: BTreeMap<String, String>,
+    pairs: impl IntoIterator<Item = String>,
+) -> Result<BTreeMap<String, String>> {
+    for pair in pairs {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid --env value {pair:?}; expected KEY=VALUE"))?;
+        if key.trim().is_empty() {
+            bail!("invalid --env value {pair:?}; key is empty");
+        }
+        env_values.insert(key.to_owned(), value.to_owned());
+    }
+    Ok(env_values)
+}
+
 fn captured_queue_environment() -> BTreeMap<String, String> {
     queue_environment_from(|key| env::var(key).ok())
 }
@@ -1383,7 +1391,7 @@ fn queue_environment_from<F>(mut lookup: F) -> BTreeMap<String, String>
 where
     F: FnMut(&str) -> Option<String>,
 {
-    ["PATH", "PYTHONPATH", "VIRTUAL_ENV"]
+    ["PATH"]
         .into_iter()
         .filter_map(|key| {
             lookup(key)
@@ -6105,7 +6113,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_run_captures_the_documented_execution_environment() {
+    fn queue_run_captures_only_path_and_allows_an_explicit_path_override() {
         let captured = queue_environment_from(|key| match key {
             "PATH" => Some("/opt/homebrew/bin:/usr/bin".to_owned()),
             "PYTHONPATH" => Some("/workspace".to_owned()),
@@ -6115,11 +6123,12 @@ mod tests {
 
         assert_eq!(
             captured,
-            BTreeMap::from([
-                ("PATH".to_owned(), "/opt/homebrew/bin:/usr/bin".to_owned()),
-                ("PYTHONPATH".to_owned(), "/workspace".to_owned()),
-                ("VIRTUAL_ENV".to_owned(), "/workspace/.venv".to_owned()),
-            ])
+            BTreeMap::from([("PATH".to_owned(), "/opt/homebrew/bin:/usr/bin".to_owned())])
+        );
+        assert_eq!(
+            apply_queue_environment_overrides(captured, vec!["PATH=/custom/bin".to_owned()],)
+                .unwrap(),
+            BTreeMap::from([("PATH".to_owned(), "/custom/bin".to_owned())])
         );
     }
 

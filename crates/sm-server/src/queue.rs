@@ -2478,11 +2478,6 @@ fn write_queue_job_wrapper(
     let mut lines = vec![
         "#!/bin/zsh".to_owned(),
         "set +e".to_owned(),
-        "function command_not_found_handler() {".to_owned(),
-        "  print -u2 -- \"[sm queue] command not found: $1\"".to_owned(),
-        "  print -u2 -- \"[sm queue] effective PATH: $PATH\"".to_owned(),
-        "  return 127".to_owned(),
-        "}".to_owned(),
         format!("cd {} || exit 127", shell_quote(cwd)),
     ];
     for (key, value) in env {
@@ -2500,20 +2495,13 @@ fn write_queue_job_wrapper(
                 .join(" "),
         );
     } else if let Some(script_path) = script_path {
-        let script_runner = r#"function command_not_found_handler() {
-  print -u2 -- "[sm queue] command not found: $1"
-  print -u2 -- "[sm queue] effective PATH: $PATH"
-  return 127
-}
-source "$1""#;
-        lines.push(format!(
-            "/bin/zsh -c {} -- {}",
-            shell_quote(script_runner),
-            shell_quote(script_path)
-        ));
+        lines.push(format!("/bin/zsh {}", shell_quote(script_path)));
     }
     lines.extend([
         "code=$?".to_owned(),
+        "if [ \"$code\" -eq 127 ]; then".to_owned(),
+        "  print -u2 -- \"[sm queue] effective PATH: $PATH\"".to_owned(),
+        "fi".to_owned(),
         format!(
             "printf '%s\\n' \"$code\" > {}",
             shell_quote(&exit_code_path.display().to_string())
@@ -4333,7 +4321,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_wrapper_reports_effective_path_when_an_executable_is_missing() {
+    fn queue_argv_wrapper_reports_effective_path_when_an_executable_is_missing() {
         let job_dir = unique_temp_path("missing-executable");
         fs::create_dir_all(&job_dir).unwrap();
         let wrapper_path = job_dir.join("run.zsh");
@@ -4372,8 +4360,63 @@ mod tests {
         let status = spawn_queue_job_process(&job).unwrap().wait().unwrap();
         let log = fs::read_to_string(&log_path).unwrap();
         assert_eq!(status.code(), Some(127));
-        assert!(log.contains("[sm queue] command not found: sm-command-that-does-not-exist"));
+        assert!(log.contains("command not found: sm-command-that-does-not-exist"));
         assert!(log.contains("[sm queue] effective PATH: /queue-test/bin"));
+        assert_eq!(fs::read_to_string(exit_code_path).unwrap().trim(), "127");
+
+        fs::remove_dir_all(job_dir).unwrap();
+    }
+
+    #[test]
+    fn queue_script_wrapper_reports_effective_path_when_an_executable_is_missing() {
+        let job_dir = unique_temp_path("missing-script-executable");
+        fs::create_dir_all(&job_dir).unwrap();
+        let script_path = job_dir.join("submitted.zsh");
+        fs::write(&script_path, "sm-script-command-that-does-not-exist\n").unwrap();
+        let wrapper_path = job_dir.join("run.zsh");
+        let exit_code_path = job_dir.join("exit.code");
+        let log_path = job_dir.join("job.log");
+        let path = "/queue-test/script-bin";
+
+        write_queue_job_wrapper(
+            &wrapper_path,
+            "/tmp",
+            None,
+            Some(script_path.to_str().unwrap()),
+            &BTreeMap::from([("PATH".to_owned(), path.to_owned())]),
+            &exit_code_path,
+        )
+        .unwrap();
+        let wrapper = fs::read_to_string(&wrapper_path).unwrap();
+        assert!(wrapper.contains(&format!(
+            "/bin/zsh {}",
+            shell_quote(script_path.to_str().unwrap())
+        )));
+        assert!(!wrapper.contains("source \"$1\""));
+        let job = QueueJobRuntimeRecord {
+            id: "job-missing-script-executable".to_owned(),
+            job_type: "tests".to_owned(),
+            state: "pending".to_owned(),
+            notify_session_id: None,
+            queued_at: now_rfc3339(),
+            started_at: None,
+            finished_at: None,
+            holding_reason: None,
+            wrapper_path: Some(wrapper_path.display().to_string()),
+            log_path: Some(log_path.display().to_string()),
+            exit_code_path: Some(exit_code_path.display().to_string()),
+            timeout_seconds: 60,
+            pid: None,
+            process_group_id: None,
+            exit_code: None,
+            completion_notified_at: None,
+        };
+
+        let status = spawn_queue_job_process(&job).unwrap().wait().unwrap();
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert_eq!(status.code(), Some(127));
+        assert!(log.contains("command not found: sm-script-command-that-does-not-exist"));
+        assert!(log.contains("[sm queue] effective PATH: /queue-test/script-bin"));
         assert_eq!(fs::read_to_string(exit_code_path).unwrap().trim(), "127");
 
         fs::remove_dir_all(job_dir).unwrap();
