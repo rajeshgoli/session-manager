@@ -196,6 +196,11 @@ creates a durable request bound to:
 - policy version;
 - requested name, vehicle, provider/model/effort, cwd, and node.
 
+The only temporary exception to the parent-seat fields is the D4
+maintainer-incarnation canary defined under Bootstrap authority. It uses the
+explicit `incarnation_bootstrap` binding there; no other policy-enabled caller
+may omit a seat key and generation.
+
 No child is allocated while policy is pending. A changed parent, prompt, policy,
 or topology stales the request. The request ID is internal: from the calling
 agent's perspective `sm spawn` is atomic and returns either the final child ID
@@ -688,6 +693,23 @@ The slice cannot authorize its own creation. PR #1269 plus the owner-approved
 deploys may be imported as `bootstrap_observation` evidence, but SM must not
 claim it was policy-enforced retroactively.
 
+Before stable seats exist, D4 permits exactly one bootstrap caller binding:
+`binding_kind=incarnation_bootstrap`, lane `sm-policy-1268`, the configured
+canonical maintainer agent ID, its managed-session credential fingerprint, and
+a monotonically versioned bootstrap-binding digest. The immutable request stores
+those fields instead of a parent seat key/generation. A changed agent ID,
+credential, binding digest, policy version, prompt, or deploy configuration
+stales the request. The binding cannot rotate or transfer authority; if that
+incarnation stops, admission fails closed until the owner approves a replacement
+binding. It cannot be used by another lane or caller.
+
+When reviewed stable-seat identity deploys, one atomic migration assigns the
+current bound incarnation to `sm-policy-1268-maintainer` generation 1 and
+disables `incarnation_bootstrap` admission before accepting another request.
+Historical requests retain their original binding and link to the migration
+event; they are not rewritten as if a seat existed earlier. All new requests
+then use the normative parent seat key/generation contract.
+
 After the slice is reviewed and deployed, the next implementation spawn from
 the canonical maintainer is the first active dogfood event. Capability N may
 govern capability N+1 only after N has passed its own tests/review/deployment;
@@ -697,10 +719,16 @@ identity lands, that binding migrates to the durable lane-prefixed
 `sm-policy-1268-maintainer` seat without changing historical event ownership.
 
 Every later package spawn is then atomic and active: the policy either returns
-the child ID or an actionable rewrite/block. The maintainer may use a durable
-scoped override, but the override and its forecast impact are part of the same
-event. This dogfoods model selection, concurrency, budget, and intent handling
-without exposing lane 355 to an unproven implementation.
+the child ID or an actionable rewrite/block. The slice includes a minimal
+`sm policy override --request <id> --reason <text>` path available only to the
+bound caller for its own frozen request. D1 durably stores a single-use,
+policy-version-bound override with reason, issuer binding, scope, expiry, and
+consumption state; D3 consumes it atomically during admission and D2 records its
+decision and forecast impact. It cannot approve policy, bypass SM invariants,
+or apply to another request. The broader role/task/issue scopes and watch UX in
+2A/4B extend this primitive rather than supplying the first escape hatch. This
+dogfoods model selection, concurrency, budget, and intent handling without
+exposing lane 355 to an unproven implementation.
 
 D4 deploys an exact reviewed commit behind a canary scope that matches only the
 bound maintainer lane/incarnation. The evidence record includes source commit,
@@ -754,10 +782,10 @@ or throwaway implementations:
 
 | ID | Owner | Work | Dependency | Target |
 |---|---|---|---|---|
-| D0 | Maintainer Sol/high | Freeze policy-kernel, event, and admission interfaces plus dogfood fixtures, including `aa6c1120` omitted-tier/misreport evidence | approved spec/0F | 30-60 min |
-| D1 | Terra/high | Minimal policy store/projection and deterministic decision kernel | D0 | 1.5-3 h; parallel |
-| D2 | Terra/high | Append-only evidence ledger, forecast/breaker rows, and read-only CLI/API | D0 | 1.5-3 h; parallel |
-| D3 | Sol/high | Atomic spawn admission and provider attestation using D0 interfaces | D0; integrates D1/D2 | 2.5-5 h; parallel start |
+| D0 | Maintainer Sol/high | Freeze policy-kernel, bootstrap-binding, request-scoped override, event, and admission interfaces plus dogfood fixtures, including `aa6c1120` omitted-tier/misreport evidence | approved spec/0F | 30-60 min |
+| D1 | Terra/high | Minimal policy store/projection, deterministic decision kernel, and durable single-request override write/consume state | D0 | 1.5-3 h; parallel |
+| D2 | Terra/high | Append-only evidence ledger, forecast/breaker/override rows, and read-only CLI/API | D0 | 1.5-3 h; parallel |
+| D3 | Sol/high | Atomic spawn admission, bootstrap-incarnation binding, request-scoped override consumption, and provider attestation using D0 interfaces | D0; integrates D1/D2 | 2.5-5 h; parallel start |
 | D4 | Maintainer Sol/high | Integrate, run review protocol, deploy, and execute first governed spawn | D1-D3 | 1-2 h |
 
 Target first dogfood is 4-8 elapsed hours, central estimate 6 hours, using at
