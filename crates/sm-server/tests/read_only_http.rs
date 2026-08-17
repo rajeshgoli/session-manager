@@ -8477,13 +8477,6 @@ async fn usage_routes_preserve_exact_account_burn_and_optionally_include_childre
     let app = router(AppState::new(config));
 
     let connection = Connection::open(&usage_db_path).unwrap();
-    let window_start: String = connection
-        .query_row(
-            "SELECT window_start FROM burn_samples WHERE window_kind = 'weekly_all'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
     let observed_at = now
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
@@ -8509,14 +8502,14 @@ async fn usage_routes_preserve_exact_account_burn_and_optionally_include_childre
             .execute(
                 r#"
                 INSERT INTO seat_tokens (
-                  seat_id, account_key, project_key, window_kind, window_start,
-                  bucket_ts, model, effort, credit_metered, input_tokens,
+                  seat_id, account_key, project_key, window_kind, bucket_ts,
+                  model, effort, credit_metered, input_tokens,
                   output_tokens, reasoning_tokens, cache_write_5m,
                   cache_write_1h, cache_read_tokens, message_count, updated_at
-                ) VALUES (?1, ?2, '/repo/.git', 'weekly_all', ?3, ?4,
-                          'claude-sonnet-5', NULL, 0, 100, 0, 0, 0, 0, 0, 1, ?4)
+                ) VALUES (?1, ?2, '/repo/.git', 'weekly_all', ?3,
+                          'claude-sonnet-5', NULL, 0, 100, 0, 0, 0, 0, 0, 1, ?3)
                 "#,
-                rusqlite::params![seat_id, account.account_key(), window_start, observed_at],
+                rusqlite::params![seat_id, account.account_key(), observed_at],
             )
             .unwrap();
     }
@@ -8628,25 +8621,18 @@ async fn usage_routes_preserve_exact_account_burn_and_optionally_include_childre
             now,
         )
         .unwrap();
-    let previous_window_start: String = connection
-        .query_row(
-            "SELECT window_start FROM burn_samples WHERE account_key = ?1 AND window_kind = 'weekly_all'",
-            [previous_account_key],
-            |row| row.get(0),
-        )
-        .unwrap();
     connection
         .execute(
             r#"
             INSERT INTO seat_tokens (
-              seat_id, account_key, project_key, window_kind, window_start,
-              bucket_ts, model, effort, credit_metered, input_tokens,
+              seat_id, account_key, project_key, window_kind, bucket_ts,
+              model, effort, credit_metered, input_tokens,
               output_tokens, reasoning_tokens, cache_write_5m,
               cache_write_1h, cache_read_tokens, message_count, updated_at
-            ) VALUES ('child001', ?1, '/repo/.git', 'weekly_all', ?2, ?3,
-                      'claude-sonnet-5', NULL, 0, 100, 0, 0, 0, 0, 0, 1, ?3)
+            ) VALUES ('child001', ?1, '/repo/.git', 'weekly_all', ?2,
+                      'claude-sonnet-5', NULL, 0, 100, 0, 0, 0, 0, 0, 1, ?2)
             "#,
-            rusqlite::params![previous_account_key, previous_window_start, observed_at],
+            rusqlite::params![previous_account_key, observed_at],
         )
         .unwrap();
 

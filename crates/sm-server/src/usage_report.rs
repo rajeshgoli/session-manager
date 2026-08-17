@@ -522,14 +522,20 @@ fn load_window_rows(connection: &Connection, window: &BurnWindow) -> Result<Vec<
                MIN(bucket_ts), SUM(input_tokens), SUM(output_tokens), SUM(cache_write_5m),
                SUM(cache_write_1h), SUM(cache_read_tokens)
         FROM seat_tokens
-        WHERE account_key = ?1 AND window_kind = ?2 AND window_start = ?3
+        WHERE account_key = ?1 AND window_kind = ?2
+          AND bucket_ts >= ?3 AND bucket_ts < ?4
         GROUP BY seat_id, model, credit_metered
         ORDER BY seat_id, model, credit_metered
         "#,
     )?;
     let rows = statement
         .query_map(
-            params![window.account_key, window.window_kind, window.window_start],
+            params![
+                window.account_key,
+                window.window_kind,
+                window.window_start,
+                window.resets_at,
+            ],
             |row| {
                 Ok(WindowRow {
                     seat_id: row.get(0)?,
