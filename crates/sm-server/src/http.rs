@@ -127,9 +127,10 @@ use crate::sessions::{
     ReparentMutationOutcome, ReparentRepairAction, RoleRegistrationRequest,
     SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest, SendCoreInputRequest,
     SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
-    SetMaintainerRequest, SpawnBriefSource, SpawnReviewRequest, StartReviewRequest,
-    SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome, SubagentStopRequest,
-    TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome, UpdateSessionMetadataRequest,
+    SetMaintainerRequest, SpawnBriefBinding, SpawnBriefSource, SpawnReviewRequest,
+    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
+    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
+    UpdateSessionMetadataRequest,
 };
 
 use crate::studio_ssh::{self, StudioSshStatus};
@@ -3499,11 +3500,11 @@ async fn create_session(
             payload.working_dir.clone(),
         )?;
         payload.initial_message = Some(accepted.0);
-        payload.spawn_launch_intent_id = Some(accepted.1);
-        payload.spawn_brief_sha256 = Some(accepted.2);
-        payload.spawn_brief_path = Some(accepted.3);
+        payload.spawn_brief = Some(SpawnBriefBinding {
+            intent_id: accepted.1,
+            sha256: accepted.2,
+        });
     }
-    let spawn_launch_intent_id = payload.spawn_launch_intent_id.clone();
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
     let session = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_provider_supported(&payload)?;
@@ -3516,12 +3517,6 @@ async fn create_session(
     } else {
         state.session_store.create_core_session(payload, log_dir)?
     };
-    if let Some(intent_id) = spawn_launch_intent_id {
-        state
-            .session_store
-            .bind_spawn_launch_intent(&intent_id, &session.id)
-            .map_err(core_session_create_api_error)?;
-    }
     Ok(Json(session_response_with_live_activity(&state, session)))
 }
 
@@ -3539,7 +3534,7 @@ fn accept_spawn_brief(
     parent_session_id: Option<String>,
     requested_node: Option<String>,
     requested_working_dir: Option<String>,
-) -> Result<(String, String, String, String), ApiError> {
+) -> Result<(String, String, String), ApiError> {
     let Some(prompt) = prompt else {
         return Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
@@ -3564,12 +3559,7 @@ fn accept_spawn_brief(
         .session_store
         .read_spawn_brief(&intent.artifact)
         .map_err(core_session_create_api_error)?;
-    Ok((
-        accepted_prompt,
-        intent.id,
-        intent.artifact.sha256,
-        intent.artifact.path,
-    ))
+    Ok((accepted_prompt, intent.id, intent.artifact.sha256))
 }
 
 async fn spawn_session(
@@ -3641,9 +3631,10 @@ async fn spawn_session(
         reasoning_effort: payload.reasoning_effort,
         wait: wait_seconds,
         spawn_prompt_source: None,
-        spawn_launch_intent_id: Some(accepted.1.clone()),
-        spawn_brief_sha256: Some(accepted.2),
-        spawn_brief_path: Some(accepted.3),
+        spawn_brief: Some(SpawnBriefBinding {
+            intent_id: accepted.1,
+            sha256: accepted.2,
+        }),
     };
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
     let child = if state.config.rust_core.runtime_enabled {
@@ -3659,10 +3650,6 @@ async fn spawn_session(
             .session_store
             .create_core_session(create_payload, log_dir)?
     };
-    state
-        .session_store
-        .bind_spawn_launch_intent(&accepted.1, &child.id)
-        .map_err(core_session_create_api_error)?;
     if parent.is_em && child.provider != "codex-fork" {
         let _ = state.session_store.arm_stop_notify(
             &child.id,
@@ -3789,9 +3776,7 @@ async fn spawn_review_session(
         reasoning_effort: None,
         wait: None,
         spawn_prompt_source: None,
-        spawn_launch_intent_id: None,
-        spawn_brief_sha256: None,
-        spawn_brief_path: None,
+        spawn_brief: None,
     };
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
     let runtime = TmuxRuntime::from_app_config(&state.config);
@@ -9994,6 +9979,7 @@ fn codex_fork_event_stream_path_for_session(
         log_file: expand_home(log_file),
         provider: session.provider.clone(),
         initial_message: None,
+        force_initial_prompt_stdin: false,
         model: session.model.clone(),
         reasoning_effort: session.reasoning_effort.clone(),
     };
@@ -14188,6 +14174,7 @@ mod tests {
             log_file: log_file.clone(),
             provider: session.provider.clone(),
             initial_message: None,
+            force_initial_prompt_stdin: false,
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort.clone(),
         };
@@ -14238,6 +14225,7 @@ mod tests {
             log_file: log_file.clone(),
             provider: session.provider.clone(),
             initial_message: None,
+            force_initial_prompt_stdin: false,
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort.clone(),
         };
@@ -14291,6 +14279,7 @@ mod tests {
             log_file: log_file.clone(),
             provider: session.provider.clone(),
             initial_message: None,
+            force_initial_prompt_stdin: false,
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort.clone(),
         };

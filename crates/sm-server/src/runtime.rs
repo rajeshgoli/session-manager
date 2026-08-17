@@ -90,6 +90,9 @@ pub struct TmuxSessionSpec {
     pub log_file: PathBuf,
     pub provider: String,
     pub initial_message: Option<String>,
+    /// Bypass argv prompt mode to deliver an already-verified spawn brief via
+    /// tmux stdin, avoiding both command-line size limits and path races.
+    pub force_initial_prompt_stdin: bool,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
 }
@@ -360,7 +363,11 @@ impl TmuxRuntime {
             .open(&spec.log_file)
             .with_context(|| format!("failed to prepare log file {}", spec.log_file.display()))?;
 
-        let prompt_mode = self.prompt_mode.to_ascii_lowercase();
+        let prompt_mode = if spec.force_initial_prompt_stdin {
+            "stdin".to_owned()
+        } else {
+            self.prompt_mode.to_ascii_lowercase()
+        };
         if prompt_mode != "argv" && prompt_mode != "stdin" {
             bail!("unsupported runtime prompt mode: {}", self.prompt_mode);
         }
@@ -1973,6 +1980,7 @@ esac
             log_file: temp_dir.join("session.log"),
             provider: "claude".to_owned(),
             initial_message: None,
+            force_initial_prompt_stdin: false,
             model: None,
             reasoning_effort: None,
         };
@@ -2043,6 +2051,7 @@ esac
             log_file: temp_dir.join("session.log"),
             provider: "claude".to_owned(),
             initial_message: None,
+            force_initial_prompt_stdin: false,
             model: None,
             reasoning_effort: None,
         };
@@ -2082,6 +2091,7 @@ esac
             log_file: temp_dir.join("session.log"),
             provider: "claude".to_owned(),
             initial_message: None,
+            force_initial_prompt_stdin: false,
             model: None,
             reasoning_effort: None,
         };
@@ -2116,6 +2126,7 @@ esac
             log_file: temp_dir.join("session.log"),
             provider: "claude".to_owned(),
             initial_message: None,
+            force_initial_prompt_stdin: false,
             model: None,
             reasoning_effort: Some("high".to_owned()),
         };

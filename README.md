@@ -238,7 +238,7 @@ If `target/release` is on your `PATH`, `sm` resolves to the Rust CLI.
 | `sm status` | Show your status and active sessions |
 | `sm me` | Show the current session identity |
 | `sm all` | List active sessions |
-| `sm spawn <provider> <prompt> \| --prompt-file <path> \| --prompt-stdin [--model <model>] [--effort <level>]` | Start a managed agent. File/stdin briefs are accepted atomically, copied into private durable state, and launched from that immutable copy. |
+| `sm spawn <provider> <prompt> \| --prompt-file <path> \| --prompt-stdin [--model <model>] [--effort <level>]` | Start a managed agent. File/stdin briefs are accepted atomically, copied into private durable state, then delivered to the runtime as the verified accepted bytes. |
 | `sm send <id> "<text>"` | Send input to an agent |
 | `sm what <id> [prompt]` / `sm btw ...` | Ask an agent for a provider-native context summary |
 | `sm wait <id> <seconds>` | Wait for a session state transition |
