@@ -191,13 +191,16 @@ Addressing is explicit:
 Exact-incarnation selectors are never mutable aliases: `@previous` and an exact
 agent ID freeze the selected incarnation before delivery. An ordinary
 seat-routed operation accepted while the holder is live records both its seat
-intent and the resolved generation. Once a draining fence is installed, new
-discretionary seat work retains its seat intent, is fenced to the next committed
-generation, and queues for the successor; it is not frozen to the predecessor.
-Control-plane traffic may still target either incarnation explicitly. Every
-queued record therefore preserves the original selector, routing fence, and
-resolved generation so recovery cannot silently retarget exact-incarnation work
-or strand successor-directed seat work on the outgoing holder.
+intent and the resolved generation. Installing a draining fence atomically
+claims every ordinary seat-relative operation for the outgoing generation that
+lacks a durable delivery acknowledgement, preserving each message/idempotency
+key; exact-incarnation operations are excluded. New discretionary seat work
+retains its seat intent, is attached to that fence, and queues for the successor
+rather than being frozen to the predecessor. Control-plane traffic may still
+target either incarnation explicitly. Every queued record therefore preserves
+the original selector, routing fence, and resolved generation so recovery cannot
+silently retarget exact-incarnation work or strand successor-directed seat work
+on the outgoing holder.
 
 ### 3. Immutable spawn request
 
@@ -593,8 +596,18 @@ compare-and-swap on the same topology version and transfers exactly the frozen
 children, stable seat, monitor routes, and lane-owned registrations;
 predecessor becomes the successor's child and remains directly addressable by
 its provider session ID. A version mismatch aborts the provisional transition,
-releases or reconstructs the fence under recovery rules, and requires a fresh
-snapshot and orientation. A durable scoped override may defer rotation.
+retains the fence for retry or resolves it through the explicit rebinding rule
+below, and requires a fresh snapshot and orientation. A durable scoped override
+may defer rotation.
+
+Every pre-commit abort resolves the claimed operation set explicitly. An
+immediate retry retains the same fence and frozen seat-intent set while creating
+a new handoff/orientation attempt. Otherwise, only after the predecessor is
+re-attested live at the unchanged generation may SM atomically dissolve the
+fence and rebind the claimed seat-relative operations to that generation for
+idempotent delivery. If predecessor liveness is uncertain, the fence remains,
+work stays queued, and recovery escalates. Exact-incarnation selectors are never
+included in either rebinding path.
 
 The handoff prompt is assembled by SM, not authored solely by the policy
 document. A fixed versioned prompt template supplies the structured output
@@ -657,8 +670,8 @@ because identity and behavior changes must not be implicit:
    ownership edge list. It then runs the handoff `/btw` invisibly using those
    frozen child, route, registration, and task facts. Its prompt and answer do
    not enter the outgoing main thread; this avoids polluting the context merely
-   to extract state. Failure releases the fence under recorded recovery rules
-   without changing ownership.
+   to extract state. Failure retains the fence for an immediate retry or performs
+   the explicit attested-predecessor rebinding above without changing ownership.
 3. SM starts the successor in provisional `incoming` state with one immutable
    initial brief containing the target seat, predecessor agent ID, handoff
    artifact, policy version, current children, pending routed events, open
@@ -674,10 +687,11 @@ because identity and behavior changes must not be implicit:
    leaves the predecessor holding the seat and triggers provisional-successor
    rollback before a retry: SM stops or terminalizes the successor, removes its
    provisional hierarchy, alias, route, queue, and monitor state, retains a
-   `rotation_orientation_rejected` audit row, and releases the ownership fence
-   under recorded recovery rules. If terminalization or fence release cannot be
-   proved, rotation remains fail-closed with an explicit recovery blocker; it
-   does not launch another successor or return a completed rotation.
+   `rotation_orientation_rejected` audit row, and resolves the ownership fence
+   through immediate retry retention or explicit attested-predecessor rebinding.
+   If terminalization or fence resolution cannot be proved, rotation remains
+   fail-closed with an explicit recovery blocker; it does not launch another
+   successor or return a completed rotation.
 5. The atomic commit compare-and-swaps the frozen topology version, changes the
    seat generation and routes, reparents exactly the frozen child set, and
    attaches the predecessor beneath the successor. Any topology drift aborts
