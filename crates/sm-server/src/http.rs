@@ -2514,7 +2514,7 @@ async fn inbound_email_webhook(
         return Err(ApiError::NotFound("Session not found"));
     };
     let mut restored = false;
-    if matches!(session.status.as_str(), "stopped" | "killed") {
+    if session.is_stopped() {
         let outcome = if state.config.rust_core.runtime_enabled {
             let runtime = TmuxRuntime::from_app_config(&state.config);
             state
@@ -7415,10 +7415,12 @@ fn teardown_btw_requests_for_session(state: &AppState, session_id: &str) -> anyh
 }
 
 fn ensure_btw_session_live(session: &SessionRecord, label: &str) -> Result<(), ApiError> {
-    if matches!(
-        session.status.trim().to_ascii_lowercase().as_str(),
-        "stopped" | "killed" | "completed" | "error"
-    ) {
+    if session.is_stopped()
+        || matches!(
+            session.status.trim().to_ascii_lowercase().as_str(),
+            "completed" | "error"
+        )
+    {
         return Err(ApiError::Status {
             status: StatusCode::CONFLICT,
             detail: format!("{label} session is not live"),

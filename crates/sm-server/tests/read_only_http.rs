@@ -652,6 +652,16 @@ async fn what_request_is_durably_accepted_and_pollable() {
 #[tokio::test]
 async fn what_request_rejects_unsafe_prompt_and_stopped_target() {
     let state_file = write_session_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let stopped = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "stop1234")
+        .unwrap();
+    stopped["status"] = json!("idle");
+    stopped["completion_status"] = json!("killed");
+    fs::write(&state_file, state.to_string()).unwrap();
     let mut config = config_with_state_file_and_queue(&state_file);
     config.rust_core.fixture_writes_enabled = true;
     let app = router(AppState::new(config));
@@ -1747,6 +1757,17 @@ async fn explicit_human_email_is_required_for_human_recipients() {
 #[tokio::test]
 async fn inbound_email_requires_worker_proof_and_delivers_to_session() {
     let state_file = write_session_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let stopped = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    stopped["status"] = json!("idle");
+    stopped["completion_status"] = json!("killed");
+    stopped["stopped_at"] = json!("2026-06-01T00:02:00");
+    fs::write(&state_file, state.to_string()).unwrap();
     let bridge_config = write_email_bridge_config(None, Some("worker-secret"));
     let app = router(AppState::new(config_with_state_file_and_email(
         &state_file,
@@ -1823,7 +1844,7 @@ async fn inbound_email_requires_worker_proof_and_delivers_to_session() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "sent");
     assert_eq!(payload["session_id"], "run12345");
-    assert_eq!(payload["restored"], false);
+    assert_eq!(payload["restored"], true);
     assert_eq!(payload["delivery_result"], "delivered");
 
     let (_status, output) = get_json(app.clone(), "/sessions/run12345/output?lines=5").await;
