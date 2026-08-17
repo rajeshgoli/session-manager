@@ -166,14 +166,17 @@ holder-liveness alarm. Lifecycle history distinguishes at least `incoming`,
 collapsing every non-live state into retired.
 
 Detecting unplanned holder loss atomically installs a dead-holder recovery fence
-for the observed seat generation. New ordinary seat-relative operations retain
-their seat intent, observed generation, and recovery-fence ID without binding
-delivery to the dead agent. The recovery transaction may release them only to
-the same incarnation after provider liveness is re-attested at that generation,
-or to the replacement after a later generation commits; the chosen binding is
-recorded atomically before delivery. Recovery failure keeps them queued and
-escalated. Exact agent IDs and `@previous` remain frozen and are never rebound by
-this rule.
+for the observed seat generation. In the same transaction it claims every
+ordinary seat-relative operation for that generation that lacks a durable
+delivery acknowledgement, including operations accepted before loss detection,
+and attaches them to the fence with their original message/idempotency key. New
+ordinary seat-relative operations retain their seat intent, observed generation,
+and recovery-fence ID without binding delivery to the dead agent. The recovery
+transaction may release the claimed set only to the same incarnation after
+provider liveness is re-attested at that generation, or to the replacement after
+a later generation commits; the chosen binding is recorded atomically before
+idempotent delivery. Recovery failure keeps them queued and escalated. Exact
+agent IDs and `@previous` remain frozen and are never rebound by this rule.
 
 Addressing is explicit:
 
@@ -544,8 +547,12 @@ Every required-provider role declares its unavailable disposition: `block`,
 `run_unstaffed_recorded`, or an explicit substitute profile. Lane 355 watchdog
 and keeper seats use `run_unstaffed_recorded`; they never silently substitute a
 Claude seat during Codex outage. After launch, SM verifies actual provider,
-model, and effort from provider-side events/usage or launch evidence rather than
-agent self-report. Mismatch alarms and fails profile activation.
+model, and effort only from runtime-originated evidence: an effective-profile
+acknowledgement emitted by the provider runtime or its first event/usage record.
+Requested arguments, adapter configuration, launcher output, roster projection,
+and agent self-report are not attestation. Until runtime evidence confirms all
+three fields, the child remains provisional; mismatch or timeout alarms and
+fails profile activation through the launch-rejection rollback.
 
 Non-rotating `provider_native_compaction` seats periodically externalize a
 policy-defined durable state artifact and refresh it before planned shutdown.
@@ -656,7 +663,10 @@ because identity and behavior changes must not be implicit:
    initial brief containing the target seat, predecessor agent ID, handoff
    artifact, policy version, current children, pending routed events, open
    review/cleanup manifests, and an instruction to verify identity with
-   `sm me`. It cannot accept seat-routed discretionary work before commit.
+   `sm me`. Incoming identity and provisional links live in the pending rotation
+   record, outside the active hierarchy and its topology version; they become
+   active only inside the step 5 compare-and-swap. It cannot accept seat-routed
+   discretionary work before commit.
 4. Provider readiness and completion of that first orientation turn are
    observed by SM hooks. During orientation, the successor verifies the frozen
    proposed edge set and machine facts; it does not claim the mutation already
