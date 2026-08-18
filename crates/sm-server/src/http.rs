@@ -8178,28 +8178,38 @@ async fn retire_session(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let Some(requester_session_id) = requester_session_id else {
-        return Err(ApiError::Status {
-            status: StatusCode::UNPROCESSABLE_ENTITY,
-            detail: "requester_session_id is required to retire a child session".to_owned(),
-        });
+    // A managed requester may retire only an authenticated direct child.
+    // Retained `sm watch` is intentionally outside every managed session, so
+    // it has no session credential or requester id. Admit that distinct
+    // server-owned lifecycle path only after the normal operator/local
+    // authentication check; a remote anonymous request cannot become
+    // server-owned merely by omitting the requester field.
+    let session_credential = if requester_session_id.is_some() {
+        Some(reparent_session_credential(&headers)?)
+    } else {
+        request_actor_email_from_parts(&state.config, &headers, Some(peer_addr)).ok_or_else(
+            || ApiError::Status {
+                status: StatusCode::UNAUTHORIZED,
+                detail: "Operator authentication is required".to_owned(),
+            },
+        )?;
+        None
     };
-    let session_credential = reparent_session_credential(&headers)?;
     let outcome = if state.config.rust_core.runtime_enabled {
         let runtime = TmuxRuntime::from_app_config(&state.config);
         state
             .session_store
             .retire_core_session_with_runtime_authorized(
                 &session_id,
-                Some(requester_session_id),
-                Some(&session_credential),
+                requester_session_id,
+                session_credential.as_deref(),
                 &runtime,
             )?
     } else {
         state.session_store.retire_core_session_authorized(
             &session_id,
-            Some(requester_session_id),
-            Some(&session_credential),
+            requester_session_id,
+            session_credential.as_deref(),
         )?
     };
     match outcome {

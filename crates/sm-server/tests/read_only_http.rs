@@ -11390,17 +11390,16 @@ async fn runtime_restart_preserves_real_tmux_child_until_an_attributed_parent_re
     let app_after_restart = router(AppState::new(config));
     assert!(tmux_session_exists(&tmux_socket, tmux_session));
 
-    let (status, payload) = post_json(
+    let (status, payload) = post_json_with_headers_and_peer(
         app_after_restart.clone(),
         "/sessions/restartchild/retire",
         json!({}),
+        &[],
+        Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(
-        payload["detail"],
-        "requester_session_id is required to retire a child session"
-    );
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(payload["detail"], "Operator authentication is required");
     assert!(tmux_session_exists(&tmux_socket, tmux_session));
 
     let (status, payload) = post_json_with_headers_and_peer(
@@ -11467,7 +11466,7 @@ async fn runtime_restart_preserves_real_tmux_child_until_an_attributed_parent_re
     assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&tmux_socket, tmux_session));
 
-    let (status, payload) = get_json(app_after_restart, "/sessions/restartchild").await;
+    let (status, payload) = get_json(app_after_restart.clone(), "/sessions/restartchild").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["terminal_provenance"]["cause"], "explicit_retire");
     let persisted: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
@@ -11485,6 +11484,30 @@ async fn runtime_restart_preserves_real_tmux_child_until_an_attributed_parent_re
     assert_eq!(provenance["source"], "api_retire");
     assert_eq!(provenance["tmux_disposition"], "killed");
     assert_eq!(provenance, &first_provenance);
+
+    // The retained watch dashboard is deliberately launched outside a managed
+    // session. Its loopback operator request has no requester credential but
+    // is still allowed to exercise server-owned lifecycle authority.
+    let (status, payload) = post_json_with_headers_and_peer(
+        app_after_restart.clone(),
+        "/sessions/restartparent/retire",
+        json!({}),
+        &[("Host", "localhost")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "retired");
+
+    let (status, payload) = get_json(app_after_restart, "/sessions/restartparent").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["terminal_provenance"]["cause"], "explicit_retire");
+    assert!(payload["terminal_provenance"]["actor_session_id"].is_null());
+    assert_eq!(payload["terminal_provenance"]["authority"], "server_owned");
+    assert_eq!(
+        payload["terminal_provenance"]["source"],
+        "server_owned_retire"
+    );
 }
 
 #[tokio::test]
