@@ -949,6 +949,51 @@ impl SessionStore {
             model: launch.model.clone(),
             reasoning_effort: launch.reasoning_effort.clone(),
         };
+        let recovered_claude_initial_brief = if launch.operation_kind == "create"
+            && launch.provider == "claude"
+            && launch.force_initial_prompt_stdin
+        {
+            let Some(prompt) = launch.initial_message.as_deref() else {
+                mark_runtime_launch_failed(
+                    &mut state,
+                    launch_id,
+                    &launch.session_id,
+                    true,
+                    "Claude initial brief recovery is missing its immutable prompt",
+                )?;
+                self.write_raw_json_value(&state)?;
+                return Ok(());
+            };
+            match session_runtime.reconciled_claude_initial_brief_session(&spec, prompt) {
+                Ok(Some(provider_session_id)) => Some(provider_session_id),
+                Ok(None) => {
+                    mark_runtime_launch_failed(
+                        &mut state,
+                        launch_id,
+                        &launch.session_id,
+                        true,
+                        "Claude initial brief recovery is ambiguous; refusing to replay an unverified submission",
+                    )?;
+                    self.write_raw_json_value(&state)?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    mark_runtime_launch_failed(
+                        &mut state,
+                        launch_id,
+                        &launch.session_id,
+                        true,
+                        &format!(
+                            "Claude initial brief recovery could not reconcile provider evidence; refusing replay: {error}"
+                        ),
+                    )?;
+                    self.write_raw_json_value(&state)?;
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
         let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
         let codex_cli_creation_binding =
             if launch.operation_kind == "create" && launch.provider == "codex" {
@@ -981,7 +1026,9 @@ impl SessionStore {
             if session_runtime.session_exists(&launch.tmux_session)? {
                 session_runtime.kill_session(&launch.tmux_session)?;
             }
-            if launch.operation_kind == "create" {
+            if let Some(provider_session_id) = recovered_claude_initial_brief.as_deref() {
+                session_runtime.restore_session(&spec, "claude", Some(provider_session_id))
+            } else if launch.operation_kind == "create" {
                 session_runtime.create_session(&spec)
             } else {
                 session_runtime.restore_session(
@@ -16140,6 +16187,64 @@ mod tests {
                 );
             }
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_initial_brief_recovery_refuses_ambiguous_replay_without_runtime_invocation() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let root = unique_temp_path("claude-brief-ambiguous-recovery");
+        fs::create_dir_all(&root).unwrap();
+        let tmux = root.join("tmux");
+        let invoked = root.join("runtime-invoked");
+        fs::write(
+            &tmux,
+            "#!/bin/sh\n: > \"$SM_1289_FAKE_TMUX_SENTINEL\"\nexit 99\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        let old_path = env::var_os("PATH").unwrap_or_default();
+        let _path = EnvVarRestore::set(
+            "PATH",
+            format!("{}:{}", root.display(), old_path.to_string_lossy()),
+        );
+        let _sentinel = EnvVarRestore::set("SM_1289_FAKE_TMUX_SENTINEL", &invoked);
+        let state_file = root.join("state.json");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "claude1289", "name": "claude-1289", "provider": "claude",
+                    "working_dir": "/repo", "tmux_session": "claude-1289", "status": "stopped",
+                    "created_at": "2026-06-01T00:00:00Z", "last_activity": "2026-06-01T00:00:00Z"
+                }],
+                "session_runtime_launches": [{
+                    "id": "launch1289", "operation_kind": "create", "session_id": "claude1289",
+                    "tmux_session": "claude-1289", "working_dir": "/repo", "log_file": "/tmp/claude1289.log",
+                    "provider": "claude", "initial_message": "immutable brief", "force_initial_prompt_stdin": true,
+                    "credential_sha256": sha256_text("old-secret"), "status": "launching",
+                    "created_at": "2026-06-01T00:00:00Z", "updated_at": "2026-06-01T00:00:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let store = SessionStore::new(state_file.clone()).with_delivery_runtime(Some(
+            TmuxRuntime::from_config(&crate::config::RustCoreConfig::default()),
+        ));
+        store.recover_session_runtime_launches().unwrap();
+
+        assert!(!invoked.exists(), "ambiguous recovery must not invoke tmux");
+        let recovered = store.load_raw_json_value().unwrap();
+        assert_eq!(recovered["session_runtime_launches"][0]["status"], "failed");
+        assert_eq!(
+            recovered["session_runtime_launches"][0]["failure_reason"],
+            "Claude initial brief recovery could not reconcile provider evidence; refusing replay: Claude transcript root is unavailable for structured initial-brief acknowledgement"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

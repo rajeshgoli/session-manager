@@ -406,6 +406,33 @@ impl TmuxRuntime {
         }))
     }
 
+    /// Return the deterministic Claude provider session only when its durable
+    /// transcript already proves the exact immutable brief was accepted.
+    /// Recovery must not infer that a missing entry means an earlier Enter was
+    /// ignored: transcript flush and process death can race that observation.
+    pub fn reconciled_claude_initial_brief_session(
+        &self,
+        spec: &TmuxSessionSpec,
+        prompt: &str,
+    ) -> Result<Option<String>> {
+        if spec.provider != "claude" || !spec.force_initial_prompt_stdin {
+            return Ok(None);
+        }
+        let provider_session_id = claude_provider_session_id(&spec.session_id);
+        let transcripts = self.claude_initial_brief_transcript(spec)?;
+        Ok(transcripts
+            .iter()
+            .any(|transcript| {
+                claude_transcript_has_user_turn_after(
+                    &transcript.path,
+                    0,
+                    &provider_session_id,
+                    prompt,
+                )
+            })
+            .then_some(provider_session_id))
+    }
+
     pub fn create_session(&self, spec: &TmuxSessionSpec) -> Result<()> {
         if self.session_exists(&spec.tmux_session)? {
             bail!("tmux session already exists: {}", spec.tmux_session);
@@ -498,6 +525,7 @@ impl TmuxRuntime {
         }
         let mut spec = spec.clone();
         spec.initial_message = None;
+        spec.force_initial_prompt_stdin = false;
         runtime.create_session(&spec)
     }
 
@@ -2582,6 +2610,55 @@ esac
             .launch_command(&spec, "argv")
             .unwrap()
             .contains("--session-id"));
+    }
+
+    #[test]
+    fn claude_initial_brief_recovery_reconciles_only_an_exact_prior_turn() {
+        let root =
+            env::temp_dir().join(format!("sm-rust-claude-brief-reconcile-{}", process::id()));
+        let working_dir = root.join("repo");
+        fs::create_dir_all(&working_dir).unwrap();
+        let spec = TmuxSessionSpec {
+            session_id: "seat-1289-recovery".to_owned(),
+            session_credential: None,
+            tmux_session: "sm-test".to_owned(),
+            working_dir: working_dir.display().to_string(),
+            log_file: root.join("session.log"),
+            provider: "claude".to_owned(),
+            initial_message: Some("immutable brief\n".to_owned()),
+            force_initial_prompt_stdin: true,
+            model: None,
+            reasoning_effort: None,
+        };
+        let provider_session_id = claude_provider_session_id(&spec.session_id);
+        let transcript = root
+            .join(claude_project_dir_name(&spec.working_dir))
+            .join(format!("{provider_session_id}.jsonl"));
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            serde_json::json!({
+                "type": "user", "sessionId": provider_session_id.as_str(), "isSidechain": false,
+                "message": {"role": "user", "content": "immutable brief\n"},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.claude_transcript_roots = vec![root.clone()];
+        assert_eq!(
+            runtime
+                .reconciled_claude_initial_brief_session(&spec, "immutable brief\n")
+                .unwrap(),
+            Some(provider_session_id)
+        );
+        assert_eq!(
+            runtime
+                .reconciled_claude_initial_brief_session(&spec, "immutable brief\nchanged")
+                .unwrap(),
+            None
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
