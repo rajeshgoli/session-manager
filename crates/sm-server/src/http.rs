@@ -8249,9 +8249,17 @@ async fn retire_session(
     };
     match outcome {
         CoreRetireOutcome::Retired(result) => {
-            if let Err(error) = teardown_btw_requests_for_session(&state, &session_id) {
-                eprintln!("retired session {session_id} but BTW teardown failed: {error:#}");
-            }
+            // Retirement is durable before this cleanup. Surface a failed
+            // teardown so the caller retries the idempotent retirement rather
+            // than receiving a false success with live BTW work left behind.
+            teardown_btw_requests_for_session(&state, &session_id).map_err(|error| {
+                ApiError::Status {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    detail: format!(
+                        "session {session_id} was retired but BTW teardown requires retry: {error:#}"
+                    ),
+                }
+            })?;
             Ok(Json(serde_json::to_value(result)?))
         }
         CoreRetireOutcome::NotFound => Ok(Json(json!({

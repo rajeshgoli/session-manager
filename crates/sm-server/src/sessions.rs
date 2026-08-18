@@ -60,6 +60,9 @@ const CODEX_FORK_CONTROL_RECOVERY_POLL: Duration = Duration::from_millis(50);
 const SEAT_SESSION_RETRY_ATTEMPTS: usize = 20;
 const SEAT_SESSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 const REPARENT_REQUEST_TTL_HOURS: i64 = 24;
+const TERMINAL_RUNTIME_TEARDOWN_STABILITY_CHECKS: usize = 5;
+const TERMINAL_RUNTIME_TEARDOWN_STABILITY_DELAY: Duration = Duration::from_millis(100);
+const TERMINAL_RUNTIME_TEARDOWN_STABLE_ABSENCES: usize = 3;
 static STATE_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -876,32 +879,73 @@ impl SessionStore {
         // writes terminal evidence, so this startup pass owns the remaining
         // crash window and tears down any such late runtime before ordinary
         // launch recovery considers other work.
-        let terminal_launches = {
-            let _guard = self.write_guard()?;
-            let state = self.load_raw_json_value()?;
-            let terminal_session_ids = snapshot_from_raw_value(&state)?
-                .sessions
-                .into_iter()
-                .filter(|session| {
-                    completion_status_is_retired(session.completion_status.as_deref())
-                })
-                .map(|session| session.id)
-                .collect::<BTreeSet<_>>();
-            session_runtime_launch_records(&state)?
-                .into_iter()
-                .filter(|launch| {
-                    launch.status == "failed"
-                        && launch.failure_reason.as_deref() == Some("target_terminal")
-                        && terminal_session_ids.contains(&launch.session_id)
-                })
-                .collect::<Vec<_>>()
-        };
-        for launch in terminal_launches {
-            runtime
-                .for_socket_name(launch.tmux_socket_name.as_deref())
-                .kill_session(&launch.tmux_session)?;
+        let mut stable_absences = BTreeMap::<String, usize>::new();
+        for attempt in 0..TERMINAL_RUNTIME_TEARDOWN_STABILITY_CHECKS {
+            let terminal_launches = self.pending_terminal_runtime_teardowns()?;
+            if terminal_launches.is_empty() {
+                return Ok(());
+            }
+            for launch in terminal_launches {
+                let was_running = runtime
+                    .for_socket_name(launch.tmux_socket_name.as_deref())
+                    .kill_session(&launch.tmux_session)?;
+                let stable_absence = stable_absences.entry(launch.id).or_default();
+                *stable_absence = if was_running { 0 } else { *stable_absence + 1 };
+            }
+            if attempt + 1 < TERMINAL_RUNTIME_TEARDOWN_STABILITY_CHECKS {
+                thread::sleep(TERMINAL_RUNTIME_TEARDOWN_STABILITY_DELAY);
+            }
+        }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let terminal_session_ids = terminal_session_ids_from_state(&state)?;
+        let mut launches = session_runtime_launch_records(&state)?;
+        let unsettled_launches = launches
+            .iter()
+            .filter(|launch| {
+                launch.terminal_teardown_pending
+                    && terminal_session_ids.contains(&launch.session_id)
+                    && stable_absences.get(&launch.id).copied().unwrap_or_default()
+                        < TERMINAL_RUNTIME_TEARDOWN_STABLE_ABSENCES
+            })
+            .map(|launch| launch.id.as_str())
+            .collect::<Vec<_>>();
+        if !unsettled_launches.is_empty() {
+            anyhow::bail!(
+                "terminal runtime teardown did not reach stable absence for launch(es) {}",
+                unsettled_launches.join(", ")
+            );
+        }
+        let mut changed = false;
+        for launch in &mut launches {
+            if launch.terminal_teardown_pending
+                && terminal_session_ids.contains(&launch.session_id)
+                && stable_absences.get(&launch.id).copied().unwrap_or_default()
+                    >= TERMINAL_RUNTIME_TEARDOWN_STABLE_ABSENCES
+            {
+                launch.terminal_teardown_pending = false;
+                launch.updated_at = now_rfc3339();
+                changed = true;
+            }
+        }
+        if changed {
+            store_session_runtime_launch_records(&mut state, &launches)?;
+            self.write_raw_json_value(&state)?;
         }
         Ok(())
+    }
+
+    fn pending_terminal_runtime_teardowns(&self) -> Result<Vec<SessionRuntimeLaunchRecord>> {
+        let _guard = self.write_guard()?;
+        let state = self.load_raw_json_value()?;
+        let terminal_session_ids = terminal_session_ids_from_state(&state)?;
+        Ok(session_runtime_launch_records(&state)?
+            .into_iter()
+            .filter(|launch| {
+                launch.terminal_teardown_pending
+                    && terminal_session_ids.contains(&launch.session_id)
+            })
+            .collect())
     }
 
     fn recover_session_runtime_launch(&self, launch_id: &str) -> Result<()> {
@@ -1412,6 +1456,7 @@ impl SessionStore {
             created_at: now.clone(),
             updated_at: now.clone(),
             failure_reason: None,
+            terminal_teardown_pending: false,
         });
         rotations[rotation_index].status = "relaunching".to_owned();
         rotations[rotation_index].idle_proof_at = Some(now.clone());
@@ -4335,6 +4380,7 @@ impl SessionStore {
             created_at: launch_time.clone(),
             updated_at: launch_time,
             failure_reason: None,
+            terminal_teardown_pending: false,
         });
         record.status = "stopped".to_owned();
         record.stopped_at = Some(now_rfc3339());
@@ -5530,6 +5576,7 @@ impl SessionStore {
             created_at: launch_time.clone(),
             updated_at: launch_time,
             failure_reason: None,
+            terminal_teardown_pending: false,
         });
         {
             let sessions = ensure_sessions_array_mut(&mut state)?;
@@ -13580,6 +13627,15 @@ fn session_runtime_launch_records(state: &Value) -> Result<Vec<SessionRuntimeLau
         .unwrap_or_else(|| Ok(Vec::new()))
 }
 
+fn terminal_session_ids_from_state(state: &Value) -> Result<BTreeSet<String>> {
+    Ok(snapshot_from_raw_value(state)?
+        .sessions
+        .into_iter()
+        .filter(|session| completion_status_is_retired(session.completion_status.as_deref()))
+        .map(|session| session.id)
+        .collect())
+}
+
 fn store_session_runtime_launch_records(
     state: &mut Value,
     records: &[SessionRuntimeLaunchRecord],
@@ -13667,6 +13723,7 @@ fn finalize_active_credential_rotations_for_terminal_session(
             launch.status = "failed".to_owned();
             launch.updated_at = now.clone();
             launch.failure_reason = Some("target_terminal".to_owned());
+            launch.terminal_teardown_pending = true;
             launches_changed = true;
         }
     }
@@ -13692,6 +13749,7 @@ fn fence_terminal_runtime_launches(state: &mut Value, session_id: &str) -> Resul
             launch.status = "failed".to_owned();
             launch.updated_at = now.clone();
             launch.failure_reason = Some("target_terminal".to_owned());
+            launch.terminal_teardown_pending = true;
             changed = true;
         }
     }
@@ -14937,6 +14995,11 @@ pub struct SessionRuntimeLaunchRecord {
     pub updated_at: String,
     #[serde(default)]
     pub failure_reason: Option<String>,
+    /// A terminal transition fenced this launch while its tmux creation may
+    /// still complete. Recovery clears the flag only after observing the
+    /// target absent across a stable sequence of teardown checks.
+    #[serde(default)]
+    pub terminal_teardown_pending: bool,
 }
 
 impl SessionRuntimeLaunchRecord {
@@ -16593,6 +16656,10 @@ mod tests {
             state["session_runtime_launches"][0]["failure_reason"],
             "target_terminal"
         );
+        assert_eq!(
+            state["session_runtime_launches"][0]["terminal_teardown_pending"],
+            true
+        );
 
         let state_file = unique_temp_path("credential-rotation-terminal-recovery");
         fs::write(&state_file, state.to_string()).unwrap();
@@ -16772,6 +16839,10 @@ mod tests {
             state["session_runtime_launches"][0]["failure_reason"],
             "target_terminal"
         );
+        assert_eq!(
+            state["session_runtime_launches"][0]["terminal_teardown_pending"],
+            true
+        );
     }
 
     #[cfg(unix)]
@@ -16784,7 +16855,7 @@ mod tests {
         let invoked = root.join("runtime-invoked");
         fs::write(
             &tmux,
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SM_1314_FAKE_TMUX_SENTINEL\"\nexit 0\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SM_1314_FAKE_TMUX_SENTINEL\"\ncase \"$1\" in\nhas-session)\n  count=0\n  if test -f \"$SM_1314_FAKE_TMUX_CHECKS\"; then count=$(cat \"$SM_1314_FAKE_TMUX_CHECKS\"); fi\n  count=$((count + 1))\n  printf '%s' \"$count\" > \"$SM_1314_FAKE_TMUX_CHECKS\"\n  if test \"$count\" -eq 2; then : > \"$SM_1314_FAKE_TMUX_SESSION\"; fi\n  test -f \"$SM_1314_FAKE_TMUX_SESSION\"\n  ;;\nkill-session) rm -f \"$SM_1314_FAKE_TMUX_SESSION\" ;;\n*) exit 0 ;;\nesac\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&tmux).unwrap().permissions();
@@ -16796,6 +16867,9 @@ mod tests {
             format!("{}:{}", root.display(), old_path.to_string_lossy()),
         );
         let _sentinel = EnvVarRestore::set("SM_1314_FAKE_TMUX_SENTINEL", &invoked);
+        let fake_session = root.join("late-runtime-present");
+        let _fake_session = EnvVarRestore::set("SM_1314_FAKE_TMUX_SESSION", &fake_session);
+        let _fake_checks = EnvVarRestore::set("SM_1314_FAKE_TMUX_CHECKS", root.join("checks"));
 
         let state_file = root.join("state.json");
         let mut state = terminal_rotation_fixture("failed", Some("failed"));
@@ -16811,7 +16885,8 @@ mod tests {
         });
         state["session_runtime_launches"][0]["operation_kind"] = json!("create");
         state["session_runtime_launches"][0]["credential_rotation_id"] = Value::Null;
-        state["session_runtime_launches"][0]["failure_reason"] = json!("target_terminal");
+        state["session_runtime_launches"][0]["status"] = json!("launching");
+        fence_terminal_runtime_launches(&mut state, "rotate01").unwrap();
         fs::write(&state_file, state.to_string()).unwrap();
 
         let store = SessionStore::new(state_file).with_delivery_runtime(Some(
@@ -16822,6 +16897,18 @@ mod tests {
         let invocation = fs::read_to_string(&invoked).unwrap();
         assert!(invocation.contains("has-session -t claude-rotate01"));
         assert!(invocation.contains("kill-session -t claude-rotate01"));
+        assert!(
+            fs::read_to_string(root.join("checks"))
+                .unwrap()
+                .parse::<usize>()
+                .unwrap()
+                >= TERMINAL_RUNTIME_TEARDOWN_STABILITY_CHECKS
+        );
+        let recovered = store.load_raw_json_value().unwrap();
+        assert_eq!(
+            recovered["session_runtime_launches"][0]["terminal_teardown_pending"],
+            false
+        );
         let _ = fs::remove_dir_all(root);
     }
 
