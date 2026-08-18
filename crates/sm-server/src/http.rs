@@ -13906,12 +13906,68 @@ mod tests {
         }
     }
 
+    struct DirectHarnessProbe {
+        pid: u32,
+        isolation_root: PathBuf,
+        effective_paths: Vec<String>,
+    }
+
+    fn spawn_direct_harness_probe(
+        probe_path: &StdPath,
+        isolation_root: Option<&StdPath>,
+    ) -> ProbeChild {
+        let executable = env::current_exe().unwrap();
+        let mut command = Command::new(executable);
+        command
+            .args([
+                "--exact",
+                "http::tests::test_isolation_direct_harness_without_wrapper_cannot_open_production_state_paths",
+                "--nocapture",
+            ])
+            .env(DIRECT_HARNESS_PROBE_ENV, probe_path);
+        if let Some(isolation_root) = isolation_root {
+            command.env(TEST_ISOLATION_ROOT_ENV, isolation_root);
+        } else {
+            command.env_remove(TEST_ISOLATION_ROOT_ENV);
+        }
+        ProbeChild {
+            child: command.spawn().unwrap(),
+            release_path: probe_path.with_extension("release"),
+        }
+    }
+
+    fn wait_for_direct_harness_probe(
+        probe_child: &mut ProbeChild,
+        probe_path: &StdPath,
+    ) -> DirectHarnessProbe {
+        for _ in 0..500 {
+            if probe_path.exists() {
+                break;
+            }
+            assert!(
+                probe_child.child.try_wait().unwrap().is_none(),
+                "isolation probe exited early"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(probe_path.exists(), "isolation probe did not become ready");
+
+        let probe = fs::read_to_string(probe_path).unwrap();
+        let mut lines = probe.lines();
+        DirectHarnessProbe {
+            pid: lines.next().unwrap().parse::<u32>().unwrap(),
+            isolation_root: PathBuf::from(lines.next().unwrap()),
+            effective_paths: lines.map(str::to_owned).collect(),
+        }
+    }
+
     #[test]
-    fn direct_test_harness_without_wrapper_cannot_open_production_state_paths() {
+    fn test_isolation_direct_harness_without_wrapper_cannot_open_production_state_paths() {
         if let Some(probe_path) = env::var_os(DIRECT_HARNESS_PROBE_ENV) {
             let probe_path = PathBuf::from(probe_path);
             let state = AppState::try_new(AppConfig::default()).unwrap();
             let config = state.config();
+            let isolation_root = test_isolation_root_from_environment().unwrap().unwrap();
             let paths = [
                 config.paths.state_file.clone(),
                 config.sm_send.db_path.clone(),
@@ -13932,7 +13988,12 @@ mod tests {
             ];
             fs::write(
                 &probe_path,
-                format!("{}\n{}", process::id(), paths.join("\n")),
+                format!(
+                    "{}\n{}\n{}",
+                    process::id(),
+                    isolation_root.display(),
+                    paths.join("\n")
+                ),
             )
             .unwrap();
 
@@ -13952,61 +14013,47 @@ mod tests {
             OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
         fs::create_dir_all(&probe_root).unwrap();
-        let probe_path = probe_root.join("probe");
-        let executable = env::current_exe().unwrap();
-        let mut probe_child = ProbeChild {
-            child: Command::new(executable)
-                .args([
-                    "--exact",
-                    "http::tests::direct_test_harness_without_wrapper_cannot_open_production_state_paths",
-                    "--nocapture",
-                ])
-                .env_remove(TEST_ISOLATION_ROOT_ENV)
-                .env(DIRECT_HARNESS_PROBE_ENV, &probe_path)
-                .spawn()
-                .unwrap(),
-            release_path: probe_path.with_extension("release"),
-        };
-
-        for _ in 0..500 {
-            if probe_path.exists() {
-                break;
-            }
-            assert!(
-                probe_child.child.try_wait().unwrap().is_none(),
-                "isolation probe exited early"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(probe_path.exists(), "isolation probe did not become ready");
-
-        let probe = fs::read_to_string(&probe_path).unwrap();
-        let mut lines = probe.lines();
-        let child_pid = lines.next().unwrap().parse::<u32>().unwrap();
-        let effective_paths: Vec<_> = lines.collect();
+        let first_probe_path = probe_root.join("first-probe");
+        let second_probe_path = probe_root.join("second-probe");
+        let mut first_probe_child = spawn_direct_harness_probe(&first_probe_path, None);
+        let mut second_probe_child = spawn_direct_harness_probe(&second_probe_path, None);
+        let first_probe = wait_for_direct_harness_probe(&mut first_probe_child, &first_probe_path);
+        let second_probe =
+            wait_for_direct_harness_probe(&mut second_probe_child, &second_probe_path);
+        assert_ne!(
+            first_probe.isolation_root, second_probe.isolation_root,
+            "separate direct test binaries must not reuse a fallback isolation root"
+        );
         let production_root = env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap()
             .join(".local/share/claude-sessions");
-        for path in &effective_paths {
+        for path in first_probe
+            .effective_paths
+            .iter()
+            .chain(second_probe.effective_paths.iter())
+        {
             assert!(
                 !StdPath::new(path).starts_with(&production_root),
                 "child resolved production durable path {path}"
             );
         }
         println!(
-            "direct-harness child pid {child_pid} effective durable paths:\n{}",
-            effective_paths.join("\n")
+            "direct-harness child pid {} fallback root {} effective durable paths:\n{}",
+            first_probe.pid,
+            first_probe.isolation_root.display(),
+            first_probe.effective_paths.join("\n")
         );
 
         match Command::new("lsof")
-            .args(["-p", &child_pid.to_string()])
+            .args(["-p", &first_probe.pid.to_string()])
             .output()
         {
             Ok(lsof) => {
                 assert!(
                     lsof.status.success(),
-                    "lsof could not inspect test child {child_pid}"
+                    "lsof could not inspect test child {}",
+                    first_probe.pid
                 );
                 let open_files = String::from_utf8_lossy(&lsof.stdout);
                 assert!(
@@ -14014,7 +14061,8 @@ mod tests {
                     "unwrapped test child opened production state path:\n{open_files}"
                 );
                 println!(
-                    "direct-harness lsof proof: child pid {child_pid} has no open path below {}",
+                    "direct-harness lsof proof: child pid {} has no open path below {}",
+                    first_probe.pid,
                     production_root.display()
                 );
             }
@@ -14023,10 +14071,14 @@ mod tests {
                     "direct-harness lsof unavailable; effective-path assertions remain the portable proof"
                 );
             }
-            Err(error) => panic!("failed to invoke lsof for test child {child_pid}: {error}"),
+            Err(error) => panic!(
+                "failed to invoke lsof for test child {}: {error}",
+                first_probe.pid
+            ),
         }
 
-        probe_child.release_and_wait();
+        first_probe_child.release_and_wait();
+        second_probe_child.release_and_wait();
         fs::remove_dir_all(probe_root).unwrap();
     }
 
@@ -14040,42 +14092,17 @@ mod tests {
         let wrapper_root = probe_root.join("wrapper-root");
         fs::create_dir_all(&wrapper_root).unwrap();
         let probe_path = probe_root.join("probe");
-        let executable = env::current_exe().unwrap();
-        let mut probe_child = ProbeChild {
-            child: Command::new(executable)
-                .args([
-                    "--exact",
-                    "http::tests::direct_test_harness_without_wrapper_cannot_open_production_state_paths",
-                    "--nocapture",
-                ])
-                .env(TEST_ISOLATION_ROOT_ENV, &wrapper_root)
-                .env(DIRECT_HARNESS_PROBE_ENV, &probe_path)
-                .spawn()
-                .unwrap(),
-            release_path: probe_path.with_extension("release"),
-        };
-
-        for _ in 0..500 {
-            if probe_path.exists() {
-                break;
-            }
-            assert!(
-                probe_child.child.try_wait().unwrap().is_none(),
-                "wrapper probe exited early"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let probe = fs::read_to_string(&probe_path).unwrap();
-        let mut lines = probe.lines();
-        let child_pid = lines.next().unwrap().parse::<u32>().unwrap();
-        let state_file = StdPath::new(lines.next().unwrap());
+        let mut probe_child = spawn_direct_harness_probe(&probe_path, Some(&wrapper_root));
+        let probe = wait_for_direct_harness_probe(&mut probe_child, &probe_path);
+        let state_file = StdPath::new(probe.effective_paths.first().unwrap());
         assert!(
             state_file.starts_with(&wrapper_root),
             "wrapper root was ignored: {}",
             state_file.display()
         );
         println!(
-            "wrapper-harness child pid {child_pid} state path {}",
+            "wrapper-harness child pid {} state path {}",
+            probe.pid,
             state_file.display()
         );
 

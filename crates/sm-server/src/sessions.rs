@@ -32,7 +32,10 @@ use crate::queue::{
 };
 use crate::{
     btw::BtwStore,
-    config::{test_isolation_root_from_environment, CodexReviewConfig, ContextMonitorConfig},
+    config::{
+        path_is_under_home, test_isolation_root_from_environment, CodexReviewConfig,
+        ContextMonitorConfig,
+    },
     runtime::{ConditionalClearOutcome, TmuxRuntime, TmuxSessionSpec},
     seat_sessions::{SeatSessionIdentity, SeatSessionStore},
     usage_burn::UsageBurnStore,
@@ -519,8 +522,8 @@ impl SessionStore {
                 test_isolation_root_from_environment().expect("invalid Rust test isolation root");
             // Test launchers may retain explicit fixture indexes outside HOME,
             // but must never resolve the developer's live Codex index.
-            let is_live_home_path = env::var_os("HOME")
-                .is_some_and(|home| session_index_path.starts_with(PathBuf::from(home)));
+            let is_live_home_path =
+                path_is_under_home(session_index_path.to_string_lossy().as_ref()).unwrap_or(true);
             if !test_root.is_some() || !is_live_home_path {
                 if let Some(parent) = session_index_path.parent() {
                     self.codex_sessions_root = parent.join("sessions");
@@ -543,7 +546,7 @@ impl SessionStore {
                 .filter(|value| !value.is_empty())
                 .map(expand_home);
             let configured_under_home = configured_root.as_ref().is_some_and(|path| {
-                env::var_os("HOME").is_some_and(|home| path.starts_with(PathBuf::from(home)))
+                path_is_under_home(path.to_string_lossy().as_ref()).unwrap_or(true)
             });
             self.claude_projects_roots = match configured_root {
                 Some(path) if !configured_under_home => vec![path],

@@ -5,19 +5,24 @@ use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
 };
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
 
 /// Required by the Rust test launcher. When present, every default-shaped
 /// durable path is redirected below this root before an `AppState` starts.
 pub const TEST_ISOLATION_ROOT_ENV: &str = "SM_TEST_ISOLATION_ROOT";
 
 static TEST_ISOLATION_INSTANCE: AtomicU64 = AtomicU64::new(0);
+static DIRECT_TEST_ISOLATION_ROOT: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -257,7 +262,7 @@ pub fn test_isolation_root_from_environment() -> Result<Option<PathBuf>> {
     let root = if let Some(root) = env::var_os(TEST_ISOLATION_ROOT_ENV) {
         PathBuf::from(root)
     } else if running_rust_test_binary() {
-        env::temp_dir().join(format!("sm-rust-test-{}", std::process::id()))
+        direct_test_isolation_root()?
     } else {
         return Ok(None);
     };
@@ -336,11 +341,37 @@ fn isolate_path_from_protected_root(
     Ok(path.to_owned())
 }
 
-fn path_is_under_home(path: &str) -> Result<bool> {
+pub(crate) fn path_is_under_home(path: &str) -> Result<bool> {
     let Some(home) = env::var_os("HOME") else {
         return Ok(false);
     };
     path_resolves_under_root(path, Path::new(&home))
+}
+
+fn direct_test_isolation_root() -> Result<PathBuf> {
+    if let Some(root) = DIRECT_TEST_ISOLATION_ROOT.get() {
+        return Ok(root.clone());
+    }
+    for _ in 0..128 {
+        let candidate = env::temp_dir().join(format!(
+            "sm-rust-test-{}-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos(),
+            TEST_ISOLATION_INSTANCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::create_dir(&candidate) {
+            Ok(()) => {
+                let _ = DIRECT_TEST_ISOLATION_ROOT.set(candidate.clone());
+                return Ok(DIRECT_TEST_ISOLATION_ROOT
+                    .get()
+                    .expect("direct test isolation root was set")
+                    .clone());
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).context("failed to create direct test isolation root"),
+        }
+    }
+    anyhow::bail!("failed to create a unique direct test isolation root")
 }
 
 fn path_resolves_under_root(path: &str, root: &Path) -> Result<bool> {
@@ -2354,6 +2385,25 @@ mod tests {
             .contains("refuses production Claude transcript root"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn containment_canonicalizes_a_transcript_root_symlinked_into_home() {
+        let root = env::temp_dir().join(format!(
+            "sm-config-transcript-symlink-{}-{}",
+            std::process::id(),
+            TEST_ISOLATION_INSTANCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let home = root.join("home");
+        let live_projects = home.join(".claude/projects");
+        let alias = root.join("outside-home-alias");
+        fs::create_dir_all(&live_projects).unwrap();
+        std::os::unix::fs::symlink(&live_projects, &alias).unwrap();
+
+        assert!(path_resolves_under_root(alias.to_str().unwrap(), &home).unwrap());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
