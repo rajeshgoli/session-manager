@@ -107,6 +107,12 @@ pub struct CodexForkRuntimeArtifacts {
     pub control_socket_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct ClaudeInitialBriefReadyPane {
+    pane: String,
+    composer_y: usize,
+}
+
 #[derive(Debug)]
 pub enum CodexModelValidationError {
     Unsupported {
@@ -1302,39 +1308,53 @@ impl TmuxRuntime {
     /// brief twice.
     fn deliver_verified_initial_brief(&self, spec: &TmuxSessionSpec, prompt: &str) -> Result<()> {
         let _guard = self.lock_session_input(&spec.tmux_session)?;
-        self.wait_for_initial_brief_readiness(&spec.tmux_session, &spec.provider)?;
+        let claude_ready_pane =
+            self.wait_for_initial_brief_readiness(&spec.tmux_session, &spec.provider)?;
 
-        if spec.provider != "codex-fork" {
-            return Err(
+        match spec.provider.as_str() {
+            "codex-fork" => {
+                let artifacts = self
+                    .codex_fork_runtime_artifacts(spec)?
+                    .expect("codex-fork must have runtime artifacts");
+                let initial_event_offset = fs::metadata(&artifacts.event_stream_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                if !self.session_exists(&spec.tmux_session)? {
+                    return Err(InitialBriefDeliveryError::SessionExited {
+                        provider: spec.provider.clone(),
+                    }
+                    .into());
+                }
+                self.send_text_then_enter(&spec.tmux_session, prompt)?;
+                self.wait_for_codex_fork_initial_brief_acceptance(
+                    &spec.tmux_session,
+                    &artifacts.event_stream_path,
+                    initial_event_offset,
+                    prompt,
+                )
+            }
+            "claude" => {
+                let ready_pane = claude_ready_pane.expect("Claude readiness returns its pane");
+                if self.session_has_attached_clients(&spec.tmux_session)? {
+                    bail!("refusing to submit the initial Claude spawn brief while a tmux client is attached");
+                }
+                self.send_text_then_enter(&spec.tmux_session, prompt)?;
+                self.wait_for_claude_initial_brief_acceptance(&spec.tmux_session, &ready_pane)
+            }
+            _ => Err(
                 InitialBriefDeliveryError::ProviderAcknowledgementUnavailable {
                     provider: spec.provider.clone(),
                 }
                 .into(),
-            );
+            ),
         }
-
-        let artifacts = self
-            .codex_fork_runtime_artifacts(spec)?
-            .expect("codex-fork must have runtime artifacts");
-        let initial_event_offset = fs::metadata(&artifacts.event_stream_path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        if !self.session_exists(&spec.tmux_session)? {
-            return Err(InitialBriefDeliveryError::SessionExited {
-                provider: spec.provider.clone(),
-            }
-            .into());
-        }
-        self.send_text_then_enter(&spec.tmux_session, prompt)?;
-        self.wait_for_codex_fork_initial_brief_acceptance(
-            &spec.tmux_session,
-            &artifacts.event_stream_path,
-            initial_event_offset,
-            prompt,
-        )
     }
 
-    fn wait_for_initial_brief_readiness(&self, tmux_session: &str, provider: &str) -> Result<()> {
+    fn wait_for_initial_brief_readiness(
+        &self,
+        tmux_session: &str,
+        provider: &str,
+    ) -> Result<Option<ClaudeInitialBriefReadyPane>> {
         let deadline = Instant::now() + self.initial_brief_ready_timeout;
         let mut directory_trust_accepted = false;
         loop {
@@ -1353,8 +1373,12 @@ impl TmuxRuntime {
                     directory_trust_accepted = true;
                 }
             }
-            if self.session_input_ready(tmux_session, provider) {
-                return Ok(());
+            if provider == "claude" {
+                if let Some(pane) = self.claude_initial_brief_composer_pane(tmux_session) {
+                    return Ok(Some(pane));
+                }
+            } else if self.session_input_ready(tmux_session, provider) {
+                return Ok(None);
             }
             if Instant::now() >= deadline {
                 return Err(InitialBriefDeliveryError::ProviderReadinessTimedOut {
@@ -1364,6 +1388,49 @@ impl TmuxRuntime {
             }
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Return a Claude pane only when its composer is empty and still owned by
+    /// the provider.  Claude 2.1.226 renders the empty field as an inline
+    /// `Try "..."` suggestion, so pane text alone cannot distinguish it from
+    /// typed input.  The cursor must still be immediately after the composer
+    /// prefix on that exact row before an immutable brief may be submitted.
+    fn claude_initial_brief_composer_pane(
+        &self,
+        tmux_session: &str,
+    ) -> Option<ClaudeInitialBriefReadyPane> {
+        let pane = self.capture_pane_text(tmux_session)?;
+        if !claude_composer_is_ready(&pane) {
+            return None;
+        }
+        let (cursor_x, cursor_y) = self.pane_cursor_position(tmux_session)?;
+        claude_empty_composer_cursor(&pane, cursor_x, cursor_y).then_some(
+            ClaudeInitialBriefReadyPane {
+                pane,
+                composer_y: cursor_y,
+            },
+        )
+    }
+
+    fn pane_cursor_position(&self, tmux_session: &str) -> Option<(usize, usize)> {
+        let output = self
+            .tmux_command([
+                "display-message",
+                "-p",
+                "-t",
+                tmux_session,
+                "#{cursor_x},#{cursor_y}",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let cursor = String::from_utf8_lossy(&output.stdout);
+        let (x, y) = cursor.trim().split_once(',')?;
+        Some((x.parse().ok()?, y.parse().ok()?))
     }
 
     fn wait_for_codex_fork_initial_brief_acceptance(
@@ -1387,6 +1454,42 @@ impl TmuxRuntime {
             if Instant::now() >= deadline {
                 return Err(InitialBriefDeliveryError::ProviderAcceptanceTimedOut {
                     provider: "codex-fork".to_owned(),
+                }
+                .into());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Claude has no structured event stream.  Its only provider-originated
+    /// acknowledgement is the composer leaving the verified empty state and
+    /// the main turn entering its active UI state.  We do not resend if that
+    /// transition is missing: the original Enter may already have been seen.
+    fn wait_for_claude_initial_brief_acceptance(
+        &self,
+        tmux_session: &str,
+        ready_pane: &ClaudeInitialBriefReadyPane,
+    ) -> Result<()> {
+        let deadline = Instant::now() + self.initial_brief_ack_timeout;
+        loop {
+            if self.capture_pane_text(tmux_session).is_some_and(|pane| {
+                claude_initial_brief_submission_observed(
+                    &ready_pane.pane,
+                    ready_pane.composer_y,
+                    &pane,
+                )
+            }) {
+                return Ok(());
+            }
+            if !self.session_exists(tmux_session)? {
+                return Err(InitialBriefDeliveryError::SessionExited {
+                    provider: "claude".to_owned(),
+                }
+                .into());
+            }
+            if Instant::now() >= deadline {
+                return Err(InitialBriefDeliveryError::ProviderAcceptanceTimedOut {
+                    provider: "claude".to_owned(),
                 }
                 .into());
             }
@@ -1609,12 +1712,16 @@ fn pane_last_line(text: &str) -> Option<String> {
 
 /// Claude renders a status/footer block below its live composer. Looking only
 /// at the final pane line therefore treats every normal idle Claude session as
-/// busy. A bare composer is live when it is either the final non-empty row or
-/// immediately followed by Claude's horizontal chrome divider; an older prompt
+/// busy. Claude 2.1.226 also displays a dim inline `Try "..."` suggestion in a
+/// new empty composer. A live composer is either bare or that exact suggestion,
+/// and must be immediately followed by Claude's chrome divider; an older prompt
 /// followed by a spinner or response row is not a safe slash-command target.
 fn claude_composer_is_ready(pane: &str) -> bool {
     let lines = pane.lines().map(str::trim).collect::<Vec<_>>();
-    let Some(composer_index) = lines.iter().rposition(|line| matches!(*line, ">" | "❯")) else {
+    let Some(composer_index) = lines
+        .iter()
+        .rposition(|line| claude_composer_line_is_ready(line))
+    else {
         return false;
     };
     let trailing = lines[composer_index + 1..]
@@ -1631,6 +1738,96 @@ fn claude_composer_is_ready(pane: &str) -> bool {
                     .all(|line| !claude_line_indicates_main_thread_activity(line))
         }
     }
+}
+
+fn claude_composer_line_is_ready(line: &str) -> bool {
+    matches!(line, ">" | "❯") || claude_inline_placeholder(line)
+}
+
+/// Match the one observed Claude empty-composer rendering, not arbitrary text
+/// beginning with the composer glyph.  `claude_empty_composer_cursor` adds the
+/// second guard required before an initial spawn brief is submitted.
+fn claude_inline_placeholder(line: &str) -> bool {
+    let Some(placeholder) = line.strip_prefix('❯').or_else(|| line.strip_prefix('>')) else {
+        return false;
+    };
+    let placeholder = placeholder.trim_start();
+    placeholder.starts_with(concat!("Try ", "\""))
+        && placeholder.ends_with('"')
+        && placeholder.len() > concat!("Try ", "\"").len()
+}
+
+/// Confirm that tmux's cursor is immediately after the visible composer
+/// prefix.  A user-typed string, including one that resembles Claude's `Try
+/// "..."` placeholder, places the cursor farther right and is rejected.
+fn claude_empty_composer_cursor(pane: &str, cursor_x: usize, cursor_y: usize) -> bool {
+    let Some(line) = pane.lines().nth(cursor_y) else {
+        return false;
+    };
+    let leading = line.len() - line.trim_start().len();
+    let composer = &line[leading..];
+    let prefix_width = if composer.starts_with(">") {
+        1
+    } else if composer.starts_with("❯\u{a0}") {
+        2
+    } else if composer.starts_with('❯') {
+        1
+    } else {
+        return false;
+    };
+    claude_composer_line_is_ready(composer.trim()) && cursor_x == leading + prefix_width
+}
+
+fn claude_initial_brief_submission_observed(
+    ready_pane: &str,
+    composer_y: usize,
+    pane: &str,
+) -> bool {
+    if pane == ready_pane {
+        return false;
+    }
+    let Some(mut previous_markers) = claude_main_thread_activity_markers(ready_pane, composer_y)
+    else {
+        return false;
+    };
+    let Some(current_markers) = claude_main_thread_activity_markers(pane, composer_y) else {
+        return false;
+    };
+    current_markers.into_iter().any(|marker| {
+        match previous_markers
+            .iter()
+            .position(|previous| *previous == marker)
+        {
+            Some(index) => {
+                previous_markers.remove(index);
+                false
+            }
+            None => true,
+        }
+    })
+}
+
+/// Return a multiset of provider activity rows.  A ready pane can retain old
+/// completed-turn chrome above its new composer, so acknowledgement must
+/// observe an activity row that did not already exist before Enter.
+fn claude_main_thread_activity_markers(pane: &str, composer_y: usize) -> Option<Vec<&str>> {
+    let lines = pane.lines().collect::<Vec<_>>();
+    let composer = lines.get(composer_y)?.trim_start();
+    if !(composer.starts_with('❯') || composer.starts_with('>')) {
+        return None;
+    }
+    // The cursor-confirmed row is the actual boundary of the live input.
+    // Everything at or below it may be multiline prompt text, including
+    // quotes and rows that resemble activity. Provider turn rows render
+    // above the stationary composer. If that layout changes, fail closed.
+    Some(
+        lines
+            .iter()
+            .take(composer_y)
+            .map(|line| line.trim_start())
+            .filter(|line| claude_line_indicates_main_thread_activity(line))
+            .collect(),
+    )
 }
 
 fn claude_composer_footer_divider(line: &str) -> bool {
@@ -2187,6 +2384,126 @@ esac
     fn claude_composer_readiness_rejects_a_stale_prompt_before_running_output() {
         let pane = "❯\n────────────────────\nFable 5\n✽ Thinking through the task…\n";
         assert!(!claude_composer_is_ready(pane));
+    }
+
+    #[test]
+    fn claude_placeholder_readiness_requires_the_empty_composer_cursor() {
+        let pane = concat!(
+            "○ low · /effort\n",
+            "────────────────────\n",
+            "❯\u{a0}Try \"how does this work?\"\n",
+            "────────────────────\n",
+            "Fable 5\n",
+            "⏵⏵ bypass permissions on\n",
+        );
+
+        assert!(claude_composer_is_ready(pane));
+        assert!(claude_empty_composer_cursor(pane, 2, 2));
+        assert!(!claude_empty_composer_cursor(pane, 27, 2));
+
+        let typed = pane.replace(
+            "❯\u{a0}Try \"how does this work?\"",
+            "❯ deploy --production",
+        );
+        assert!(!claude_composer_is_ready(&typed));
+    }
+
+    #[test]
+    fn claude_initial_brief_acceptance_requires_a_provider_turn_transition() {
+        let ready = "Idle header\n❯\n────────────────────\nFable 5\n";
+        assert!(!claude_initial_brief_submission_observed(
+            ready,
+            1,
+            "Idle header\n❯\n────────────────────\nFable 5\nupdated idle footer\n",
+        ));
+        assert!(!claude_initial_brief_submission_observed(
+            ready,
+            1,
+            "Idle header\n❯\n────────────────────\nFable 5\n",
+        ));
+        assert!(claude_initial_brief_submission_observed(
+            ready,
+            1,
+            "✽ Thinking through the task…\n❯\n────────────────────\nFable 5\n",
+        ));
+    }
+
+    #[test]
+    fn claude_initial_brief_acceptance_rejects_stale_activity_from_the_ready_pane() {
+        let ready = concat!(
+            "⏺ Completed startup housekeeping\n",
+            "❯\n",
+            "────────────────────\n",
+            "Fable 5\n",
+        );
+
+        assert!(!claude_initial_brief_submission_observed(
+            ready,
+            1,
+            concat!(
+                "⏺ Completed startup housekeeping\n",
+                "❯ pasted-but-not-submitted\n",
+                "────────────────────\n",
+                "Fable 5\n",
+            ),
+        ));
+        assert!(claude_initial_brief_submission_observed(
+            ready,
+            1,
+            concat!(
+                "✽ Thinking through the initial brief…\n",
+                "❯\n",
+                "────────────────────\n",
+                "Fable 5\n",
+            ),
+        ));
+    }
+
+    #[test]
+    fn claude_initial_brief_acceptance_rejects_marker_shaped_multiline_input() {
+        let ready = concat!(
+            "⏺ Completed startup housekeeping\n",
+            "❯\n",
+            "────────────────────\n",
+            "Fable 5\n",
+        );
+
+        // A failed Enter leaves every continuation row in Claude's composer.
+        // The second row deliberately resembles a provider activity marker.
+        assert!(!claude_initial_brief_submission_observed(
+            ready,
+            1,
+            concat!(
+                "⏺ Completed startup housekeeping\n",
+                "❯ first line of immutable brief\n",
+                "✽ marker-shaped continuation, still unsubmitted\n",
+                "────────────────────\n",
+                "Fable 5\n",
+            ),
+        ));
+    }
+
+    #[test]
+    fn claude_initial_brief_acceptance_anchors_input_at_the_ready_cursor_row() {
+        let ready = concat!(
+            "⏺ Completed startup housekeeping\n",
+            "❯\n",
+            "────────────────────\n",
+            "Fable 5\n",
+        );
+
+        assert!(!claude_initial_brief_submission_observed(
+            ready,
+            1,
+            concat!(
+                "⏺ Completed startup housekeeping\n",
+                "❯ first line of immutable brief\n",
+                "✽ marker-shaped continuation, still unsubmitted\n",
+                "> quoted continuation, still unsubmitted\n",
+                "────────────────────\n",
+                "Fable 5\n",
+            ),
+        ));
     }
 
     #[test]
