@@ -61,6 +61,7 @@ from .models import (
     SubagentStatus,
     DeliveryResult,
 )
+from .message_queue import CodexReviewRequestConflict
 from .cli.commands import validate_friendly_name
 from .cli.dispatch import get_auto_remind_config
 from .bug_report_store import BugReportStore
@@ -964,6 +965,9 @@ class CodexReviewRequestResponse(BaseModel):
     last_error: Optional[str] = None
     state: str
     is_active: bool = True
+    requested_head_sha: Optional[str] = None
+    superseded_by_request_id: Optional[str] = None
+    superseded_at: Optional[str] = None
 
 
 class AgentStatusRequest(BaseModel):
@@ -2516,6 +2520,9 @@ def create_app(
             last_error=registration.last_error,
             state=registration.state,
             is_active=registration.is_active,
+            requested_head_sha=registration.requested_head_sha,
+            superseded_by_request_id=registration.superseded_by_request_id,
+            superseded_at=registration.superseded_at.isoformat() if registration.superseded_at else None,
         )
 
     def _response_dict(model: BaseModel) -> dict:
@@ -8726,6 +8733,8 @@ Provide ONLY the summary, no preamble or questions."""
                 poll_interval_seconds=request.poll_interval_seconds,
                 retry_interval_seconds=request.retry_interval_seconds,
             )
+        except CodexReviewRequestConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:

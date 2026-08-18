@@ -37,6 +37,10 @@ from .github_reviews import (
 logger = logging.getLogger(__name__)
 
 
+class CodexReviewRequestConflict(ValueError):
+    """An active request belongs to another caller and cannot be replaced."""
+
+
 class MessageQueueManager:
     """
     Manages queued messages and delivers them reliably when sessions become idle.
@@ -368,6 +372,18 @@ class MessageQueueManager:
             CREATE INDEX IF NOT EXISTS idx_codex_review_notify_active
             ON codex_review_request_registrations(notify_session_id, is_active)
         """)
+        cursor.execute("PRAGMA table_info(codex_review_request_registrations)")
+        codex_review_columns = [col[1] for col in cursor.fetchall()]
+        for column, declaration in (
+            ("requested_head_sha", "TEXT"),
+            ("superseded_by_request_id", "TEXT"),
+            ("superseded_at", "TIMESTAMP"),
+        ):
+            if column not in codex_review_columns:
+                cursor.execute(
+                    f"ALTER TABLE codex_review_request_registrations ADD COLUMN {column} {declaration}"
+                )
+                logger.info("Migrated codex_review_request_registrations: added %s", column)
 
         self._db_conn.commit()
         logger.info(f"Message queue database initialized at {self.db_path} (WAL mode enabled)")
@@ -926,6 +942,9 @@ class MessageQueueManager:
             last_error=row[21],
             state=row[22],
             is_active=bool(row[23]),
+            requested_head_sha=row[24],
+            superseded_by_request_id=row[25],
+            superseded_at=datetime.fromisoformat(row[26]) if row[26] else None,
         )
 
     def _load_codex_review_request_from_db(
@@ -940,7 +959,8 @@ class MessageQueueManager:
                    latest_request_posted_at, attempt_count, next_retry_at,
                    poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
                    pickup_source, review_landed_at, review_source, review_comment_id,
-                   review_url, last_polled_at, last_error, state, is_active
+                   review_url, last_polled_at, last_error, state, is_active,
+                   requested_head_sha, superseded_by_request_id, superseded_at
             FROM codex_review_request_registrations
             WHERE id = ?
             """,
@@ -979,7 +999,8 @@ class MessageQueueManager:
                    latest_request_posted_at, attempt_count, next_retry_at,
                    poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
                    pickup_source, review_landed_at, review_source, review_comment_id,
-                   review_url, last_polled_at, last_error, state, is_active
+                   review_url, last_polled_at, last_error, state, is_active,
+                   requested_head_sha, superseded_by_request_id, superseded_at
             FROM codex_review_request_registrations
         """
         if where_clauses:
@@ -989,23 +1010,95 @@ class MessageQueueManager:
         rows = self._execute_query(query, tuple(params))
         return [self._row_to_codex_review_request_registration(row) for row in rows]
 
-    def _find_active_codex_review_request(
+    @staticmethod
+    def _codex_review_owner_id(registration: CodexReviewRequestRegistration) -> str:
+        """Return the caller that owns replacement rights for a request."""
+        return registration.requester_session_id or registration.notify_session_id
+
+    def _codex_review_request_lock(
         self,
         repo: str,
         pr_number: int,
-        notify_session_id: str,
-    ) -> Optional[CodexReviewRequestRegistration]:
-        """Return an active duplicate request when one already exists."""
-        for registration in self._codex_review_requests.values():
-            if not registration.is_active:
-                continue
-            if (
-                registration.repo == repo
-                and registration.pr_number == pr_number
-                and registration.notify_session_id == notify_session_id
-            ):
-                return registration
-        return None
+        owner_session_id: str,
+    ) -> asyncio.Lock:
+        """Return the local serialization lock for one caller's PR requests."""
+        key = (repo, pr_number, owner_session_id)
+        return self._codex_review_request_creation_locks.setdefault(key, asyncio.Lock())
+
+    def _find_active_codex_review_requests(
+        self,
+        repo: str,
+        pr_number: int,
+    ) -> list[CodexReviewRequestRegistration]:
+        """Load active requests from durable state, including post-restart rows."""
+        registrations = self._load_codex_review_requests_from_db(
+            repo=repo,
+            pr_number=pr_number,
+            include_inactive=False,
+        )
+        resolved = []
+        for registration in registrations:
+            in_memory = self._codex_review_requests.get(registration.id)
+            if in_memory is None:
+                self._codex_review_requests[registration.id] = registration
+                in_memory = registration
+            resolved.append(in_memory)
+        return resolved
+
+    def _persist_codex_review_request_replacement(
+        self,
+        registration: CodexReviewRequestRegistration,
+        superseded: list[CodexReviewRequestRegistration],
+    ) -> None:
+        """Atomically retain old requests and insert their active replacement."""
+        superseded_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        with self._db_lock:
+            cursor = self._db_conn.cursor()
+            try:
+                cursor.execute("BEGIN")
+                for prior in superseded:
+                    cursor.execute(
+                        """
+                        UPDATE codex_review_request_registrations
+                        SET is_active = 0, state = 'superseded',
+                            superseded_by_request_id = ?, superseded_at = ?
+                        WHERE id = ? AND is_active = 1
+                        """,
+                        (registration.id, superseded_at.isoformat(), prior.id),
+                    )
+                    prior.is_active = False
+                    prior.state = "superseded"
+                    prior.superseded_by_request_id = registration.id
+                    prior.superseded_at = superseded_at
+                cursor.execute(
+                    """
+                    INSERT INTO codex_review_request_registrations
+                    (id, repo, pr_number, requester_session_id, notify_session_id, steer,
+                     requested_at, latest_request_comment_id, latest_request_comment_url,
+                     latest_request_posted_at, attempt_count, next_retry_at,
+                     poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
+                     pickup_source, review_landed_at, review_source, review_comment_id,
+                     review_url, last_polled_at, last_error, state, is_active,
+                     requested_head_sha, superseded_by_request_id, superseded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                    """,
+                    (
+                        registration.id, registration.repo, registration.pr_number,
+                        registration.requester_session_id, registration.notify_session_id,
+                        registration.steer, registration.requested_at.isoformat(),
+                        registration.latest_request_comment_id, registration.latest_request_comment_url,
+                        registration.latest_request_posted_at.isoformat() if registration.latest_request_posted_at else None,
+                        registration.attempt_count,
+                        registration.next_retry_at.isoformat() if registration.next_retry_at else None,
+                        registration.poll_interval_seconds, registration.retry_interval_seconds,
+                        None, None, None, None, None, None, None, None, registration.state,
+                        registration.requested_head_sha, None, None,
+                    ),
+                )
+                self._db_conn.commit()
+            except Exception:
+                self._db_conn.rollback()
+                raise
 
     async def register_codex_review_request(
         self,
@@ -1031,15 +1124,40 @@ class MessageQueueManager:
             raise ValueError(f"Requester session {requester_session_id} not found")
 
         resolved_repo = await self._resolve_codex_review_repo(repo, requester_session_id)
-        creation_key = (resolved_repo, pr_number, notify_session_id)
-        creation_lock = self._codex_review_request_creation_locks.setdefault(creation_key, asyncio.Lock())
+        owner_session_id = requester_session_id or notify_session_id
+        creation_lock = self._codex_review_request_lock(resolved_repo, pr_number, owner_session_id)
         async with creation_lock:
-            if self._find_active_codex_review_request(resolved_repo, pr_number, notify_session_id):
-                raise ValueError(
-                    f"Active Codex review request already exists for {resolved_repo} PR #{pr_number}"
+            pr = await asyncio.to_thread(validate_open_pr, resolved_repo, pr_number)
+            requested_head_sha = str(pr.get("headRefOid") or "").lower()
+            if not requested_head_sha:
+                raise RuntimeError(
+                    f"PR #{pr_number} in {resolved_repo} did not provide an exact head SHA"
                 )
 
-            await asyncio.to_thread(validate_open_pr, resolved_repo, pr_number)
+            active_requests = self._find_active_codex_review_requests(resolved_repo, pr_number)
+            owned_active = [
+                registration for registration in active_requests
+                if self._codex_review_owner_id(registration) == owner_session_id
+            ]
+            same_head = next(
+                (registration for registration in owned_active
+                 if registration.requested_head_sha == requested_head_sha),
+                None,
+            )
+            if same_head:
+                return same_head
+            competing = next(
+                (registration for registration in active_requests
+                 if self._codex_review_owner_id(registration) != owner_session_id),
+                None,
+            )
+            if competing:
+                raise CodexReviewRequestConflict(
+                    "Active Codex review request "
+                    f"{competing.id} already owns {resolved_repo} PR #{pr_number} "
+                    f"for caller {self._codex_review_owner_id(competing)} at head "
+                    f"{competing.requested_head_sha or 'unknown'}; wait for it or have its caller cancel it."
+                )
             comment_result = await asyncio.to_thread(post_pr_review_comment, resolved_repo, pr_number, steer)
 
             latest_comment_id = comment_result.get("comment_id") or None
@@ -1080,45 +1198,14 @@ class MessageQueueManager:
                 next_retry_at=latest_posted_at + timedelta(seconds=retry_interval_seconds),
                 poll_interval_seconds=poll_interval_seconds,
                 retry_interval_seconds=retry_interval_seconds,
+                requested_head_sha=requested_head_sha,
             )
+            self._persist_codex_review_request_replacement(registration, owned_active)
             self._codex_review_requests[request_id] = registration
-            self._execute(
-                """
-                INSERT OR REPLACE INTO codex_review_request_registrations
-                (id, repo, pr_number, requester_session_id, notify_session_id, steer,
-                 requested_at, latest_request_comment_id, latest_request_comment_url,
-                 latest_request_posted_at, attempt_count, next_retry_at,
-                 poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
-                 pickup_source, review_landed_at, review_source, review_comment_id,
-                 review_url, last_polled_at, last_error, state, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                """,
-                (
-                    registration.id,
-                    registration.repo,
-                    registration.pr_number,
-                    registration.requester_session_id,
-                    registration.notify_session_id,
-                    registration.steer,
-                    registration.requested_at.isoformat(),
-                    registration.latest_request_comment_id,
-                    registration.latest_request_comment_url,
-                    registration.latest_request_posted_at.isoformat() if registration.latest_request_posted_at else None,
-                    registration.attempt_count,
-                    registration.next_retry_at.isoformat() if registration.next_retry_at else None,
-                    registration.poll_interval_seconds,
-                    registration.retry_interval_seconds,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    registration.state,
-                ),
-            )
+            for prior in owned_active:
+                task = self._codex_review_request_tasks.pop(prior.id, None)
+                if task:
+                    task.cancel()
 
             task = asyncio.create_task(self._run_codex_review_request_task(registration.id))
             self._codex_review_request_tasks[registration.id] = task
@@ -1226,6 +1313,52 @@ class MessageQueueManager:
             message = f"{message} {url}"
         return message
 
+    async def _complete_codex_review_request_if_current(
+        self,
+        registration: CodexReviewRequestRegistration,
+        review_match: dict,
+        now: datetime,
+    ) -> bool:
+        """Complete and wake only if this exact durable request is still active.
+
+        Matching happens outside the caller lock because it may invoke GitHub.
+        Re-checking and persisting inside the same lock used for replacement
+        prevents a late old task from waking a caller after supersession.
+        """
+        owner_session_id = self._codex_review_owner_id(registration)
+        lock = self._codex_review_request_lock(
+            registration.repo, registration.pr_number, owner_session_id
+        )
+        async with lock:
+            persisted = self._load_codex_review_request_from_db(registration.id)
+            if persisted is None or not persisted.is_active:
+                return False
+
+            review_landed_at = self._parse_iso_datetime(review_match.get("created_at")) or now
+            updates = {
+                "review_landed_at": review_landed_at,
+                "review_source": review_match.get("source"),
+                "review_comment_id": review_match.get("id"),
+                "review_url": review_match.get("url"),
+                "state": "completed",
+                "is_active": False,
+                "last_error": None,
+            }
+            self._update_codex_review_request_db(registration.id, **updates)
+            registration.review_landed_at = review_landed_at
+            registration.review_source = review_match.get("source")
+            registration.review_comment_id = review_match.get("id")
+            registration.review_url = review_match.get("url")
+            registration.state = "completed"
+            registration.is_active = False
+            registration.last_error = None
+            self.queue_message(
+                target_session_id=registration.notify_session_id,
+                text=self._render_codex_review_landed_message(registration, review_match),
+                delivery_mode="sequential",
+            )
+            return True
+
     async def _run_codex_review_request_task(self, request_id: str) -> None:
         """Poll GitHub until one Codex review request completes or is cancelled."""
         try:
@@ -1284,40 +1417,22 @@ class MessageQueueManager:
                         registration.repo,
                         registration.pr_number,
                         registration.latest_request_posted_at or registration.requested_at,
+                        requested_head_sha=registration.requested_head_sha,
+                        excluded_comment_ids={registration.latest_request_comment_id}
+                        if registration.latest_request_comment_id
+                        else set(),
                     )
                     if review_match:
-                        registration.review_landed_at = (
-                            self._parse_iso_datetime(review_match.get("created_at")) or now
-                        )
-                        registration.review_source = review_match.get("source")
-                        registration.review_comment_id = review_match.get("id")
-                        registration.review_url = review_match.get("url")
-                        registration.state = "completed"
-                        registration.is_active = False
-                        registration.last_error = None
-                        updates.update(
-                            {
-                                "review_landed_at": registration.review_landed_at,
-                                "review_source": registration.review_source,
-                                "review_comment_id": registration.review_comment_id,
-                                "review_url": registration.review_url,
-                                "state": "completed",
-                                "is_active": False,
-                                "last_error": None,
-                            }
-                        )
-                        self.queue_message(
-                            target_session_id=registration.notify_session_id,
-                            text=self._render_codex_review_landed_message(registration, review_match),
-                            delivery_mode="sequential",
-                        )
-                        self._update_codex_review_request_db(request_id, **updates)
-                        logger.info(
-                            "Codex review request %s completed for %s PR #%s",
-                            request_id,
-                            registration.repo,
-                            registration.pr_number,
-                        )
+                        if await self._complete_codex_review_request_if_current(
+                            registration, review_match, now
+                        ):
+                            logger.info(
+                                "Codex review request %s completed for %s PR #%s",
+                                request_id,
+                                registration.repo,
+                                registration.pr_number,
+                            )
+                            return
                         return
 
                     if registration.next_retry_at and now >= registration.next_retry_at:

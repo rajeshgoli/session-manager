@@ -17,7 +17,7 @@ from src.cli.commands import (
     cmd_request_codex_review_list,
     cmd_request_codex_review_status,
 )
-from src.message_queue import MessageQueueManager
+from src.message_queue import CodexReviewRequestConflict, MessageQueueManager
 from src.models import CodexReviewRequestRegistration, Session, SessionStatus
 from src.server import create_app
 
@@ -65,7 +65,7 @@ def mq(mock_session_manager, temp_db_path):
 @pytest.mark.asyncio
 async def test_register_codex_review_request_persists_and_lists(mq, mock_session_manager, temp_db_path):
     with patch.object(mq, "_run_codex_review_request_task", AsyncMock()):
-        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN"}):
+        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN", "headRefOid": "a" * 40}):
             with patch(
                 "src.message_queue.post_pr_review_comment",
                 return_value={
@@ -107,7 +107,7 @@ async def test_register_codex_review_request_persists_and_lists(mq, mock_session
 @pytest.mark.asyncio
 async def test_register_codex_review_request_rejects_duplicates(mq):
     with patch.object(mq, "_run_codex_review_request_task", AsyncMock()):
-        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN"}):
+        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN", "headRefOid": "a" * 40}):
             with patch(
                 "src.message_queue.post_pr_review_comment",
                 return_value={
@@ -123,13 +123,13 @@ async def test_register_codex_review_request_rejects_duplicates(mq):
                         requester_session_id="agent618",
                         notify_session_id="agent618",
                     )
-                    with pytest.raises(ValueError, match="already exists"):
-                        await mq.register_codex_review_request(
+                    repeated = await mq.register_codex_review_request(
                             pr_number=42,
                             repo="owner/repo",
                             requester_session_id="agent618",
                             notify_session_id="agent618",
-                        )
+                    )
+    assert repeated.id == mq.list_codex_review_requests(notify_session_id="agent618")[0].id
 
 
 @pytest.mark.asyncio
@@ -157,7 +157,7 @@ async def test_register_codex_review_request_serializes_duplicate_creation(mq):
         }
 
     with patch.object(mq, "_run_codex_review_request_task", AsyncMock()):
-        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN"}):
+        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN", "headRefOid": "a" * 40}):
             with patch("src.message_queue.post_pr_review_comment", side_effect=fake_post):
                 with patch("src.message_queue.fetch_issue_comment", return_value=None):
                     first = asyncio.create_task(
@@ -179,9 +179,147 @@ async def test_register_codex_review_request_serializes_duplicate_creation(mq):
                     first_result, second_result = await asyncio.gather(first, second, return_exceptions=True)
 
     assert isinstance(first_result, CodexReviewRequestRegistration)
-    assert isinstance(second_result, ValueError)
-    assert "already exists" in str(second_result)
+    assert isinstance(second_result, CodexReviewRequestRegistration)
+    assert second_result.id == first_result.id
     assert comment_call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_register_newer_head_supersedes_same_callers_old_request_and_preserves_history(mq):
+    old_head = "a" * 40
+    new_head = "b" * 40
+    with patch.object(mq, "_run_codex_review_request_task", AsyncMock()):
+        with patch(
+            "src.message_queue.validate_open_pr",
+            side_effect=[{"state": "OPEN", "headRefOid": old_head}, {"state": "OPEN", "headRefOid": new_head}],
+        ):
+            with patch(
+                "src.message_queue.post_pr_review_comment",
+                side_effect=[
+                    {"comment_id": 321, "comment_url": "https://example/321", "posted_at": "2026-04-17T00:00:00Z"},
+                    {"comment_id": 322, "comment_url": "https://example/322", "posted_at": "2026-04-17T00:01:00Z"},
+                ],
+            ):
+                with patch("src.message_queue.fetch_issue_comment", return_value=None):
+                    old = await mq.register_codex_review_request(
+                        pr_number=42, repo="owner/repo", requester_session_id="agent618", notify_session_id="agent618"
+                    )
+                    replacement = await mq.register_codex_review_request(
+                        pr_number=42, repo="owner/repo", requester_session_id="agent618", notify_session_id="agent618"
+                    )
+
+    assert old.is_active is False
+    assert old.state == "superseded"
+    assert old.superseded_by_request_id == replacement.id
+    assert replacement.is_active is True
+    assert replacement.requested_head_sha == new_head
+    rows = mq.list_codex_review_requests(
+        notify_session_id="agent618", repo="owner/repo", pr_number=42, include_inactive=True
+    )
+    assert [(row.id, row.state, row.requested_head_sha) for row in rows] == [
+        (old.id, "superseded", old_head),
+        (replacement.id, "active", new_head),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_register_current_head_owned_by_another_caller_returns_actionable_conflict(mq):
+    active = CodexReviewRequestRegistration(
+        id="other-request",
+        repo="owner/repo",
+        pr_number=42,
+        requester_session_id="other-agent",
+        notify_session_id="agent618",
+        steer=None,
+        requested_at=datetime(2026, 4, 17, 0, 0, 0),
+        latest_request_comment_id=321,
+        latest_request_comment_url="https://example/321",
+        latest_request_posted_at=datetime(2026, 4, 17, 0, 0, 0),
+        attempt_count=1,
+        next_retry_at=datetime(2026, 4, 17, 0, 10, 0),
+        requested_head_sha="a" * 40,
+    )
+    mq._persist_codex_review_request_replacement(active, [])
+    mq._codex_review_requests[active.id] = active
+
+    with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN", "headRefOid": "a" * 40}):
+        with pytest.raises(CodexReviewRequestConflict, match="other-request.*other-agent.*cancel"):
+            await mq.register_codex_review_request(
+                pr_number=42, repo="owner/repo", requester_session_id="agent618", notify_session_id="agent618"
+            )
+
+
+@pytest.mark.asyncio
+async def test_late_old_completion_cannot_complete_or_wake_replacement(mq):
+    old_head = "a" * 40
+    new_head = "b" * 40
+    with patch.object(mq, "_run_codex_review_request_task", AsyncMock()):
+        with patch(
+            "src.message_queue.validate_open_pr",
+            side_effect=[{"state": "OPEN", "headRefOid": old_head}, {"state": "OPEN", "headRefOid": new_head}],
+        ):
+            with patch(
+                "src.message_queue.post_pr_review_comment",
+                side_effect=[
+                    {"comment_id": 321, "comment_url": "https://example/321", "posted_at": "2026-04-17T00:00:00Z"},
+                    {"comment_id": 322, "comment_url": "https://example/322", "posted_at": "2026-04-17T00:01:00Z"},
+                ],
+            ):
+                with patch("src.message_queue.fetch_issue_comment", return_value=None):
+                    old = await mq.register_codex_review_request(
+                        pr_number=42, repo="owner/repo", requester_session_id="agent618", notify_session_id="agent618"
+                    )
+                    replacement = await mq.register_codex_review_request(
+                        pr_number=42, repo="owner/repo", requester_session_id="agent618", notify_session_id="agent618"
+                    )
+
+    mq.queue_message = MagicMock()
+    completed = await mq._complete_codex_review_request_if_current(
+        old,
+        {"source": "review", "created_at": "2026-04-17T00:02:00Z", "id": 777, "url": "https://example/777"},
+        datetime(2026, 4, 17, 0, 2, 0),
+    )
+    assert completed is False
+    assert replacement.state == "active"
+    assert replacement.is_active is True
+    mq.queue_message.assert_not_called()
+
+
+def test_restart_recovers_only_active_replacement_and_preserves_superseded_history(mock_session_manager, temp_db_path):
+    mq1 = MessageQueueManager(mock_session_manager, db_path=temp_db_path, config={}, notifier=None)
+    old_head = "a" * 40
+    new_head = "b" * 40
+    with patch.object(mq1, "_run_codex_review_request_task", AsyncMock()):
+        with patch(
+            "src.message_queue.validate_open_pr",
+            side_effect=[{"state": "OPEN", "headRefOid": old_head}, {"state": "OPEN", "headRefOid": new_head}],
+        ):
+            with patch(
+                "src.message_queue.post_pr_review_comment",
+                side_effect=[
+                    {"comment_id": 321, "comment_url": "https://example/321", "posted_at": "2026-04-17T00:00:00Z"},
+                    {"comment_id": 322, "comment_url": "https://example/322", "posted_at": "2026-04-17T00:01:00Z"},
+                ],
+            ):
+                with patch("src.message_queue.fetch_issue_comment", return_value=None):
+                    old = asyncio.run(mq1.register_codex_review_request(
+                        pr_number=42, repo="owner/repo", requester_session_id="agent618", notify_session_id="agent618"
+                    ))
+                    replacement = asyncio.run(mq1.register_codex_review_request(
+                        pr_number=42, repo="owner/repo", requester_session_id="agent618", notify_session_id="agent618"
+                    ))
+
+    mq2 = MessageQueueManager(mock_session_manager, db_path=temp_db_path, config={}, notifier=None)
+    with patch.object(mq2, "_run_codex_review_request_task", AsyncMock()):
+        asyncio.run(mq2._recover_codex_review_requests())
+
+    rows = mq2.list_codex_review_requests(notify_session_id="agent618", include_inactive=True)
+    assert [(row.id, row.state, row.requested_head_sha) for row in rows] == [
+        (old.id, "superseded", old_head),
+        (replacement.id, "active", new_head),
+    ]
+    assert old.id not in mq2._codex_review_request_tasks
+    assert replacement.id in mq2._codex_review_request_tasks
 
 
 @pytest.mark.asyncio
@@ -199,6 +337,7 @@ async def test_codex_review_request_task_completes_and_queues_message(mq):
         latest_request_posted_at=datetime(2026, 4, 17, 0, 0, 0),
         attempt_count=1,
         next_retry_at=datetime(2026, 4, 17, 0, 10, 0),
+        requested_head_sha="a" * 40,
     )
     mq._codex_review_requests[reg.id] = reg
     mq.queue_message = MagicMock()
@@ -208,7 +347,8 @@ async def test_codex_review_request_task_completes_and_queues_message(mq):
 
     with patch("asyncio.sleep", side_effect=immediate_sleep):
         with patch("src.message_queue.detect_codex_pickup", return_value=False):
-            with patch(
+            with patch.object(mq, "_load_codex_review_request_from_db", return_value=reg):
+                with patch(
                 "src.message_queue.find_fresh_codex_review_or_comment",
                 return_value={
                     "source": "comment",
@@ -216,8 +356,8 @@ async def test_codex_review_request_task_completes_and_queues_message(mq):
                     "id": 777,
                     "url": "https://github.com/owner/repo/pull/42#issuecomment-777",
                 },
-            ):
-                await mq._run_codex_review_request_task(reg.id)
+                ):
+                    await mq._run_codex_review_request_task(reg.id)
 
     assert reg.state == "completed"
     assert reg.is_active is False
@@ -240,6 +380,7 @@ async def test_codex_review_request_task_still_checks_review_when_pickup_lookup_
         latest_request_posted_at=datetime(2026, 4, 17, 0, 0, 0),
         attempt_count=1,
         next_retry_at=datetime(2026, 4, 17, 0, 10, 0),
+        requested_head_sha="a" * 40,
     )
     mq._codex_review_requests[reg.id] = reg
     mq.queue_message = MagicMock()
@@ -249,7 +390,8 @@ async def test_codex_review_request_task_still_checks_review_when_pickup_lookup_
 
     with patch("asyncio.sleep", side_effect=immediate_sleep):
         with patch("src.message_queue.detect_codex_pickup", side_effect=RuntimeError("boom")):
-            with patch(
+            with patch.object(mq, "_load_codex_review_request_from_db", return_value=reg):
+                with patch(
                 "src.message_queue.find_fresh_codex_review_or_comment",
                 return_value={
                     "source": "review",
@@ -257,8 +399,8 @@ async def test_codex_review_request_task_still_checks_review_when_pickup_lookup_
                     "id": 778,
                     "url": "https://github.com/owner/repo/pull/42#pullrequestreview-778",
                 },
-            ):
-                await mq._run_codex_review_request_task(reg.id)
+                ):
+                    await mq._run_codex_review_request_task(reg.id)
 
     assert reg.state == "completed"
     assert reg.is_active is False
@@ -271,7 +413,7 @@ def test_recover_codex_review_requests_restores_active_records(mock_session_mana
     mock_session_manager.message_queue_manager = mq1
 
     with patch.object(mq1, "_run_codex_review_request_task", AsyncMock()):
-        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN"}):
+        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN", "headRefOid": "a" * 40}):
             with patch(
                 "src.message_queue.post_pr_review_comment",
                 return_value={
@@ -304,7 +446,7 @@ def test_recover_codex_review_requests_preserves_inactive_history(mock_session_m
     mock_session_manager.message_queue_manager = mq1
 
     with patch.object(mq1, "_run_codex_review_request_task", AsyncMock()):
-        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN"}):
+        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN", "headRefOid": "a" * 40}):
             with patch(
                 "src.message_queue.post_pr_review_comment",
                 return_value={
@@ -377,7 +519,7 @@ async def test_register_codex_review_request_resolves_repo_via_to_thread(mq):
         return func(*args, **kwargs)
 
     with patch.object(mq, "_run_codex_review_request_task", AsyncMock()):
-        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN"}):
+        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN", "headRefOid": "a" * 40}):
             with patch(
                 "src.message_queue.post_pr_review_comment",
                 return_value={
@@ -467,6 +609,7 @@ def test_codex_review_request_endpoints_roundtrip(mock_session_manager):
         latest_request_posted_at=datetime(2026, 4, 17, 0, 0, 0),
         attempt_count=1,
         next_retry_at=datetime(2026, 4, 17, 0, 10, 0),
+        requested_head_sha="a" * 40,
     )
     queue_mgr.register_codex_review_request = AsyncMock(return_value=reg)
     queue_mgr.list_codex_review_requests.return_value = [reg]
@@ -503,6 +646,7 @@ def test_codex_review_request_endpoints_roundtrip(mock_session_manager):
     )
     assert create_response.status_code == 200
     assert create_response.json()["id"] == "req123"
+    assert create_response.json()["requested_head_sha"] == "a" * 40
 
     list_response = client.get("/codex-review-requests?notify_target=agent618")
     assert list_response.status_code == 200
@@ -547,6 +691,22 @@ def test_codex_review_request_endpoint_maps_operational_failures(mock_session_ma
     )
     assert response.status_code == 502
     assert response.json()["detail"] == "Failed to request Codex review: gh hung"
+
+
+def test_codex_review_request_endpoint_maps_ownership_conflict_to_409(mock_session_manager):
+    queue_mgr = MagicMock()
+    queue_mgr.register_codex_review_request = AsyncMock(
+        side_effect=CodexReviewRequestConflict("Active Codex review request other-request; have its caller cancel it.")
+    )
+    mock_session_manager.message_queue_manager = queue_mgr
+    client = TestClient(create_app(session_manager=mock_session_manager))
+
+    response = client.post(
+        "/codex-review-requests",
+        json={"pr_number": 42, "repo": "owner/repo", "requester_session_id": "agent618"},
+    )
+    assert response.status_code == 409
+    assert "other-request" in response.json()["detail"]
 
 
 def test_codex_review_request_endpoint_serializes_string_review_ids(mock_session_manager):
@@ -668,6 +828,7 @@ def test_cmd_request_codex_review_create_list_status_cancel(capsys):
             "pickup_detected_at": None,
             "review_landed_at": None,
             "review_source": None,
+            "requested_head_sha": "a" * 40,
             "next_retry_at": "2026-04-17T00:10:00",
             "last_error": None,
         },
@@ -724,7 +885,9 @@ def test_cmd_request_codex_review_create_list_status_cancel(capsys):
         json_output=False,
     )
     assert rc == 0
-    assert "Request: req123" in capsys.readouterr().out
+    status_output = capsys.readouterr().out
+    assert "Request: req123" in status_output
+    assert f"Requested head: {'a' * 40}" in status_output
 
     rc = cmd_request_codex_review_cancel(client, "req123")
     assert rc == 0
