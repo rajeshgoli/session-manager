@@ -37,13 +37,19 @@ When Codex review lands:
 - If the review is clean, exit criteria are **met**.
 
 Codex review is a sampled gate, not proof obtained by requesting reviews until
-one happens to be clean. A PR receives at most three exact-head review rounds:
+one happens to be clean. Assign the review tier before the first request and
+record it in the PR body:
 
-1. broad current-capability review;
-2. root-cause verification after one batched repair, including sibling instances
-   in the touched subsystem; and
-3. a final enabled-path/rollback/test review only when round 2 retains or
-   introduces a reachable `P0`/`P1`.
+- **R0 - ephemeral:** no review cycle for temporary working/execution docs.
+- **R1 - low risk:** one broad round. A reachable `P1` promotes the PR to R2;
+  clean or P2-only results meet the gate.
+- **R2 - medium risk:** at most three exact-head rounds. Use a broad review, one
+  batched root-cause repair and sibling search, then a current-capability review
+  only if a reachable `P0`/`P1` remains.
+- **R3 - high risk:** persisted shapes, authority, recovery, concurrency,
+  security, ambiguity semantics, hot paths, and public contracts. Run at least
+  two rounds and no more than five. A repeated or structural P1 at round 3
+  triggers design-return rather than more local patching.
 
 Record the requested and reviewed head, scope/steer, findings, disposition,
 resulting head, review wait, and available token estimate for every round. Do
@@ -57,18 +63,38 @@ not request an unchanged head again.
 If exit criteria are not met:
 
 1. Push the fixes.
-2. Request the next bounded round only if fewer than three rounds have run.
+2. Request the next bounded round only when the selected tier permits it and
+   the new head stays inside the frozen capability.
 
-At the three-round cap:
+At an R2 third-round P1 or an R3 design-return trigger:
 
-1. A reachable `P0`/`P1` blocks merge. Simplify, revert, split, or mark the PR
-   blocked with the residual finding and evidence.
-2. A finding that only affects disabled or future capability becomes a linked
-   issue and acceptance criterion for that capability.
-3. Fix, explicitly accept with rationale, or file each `P2`/`P3`.
-4. Do not start a fourth round automatically. The owner may approve one bounded
-   extension with an explicit token/time budget. It cannot be extended again;
-   another reachable `P0`/`P1` requires a split or redesign.
+1. A reachable `P0`/`P1` still blocks merge. Never merge a repair for the final
+   blocking finding without review of that repaired head.
+2. Classify the finding as localized, partitionable, or structural using its
+   enabled-path reachability, blast radius, recurrence across rounds, touched
+   files/interfaces, rollback quality, and hostile-test coverage.
+3. A newly discovered, localized R3 repair may receive a focused confirming
+   round while still below the five-round ceiling. A repeated finding class or
+   a repair that changes architecture goes to design-return. R2 does not grow a
+   fourth round; split the localized repair into a fresh bounded package if
+   confirmation is required.
+4. A partitionable finding produces a split proposal keyed by the findings'
+   file/interface list. Land no partition until its own bounded review passes.
+5. A structural or repeated finding enters design-return: a fresh design seat
+   receives the ticket, current code, and accumulated findings; it must produce
+   pieces that each have an independent gate. Execute those pieces as a
+   subepic, rerun the original full gate at the subepic head, and perform one
+   integration-focused review before landing.
+6. A finding that only affects disabled or future capability becomes a linked
+   issue and an activation criterion for that capability.
+7. Fix, explicitly accept with rationale, or file every `P2`/`P3`.
+
+At the R3 five-round ceiling, the maintainer chooses revert, split, redesign,
+or park from the recorded risk and cost evidence. Do not ask the owner to read
+or adjudicate code findings. Owner input is required only to accept a named
+residual risk, change product scope, or override policy. If owner input is not
+available, the fail-closed default is split/park, not an indefinite review loop
+and not a merge with unresolved P1s.
 
 If exit criteria are met:
 
@@ -87,6 +113,11 @@ If exit criteria are met:
 - Keep one deployable capability per PR. A head-expanding refactor discovered
   during review belongs in a separate PR rather than silently increasing the
   current review surface.
+- A review dominated by defects in verification infrastructure terminates the
+  product-code loop and files an apparatus issue, unless the PR itself changes
+  that apparatus.
+- A new gate, probe, fixture, or monitor does not count as protection until a
+  test or recorded trial demonstrates that it fires red.
 - For unusually high-risk transactions, up to two focused reviews may run in
   parallel on the same immutable head and be aggregated as one round. Record
   their costs separately and deduplicate findings before one repair batch.
