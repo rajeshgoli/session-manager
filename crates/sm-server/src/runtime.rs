@@ -800,6 +800,16 @@ impl TmuxRuntime {
         Ok(true)
     }
 
+    /// Tear down a runtime without allowing an unresponsive tmux client to
+    /// block recovery of other independent sessions.
+    pub fn kill_session_with_timeout(&self, tmux_session: &str, timeout: Duration) -> Result<bool> {
+        if !self.session_exists_with_timeout(tmux_session, timeout)? {
+            return Ok(false);
+        }
+        self.run_tmux_with_timeout(["kill-session", "-t", tmux_session], timeout)?;
+        Ok(true)
+    }
+
     pub fn set_status_bar(&self, tmux_session: &str, friendly_name: &str) -> Result<bool> {
         if !self.session_exists(tmux_session)? {
             return Ok(false);
@@ -823,6 +833,12 @@ impl TmuxRuntime {
             .output()
             .with_context(|| "failed to run tmux has-session")?;
         Ok(output.status.success())
+    }
+
+    fn session_exists_with_timeout(&self, tmux_session: &str, timeout: Duration) -> Result<bool> {
+        Ok(self
+            .run_tmux_status_with_timeout(["has-session", "-t", tmux_session], timeout)?
+            .success())
     }
 
     fn create_session_with_bootstrap(&self, spec: &TmuxSessionSpec, command: &str) -> Result<()> {
@@ -1179,6 +1195,45 @@ impl TmuxRuntime {
             bail!("tmux command failed: {}", stderr.trim());
         }
         Ok(())
+    }
+
+    fn run_tmux_with_timeout<'a>(
+        &self,
+        args: impl IntoIterator<Item = &'a str>,
+        timeout: Duration,
+    ) -> Result<()> {
+        if !self.run_tmux_status_with_timeout(args, timeout)?.success() {
+            bail!("tmux command failed");
+        }
+        Ok(())
+    }
+
+    fn run_tmux_status_with_timeout<'a>(
+        &self,
+        args: impl IntoIterator<Item = &'a str>,
+        timeout: Duration,
+    ) -> Result<std::process::ExitStatus> {
+        let mut child = self
+            .tmux_command(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| "failed to run tmux")?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| "failed to wait for tmux")?
+            {
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("tmux command timed out after {}ms", timeout.as_millis());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn tmux_command<'a>(&self, args: impl IntoIterator<Item = &'a str>) -> Command {
@@ -2341,6 +2396,31 @@ printf '%s' '{"models":[{"slug":"gpt-5.6-luna","visibility":"list"}]}'
         assert_eq!(output, ">\n");
         let log = fs::read_to_string(log_path).unwrap();
         assert!(log.contains("capture-pane -p -S -1 -t sm-test"));
+    }
+
+    #[test]
+    fn bounded_kill_session_does_not_wait_on_an_unresponsive_tmux_client() {
+        let (tmux_binary, _log_path, _temp_dir) = fake_tmux_binary();
+        fs::write(
+            &tmux_binary,
+            r#"#!/bin/sh
+while :; do :; done
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux_binary, permissions).unwrap();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.tmux_binary = tmux_binary.display().to_string();
+        let started = Instant::now();
+
+        let error = runtime
+            .kill_session_with_timeout("sm-test", Duration::from_millis(25))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 
     #[test]

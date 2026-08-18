@@ -57,6 +57,7 @@ const CODEX_FORK_EVENT_MONITOR_POLL: Duration = Duration::from_millis(250);
 const CODEX_FORK_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const CODEX_FORK_CONTROL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 const CODEX_FORK_CONTROL_RECOVERY_POLL: Duration = Duration::from_millis(50);
+const TERMINAL_RUNTIME_TEARDOWN_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 const SEAT_SESSION_RETRY_ATTEMPTS: usize = 20;
 const SEAT_SESSION_RETRY_DELAY: Duration = Duration::from_millis(100);
 const REPARENT_REQUEST_TTL_HOURS: i64 = 24;
@@ -904,9 +905,18 @@ impl SessionStore {
             // restore until this teardown attempt is complete.
             let _lifecycle_guard = self.lock_terminal_runtime_fence(&launch.session_id)?;
             if self.terminal_runtime_fence_epoch(&launch.session_id)? == epoch {
-                runtime
+                if let Err(error) = runtime
                     .for_socket_name(launch.tmux_socket_name.as_deref())
-                    .kill_session(&launch.tmux_session)?;
+                    .kill_session_with_timeout(
+                        &launch.tmux_session,
+                        TERMINAL_RUNTIME_TEARDOWN_COMMAND_TIMEOUT,
+                    )
+                {
+                    eprintln!(
+                        "terminal runtime teardown retry for {} failed: {error:#}",
+                        launch.id
+                    );
+                }
             }
         }
         Ok(())
