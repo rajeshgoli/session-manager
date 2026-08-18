@@ -3014,6 +3014,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(mappings, 1);
+        let view_tokens: i64 = connection
+            .query_row(
+                "SELECT SUM(input_tokens + output_tokens + cache_read_tokens) FROM current_seat_token_totals WHERE window_kind = 'codex_10080'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(view_tokens, 25);
     }
 
     #[test]
