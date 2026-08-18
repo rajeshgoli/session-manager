@@ -431,26 +431,29 @@ impl UsageLedgerStore {
                   FROM burn_samples
                 )
                 SELECT windows.account_key, windows.window_kind, windows.window_scope,
-                       windows.window_start, windows.resets_at, tokens.seat_id,
-                       tokens.project_key, tokens.model, tokens.credit_metered,
-                       SUM(tokens.input_tokens) AS input_tokens,
-                       SUM(tokens.output_tokens) AS output_tokens,
-                       SUM(tokens.reasoning_tokens) AS reasoning_tokens,
-                       SUM(tokens.cache_write_5m) AS cache_write_5m,
-                       SUM(tokens.cache_write_1h) AS cache_write_1h,
-                       SUM(tokens.cache_read_tokens) AS cache_read_tokens,
-                       SUM(tokens.message_count) AS message_count
+                       windows.window_start, windows.resets_at, ledger.seat_id,
+                       ledger.project_key, ledger.model, ledger.credit_metered,
+                       SUM(ledger.input_tokens) AS input_tokens,
+                       SUM(ledger.output_tokens) AS output_tokens,
+                       SUM(ledger.reasoning_tokens) AS reasoning_tokens,
+                       SUM(ledger.cache_write_5m) AS cache_write_5m,
+                       SUM(ledger.cache_write_1h) AS cache_write_1h,
+                       SUM(ledger.cache_read_tokens) AS cache_read_tokens,
+                       COUNT(*) AS message_count
                 FROM ranked_windows AS windows
-                JOIN seat_tokens AS tokens
-                  ON tokens.account_key = windows.account_key
-                 AND tokens.window_kind = windows.window_kind
-                 AND tokens.bucket_ts >= windows.window_start
-                 AND tokens.bucket_ts < windows.resets_at
+                JOIN message_ledger AS ledger
+                  ON ledger.account_key = windows.account_key
+                 AND ledger.recorded_at >= windows.window_start
+                 AND ledger.recorded_at < windows.resets_at
+                JOIN message_window AS mapped
+                  ON mapped.msg_id = ledger.msg_id
+                 AND mapped.window_kind = windows.window_kind
                 WHERE windows.window_rank = 1
                   AND windows.window_scope IS NULL
+                  AND ledger.model != '<synthetic>'
                 GROUP BY windows.account_key, windows.window_kind, windows.window_scope,
-                         windows.window_start, windows.resets_at, tokens.seat_id,
-                         tokens.project_key, tokens.model, tokens.credit_metered;
+                         windows.window_start, windows.resets_at, ledger.seat_id,
+                         ledger.project_key, ledger.model, ledger.credit_metered;
                 "#,
             )
             .context("failed to create usage ledger views")?;
@@ -3148,6 +3151,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn current_totals_view_keeps_subminute_window_membership() {
+        let dir = TestDir::new("current-totals-subminute-boundary");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Claude,
+            "account-one",
+            "max",
+            "session_5h",
+            300,
+        );
+        let _store = UsageLedgerStore::new(&db_path).unwrap();
+        record_window(
+            &db_path,
+            "session_5h",
+            300,
+            "2026-08-10T21:05:30Z",
+            "subminute-window",
+        );
+        let mut connection = Connection::open(&db_path).unwrap();
+        let tx = connection.transaction().unwrap();
+        ingest_contribution(
+            &tx,
+            &contribution_at("subminute", "subminute-request", "2026-08-10T16:05:45Z"),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let connection = Connection::open(&db_path).unwrap();
+        let tokens: i64 = connection
+            .query_row(
+                "SELECT SUM(input_tokens + output_tokens + cache_read_tokens) FROM current_seat_token_totals WHERE window_kind = 'session_5h'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tokens, 25);
     }
 
     #[test]

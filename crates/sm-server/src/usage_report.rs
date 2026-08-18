@@ -518,14 +518,19 @@ fn select_windows(
 fn load_window_rows(connection: &Connection, window: &BurnWindow) -> Result<Vec<WindowRow>> {
     let mut statement = connection.prepare(
         r#"
-        SELECT seat_id, model, credit_metered,
-               MIN(bucket_ts), SUM(input_tokens), SUM(output_tokens), SUM(cache_write_5m),
-               SUM(cache_write_1h), SUM(cache_read_tokens)
-        FROM seat_tokens
-        WHERE account_key = ?1 AND window_kind = ?2
-          AND bucket_ts >= ?3 AND bucket_ts < ?4
-        GROUP BY seat_id, model, credit_metered
-        ORDER BY seat_id, model, credit_metered
+        SELECT ledger.seat_id, ledger.model, ledger.credit_metered,
+               MIN(ledger.bucket_ts), SUM(ledger.input_tokens), SUM(ledger.output_tokens),
+               SUM(ledger.cache_write_5m), SUM(ledger.cache_write_1h),
+               SUM(ledger.cache_read_tokens)
+        FROM message_ledger AS ledger
+        JOIN message_window AS mapped
+          ON mapped.msg_id = ledger.msg_id
+         AND mapped.window_kind = ?2
+        WHERE ledger.account_key = ?1
+          AND ledger.recorded_at >= ?3 AND ledger.recorded_at < ?4
+          AND ledger.model != '<synthetic>'
+        GROUP BY ledger.seat_id, ledger.model, ledger.credit_metered
+        ORDER BY ledger.seat_id, ledger.model, ledger.credit_metered
         "#,
     )?;
     let rows = statement
