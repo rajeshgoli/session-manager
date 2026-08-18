@@ -36,6 +36,9 @@ When Codex review lands:
   PR is **not mergeable**.
 - If there are no important feedback items (`P2` or lower only), exit criteria are **met**.
 - If the review is clean, exit criteria are **met**.
+- Meeting the severity gate does not waive the selected tier's minimum review
+  count. In particular, an R3 PR is not mergeable until at least two recorded
+  rounds have completed, even when its first round is clean.
 
 Codex review is a sampled gate, not proof obtained by requesting reviews until
 one happens to be clean. Assign the review tier before the first request and

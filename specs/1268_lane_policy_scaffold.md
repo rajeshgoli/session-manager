@@ -451,46 +451,6 @@ success. Internal request and rejected-launch evidence remains observable for
 recovery and diagnostics but is not an active child or the normal caller
 contract.
 
-#### Bounded operational action authority
-
-An incident or live verification that permits one bounded production action
-has exactly one named decision authority. Its durable decision records incident
-ID, action ID, monotonically increasing version, authority incarnation, exact
-scope, state, expiry, and evidence requirement. Other seats may relay only that
-same action ID/version; prose such as `final` or `supersedes` has no authority by
-itself.
-
-The action state advances monotonically through proposed, authorized, started,
-recovering, and terminal. Immediately before its first side effect, the executor
-must claim `authorized -> started` with one compare-and-swap that verifies the
-current authority incarnation, highest decision version, exact scope, executor
-binding, and expiry. The claim records an action-scoped idempotency key, attempt
-epoch, executor lease, and the evidence that can distinguish completed,
-not-executed, and ambiguous outcomes. A failed claim performs no side effect and
-returns the current decision. The authority may revoke only before a successful
-`started` claim; once execution is recorded, later messages cannot authorize a
-competing action.
-
-If the executor disappears after `started`, a replacement may claim
-`started -> recovering` only after the executor lease expires and only with a
-compare-and-swap over the same action ID, decision version, scope, and current
-attempt epoch. Recovery increments the attempt epoch and first reconciles the
-declared evidence. It marks terminal when execution is proved, resumes with the
-same idempotency key when non-execution is proved or the external operation
-provides equivalent idempotent replay, and otherwise records an explicit
-ambiguous blocker. It never creates a new authorization or performs a competing
-side effect merely because the original executor is absent. Actions whose
-effects cannot be made idempotent or distinguished after a crash are ineligible
-for automatic execution and require reconciliation before a new action ID can
-be authorized.
-
-Transferring decision authority is an atomic recorded handoff. Recipients act
-only on the highest durable version and default to inaction on conflicting or
-unverifiable messages. This prevents several coordinators from oscillating a
-one-shot probe or restart faster than the executing seat can observe the
-decisions, while leaving a bounded recovery path for a pre-effect executor
-crash.
-
 ### 6. Evaluation telemetry
 
 Every policy evaluation records one canonical, non-duplicated usage row keyed
@@ -820,6 +780,9 @@ Stable cross-lane seats, generalized routing, cleanup/relocation, compound
 context/message profiles, two-step stand-by/brief acknowledgement, and rotation
 are not prerequisites for this first slice. They remain in the full plan and
 are added to the live canary only after their own review.
+Restart-safe bounded operational actions are likewise deferred to issue #1291;
+the spawn-policy canary does not implement or claim that control-plane
+transaction.
 This avoids paying for the complete identity and lifecycle substrate before the
 spawn-policy hypothesis produces evidence.
 
