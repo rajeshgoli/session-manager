@@ -13210,13 +13210,7 @@ fn refresh_reparent_requests(
     for index in 0..records.len() {
         let superseded_by_request_id = records
             .iter()
-            .filter(|other| {
-                other.id != records[index].id
-                    && other.status == "applied"
-                    && other.kind == records[index].kind
-                    && other.subject_session_id == records[index].subject_session_id
-                    && other.target_parent_session_id == records[index].target_parent_session_id
-            })
+            .filter(|other| reparent_request_supersedes(other, &records[index]))
             .min_by(|left, right| (&left.applied_at, &left.id).cmp(&(&right.applied_at, &right.id)))
             .map(|record| record.id.clone());
         let record = &mut records[index];
@@ -13257,6 +13251,28 @@ fn refresh_reparent_requests(
         }
     }
     changed
+}
+
+/// An applied request is the winner only when it committed precisely the same
+/// immutable plan after this request was opened.  Matching the subject and
+/// destination alone can confuse an earlier, unrelated move with a winner.
+fn reparent_request_supersedes(
+    applied: &ReparentRequestRecord,
+    pending: &ReparentRequestRecord,
+) -> bool {
+    if applied.id == pending.id
+        || applied.status != "applied"
+        || applied.topology_fingerprint != pending.topology_fingerprint
+    {
+        return false;
+    }
+    let (Some(applied_at), Some(created_at)) = (
+        applied.applied_at.as_deref().and_then(parse_timestamp),
+        parse_timestamp(&pending.created_at),
+    ) else {
+        return false;
+    };
+    applied_at > created_at
 }
 
 fn reparent_stale_reason(

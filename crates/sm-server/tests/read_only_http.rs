@@ -18023,6 +18023,7 @@ async fn reparent_request_projects_a_same_edge_winner_as_durable_supersession() 
     // Reproduce a request that was advertised before another same-edge request
     // won. The old request must remain addressable rather than becoming a 404.
     let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    state["reparent_requests"][0]["created_at"] = json!("2026-08-18T00:59:00Z");
     let mut winner = state["reparent_requests"][0].clone();
     winner["id"] = json!("winner01");
     winner["status"] = json!("applied");
@@ -18061,6 +18062,54 @@ async fn reparent_request_projects_a_same_edge_winner_as_durable_supersession() 
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(response["detail"].as_str().unwrap().contains("winner01"));
+}
+
+#[tokio::test]
+async fn reparent_request_does_not_supersede_from_an_unrelated_historical_plan() {
+    let state_file = write_reparent_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, loser) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let loser_id = loser["id"].as_str().unwrap();
+
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    state["reparent_requests"][0]["created_at"] = json!("2026-08-18T00:59:00Z");
+    let mut historical = state["reparent_requests"][0].clone();
+    historical["id"] = json!("oldwinner");
+    historical["status"] = json!("applied");
+    historical["ready_to_apply"] = json!(false);
+    historical["applied_at"] = json!("2026-08-18T01:00:00Z");
+    // Same child/destination but a different immutable topology plan.
+    historical["topology_fingerprint"] = json!("different-historical-plan");
+    state["reparent_requests"]
+        .as_array_mut()
+        .unwrap()
+        .push(historical);
+    state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "newparent")
+        .unwrap()["status"] = json!("stopped");
+    fs::write(&state_file, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let (status, projected) = get_json(app, &format!("/reparent-requests/{loser_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(projected["status"], "stale");
+    assert!(projected["superseded_by_request_id"].is_null());
 }
 
 #[tokio::test]
