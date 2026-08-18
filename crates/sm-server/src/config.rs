@@ -299,6 +299,11 @@ pub struct GoogleAuthConfig {
     pub redirect_uri: Option<String>,
     #[serde(default)]
     pub allowlist_emails: Vec<String>,
+    /// Policy evidence is often cross-lane sensitive. Keys are exact lane IDs;
+    /// `*` is reserved for the registered owner. Empty is fail-closed for
+    /// remote policy inspection while local development remains unchanged.
+    #[serde(default)]
+    pub policy_evidence_readers: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub session_cookie_secret: Option<String>,
 }
