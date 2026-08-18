@@ -451,6 +451,24 @@ success. Internal request and rejected-launch evidence remains observable for
 recovery and diagnostics but is not an active child or the normal caller
 contract.
 
+#### Bounded operational action authority
+
+An incident or live verification that permits one bounded production action
+has exactly one named decision authority. Its durable decision records incident
+ID, action ID, monotonically increasing version, authority incarnation, exact
+scope, state, expiry, and evidence requirement. Other seats may relay only that
+same action ID/version; prose such as `final` or `supersedes` has no authority by
+itself.
+
+The action state advances monotonically through proposed, authorized, started,
+and terminal. The authority may revoke only before `started`; once execution is
+recorded, later messages cannot authorize a competing action and recovery must
+reconcile the observed action first. Transferring decision authority is an
+atomic recorded handoff. Recipients act only on the highest durable version and
+default to inaction on conflicting or unverifiable messages. This prevents
+several coordinators from oscillating a one-shot probe or restart faster than
+the executing seat can observe the decisions.
+
 ### 6. Evaluation telemetry
 
 Every policy evaluation records one canonical, non-duplicated usage row keyed
@@ -1069,15 +1087,16 @@ Codex review is a sampled engineering gate, not a proof obtained by repeatedly
 requesting reviews until one happens to return no finding. Each package or final
 integration PR is limited to one deployable capability and declares R0-R3 risk
 before review. R0 needs no cycle; R1 receives one broad round and promotes to R2
-on a reachable P1; R2 receives at most three exact-head rounds; R3 receives at
-least two and at most five. Broad, root-cause/sibling, and current-capability
+on a reachable P0/P1; R2 receives at most three exact-head rounds; R3 receives
+at least two and at most five. Broad, root-cause/sibling, and current-capability
 steers remain the default sequence.
 
 Every round records requested/reviewed head, steer and scope, queue/review wait,
 estimated or direct token counters, findings, disposition, and resulting head.
-Unchanged heads are not re-requested. A head-expanding refactor discovered
-during review becomes a separate package rather than silently enlarging the
-review surface.
+Unchanged heads are not re-requested except for R3's mandatory second round: a
+differently scoped confirmation may review the same immutable head once when
+round 1 produced no change. A head-expanding refactor discovered during review
+becomes a separate package rather than silently enlarging the review surface.
 
 An R2 third-round P1 or an R3 P1 at/after round 3 triggers measured repair
 selection, not owner code review. A newly discovered localized R3 repair may use

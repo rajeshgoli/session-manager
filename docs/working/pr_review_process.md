@@ -41,7 +41,7 @@ one happens to be clean. Assign the review tier before the first request and
 record it in the PR body:
 
 - **R0 - ephemeral:** no review cycle for temporary working/execution docs.
-- **R1 - low risk:** one broad round. A reachable `P1` promotes the PR to R2;
+- **R1 - low risk:** one broad round. A reachable `P0`/`P1` promotes the PR to R2;
   clean or P2-only results meet the gate.
 - **R2 - medium risk:** at most three exact-head rounds. Use a broad review, one
   batched root-cause repair and sibling search, then a current-capability review
@@ -53,7 +53,9 @@ record it in the PR body:
 
 Record the requested and reviewed head, scope/steer, findings, disposition,
 resulting head, review wait, and available token estimate for every round. Do
-not request an unchanged head again.
+not request an unchanged head again except for R3's mandatory second round: a
+differently scoped confirmation may review the same immutable head once when
+round 1 produced no change.
 
 ## After Feedback
 
