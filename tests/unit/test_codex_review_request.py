@@ -250,6 +250,51 @@ async def test_register_current_head_owned_by_another_caller_returns_actionable_
 
 
 @pytest.mark.asyncio
+async def test_concurrent_different_callers_admit_only_one_active_request(mq, mock_session_manager, tmp_path):
+    other = Session(
+        id="other-agent",
+        name="other-agent",
+        working_dir=str(tmp_path),
+        tmux_session="claude-other-agent",
+        provider="claude",
+        log_file=str(tmp_path / "other.log"),
+        status=SessionStatus.RUNNING,
+    )
+    sessions = {"agent618": mock_session_manager.sessions["agent618"], other.id: other}
+    mock_session_manager.get_session.side_effect = sessions.get
+    post_started = asyncio.Event()
+    release_post = asyncio.Event()
+
+    async def delayed_post(*_args, **_kwargs):
+        post_started.set()
+        await release_post.wait()
+        return {"comment_id": 321, "comment_url": "https://example/321", "posted_at": "2026-04-17T00:00:00Z"}
+
+    with patch.object(mq, "_run_codex_review_request_task", AsyncMock()):
+        with patch("src.message_queue.validate_open_pr", return_value={"state": "OPEN", "headRefOid": "a" * 40}):
+            with patch("src.message_queue.post_pr_review_comment") as post_comment:
+                with patch("src.message_queue.fetch_issue_comment", return_value=None):
+                    async def fake_to_thread(function, *args, **kwargs):
+                        if function is post_comment:
+                            return await delayed_post(*args, **kwargs)
+                        return function(*args, **kwargs)
+                    with patch("src.message_queue.asyncio.to_thread", side_effect=fake_to_thread):
+                        first = asyncio.create_task(mq.register_codex_review_request(
+                            pr_number=42, repo="owner/repo", requester_session_id="agent618", notify_session_id="agent618"
+                        ))
+                        await post_started.wait()
+                        second = asyncio.create_task(mq.register_codex_review_request(
+                            pr_number=42, repo="owner/repo", requester_session_id="other-agent", notify_session_id="other-agent"
+                        ))
+                        release_post.set()
+                        first_result, second_result = await asyncio.gather(first, second, return_exceptions=True)
+
+    assert isinstance(first_result, CodexReviewRequestRegistration)
+    assert isinstance(second_result, CodexReviewRequestConflict)
+    assert len(mq.list_codex_review_requests(repo="owner/repo", pr_number=42)) == 1
+
+
+@pytest.mark.asyncio
 async def test_late_old_completion_cannot_complete_or_wake_replacement(mq):
     old_head = "a" * 40
     new_head = "b" * 40

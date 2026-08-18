@@ -1019,10 +1019,15 @@ class MessageQueueManager:
         self,
         repo: str,
         pr_number: int,
-        owner_session_id: str,
+        _owner_session_id: str,
     ) -> asyncio.Lock:
-        """Return the local serialization lock for one caller's PR requests."""
-        key = (repo, pr_number, owner_session_id)
+        """Return the local admission lock for every request on one PR.
+
+        Ownership determines whether an existing request is replaceable, but
+        every owner must share this lock so two callers cannot both observe an
+        empty durable state and create competing active requests.
+        """
+        key = (repo, pr_number, "__pr_admission__")
         return self._codex_review_request_creation_locks.setdefault(key, asyncio.Lock())
 
     def _find_active_codex_review_requests(
