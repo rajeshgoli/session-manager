@@ -3,13 +3,16 @@ use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 use std::{
     collections::HashMap,
     env, fs,
-    io::{Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak},
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(test)]
+use std::io::Write;
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -34,6 +37,12 @@ struct SessionInputLock {
     available: Condvar,
 }
 
+#[derive(Debug, Clone)]
+struct ClaudeInitialBriefTranscript {
+    path: PathBuf,
+    offset: u64,
+}
+
 #[derive(Debug)]
 pub struct SessionInputGuard {
     lock: Arc<SessionInputLock>,
@@ -55,6 +64,7 @@ pub struct TmuxRuntime {
     custom_runtime_command: bool,
     claude_command: String,
     claude_args: Vec<String>,
+    claude_transcript_roots: Vec<PathBuf>,
     codex_command: String,
     codex_args: Vec<String>,
     codex_default_model: Option<String>,
@@ -105,12 +115,6 @@ pub struct TmuxSessionSpec {
 pub struct CodexForkRuntimeArtifacts {
     pub event_stream_path: PathBuf,
     pub control_socket_path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-struct ClaudeInitialBriefReadyPane {
-    pane: String,
-    composer_y: usize,
 }
 
 #[derive(Debug)]
@@ -202,6 +206,7 @@ impl TmuxRuntime {
                 .unwrap_or("claude")
                 .to_owned(),
             claude_args: Vec::new(),
+            claude_transcript_roots: Vec::new(),
             codex_command: "codex".to_owned(),
             codex_args: Vec::new(),
             codex_default_model: None,
@@ -273,6 +278,8 @@ impl TmuxRuntime {
             runtime.claude_command = config.claude.command.clone();
             runtime.claude_args = config.claude.args.clone();
         }
+        runtime.claude_transcript_roots =
+            claude_projects_roots(config.claude.transcript_root.as_deref());
         runtime.codex_command = config.codex.command.clone();
         runtime.codex_args = config.codex.args.clone();
         runtime.codex_default_model = config.codex.default_model.clone();
@@ -1235,6 +1242,10 @@ impl TmuxRuntime {
                 parts.push(shell_quote(&format!("model_reasoning_effort={effort}")));
             }
         }
+        if spec.provider == "claude" && spec.force_initial_prompt_stdin {
+            parts.push("--session-id".to_owned());
+            parts.push(shell_quote(&claude_provider_session_id(&spec.session_id)));
+        }
         if prompt_mode == "argv" {
             if let Some(initial_message) = spec
                 .initial_message
@@ -1308,8 +1319,7 @@ impl TmuxRuntime {
     /// brief twice.
     fn deliver_verified_initial_brief(&self, spec: &TmuxSessionSpec, prompt: &str) -> Result<()> {
         let _guard = self.lock_session_input(&spec.tmux_session)?;
-        let claude_ready_pane =
-            self.wait_for_initial_brief_readiness(&spec.tmux_session, &spec.provider)?;
+        self.wait_for_initial_brief_readiness(&spec.tmux_session, &spec.provider)?;
 
         match spec.provider.as_str() {
             "codex-fork" => {
@@ -1334,12 +1344,18 @@ impl TmuxRuntime {
                 )
             }
             "claude" => {
-                let ready_pane = claude_ready_pane.expect("Claude readiness returns its pane");
                 if self.session_has_attached_clients(&spec.tmux_session)? {
                     bail!("refusing to submit the initial Claude spawn brief while a tmux client is attached");
                 }
+                let transcript = self.claude_initial_brief_transcript(spec)?;
+                let provider_session_id = claude_provider_session_id(&spec.session_id);
                 self.send_text_then_enter(&spec.tmux_session, prompt)?;
-                self.wait_for_claude_initial_brief_acceptance(&spec.tmux_session, &ready_pane)
+                self.wait_for_claude_initial_brief_acceptance(
+                    &spec.tmux_session,
+                    &transcript,
+                    &provider_session_id,
+                    prompt,
+                )
             }
             _ => Err(
                 InitialBriefDeliveryError::ProviderAcknowledgementUnavailable {
@@ -1350,11 +1366,7 @@ impl TmuxRuntime {
         }
     }
 
-    fn wait_for_initial_brief_readiness(
-        &self,
-        tmux_session: &str,
-        provider: &str,
-    ) -> Result<Option<ClaudeInitialBriefReadyPane>> {
+    fn wait_for_initial_brief_readiness(&self, tmux_session: &str, provider: &str) -> Result<()> {
         let deadline = Instant::now() + self.initial_brief_ready_timeout;
         let mut directory_trust_accepted = false;
         loop {
@@ -1374,11 +1386,14 @@ impl TmuxRuntime {
                 }
             }
             if provider == "claude" {
-                if let Some(pane) = self.claude_initial_brief_composer_pane(tmux_session) {
-                    return Ok(Some(pane));
+                if self
+                    .claude_initial_brief_composer_pane(tmux_session)
+                    .is_some()
+                {
+                    return Ok(());
                 }
             } else if self.session_input_ready(tmux_session, provider) {
-                return Ok(None);
+                return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(InitialBriefDeliveryError::ProviderReadinessTimedOut {
@@ -1395,21 +1410,13 @@ impl TmuxRuntime {
     /// `Try "..."` suggestion, so pane text alone cannot distinguish it from
     /// typed input.  The cursor must still be immediately after the composer
     /// prefix on that exact row before an immutable brief may be submitted.
-    fn claude_initial_brief_composer_pane(
-        &self,
-        tmux_session: &str,
-    ) -> Option<ClaudeInitialBriefReadyPane> {
+    fn claude_initial_brief_composer_pane(&self, tmux_session: &str) -> Option<()> {
         let pane = self.capture_pane_text(tmux_session)?;
         if !claude_composer_is_ready(&pane) {
             return None;
         }
         let (cursor_x, cursor_y) = self.pane_cursor_position(tmux_session)?;
-        claude_empty_composer_cursor(&pane, cursor_x, cursor_y).then_some(
-            ClaudeInitialBriefReadyPane {
-                pane,
-                composer_y: cursor_y,
-            },
-        )
+        claude_empty_composer_cursor(&pane, cursor_x, cursor_y).then_some(())
     }
 
     fn pane_cursor_position(&self, tmux_session: &str) -> Option<(usize, usize)> {
@@ -1461,22 +1468,55 @@ impl TmuxRuntime {
         }
     }
 
-    /// Claude has no structured event stream.  Its only provider-originated
-    /// acknowledgement is the composer leaving the verified empty state and
-    /// the main turn entering its active UI state.  We do not resend if that
-    /// transition is missing: the original Enter may already have been seen.
+    /// A Claude launch with an immutable brief gets a deterministic provider
+    /// session ID.  That lets us bind acknowledgement to exactly one
+    /// provider-owned JSONL transcript rather than inferring it from terminal
+    /// rendering or another Claude session in the same working directory.
+    fn claude_initial_brief_transcript(
+        &self,
+        spec: &TmuxSessionSpec,
+    ) -> Result<Vec<ClaudeInitialBriefTranscript>> {
+        let provider_session_id = claude_provider_session_id(&spec.session_id);
+        let project_dir = claude_project_dir_name(&spec.working_dir);
+        let paths = self
+            .claude_transcript_roots
+            .iter()
+            .map(|root| {
+                let path = root
+                    .join(&project_dir)
+                    .join(format!("{provider_session_id}.jsonl"));
+                ClaudeInitialBriefTranscript {
+                    offset: fs::metadata(&path)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0),
+                    path,
+                }
+            })
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            bail!("Claude transcript root is unavailable for structured initial-brief acknowledgement");
+        }
+        Ok(paths)
+    }
+
+    /// Confirm the exact submitted brief appears in the provider-owned
+    /// transcript. We do not resend if the entry is absent: the original Enter
+    /// may already have been accepted.
     fn wait_for_claude_initial_brief_acceptance(
         &self,
         tmux_session: &str,
-        ready_pane: &ClaudeInitialBriefReadyPane,
+        transcripts: &[ClaudeInitialBriefTranscript],
+        provider_session_id: &str,
+        prompt: &str,
     ) -> Result<()> {
         let deadline = Instant::now() + self.initial_brief_ack_timeout;
         loop {
-            if self.capture_pane_text(tmux_session).is_some_and(|pane| {
-                claude_initial_brief_submission_observed(
-                    &ready_pane.pane,
-                    ready_pane.composer_y,
-                    &pane,
+            if transcripts.iter().any(|transcript| {
+                claude_transcript_has_user_turn_after(
+                    &transcript.path,
+                    transcript.offset,
+                    provider_session_id,
+                    prompt,
                 )
             }) {
                 return Ok(());
@@ -1778,58 +1818,6 @@ fn claude_empty_composer_cursor(pane: &str, cursor_x: usize, cursor_y: usize) ->
     claude_composer_line_is_ready(composer.trim()) && cursor_x == leading + prefix_width
 }
 
-fn claude_initial_brief_submission_observed(
-    ready_pane: &str,
-    composer_y: usize,
-    pane: &str,
-) -> bool {
-    if pane == ready_pane {
-        return false;
-    }
-    let Some(mut previous_markers) = claude_main_thread_activity_markers(ready_pane, composer_y)
-    else {
-        return false;
-    };
-    let Some(current_markers) = claude_main_thread_activity_markers(pane, composer_y) else {
-        return false;
-    };
-    current_markers.into_iter().any(|marker| {
-        match previous_markers
-            .iter()
-            .position(|previous| *previous == marker)
-        {
-            Some(index) => {
-                previous_markers.remove(index);
-                false
-            }
-            None => true,
-        }
-    })
-}
-
-/// Return a multiset of provider activity rows.  A ready pane can retain old
-/// completed-turn chrome above its new composer, so acknowledgement must
-/// observe an activity row that did not already exist before Enter.
-fn claude_main_thread_activity_markers(pane: &str, composer_y: usize) -> Option<Vec<&str>> {
-    let lines = pane.lines().collect::<Vec<_>>();
-    let composer = lines.get(composer_y)?.trim_start();
-    if !(composer.starts_with('❯') || composer.starts_with('>')) {
-        return None;
-    }
-    // The cursor-confirmed row is the actual boundary of the live input.
-    // Everything at or below it may be multiline prompt text, including
-    // quotes and rows that resemble activity. Provider turn rows render
-    // above the stationary composer. If that layout changes, fail closed.
-    Some(
-        lines
-            .iter()
-            .take(composer_y)
-            .map(|line| line.trim_start())
-            .filter(|line| claude_line_indicates_main_thread_activity(line))
-            .collect(),
-    )
-}
-
 fn claude_composer_footer_divider(line: &str) -> bool {
     let non_whitespace = line
         .chars()
@@ -1851,6 +1839,105 @@ fn claude_line_indicates_main_thread_activity(line: &str) -> bool {
             .chars()
             .next()
             .is_some_and(|ch| (0x2700..=0x27bf).contains(&(ch as u32)))
+}
+
+fn claude_projects_roots(configured_transcript_root: Option<&str>) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut push = |path: PathBuf| {
+        if !roots.contains(&path) {
+            roots.push(path);
+        }
+    };
+    if let Some(root) = configured_transcript_root
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+    {
+        push(expand_home(root));
+    }
+    if let Some(config_dirs) = env::var_os("CLAUDE_CONFIG_DIR") {
+        for config_dir in config_dirs.to_string_lossy().split(',') {
+            let config_dir = config_dir.trim();
+            if !config_dir.is_empty() {
+                push(expand_home(config_dir).join("projects"));
+            }
+        }
+    }
+    if let Some(xdg_config_home) = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        push(xdg_config_home.join("claude").join("projects"));
+    } else {
+        push(expand_home("~/.config/claude/projects"));
+    }
+    push(expand_home("~/.claude/projects"));
+    roots
+}
+
+fn claude_project_dir_name(working_dir: &str) -> String {
+    fs::canonicalize(working_dir)
+        .unwrap_or_else(|_| PathBuf::from(working_dir))
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "-")
+}
+
+fn claude_provider_session_id(session_id: &str) -> String {
+    let digest = Sha256::digest(format!("sm-claude-initial-brief:{session_id}").as_bytes());
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "{}-{}-4{}-8{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[13..16],
+        &hex[17..20],
+        &hex[20..32],
+    )
+}
+
+fn claude_transcript_has_user_turn_after(
+    path: &Path,
+    offset: u64,
+    provider_session_id: &str,
+    prompt: &str,
+) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return false;
+    }
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .any(|line| {
+            let Ok(entry) = serde_json::from_str::<Value>(&line) else {
+                return false;
+            };
+            entry.get("type").and_then(Value::as_str) == Some("user")
+                && entry.get("sessionId").and_then(Value::as_str) == Some(provider_session_id)
+                && entry.get("isSidechain").and_then(Value::as_bool) != Some(true)
+                && entry
+                    .get("message")
+                    .and_then(Value::as_object)
+                    .is_some_and(|message| {
+                        message.get("role").and_then(Value::as_str) == Some("user")
+                            && message.get("content").and_then(Value::as_str) == Some(prompt)
+                    })
+        })
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    if path == "~" {
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+    path.strip_prefix("~/")
+        .and_then(|rest| env::var_os("HOME").map(|home| Path::new(&home).join(rest)))
+        .unwrap_or_else(|| PathBuf::from(path))
 }
 
 fn command_parts(command: &str, args: &[String]) -> Vec<String> {
@@ -2175,6 +2262,7 @@ fn initial_stdin_prompt<'a>(spec: &'a TmuxSessionSpec, prompt_mode: &str) -> Opt
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::process;
 
     #[test]
     fn verified_spawn_stdin_prompt_preserves_outer_whitespace() {
@@ -2409,101 +2497,91 @@ esac
     }
 
     #[test]
-    fn claude_initial_brief_acceptance_requires_a_provider_turn_transition() {
-        let ready = "Idle header\n❯\n────────────────────\nFable 5\n";
-        assert!(!claude_initial_brief_submission_observed(
-            ready,
-            1,
-            "Idle header\n❯\n────────────────────\nFable 5\nupdated idle footer\n",
+    fn claude_initial_brief_acceptance_requires_its_exact_structured_user_turn() {
+        let dir = env::temp_dir().join(format!("sm-rust-claude-structured-ack-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("transcript.jsonl");
+        let provider_session_id = claude_provider_session_id("seat-1289");
+        let prompt = "exact immutable brief\nwith a second line\n";
+        let entries = [
+            serde_json::json!({
+                "type": "user", "sessionId": "other-session", "isSidechain": false,
+                "message": {"role": "user", "content": prompt},
+            }),
+            serde_json::json!({
+                "type": "user", "sessionId": provider_session_id.as_str(), "isSidechain": true,
+                "message": {"role": "user", "content": prompt},
+            }),
+            serde_json::json!({
+                "type": "user", "sessionId": provider_session_id.as_str(), "isSidechain": false,
+                "message": {"role": "user", "content": "exact immutable brief\nwith a changed line\n"},
+            }),
+        ];
+        fs::write(
+            &path,
+            entries
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        assert!(!claude_transcript_has_user_turn_after(
+            &path,
+            0,
+            &provider_session_id,
+            prompt
         ));
-        assert!(!claude_initial_brief_submission_observed(
-            ready,
-            1,
-            "Idle header\n❯\n────────────────────\nFable 5\n",
+
+        let offset = fs::metadata(&path).unwrap().len();
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "{}",
+            serde_json::json!({
+                "type": "user", "sessionId": provider_session_id.as_str(), "isSidechain": false,
+                "message": {"role": "user", "content": prompt},
+            })
+        )
+        .unwrap();
+        assert!(claude_transcript_has_user_turn_after(
+            &path,
+            offset,
+            &provider_session_id,
+            prompt
         ));
-        assert!(claude_initial_brief_submission_observed(
-            ready,
-            1,
-            "✽ Thinking through the task…\n❯\n────────────────────\nFable 5\n",
-        ));
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn claude_initial_brief_acceptance_rejects_stale_activity_from_the_ready_pane() {
-        let ready = concat!(
-            "⏺ Completed startup housekeeping\n",
-            "❯\n",
-            "────────────────────\n",
-            "Fable 5\n",
-        );
+    fn claude_initial_brief_launch_binds_a_valid_provider_session_id() {
+        let session_id = claude_provider_session_id("seat-1289");
+        assert_eq!(session_id.len(), 36);
+        assert_eq!(&session_id[14..15], "4");
+        assert_eq!(&session_id[19..20], "8");
+        assert_ne!(session_id, claude_provider_session_id("seat-1290"));
 
-        assert!(!claude_initial_brief_submission_observed(
-            ready,
-            1,
-            concat!(
-                "⏺ Completed startup housekeeping\n",
-                "❯ pasted-but-not-submitted\n",
-                "────────────────────\n",
-                "Fable 5\n",
-            ),
-        ));
-        assert!(claude_initial_brief_submission_observed(
-            ready,
-            1,
-            concat!(
-                "✽ Thinking through the initial brief…\n",
-                "❯\n",
-                "────────────────────\n",
-                "Fable 5\n",
-            ),
-        ));
-    }
-
-    #[test]
-    fn claude_initial_brief_acceptance_rejects_marker_shaped_multiline_input() {
-        let ready = concat!(
-            "⏺ Completed startup housekeeping\n",
-            "❯\n",
-            "────────────────────\n",
-            "Fable 5\n",
-        );
-
-        // A failed Enter leaves every continuation row in Claude's composer.
-        // The second row deliberately resembles a provider activity marker.
-        assert!(!claude_initial_brief_submission_observed(
-            ready,
-            1,
-            concat!(
-                "⏺ Completed startup housekeeping\n",
-                "❯ first line of immutable brief\n",
-                "✽ marker-shaped continuation, still unsubmitted\n",
-                "────────────────────\n",
-                "Fable 5\n",
-            ),
-        ));
-    }
-
-    #[test]
-    fn claude_initial_brief_acceptance_anchors_input_at_the_ready_cursor_row() {
-        let ready = concat!(
-            "⏺ Completed startup housekeeping\n",
-            "❯\n",
-            "────────────────────\n",
-            "Fable 5\n",
-        );
-
-        assert!(!claude_initial_brief_submission_observed(
-            ready,
-            1,
-            concat!(
-                "⏺ Completed startup housekeeping\n",
-                "❯ first line of immutable brief\n",
-                "✽ marker-shaped continuation, still unsubmitted\n",
-                "> quoted continuation, still unsubmitted\n",
-                "────────────────────\n",
-                "Fable 5\n",
-            ),
-        ));
+        let runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        let mut spec = TmuxSessionSpec {
+            session_id: "seat-1289".to_owned(),
+            session_credential: None,
+            tmux_session: "sm-test".to_owned(),
+            working_dir: "/tmp".to_owned(),
+            log_file: PathBuf::from("/tmp/session.log"),
+            provider: "claude".to_owned(),
+            initial_message: Some("brief".to_owned()),
+            force_initial_prompt_stdin: true,
+            model: None,
+            reasoning_effort: None,
+        };
+        assert!(runtime
+            .launch_command(&spec, "stdin")
+            .unwrap()
+            .contains(&format!("--session-id '{session_id}'")));
+        spec.force_initial_prompt_stdin = false;
+        assert!(!runtime
+            .launch_command(&spec, "argv")
+            .unwrap()
+            .contains("--session-id"));
     }
 
     #[test]

@@ -15143,7 +15143,7 @@ async fn runtime_core_claude_spawn_brief_never_retries_an_unobserved_submission(
         &state_file,
         &log_dir,
         &tmux_socket,
-        r#"/bin/sh -lc 'printf ">"; while IFS= read -r line; do printf "\nreceived:%s\n>" "$line"; done' runtime-sh"#,
+        r#"/bin/sh -lc 'printf ">"; while IFS= read -r line; do printf "\nreceived:%s\n✽ renderer activity alone must not acknowledge\n>" "$line"; done' runtime-sh"#,
     );
 
     let (status, payload) = post_json(
@@ -15175,7 +15175,7 @@ async fn runtime_core_claude_spawn_brief_never_retries_an_unobserved_submission(
 }
 
 #[tokio::test]
-async fn runtime_core_claude_spawn_brief_accepts_provider_turn_transition() {
+async fn runtime_core_claude_spawn_brief_accepts_exact_structured_user_turn() {
     if !tmux_available() {
         return;
     }
@@ -15192,11 +15192,15 @@ async fn runtime_core_claude_spawn_brief_accepts_provider_turn_transition() {
             .as_nanos()
     );
     let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let transcript_root = state_file.with_extension("claude-projects");
     let app = runtime_app_with_command(
         &state_file,
         &log_dir,
         &tmux_socket,
-        r#"/bin/sh -lc 'printf "Header\n>"; while IFS= read -r line; do printf "\nreceived:%s\n\033[2J\033[H✽ Thinking through the initial brief\n>" "$line"; done' runtime-sh"#,
+        &format!(
+            r#"/bin/sh -lc 'session_id=""; previous=""; for arg in "$@"; do if [ "$previous" = "--session-id" ]; then session_id="$arg"; fi; previous="$arg"; done; project=$(pwd -P | sed "s#/#-#g"); transcript="{}/$project/$session_id.jsonl"; mkdir -p "$(dirname "$transcript")"; printf "Header\n>"; while IFS= read -r line; do printf "\nreceived:%s\n>" "$line"; printf "{{\"type\":\"user\",\"sessionId\":\"%s\",\"isSidechain\":false,\"message\":{{\"role\":\"user\",\"content\":\"%s\"}}}}\n" "$session_id" "$line" > "$transcript"; done' runtime-sh"#,
+            transcript_root.display()
+        ),
     );
 
     let (status, payload) = post_json(
@@ -20137,6 +20141,18 @@ fn runtime_app_with_command(
                     .to_string(),
             ),
             transcript_root: None,
+        },
+        claude: ProviderLaunchConfig {
+            command: runtime_command.to_owned(),
+            args: Vec::new(),
+            default_model: Some("sonnet".to_owned()),
+            session_index_path: None,
+            transcript_root: Some(
+                state_file
+                    .with_extension("claude-projects")
+                    .display()
+                    .to_string(),
+            ),
         },
         ..AppConfig::default()
     }))
