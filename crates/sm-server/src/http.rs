@@ -13956,16 +13956,21 @@ mod tests {
         let probe = fs::read_to_string(&probe_path).unwrap();
         let mut lines = probe.lines();
         let child_pid = lines.next().unwrap().parse::<u32>().unwrap();
+        let effective_paths: Vec<_> = lines.collect();
         let production_root = env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap()
             .join(".local/share/claude-sessions");
-        for path in lines {
+        for path in &effective_paths {
             assert!(
                 !StdPath::new(path).starts_with(&production_root),
                 "child resolved production durable path {path}"
             );
         }
+        println!(
+            "direct-harness child pid {child_pid} effective durable paths:\n{}",
+            effective_paths.join("\n")
+        );
 
         let lsof = Command::new("/usr/sbin/lsof")
             .args(["-p", &child_pid.to_string()])
@@ -13979,6 +13984,10 @@ mod tests {
         assert!(
             !open_files.contains(production_root.to_string_lossy().as_ref()),
             "unwrapped test child opened production state path:\n{open_files}"
+        );
+        println!(
+            "direct-harness lsof proof: child pid {child_pid} has no open path below {}",
+            production_root.display()
         );
 
         fs::write(probe_path.with_extension("release"), []).unwrap();
