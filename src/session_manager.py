@@ -7708,6 +7708,20 @@ done
                 try:
                     remote_event_queue = await self._register_codex_fork_remote_bridge(session)
                     remote_bridge_registered = True
+                except asyncio.CancelledError:
+                    # CancelledError is a BaseException on supported Python
+                    # versions.  No runtime has launched yet, but the durable
+                    # admission marker must not block the next explicit restore.
+                    session.restore_launch_pending = False
+                    session.restore_pending_resume_id = None
+                    session.status = SessionStatus.STOPPED
+                    session.stopped_at = datetime.now()
+                    session.error_message = (
+                        "Codex-fork restore was cancelled before remote bridge "
+                        "registration completed"
+                    )
+                    self._save_state()
+                    raise
                 except Exception as exc:
                     self.mark_node_unreachable(session.id, True)
                     error = await self._fail_codex_fork_restore_acceptance(

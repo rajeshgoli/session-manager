@@ -873,6 +873,56 @@ async def test_restore_remote_codex_fork_bridge_failure_clears_pending_admission
 
 
 @pytest.mark.asyncio
+async def test_restore_remote_codex_fork_bridge_cancellation_clears_pending_admission(tmp_path):
+    manager = _manager(tmp_path)
+    session = Session(
+        id="restorebridgecancel",
+        name="codex-fork-restorebridgecancel",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        node="worker",
+        status=SessionStatus.STOPPED,
+        provider_resume_id="resume-restorebridgecancel",
+    )
+    manager.sessions[session.id] = session
+
+    class HealthyConnection:
+        def is_healthy(self):
+            return True
+
+    bridge_entered = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def register_bridge(_candidate: Session):
+        bridge_entered.set()
+        await never_finish.wait()
+        raise AssertionError("cancelled bridge should not resume")
+
+    manager.codex_fork_node_agents._connections["worker"] = HealthyConnection()
+    manager.node_runner.command_available = Mock(return_value=True)
+    manager.node_runner.run = Mock(
+        return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    )
+    manager._register_codex_fork_remote_bridge = AsyncMock(side_effect=register_bridge)
+    manager.tmux.session_exists = Mock(return_value=False)
+    manager.tmux.create_session_with_command = Mock(return_value=True)
+
+    restore_task = asyncio.create_task(manager.restore_session(session.id))
+    await asyncio.wait_for(bridge_entered.wait(), timeout=0.2)
+    assert session.restore_launch_pending is True
+    restore_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await restore_task
+
+    assert session.status == SessionStatus.STOPPED
+    assert session.restore_launch_pending is False
+    assert session.restore_pending_resume_id is None
+    assert session.error_message == "Codex-fork restore was cancelled before remote bridge registration completed"
+    manager.tmux.create_session_with_command.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_remote_codex_fork_create_rejects_legacy_codex_fallback(tmp_path):
     manager = _manager(tmp_path)
 
