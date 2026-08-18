@@ -32,10 +32,11 @@ sm request-codex-review list
 
 ## Workflow doc note
 
-The operator request referenced `~/.agent-os/workflows/pr_review_workflow.md`, but the live file in this environment is:
+The operator request referenced a home-directory workflow, but the operative,
+reviewed file in this repository is:
 
 ```text
-~/.agent-os/workflows/pr_review_process.md
+specs/1268_pr_review_process.md
 ```
 
 This feature should automate that actual process doc:

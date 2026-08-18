@@ -1073,7 +1073,7 @@ sole objective.
   and targets the epic branch; a dependency must be merged, not merely in
   review, before its consumer starts.
 - Each implementation agent owns its focused tests, full applicable gates,
-  `docs/working/pr_review_process.md`, merge to the epic branch, and worktree
+  `specs/1268_pr_review_process.md`, merge to the epic branch, and worktree
   cleanup. Codex review follows the bounded protocol below; a P0/P1 blocks merge
   but does not authorize indefinite review rounds.
 - Limit active implementation to four agents: at most two Sol, two Terra, and

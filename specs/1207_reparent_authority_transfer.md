@@ -599,7 +599,7 @@ Add Rust CLI commands, actionable notifications, retained `sm watch` human UX,
 and end-to-end tests.
 
 Every phase PR targets `epic/1207-reparent-authority` and follows
-`docs/working/pr_review_process.md`. After all phases merge, one reviewed epic
+`specs/1268_pr_review_process.md`. After all phases merge, one reviewed epic
 PR targets `main`. Partial phases are not deployed.
 
 ## Acceptance gates
