@@ -54,6 +54,12 @@ const CODEX_CLI_DEFERRED_BIND_TIMEOUT: Duration = Duration::from_secs(30);
 const CODEX_CLI_SESSION_BIND_POLL: Duration = Duration::from_millis(50);
 const CODEX_FORK_THREAD_STARTED_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_FORK_EVENT_MONITOR_POLL: Duration = Duration::from_millis(250);
+// Recovery must inspect a bounded tail before it starts at EOF: a native
+// compaction while the service was down otherwise leaves an obsolete alert
+// pending forever. Event streams are line-oriented; this covers the recent
+// activity needed to establish the current root-thread occupancy without
+// replaying unbounded history during startup.
+const CODEX_FORK_CONTEXT_RECOVERY_TAIL_LINES: usize = 256;
 const CODEX_FORK_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const CODEX_FORK_CONTROL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 const CODEX_FORK_CONTROL_RECOVERY_POLL: Duration = Duration::from_millis(50);
@@ -6855,12 +6861,99 @@ impl SessionStore {
             .collect::<Vec<_>>();
 
         for (session_id, event_stream_path) in &monitors {
+            self.reconcile_codex_fork_context_at_restart(session_id, event_stream_path)?;
             self.start_codex_fork_event_monitor_from_current_end(
                 session_id.clone(),
                 event_stream_path.clone(),
             )?;
         }
         Ok(monitors.len())
+    }
+
+    /// Bring a persisted Codex context snapshot in line with the latest
+    /// root-thread gauge before monitoring resumes at EOF. If the bounded tail
+    /// cannot establish a current gauge, discard any pending alert and expose
+    /// unknown occupancy rather than delivering an alert for context Codex may
+    /// have compacted while the service was down.
+    fn reconcile_codex_fork_context_at_restart(
+        &self,
+        session_id: &str,
+        event_stream_path: &Path,
+    ) -> Result<()> {
+        let root_thread_id = self
+            .get_session(session_id)?
+            .and_then(|session| session.provider_resume_id);
+        let usage =
+            latest_codex_fork_context_usage_from_tail(event_stream_path, root_thread_id.as_deref());
+
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(());
+        };
+        if json_text(session.get("provider")).as_deref() != Some("codex-fork") {
+            return Ok(());
+        }
+
+        let previous_tokens = session
+            .get("context_total_input_tokens")
+            .and_then(Value::as_i64);
+        let compaction_or_unknown = usage.as_ref().is_none_or(|usage| {
+            previous_tokens.is_some_and(|previous_tokens| usage.tokens_used < previous_tokens)
+        });
+        if compaction_or_unknown {
+            self.cancel_context_monitor_alerts(session_id)?;
+            reset_context_oneshot_flags(session);
+        }
+
+        let changed = match usage {
+            Some(usage) => {
+                let snapshot_changed = previous_tokens != Some(usage.tokens_used)
+                    || session
+                        .get("context_used_percentage")
+                        .and_then(Value::as_f64)
+                        != Some(usage.used_percentage)
+                    || json_text(session.get("context_sampled_at")).is_none();
+                if snapshot_changed {
+                    session.insert("tokens_used".to_owned(), json!(usage.tokens_used));
+                    session.insert(
+                        "context_used_percentage".to_owned(),
+                        json!(usage.used_percentage),
+                    );
+                    session.insert(
+                        "context_total_input_tokens".to_owned(),
+                        json!(usage.tokens_used),
+                    );
+                    session.insert(
+                        "context_sampled_at".to_owned(),
+                        Value::String(now_rfc3339()),
+                    );
+                }
+                snapshot_changed
+            }
+            None => {
+                let had_snapshot = session
+                    .get("context_used_percentage")
+                    .is_some_and(|value| !value.is_null())
+                    || session
+                        .get("context_total_input_tokens")
+                        .is_some_and(|value| !value.is_null())
+                    || session
+                        .get("context_sampled_at")
+                        .is_some_and(|value| !value.is_null());
+                if had_snapshot {
+                    session.insert("context_used_percentage".to_owned(), Value::Null);
+                    session.insert("context_total_input_tokens".to_owned(), Value::Null);
+                    session.insert("context_sampled_at".to_owned(), Value::Null);
+                }
+                had_snapshot
+            }
+        };
+        if changed || compaction_or_unknown {
+            self.write_raw_json_value(&state)?;
+        }
+        Ok(())
     }
 
     fn start_codex_fork_handoff_monitor(
@@ -8787,6 +8880,26 @@ fn codex_fork_context_usage(event: &Map<String, Value>) -> Option<CodexContextUs
         tokens_used,
         used_percentage: (tokens_used as f64 / context_window as f64) * 100.0,
     })
+}
+
+/// Return the newest complete root-thread context gauge from a bounded event
+/// stream tail. The first tail line may be partial, so malformed lines are
+/// ignored rather than making restart recovery fail.
+fn latest_codex_fork_context_usage_from_tail(
+    event_stream_path: &Path,
+    root_thread_id: Option<&str>,
+) -> Option<CodexContextUsage> {
+    read_tail_lines(event_stream_path, CODEX_FORK_CONTEXT_RECOVERY_TAIL_LINES)
+        .ok()?
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter_map(|event| event.as_object().cloned())
+        .find_map(|event| {
+            codex_fork_event_matches_root_thread(&event, root_thread_id)
+                .then(|| codex_fork_context_usage(&event))
+                .flatten()
+        })
 }
 
 fn codex_fork_item_completed_status(event: &Map<String, Value>) -> Option<&'static str> {
@@ -20393,6 +20506,7 @@ mod tests {
         let initial = store_with_provider_child("ctxcodexcycles", "codex-fork", "running");
         let state_file = initial.state_file.clone();
         let queue_db = state_file.with_extension("db");
+        let event_stream = state_file.with_extension("events.jsonl");
         let queue = RetainedQueueStore::new(queue_db.clone());
         queue.ensure_schema().unwrap();
         let store = SessionStore::new_with_queue(state_file, queue_db);
@@ -20445,14 +20559,20 @@ mod tests {
         );
 
         // A lower resident-token count is Codex's observed native-compaction
-        // boundary, so stale alerts are discarded and the next high-water
-        // cycle can notify again.
+        // boundary. Recovery begins at EOF, so it must reconcile that current
+        // gauge before retaining the pre-restart high-context alert.
+        fs::write(
+            &event_stream,
+            format!("{}\n", usage_event("root-thread", 20_000)),
+        )
+        .unwrap();
         store
-            .apply_codex_fork_event_line("child001", &usage_event("root-thread", 20_000))
+            .reconcile_codex_fork_context_at_restart("child001", &event_stream)
             .unwrap();
         let compacted = store.get_session("child001").unwrap().unwrap();
         assert!(!compacted.context_warning_sent);
         assert!(!compacted.context_critical_sent);
+        assert_eq!(compacted.context_total_input_tokens, Some(20_000));
         assert!(queue
             .pending_messages_for_target("child001", 10)
             .unwrap()
