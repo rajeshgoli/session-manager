@@ -7363,6 +7363,7 @@ fn recover_btw_requests(state: Arc<AppState>) {
     // request participants synchronously before starting any BTW workers.
     if let Err(error) = teardown_btw_requests_for_terminal_sessions(&state, &requests) {
         eprintln!("BTW terminal-session recovery failed: {error:#}");
+        return;
     }
     let Ok(requests) = store.list_recoverable() else {
         return;

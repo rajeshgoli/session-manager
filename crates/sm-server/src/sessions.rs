@@ -828,6 +828,7 @@ impl SessionStore {
 
     pub fn recover_session_runtime_launches(&self) -> Result<()> {
         self.recover_pending_runtime_retires()?;
+        self.recover_terminal_runtime_launch_teardowns()?;
         loop {
             let launch_id = {
                 let _guard = self.write_guard()?;
@@ -862,6 +863,43 @@ impl SessionStore {
         drop(_guard);
         for session_id in pending_ids {
             self.retire_core_session_with_runtime_authorized(&session_id, None, None, runtime)?;
+        }
+        Ok(())
+    }
+
+    fn recover_terminal_runtime_launch_teardowns(&self) -> Result<()> {
+        let Some(runtime) = self.delivery_runtime.as_ref() else {
+            return Ok(());
+        };
+        // A create worker can bring tmux up after a concurrent retirement's
+        // first absence check. Retirement fences its launch record before it
+        // writes terminal evidence, so this startup pass owns the remaining
+        // crash window and tears down any such late runtime before ordinary
+        // launch recovery considers other work.
+        let terminal_launches = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            let terminal_session_ids = snapshot_from_raw_value(&state)?
+                .sessions
+                .into_iter()
+                .filter(|session| {
+                    completion_status_is_retired(session.completion_status.as_deref())
+                })
+                .map(|session| session.id)
+                .collect::<BTreeSet<_>>();
+            session_runtime_launch_records(&state)?
+                .into_iter()
+                .filter(|launch| {
+                    launch.status == "failed"
+                        && launch.failure_reason.as_deref() == Some("target_terminal")
+                        && terminal_session_ids.contains(&launch.session_id)
+                })
+                .collect::<Vec<_>>()
+        };
+        for launch in terminal_launches {
+            runtime
+                .for_socket_name(launch.tmux_socket_name.as_deref())
+                .kill_session(&launch.tmux_session)?;
         }
         Ok(())
     }
@@ -7562,6 +7600,7 @@ impl SessionStore {
         // attributed retirement rather than inferring a disappearance.
         if !pending_retire_intent {
             finalize_active_credential_rotations_for_terminal_session(&mut state, session_id)?;
+            fence_terminal_runtime_launches(&mut state, session_id)?;
             let now = now_rfc3339();
             let sessions = ensure_sessions_array_mut(&mut state)?;
             let session = session_object_mut(sessions, session_id)
@@ -13637,6 +13676,31 @@ fn finalize_active_credential_rotations_for_terminal_session(
     Ok(())
 }
 
+/// A terminal lifecycle transition must durably cancel every in-flight runtime
+/// launch for the seat before it releases the state lock. The corresponding
+/// launcher observes the terminal marker before publishing `running`; if it
+/// crashes after creating tmux, startup uses this fence to remove that late
+/// runtime instead of treating the failed launch as inert.
+fn fence_terminal_runtime_launches(state: &mut Value, session_id: &str) -> Result<()> {
+    let mut launches = session_runtime_launch_records(state)?;
+    let mut changed = false;
+    let now = now_rfc3339();
+    for launch in &mut launches {
+        if launch.session_id == session_id
+            && matches!(launch.status.as_str(), "prepared" | "launching")
+        {
+            launch.status = "failed".to_owned();
+            launch.updated_at = now.clone();
+            launch.failure_reason = Some("target_terminal".to_owned());
+            changed = true;
+        }
+    }
+    if changed {
+        store_session_runtime_launch_records(state, &launches)?;
+    }
+    Ok(())
+}
+
 /// Reconcile a missing local tmux runtime to durable terminal state without
 /// interpreting pane output.  This is only called while the caller holds the
 /// session mutation lock.
@@ -16692,6 +16756,72 @@ mod tests {
         );
         assert_eq!(session["terminal_provenance"]["source"], "api_retire");
         assert_eq!(session["terminal_provenance"]["tmux_disposition"], "killed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn terminal_retirement_fences_a_provisional_runtime_launch() {
+        let mut state = terminal_rotation_fixture("failed", Some("launching"));
+        state["session_runtime_launches"][0]["operation_kind"] = json!("create");
+        state["session_runtime_launches"][0]["credential_rotation_id"] = Value::Null;
+
+        fence_terminal_runtime_launches(&mut state, "rotate01").unwrap();
+
+        assert_eq!(state["session_runtime_launches"][0]["status"], "failed");
+        assert_eq!(
+            state["session_runtime_launches"][0]["failure_reason"],
+            "target_terminal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_tears_down_a_late_runtime_fenced_by_terminal_retirement() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let root = unique_temp_path("terminal-launch-teardown");
+        fs::create_dir_all(&root).unwrap();
+        let tmux = root.join("tmux");
+        let invoked = root.join("runtime-invoked");
+        fs::write(
+            &tmux,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SM_1314_FAKE_TMUX_SENTINEL\"\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        let old_path = env::var_os("PATH").unwrap_or_default();
+        let _path = EnvVarRestore::set(
+            "PATH",
+            format!("{}:{}", root.display(), old_path.to_string_lossy()),
+        );
+        let _sentinel = EnvVarRestore::set("SM_1314_FAKE_TMUX_SENTINEL", &invoked);
+
+        let state_file = root.join("state.json");
+        let mut state = terminal_rotation_fixture("failed", Some("failed"));
+        state["sessions"][0]["status"] = json!("stopped");
+        state["sessions"][0]["completion_status"] = json!("retired");
+        state["sessions"][0]["terminal_provenance"] = json!({
+            "cause": "explicit_retire",
+            "observed_at": "2026-08-18T04:00:00Z",
+            "actor_session_id": "parent01",
+            "authority": "authenticated_parent",
+            "source": "api_retire",
+            "tmux_disposition": "already_absent"
+        });
+        state["session_runtime_launches"][0]["operation_kind"] = json!("create");
+        state["session_runtime_launches"][0]["credential_rotation_id"] = Value::Null;
+        state["session_runtime_launches"][0]["failure_reason"] = json!("target_terminal");
+        fs::write(&state_file, state.to_string()).unwrap();
+
+        let store = SessionStore::new(state_file).with_delivery_runtime(Some(
+            TmuxRuntime::from_config(&crate::config::RustCoreConfig::default()),
+        ));
+        store.recover_session_runtime_launches().unwrap();
+
+        let invocation = fs::read_to_string(&invoked).unwrap();
+        assert!(invocation.contains("has-session -t claude-rotate01"));
+        assert!(invocation.contains("kill-session -t claude-rotate01"));
         let _ = fs::remove_dir_all(root);
     }
 
