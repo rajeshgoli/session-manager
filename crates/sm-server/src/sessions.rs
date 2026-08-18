@@ -1959,7 +1959,7 @@ impl SessionStore {
 
         let now = OffsetDateTime::now_utc();
         let mut records = reparent_request_records(&state)?;
-        let _ = refresh_reparent_requests(&mut records, &sessions, now);
+        let _ = refresh_reparent_requests(&mut records, &sessions, &state, now);
         let affected_ids = BTreeSet::from([subject_session_id.to_owned()]);
         if let Some(conflict) = records.iter().find(|record| {
             record.is_active() && !record.affected_session_ids().is_disjoint(&affected_ids)
@@ -2260,7 +2260,7 @@ impl SessionStore {
         };
         let now = OffsetDateTime::now_utc();
         let mut records = reparent_request_records(&state)?;
-        let refreshed = refresh_reparent_requests(&mut records, &sessions, now);
+        let refreshed = refresh_reparent_requests(&mut records, &sessions, &state, now);
         let affected_ids = preview
             .edge_changes
             .iter()
@@ -2390,7 +2390,7 @@ impl SessionStore {
         }
         let mut records = reparent_request_records(&state)?;
         let now = OffsetDateTime::now_utc();
-        let refreshed = refresh_reparent_requests(&mut records, &sessions, now);
+        let refreshed = refresh_reparent_requests(&mut records, &sessions, &state, now);
         let Some(index) = records.iter().position(|record| record.id == request_id) else {
             if refreshed {
                 store_reparent_request_records(&mut state, &records)?;
@@ -2493,7 +2493,7 @@ impl SessionStore {
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
         let mut records = reparent_request_records(&state)?;
         let now = OffsetDateTime::now_utc();
-        let refreshed = refresh_reparent_requests(&mut records, &sessions, now);
+        let refreshed = refresh_reparent_requests(&mut records, &sessions, &state, now);
         let Some(index) = records.iter().position(|record| record.id == request_id) else {
             if refreshed {
                 store_reparent_request_records(&mut state, &records)?;
@@ -2572,7 +2572,7 @@ impl SessionStore {
         let mut state = self.load_raw_json_value()?;
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
         let mut records = reparent_request_records(&state)?;
-        if refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc()) {
+        if refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc()) {
             store_reparent_request_records(&mut state, &records)?;
             self.write_raw_json_value(&state)?;
         }
@@ -2586,7 +2586,7 @@ impl SessionStore {
         let mut state = self.load_raw_json_value()?;
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
         let mut records = reparent_request_records(&state)?;
-        if refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc()) {
+        if refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc()) {
             store_reparent_request_records(&mut state, &records)?;
             self.write_raw_json_value(&state)?;
         }
@@ -2609,7 +2609,7 @@ impl SessionStore {
             return Ok(None);
         }
         let mut records = reparent_request_records(&state)?;
-        if refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc()) {
+        if refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc()) {
             store_reparent_request_records(&mut state, &records)?;
             self.write_raw_json_value(&state)?;
         }
@@ -2719,8 +2719,12 @@ impl SessionStore {
             let mut state = self.load_raw_json_value()?;
             let sessions = snapshot_from_raw_value(&state)?.into_sessions();
             let mut records = reparent_request_records(&state)?;
-            let refreshed =
-                refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc());
+            let refreshed = refresh_reparent_requests(
+                &mut records,
+                &sessions,
+                &state,
+                OffsetDateTime::now_utc(),
+            );
             let mut changed = refreshed;
             for record in &mut records {
                 let desired = desired_reparent_notifications(record);
@@ -3036,7 +3040,8 @@ impl SessionStore {
         }
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
         let mut records = reparent_request_records(&state)?;
-        let _ = refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc());
+        let _ =
+            refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc());
         let Some(index) = records
             .iter()
             .enumerate()
@@ -3054,7 +3059,7 @@ impl SessionStore {
             self.write_raw_json_value(&state)?;
             return Ok(None);
         };
-        if let Some(reason) = reparent_stale_reason(&records[index], &sessions) {
+        if let Some(reason) = reparent_stale_reason(&records[index], &sessions, &state) {
             records[index].status = "stale".to_owned();
             records[index].ready_to_apply = false;
             records[index].failure_reason = Some(reason);
@@ -3289,7 +3294,7 @@ impl SessionStore {
             .clone()
             .context("reparent apply plan is missing")?;
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
-        if let Some(reason) = reparent_stale_reason(record, &sessions) {
+        if let Some(reason) = reparent_stale_reason(record, &sessions, &state) {
             anyhow::bail!("reparent request became stale before quiesce: {reason}");
         }
         quiesce_json_reparent_routes(&mut state, &plan)?;
@@ -3338,7 +3343,7 @@ impl SessionStore {
             .clone()
             .context("reparent apply plan is missing")?;
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
-        if let Some(reason) = reparent_stale_reason(record, &sessions) {
+        if let Some(reason) = reparent_stale_reason(record, &sessions, &state) {
             return Ok(Some(reason));
         }
         commit_json_reparent_plan(&mut state, &plan)?;
@@ -13372,6 +13377,7 @@ fn approvals_satisfied(
 fn refresh_reparent_requests(
     records: &mut [ReparentRequestRecord],
     sessions: &[SessionRecord],
+    state: &Value,
     now: OffsetDateTime,
 ) -> bool {
     let mut changed = false;
@@ -13407,7 +13413,7 @@ fn refresh_reparent_requests(
             }
             _ => {}
         }
-        if let Some(reason) = reparent_stale_reason(record, sessions) {
+        if let Some(reason) = reparent_stale_reason(record, sessions, state) {
             if let Some(winner) = superseded_by_request_id {
                 record.status = "superseded".to_owned();
                 record.superseded_by_request_id = Some(winner.clone());
@@ -13449,6 +13455,7 @@ fn reparent_request_supersedes(
 fn reparent_stale_reason(
     record: &ReparentRequestRecord,
     sessions: &[SessionRecord],
+    state: &Value,
 ) -> Option<String> {
     let expected_fingerprint = reparent_topology_fingerprint(
         &record.kind,
@@ -13541,6 +13548,25 @@ fn reparent_stale_reason(
                     "stopped-root request lacks durable maintainer authorization binding"
                         .to_owned(),
                 );
+            }
+            match find_raw_registration(state, "maintainer") {
+                Ok(Some(maintainer)) if maintainer.session_id == target_parent_id => {}
+                Ok(Some(_)) => {
+                    return Some(
+                        "durable maintainer registration changed after request creation".to_owned(),
+                    );
+                }
+                Ok(None) => {
+                    return Some(
+                        "durable maintainer registration disappeared after request creation"
+                            .to_owned(),
+                    );
+                }
+                Err(_) => {
+                    return Some(
+                        "durable maintainer registration could not be revalidated".to_owned(),
+                    );
+                }
             }
             if sessions.iter().any(|session| {
                 session.parent_session_id.as_deref()
@@ -21158,6 +21184,63 @@ mod tests {
                 .as_deref(),
             Some("maintainer")
         );
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn stopped_root_recovery_stales_on_maintainer_reassignment_without_edges() {
+        let (store, state_file) = stopped_root_recovery_store("maintainer-reassignment");
+        let request = match store
+            .create_reparent_tree_request(
+                "outgoing",
+                CreateReparentTreeRequest {
+                    requester_session_id: "successor".to_owned(),
+                    target_session_id: "successor".to_owned(),
+                    dry_run: false,
+                },
+                "successor-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Created(record) => record,
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            state["agent_registrations"] = json!([{
+                "role": "maintainer",
+                "session_id": "replacement-maintainer",
+                "created_at": now_rfc3339(),
+            }]);
+            store.write_raw_json_value(&state).unwrap();
+        }
+        let stale = store.get_reparent_request(&request.id).unwrap().unwrap();
+        assert_eq!(stale.status, "stale");
+        assert_eq!(
+            stale.failure_reason.as_deref(),
+            Some("durable maintainer registration changed after request creation")
+        );
+        assert_eq!(
+            store
+                .get_session("successor")
+                .unwrap()
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("maintainer")
+        );
+        for session_id in ["outgoing", "worker-a", "worker-b"] {
+            assert_eq!(
+                store
+                    .get_session(session_id)
+                    .unwrap()
+                    .unwrap()
+                    .parent_session_id
+                    .as_deref(),
+                Some("outgoing")
+            );
+        }
         let _ = fs::remove_file(state_file);
     }
 

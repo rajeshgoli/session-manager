@@ -26,6 +26,10 @@ parent gives the second ordinary credential-bound approval. There is no new
 synchronous human gate: the durable maintainer registration and its recorded
 approval are the recovery authority.
 
+Freshness re-reads that durable `maintainer` registration before every pending
+decision, lease acquisition, quiesce, and authority commit. A removed or
+reassigned maintainer registration makes the request stale with no edge change.
+
 The immutable plan binds both old parents and exactly the frozen live source
 children:
 
