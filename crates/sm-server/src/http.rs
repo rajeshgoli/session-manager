@@ -3473,7 +3473,7 @@ async fn get_policy_status(
     Query(query): Query<PolicyLaneQuery>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
+    ensure_policy_evidence_read_allowed(&state, &request, &query.lane)?;
     Ok(Json(serde_json::to_value(
         state.policy_evidence_store().status(&query.lane)?,
     )?))
@@ -3484,10 +3484,16 @@ async fn get_policy_explain(
     Path(decision_id): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
-    Ok(Json(serde_json::to_value(
-        state.policy_evidence_store().explain(&decision_id)?,
-    )?))
+    let explanation = state.policy_evidence_store().explain(&decision_id)?;
+    for lane in explanation
+        .events
+        .iter()
+        .map(|event| event.envelope.lane.as_str())
+        .collect::<BTreeSet<_>>()
+    {
+        ensure_policy_evidence_read_allowed(&state, &request, lane)?;
+    }
+    Ok(Json(serde_json::to_value(explanation)?))
 }
 
 async fn get_policy_events(
@@ -3495,7 +3501,7 @@ async fn get_policy_events(
     Query(query): Query<PolicyLaneQuery>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
+    ensure_policy_evidence_read_allowed(&state, &request, &query.lane)?;
     Ok(Json(
         json!({ "lane": query.lane, "events": state.policy_evidence_store().events(&query.lane)? }),
     ))
@@ -3506,7 +3512,7 @@ async fn get_policy_trial(
     Query(query): Query<PolicyLaneQuery>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
+    ensure_policy_evidence_read_allowed(&state, &request, &query.lane)?;
     Ok(Json(
         json!({ "lane": query.lane, "rows": state.policy_evidence_store().trial(&query.lane)? }),
     ))
@@ -12378,6 +12384,48 @@ fn ensure_session_read_allowed(state: &AppState, request: &Request) -> Result<()
         peer_addr,
         request.uri().path(),
     )
+}
+
+fn ensure_policy_evidence_read_allowed(
+    state: &AppState,
+    request: &Request,
+    lane: &str,
+) -> Result<(), ApiError> {
+    ensure_session_read_allowed(state, request)?;
+    if !state.config.google_auth.requested() {
+        return Ok(());
+    }
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    if is_local_bypass_request(request.headers(), peer_addr, &state.config) {
+        return Ok(());
+    }
+    let Some(user) = authenticated_user(request.headers(), &state.config) else {
+        return Err(ApiError::Auth {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Authentication required",
+            login_url: Some(google_login_redirect(request.uri().path())),
+        });
+    };
+    let readers = state
+        .config
+        .google_auth
+        .policy_evidence_readers
+        .get(lane)
+        .or_else(|| state.config.google_auth.policy_evidence_readers.get("*"));
+    if readers.is_some_and(|readers| {
+        readers
+            .iter()
+            .any(|reader| reader.trim().eq_ignore_ascii_case(&user.email))
+    }) {
+        return Ok(());
+    }
+    Err(ApiError::Status {
+        status: StatusCode::FORBIDDEN,
+        detail: format!("Policy evidence access is not authorized for lane {lane}"),
+    })
 }
 
 fn ensure_session_allowed_from_parts(

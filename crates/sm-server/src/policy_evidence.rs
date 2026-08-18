@@ -37,11 +37,19 @@ pub struct PolicyStatus {
     pub requirement_count: u64,
     pub latest_event_at: Option<String>,
     pub actual_usage: PolicyUsageTotals,
+    pub actual_wall_time: PolicyWallTimeTotals,
     pub latest_forecast: Option<Value>,
     pub latest_breaker: Option<Value>,
     /// Published thresholds only. This evidence package never dispatches or
     /// stops work; callers decide how to act on the visible projection.
     pub slice_breaker_thresholds: SliceBreakerThresholds,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PolicyWallTimeTotals {
+    pub queue_wait_ms: u64,
+    pub active_ms: u64,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -213,6 +221,7 @@ impl PolicyEvidenceStore {
     pub fn status(&self, lane: &str) -> Result<PolicyStatus> {
         let events = self.events(lane)?;
         let mut totals = PolicyUsageTotals::default();
+        let mut wall_time = PolicyWallTimeTotals::default();
         let mut latest_forecast = None;
         let mut latest_breaker = None;
         for event in &events {
@@ -225,6 +234,11 @@ impl PolicyEvidenceStore {
                 totals.reasoning_tokens += counters.reasoning_tokens.value;
                 totals.cost_usd += counters.cost_usd.value;
                 totals.quota_points += counters.quota_points.value;
+            }
+            if let Some(span) = wall_time_from_payload(&event.envelope.payload) {
+                wall_time.queue_wait_ms += span.queue_wait_ms;
+                wall_time.active_ms += span.active_ms;
+                wall_time.elapsed_ms += span.elapsed_ms;
             }
             if event.envelope.event_type.contains("forecast") {
                 latest_forecast = Some(event.envelope.payload.clone());
@@ -244,6 +258,7 @@ impl PolicyEvidenceStore {
             requirement_count,
             latest_event_at: events.last().map(|e| e.envelope.occurred_at.clone()),
             actual_usage: totals,
+            actual_wall_time: wall_time,
             latest_forecast,
             latest_breaker,
             slice_breaker_thresholds: SliceBreakerThresholds::default(),
@@ -362,6 +377,9 @@ fn validate_event(event: &PolicyEventEnvelope) -> Result<()> {
             bail!("policy event links must have non-empty string keys and values");
         }
     }
+    if event.payload.get("wall_time").is_some() {
+        let _ = wall_time_from_payload_checked(&event.payload)?;
+    }
     if event.event_type == "requirement_effect" {
         let requirement_id = string_field(&event.payload, "requirement_id")?;
         let _ = requirement_id;
@@ -441,6 +459,29 @@ fn usage_from_payload(payload: &Value) -> Option<PolicyUsageCounters> {
         .get("usage")
         .or_else(|| payload.get("usage_counters"))
         .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
+fn wall_time_from_payload(payload: &Value) -> Option<PolicyWallTimeTotals> {
+    wall_time_from_payload_checked(payload).ok().flatten()
+}
+
+fn wall_time_from_payload_checked(payload: &Value) -> Result<Option<PolicyWallTimeTotals>> {
+    let Some(raw) = payload.get("wall_time") else {
+        return Ok(None);
+    };
+    let object = raw
+        .as_object()
+        .ok_or_else(|| anyhow!("wall_time must be a JSON object"))?;
+    let value = |field: &str| -> Result<u64> {
+        object.get(field).and_then(Value::as_u64).ok_or_else(|| {
+            anyhow!("wall_time.{field} must be a non-negative integer milliseconds value")
+        })
+    };
+    Ok(Some(PolicyWallTimeTotals {
+        queue_wait_ms: value("queue_wait_ms")?,
+        active_ms: value("active_ms")?,
+        elapsed_ms: value("elapsed_ms")?,
+    }))
 }
 
 fn index_links(tx: &rusqlite::Transaction<'_>, event: &PolicyEventEnvelope) -> Result<()> {
@@ -707,5 +748,29 @@ mod tests {
         assert_eq!(thresholds.warning_tokens, 165_000_000);
         assert_eq!(thresholds.hard_breaker_tokens, 220_000_000);
         assert_eq!(thresholds.hard_breaker_integration_failures, 2);
+    }
+
+    #[test]
+    fn status_aggregates_validated_wall_time_spans() {
+        let dir = TempDir::new();
+        let store = PolicyEvidenceStore::new(dir.0.join("policy.db")).unwrap();
+        store
+            .append(&event(
+                "wall-time",
+                1,
+                json!({"wall_time":{"queue_wait_ms":7,"active_ms":11,"elapsed_ms":19}}),
+            ))
+            .unwrap();
+        let totals = store.status("sm-policy-1268").unwrap().actual_wall_time;
+        assert_eq!(totals.queue_wait_ms, 7);
+        assert_eq!(totals.active_ms, 11);
+        assert_eq!(totals.elapsed_ms, 19);
+        assert!(store
+            .append(&event(
+                "bad-wall-time",
+                2,
+                json!({"wall_time":{"queue_wait_ms":0}})
+            ))
+            .is_err());
     }
 }
