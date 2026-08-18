@@ -95,11 +95,15 @@ Phase 1 (service untouched on any failure; nothing writes the registered path)
   record /health and session count (a healthy server must yield a baseline)
   preflight: cutover executable, config readable, local-env readable,
              no lingering Python label, registered path is NOT cargo's output,
-             plist would not be rewritten
+             plist would not be rewritten, durable signing config readable,
+             configured identity usable in the keychain
   cargo build --release -p sm-server --target-dir <pinned>
   cp cargo output -> staging (beside the installed binary)
-  codesign --force --sign - --identifier com.rajeshgoli.sm-server <staging>
+  codesign --force --sign <configured persistent identity> \
+           --identifier com.rajeshgoli.sm-server <staging>
   codesign --verify --strict <staging>
+  verify staged Identifier, non-ad-hoc certificate Authority, and exact
+         configured certificate-anchored designated requirement
 Phase 2
   cutover stop-rust                     <- bootout
   confirm the job is really unloaded    <- the cutover swallows bootout failures
