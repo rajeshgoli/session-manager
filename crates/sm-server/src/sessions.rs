@@ -880,27 +880,18 @@ impl SessionStore {
         // writes terminal evidence, so this startup pass owns the remaining
         // crash window and tears down any such late runtime before ordinary
         // launch recovery considers other work.
-        for launch in self.pending_terminal_runtime_teardowns()? {
+        // Restoration holds this same mutation lock from its terminal-marker
+        // check through tmux creation and the durable running transition. Do
+        // not release it between terminal revalidation and kill: otherwise a
+        // stale terminal snapshot could tear down a just-restored runtime.
+        let _guard = self.write_guard()?;
+        let state = self.load_raw_json_value()?;
+        for launch in terminal_runtime_teardown_records(&state)? {
             runtime
                 .for_socket_name(launch.tmux_socket_name.as_deref())
                 .kill_session(&launch.tmux_session)?;
         }
         Ok(())
-    }
-
-    fn pending_terminal_runtime_teardowns(&self) -> Result<Vec<SessionRuntimeLaunchRecord>> {
-        let _guard = self.write_guard()?;
-        let state = self.load_raw_json_value()?;
-        let terminal_session_ids = terminal_session_ids_from_state(&state)?;
-        Ok(session_runtime_launch_records(&state)?
-            .into_iter()
-            .filter(|launch| {
-                (launch.terminal_teardown_pending
-                    || (launch.status == "failed"
-                        && launch.failure_reason.as_deref() == Some("target_terminal")))
-                    && terminal_session_ids.contains(&launch.session_id)
-            })
-            .collect())
     }
 
     fn recover_session_runtime_launch(&self, launch_id: &str) -> Result<()> {
@@ -13591,6 +13582,19 @@ fn terminal_session_ids_from_state(state: &Value) -> Result<BTreeSet<String>> {
         .collect())
 }
 
+fn terminal_runtime_teardown_records(state: &Value) -> Result<Vec<SessionRuntimeLaunchRecord>> {
+    let terminal_session_ids = terminal_session_ids_from_state(state)?;
+    Ok(session_runtime_launch_records(state)?
+        .into_iter()
+        .filter(|launch| {
+            (launch.terminal_teardown_pending
+                || (launch.status == "failed"
+                    && launch.failure_reason.as_deref() == Some("target_terminal")))
+                && terminal_session_ids.contains(&launch.session_id)
+        })
+        .collect())
+}
+
 fn store_session_runtime_launch_records(
     state: &mut Value,
     records: &[SessionRuntimeLaunchRecord],
@@ -16816,7 +16820,8 @@ mod tests {
         fs::write(&state_file, state.to_string()).unwrap();
 
         let store = SessionStore::new(state_file.clone());
-        let pending = store.pending_terminal_runtime_teardowns().unwrap();
+        let pending =
+            terminal_runtime_teardown_records(&store.load_raw_json_value().unwrap()).unwrap();
 
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "launch01");
