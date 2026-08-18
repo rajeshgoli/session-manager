@@ -1762,13 +1762,38 @@ fn claude_empty_composer_cursor(pane: &str, cursor_x: usize, cursor_y: usize) ->
 }
 
 fn claude_initial_brief_submission_observed(ready_pane: &str, pane: &str) -> bool {
-    pane != ready_pane
-        && pane.lines().any(|line| {
-            let line = line.trim_start();
+    if pane == ready_pane {
+        return false;
+    }
+    let mut previous_markers = claude_main_thread_activity_markers(ready_pane);
+    claude_main_thread_activity_markers(pane)
+        .into_iter()
+        .any(|marker| {
+            match previous_markers
+                .iter()
+                .position(|previous| *previous == marker)
+            {
+                Some(index) => {
+                    previous_markers.remove(index);
+                    false
+                }
+                None => true,
+            }
+        })
+}
+
+/// Return a multiset of provider activity rows.  A ready pane can retain old
+/// completed-turn chrome above its new composer, so acknowledgement must
+/// observe an activity row that did not already exist before Enter.
+fn claude_main_thread_activity_markers(pane: &str) -> Vec<&str> {
+    pane.lines()
+        .map(str::trim_start)
+        .filter(|line| {
             !line.starts_with('❯')
                 && !line.starts_with('>')
                 && claude_line_indicates_main_thread_activity(line)
         })
+        .collect()
 }
 
 fn claude_composer_footer_divider(line: &str) -> bool {
@@ -2363,6 +2388,36 @@ esac
         assert!(claude_initial_brief_submission_observed(
             ready,
             "❯\n────────────────────\nFable 5\n✽ Thinking through the task…\n",
+        ));
+    }
+
+    #[test]
+    fn claude_initial_brief_acceptance_rejects_stale_activity_from_the_ready_pane() {
+        let ready = concat!(
+            "⏺ Completed startup housekeeping\n",
+            "❯\n",
+            "────────────────────\n",
+            "Fable 5\n",
+        );
+
+        assert!(!claude_initial_brief_submission_observed(
+            ready,
+            concat!(
+                "⏺ Completed startup housekeeping\n",
+                "❯ pasted-but-not-submitted\n",
+                "────────────────────\n",
+                "Fable 5\n",
+            ),
+        ));
+        assert!(claude_initial_brief_submission_observed(
+            ready,
+            concat!(
+                "⏺ Completed startup housekeeping\n",
+                "❯\n",
+                "────────────────────\n",
+                "Fable 5\n",
+                "✽ Thinking through the initial brief…\n",
+            ),
         ));
     }
 
