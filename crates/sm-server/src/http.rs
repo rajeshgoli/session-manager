@@ -905,15 +905,29 @@ fn codex_comment_is_bound(
         .get("body")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let reviewed_commit = format!("Reviewed commit: `{requested_head_sha}`");
-    let bold_reviewed_commit = format!("**Reviewed commit:** `{requested_head_sha}`");
     comment.get("id").and_then(Value::as_i64) != request_comment_id
         && github_actor_is_codex(comment)
         && !body
             .trim_start()
             .to_ascii_lowercase()
             .starts_with("@codex review")
-        && (body.contains(&reviewed_commit) || body.contains(&bold_reviewed_commit))
+        && reviewed_commit_matches_requested_head(body, requested_head_sha)
+}
+
+fn reviewed_commit_matches_requested_head(body: &str, requested_head_sha: &str) -> bool {
+    body.match_indices("Reviewed commit:").any(|(offset, _)| {
+        let suffix = &body[offset + "Reviewed commit:".len()..];
+        let Some((_, candidate_and_rest)) = suffix.split_once('`') else {
+            return false;
+        };
+        let Some((candidate, _)) = candidate_and_rest.split_once('`') else {
+            return false;
+        };
+        candidate.len() >= 7
+            && candidate.len() <= requested_head_sha.len()
+            && candidate.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && requested_head_sha.starts_with(candidate)
+    })
 }
 
 fn find_fresh_codex_review_with_gh(
@@ -17607,5 +17621,19 @@ mod tests {
             head,
             Some(77)
         ));
+
+        let exact_abbreviated = json!({
+            "id": 82,
+            "body": "**Reviewed commit:** `aaaaaaaaaa`",
+            "user": { "login": "chatgpt-codex-connector[bot]" }
+        });
+        assert!(codex_comment_is_bound(&exact_abbreviated, head, Some(77)));
+
+        let stale_abbreviated = json!({
+            "id": 83,
+            "body": "**Reviewed commit:** `bbbbbbbbbb`",
+            "user": { "login": "chatgpt-codex-connector[bot]" }
+        });
+        assert!(!codex_comment_is_bound(&stale_abbreviated, head, Some(77)));
     }
 }
