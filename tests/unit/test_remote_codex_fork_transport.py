@@ -802,7 +802,14 @@ async def test_restore_remote_codex_fork_registers_bridge_before_launch_and_uses
             }
         )
     )
-    manager._register_codex_fork_remote_bridge = AsyncMock(return_value=acceptance_events)
+    async def register_bridge(candidate: Session):
+        # Remote bridge registration is the first restore await; admission must
+        # already be durable so a concurrent restore cannot pass its guard.
+        assert candidate.restore_launch_pending is True
+        assert candidate.restore_pending_resume_id == "resume-restoreremote1"
+        return acceptance_events
+
+    manager._register_codex_fork_remote_bridge = AsyncMock(side_effect=register_bridge)
     manager._start_codex_fork_event_monitor = Mock()
     manager.codex_fork_restore_acceptance_timeout_seconds = 0.1
     manager.codex_fork_restore_acceptance_window_seconds = 0.01
@@ -825,6 +832,44 @@ async def test_restore_remote_codex_fork_registers_bridge_before_launch_and_uses
     control_socket_path = args[args.index("--control-socket") + 1]
     assert event_stream_path == "/tmp/worker-sm/restoreremote1.codex-fork.events.jsonl"
     assert control_socket_path == "/tmp/worker-sm/restoreremote1.codex-fork.control.sock"
+
+
+@pytest.mark.asyncio
+async def test_restore_remote_codex_fork_bridge_failure_clears_pending_admission(tmp_path):
+    manager = _manager(tmp_path)
+    session = Session(
+        id="restorebridgefail",
+        name="codex-fork-restorebridgefail",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        node="worker",
+        status=SessionStatus.STOPPED,
+        provider_resume_id="resume-restorebridgefail",
+    )
+    manager.sessions[session.id] = session
+
+    class HealthyConnection:
+        def is_healthy(self):
+            return True
+
+    manager.codex_fork_node_agents._connections["worker"] = HealthyConnection()
+    manager.node_runner.command_available = Mock(return_value=True)
+    manager.node_runner.run = Mock(
+        return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    )
+    manager._register_codex_fork_remote_bridge = AsyncMock(side_effect=RuntimeError("bridge unavailable"))
+    manager.tmux.session_exists = Mock(return_value=False)
+    manager.tmux.create_session_with_command = Mock(return_value=True)
+
+    success, restored, error = await manager.restore_session(session.id)
+
+    assert success is False
+    assert restored is session
+    assert error == "Codex-fork remote bridge registration failed: bridge unavailable"
+    assert session.status == SessionStatus.STOPPED
+    assert session.restore_launch_pending is False
+    assert session.restore_pending_resume_id is None
+    manager.tmux.create_session_with_command.assert_not_called()
 
 
 @pytest.mark.asyncio

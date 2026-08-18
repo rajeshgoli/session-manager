@@ -7694,22 +7694,28 @@ done
                     session.provider = effective_provider
             remote_bridge_registered = False
             remote_event_queue: Optional[asyncio.Queue[Optional[str]]] = None
+            if session.provider == "codex-fork":
+                # Persist before the remote bridge registration await as well as
+                # before local tmux launch.  This is the restore admission lock:
+                # a concurrent caller must not register or launch another
+                # runtime while this provider identity is being verified.
+                session.restore_launch_pending = True
+                session.restore_pending_resume_id = resume_id
+                session.status = SessionStatus.STOPPED
+                session.error_message = "Codex-fork restore awaiting provider acceptance"
+                self._save_state()
             if session.provider == "codex-fork" and normalize_node_id(session.node) != PRIMARY_NODE:
                 try:
                     remote_event_queue = await self._register_codex_fork_remote_bridge(session)
                     remote_bridge_registered = True
                 except Exception as exc:
                     self.mark_node_unreachable(session.id, True)
-                    return False, session, str(exc)
-            if session.provider == "codex-fork":
-                # Persist the in-flight state before launching.  If SM restarts
-                # now, hydrate must leave this record stopped rather than turn an
-                # unobserved provider process into a false live session.
-                session.restore_launch_pending = True
-                session.restore_pending_resume_id = resume_id
-                session.status = SessionStatus.STOPPED
-                session.error_message = "Codex-fork restore awaiting provider acceptance"
-                self._save_state()
+                    error = await self._fail_codex_fork_restore_acceptance(
+                        session,
+                        f"Codex-fork remote bridge registration failed: {exc}",
+                        remote_bridge_registered=False,
+                    )
+                    return False, session, error
             if not self.tmux.create_session_with_command(
                 session.tmux_session,
                 session.working_dir,
