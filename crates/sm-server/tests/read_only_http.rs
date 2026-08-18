@@ -18000,6 +18000,119 @@ async fn reparent_request_creation_persists_and_queues_exact_actionable_notifica
 }
 
 #[tokio::test]
+async fn reparent_request_projects_a_same_edge_winner_as_durable_supersession() {
+    let state_file = write_reparent_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, loser) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let loser_id = loser["id"].as_str().unwrap().to_owned();
+
+    // Reproduce a request that was advertised before another same-edge request
+    // won. The old request must remain addressable rather than becoming a 404.
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    state["reparent_requests"][0]["created_at"] = json!("2026-08-18T00:59:00Z");
+    let mut winner = state["reparent_requests"][0].clone();
+    winner["id"] = json!("winner01");
+    winner["status"] = json!("applied");
+    winner["ready_to_apply"] = json!(false);
+    winner["applied_at"] = json!("2026-08-18T01:00:00Z");
+    winner["decided_at"] = json!("2026-08-18T01:00:00Z");
+    state["reparent_requests"]
+        .as_array_mut()
+        .unwrap()
+        .push(winner);
+    state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "child")
+        .unwrap()["parent_session_id"] = json!("newparent");
+    fs::write(&state_file, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let (status, projected) =
+        get_json(app.clone(), &format!("/reparent-requests/{loser_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(projected["status"], "superseded");
+    assert_eq!(projected["superseded_by_request_id"], "winner01");
+    assert!(projected["failure_reason"]
+        .as_str()
+        .unwrap()
+        .contains("winner01"));
+
+    let (status, response) = post_json_with_headers_and_peer(
+        app,
+        &format!("/reparent-requests/{loser_id}/approve"),
+        json!({ "requester_session_id": "newparent" }),
+        &[("x-sm-session-credential", "new-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(response["detail"].as_str().unwrap().contains("winner01"));
+}
+
+#[tokio::test]
+async fn reparent_request_does_not_supersede_from_an_unrelated_historical_plan() {
+    let state_file = write_reparent_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, loser) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let loser_id = loser["id"].as_str().unwrap();
+
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    state["reparent_requests"][0]["created_at"] = json!("2026-08-18T00:59:00Z");
+    let mut historical = state["reparent_requests"][0].clone();
+    historical["id"] = json!("oldwinner");
+    historical["status"] = json!("applied");
+    historical["ready_to_apply"] = json!(false);
+    historical["applied_at"] = json!("2026-08-18T01:00:00Z");
+    // Same child/destination but a different immutable topology plan.
+    historical["topology_fingerprint"] = json!("different-historical-plan");
+    state["reparent_requests"]
+        .as_array_mut()
+        .unwrap()
+        .push(historical);
+    state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "newparent")
+        .unwrap()["status"] = json!("stopped");
+    fs::write(&state_file, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let (status, projected) = get_json(app, &format!("/reparent-requests/{loser_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(projected["status"], "stale");
+    assert!(projected["superseded_by_request_id"].is_null());
+}
+
+#[tokio::test]
 async fn reparent_request_immediately_delivers_approval_prompt_to_an_idle_runtime() {
     if !tmux_available() {
         return;
@@ -18448,6 +18561,79 @@ async fn reparent_tree_promotes_a_root_child_without_stranding_parent_routes() {
         .unwrap();
     assert_eq!(target_wake["parent_session_id"], "source01");
     assert_eq!(target_wake["is_active"], false);
+}
+
+#[tokio::test]
+async fn reparent_tree_atomically_succeeds_between_owner_started_peer_roots() {
+    let state_file = write_reparent_tree_fixture();
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let sessions = state["sessions"].as_array_mut().unwrap();
+    for session_id in ["source01", "target01"] {
+        let session = sessions
+            .iter_mut()
+            .find(|session| session["id"] == session_id)
+            .unwrap();
+        session["parent_session_id"] = Value::Null;
+        session["context_monitor_enabled"] = json!(false);
+        session["context_monitor_notify"] = Value::Null;
+    }
+    sessions.retain(|session| session["id"] != "grand001");
+    state["retained_parent_wake_registrations"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|wake| {
+            wake["child_session_id"] != "source01" && wake["child_session_id"] != "target01"
+        });
+    fs::write(&state_file, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+    let (status, created) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/source01/reparent-tree-requests",
+        json!({
+            "requester_session_id": "source01",
+            "target_session_id": "target01"
+        }),
+        &[("x-sm-session-credential", "source-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["peer_root_succession"], true);
+    assert_eq!(
+        created["required_agent_approvals"],
+        json!(["source01", "target01"])
+    );
+
+    let (status, applied) = post_json_with_headers_and_peer(
+        app,
+        &format!(
+            "/reparent-requests/{}/approve",
+            created["id"].as_str().unwrap()
+        ),
+        json!({ "requester_session_id": "target01" }),
+        &[("x-sm-session-credential", "target-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(applied["status"], "applied");
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let parent = |id: &str| {
+        state["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|session| session["id"] == id)
+            .and_then(|session| session["parent_session_id"].as_str())
+    };
+    assert_eq!(parent("target01"), None);
+    assert_eq!(parent("source01"), Some("target01"));
+    assert_eq!(parent("sibling01"), Some("target01"));
+    assert_eq!(parent("stopped01"), Some("source01"));
 }
 
 #[tokio::test]

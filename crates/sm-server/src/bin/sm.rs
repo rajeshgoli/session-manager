@@ -3028,18 +3028,20 @@ fn reparent_edges_for_display(record: &Value) -> Vec<Value> {
         .unwrap_or("unknown");
     let old_parent = record["expected_parent_session_id"].as_str();
     if record["kind"] == "tree" {
-        let mut edges = vec![
-            json!({
+        let peer_root_succession = record["peer_root_succession"].as_bool().unwrap_or(false);
+        let mut edges = Vec::new();
+        if !peer_root_succession {
+            edges.push(json!({
                 "session_id": target,
                 "expected_parent_session_id": source,
                 "new_parent_session_id": old_parent,
-            }),
-            json!({
-                "session_id": source,
-                "expected_parent_session_id": old_parent,
-                "new_parent_session_id": target,
-            }),
-        ];
+            }));
+        }
+        edges.push(json!({
+            "session_id": source,
+            "expected_parent_session_id": old_parent,
+            "new_parent_session_id": target,
+        }));
         edges.extend(
             record["frozen_live_child_ids"]
                 .as_array()
@@ -3071,6 +3073,9 @@ fn print_reparent_tree_preview(preview: &Value) {
         preview["source_session_id"].as_str().unwrap_or("unknown"),
         preview["target_session_id"].as_str().unwrap_or("unknown")
     );
+    if preview["peer_root_succession"].as_bool().unwrap_or(false) {
+        println!("mode: peer-root succession");
+    }
     print_reparent_edges(preview["edge_changes"].as_array());
     for blocker in preview["blockers"].as_array().into_iter().flatten() {
         println!("blocker: {}", blocker.as_str().unwrap_or("unknown"));
@@ -7016,6 +7021,34 @@ mod tests {
         assert_eq!(format_context_percentage(Some(&json!(43.5))), "43.5%");
         assert_eq!(format_context_percentage(Some(&Value::Null)), "unknown");
         assert_eq!(format_context_percentage(None), "unknown");
+    }
+
+    #[test]
+    fn peer_root_pending_request_display_has_no_successor_move() {
+        let record = json!({
+            "kind": "tree",
+            "subject_session_id": "outgoing",
+            "target_parent_session_id": "successor",
+            "expected_parent_session_id": null,
+            "peer_root_succession": true,
+            "frozen_live_child_ids": ["worker"]
+        });
+
+        assert_eq!(
+            reparent_edges_for_display(&record),
+            vec![
+                json!({
+                    "session_id": "outgoing",
+                    "expected_parent_session_id": null,
+                    "new_parent_session_id": "successor",
+                }),
+                json!({
+                    "session_id": "worker",
+                    "expected_parent_session_id": "outgoing",
+                    "new_parent_session_id": "successor",
+                }),
+            ]
+        );
     }
 
     #[test]
