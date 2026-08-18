@@ -916,10 +916,14 @@ estimated 36M-62M and 2.5-4 active hours to preserve the requested durable
 override, capacity, and restart-reconciliation capability. The owner delegated
 this bounded execution decision to the maintainer rather than accepting a code
 or scope adjudication task. The maintainer therefore preserves the intended
-canary and records one continuation phase capped at 290M cumulative Codex tokens
-and four additional active hours. It adds no capability beyond D1/D3/D4, warns
-at 275M or three hours, and hard-stops at either cap. A second rebaseline is not
-implicit: a miss produces split/park and a variance report.
+canary and debits continuation from the conservative 245M attribution bound,
+not the 225M point estimate. The phase is capped at 65M incremental and 310M
+cumulative Codex tokens or four additional active hours. It adds no capability
+beyond D1/D3/D4, warns at 285M conservative cumulative usage or three hours, and
+hard-stops at either cap. Direct continuation usage is added to the frozen 245M
+bound, so attribution uncertainty cannot delay the warning or hard stop. A
+second rebaseline is not implicit: a miss produces split/park and a variance
+report.
 
 #### Economy controls
 
@@ -1107,9 +1111,12 @@ reachable P0/P1 remains unmergeable.
 
 At the R3 five-round ceiling, the maintainer selects revert, split, redesign, or
 park from recorded reachability, blast radius, recurrence, rollback, hostile
-tests, review cost, and expected benefit. The owner is asked only to accept a
-named residual risk, change scope, or override policy, never to inspect the code
-finding. Without such an owner decision, split/park is the fail-closed default.
+tests, review cost, and expected benefit. A reachable P0/P1 remains unmergeable;
+owner residual-risk acceptance cannot waive that gate. The owner may accept only
+a named lower-severity residual risk, change product scope, or override policy
+to remove or disable the affected capability before a newly scoped head is
+reviewed. The owner is never asked to inspect the code finding. Without such a
+scope or policy decision, split/park is the fail-closed default.
 
 For an unusually high-risk transaction, up to two focused specialist reviews
 may run in parallel against the same immutable head and be aggregated as one
