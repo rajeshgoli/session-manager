@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -162,7 +163,7 @@ def validate_open_pr(repo: str, pr_number: int) -> dict:
             "--repo",
             repo,
             "--json",
-            "number,state,title,url",
+            "number,state,title,url,headRefOid",
         ],
         capture_output=True,
         text=True,
@@ -290,40 +291,70 @@ def find_fresh_codex_review_or_comment(
     repo: str,
     pr_number: int,
     since: datetime,
+    *,
+    requested_head_sha: Optional[str] = None,
+    excluded_comment_ids: Optional[set[int]] = None,
 ) -> Optional[dict]:
-    """Find the first fresh Codex review or issue comment newer than `since`."""
+    """Find the first fresh Codex artifact bound to a requested PR head.
+
+    A GitHub review is authoritative only when its ``commit_id`` exactly equals
+    ``requested_head_sha``.  A Codex issue comment has no commit field, so it
+    is accepted only when its body explicitly records that exact full SHA.
+    Request-trigger comments are always excluded, even if GitHub attributes
+    them to an app.
+    """
     since_utc = _coerce_utc(since)
+    expected_head = requested_head_sha.lower() if requested_head_sha else None
+    excluded_ids = excluded_comment_ids or set()
     candidates: list[dict[str, Any]] = []
 
-    latest_review = _fetch_latest_codex_review_snapshot(repo, pr_number)
-    if latest_review:
-        submitted_at = _parse_github_datetime(latest_review.get("submitted_at"))
-        if submitted_at and submitted_at > since_utc:
-            latest_review = _resolve_review_snapshot_to_rest_review(repo, pr_number, latest_review)
+    for review in fetch_pr_reviews(repo, pr_number):
+        submitted_at = _parse_github_datetime(review.get("submitted_at"))
+        commit_id = str(review.get("commit_id") or "").lower()
+        if (
+            submitted_at
+            and submitted_at > since_utc
+            and is_codex_actor(review)
+            and (expected_head is None or commit_id == expected_head)
+        ):
             candidates.append(
                 {
                     "source": "review",
                     "created_at": submitted_at,
-                    "id": latest_review.get("id"),
-                    "url": latest_review.get("html_url") or latest_review.get("pull_request_url"),
-                    "state": latest_review.get("state"),
-                    "body": latest_review.get("body"),
-                    "actor": latest_review.get("user", {}).get("login"),
+                    "id": review.get("id"),
+                    "url": review.get("html_url") or review.get("pull_request_url"),
+                    "state": review.get("state"),
+                    "body": review.get("body"),
+                    "actor": review.get("user", {}).get("login"),
+                    "head_sha": commit_id,
                 }
             )
 
     for comment in fetch_pr_issue_comments(repo, pr_number, since=since_utc):
         created_at = _parse_github_datetime(comment.get("created_at"))
-        if created_at and created_at > since_utc and is_codex_actor(comment):
+        body = str(comment.get("body") or "")
+        comment_id = comment.get("id")
+        comment_head_match = re.search(r"Reviewed\s+commit\s*:\s*`([0-9a-fA-F]{40})`", body, re.IGNORECASE)
+        comment_head = comment_head_match.group(1).lower() if comment_head_match else None
+        if (
+            created_at
+            and created_at > since_utc
+            and isinstance(comment_id, int)
+            and comment_id not in excluded_ids
+            and is_codex_actor(comment)
+            and "@codex review" not in body.lower()
+            and (expected_head is None or comment_head == expected_head)
+        ):
             candidates.append(
                 {
                     "source": "comment",
                     "created_at": created_at,
-                    "id": comment.get("id"),
+                    "id": comment_id,
                     "url": comment.get("html_url"),
                     "state": None,
-                    "body": comment.get("body"),
+                    "body": body,
                     "actor": comment.get("user", {}).get("login"),
+                    "head_sha": comment_head,
                 }
             )
 

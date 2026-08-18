@@ -4975,12 +4975,14 @@ def cmd_request_codex_review_status(
 
     print(f"Request: {payload.get('id', 'unknown')}")
     print(f"PR: {payload.get('repo', '?')}#{payload.get('pr_number', '?')}")
+    print(f"Requested head: {payload.get('requested_head_sha') or '-'}")
     print(f"Notify: {payload.get('notify_name') or payload.get('notify_session_id') or '-'}")
     print(f"State: {payload.get('state') or '-'}")
     print(f"Attempts: {payload.get('attempt_count', 0)}")
     print(f"Pickup: {payload.get('pickup_detected_at') or '-'}")
     print(f"Review landed: {payload.get('review_landed_at') or '-'}")
     print(f"Review source: {payload.get('review_source') or '-'}")
+    print(f"Superseded by: {payload.get('superseded_by_request_id') or '-'}")
     print(f"Next retry: {payload.get('next_retry_at') or '-'}")
     print(f"Last error: {payload.get('last_error') or '-'}")
     return 0

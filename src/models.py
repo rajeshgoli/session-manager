@@ -786,6 +786,9 @@ class CodexReviewRequestRegistration:
     last_error: Optional[str] = None
     state: str = "active"
     is_active: bool = True
+    requested_head_sha: Optional[str] = None
+    superseded_by_request_id: Optional[str] = None
+    superseded_at: Optional[datetime] = None
 
     def to_dict(self) -> dict:
         """Convert registration to a JSON-serializable dictionary."""
@@ -814,6 +817,9 @@ class CodexReviewRequestRegistration:
             "last_error": self.last_error,
             "state": self.state,
             "is_active": self.is_active,
+            "requested_head_sha": self.requested_head_sha,
+            "superseded_by_request_id": self.superseded_by_request_id,
+            "superseded_at": self.superseded_at.isoformat() if self.superseded_at else None,
         }
 
     @classmethod
@@ -844,6 +850,9 @@ class CodexReviewRequestRegistration:
             last_error=data.get("last_error"),
             state=data.get("state", "active"),
             is_active=bool(data.get("is_active", True)),
+            requested_head_sha=data.get("requested_head_sha"),
+            superseded_by_request_id=data.get("superseded_by_request_id"),
+            superseded_at=datetime.fromisoformat(data["superseded_at"]) if data.get("superseded_at") else None,
         )
 
 

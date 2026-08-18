@@ -255,18 +255,11 @@ class TestCodexHelpers:
         assert detect_codex_pickup("owner/repo", 12345) is False
 
     @patch("src.github_reviews.fetch_pr_issue_comments")
-    @patch("src.github_reviews._resolve_review_snapshot_to_rest_review")
-    @patch("src.github_reviews._fetch_latest_codex_review_snapshot")
-    def test_find_fresh_codex_review_or_comment_prefers_newer_than_since(self, mock_latest_review, mock_resolve_review, mock_comments):
+    @patch("src.github_reviews.fetch_pr_reviews")
+    def test_find_fresh_codex_review_or_comment_prefers_newer_than_since(self, mock_reviews, mock_comments):
         since = datetime(2026, 4, 16, 18, 27, 57)
-        mock_latest_review.return_value = {
-            "id": 100,
-            "user": {"login": "codex[bot]"},
-            "submitted_at": "2026-04-16T18:20:00Z",
-            "html_url": "https://example/review/100",
-            "state": "COMMENTED",
-        }
-        mock_resolve_review.return_value = mock_latest_review.return_value
+        head = "a" * 40
+        mock_reviews.return_value = []
         mock_comments.return_value = [
             {
                 "id": 200,
@@ -274,15 +267,72 @@ class TestCodexHelpers:
                 "performed_via_github_app": {"slug": "chatgpt-codex-connector"},
                 "created_at": "2026-04-16T18:32:59Z",
                 "html_url": "https://example/comment/200",
-                "body": "Codex Review: clean",
+                "body": f"Codex Review: clean\\n\\nReviewed commit: `{head}`",
             }
         ]
 
-        result = find_fresh_codex_review_or_comment("owner/repo", 42, since)
+        result = find_fresh_codex_review_or_comment("owner/repo", 42, since, requested_head_sha=head)
 
         assert result is not None
         assert result["source"] == "comment"
         assert result["id"] == 200
+
+    @patch("src.github_reviews.fetch_pr_issue_comments")
+    @patch("src.github_reviews.fetch_pr_reviews")
+    def test_find_fresh_codex_review_or_comment_rejects_request_comments_and_stale_heads(self, mock_reviews, mock_comments):
+        since = datetime(2026, 4, 16, 18, 27, 57)
+        requested_head = "a" * 40
+        mock_reviews.return_value = [
+            {
+                "id": 100,
+                "user": {"login": "codex[bot]"},
+                "submitted_at": "2026-04-16T18:32:59Z",
+                "commit_id": "b" * 40,
+                "html_url": "https://example/review/100",
+            }
+        ]
+        mock_comments.return_value = [
+            {
+                "id": 200,
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "performed_via_github_app": {"slug": "chatgpt-codex-connector"},
+                "created_at": "2026-04-16T18:32:59Z",
+                "html_url": "https://example/comment/200",
+                "body": f"@codex review\\n\\nReviewed commit: `{requested_head}`",
+            },
+            {
+                "id": 201,
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "created_at": "2026-04-16T18:33:00Z",
+                "html_url": "https://example/comment/201",
+                "body": "Unrelated discussion",
+            },
+        ]
+
+        assert find_fresh_codex_review_or_comment(
+            "owner/repo", 42, since, requested_head_sha=requested_head, excluded_comment_ids={200}
+        ) is None
+
+    @patch("src.github_reviews.fetch_pr_issue_comments")
+    @patch("src.github_reviews.fetch_pr_reviews")
+    def test_find_fresh_codex_review_or_comment_accepts_exact_head_review(self, mock_reviews, mock_comments):
+        since = datetime(2026, 4, 16, 18, 27, 57)
+        head = "a" * 40
+        mock_comments.return_value = []
+        mock_reviews.return_value = [
+            {
+                "id": 100,
+                "user": {"login": "codex[bot]"},
+                "submitted_at": "2026-04-16T18:32:59Z",
+                "commit_id": head,
+                "html_url": "https://example/review/100",
+            }
+        ]
+
+        result = find_fresh_codex_review_or_comment("owner/repo", 42, since, requested_head_sha=head)
+        assert result is not None
+        assert result["source"] == "review"
+        assert result["head_sha"] == head
 
     @patch("src.github_reviews.fetch_pr_reviews")
     @patch("src.github_reviews.subprocess.run")
