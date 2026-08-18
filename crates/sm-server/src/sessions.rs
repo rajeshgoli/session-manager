@@ -1050,7 +1050,9 @@ impl SessionStore {
             return Ok(());
         }
 
-        let mut recovered_provider_resume_id = launch.provider_resume_id.clone();
+        let mut recovered_provider_resume_id = recovered_claude_initial_brief
+            .clone()
+            .or_else(|| launch.provider_resume_id.clone());
         if launch.operation_kind == "create" {
             if let Some((record, excluded_ids, launched_at_ns)) =
                 codex_cli_creation_binding.as_ref()
