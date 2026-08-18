@@ -432,7 +432,7 @@ impl PolicyStore {
                 capacity_version
             )));
         }
-        if let Some(existing) = load_reusable_decision(&tx, request_id, override_id)? {
+        if let Some(existing) = load_reusable_decision(&tx, &request, override_id)? {
             tx.commit()?;
             return Ok(PreparedDecision {
                 decision: existing,
@@ -927,17 +927,25 @@ fn load_terminal_decision(
 }
 fn load_reusable_decision(
     tx: &Transaction<'_>,
-    request_id: &str,
+    request: &PolicySpawnRequest,
     override_id: Option<&str>,
 ) -> Result<Option<PolicyDecision>> {
     let value = match override_id {
-        Some(id) => tx.query_row("SELECT decision_json FROM policy_decisions WHERE request_id = ?1 AND override_id = ?2", params![request_id, id], |row| row.get::<_, String>(0)).optional()?,
-        None => tx.query_row("SELECT decision_json FROM policy_decisions WHERE request_id = ?1 AND override_id IS NULL ORDER BY attempt ASC LIMIT 1", [request_id], |row| row.get::<_, String>(0)).optional()?,
+        Some(id) => tx.query_row("SELECT decision_id, decision_json FROM policy_decisions WHERE request_id = ?1 AND override_id = ?2", params![request.request_id, id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).optional()?,
+        None => tx.query_row("SELECT decision_id, decision_json FROM policy_decisions WHERE request_id = ?1 AND override_id IS NULL ORDER BY attempt ASC LIMIT 1", [&request.request_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).optional()?,
     };
-    let Some(json) = value else {
+    let Some((stored_decision_id, json)) = value else {
         return Ok(None);
     };
     let decision: PolicyDecision = serde_json::from_str(&json)?;
+    decision
+        .validate_for_request(request)
+        .map_err(|error| PolicyStoreError::Invalid(error.to_string()))?;
+    if decision.decision_id != stored_decision_id {
+        return Err(PolicyStoreError::Invalid(
+            "stored decision does not match its immutable lookup key".into(),
+        ));
+    }
     if let Some(lease) = &decision.capacity_lease {
         let active: bool = tx
             .query_row(
@@ -1364,6 +1372,51 @@ mod tests {
         assert!(matches!(
             after_restart.override_record("override-1").unwrap().state,
             PolicyOverrideState::Consumed
+        ));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn damaged_reusable_decision_fails_closed_after_restart() {
+        let (store, path) = store("damaged-decision");
+        store.install_projection(&projection(true, 1)).unwrap();
+        store.set_runtime_versions("sm-policy-1268", 1, 1).unwrap();
+        store
+            .create_request(&request(
+                "damaged",
+                PolicyVehicle::TaskAgent,
+                None,
+                "intent-damaged",
+            ))
+            .unwrap();
+        let now = instant("2026-08-17T00:01:00Z");
+        let decision = store
+            .prepare_admission("damaged", &class("routine_bounded", None), None, now)
+            .unwrap()
+            .decision;
+        let conn = Connection::open(&path).unwrap();
+        let json: String = conn
+            .query_row(
+                "SELECT decision_json FROM policy_decisions WHERE decision_id = ?1",
+                [&decision.decision_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut damaged: serde_json::Value = serde_json::from_str(&json).unwrap();
+        damaged["capacity_lease"] = serde_json::Value::Null;
+        conn.execute(
+            "UPDATE policy_decisions SET decision_json = ?2 WHERE decision_id = ?1",
+            params![
+                decision.decision_id,
+                serde_json::to_string(&damaged).unwrap()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        let after_restart = PolicyStore::new(&path).unwrap();
+        assert!(matches!(
+            after_restart.prepare_admission("damaged", &class("routine_bounded", None), None, now),
+            Err(PolicyStoreError::Invalid(_))
         ));
         std::fs::remove_file(path).ok();
     }
