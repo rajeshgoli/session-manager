@@ -364,12 +364,16 @@ identity and caused repeated protected-folder prompts in production.
 
 The supported restart contract now reads the exact uppercase 40-hex fingerprint
 from the tracked, non-secret `config/rust-server-signing.env`; an explicit
-`SM_SIGN_IDENTITY` override is reserved for a planned certificate rotation.
+`SM_SIGN_IDENTITY` plus `SM_SIGN_DESIGNATED_REQUIREMENT` override is reserved
+for a planned certificate rotation.
 The file is parsed as data (not sourced as shell code), must contain exactly one
 identity line, and is therefore durable and discoverable to future operators.
 The production machine's measured default is
 `36FC54A873D584A34FCFEEA7D1F519B19A39DE72` (`Office Automate Local Signing`),
-with a fail-closed override/rotation path.
+whose currently observed self-signed requirement uses the same certificate-root
+hash. A CA-issued future leaf may have a different root hash: the rotation
+procedure must prove and supply both values, not infer the requirement from the
+leaf fingerprint.
 
 Before `stop-rust`, the script requires that identity to be available from the
 keychain, signs the disposable staged binary with it, verifies strictly, and
@@ -377,14 +381,14 @@ rejects ad-hoc output, a wrong identifier, absent certificate authority, or a
 designated requirement other than:
 
 ```
-designated => identifier "com.rajeshgoli.sm-server" and certificate root = H"<configured fingerprint lowercase>"
+designated => identifier "com.rajeshgoli.sm-server" and certificate (root|leaf) = H"<observed certificate hash>"
 ```
 
-The certificate-root requirement is expected to remain identical across changed
-binary content, while CDHash may change. `--sign -` is never an allowed
-fallback. All of these gates run before the installed binary is replaced or the
-launchd job is stopped, so the atomic install, re-registration, rollback, queue
-authority, health, PID, and session checks are unchanged.
+The exact configured certificate requirement is expected to remain identical
+across changed binary content, while CDHash may change. `--sign -` is never an
+allowed fallback. All of these gates run before the installed binary is replaced
+or the launchd job is stopped, so the atomic install, re-registration, rollback,
+queue authority, health, PID, and session checks are unchanged.
 
 Pre-deployment proof is performed only on disposable binaries: sign two
 different-content copies with the named fingerprint, run `codesign --verify

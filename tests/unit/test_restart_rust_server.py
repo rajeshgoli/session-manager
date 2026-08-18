@@ -22,6 +22,10 @@ SCRIPT = REPO_ROOT / "scripts" / "restart-rust-server.sh"
 CALLS = "calls.log"
 LABEL = "com.example.test"
 SIGN_IDENTITY = "36FC54A873D584A34FCFEEA7D1F519B19A39DE72"
+SIGN_REQUIREMENT = (
+    'designated => identifier "com.rajeshgoli.sm-server" '
+    f'and certificate root = H"{SIGN_IDENTITY.lower()}"'
+)
 
 
 def _write(path: Path, body: str, executable: bool = False) -> Path:
@@ -82,6 +86,7 @@ def env(tmp_path, request):
     (state / "codesign_inspect_rc").write_text("0")
     (state / "codesign_requirement_rc").write_text("0")
     (state / "signing_identity_present").write_text("1")
+    (state / "available_signing_identity").write_text(SIGN_IDENTITY)
     (state / "signed_identifier").write_text("com.rajeshgoli.sm-server")
     (state / "signed_signature").write_text("")
     (state / "signed_authority").write_text("Office Automate Local Signing")
@@ -167,7 +172,7 @@ exit "$(cat "{state}/codesign_sign_rc")"
         f"""#!/bin/bash
 echo "security $*" >> "{log}"
 if [[ "$(cat "{state}/signing_identity_present")" == "1" ]]; then
-  echo '  1) {SIGN_IDENTITY} "Office Automate Local Signing"'
+  echo "  1) $(cat "{state}/available_signing_identity") \"Office Automate Local Signing\""
   echo '     1 valid identities found'
 else
   echo '     0 valid identities found'
@@ -286,7 +291,9 @@ exit 0
 
     config = _write(tmp_path / "config.yaml", "server:\n  port: 8420\n")
     signing_config = _write(
-        tmp_path / "rust-server-signing.env", f"SM_SIGN_IDENTITY={SIGN_IDENTITY}\n"
+        tmp_path / "rust-server-signing.env",
+        f"SM_SIGN_IDENTITY={SIGN_IDENTITY}\n"
+        f"SM_SIGN_DESIGNATED_REQUIREMENT={SIGN_REQUIREMENT}\n",
     )
     # Matches the stub's render-plist output, so there is no divergence by default.
     plist = _write(tmp_path / "service.plist", "<plist>canned</plist>\n")
@@ -433,7 +440,7 @@ def test_missing_signing_identity_blocks_before_service_mutation(env):
     result = env["run"](SM_SIGN_IDENTITY="")
 
     assert result.returncode != 0
-    assert "signing config must contain exactly one" in result.stderr
+    assert "signing config must contain exactly one SM_SIGN_IDENTITY" in result.stderr
     assert "cargo build" not in calls(env)
     assert_service_untouched(env)
 
@@ -475,7 +482,7 @@ def test_wrong_staged_certificate_authority_blocks_before_service_mutation(env):
     result = env["run"]()
 
     assert result.returncode != 0
-    assert "stable certificate-anchored requirement" in result.stderr
+    assert "stable configured certificate-anchored requirement" in result.stderr
     assert_service_untouched(env)
 
 
@@ -735,6 +742,32 @@ def test_tracked_signing_config_supplies_the_durable_default(env):
     assert f"--sign {SIGN_IDENTITY}" in calls(env)
 
 
+def test_ca_issued_rotation_accepts_distinct_leaf_and_requirement_root(env):
+    """A CA-issued leaf must not be compared to the root named by `-dr`.
+
+    The rotation supplies the leaf fingerprint used by `--sign` plus the exact
+    disposable-proof requirement. They intentionally differ, while the staged
+    requirement must still equal the configured stable certificate anchor.
+    """
+    rotated_leaf = "A" * 40
+    rotated_root = "b" * 40
+    rotated_requirement = (
+        'designated => identifier "com.rajeshgoli.sm-server" '
+        f'and certificate root = H"{rotated_root}"'
+    )
+    (env["state"] / "available_signing_identity").write_text(rotated_leaf)
+    (env["state"] / "requirement_identity").write_text(rotated_root)
+
+    result = env["run"](
+        SM_SIGN_IDENTITY=rotated_leaf,
+        SM_SIGN_DESIGNATED_REQUIREMENT=rotated_requirement,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"--sign {rotated_leaf}" in calls(env)
+    assert (env["state"] / "requirements.log").read_text().splitlines() == [rotated_requirement]
+
+
 def test_two_different_staged_binaries_require_the_same_certificate_requirement(env):
     """Changed bytes must not turn the TCC-facing identity back into a CDHash.
 
@@ -752,11 +785,7 @@ def test_two_different_staged_binaries_require_the_same_certificate_requirement(
     assert "MARKER=REBUILT_CHANGED" in env["installed"].read_text()
 
     requirements = (env["state"] / "requirements.log").read_text().splitlines()
-    expected = (
-        'designated => identifier "com.rajeshgoli.sm-server" '
-        f'and certificate root = H"{SIGN_IDENTITY.lower()}"'
-    )
-    assert requirements == [expected, expected]
+    assert requirements == [SIGN_REQUIREMENT, SIGN_REQUIREMENT]
 
 
 def test_restart_goes_through_the_cutover_script(env):

@@ -212,8 +212,9 @@ The durable non-secret default lives in `config/rust-server-signing.env` and
 must be the exact persistent certificate fingerprint from `security
 find-identity -v -p codesigning`; the script refuses ad-hoc signing or an
 implicit keychain default. During an intentional certificate rotation, supply a
-validated replacement with `SM_SIGN_IDENTITY=<40-hex-fingerprint>` and update
-that tracked config before treating it as the new default.
+validated replacement with both `SM_SIGN_IDENTITY=<40-hex-fingerprint>` and
+the exact `SM_SIGN_DESIGNATED_REQUIREMENT` captured from disposable signing
+proof, then update that tracked config before treating it as the new default.
 
 If a deployment is already registered against `target/release/sm-server`, migrate
 it once with:

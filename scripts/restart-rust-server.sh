@@ -88,6 +88,7 @@ SM_SIGN_IDENTIFIER="${SM_SIGN_IDENTIFIER:-com.rajeshgoli.sm-server}"
 # for a planned certificate rotation. This is the SHA-1 fingerprint reported by
 # `security find-identity -v -p codesigning`, not a keychain display name.
 SM_SIGN_IDENTITY="${SM_SIGN_IDENTITY:-}"
+SM_SIGN_DESIGNATED_REQUIREMENT="${SM_SIGN_DESIGNATED_REQUIREMENT:-}"
 SM_SIGNING_CONFIG="${SM_SIGNING_CONFIG:-$REPO_ROOT/config/rust-server-signing.env}"
 SM_QUEUE_AUTHORITY_SOCKET="${SM_QUEUE_AUTHORITY_SOCKET:-$HOME/.local/share/claude-sessions/queue-runner/authority.sock}"
 SM_QUEUE_AUTHORITY_VERIFIER="${SM_QUEUE_AUTHORITY_VERIFIER:-$REPO_ROOT/scripts/verify_queue_authority.py}"
@@ -131,17 +132,18 @@ Options:
 Environment overrides: SM_LABEL, SM_BINARY, SM_TARGET_DIR, SM_CARGO_OUTPUT,
 SM_CUTOVER, SM_CONFIG, SM_LOCAL_ENV, SM_LOG_DIR, SM_PLIST, SM_HOST, SM_PORT,
 SM_PYTHON_LABELS (extra labels), SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT,
-SM_SIGN_IDENTITY, SM_SIGNING_CONFIG, SM_QUEUE_AUTHORITY_SOCKET,
-SM_QUEUE_AUTHORITY_VERIFIER, SM_PID_SETTLE_SECONDS, SM_UNLOAD_TIMEOUT,
-SM_ALLOW_SESSION_DROP, SM_LOCK.
+SM_SIGN_IDENTITY, SM_SIGN_DESIGNATED_REQUIREMENT, SM_SIGNING_CONFIG,
+SM_QUEUE_AUTHORITY_SOCKET, SM_QUEUE_AUTHORITY_VERIFIER, SM_PID_SETTLE_SECONDS,
+SM_UNLOAD_TIMEOUT, SM_ALLOW_SESSION_DROP, SM_LOCK.
 
 The default identity is the sole `SM_SIGN_IDENTITY=...` line in the tracked,
-non-secret $SM_SIGNING_CONFIG. An explicit SM_SIGN_IDENTITY override supports
-planned certificate rotation. Every value must be the exact uppercase 40-hex
-fingerprint from `security find-identity -v -p codesigning`. The restart refuses
-a missing, unavailable, ad-hoc, wrong-identifier, or non-certificate-anchored
-staged signature before it stops the service. It never falls back to
-`codesign --sign -`.
+non-secret $SM_SIGNING_CONFIG. Planned certificate rotation explicitly overrides
+both SM_SIGN_IDENTITY and SM_SIGN_DESIGNATED_REQUIREMENT with values proven on
+disposable binaries; this supports CA-issued identities whose leaf fingerprint
+differs from their designated requirement's certificate root. The restart
+refuses a missing, unavailable, ad-hoc, wrong-identifier, or
+non-certificate-anchored staged signature before it stops the service. It never
+falls back to `codesign --sign -`.
 
 SM_LABEL, SM_BINARY, SM_CONFIG, SM_LOCAL_ENV, SM_LOG_DIR, SM_PLIST, SM_HOST, and
 SM_PORT are forwarded to the cutover script, so both phases act on the same
@@ -219,25 +221,34 @@ step() { printf '\n==> %s\n' "$1"; }
 fail() { echo "ERROR: $1" >&2; exit 1; }
 
 load_signing_identity() {
-  local configured count invalid
+  local configured configured_requirement identity_count requirement_count invalid
   [[ -r "$SM_SIGNING_CONFIG" ]] \
     || fail "signing config is not readable: $SM_SIGNING_CONFIG; the running service was not touched"
   # This file is deployment data, not shell code. Parse only the one
   # non-secret key so editing the config can never execute commands in the
   # production restart path.
-  count="$(grep -Ec '^SM_SIGN_IDENTITY=[0-9A-F]{40}$' "$SM_SIGNING_CONFIG" || true)"
-  invalid="$(grep -Ev '^(#.*|[[:space:]]*|SM_SIGN_IDENTITY=[0-9A-F]{40})$' "$SM_SIGNING_CONFIG" || true)"
-  if [[ "$count" != "1" || -n "$invalid" ]]; then
-    fail "signing config must contain exactly one uppercase SM_SIGN_IDENTITY=40-hex-fingerprint line and only comments or blank lines; the running service was not touched"
+  identity_count="$(grep -Ec '^SM_SIGN_IDENTITY=[0-9A-F]{40}$' "$SM_SIGNING_CONFIG" || true)"
+  requirement_count="$(grep -Ec '^SM_SIGN_DESIGNATED_REQUIREMENT=.+$' "$SM_SIGNING_CONFIG" || true)"
+  invalid="$(grep -Ev '^(#.*|[[:space:]]*|SM_SIGN_IDENTITY=[0-9A-F]{40}|SM_SIGN_DESIGNATED_REQUIREMENT=.+)$' "$SM_SIGNING_CONFIG" || true)"
+  if [[ "$identity_count" != "1" || "$requirement_count" != "1" || -n "$invalid" ]]; then
+    fail "signing config must contain exactly one SM_SIGN_IDENTITY and one SM_SIGN_DESIGNATED_REQUIREMENT line and only comments or blank lines; the running service was not touched"
   fi
   configured="$(sed -n -E 's/^SM_SIGN_IDENTITY=([0-9A-F]{40})$/\1/p' "$SM_SIGNING_CONFIG")"
+  configured_requirement="$(sed -n -E 's/^SM_SIGN_DESIGNATED_REQUIREMENT=//p' "$SM_SIGNING_CONFIG")"
   if [[ -z "$SM_SIGN_IDENTITY" ]]; then
     SM_SIGN_IDENTITY="$configured"
+  fi
+  if [[ -z "$SM_SIGN_DESIGNATED_REQUIREMENT" ]]; then
+    SM_SIGN_DESIGNATED_REQUIREMENT="$configured_requirement"
   fi
   if ! [[ "$SM_SIGN_IDENTITY" =~ ^[0-9A-F]{40}$ ]]; then
     fail "SM_SIGN_IDENTITY must be the exact uppercase 40-hex fingerprint of a valid codesigning identity; no ad-hoc fallback is permitted"
   fi
-  SM_SIGN_IDENTITY_LOWER="$(printf '%s' "$SM_SIGN_IDENTITY" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$SM_SIGN_DESIGNATED_REQUIREMENT" != "designated => identifier \"$SM_SIGN_IDENTIFIER\" and certificate "* ]] \
+      || ! printf '%s\n' "$SM_SIGN_DESIGNATED_REQUIREMENT" \
+          | grep -Eq '^designated => identifier ".+" and certificate (root|leaf) = H"[0-9a-f]{40}"$'; then
+    fail "SM_SIGN_DESIGNATED_REQUIREMENT must be an exact certificate-root or certificate-leaf requirement for $SM_SIGN_IDENTIFIER; the running service was not touched"
+  fi
 }
 
 require_signing_identity() {
@@ -252,7 +263,7 @@ require_signing_identity() {
 }
 
 verify_staged_signature() {
-  local metadata requirement expected_requirement
+  local metadata requirement
   metadata="$(codesign -dvvv "$SM_STAGING" 2>&1)" \
     || fail "could not inspect the staged signature; the running service was not touched"
 
@@ -268,11 +279,10 @@ verify_staged_signature() {
 
   requirement="$(codesign -dr - "$SM_STAGING" 2>&1)" \
     || fail "could not read the staged designated requirement; the running service was not touched"
-  expected_requirement="designated => identifier \"$SM_SIGN_IDENTIFIER\" and certificate root = H\"$SM_SIGN_IDENTITY_LOWER\""
-  if ! printf '%s\n' "$requirement" | grep -Fx "$expected_requirement" >/dev/null; then
-    fail "staged designated requirement is not the stable certificate-anchored requirement for $SM_SIGN_IDENTITY; the running service was not touched"
+  if ! printf '%s\n' "$requirement" | grep -Fx "$SM_SIGN_DESIGNATED_REQUIREMENT" >/dev/null; then
+    fail "staged designated requirement is not the stable configured certificate-anchored requirement; the running service was not touched"
   fi
-  echo "signature ok: $SM_SIGN_IDENTIFIER; certificate root $SM_SIGN_IDENTITY"
+  echo "signature ok: $SM_SIGN_IDENTIFIER; $SM_SIGN_DESIGNATED_REQUIREMENT"
 }
 
 # Relative paths must resolve exactly as rust-service-cutover.sh resolves them
