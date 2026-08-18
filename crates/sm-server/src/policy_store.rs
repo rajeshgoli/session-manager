@@ -208,6 +208,11 @@ impl PolicyProjection {
         if let Some(authority) = &self.seat_authority {
             authority.validate(&self.lane)?;
         }
+        if self.enabled && (self.bootstrap_authority.is_some() == self.seat_authority.is_some()) {
+            return Err(PolicyStoreError::Invalid(
+                "an enabled canary requires exactly one bootstrap or seat authority".into(),
+            ));
+        }
         if self.rules.is_empty() {
             return Err(PolicyStoreError::Invalid(
                 "projection must contain a rule".into(),
@@ -339,6 +344,9 @@ impl PolicyStore {
             "INSERT INTO policy_runtime_versions (lane, topology_version, capacity_version) VALUES (?1, 0, 0) ON CONFLICT(lane) DO NOTHING",
             [&projection.lane],
         )?;
+        if inserted != 0 {
+            conn.execute("INSERT INTO policy_active_projections (lane, policy_version, policy_digest) VALUES (?1, ?2, ?3) ON CONFLICT(lane) DO UPDATE SET policy_version = excluded.policy_version, policy_digest = excluded.policy_digest", params![projection.lane, projection.policy_version, projection.policy_digest])?;
+        }
         Ok(())
     }
 
@@ -421,6 +429,17 @@ impl PolicyStore {
             &request.policy_version,
             &request.policy_digest,
         )?;
+        let active: (String, String) = tx.query_row("SELECT policy_version, policy_digest FROM policy_active_projections WHERE lane = ?1", [request.caller.lane()], |row| Ok((row.get(0)?, row.get(1)?))).optional()?.ok_or_else(|| PolicyStoreError::ProjectionNotFound(request.caller.lane().into()))?;
+        if active
+            != (
+                request.policy_version.clone(),
+                request.policy_digest.clone(),
+            )
+        {
+            return Err(PolicyStoreError::Stale(
+                "request policy projection is no longer active".into(),
+            ));
+        }
         authorize_caller(&projection, &request)?;
         let (topology_version, capacity_version): (u64, u64) = tx.query_row(
             "SELECT topology_version, capacity_version FROM policy_runtime_versions WHERE lane = ?1",
@@ -447,7 +466,19 @@ impl PolicyStore {
             });
         }
         let attempt = next_attempt(&tx, request_id)?;
-        let resolved = resolve_rule(&projection, &request, classification);
+        let mut effective_classification = classification.clone();
+        if let Some(override_id) = override_id {
+            let override_record = load_override_tx(&tx, override_id)?;
+            let terminal = load_terminal_decision(&tx, request_id, &override_record.decision_id)?;
+            override_record
+                .validate_for_consumption(&request, &terminal, now)
+                .map_err(|error| PolicyStoreError::OverrideDenied(error.to_string()))?;
+            if classification != &terminal.classification {
+                return Err(PolicyStoreError::OverrideDenied("override re-admission classification differs from its frozen terminal decision".into()));
+            }
+            effective_classification = terminal.classification;
+        }
+        let resolved = resolve_rule(&projection, &request, &effective_classification);
         let mut outcome = resolved.outcome.clone();
         let mut override_used = None;
         if let Some(override_id) = override_id {
@@ -483,7 +514,7 @@ impl PolicyStore {
             policy_version: request.policy_version.clone(),
             policy_digest: request.policy_digest.clone(),
             outcome: outcome.clone(),
-            classification: classification.clone(),
+            classification: effective_classification,
             applicable_clause_ids: resolved.clause_ids.clone(),
             resolved_profile: resolved.profile.clone(),
             reason: resolved.reason.clone(),
@@ -529,7 +560,8 @@ impl PolicyStore {
         decision
             .validate_for_request(&request)
             .map_err(|e| PolicyStoreError::Invalid(e.to_string()))?;
-        tx.execute("INSERT INTO policy_decisions (decision_id, request_id, attempt, override_id, decision_json, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![decision.decision_id, request_id, attempt, override_used, serde_json::to_string(&decision)?, decision.decided_at])?;
+        let decision_json = serde_json::to_string(&decision)?;
+        tx.execute("INSERT INTO policy_decisions (decision_id, request_id, attempt, override_id, decision_json, decision_digest, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![decision.decision_id, request_id, attempt, override_used, decision_json, text_digest(&serde_json::to_string(&decision)?), decision.decided_at])?;
         if let Some(override_id) = override_used {
             consume_override_tx(&tx, override_id, now)?;
         }
@@ -672,9 +704,10 @@ impl PolicyStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(r#"
             CREATE TABLE IF NOT EXISTS policy_projections (lane TEXT NOT NULL, policy_version TEXT NOT NULL, policy_digest TEXT NOT NULL, projection_json TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (lane, policy_version, policy_digest));
+            CREATE TABLE IF NOT EXISTS policy_active_projections (lane TEXT PRIMARY KEY, policy_version TEXT NOT NULL, policy_digest TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS policy_runtime_versions (lane TEXT PRIMARY KEY, topology_version INTEGER NOT NULL, capacity_version INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS policy_requests (request_id TEXT PRIMARY KEY, lane TEXT NOT NULL, request_digest TEXT NOT NULL, request_json TEXT NOT NULL, created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS policy_decisions (decision_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, attempt INTEGER NOT NULL, override_id TEXT, decision_json TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(request_id, attempt), UNIQUE(request_id, override_id));
+            CREATE TABLE IF NOT EXISTS policy_decisions (decision_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, attempt INTEGER NOT NULL, override_id TEXT, decision_json TEXT NOT NULL, decision_digest TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(request_id, attempt), UNIQUE(request_id, override_id));
             CREATE TABLE IF NOT EXISTS policy_capacity_leases (lease_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, provisional_child_session_id TEXT NOT NULL, state TEXT NOT NULL, expires_at TEXT NOT NULL, released_at TEXT, lease_json TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS policy_capacity_claims (lease_id TEXT NOT NULL, dimension TEXT NOT NULL, claim_key TEXT NOT NULL, units INTEGER NOT NULL, PRIMARY KEY (lease_id, dimension, claim_key));
             CREATE TABLE IF NOT EXISTS policy_provisional_children (child_session_id TEXT PRIMARY KEY, lease_id TEXT NOT NULL UNIQUE, request_id TEXT NOT NULL, decision_id TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, released_at TEXT);
@@ -688,6 +721,7 @@ impl PolicyStore {
             "provisional_child_session_id",
             "TEXT",
         )?;
+        ensure_column(&conn, "policy_decisions", "decision_digest", "TEXT")?;
         conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_active_lease_child ON policy_capacity_leases(provisional_child_session_id) WHERE state = 'active';")?;
         Ok(conn)
     }
@@ -789,16 +823,8 @@ fn requested_profile_conflicts(
 ) -> bool {
     request.requested.vehicle != profile.vehicle
         || request.requested.provider != profile.provider
-        || request
-            .requested
-            .model
-            .as_deref()
-            .is_some_and(|model| model != profile.model)
-        || request
-            .requested
-            .effort
-            .as_deref()
-            .is_some_and(|effort| effort != profile.effort)
+        || request.requested.model.as_deref() != Some(profile.model.as_str())
+        || request.requested.effort.as_deref() != Some(profile.effort.as_str())
 }
 
 fn authorize_caller(projection: &PolicyProjection, request: &PolicySpawnRequest) -> Result<()> {
@@ -1008,16 +1034,21 @@ fn load_terminal_decision(
     request_id: &str,
     decision_id: &str,
 ) -> Result<PolicyDecision> {
-    let value = tx
+    let (stored_decision_id, digest, value): (String, String, String) = tx
         .query_row(
-            "SELECT decision_json FROM policy_decisions WHERE request_id = ?1 AND decision_id = ?2",
+            "SELECT decision_id, decision_digest, decision_json FROM policy_decisions WHERE request_id = ?1 AND decision_id = ?2",
             params![request_id, decision_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?
         .ok_or_else(|| {
             PolicyStoreError::OverrideDenied("override points to a missing decision".into())
         })?;
+    if stored_decision_id != decision_id || text_digest(&value) != digest {
+        return Err(PolicyStoreError::Invalid(
+            "stored terminal decision digest does not match".into(),
+        ));
+    }
     Ok(serde_json::from_str(&value)?)
 }
 
@@ -1077,12 +1108,17 @@ fn load_reusable_decision(
     override_id: Option<&str>,
 ) -> Result<Option<PolicyDecision>> {
     let value = match override_id {
-        Some(id) => tx.query_row("SELECT decision_id, decision_json FROM policy_decisions WHERE request_id = ?1 AND override_id = ?2", params![request.request_id, id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).optional()?,
-        None => tx.query_row("SELECT decision_id, decision_json FROM policy_decisions WHERE request_id = ?1 AND override_id IS NULL ORDER BY attempt ASC LIMIT 1", [&request.request_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).optional()?,
+        Some(id) => tx.query_row("SELECT decision_id, decision_digest, decision_json FROM policy_decisions WHERE request_id = ?1 AND override_id = ?2", params![request.request_id, id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).optional()?,
+        None => tx.query_row("SELECT decision_id, decision_digest, decision_json FROM policy_decisions WHERE request_id = ?1 AND override_id IS NULL ORDER BY attempt ASC LIMIT 1", [&request.request_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))).optional()?,
     };
-    let Some((stored_decision_id, json)) = value else {
+    let Some((stored_decision_id, digest, json)) = value else {
         return Ok(None);
     };
+    if text_digest(&json) != digest {
+        return Err(PolicyStoreError::Invalid(
+            "stored reusable decision digest does not match".into(),
+        ));
+    }
     let decision: PolicyDecision = serde_json::from_str(&json)?;
     decision
         .validate_for_request(request)
@@ -1185,6 +1221,9 @@ fn derived_id(prefix: &str, values: &[&str]) -> String {
         digest.update([0]);
     }
     format!("{prefix}-{:x}", digest.finalize())
+}
+fn text_digest(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 fn default_true() -> bool {
     true
@@ -1304,6 +1343,10 @@ mod tests {
         model: Option<&str>,
         intent: &str,
     ) -> PolicySpawnRequest {
+        let canonical_model = match vehicle {
+            PolicyVehicle::NamedSeat => "opus",
+            PolicyVehicle::TaskAgent => "sonnet",
+        };
         PolicySpawnRequest {
             schema: SPAWN_REQUEST_SCHEMA.into(),
             request_id: id.into(),
@@ -1321,8 +1364,8 @@ mod tests {
                 name: id.into(),
                 vehicle,
                 provider: "claude".into(),
-                model: model.map(str::to_owned),
-                effort: None,
+                model: Some(model.unwrap_or(canonical_model).to_owned()),
+                effort: Some("high".into()),
                 working_dir: "/tmp/work".into(),
                 node: "local".into(),
             },
@@ -1347,8 +1390,12 @@ mod tests {
         let (store, path) = store("omitted-models");
         store.install_projection(&projection(true, 2)).unwrap();
         store.set_runtime_versions("sm-policy-1268", 1, 1).unwrap();
-        let aa6c1120 = request("aa6c1120", PolicyVehicle::TaskAgent, None, "intent-aa");
-        let root = request("2260296e", PolicyVehicle::NamedSeat, None, "intent-root");
+        let mut aa6c1120 = request("aa6c1120", PolicyVehicle::TaskAgent, None, "intent-aa");
+        aa6c1120.requested.model = None;
+        aa6c1120.requested.effort = None;
+        let mut root = request("2260296e", PolicyVehicle::NamedSeat, None, "intent-root");
+        root.requested.model = None;
+        root.requested.effort = None;
         store.create_request(&aa6c1120).unwrap();
         store.create_request(&root).unwrap();
         let now = instant("2026-08-17T00:01:00Z");
@@ -1374,8 +1421,8 @@ mod tests {
             .decision;
         assert_eq!(worker.resolved_profile.unwrap().model, "sonnet");
         assert_eq!(named.resolved_profile.unwrap().model, "opus");
-        assert!(matches!(worker.outcome, PolicyDecisionOutcome::Allow));
-        assert!(matches!(named.outcome, PolicyDecisionOutcome::Allow));
+        assert!(matches!(worker.outcome, PolicyDecisionOutcome::Rewrite));
+        assert!(matches!(named.outcome, PolicyDecisionOutcome::Rewrite));
         std::fs::remove_file(path).ok();
     }
 
