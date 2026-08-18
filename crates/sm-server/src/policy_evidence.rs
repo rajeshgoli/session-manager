@@ -7,7 +7,7 @@
 use std::{fs, path::PathBuf, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -123,10 +123,15 @@ impl PolicyEvidenceStore {
     /// Appends one immutable envelope. Repeating the exact same event ID is a
     /// success; changing its contents is rejected rather than silently merged.
     pub fn append(&self, event: &PolicyEventEnvelope) -> Result<AppendPolicyEventResult> {
-        validate_event(event)?;
+        let mut event = event.clone();
+        event.occurred_at = normalize_timestamp(&event.occurred_at)?;
+        validate_event(&event)?;
         let encoded_payload = serde_json::to_string(&event.payload)?;
         let mut connection = self.open()?;
-        let tx = connection.transaction()?;
+        // A deferred read transaction cannot be safely upgraded after another
+        // append commits. IMMEDIATE makes duplicate retries serial and lets the
+        // second writer observe the first writer's durable event.
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing = tx
             .query_row(
                 "SELECT ordinal, sequence, event_type, operation_id, lane, seat_key, session_id, occurred_at, payload_schema, payload FROM policy_events WHERE event_id = ?1",
@@ -174,8 +179,8 @@ impl PolicyEvidenceStore {
             params![event.event_id, event.sequence as i64, event.event_type, event.operation_id, event.lane, event.seat_key, event.session_id, event.occurred_at, event.payload_schema, encoded_payload, OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?],
         )?;
         let ordinal = tx.last_insert_rowid();
-        index_links(&tx, event)?;
-        index_requirement_effect(&tx, event)?;
+        index_links(&tx, &event)?;
+        index_requirement_effect(&tx, &event)?;
         tx.commit()?;
         Ok(AppendPolicyEventResult {
             event_id: event.event_id.clone(),
@@ -381,15 +386,48 @@ fn validate_event(event: &PolicyEventEnvelope) -> Result<()> {
         let _ = wall_time_from_payload_checked(&event.payload)?;
     }
     if event.event_type == "requirement_effect" {
-        let requirement_id = string_field(&event.payload, "requirement_id")?;
-        let _ = requirement_id;
-        for field in ["incremental_cost", "benefit"] {
-            if !event.payload.get(field).is_some_and(Value::is_object) {
-                bail!("requirement_effect.{field} must be a JSON object");
-            }
+        let _ = string_field(&event.payload, "requirement_id")?;
+        let cost = event
+            .payload
+            .get("incremental_cost")
+            .ok_or_else(|| anyhow!("requirement_effect.incremental_cost is required"))?;
+        validate_measurement(cost, "requirement_effect.incremental_cost")?;
+        let benefit = event
+            .payload
+            .get("benefit")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("requirement_effect.benefit must be a JSON object"))?;
+        if benefit.is_empty() {
+            bail!("requirement_effect.benefit must not be empty");
         }
     }
     Ok(())
+}
+
+fn validate_measurement(value: &Value, name: &str) -> Result<()> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{name} must be a JSON object"))?;
+    let raw_usage = object
+        .get("usage")
+        .or_else(|| object.get("usage_counters"))
+        .ok_or_else(|| anyhow!("{name} requires numeric usage counters"))?;
+    let usage = serde_json::from_value::<PolicyUsageCounters>(raw_usage.clone())
+        .with_context(|| format!("{name} usage counters are malformed"))?;
+    validate_usage(&usage)?;
+    validate_provider_boundary(value)?;
+    if object.get("wall_time").is_some() {
+        let _ = wall_time_from_payload_checked(value)?;
+    }
+    Ok(())
+}
+
+fn normalize_timestamp(value: &str) -> Result<String> {
+    OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+        .context("policy event occurred_at must be RFC 3339")?
+        .to_offset(time::UtcOffset::UTC)
+        .format(&time::format_description::well_known::Rfc3339)
+        .context("failed to normalize policy event occurred_at")
 }
 
 fn validate_provider_boundary(payload: &Value) -> Result<()> {
@@ -726,13 +764,17 @@ mod tests {
         let mut effect = event(
             "effect",
             1,
-            json!({"requirement_id":"model-attestation","incremental_cost":{"tokens":usage(true)},"benefit":{"status":"no_observed_benefit"},"links":{"decision_id":"decision-1"}}),
+            json!({"requirement_id":"model-attestation","incremental_cost":{"usage":usage(true),"provider_boundary":{"thread_id":"thread-a","before":{"event_seq":10},"after":{"event_seq":11}}},"benefit":{"status":"no_observed_benefit"},"links":{"decision_id":"decision-1"}}),
         );
         effect.event_type = "requirement_effect".to_owned();
         store.append(&effect).unwrap();
         assert_eq!(store.trial("sm-policy-1268").unwrap().len(), 1);
         assert!(store.trial("other").unwrap().is_empty());
         assert_eq!(store.explain("decision-1").unwrap().events.len(), 1);
+        let mut invalid = effect;
+        invalid.event_id = "effect-invalid".to_owned();
+        invalid.payload["incremental_cost"]["usage"]["input_tokens"]["source"] = json!("unknown");
+        assert!(store.append(&invalid).is_err());
     }
 
     #[test]
@@ -772,5 +814,38 @@ mod tests {
                 json!({"wall_time":{"queue_wait_ms":0}})
             ))
             .is_err());
+    }
+
+    #[test]
+    fn normalizes_timestamps_and_rejects_invalid_ones() {
+        let dir = TempDir::new();
+        let store = PolicyEvidenceStore::new(dir.0.join("policy.db")).unwrap();
+        let mut offset = event("offset", 1, json!({}));
+        offset.occurred_at = "2026-08-16T17:00:00-07:00".to_owned();
+        store.append(&offset).unwrap();
+        assert_eq!(
+            store.events("sm-policy-1268").unwrap()[0]
+                .envelope
+                .occurred_at,
+            "2026-08-17T00:00:00Z"
+        );
+        let mut invalid = event("invalid-time", 2, json!({}));
+        invalid.occurred_at = "yesterday".to_owned();
+        assert!(store.append(&invalid).is_err());
+    }
+
+    #[test]
+    fn concurrent_duplicate_appends_are_idempotent() {
+        let dir = TempDir::new();
+        let store = PolicyEvidenceStore::new(dir.0.join("policy.db")).unwrap();
+        let first = store.clone();
+        let second = store.clone();
+        let event = event("concurrent", 1, json!({}));
+        let left = event.clone();
+        let first = std::thread::spawn(move || first.append(&left).unwrap());
+        let second = std::thread::spawn(move || second.append(&event).unwrap());
+        let results = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(results.iter().filter(|result| !result.duplicate).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.duplicate).count(), 1);
     }
 }
