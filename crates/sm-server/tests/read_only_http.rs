@@ -11445,6 +11445,28 @@ async fn runtime_restart_preserves_real_tmux_child_until_an_attributed_parent_re
     assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&tmux_socket, tmux_session));
 
+    let persisted_after_first_retire: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let first_provenance = persisted_after_first_retire["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "restartchild")
+        .unwrap()["terminal_provenance"]
+        .clone();
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app_after_restart.clone(),
+        "/sessions/restartchild/retire",
+        json!({ "requester_session_id": "restartparent" }),
+        &[("X-SM-Session-Credential", "restart-parent-credential")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "retired");
+    assert!(!tmux_session_exists(&tmux_socket, tmux_session));
+
     let (status, payload) = get_json(app_after_restart, "/sessions/restartchild").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["terminal_provenance"]["cause"], "explicit_retire");
@@ -11462,6 +11484,7 @@ async fn runtime_restart_preserves_real_tmux_child_until_an_attributed_parent_re
     assert_eq!(provenance["authority"], "authenticated_parent");
     assert_eq!(provenance["source"], "api_retire");
     assert_eq!(provenance["tmux_disposition"], "killed");
+    assert_eq!(provenance, &first_provenance);
 }
 
 #[tokio::test]

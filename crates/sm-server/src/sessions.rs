@@ -7417,6 +7417,13 @@ impl SessionStore {
                     return Ok(CoreRetireOutcome::NotChild);
                 }
             }
+            if raw_session_is_stopped(session) {
+                return Ok(CoreRetireOutcome::Retired(CoreRetireResult {
+                    ok: true,
+                    session_id: session_id.to_owned(),
+                    status: "retired".to_owned(),
+                }));
+            }
             raw_session_display_name(session, session_id)
         };
         // A terminal write and its rotation finalization share this one atomic
@@ -7500,6 +7507,13 @@ impl SessionStore {
                 {
                     return Ok(CoreRetireOutcome::NotChild);
                 }
+            }
+            if raw_session_is_stopped(session) {
+                return Ok(CoreRetireOutcome::Retired(CoreRetireResult {
+                    ok: true,
+                    session_id: session_id.to_owned(),
+                    status: "retired".to_owned(),
+                }));
             }
             let node = json_text(session.get("node")).unwrap_or_else(default_node);
             let tmux_session = json_text(session.get("tmux_session"))
@@ -13585,6 +13599,13 @@ fn mark_session_runtime_missing_terminal(state: &mut Value, session_id: &str) ->
         let now = now_rfc3339();
         session.insert("status".to_owned(), Value::String("stopped".to_owned()));
         session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+        session.insert(
+            "terminal_provenance".to_owned(),
+            serde_json::to_value(TerminalProvenance::tmux_disappearance(
+                &now,
+                "runtime_liveness_check",
+            ))?,
+        );
         session.insert("last_activity".to_owned(), Value::String(now));
     }
     Ok(())
@@ -13682,8 +13703,19 @@ fn mark_runtime_launch_failed(
         finalize_active_credential_rotations_for_terminal_session(state, session_id)?;
         let sessions = ensure_sessions_array_mut(state)?;
         if let Some(session) = session_object_mut(sessions, session_id) {
-            session.insert("status".to_owned(), Value::String("stopped".to_owned()));
-            session.insert("stopped_at".to_owned(), Value::String(now_rfc3339()));
+            if !raw_session_is_stopped(session) {
+                let now = now_rfc3339();
+                session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+                session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+                session.insert(
+                    "terminal_provenance".to_owned(),
+                    serde_json::to_value(TerminalProvenance::startup_reconciliation(
+                        &now,
+                        "runtime_launch_failed",
+                    ))?,
+                );
+                session.insert("last_activity".to_owned(), Value::String(now));
+            }
         }
     }
     Ok(())
@@ -15098,6 +15130,17 @@ impl TerminalProvenance {
             tmux_disposition: Some("absent".to_owned()),
         }
     }
+
+    fn startup_reconciliation(observed_at: &str, source: &str) -> Self {
+        Self {
+            cause: TerminalCause::StartupReconciliation,
+            observed_at: observed_at.to_owned(),
+            actor_session_id: None,
+            authority: "server_observed".to_owned(),
+            source: source.to_owned(),
+            tmux_disposition: None,
+        }
+    }
 }
 
 fn root_seat_id(record: &SessionRecord, records: &BTreeMap<&str, &SessionRecord>) -> String {
@@ -15849,6 +15892,16 @@ mod tests {
             "stopped_at".to_owned(),
             Value::String("2026-06-01T00:02:00Z".to_owned()),
         );
+        retired.insert(
+            "terminal_provenance".to_owned(),
+            json!({
+                "cause": "tmux_disappearance",
+                "observed_at": "2026-06-01T00:02:00Z",
+                "authority": "runtime_observed",
+                "source": "runtime_delivery_failed",
+                "tmux_disposition": "absent"
+            }),
+        );
         let mut state = json!({
             "sessions": [retired],
             "session_runtime_launches": [{
@@ -15881,7 +15934,81 @@ mod tests {
 
         assert_eq!(state["sessions"].as_array().unwrap().len(), 1);
         assert_eq!(state["sessions"][0]["completion_status"], "retired");
+        assert_eq!(
+            state["sessions"][0]["terminal_provenance"]["cause"],
+            "tmux_disappearance"
+        );
+        assert_eq!(
+            state["sessions"][0]["terminal_provenance"]["observed_at"],
+            "2026-06-01T00:02:00Z"
+        );
         assert_eq!(state["session_runtime_launches"][0]["status"], "failed");
+    }
+
+    #[test]
+    fn runtime_missing_terminal_records_observed_tmux_provenance() {
+        let mut state = json!({
+            "sessions": [reparent_test_session("missing01", None, "secret")]
+        });
+
+        mark_session_runtime_missing_terminal(&mut state, "missing01").unwrap();
+
+        assert_eq!(state["sessions"][0]["status"], "stopped");
+        assert_eq!(
+            state["sessions"][0]["terminal_provenance"]["cause"],
+            "tmux_disappearance"
+        );
+        assert_eq!(
+            state["sessions"][0]["terminal_provenance"]["authority"],
+            "runtime_observed"
+        );
+        assert_eq!(
+            state["sessions"][0]["terminal_provenance"]["source"],
+            "runtime_liveness_check"
+        );
+    }
+
+    #[test]
+    fn failed_runtime_launch_records_startup_provenance() {
+        let mut state = json!({
+            "sessions": [reparent_test_session("launch01", None, "secret")],
+            "session_runtime_launches": [{
+                "id": "launch01",
+                "operation_kind": "restore",
+                "session_id": "launch01",
+                "tmux_session": "claude-launch01",
+                "working_dir": "/repo",
+                "log_file": "/tmp/launch01.log",
+                "provider": "claude",
+                "credential_sha256": sha256_text("secret"),
+                "status": "launching",
+                "created_at": "2026-06-01T00:00:00Z",
+                "updated_at": "2026-06-01T00:00:00Z"
+            }]
+        });
+
+        mark_runtime_launch_failed(
+            &mut state,
+            "launch01",
+            "launch01",
+            false,
+            "runtime exited during recovery",
+        )
+        .unwrap();
+
+        assert_eq!(state["sessions"][0]["status"], "stopped");
+        assert_eq!(
+            state["sessions"][0]["terminal_provenance"]["cause"],
+            "startup_reconciliation"
+        );
+        assert_eq!(
+            state["sessions"][0]["terminal_provenance"]["authority"],
+            "server_observed"
+        );
+        assert_eq!(
+            state["sessions"][0]["terminal_provenance"]["source"],
+            "runtime_launch_failed"
+        );
     }
 
     static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
