@@ -88,6 +88,7 @@ pub struct SessionStore {
     credential_rotation_workers: Arc<Mutex<BTreeSet<String>>>,
     seat_session_appends: Arc<Mutex<BTreeSet<(String, String, String)>>>,
     clear_operation_locks: Arc<Mutex<BTreeMap<String, Weak<SessionClearLock>>>>,
+    terminal_runtime_fence_epochs: Arc<Mutex<BTreeMap<String, u64>>>,
     seat_session_store: SeatSessionStore,
     usage_identity_store: Option<UsageIdentityStore>,
     usage_burn_store: Option<UsageBurnStore>,
@@ -209,6 +210,7 @@ impl SessionStore {
             credential_rotation_workers: Arc::new(Mutex::new(BTreeSet::new())),
             seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            terminal_runtime_fence_epochs: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
             usage_identity_store: None,
             usage_burn_store: None,
@@ -883,36 +885,29 @@ impl SessionStore {
         let terminal_launches = {
             let _guard = self.write_guard()?;
             let state = self.load_raw_json_value()?;
-            terminal_runtime_teardown_records(&state)?
-        };
-        let candidate_ids = terminal_launches
-            .iter()
-            .map(|launch| launch.id.as_str())
-            .collect::<BTreeSet<_>>();
-        // Restore and terminal teardown share a per-session gate. Acquire the
-        // deduplicated gates in sorted order, then revalidate every candidate
-        // in one short state-lock pass. This keeps tmux work outside the
-        // global lock without turning the once-per-second reconciliation into
-        // a full state-file scan per terminal fence.
-        let _lifecycle_guards = terminal_launches
-            .iter()
-            .map(|launch| launch.session_id.as_str())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .map(|session_id| self.lock_terminal_runtime_fence(session_id))
-            .collect::<Result<Vec<_>>>()?;
-        let launches = {
-            let _guard = self.write_guard()?;
-            let state = self.load_raw_json_value()?;
+            let mut epochs = self
+                .terminal_runtime_fence_epochs
+                .lock()
+                .map_err(|_| anyhow::anyhow!("terminal runtime fence epoch registry poisoned"))?;
             terminal_runtime_teardown_records(&state)?
                 .into_iter()
-                .filter(|launch| candidate_ids.contains(launch.id.as_str()))
+                .map(|launch| {
+                    let epoch = *epochs.entry(launch.session_id.clone()).or_default();
+                    (launch, epoch)
+                })
                 .collect::<Vec<_>>()
         };
-        for launch in launches {
-            runtime
-                .for_socket_name(launch.tmux_socket_name.as_deref())
-                .kill_session(&launch.tmux_session)?;
+        for (launch, epoch) in terminal_launches {
+            // Restore increments its epoch while holding this same gate and
+            // the state lock. A changed epoch proves this candidate's terminal
+            // snapshot is stale; otherwise the held gate excludes a future
+            // restore until this teardown attempt is complete.
+            let _lifecycle_guard = self.lock_terminal_runtime_fence(&launch.session_id)?;
+            if self.terminal_runtime_fence_epoch(&launch.session_id)? == epoch {
+                runtime
+                    .for_socket_name(launch.tmux_socket_name.as_deref())
+                    .kill_session(&launch.tmux_session)?;
+            }
         }
         Ok(())
     }
@@ -1590,6 +1585,7 @@ impl SessionStore {
             credential_rotation_workers: Arc::new(Mutex::new(BTreeSet::new())),
             seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            terminal_runtime_fence_epochs: Arc::new(Mutex::new(BTreeMap::new())),
             seat_session_store,
             usage_identity_store: None,
             usage_burn_store: None,
@@ -5358,6 +5354,27 @@ impl SessionStore {
         self.lock_named_clear_operation(&format!("terminal-runtime-fence:{session_id}"))
     }
 
+    fn terminal_runtime_fence_epoch(&self, session_id: &str) -> Result<u64> {
+        let mut epochs = self
+            .terminal_runtime_fence_epochs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal runtime fence epoch registry poisoned"))?;
+        Ok(*epochs.entry(session_id.to_owned()).or_default())
+    }
+
+    /// Call while holding the state mutation lock. The paired reconciler takes
+    /// that lock before sampling the epoch, so this is ordered with the
+    /// durable restore transition as well as its per-session lifecycle gate.
+    fn advance_terminal_runtime_fence_epoch(&self, session_id: &str) -> Result<()> {
+        let mut epochs = self
+            .terminal_runtime_fence_epochs
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal runtime fence epoch registry poisoned"))?;
+        let epoch = epochs.entry(session_id.to_owned()).or_default();
+        *epoch = epoch.wrapping_add(1);
+        Ok(())
+    }
+
     fn lock_codex_cli_binding_working_dir(&self, working_dir: &str) -> Result<SessionClearGuard> {
         let sessions_root = resolve_path_lossy(self.codex_sessions_root.clone());
         let working_dir = resolve_path_lossy(expand_home(working_dir));
@@ -5521,6 +5538,7 @@ impl SessionStore {
             reasoning_effort: record.reasoning_effort.clone(),
         };
         let codex_fork_artifacts = session_runtime.codex_fork_runtime_artifacts(&spec)?;
+        self.advance_terminal_runtime_fence_epoch(session_id)?;
         let mut launch_records = session_runtime_launch_records(&state)?;
         let launch_id = generate_unique_runtime_launch_id(&launch_records)?;
         let launch_time = now_rfc3339();
