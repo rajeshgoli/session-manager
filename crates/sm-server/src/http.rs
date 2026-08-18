@@ -882,14 +882,35 @@ fn attest_policy_session(
     let event_stream_path = session_store
         .codex_fork_event_stream_path(child, &runtime)
         .context("provider event stream path is unavailable")?;
-    let attestation = attest_codex_fork_launch_file(
-        &event_stream_path,
-        profile,
-        &admission.decision.decision_id,
-        &admission.request.launch_intent_id,
-        &child.id,
-        provider_resume_id,
-    )?;
+    let started = Instant::now();
+    let evidence_wait = if config.rust_core.runtime_enabled {
+        Duration::from_secs(10)
+    } else {
+        Duration::ZERO
+    };
+    let attestation = loop {
+        match attest_codex_fork_launch_file(
+            &event_stream_path,
+            profile,
+            &admission.decision.decision_id,
+            &admission.request.launch_intent_id,
+            &child.id,
+            provider_resume_id,
+        ) {
+            Ok(attestation) => break attestation,
+            Err(error)
+                if matches!(
+                    error.code,
+                    "codex_event_stream_unavailable"
+                        | "missing_codex_launch_settings"
+                        | "invalid_codex_event_json"
+                ) && started.elapsed() < evidence_wait =>
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
     let result = PolicyAdmissionResult {
         schema: ADMISSION_RESULT_SCHEMA.to_owned(),
         outcome: PolicyAdmissionOutcome::Allowed {
