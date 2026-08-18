@@ -14967,7 +14967,7 @@ async fn runtime_core_spawn_brief_ack_timeout_is_recoverable_and_never_retries()
 }
 
 #[tokio::test]
-async fn runtime_core_spawn_brief_fails_closed_when_provider_has_no_acknowledgement() {
+async fn runtime_core_claude_spawn_brief_never_retries_an_unobserved_submission() {
     if !tmux_available() {
         return;
     }
@@ -14988,18 +14988,18 @@ async fn runtime_core_spawn_brief_fails_closed_when_provider_has_no_acknowledgem
         &state_file,
         &log_dir,
         &tmux_socket,
-        r#"/bin/sh -lc 'printf ">\n"; while IFS= read -r line; do printf "received:%s\n>\n" "$line"; done' runtime-sh"#,
+        r#"/bin/sh -lc 'printf ">"; while IFS= read -r line; do printf "\nreceived:%s\n>" "$line"; done' runtime-sh"#,
     );
 
     let (status, payload) = post_json(
         app,
         "/sessions",
         json!({
-            "id": "briefunverified",
-            "name": "brief-unverified",
+            "id": "claudeunobserved",
+            "name": "claude-unobserved",
             "working_dir": working_dir.display().to_string(),
             "provider": "claude",
-            "initial_message": "UNVERIFIED_SENTINEL",
+            "initial_message": "CLAUDE_UNOBSERVED_SENTINEL",
             "spawn_prompt_source": {"kind": "positional"}
         }),
     )
@@ -15008,13 +15008,61 @@ async fn runtime_core_spawn_brief_fails_closed_when_provider_has_no_acknowledgem
     assert!(payload["detail"]
         .as_str()
         .unwrap()
-        .contains("no equivalent provider-originated acknowledgement"));
+        .contains("not resent to avoid duplicate work"));
     let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
     let launch = &state["session_runtime_launches"][0];
     assert_eq!(launch["status"], "failed");
-    assert!(!fs::read_to_string(launch["log_file"].as_str().unwrap())
-        .unwrap_or_default()
-        .contains("UNVERIFIED_SENTINEL"));
+    let logs = fs::read_to_string(launch["log_file"].as_str().unwrap()).unwrap_or_default();
+    assert_eq!(
+        logs.matches("received:CLAUDE_UNOBSERVED_SENTINEL").count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn runtime_core_claude_spawn_brief_accepts_provider_turn_transition() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-claude-brief-accepted-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app_with_command(
+        &state_file,
+        &log_dir,
+        &tmux_socket,
+        r#"/bin/sh -lc 'printf ">"; while IFS= read -r line; do printf "\nreceived:%s\n✽ Thinking through the initial brief\n" "$line"; done' runtime-sh"#,
+    );
+
+    let (status, payload) = post_json(
+        app,
+        "/sessions",
+        json!({
+            "id": "claudeaccepted",
+            "name": "claude-accepted",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "CLAUDE_ACCEPTED_SENTINEL",
+            "spawn_prompt_source": {"kind": "file", "path": "/tmp/claude-accepted.md"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let launch = &state["session_runtime_launches"][0];
+    assert_eq!(launch["status"], "applied");
+    let logs = fs::read_to_string(launch["log_file"].as_str().unwrap()).unwrap_or_default();
+    assert_eq!(logs.matches("received:CLAUDE_ACCEPTED_SENTINEL").count(), 1);
 }
 
 #[tokio::test]
@@ -19723,6 +19771,8 @@ fn runtime_app_with_command(
             runtime_command: Some(runtime_command.to_owned()),
             runtime_prompt_mode: Some("stdin".to_owned()),
             runtime_start_settle_ms: Some(100),
+            runtime_initial_brief_ready_timeout_ms: Some(2_000),
+            runtime_initial_brief_ack_timeout_ms: Some(300),
             send_keys_settle_ms: Some(10.0),
             send_keys_settle_max_ms: Some(50.0),
             send_keys_max_chunk_chars: Some(128),
