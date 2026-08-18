@@ -867,6 +867,32 @@ impl SessionStore {
         if !matches!(launch.status.as_str(), "prepared" | "launching") {
             return Ok(());
         }
+        let terminal_session = snapshot_from_raw_value(&state)?
+            .sessions
+            .iter()
+            .find(|session| session.id == launch.session_id)
+            .is_some_and(|session| {
+                completion_status_is_retired(session.completion_status.as_deref())
+            });
+        if terminal_session && !launch.is_authorized_restore_intent() {
+            // Recovery is allowed to reconstruct interrupted launches, never
+            // to revive a seat whose durable lifecycle has already become
+            // terminal.  Finalize both records before any runtime/provider
+            // operation so a later recovery pass cannot resurrect it.
+            finalize_active_credential_rotations_for_terminal_session(
+                &mut state,
+                &launch.session_id,
+            )?;
+            mark_runtime_launch_failed(
+                &mut state,
+                launch_id,
+                &launch.session_id,
+                false,
+                "target_terminal",
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(());
+        }
         let Some(runtime) = self.delivery_runtime.as_ref() else {
             mark_runtime_launch_failed(
                 &mut state,
@@ -1181,15 +1207,16 @@ impl SessionStore {
         }
         let rotation = rotation.expect("waiting rotation checked above");
         let session = session.expect("waiting rotation session checked above");
+        if !session.is_live_for_registry() {
+            self.finalize_terminal_credential_rotation(&rotation.id, session_id)?;
+            return Ok(true);
+        }
         let Some(runtime) = self.delivery_runtime.as_ref() else {
             return Ok(true);
         };
         let session_runtime = runtime.for_socket_name(rotation.tmux_socket_name.as_deref());
         if !session_runtime.session_exists(&rotation.tmux_session)? {
-            self.fail_waiting_credential_rotation(
-                &rotation.id,
-                "session runtime disappeared while waiting for idle",
-            )?;
+            self.finalize_missing_runtime_credential_rotation(&rotation.id, session_id)?;
             return Ok(true);
         }
         if !credential_rotation_has_fresh_idle_proof(&rotation, &session)
@@ -1215,11 +1242,7 @@ impl SessionStore {
             return Ok(true);
         };
         if !session_runtime.session_exists(&rotation.tmux_session)? {
-            rotations[rotation_index].status = "failed".to_owned();
-            rotations[rotation_index].updated_at = now_rfc3339();
-            rotations[rotation_index].failure_reason =
-                Some("session runtime disappeared while waiting for idle".to_owned());
-            store_session_credential_rotation_records(&mut state, &rotations)?;
+            mark_session_runtime_missing_terminal(&mut state, session_id)?;
             self.write_raw_json_value(&state)?;
             return Ok(true);
         }
@@ -1237,8 +1260,12 @@ impl SessionStore {
             self.write_raw_json_value(&state)?;
             return Ok(true);
         };
-        if !session.is_live_for_registry()
-            || session.provider != rotation.provider
+        if !session.is_live_for_registry() {
+            finalize_active_credential_rotations_for_terminal_session(&mut state, session_id)?;
+            self.write_raw_json_value(&state)?;
+            return Ok(true);
+        }
+        if session.provider != rotation.provider
             || session.tmux_session != rotation.tmux_session
             || session.tmux_socket_name != rotation.tmux_socket_name
             || provider_resume_id_for_restore(&session).as_deref()
@@ -1311,6 +1338,7 @@ impl SessionStore {
             provider: session.provider.clone(),
             provider_resume_id: Some(rotation.provider_resume_id.clone()),
             credential_rotation_id: Some(rotation.id.clone()),
+            restore_authorized: false,
             initial_message: None,
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort.clone(),
@@ -1364,6 +1392,32 @@ impl SessionStore {
             return Ok(true);
         }
 
+        // The runtime could die after restore returns but before the durable
+        // applied transition.  Check it under the retained session mutation
+        // lock, then ensure a terminal writer did not finalize the rotation.
+        if !session_runtime.session_exists(&session.tmux_session)? {
+            mark_runtime_launch_failed(
+                &mut state,
+                &launch_id,
+                session_id,
+                false,
+                "target_terminal",
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(true);
+        }
+        let rotation_still_relaunching =
+            session_credential_rotation_records(&state)?
+                .iter()
+                .any(|record| {
+                    record.id == rotation.id
+                        && record.status == "relaunching"
+                        && record.runtime_launch_id.as_deref() == Some(launch_id.as_str())
+                });
+        if !rotation_still_relaunching {
+            return Ok(true);
+        }
+
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(raw_session) = session_object_mut(sessions, session_id) else {
             let _ = session_runtime.kill_session(&session.tmux_session);
@@ -1389,24 +1443,25 @@ impl SessionStore {
         Ok(true)
     }
 
-    fn fail_waiting_credential_rotation(
+    fn finalize_terminal_credential_rotation(
         &self,
-        rotation_id: &str,
-        failure_reason: &str,
+        _rotation_id: &str,
+        session_id: &str,
     ) -> Result<()> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
-        let mut rotations = session_credential_rotation_records(&state)?;
-        let Some(rotation) = rotations
-            .iter_mut()
-            .find(|record| record.id == rotation_id && record.status == "waiting_idle")
-        else {
-            return Ok(());
-        };
-        rotation.status = "failed".to_owned();
-        rotation.updated_at = now_rfc3339();
-        rotation.failure_reason = Some(failure_reason.to_owned());
-        store_session_credential_rotation_records(&mut state, &rotations)?;
+        finalize_active_credential_rotations_for_terminal_session(&mut state, session_id)?;
+        self.write_raw_json_value(&state)
+    }
+
+    fn finalize_missing_runtime_credential_rotation(
+        &self,
+        _rotation_id: &str,
+        session_id: &str,
+    ) -> Result<()> {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        mark_session_runtime_missing_terminal(&mut state, session_id)?;
         self.write_raw_json_value(&state)
     }
 
@@ -3940,6 +3995,8 @@ impl SessionStore {
                 return Ok(CredentialRotationOutcome::SessionNotFound);
             };
             if !session.is_live_for_registry() {
+                finalize_active_credential_rotations_for_terminal_session(&mut state, session_id)?;
+                self.write_raw_json_value(&state)?;
                 return Ok(CredentialRotationOutcome::BadRequest(format!(
                     "session {session_id} is stopped"
                 )));
@@ -3961,6 +4018,21 @@ impl SessionStore {
                     "session {session_id} has no resumable provider identity"
                 )));
             };
+            // The durable record can lag a provider/tmux exit.  Admission
+            // linearizes its liveness proof under the same mutation lock that
+            // writes `waiting_idle`; terminal scrollback is never consulted.
+            let runtime = self
+                .delivery_runtime
+                .as_ref()
+                .expect("runtime-backed rotation checked above");
+            let session_runtime = runtime.for_socket_name(session.tmux_socket_name.as_deref());
+            if !session_runtime.session_exists(&session.tmux_session)? {
+                mark_session_runtime_missing_terminal(&mut state, session_id)?;
+                self.write_raw_json_value(&state)?;
+                return Ok(CredentialRotationOutcome::BadRequest(format!(
+                    "session {session_id} is stopped"
+                )));
+            }
             let mut rotations = session_credential_rotation_records(&state)?;
             rotations.sort_by(|left, right| {
                 (&left.requested_at, &left.id).cmp(&(&right.requested_at, &right.id))
@@ -4183,6 +4255,7 @@ impl SessionStore {
             provider: record.provider.clone(),
             provider_resume_id: None,
             credential_rotation_id: None,
+            restore_authorized: false,
             initial_message: runtime_initial_message,
             model: request.model.clone(),
             reasoning_effort: request.reasoning_effort.clone(),
@@ -5379,6 +5452,10 @@ impl SessionStore {
             provider: record.provider.clone(),
             provider_resume_id: provider_resume_id.clone(),
             credential_rotation_id: None,
+            // This durable intent is written before the explicit restore
+            // clears a retired/killed completion marker. Startup recovery may
+            // continue only this authorized transition.
+            restore_authorized: true,
             initial_message: None,
             model: record.model.clone(),
             reasoning_effort: record.reasoning_effort.clone(),
@@ -7309,17 +7386,22 @@ impl SessionStore {
                     return Ok(CoreRetireOutcome::NotChild);
                 }
             }
-            let recipient_name = raw_session_display_name(session, session_id);
-            let now = now_rfc3339();
-            session.insert("status".to_owned(), Value::String("stopped".to_owned()));
-            mark_session_retired(session, &now);
-            session.insert("stopped_at".to_owned(), Value::String(now.clone()));
-            session.insert("last_activity".to_owned(), Value::String(now));
-            if let Some(log_file) = json_text(session.get("log_file")) {
-                append_log_line(&expand_home(&log_file), "[sm-rust] fixture session retired")?;
-            }
-            recipient_name
+            raw_session_display_name(session, session_id)
         };
+        // A terminal write and its rotation finalization share this one atomic
+        // state replacement, so recovery cannot later relaunch the seat.
+        finalize_active_credential_rotations_for_terminal_session(&mut state, session_id)?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let session = session_object_mut(sessions, session_id)
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during retire"))?;
+        let now = now_rfc3339();
+        session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+        mark_session_retired(session, &now);
+        session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+        session.insert("last_activity".to_owned(), Value::String(now));
+        if let Some(log_file) = json_text(session.get("log_file")) {
+            append_log_line(&expand_home(&log_file), "[sm-rust] fixture session retired")?;
+        }
         complete_stop_notify_after_stop_raw(self, &mut state, None, session_id, &recipient_name)?;
         self.write_raw_json_value(&state)?;
         Ok(CoreRetireOutcome::Retired(CoreRetireResult {
@@ -7363,6 +7445,9 @@ impl SessionStore {
         }
         let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
         let _ = session_runtime.kill_session(&tmux_session)?;
+        // A terminal write and its rotation finalization share this one atomic
+        // state replacement, so recovery cannot later relaunch the seat.
+        finalize_active_credential_rotations_for_terminal_session(&mut state, session_id)?;
         let now = now_rfc3339();
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let session = session_object_mut(sessions, session_id)
@@ -8010,6 +8095,7 @@ impl SessionStore {
         }
 
         let mut changed = false;
+        let mut terminal_provider_event = false;
         if let Some(event_type) = codex_fork_event_type(event)
             .map(|value| normalize_codex_fork_event_type(&value.replace('/', "_")))
         {
@@ -8061,6 +8147,7 @@ impl SessionStore {
             session.insert("last_activity".to_owned(), Value::String(now.clone()));
             if next_status == "stopped" {
                 session.insert("stopped_at".to_owned(), Value::String(now));
+                terminal_provider_event = true;
             } else {
                 session.insert("stopped_at".to_owned(), Value::Null);
             }
@@ -8146,6 +8233,13 @@ impl SessionStore {
                 runtime.as_ref(),
             )?;
             changed = true;
+        }
+
+        if terminal_provider_event {
+            // The provider is an authoritative terminal source.  Keep the
+            // rotation/launch finalization in the same durable write as this
+            // status transition so startup recovery cannot relaunch it.
+            finalize_active_credential_rotations_for_terminal_session(&mut state, session_id)?;
         }
 
         if changed {
@@ -10223,35 +10317,42 @@ fn deliver_runtime_text_to_session_raw(
     text: &str,
     runtime: &TmuxRuntime,
 ) -> Result<(String, bool)> {
-    let sessions = ensure_sessions_array_mut(state)?;
-    let session = session_object_mut(sessions, session_id)
-        .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
-    let node = json_text(session.get("node")).unwrap_or_else(default_node);
-    ensure_runtime_local_node(&node)?;
-    let mut status = effective_raw_session_status(session);
-    if raw_session_is_stopped(session) {
-        return Ok((status, false));
-    }
-    if claude_handoff_is_reserved_raw(session) {
-        return Ok((status, false));
-    }
-    let tmux_session = json_text(session.get("tmux_session"))
-        .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
-    let session_socket_name = json_text(session.get("tmux_socket_name"));
-    let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
-    let (delivered, mark_stopped_on_failure) =
-        match deliver_codex_fork_control_text_to_session_raw(session_id, session, text, runtime)? {
-            Some(true) => (true, true),
-            Some(false) if runtime.codex_fork_control_tmux_fallback_enabled() => {
-                (session_runtime.send_input(&tmux_session, text)?, true)
-            }
-            Some(false) => (false, false),
-            None => (session_runtime.send_input(&tmux_session, text)?, true),
-        };
-    let now = now_rfc3339();
-    if delivered {
-        mark_session_followup_activity(session, &now);
-    } else if mark_stopped_on_failure {
+    let (mut status, delivered, terminal_delivery_failure) = {
+        let sessions = ensure_sessions_array_mut(state)?;
+        let session = session_object_mut(sessions, session_id)
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
+        let node = json_text(session.get("node")).unwrap_or_else(default_node);
+        ensure_runtime_local_node(&node)?;
+        let status = effective_raw_session_status(session);
+        if raw_session_is_stopped(session) || claude_handoff_is_reserved_raw(session) {
+            return Ok((status, false));
+        }
+        let tmux_session = json_text(session.get("tmux_session"))
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+        let session_socket_name = json_text(session.get("tmux_socket_name"));
+        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
+        let (delivered, mark_stopped_on_failure) =
+            match deliver_codex_fork_control_text_to_session_raw(
+                session_id, session, text, runtime,
+            )? {
+                Some(true) => (true, true),
+                Some(false) if runtime.codex_fork_control_tmux_fallback_enabled() => {
+                    (session_runtime.send_input(&tmux_session, text)?, true)
+                }
+                Some(false) => (false, false),
+                None => (session_runtime.send_input(&tmux_session, text)?, true),
+            };
+        if delivered {
+            mark_session_followup_activity(session, &now_rfc3339());
+        }
+        (status, delivered, !delivered && mark_stopped_on_failure)
+    };
+    if terminal_delivery_failure {
+        finalize_active_credential_rotations_for_terminal_session(state, session_id)?;
+        let sessions = ensure_sessions_array_mut(state)?;
+        let session = session_object_mut(sessions, session_id)
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
+        let now = now_rfc3339();
         status = "stopped".to_owned();
         session.insert("status".to_owned(), Value::String(status.clone()));
         session.insert("stopped_at".to_owned(), Value::String(now.clone()));
@@ -10266,48 +10367,55 @@ fn deliver_urgent_runtime_text_to_session_raw(
     text: &str,
     runtime: &TmuxRuntime,
 ) -> Result<(String, bool)> {
-    let sessions = ensure_sessions_array_mut(state)?;
-    let session = session_object_mut(sessions, session_id)
-        .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
-    let node = json_text(session.get("node")).unwrap_or_else(default_node);
-    ensure_runtime_local_node(&node)?;
-    let mut status = effective_raw_session_status(session);
-    if raw_session_is_stopped(session) {
-        return Ok((status, false));
-    }
-    if claude_handoff_is_reserved_raw(session) {
-        return Ok((status, false));
-    }
-    let tmux_session = json_text(session.get("tmux_session"))
-        .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
-    let provider = json_text(session.get("provider")).unwrap_or_else(|| "claude".to_owned());
-    let session_socket_name = json_text(session.get("tmux_socket_name"));
-    let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
-    let (delivered, mark_stopped_on_failure) =
-        match deliver_codex_fork_control_text_to_session_raw(session_id, session, text, runtime)? {
-            Some(true) => (true, true),
-            Some(false) if runtime.codex_fork_control_tmux_fallback_enabled() => (
-                session_runtime.send_urgent_input(
-                    &tmux_session,
-                    text,
-                    provider.eq_ignore_ascii_case("claude"),
-                )?,
-                true,
-            ),
-            Some(false) => (false, false),
-            None => (
-                session_runtime.send_urgent_input(
-                    &tmux_session,
-                    text,
-                    provider.eq_ignore_ascii_case("claude"),
-                )?,
-                true,
-            ),
-        };
-    let now = now_rfc3339();
-    if delivered {
-        mark_session_followup_activity(session, &now);
-    } else if mark_stopped_on_failure {
+    let (mut status, delivered, terminal_delivery_failure) = {
+        let sessions = ensure_sessions_array_mut(state)?;
+        let session = session_object_mut(sessions, session_id)
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
+        let node = json_text(session.get("node")).unwrap_or_else(default_node);
+        ensure_runtime_local_node(&node)?;
+        let status = effective_raw_session_status(session);
+        if raw_session_is_stopped(session) || claude_handoff_is_reserved_raw(session) {
+            return Ok((status, false));
+        }
+        let tmux_session = json_text(session.get("tmux_session"))
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+        let provider = json_text(session.get("provider")).unwrap_or_else(|| "claude".to_owned());
+        let session_socket_name = json_text(session.get("tmux_socket_name"));
+        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
+        let (delivered, mark_stopped_on_failure) =
+            match deliver_codex_fork_control_text_to_session_raw(
+                session_id, session, text, runtime,
+            )? {
+                Some(true) => (true, true),
+                Some(false) if runtime.codex_fork_control_tmux_fallback_enabled() => (
+                    session_runtime.send_urgent_input(
+                        &tmux_session,
+                        text,
+                        provider.eq_ignore_ascii_case("claude"),
+                    )?,
+                    true,
+                ),
+                Some(false) => (false, false),
+                None => (
+                    session_runtime.send_urgent_input(
+                        &tmux_session,
+                        text,
+                        provider.eq_ignore_ascii_case("claude"),
+                    )?,
+                    true,
+                ),
+            };
+        if delivered {
+            mark_session_followup_activity(session, &now_rfc3339());
+        }
+        (status, delivered, !delivered && mark_stopped_on_failure)
+    };
+    if terminal_delivery_failure {
+        finalize_active_credential_rotations_for_terminal_session(state, session_id)?;
+        let sessions = ensure_sessions_array_mut(state)?;
+        let session = session_object_mut(sessions, session_id)
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during delivery"))?;
+        let now = now_rfc3339();
         status = "stopped".to_owned();
         session.insert("status".to_owned(), Value::String(status.clone()));
         session.insert("stopped_at".to_owned(), Value::String(now.clone()));
@@ -13273,6 +13381,74 @@ fn store_session_credential_rotation_records(
     Ok(())
 }
 
+/// Finalize every active rotation before a terminal session state is made
+/// visible.  A relaunching runtime launch must fail too: otherwise startup
+/// recovery could resurrect a seat after its terminal transition.
+fn finalize_active_credential_rotations_for_terminal_session(
+    state: &mut Value,
+    session_id: &str,
+) -> Result<()> {
+    let mut rotations = session_credential_rotation_records(state)?;
+    let active_rotation_ids = rotations
+        .iter()
+        .filter(|rotation| {
+            rotation.session_id == session_id
+                && matches!(rotation.status.as_str(), "waiting_idle" | "relaunching")
+        })
+        .map(|rotation| rotation.id.clone())
+        .collect::<BTreeSet<_>>();
+    if active_rotation_ids.is_empty() {
+        return Ok(());
+    }
+    let now = now_rfc3339();
+    for rotation in &mut rotations {
+        if active_rotation_ids.contains(&rotation.id) {
+            rotation.status = "failed".to_owned();
+            rotation.updated_at = now.clone();
+            rotation.failure_reason = Some("target_terminal".to_owned());
+        }
+    }
+    store_session_credential_rotation_records(state, &rotations)?;
+
+    let mut launches = session_runtime_launch_records(state)?;
+    let mut launches_changed = false;
+    for launch in &mut launches {
+        if launch
+            .credential_rotation_id
+            .as_deref()
+            .is_some_and(|id| active_rotation_ids.contains(id))
+            && matches!(launch.status.as_str(), "prepared" | "launching")
+        {
+            launch.status = "failed".to_owned();
+            launch.updated_at = now.clone();
+            launch.failure_reason = Some("target_terminal".to_owned());
+            launches_changed = true;
+        }
+    }
+    if launches_changed {
+        store_session_runtime_launch_records(state, &launches)?;
+    }
+    Ok(())
+}
+
+/// Reconcile a missing local tmux runtime to durable terminal state without
+/// interpreting pane output.  This is only called while the caller holds the
+/// session mutation lock.
+fn mark_session_runtime_missing_terminal(state: &mut Value, session_id: &str) -> Result<()> {
+    finalize_active_credential_rotations_for_terminal_session(state, session_id)?;
+    let sessions = ensure_sessions_array_mut(state)?;
+    let Some(session) = session_object_mut(sessions, session_id) else {
+        return Ok(());
+    };
+    if !raw_session_is_stopped(session) {
+        let now = now_rfc3339();
+        session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+        session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+        session.insert("last_activity".to_owned(), Value::String(now));
+    }
+    Ok(())
+}
+
 fn mark_runtime_launch_applied(
     state: &mut Value,
     launch_id: &str,
@@ -13356,12 +13532,18 @@ fn mark_runtime_launch_failed(
             store_session_credential_rotation_records(state, &rotations)?;
         }
     }
-    let sessions = ensure_sessions_array_mut(state)?;
     if remove_provisional_session {
+        let sessions = ensure_sessions_array_mut(state)?;
         sessions.retain(|session| session.get("id").and_then(Value::as_str) != Some(session_id));
-    } else if let Some(session) = session_object_mut(sessions, session_id) {
-        session.insert("status".to_owned(), Value::String("stopped".to_owned()));
-        session.insert("stopped_at".to_owned(), Value::String(now_rfc3339()));
+    } else {
+        // A failed runtime launch leaves the seat terminal; fail any still
+        // active rotation before the terminal state reaches durable storage.
+        finalize_active_credential_rotations_for_terminal_session(state, session_id)?;
+        let sessions = ensure_sessions_array_mut(state)?;
+        if let Some(session) = session_object_mut(sessions, session_id) {
+            session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+            session.insert("stopped_at".to_owned(), Value::String(now_rfc3339()));
+        }
     }
     Ok(())
 }
@@ -14435,6 +14617,11 @@ pub struct SessionRuntimeLaunchRecord {
     pub provider_resume_id: Option<String>,
     #[serde(default)]
     pub credential_rotation_id: Option<String>,
+    /// Set only by explicit restore admission after it has authorized a
+    /// resumable provider identity. Legacy records default false and remain
+    /// terminal-fenced when their session has a retired/killed marker.
+    #[serde(default)]
+    pub restore_authorized: bool,
     #[serde(default)]
     pub initial_message: Option<String>,
     #[serde(default)]
@@ -14453,6 +14640,12 @@ pub struct SessionRuntimeLaunchRecord {
     pub updated_at: String,
     #[serde(default)]
     pub failure_reason: Option<String>,
+}
+
+impl SessionRuntimeLaunchRecord {
+    fn is_authorized_restore_intent(&self) -> bool {
+        self.operation_kind == "restore" && self.restore_authorized
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -15691,6 +15884,334 @@ mod tests {
             &rotation,
             &stock_codex
         ));
+    }
+
+    fn terminal_rotation_fixture(rotation_status: &str, launch_status: Option<&str>) -> Value {
+        let mut session = reparent_test_session("rotate01", None, "old-secret");
+        session["provider_resume_id"] = json!("provider-thread");
+        let mut state = json!({
+            "sessions": [session],
+            "session_credential_rotations": [{
+                "id": "rotation01",
+                "session_id": "rotate01",
+                "provider": "claude",
+                "provider_resume_id": "provider-thread",
+                "tmux_session": "claude-rotate01",
+                "request_actor": "operator",
+                "status": rotation_status,
+                "requested_at": "2026-06-01T00:00:00Z",
+                "updated_at": "2026-06-01T00:00:00Z"
+            }]
+        });
+        if let Some(launch_status) = launch_status {
+            state["session_runtime_launches"] = json!([{
+                "id": "launch01",
+                "operation_kind": "recredential",
+                "session_id": "rotate01",
+                "tmux_session": "claude-rotate01",
+                "working_dir": "/repo",
+                "log_file": "/tmp/rotate01.log",
+                "provider": "claude",
+                "provider_resume_id": "provider-thread",
+                "credential_rotation_id": "rotation01",
+                "credential_sha256": sha256_text("new-secret"),
+                "status": launch_status,
+                "created_at": "2026-06-01T00:00:00Z",
+                "updated_at": "2026-06-01T00:00:00Z"
+            }]);
+            state["session_credential_rotations"][0]["runtime_launch_id"] = json!("launch01");
+        }
+        state
+    }
+
+    fn isolated_test_tmux_runtime() -> (String, TmuxRuntime) {
+        // Rust durable-path isolation deliberately does not choose a tmux
+        // socket.  Tests which model a missing runtime must therefore use an
+        // unguessable private socket rather than accidentally inspecting or
+        // targeting the operator's default tmux server.
+        let socket_name = format!(
+            "sm-test-1322-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
+            .for_socket_name(Some(&socket_name));
+        (socket_name, runtime)
+    }
+
+    #[test]
+    fn credential_rotation_stopped_before_admission_is_first_call_truthful_and_idempotent() {
+        let state_file = unique_temp_path("credential-rotation-stopped-admission");
+        let mut state = terminal_rotation_fixture("waiting_idle", None);
+        state["sessions"][0]["status"] = json!("stopped");
+        fs::write(&state_file, state.to_string()).unwrap();
+        let store = SessionStore::new(state_file.clone()).with_delivery_runtime(Some(
+            TmuxRuntime::from_config(&crate::config::RustCoreConfig::default()),
+        ));
+
+        for _ in 0..2 {
+            assert!(matches!(
+                store.create_session_credential_rotation("rotate01", "operator").unwrap(),
+                CredentialRotationOutcome::BadRequest(detail) if detail == "session rotate01 is stopped"
+            ));
+        }
+        let state = store.load_raw_json_value().unwrap();
+        assert_eq!(state["sessions"][0]["status"], "stopped");
+        assert_eq!(state["session_credential_rotations"][0]["status"], "failed");
+        assert_eq!(
+            state["session_credential_rotations"][0]["failure_reason"],
+            "target_terminal"
+        );
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn credential_rotation_missing_runtime_admission_never_uses_tail_or_persists_waiting() {
+        let state_file = unique_temp_path("credential-rotation-missing-runtime-admission");
+        let mut state = terminal_rotation_fixture("failed", None);
+        state["session_credential_rotations"] = json!([]);
+        // Deliberately stale-looking log content is present but is not read by
+        // admission; only the missing tmux runtime decides terminal liveness.
+        state["sessions"][0]["log_file"] = json!("/tmp/stale-auth-scrollback.log");
+        let (tmux_socket_name, runtime) = isolated_test_tmux_runtime();
+        state["sessions"][0]["tmux_socket_name"] = json!(tmux_socket_name);
+        fs::write(&state_file, state.to_string()).unwrap();
+        let store = SessionStore::new(state_file.clone()).with_delivery_runtime(Some(runtime));
+
+        assert!(matches!(
+            store.create_session_credential_rotation("rotate01", "operator").unwrap(),
+            CredentialRotationOutcome::BadRequest(detail) if detail == "session rotate01 is stopped"
+        ));
+        let state = store.load_raw_json_value().unwrap();
+        assert_eq!(state["sessions"][0]["status"], "stopped");
+        assert!(state["session_credential_rotations"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn credential_rotation_stop_between_admission_and_worker_finalizes_waiting_record() {
+        let mut state = terminal_rotation_fixture("waiting_idle", None);
+        // Deterministic interleaving: admission already persisted waiting_idle,
+        // then the terminal writer wins before the worker's next poll.
+        state["sessions"][0]["status"] = json!("stopped");
+        finalize_active_credential_rotations_for_terminal_session(&mut state, "rotate01").unwrap();
+
+        assert_eq!(state["session_credential_rotations"][0]["status"], "failed");
+        assert_eq!(
+            state["session_credential_rotations"][0]["failure_reason"],
+            "target_terminal"
+        );
+        assert_eq!(state["sessions"][0]["status"], "stopped");
+    }
+
+    #[test]
+    fn credential_rotation_send_undeliverable_finalizes_waiting_record() {
+        let mut state = terminal_rotation_fixture("waiting_idle", None);
+        let (tmux_socket_name, runtime) = isolated_test_tmux_runtime();
+        state["sessions"][0]["tmux_socket_name"] = json!(tmux_socket_name);
+
+        let (status, delivered) =
+            deliver_runtime_text_to_session_raw(&mut state, "rotate01", "probe", &runtime).unwrap();
+
+        assert!(!delivered);
+        assert_eq!(status, "stopped");
+        assert_eq!(state["sessions"][0]["status"], "stopped");
+        assert_eq!(state["session_credential_rotations"][0]["status"], "failed");
+        assert_eq!(
+            state["session_credential_rotations"][0]["failure_reason"],
+            "target_terminal"
+        );
+    }
+
+    #[test]
+    fn credential_rotation_stop_immediately_before_apply_fails_launch_and_blocks_recovery() {
+        let mut state = terminal_rotation_fixture("relaunching", Some("launching"));
+        // Deterministic interleaving: the worker owns a prepared relaunch, then
+        // the terminal writer lands before its durable applied transition.
+        state["sessions"][0]["status"] = json!("stopped");
+        state["sessions"][0]["completion_status"] = json!("retired");
+        finalize_active_credential_rotations_for_terminal_session(&mut state, "rotate01").unwrap();
+
+        assert_eq!(state["session_credential_rotations"][0]["status"], "failed");
+        assert_eq!(state["session_runtime_launches"][0]["status"], "failed");
+        assert_eq!(
+            state["session_runtime_launches"][0]["failure_reason"],
+            "target_terminal"
+        );
+
+        let state_file = unique_temp_path("credential-rotation-terminal-recovery");
+        fs::write(&state_file, state.to_string()).unwrap();
+        let restarted = SessionStore::new(state_file.clone());
+        restarted.recover_session_runtime_launches().unwrap();
+        let recovered = restarted.load_raw_json_value().unwrap();
+        assert_eq!(recovered["sessions"][0]["status"], "stopped");
+        assert_eq!(
+            recovered["session_credential_rotations"][0]["status"],
+            "failed"
+        );
+        assert_eq!(recovered["session_runtime_launches"][0]["status"], "failed");
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_rotation_terminal_completion_marker_blocks_prepared_and_launching_recovery_without_runtime_invocation(
+    ) {
+        // The durable completion marker is authoritative even if a delayed
+        // activity-state writer left `status` looking idle.  Put a sentinel
+        // tmux binary first on PATH: recovery must finalize the records
+        // without invoking it for every persisted terminal-marker/launch
+        // interleaving.
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let root = unique_temp_path("terminal-marker-recovery");
+        fs::create_dir_all(&root).unwrap();
+        let tmux = root.join("tmux");
+        let invoked = root.join("runtime-invoked");
+        fs::write(
+            &tmux,
+            "#!/bin/sh\n: > \"$SM_1322_FAKE_TMUX_SENTINEL\"\nexit 99\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        let old_path = env::var_os("PATH").unwrap_or_default();
+        let _path = EnvVarRestore::set(
+            "PATH",
+            format!("{}:{}", root.display(), old_path.to_string_lossy()),
+        );
+        let _sentinel = EnvVarRestore::set("SM_1322_FAKE_TMUX_SENTINEL", &invoked);
+
+        for (completion_status, launch_status) in [
+            ("retired", "prepared"),
+            ("retired", "launching"),
+            ("killed", "prepared"),
+            ("killed", "launching"),
+        ] {
+            for operation_kind in ["create", "recredential", "restore"] {
+                let state_file = root.join(format!(
+                    "{completion_status}-{launch_status}-{operation_kind}.json"
+                ));
+                let mut state = terminal_rotation_fixture("relaunching", Some(launch_status));
+                // This is deliberately stale: the completion marker, not the
+                // projection, must fence recovery before provider/tmux work.
+                state["sessions"][0]["status"] = json!("idle");
+                state["sessions"][0]["completion_status"] = json!(completion_status);
+                state["sessions"][0]["stopped_at"] = json!("2026-06-01T00:01:00Z");
+                state["session_runtime_launches"][0]["operation_kind"] = json!(operation_kind);
+                // Missing is deliberately equivalent to false for legacy
+                // serialized launch records.
+                state["session_runtime_launches"][0]["restore_authorized"] = json!(false);
+                fs::write(&state_file, state.to_string()).unwrap();
+
+                let store = SessionStore::new(state_file.clone()).with_delivery_runtime(Some(
+                    TmuxRuntime::from_config(&crate::config::RustCoreConfig::default()),
+                ));
+                store.recover_session_runtime_launches().unwrap();
+
+                assert!(
+                    !invoked.exists(),
+                    "terminal {completion_status}/{launch_status}/{operation_kind} recovery invoked tmux"
+                );
+                let recovered = store.load_raw_json_value().unwrap();
+                assert_eq!(
+                    recovered["sessions"][0]["completion_status"],
+                    completion_status
+                );
+                assert_eq!(recovered["sessions"][0]["status"], "stopped");
+                assert_eq!(
+                    recovered["session_credential_rotations"][0]["status"],
+                    "failed"
+                );
+                assert_eq!(
+                    recovered["session_credential_rotations"][0]["failure_reason"],
+                    "target_terminal"
+                );
+                assert_eq!(recovered["session_runtime_launches"][0]["status"], "failed");
+                assert_eq!(
+                    recovered["session_runtime_launches"][0]["failure_reason"],
+                    "target_terminal"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn credential_rotation_authorized_restore_with_terminal_marker_continues_recovery() {
+        for (completion_status, launch_status) in [
+            ("retired", "prepared"),
+            ("retired", "launching"),
+            ("killed", "prepared"),
+            ("killed", "launching"),
+        ] {
+            let state_file = unique_temp_path("credential-rotation-authorized-restore");
+            let mut state = terminal_rotation_fixture("relaunching", Some(launch_status));
+            state["sessions"][0]["status"] = json!("stopped");
+            state["sessions"][0]["completion_status"] = json!(completion_status);
+            state["session_credential_rotations"] = json!([]);
+            state["session_runtime_launches"][0]["operation_kind"] = json!("restore");
+            state["session_runtime_launches"][0]["credential_rotation_id"] = Value::Null;
+            state["session_runtime_launches"][0]["restore_authorized"] = json!(true);
+            fs::write(&state_file, state.to_string()).unwrap();
+
+            // No runtime is configured, so an allowed recovery reaches its
+            // ordinary disabled-runtime failure without invoking a provider.
+            let store = SessionStore::new(state_file.clone());
+            store.recover_session_runtime_launches().unwrap();
+
+            let recovered = store.load_raw_json_value().unwrap();
+            assert_eq!(
+                recovered["sessions"][0]["completion_status"],
+                completion_status
+            );
+            assert_eq!(
+                recovered["session_runtime_launches"][0]["failure_reason"],
+                "runtime launch recovery is disabled"
+            );
+            assert_ne!(
+                recovered["session_runtime_launches"][0]["failure_reason"],
+                "target_terminal"
+            );
+            let _ = fs::remove_file(state_file);
+        }
+    }
+
+    #[test]
+    fn credential_rotation_transactional_stopped_launch_is_not_terminalized_during_recovery() {
+        for launch_status in ["prepared", "launching"] {
+            let state_file = unique_temp_path("credential-rotation-transactional-recovery");
+            let mut state = terminal_rotation_fixture("relaunching", Some(launch_status));
+            // Runtime launch recovery itself writes this transitional status
+            // before restoring a provider. It is not an authoritative terminal
+            // marker and must not be collapsed into target_terminal.
+            state["sessions"][0]["status"] = json!("stopped");
+            fs::write(&state_file, state.to_string()).unwrap();
+
+            // With no runtime the normal recovery path reaches its explicit
+            // disabled-runtime failure. That distinguishes it from the
+            // terminal-marker fence without launching a provider in the test.
+            let store = SessionStore::new(state_file.clone());
+            store.recover_session_runtime_launches().unwrap();
+
+            let recovered = store.load_raw_json_value().unwrap();
+            assert!(recovered["sessions"][0]["completion_status"].is_null());
+            assert_eq!(
+                recovered["session_credential_rotations"][0]["failure_reason"],
+                "runtime launch recovery is disabled"
+            );
+            assert_eq!(
+                recovered["session_runtime_launches"][0]["failure_reason"],
+                "runtime launch recovery is disabled"
+            );
+            let _ = fs::remove_file(state_file);
+        }
     }
 
     #[test]

@@ -2908,11 +2908,7 @@ fn run_recredential(client: &ApiClient, args: RecredentialArgs) -> Result<()> {
             &format!("/sessions/{target}/credential-rotation"),
             json!({}),
         ) {
-            Ok(record) => println!(
-                "{} {}",
-                target,
-                record["status"].as_str().unwrap_or("unknown")
-            ),
+            Ok(record) => println!("{}", format_recredential_outcome(&target, &record)),
             Err(error) => {
                 failed += 1;
                 eprintln!("{target} failed: {error:#}");
@@ -2923,6 +2919,16 @@ fn run_recredential(client: &ApiClient, args: RecredentialArgs) -> Result<()> {
         bail!("{failed} recredential request(s) failed");
     }
     Ok(())
+}
+
+fn format_recredential_outcome(target: &str, record: &Value) -> String {
+    match record["status"].as_str().unwrap_or("unknown") {
+        "waiting_idle" => format!(
+            "{target} waiting_idle (pending; target is not recredentialed until idle proof completes)"
+        ),
+        "relaunching" => format!("{target} relaunching (pending; target is not yet recovered)"),
+        status => format!("{target} {status}"),
+    }
 }
 
 fn decide_reparent_request(client: &ApiClient, request_id: &str, action: &str) -> Result<()> {
@@ -7092,6 +7098,18 @@ mod tests {
         assert_eq!(
             session_context_path("Runner Native/1"),
             "/sessions/Runner%20Native%2F1/context"
+        );
+    }
+
+    #[test]
+    fn recredential_waiting_output_is_explicitly_pending() {
+        assert_eq!(
+            format_recredential_outcome("rotate01", &json!({"status": "waiting_idle"})),
+            "rotate01 waiting_idle (pending; target is not recredentialed until idle proof completes)"
+        );
+        assert_eq!(
+            format_recredential_outcome("rotate01", &json!({"status": "applied"})),
+            "rotate01 applied"
         );
     }
 
