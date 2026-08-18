@@ -58,6 +58,25 @@ record it in the PR body:
   two rounds and no more than five. A repeated or structural P0/P1 at round 3
   triggers design-return rather than more local patching.
 
+Tier assignment uses the highest matching row; lower-risk labels never override
+a higher-risk characteristic:
+
+| Tier | Objective match |
+|---|---|
+| R0 | Non-operative scratch only; the artifact cannot authorize, gate, mutate, migrate, deploy, recover, or define durable behavior. |
+| R1 | Local, reversible implementation or documentation with no persisted shape, public contract, authority, concurrency, recovery, security, or production-control effect. |
+| R2 | Durable or user-visible behavior spanning a bounded component, provided no R3 characteristic applies. |
+| R3 | Any persisted schema or lifecycle, authority/authentication, atomicity/concurrency, restart/recovery, security boundary, ambiguity that could authorize action, production hot path/control, migration, or public compatibility contract. |
+
+The PR author records the selected tier and matched characteristics in the PR
+body before requesting review. Until Session Manager enforces this field, the
+maintainer treats a missing tier as blocked and does not request or accept the
+review gate. Any reviewer or maintainer may raise an under-classified PR to the
+highest matching tier; lowering a tier requires a recorded rationale showing
+that the higher-risk characteristic is absent or removed from the current head.
+Tier changes preserve prior rounds and must satisfy the new tier's minimum and
+maximum from that point. The owner is not a code-classification gate.
+
 Record the requested and reviewed head, scope/steer, findings, disposition,
 resulting head, review wait, and available token estimate for every round. Do
 not request an unchanged head again except for R3's mandatory second round: a
