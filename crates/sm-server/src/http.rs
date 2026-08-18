@@ -3484,6 +3484,7 @@ async fn get_policy_explain(
     Path(decision_id): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
     let explanation = state.policy_evidence_store().explain(&decision_id)?;
     for lane in explanation
         .events
@@ -12409,17 +12410,16 @@ fn ensure_policy_evidence_read_allowed(
             login_url: Some(google_login_redirect(request.uri().path())),
         });
     };
-    let readers = state
-        .config
-        .google_auth
-        .policy_evidence_readers
-        .get(lane)
-        .or_else(|| state.config.google_auth.policy_evidence_readers.get("*"));
-    if readers.is_some_and(|readers| {
-        readers
-            .iter()
-            .any(|reader| reader.trim().eq_ignore_ascii_case(&user.email))
-    }) {
+    let is_reader = |readers: Option<&Vec<String>>| {
+        readers.is_some_and(|readers| {
+            readers
+                .iter()
+                .any(|reader| reader.trim().eq_ignore_ascii_case(&user.email))
+        })
+    };
+    if is_reader(state.config.google_auth.policy_evidence_readers.get(lane))
+        || is_reader(state.config.google_auth.policy_evidence_readers.get("*"))
+    {
         return Ok(());
     }
     Err(ApiError::Status {

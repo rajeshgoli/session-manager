@@ -180,6 +180,7 @@ impl PolicyEvidenceStore {
         )?;
         let ordinal = tx.last_insert_rowid();
         index_links(&tx, &event)?;
+        index_decision_links(&tx, &event)?;
         index_requirement_effect(&tx, &event)?;
         tx.commit()?;
         Ok(AppendPolicyEventResult {
@@ -209,14 +210,11 @@ impl PolicyEvidenceStore {
         }
         let connection = self.open()?;
         let mut statement = connection.prepare(
-            "SELECT ordinal, event_id, sequence, event_type, operation_id, lane, seat_key, session_id, occurred_at, payload_schema, payload FROM policy_events ORDER BY sequence ASC, ordinal ASC",
+            "SELECT ordinal, event_id, sequence, event_type, operation_id, lane, seat_key, session_id, occurred_at, payload_schema, payload FROM policy_events WHERE operation_id = ?1 OR event_id IN (SELECT event_id FROM policy_event_decisions WHERE decision_id = ?1) ORDER BY sequence ASC, ordinal ASC",
         )?;
         let events = statement
-            .query_map([], row_to_event)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .into_iter()
-            .filter(|event| event_matches_decision(event, decision_id))
-            .collect();
+            .query_map([decision_id], row_to_event)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(PolicyExplanation {
             decision_id: decision_id.to_owned(),
             events,
@@ -319,6 +317,12 @@ impl PolicyEvidenceStore {
               PRIMARY KEY(event_id, relation, entity_id)
             );
             CREATE INDEX IF NOT EXISTS idx_policy_event_links_entity ON policy_event_links(relation, entity_id);
+            CREATE TABLE IF NOT EXISTS policy_event_decisions (
+              event_id TEXT NOT NULL REFERENCES policy_events(event_id),
+              decision_id TEXT NOT NULL,
+              PRIMARY KEY(event_id, decision_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_policy_event_decisions_lookup ON policy_event_decisions(decision_id, event_id);
             CREATE TABLE IF NOT EXISTS policy_requirement_effects (
               event_id TEXT PRIMARY KEY REFERENCES policy_events(event_id),
               requirement_id TEXT NOT NULL,
@@ -538,6 +542,40 @@ fn index_links(tx: &rusqlite::Transaction<'_>, event: &PolicyEventEnvelope) -> R
     Ok(())
 }
 
+fn index_decision_links(tx: &rusqlite::Transaction<'_>, event: &PolicyEventEnvelope) -> Result<()> {
+    let mut decision_ids = Vec::new();
+    if let Some(id) = event.payload.get("decision_id").and_then(Value::as_str) {
+        decision_ids.push(id);
+    }
+    if let Some(id) = event
+        .payload
+        .get("links")
+        .and_then(Value::as_object)
+        .and_then(|links| links.get("decision_id"))
+        .and_then(Value::as_str)
+    {
+        decision_ids.push(id);
+    }
+    if let Some(id) = event
+        .payload
+        .get("decision")
+        .and_then(Value::as_object)
+        .and_then(|decision| decision.get("decision_id"))
+        .and_then(Value::as_str)
+    {
+        decision_ids.push(id);
+    }
+    decision_ids.sort_unstable();
+    decision_ids.dedup();
+    for decision_id in decision_ids {
+        tx.execute(
+            "INSERT INTO policy_event_decisions(event_id, decision_id) VALUES (?1, ?2)",
+            params![event.event_id, decision_id],
+        )?;
+    }
+    Ok(())
+}
+
 fn index_requirement_effect(
     tx: &rusqlite::Transaction<'_>,
     event: &PolicyEventEnvelope,
@@ -584,31 +622,6 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredPolicyEvent> 
 
 fn json_sql_error(error: serde_json::Error) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
-}
-
-fn event_matches_decision(event: &StoredPolicyEvent, decision_id: &str) -> bool {
-    event.envelope.operation_id == decision_id
-        || event
-            .envelope
-            .payload
-            .get("decision_id")
-            .and_then(Value::as_str)
-            == Some(decision_id)
-        || event
-            .envelope
-            .payload
-            .get("links")
-            .and_then(Value::as_object)
-            .and_then(|links| links.get("decision_id"))
-            .and_then(Value::as_str)
-            == Some(decision_id)
-        || event
-            .envelope
-            .payload
-            .get("decision")
-            .and_then(|decision| decision.get("decision_id"))
-            .and_then(Value::as_str)
-            == Some(decision_id)
 }
 
 #[cfg(test)]
