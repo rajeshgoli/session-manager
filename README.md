@@ -488,8 +488,10 @@ cd android-app
 
 `usage.db` stores minute-level `seat_tokens` facts. Do not sum rows across
 `window_kind`: a token can belong to more than one quota window. For correct
-current per-seat totals, use the `current_seat_token_totals` view, which selects
-the latest observed window and filters facts by that window's timestamp range:
+current unscoped per-seat totals, use the `current_seat_token_totals` view,
+which selects the latest observed unscoped window and filters facts by that
+window's timestamp range. Scoped model pools remain available through `sm
+usage`'s model-aware report:
 
 ```bash
 sqlite3 ~/.local/share/claude-sessions/usage.db \

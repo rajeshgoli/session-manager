@@ -447,6 +447,7 @@ impl UsageLedgerStore {
                  AND tokens.bucket_ts >= windows.window_start
                  AND tokens.bucket_ts < windows.resets_at
                 WHERE windows.window_rank = 1
+                  AND windows.window_scope IS NULL
                 GROUP BY windows.account_key, windows.window_kind, windows.window_scope,
                          windows.window_start, windows.resets_at, tokens.seat_id,
                          tokens.project_key, tokens.model, tokens.credit_metered;
@@ -3100,6 +3101,53 @@ mod tests {
             .unwrap();
         assert_eq!(mappings, 1);
         assert!(!primary_key_includes(&connection, "seat_tokens", "window_start").unwrap());
+    }
+
+    #[test]
+    fn current_totals_view_excludes_overlapping_scoped_windows() {
+        let dir = TestDir::new("current-totals-unscoped-only");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Claude,
+            "account-one",
+            "max",
+            "weekly_all",
+            10_080,
+        );
+        UsageLedgerStore::new(&db_path).unwrap();
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO burn_samples (
+                  account_key, window_kind, window_scope, window_start, percent, resets_at,
+                  severity, is_active, source, observed_at
+                ) VALUES
+                  ('claude:account-one', 'weekly_scoped', 'sonnet',
+                   '2026-08-17T00:00:00.000000000Z', 10, '2026-08-24T00:00:00.000000000Z',
+                   NULL, 1, 'test', '2026-08-17T00:01:00.000000000Z'),
+                  ('claude:account-one', 'weekly_scoped', 'opus',
+                   '2026-08-17T00:00:00.000000000Z', 10, '2026-08-24T00:00:00.000000000Z',
+                   NULL, 1, 'test', '2026-08-17T00:01:00.000000000Z');
+                INSERT INTO seat_tokens (
+                  seat_id, account_key, project_key, window_kind, bucket_ts, model, effort,
+                  credit_metered, input_tokens, output_tokens, reasoning_tokens, cache_write_5m,
+                  cache_write_1h, cache_read_tokens, message_count, updated_at
+                ) VALUES ('seat', 'claude:account-one', '/repo/.git', 'weekly_scoped',
+                          '2026-08-17T01:00:00.000000000Z', 'claude-sonnet-5', NULL,
+                          0, 100, 0, 0, 0, 0, 0, 1, '2026-08-17T01:00:00.000000000Z');
+                "#,
+            )
+            .unwrap();
+        let rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM current_seat_token_totals WHERE window_kind = 'weekly_scoped'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]
