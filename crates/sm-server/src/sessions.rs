@@ -885,23 +885,34 @@ impl SessionStore {
             let state = self.load_raw_json_value()?;
             terminal_runtime_teardown_records(&state)?
         };
-        for candidate in terminal_launches {
-            // Restore and terminal teardown share this per-session gate. The
-            // state lock is held only for revalidation, while the potentially
-            // slow tmux commands run outside the global mutation lock.
-            let _lifecycle_guard = self.lock_terminal_runtime_fence(&candidate.session_id)?;
-            let launch = {
-                let _guard = self.write_guard()?;
-                let state = self.load_raw_json_value()?;
-                terminal_runtime_teardown_records(&state)?
-                    .into_iter()
-                    .find(|launch| launch.id == candidate.id)
-            };
-            if let Some(launch) = launch {
-                runtime
-                    .for_socket_name(launch.tmux_socket_name.as_deref())
-                    .kill_session(&launch.tmux_session)?;
-            }
+        let candidate_ids = terminal_launches
+            .iter()
+            .map(|launch| launch.id.as_str())
+            .collect::<BTreeSet<_>>();
+        // Restore and terminal teardown share a per-session gate. Acquire the
+        // deduplicated gates in sorted order, then revalidate every candidate
+        // in one short state-lock pass. This keeps tmux work outside the
+        // global lock without turning the once-per-second reconciliation into
+        // a full state-file scan per terminal fence.
+        let _lifecycle_guards = terminal_launches
+            .iter()
+            .map(|launch| launch.session_id.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|session_id| self.lock_terminal_runtime_fence(session_id))
+            .collect::<Result<Vec<_>>>()?;
+        let launches = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            terminal_runtime_teardown_records(&state)?
+                .into_iter()
+                .filter(|launch| candidate_ids.contains(launch.id.as_str()))
+                .collect::<Vec<_>>()
+        };
+        for launch in launches {
+            runtime
+                .for_socket_name(launch.tmux_socket_name.as_deref())
+                .kill_session(&launch.tmux_session)?;
         }
         Ok(())
     }
