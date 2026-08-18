@@ -5168,9 +5168,29 @@ mod tests {
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                 .unwrap();
-            let mut buffer = [0_u8; 8192];
-            let bytes_read = stream.read(&mut buffer).unwrap();
-            let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            let mut content_length = 0_usize;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line.is_empty() {
+                    panic!("test request ended before its headers");
+                }
+                if let Some((name, value)) = line.trim_end_matches(['\r', '\n']).split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.trim().parse().unwrap();
+                    }
+                }
+                let end_of_headers = line == "\r\n";
+                request.push_str(&line);
+                if end_of_headers {
+                    break;
+                }
+            }
+            let mut body_bytes = vec![0_u8; content_length];
+            reader.read_exact(&mut body_bytes).unwrap();
+            request.push_str(&String::from_utf8_lossy(&body_bytes));
             let reason = if status == 200 { "OK" } else { "Error" };
             let response = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

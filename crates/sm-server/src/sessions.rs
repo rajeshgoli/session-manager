@@ -16628,6 +16628,73 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn recovery_resumes_pending_retire_intent_without_erasing_authenticated_provenance() {
+        // The intent is written before tmux is touched.  Model a process exit
+        // at that boundary and make recovery complete the original operation,
+        // rather than treating the marker as terminal or replacing its actor.
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let root = unique_temp_path("pending-retire-recovery");
+        fs::create_dir_all(&root).unwrap();
+        let tmux = root.join("tmux");
+        let invoked = root.join("runtime-invoked");
+        fs::write(
+            &tmux,
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SM_1314_FAKE_TMUX_SENTINEL\"\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        let old_path = env::var_os("PATH").unwrap_or_default();
+        let _path = EnvVarRestore::set(
+            "PATH",
+            format!("{}:{}", root.display(), old_path.to_string_lossy()),
+        );
+        let _sentinel = EnvVarRestore::set("SM_1314_FAKE_TMUX_SENTINEL", &invoked);
+
+        let state_file = root.join("state.json");
+        let mut child = reparent_test_session("child01", Some("parent01"), "child-secret");
+        child["status"] = json!("stopped");
+        child["completion_status"] = json!("retired");
+        child["node"] = json!("primary");
+        child["terminal_provenance"] = json!({
+            "cause": "explicit_retire",
+            "observed_at": "2026-08-18T04:00:00Z",
+            "actor_session_id": "parent01",
+            "authority": "authenticated_parent",
+            "source": "api_retire",
+            "tmux_disposition": "retire_requested"
+        });
+        fs::write(&state_file, json!({ "sessions": [child] }).to_string()).unwrap();
+
+        let store = SessionStore::new(state_file.clone()).with_delivery_runtime(Some(
+            TmuxRuntime::from_config(&crate::config::RustCoreConfig::default()),
+        ));
+        store.recover_session_runtime_launches().unwrap();
+
+        let invocation = fs::read_to_string(&invoked).unwrap();
+        assert!(invocation.contains("has-session -t claude-child01"));
+        assert!(invocation.contains("kill-session -t claude-child01"));
+        let recovered = store.load_raw_json_value().unwrap();
+        let session = &recovered["sessions"][0];
+        assert_eq!(session["status"], "stopped");
+        assert_eq!(session["completion_status"], "retired");
+        assert_eq!(session["terminal_provenance"]["cause"], "explicit_retire");
+        assert_eq!(
+            session["terminal_provenance"]["actor_session_id"],
+            "parent01"
+        );
+        assert_eq!(
+            session["terminal_provenance"]["authority"],
+            "authenticated_parent"
+        );
+        assert_eq!(session["terminal_provenance"]["source"], "api_retire");
+        assert_eq!(session["terminal_provenance"]["tmux_disposition"], "killed");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn credential_rotation_authorized_restore_with_terminal_marker_continues_recovery() {
         for (completion_status, launch_status) in [
