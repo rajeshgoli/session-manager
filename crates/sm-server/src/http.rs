@@ -8332,6 +8332,16 @@ async fn set_context_monitor(
     {
         ContextMonitorOutcome::Updated(result) => Ok(Json(serde_json::to_value(result)?)),
         ContextMonitorOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
+        ContextMonitorOutcome::NotRunning => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Session is stopped; restore it before enabling context monitoring".to_owned(),
+        }),
+        ContextMonitorOutcome::UnsupportedProvider(provider) => Err(ApiError::Status {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail: format!(
+                "Context monitoring cannot enroll provider {provider:?}: no measured context gauge is available; use `sm context` on each heartbeat until provider support is added"
+            ),
+        }),
         ContextMonitorOutcome::MissingNotifyTarget => Err(ApiError::Status {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             detail: "notify_session_id required when enabling".to_owned(),
@@ -15325,6 +15335,160 @@ mod tests {
             .extensions_mut()
             .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 4200))));
         request
+    }
+
+    fn context_monitor_test_config(provider: &str, status: &str) -> AppConfig {
+        let state_file = write_session_state("context-monitor-agent", status);
+        let mut state: Value = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+        state["sessions"][0]["provider"] = Value::String(provider.to_owned());
+        fs::write(&state_file, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        let mut config = AppConfig::default();
+        let queue_path = PathBuf::from(&state_file).with_file_name("context-monitor-queue.db");
+        config.paths.state_file = state_file;
+        config.sm_send.db_path = queue_path.display().to_string();
+        config.rust_core.fixture_writes_enabled = true;
+        config.rust_core.runtime_enabled = false;
+        config
+    }
+
+    fn context_monitor_request(session_id: &str) -> axum::http::Request<Body> {
+        let mut request = local_request(
+            Method::POST,
+            &format!("/sessions/{session_id}/context-monitor"),
+            Body::from(
+                serde_json::to_vec(&json!({
+                    "enabled": true,
+                    "requester_session_id": session_id,
+                    "notify_session_id": session_id,
+                }))
+                .unwrap(),
+            ),
+        );
+        request
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        request
+    }
+
+    #[tokio::test]
+    async fn context_monitor_http_fails_closed_or_persists_a_visible_enrollment() {
+        let session_id = "context-monitor-agent";
+
+        let codex_config = context_monitor_test_config("codex", "running");
+        let codex_state = PathBuf::from(&codex_config.paths.state_file);
+        let codex_app = router(AppState::new(codex_config));
+        let (status, body) = response_json(
+            codex_app
+                .clone()
+                .oneshot(context_monitor_request(session_id))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("no measured context gauge")));
+        let persisted: Value = serde_json::from_slice(&fs::read(codex_state).unwrap()).unwrap();
+        assert_ne!(
+            persisted["sessions"][0]["context_monitor_enabled"],
+            json!(true)
+        );
+        let (status, body) = response_json(
+            codex_app
+                .oneshot(local_request(
+                    Method::GET,
+                    "/sessions/context-monitor",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["monitored"], json!([]));
+
+        let stopped_app = router(AppState::new(context_monitor_test_config(
+            "claude", "stopped",
+        )));
+        let (status, body) = response_json(
+            stopped_app
+                .clone()
+                .oneshot(context_monitor_request(session_id))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("stopped")));
+        let (status, _) = response_json(
+            stopped_app
+                .oneshot(context_monitor_request("missing-session"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let fork_app = router(AppState::new(context_monitor_test_config(
+            "codex-fork",
+            "running",
+        )));
+        for _ in 0..2 {
+            let (status, body) = response_json(
+                fork_app
+                    .clone()
+                    .oneshot(context_monitor_request(session_id))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["enabled"], json!(true));
+        }
+        let (status, body) = response_json(
+            fork_app
+                .oneshot(local_request(
+                    Method::GET,
+                    "/sessions/context-monitor",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["monitored"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["monitored"][0]["session_id"], json!(session_id));
+
+        let claude_app = router(AppState::new(context_monitor_test_config(
+            "claude", "running",
+        )));
+        let (status, body) = response_json(
+            claude_app
+                .clone()
+                .oneshot(context_monitor_request(session_id))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["enabled"], json!(true));
+        let (_, body) = response_json(
+            claude_app
+                .oneshot(local_request(
+                    Method::GET,
+                    "/sessions/context-monitor",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["monitored"].as_array().map(Vec::len), Some(1));
     }
 
     fn reminder_test_config(status: &str) -> (AppConfig, PathBuf) {
