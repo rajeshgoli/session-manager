@@ -827,6 +827,7 @@ impl SessionStore {
     }
 
     pub fn recover_session_runtime_launches(&self) -> Result<()> {
+        self.recover_pending_runtime_retires()?;
         loop {
             let launch_id = {
                 let _guard = self.write_guard()?;
@@ -841,6 +842,28 @@ impl SessionStore {
             };
             self.recover_session_runtime_launch(&launch_id)?;
         }
+    }
+
+    fn recover_pending_runtime_retires(&self) -> Result<()> {
+        let Some(runtime) = self.delivery_runtime.as_ref() else {
+            return Ok(());
+        };
+        let _guard = self.write_guard()?;
+        let state = self.load_raw_json_value()?;
+        let pending_ids = state
+            .get("sessions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+            .filter(|session| raw_session_retire_intent_pending(session))
+            .filter_map(|session| json_text(session.get("id")))
+            .collect::<Vec<_>>();
+        drop(_guard);
+        for session_id in pending_ids {
+            self.retire_core_session_with_runtime_authorized(&session_id, None, None, runtime)?;
+        }
+        Ok(())
     }
 
     fn recover_session_runtime_launch(&self, launch_id: &str) -> Result<()> {
@@ -7493,7 +7516,7 @@ impl SessionStore {
                 return Ok(CoreRetireOutcome::Forbidden);
             }
         }
-        let (node, tmux_session, session_socket_name, recipient_name) = {
+        let (node, tmux_session, session_socket_name, recipient_name, pending_retire_intent) = {
             let sessions = ensure_sessions_array_mut(&mut state)?;
             let Some(session) = session_object_mut(sessions, session_id) else {
                 return Ok(CoreRetireOutcome::NotFound);
@@ -7508,7 +7531,8 @@ impl SessionStore {
                     return Ok(CoreRetireOutcome::NotChild);
                 }
             }
-            if raw_session_has_terminal_evidence(session) {
+            let pending_retire_intent = raw_session_retire_intent_pending(session);
+            if raw_session_has_terminal_evidence(session) && !pending_retire_intent {
                 return Ok(CoreRetireOutcome::Retired(CoreRetireResult {
                     ok: true,
                     session_id: session_id.to_owned(),
@@ -7520,7 +7544,13 @@ impl SessionStore {
                 .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
             let session_socket_name = json_text(session.get("tmux_socket_name"));
             let recipient_name = raw_session_display_name(session, session_id);
-            (node, tmux_session, session_socket_name, recipient_name)
+            (
+                node,
+                tmux_session,
+                session_socket_name,
+                recipient_name,
+                pending_retire_intent,
+            )
         };
         if !is_primary_node(&node) {
             return Ok(CoreRetireOutcome::UnsupportedNode(node));
@@ -7530,25 +7560,27 @@ impl SessionStore {
         // must reach durable storage before the external kill: if this process
         // exits after tmux accepts the kill, startup recovery retains the
         // attributed retirement rather than inferring a disappearance.
-        finalize_active_credential_rotations_for_terminal_session(&mut state, session_id)?;
-        let now = now_rfc3339();
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let session = session_object_mut(sessions, session_id)
-            .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during retire"))?;
-        session.insert("status".to_owned(), Value::String("stopped".to_owned()));
-        mark_session_retired(
-            session,
-            &now,
-            TerminalProvenance::explicit_retire(
+        if !pending_retire_intent {
+            finalize_active_credential_rotations_for_terminal_session(&mut state, session_id)?;
+            let now = now_rfc3339();
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let session = session_object_mut(sessions, session_id)
+                .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during retire"))?;
+            session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+            mark_session_retired(
+                session,
                 &now,
-                requester_session_id,
-                authority,
-                Some("retire_requested"),
-            ),
-        );
-        session.insert("stopped_at".to_owned(), Value::String(now.clone()));
-        session.insert("last_activity".to_owned(), Value::String(now));
-        self.write_raw_json_value(&state)?;
+                TerminalProvenance::explicit_retire(
+                    &now,
+                    requester_session_id,
+                    authority,
+                    Some("retire_requested"),
+                ),
+            );
+            session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+            session.insert("last_activity".to_owned(), Value::String(now));
+            self.write_raw_json_value(&state)?;
+        }
 
         let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
         let tmux_was_killed = session_runtime.kill_session(&tmux_session)?;
@@ -15531,6 +15563,17 @@ fn raw_session_has_terminal_evidence(session: &Map<String, Value>) -> bool {
         || session
             .get("terminal_provenance")
             .is_some_and(|provenance| !provenance.is_null())
+}
+
+fn raw_session_retire_intent_pending(session: &Map<String, Value>) -> bool {
+    json_text(
+        session
+            .get("terminal_provenance")
+            .and_then(Value::as_object)
+            .and_then(|provenance| provenance.get("tmux_disposition")),
+    )
+    .as_deref()
+        == Some("retire_requested")
 }
 
 fn effective_raw_session_status(session: &Map<String, Value>) -> String {
