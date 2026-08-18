@@ -905,10 +905,15 @@ fn codex_comment_is_bound(
         .get("body")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let reviewed_commit = format!("Reviewed commit: `{requested_head_sha}`");
+    let bold_reviewed_commit = format!("**Reviewed commit:** `{requested_head_sha}`");
     comment.get("id").and_then(Value::as_i64) != request_comment_id
         && github_actor_is_codex(comment)
-        && !body.to_ascii_lowercase().contains("@codex review")
-        && body.contains(&format!("Reviewed commit: `{requested_head_sha}`"))
+        && !body
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("@codex review")
+        && (body.contains(&reviewed_commit) || body.contains(&bold_reviewed_commit))
 }
 
 fn find_fresh_codex_review_with_gh(
@@ -17591,5 +17596,16 @@ mod tests {
             "user": { "login": "codex" }
         });
         assert!(codex_comment_is_bound(&exact, head, Some(77)));
+
+        let exact_bold_with_boilerplate = json!({
+            "id": 81,
+            "body": "Codex Review: no findings.\n\n**Reviewed commit:** `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`\n\nReplies may say @codex review.",
+            "user": { "login": "chatgpt-codex-connector[bot]" }
+        });
+        assert!(codex_comment_is_bound(
+            &exact_bold_with_boilerplate,
+            head,
+            Some(77)
+        ));
     }
 }
