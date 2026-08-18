@@ -95,11 +95,15 @@ Phase 1 (service untouched on any failure; nothing writes the registered path)
   record /health and session count (a healthy server must yield a baseline)
   preflight: cutover executable, config readable, local-env readable,
              no lingering Python label, registered path is NOT cargo's output,
-             plist would not be rewritten
+             plist would not be rewritten, durable signing config readable,
+             configured identity usable in the keychain
   cargo build --release -p sm-server --target-dir <pinned>
   cp cargo output -> staging (beside the installed binary)
-  codesign --force --sign - --identifier com.rajeshgoli.sm-server <staging>
+  codesign --force --sign <configured persistent identity> \
+           --identifier com.rajeshgoli.sm-server <staging>
   codesign --verify --strict <staging>
+  verify staged Identifier, non-ad-hoc certificate Authority, and exact
+         configured certificate-anchored designated requirement
 Phase 2
   cutover stop-rust                     <- bootout
   confirm the job is really unloaded    <- the cutover swallows bootout failures
@@ -355,6 +359,48 @@ Notes on specific choices:
   churn). Sessions do retire on their own - the count moved 13 -> 12 during this
   investigation with no restart - so the escape hatch exists, but the default is
   strict.
+
+### TCC signing revision (#1301)
+
+The old `codesign --force --sign -` command produced a new ad-hoc CDHash
+requirement for each rebuilt `sm-server`. That is not a stable macOS TCC client
+identity and caused repeated protected-folder prompts in production.
+
+The supported restart contract now reads the exact uppercase 40-hex fingerprint
+from the tracked, non-secret `config/rust-server-signing.env`; an explicit
+`SM_SIGN_IDENTITY` plus `SM_SIGN_DESIGNATED_REQUIREMENT` override is reserved
+for a planned certificate rotation.
+The file is parsed as data (not sourced as shell code), must contain exactly one
+identity line, and is therefore durable and discoverable to future operators.
+The production machine's measured default is
+`36FC54A873D584A34FCFEEA7D1F519B19A39DE72` (`Office Automate Local Signing`),
+whose currently observed self-signed requirement uses the same certificate-root
+hash. A CA-issued future leaf may have a different root hash: the rotation
+procedure must prove and supply both values, not infer the requirement from the
+leaf fingerprint.
+
+Before `stop-rust`, the script requires that identity to be available from the
+keychain, signs the disposable staged binary with it, verifies strictly, and
+rejects ad-hoc output, a wrong identifier, absent certificate authority, or a
+designated requirement other than:
+
+```
+designated => identifier "com.rajeshgoli.sm-server" and certificate (root|leaf) = H"<observed certificate hash>"
+```
+
+The exact configured certificate requirement is expected to remain identical
+across changed binary content, while CDHash may change. `--sign -` is never an
+allowed fallback. All of these gates run before the installed binary is replaced
+or the launchd job is stopped, so the atomic install, re-registration, rollback,
+queue authority, health, PID, and session checks are unchanged.
+
+Pre-deployment proof is performed only on disposable binaries: sign two
+different-content copies with the named fingerprint, run `codesign --verify
+--strict`, then compare `codesign -dr -` output. Do not use protected-folder
+access as a signing or TCC test. After deployment, inspect `codesign -dv`,
+`codesign -dr -`, launchd's live PID/executable path, health, session count, and
+queue authority. Do not clear the existing TCC record unless Rajesh explicitly
+approves it.
 
 ## Recovery
 
