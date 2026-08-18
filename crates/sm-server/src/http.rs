@@ -133,6 +133,7 @@ use crate::sessions::{
     UpdateSessionMetadataRequest,
 };
 
+use crate::policy_evidence::PolicyEvidenceStore;
 use crate::studio_ssh::{self, StudioSshStatus};
 use crate::tool_usage::{
     list_recent_codex_fork_tool_calls_from_path, list_recent_tool_calls_from_path,
@@ -366,6 +367,7 @@ impl GitHubReviewPoster for GhCliReviewPoster {
 pub struct AppState {
     config: AppConfig,
     session_store: SessionStore,
+    policy_evidence_store: PolicyEvidenceStore,
     github_review_poster: Arc<dyn GitHubReviewPoster>,
     codex_review_creation_locks: Arc<AsyncMutex<BTreeSet<String>>>,
     codex_review_watcher_ids: Arc<Mutex<BTreeSet<String>>>,
@@ -391,6 +393,11 @@ impl AppState {
     pub fn try_new(config: AppConfig) -> anyhow::Result<Self> {
         let state_file = expand_home(&config.paths.state_file);
         let queue_db_path = expand_home(&config.sm_send.db_path);
+        // Keep policy spans separate from the corrected usage materializations.
+        // In particular, a rolling seat/window aggregate is not a provider-thread
+        // boundary and must never become the fact identity for policy evidence.
+        let policy_evidence_store =
+            PolicyEvidenceStore::new(state_file.with_extension("policy_evidence.db"))?;
         let mut session_store = SessionStore::new_with_queue(state_file, queue_db_path)
             .with_codex_session_index_path(config.codex.session_index_path.as_deref())
             .with_claude_transcript_root(config.claude.transcript_root.as_deref())
@@ -463,6 +470,7 @@ impl AppState {
         Ok(Self {
             config,
             session_store,
+            policy_evidence_store,
             github_review_poster: Arc::new(GhCliReviewPoster),
             codex_review_creation_locks: Arc::new(AsyncMutex::new(BTreeSet::new())),
             codex_review_watcher_ids: Arc::new(Mutex::new(BTreeSet::new())),
@@ -499,6 +507,12 @@ impl AppState {
     /// Read-only access to the loaded configuration (used to launch background tasks).
     pub fn config(&self) -> &AppConfig {
         &self.config
+    }
+
+    /// Narrow append/read handle for policy packages. HTTP only exposes reads;
+    /// D1/D3 use this handle to append their frozen contract evidence.
+    pub fn policy_evidence_store(&self) -> &PolicyEvidenceStore {
+        &self.policy_evidence_store
     }
 
     pub fn reconcile_current_seat_sessions(&self) -> anyhow::Result<()> {
@@ -1148,6 +1162,10 @@ pub fn router(state: AppState) -> Router {
         .route("/email/send", post(send_registered_email))
         .route(DEFAULT_EMAIL_WEBHOOK_PATH, post(inbound_email_webhook))
         .route("/usage/accounts", get(get_account_usage))
+        .route("/policy/status", get(get_policy_status))
+        .route("/policy/explain/{decision_id}", get(get_policy_explain))
+        .route("/policy/events", get(get_policy_events))
+        .route("/policy/trial", get(get_policy_trial))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/reparent-requests", get(list_reparent_requests))
         .route(
@@ -3448,6 +3466,57 @@ async fn get_account_usage(
             detail: "Usage reporting is unavailable".to_owned(),
         })?;
     Ok(Json(serde_json::to_value(report)?))
+}
+
+async fn get_policy_status(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PolicyLaneQuery>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_policy_evidence_read_allowed(&state, &request, &query.lane)?;
+    Ok(Json(serde_json::to_value(
+        state.policy_evidence_store().status(&query.lane)?,
+    )?))
+}
+
+async fn get_policy_explain(
+    State(state): State<Arc<AppState>>,
+    Path(decision_id): Path<String>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let explanation = state.policy_evidence_store().explain(&decision_id)?;
+    for lane in explanation
+        .events
+        .iter()
+        .map(|event| event.envelope.lane.as_str())
+        .collect::<BTreeSet<_>>()
+    {
+        ensure_policy_evidence_read_allowed(&state, &request, lane)?;
+    }
+    Ok(Json(serde_json::to_value(explanation)?))
+}
+
+async fn get_policy_events(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PolicyLaneQuery>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_policy_evidence_read_allowed(&state, &request, &query.lane)?;
+    Ok(Json(
+        json!({ "lane": query.lane, "events": state.policy_evidence_store().events(&query.lane)? }),
+    ))
+}
+
+async fn get_policy_trial(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PolicyLaneQuery>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_policy_evidence_read_allowed(&state, &request, &query.lane)?;
+    Ok(Json(
+        json!({ "lane": query.lane, "rows": state.policy_evidence_store().trial(&query.lane)? }),
+    ))
 }
 
 fn ensure_usage_reporting_enabled(state: &AppState) -> Result<(), ApiError> {
@@ -12318,6 +12387,47 @@ fn ensure_session_read_allowed(state: &AppState, request: &Request) -> Result<()
     )
 }
 
+fn ensure_policy_evidence_read_allowed(
+    state: &AppState,
+    request: &Request,
+    lane: &str,
+) -> Result<(), ApiError> {
+    ensure_session_read_allowed(state, request)?;
+    if !state.config.google_auth.requested() {
+        return Ok(());
+    }
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    if is_local_bypass_request(request.headers(), peer_addr, &state.config) {
+        return Ok(());
+    }
+    let Some(user) = authenticated_user(request.headers(), &state.config) else {
+        return Err(ApiError::Auth {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Authentication required",
+            login_url: Some(google_login_redirect(request.uri().path())),
+        });
+    };
+    let is_reader = |readers: Option<&Vec<String>>| {
+        readers.is_some_and(|readers| {
+            readers
+                .iter()
+                .any(|reader| reader.trim().eq_ignore_ascii_case(&user.email))
+        })
+    };
+    if is_reader(state.config.google_auth.policy_evidence_readers.get(lane))
+        || is_reader(state.config.google_auth.policy_evidence_readers.get("*"))
+    {
+        return Ok(());
+    }
+    Err(ApiError::Status {
+        status: StatusCode::FORBIDDEN,
+        detail: format!("Policy evidence access is not authorized for lane {lane}"),
+    })
+}
+
 fn ensure_session_allowed_from_parts(
     config: &AppConfig,
     headers: &HeaderMap,
@@ -12839,6 +12949,11 @@ struct AccountUsageQuery {
     since_reset: bool,
     #[serde(default)]
     by_model: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PolicyLaneQuery {
+    lane: String,
 }
 
 #[derive(Debug, Deserialize)]

@@ -42,6 +42,7 @@ enum Command {
     #[command(alias = "btw")]
     What(WhatArgs),
     Usage(UsageArgs),
+    Policy(PolicyArgs),
     Remind(RemindArgs),
     Wait(WaitArgs),
     Spawn(SpawnArgs),
@@ -194,6 +195,35 @@ struct UsageArgs {
     by_model: bool,
     #[arg(long)]
     json: bool,
+}
+
+#[derive(Args)]
+struct PolicyArgs {
+    #[command(subcommand)]
+    command: PolicyCommand,
+}
+
+#[derive(Subcommand)]
+enum PolicyCommand {
+    Status {
+        #[arg(long)]
+        lane: String,
+    },
+    Explain {
+        decision_id: String,
+    },
+    Events {
+        #[arg(long)]
+        lane: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Trial {
+        #[arg(long)]
+        lane: String,
+        #[arg(long)]
+        csv: bool,
+    },
 }
 
 #[derive(Args)]
@@ -869,6 +899,7 @@ fn run() -> Result<()> {
         }
         Command::What(args) => run_what(&client, args)?,
         Command::Usage(args) => run_usage(&client, args)?,
+        Command::Policy(args) => run_policy(&client, args)?,
         Command::Remind(args) => run_remind(&client, args)?,
         Command::Output(args) => print_output(&client, &args.session_id, args.lines)?,
         Command::Tail(args) => print_tail(&client, &args.session_id, args.lines, args.raw)?,
@@ -3160,6 +3191,84 @@ fn run_usage(client: &ApiClient, args: UsageArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_policy(client: &ApiClient, args: PolicyArgs) -> Result<()> {
+    match args.command {
+        PolicyCommand::Status { lane } => {
+            let payload = client.get_json(&format!(
+                "/policy/status?lane={}",
+                encode_query_value(&lane)
+            ))?;
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        }
+        PolicyCommand::Explain { decision_id } => {
+            let payload = client.get_json(&format!(
+                "/policy/explain/{}",
+                encode_path_segment(&decision_id)
+            ))?;
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        }
+        PolicyCommand::Events { lane, json } => {
+            if !json {
+                bail!("policy events requires --json");
+            }
+            let payload = client.get_json(&format!(
+                "/policy/events?lane={}",
+                encode_query_value(&lane)
+            ))?;
+            println!("{}", serde_json::to_string_pretty(&payload)?);
+        }
+        PolicyCommand::Trial { lane, csv } => {
+            if !csv {
+                bail!("policy trial requires --csv");
+            }
+            let payload =
+                client.get_json(&format!("/policy/trial?lane={}", encode_query_value(&lane)))?;
+            println!(
+                "requirement_id,event_id,operation_id,lane,incremental_cost,benefit,observed_at"
+            );
+            for row in payload["rows"].as_array().into_iter().flatten() {
+                let values = [
+                    row["requirement_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned(),
+                    row["event_id"].as_str().unwrap_or_default().to_owned(),
+                    row["operation_id"].as_str().unwrap_or_default().to_owned(),
+                    row["lane"].as_str().unwrap_or_default().to_owned(),
+                    serde_json::to_string(&row["incremental_cost"])?,
+                    serde_json::to_string(&row["benefit"])?,
+                    row["observed_at"].as_str().unwrap_or_default().to_owned(),
+                ];
+                println!(
+                    "{}",
+                    values
+                        .iter()
+                        .map(|value| csv_field(value))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn csv_field(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn encode_query_value(value: &str) -> String {
+    value.bytes().fold(String::new(), |mut encoded, byte| {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "%{byte:02X}").expect("writing into string cannot fail");
+        }
+        encoded
+    })
+}
+
 fn usage_uses_account_view(args: &UsageArgs, current_session_id: Option<&str>) -> bool {
     args.account || (args.agent.is_none() && current_session_id.is_none())
 }
@@ -5236,6 +5345,72 @@ mod tests {
         };
         assert!(children.usage);
         assert_eq!(children.session_id.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn policy_cli_keeps_inspection_surfaces_read_only_and_explicit() {
+        assert!(matches!(
+            Cli::try_parse_from(["sm", "policy", "status", "--lane", "sm-policy-1268"])
+                .unwrap()
+                .command,
+            Command::Policy(PolicyArgs {
+                command: PolicyCommand::Status { .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["sm", "policy", "explain", "decision-1"])
+                .unwrap()
+                .command,
+            Command::Policy(PolicyArgs {
+                command: PolicyCommand::Explain { .. }
+            })
+        ));
+        assert!(Cli::try_parse_from(["sm", "policy", "events", "--lane", "lane"]).is_ok());
+        assert!(Cli::try_parse_from(["sm", "policy", "trial", "--lane", "lane"]).is_ok());
+        assert_eq!(encode_query_value("lane/one"), "lane%2Fone");
+    }
+
+    #[test]
+    fn policy_events_and_trial_use_only_get_endpoints() {
+        let (client, server) = start_lookup_server([
+            (
+                "/policy/events?lane=sm-policy-1268",
+                200,
+                r#"{"events":[]}"#,
+            ),
+            ("/policy/trial?lane=sm-policy-1268", 200, r#"{"rows":[]}"#),
+        ]);
+        run_policy(
+            &client,
+            PolicyArgs {
+                command: PolicyCommand::Events {
+                    lane: "sm-policy-1268".to_owned(),
+                    json: true,
+                },
+            },
+        )
+        .unwrap();
+        run_policy(
+            &client,
+            PolicyArgs {
+                command: PolicyCommand::Trial {
+                    lane: "sm-policy-1268".to_owned(),
+                    csv: true,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(server.join().unwrap().len(), 2);
+        assert!(run_policy(
+            &client,
+            PolicyArgs {
+                command: PolicyCommand::Events {
+                    lane: "sm-policy-1268".to_owned(),
+                    json: false,
+                },
+            }
+        )
+        .is_err());
     }
 
     #[test]
