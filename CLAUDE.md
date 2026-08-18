@@ -108,6 +108,10 @@ running server. See `specs/1134_rust_restart_procedure.md`.
 ### Testing
 
 ```bash
+# Rust server tests — the supported launcher also cleans isolated state. Direct
+# cargo test has a fail-safe isolation root, but must not be used for normal work.
+./scripts/test-rust-isolated.sh
+
 # Manual testing - spawn a child agent
 sm spawn --name test-agent "echo hello and exit"
 

@@ -32,7 +32,7 @@ use crate::queue::{
 };
 use crate::{
     btw::BtwStore,
-    config::{CodexReviewConfig, ContextMonitorConfig},
+    config::{test_isolation_root_from_environment, CodexReviewConfig, ContextMonitorConfig},
     runtime::{ConditionalClearOutcome, TmuxRuntime, TmuxSessionSpec},
     seat_sessions::{SeatSessionIdentity, SeatSessionStore},
     usage_burn::UsageBurnStore,
@@ -177,6 +177,8 @@ impl Drop for SessionClearGuard {
 
 impl SessionStore {
     pub fn new(state_file: PathBuf) -> Self {
+        let test_isolation_root =
+            test_isolation_root_from_environment().expect("invalid Rust test isolation root");
         let legacy_state_file = if state_file == expand_home(DEFAULT_SESSION_STATE_FILE) {
             Some(PathBuf::from(LEGACY_TMP_SESSION_STATE_FILE))
         } else {
@@ -186,8 +188,14 @@ impl SessionStore {
         Self {
             state_file,
             legacy_state_file,
-            codex_sessions_root: expand_home("~/.codex/sessions"),
-            claude_projects_roots: claude_projects_roots(None),
+            codex_sessions_root: test_isolation_root
+                .as_ref()
+                .map(|root| root.join("codex-sessions"))
+                .unwrap_or_else(|| expand_home("~/.codex/sessions")),
+            claude_projects_roots: test_isolation_root
+                .as_ref()
+                .map(|root| vec![root.join("claude-projects")])
+                .unwrap_or_else(|| claude_projects_roots(None)),
             write_lock: Arc::new(Mutex::new(())),
             reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,
@@ -507,15 +515,43 @@ impl SessionStore {
             .filter(|value| !value.is_empty())
         {
             let session_index_path = expand_home(session_index_path);
-            if let Some(parent) = session_index_path.parent() {
-                self.codex_sessions_root = parent.join("sessions");
+            let test_root =
+                test_isolation_root_from_environment().expect("invalid Rust test isolation root");
+            // Test launchers may retain explicit fixture indexes outside HOME,
+            // but must never resolve the developer's live Codex index.
+            let is_live_home_path = env::var_os("HOME")
+                .is_some_and(|home| session_index_path.starts_with(PathBuf::from(home)));
+            if !test_root.is_some() || !is_live_home_path {
+                if let Some(parent) = session_index_path.parent() {
+                    self.codex_sessions_root = parent.join("sessions");
+                }
             }
         }
         self
     }
 
     pub fn with_claude_transcript_root(mut self, transcript_root: Option<&str>) -> Self {
-        self.claude_projects_roots = claude_projects_roots(transcript_root);
+        if let Some(root) =
+            test_isolation_root_from_environment().expect("invalid Rust test isolation root")
+        {
+            // `claude_projects_roots(None)` normally includes CLAUDE_CONFIG_DIR,
+            // XDG_CONFIG_HOME, and HOME. A test process must not scan any of
+            // those external roots, even after AppState applies its config. A
+            // deliberately supplied fixture root outside HOME remains usable.
+            let configured_root = transcript_root
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(expand_home);
+            let configured_under_home = configured_root.as_ref().is_some_and(|path| {
+                env::var_os("HOME").is_some_and(|home| path.starts_with(PathBuf::from(home)))
+            });
+            self.claude_projects_roots = match configured_root {
+                Some(path) if !configured_under_home => vec![path],
+                _ => vec![root.join("claude-projects")],
+            };
+        } else {
+            self.claude_projects_roots = claude_projects_roots(transcript_root);
+        }
         self
     }
 
@@ -1396,12 +1432,20 @@ impl SessionStore {
 
     #[cfg(test)]
     fn new_with_legacy_fallback(state_file: PathBuf, legacy_state_file: PathBuf) -> Self {
+        let test_isolation_root =
+            test_isolation_root_from_environment().expect("invalid Rust test isolation root");
         let seat_session_store = SeatSessionStore::for_state_file(&state_file);
         Self {
             state_file,
             legacy_state_file: Some(legacy_state_file),
-            codex_sessions_root: expand_home("~/.codex/sessions"),
-            claude_projects_roots: claude_projects_roots(None),
+            codex_sessions_root: test_isolation_root
+                .as_ref()
+                .map(|root| root.join("codex-sessions"))
+                .unwrap_or_else(|| expand_home("~/.codex/sessions")),
+            claude_projects_roots: test_isolation_root
+                .as_ref()
+                .map(|root| vec![root.join("claude-projects")])
+                .unwrap_or_else(|| claude_projects_roots(None)),
             write_lock: Arc::new(Mutex::new(())),
             reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,

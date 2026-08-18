@@ -2,12 +2,19 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 use sha2::{Digest, Sha256};
+
+/// Required by the Rust test launcher. When present, every default-shaped
+/// durable path is redirected below this root before an `AppState` starts.
+pub const TEST_ISOLATION_ROOT_ENV: &str = "SM_TEST_ISOLATION_ROOT";
+
+static TEST_ISOLATION_INSTANCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -131,6 +138,172 @@ impl AppConfig {
         }
         PathBuf::from(&self.queue_runner.state_dir)
     }
+
+    /// Redirect production-shaped durable paths below `root`. Explicit fixture
+    /// paths outside the production state directory are retained, while every
+    /// default AppState receives a unique state-file sibling and therefore a
+    /// unique reparent lock and queue database.
+    pub fn isolate_test_paths(&mut self, root: &Path) -> Result<()> {
+        if !root.is_absolute() {
+            anyhow::bail!("test isolation root must be absolute: {}", root.display());
+        }
+        fs::create_dir_all(root)
+            .with_context(|| format!("failed to create test isolation root {}", root.display()))?;
+        let instance = root.join(format!(
+            "appstate-{}-{}",
+            std::process::id(),
+            TEST_ISOLATION_INSTANCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&instance).with_context(|| {
+            format!(
+                "failed to create isolated AppState root {}",
+                instance.display()
+            )
+        })?;
+
+        self.paths.state_file =
+            isolate_default_data_path(&self.paths.state_file, &default_state_file(), &instance)?;
+        self.sm_send.db_path = isolate_default_data_path(
+            &self.sm_send.db_path,
+            &default_message_queue_db_path(),
+            &instance,
+        )?;
+        self.mobile_analytics.message_queue_db = isolate_default_data_path(
+            &self.mobile_analytics.message_queue_db,
+            &default_message_queue_db_path(),
+            &instance,
+        )?;
+        self.tool_logging.db_path = isolate_default_data_path(
+            &self.tool_logging.db_path,
+            &default_tool_usage_db_path(),
+            &instance,
+        )?;
+        self.usage.db_path =
+            isolate_default_data_path(&self.usage.db_path, &default_usage_db_path(), &instance)?;
+        self.codex_events.db_path = isolate_default_data_path(
+            &self.codex_events.db_path,
+            &default_codex_events_db_path(),
+            &instance,
+        )?;
+        self.codex_requests.db_path = isolate_default_data_path(
+            &self.codex_requests.db_path,
+            &default_codex_requests_db_path(),
+            &instance,
+        )?;
+        self.codex_observability.db_path = isolate_default_data_path(
+            &self.codex_observability.db_path,
+            &default_codex_observability_db_path(),
+            &instance,
+        )?;
+        self.queue_runner.state_dir = isolate_default_data_path(
+            &self.queue_runner.state_dir,
+            &default_queue_runner_state_dir(),
+            &instance,
+        )?;
+        self.mobile_terminal.device_enrollment_db_path = isolate_default_data_path(
+            &self.mobile_terminal.device_enrollment_db_path,
+            &default_mobile_terminal_device_enrollment_db_path(),
+            &instance,
+        )?;
+
+        // Default production indexes can make a test AppState scan live agent
+        // artifacts during startup. Fixtures that explicitly point elsewhere
+        // remain available, but home-relative defaults are never consulted.
+        if let Some(path) = self.codex.session_index_path.as_deref() {
+            if path == "~/.codex/session_index.jsonl" {
+                self.codex.session_index_path = None;
+            } else if path_is_under_home(path) {
+                anyhow::bail!("test isolation refuses production Codex index path {path}");
+            }
+        }
+        if let Some(path) = self.claude.transcript_root.as_deref() {
+            if path_is_under_home(path) {
+                anyhow::bail!("test isolation refuses production Claude transcript root {path}");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Return the configured test-isolation root, creating it before any durable
+/// store can be opened. The supported launcher supplies a cleanable root. As
+/// a fail-safe, a Cargo test binary that bypasses that launcher gets its own
+/// temporary root instead of falling through to production defaults.
+pub fn test_isolation_root_from_environment() -> Result<Option<PathBuf>> {
+    let root = if let Some(root) = env::var_os(TEST_ISOLATION_ROOT_ENV) {
+        PathBuf::from(root)
+    } else if running_rust_test_binary() {
+        env::temp_dir().join(format!("sm-rust-test-{}", std::process::id()))
+    } else {
+        return Ok(None);
+    };
+    if !root.is_absolute() {
+        anyhow::bail!("{TEST_ISOLATION_ROOT_ENV} must be an absolute path");
+    }
+    fs::create_dir_all(&root)
+        .with_context(|| format!("failed to create test isolation root {}", root.display()))?;
+    Ok(Some(root))
+}
+
+fn running_rust_test_binary() -> bool {
+    let Ok(executable) = env::current_exe() else {
+        return false;
+    };
+    let in_cargo_deps = executable
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "deps");
+    let has_cargo_hash = executable
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.rsplit_once('-'))
+        .is_some_and(|(_, hash)| {
+            hash.len() >= 8 && hash.chars().all(|character| character.is_ascii_hexdigit())
+        });
+    in_cargo_deps && has_cargo_hash
+}
+
+fn production_data_root() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| Path::new(&home).join(".local/share/claude-sessions"))
+}
+
+fn expand_home_for_path_match(path: &str) -> PathBuf {
+    if path == "~" {
+        return env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+    path.strip_prefix("~/")
+        .and_then(|rest| env::var_os("HOME").map(|home| Path::new(&home).join(rest)))
+        .unwrap_or_else(|| PathBuf::from(path))
+}
+
+fn isolate_default_data_path(path: &str, default: &str, root: &Path) -> Result<String> {
+    let expanded = expand_home_for_path_match(path);
+    let Some(production_root) = production_data_root() else {
+        return Ok(path.to_owned());
+    };
+    if path == default {
+        let default_expanded = expand_home_for_path_match(default);
+        let relative = default_expanded
+            .strip_prefix(&production_root)
+            .with_context(|| {
+                format!(
+                    "default test path {default} is not under {}",
+                    production_root.display()
+                )
+            })?;
+        return Ok(root.join(relative).to_string_lossy().into_owned());
+    }
+    if expanded.starts_with(&production_root) {
+        anyhow::bail!("test isolation refuses explicit production path {path}");
+    };
+    Ok(path.to_owned())
+}
+
+fn path_is_under_home(path: &str) -> bool {
+    let expanded = expand_home_for_path_match(path);
+    env::var_os("HOME").is_some_and(|home| expanded.starts_with(PathBuf::from(home)))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1910,6 +2083,106 @@ fn derive_session_cookie_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_isolation_rehomes_all_default_durable_paths() {
+        let root = env::temp_dir().join(format!(
+            "sm-config-test-isolation-{}-{}",
+            std::process::id(),
+            TEST_ISOLATION_INSTANCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut config = AppConfig::default();
+        config.isolate_test_paths(&root).unwrap();
+
+        let durable_paths = [
+            &config.paths.state_file,
+            &config.sm_send.db_path,
+            &config.mobile_analytics.message_queue_db,
+            &config.tool_logging.db_path,
+            &config.usage.db_path,
+            &config.codex_events.db_path,
+            &config.codex_requests.db_path,
+            &config.codex_observability.db_path,
+            &config.queue_runner.state_dir,
+            &config.mobile_terminal.device_enrollment_db_path,
+        ];
+        for path in durable_paths {
+            assert!(
+                Path::new(path).starts_with(&root),
+                "expected {path} below {}",
+                root.display()
+            );
+        }
+        assert!(Path::new(&config.paths.state_file)
+            .with_extension("reparent-apply.lock")
+            .starts_with(&root));
+        assert_eq!(config.codex.session_index_path, None);
+
+        let first_state_file = config.paths.state_file.clone();
+        let mut second_config = AppConfig::default();
+        second_config.isolate_test_paths(&root).unwrap();
+        assert_ne!(first_state_file, second_config.paths.state_file);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn test_isolation_retains_safe_fixtures_and_rejects_production_paths() {
+        let root = env::temp_dir().join(format!(
+            "sm-config-test-isolation-explicit-{}-{}",
+            std::process::id(),
+            TEST_ISOLATION_INSTANCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let safe_state_file = env::temp_dir().join("sm-safe-fixture-sessions.json");
+        let mut config = AppConfig::default();
+        config.paths.state_file = safe_state_file.display().to_string();
+        config.isolate_test_paths(&root).unwrap();
+        assert_eq!(
+            config.paths.state_file,
+            safe_state_file.display().to_string()
+        );
+
+        let mut unsafe_config = AppConfig::default();
+        unsafe_config.paths.state_file = production_data_root()
+            .unwrap()
+            .join("explicit-test-sessions.json")
+            .display()
+            .to_string();
+        let error = unsafe_config.isolate_test_paths(&root).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("refuses explicit production path"));
+
+        let mut unsafe_queue_config = AppConfig::default();
+        unsafe_queue_config.sm_send.db_path = production_data_root()
+            .unwrap()
+            .join("message_queue.db")
+            .display()
+            .to_string();
+        let error = unsafe_queue_config.isolate_test_paths(&root).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("refuses explicit production path"));
+
+        let mut unsafe_index_config = AppConfig::default();
+        unsafe_index_config.codex.session_index_path =
+            Some("~/.codex/sessions/index.jsonl".to_owned());
+        let error = unsafe_index_config.isolate_test_paths(&root).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("refuses production Codex index path"));
+
+        let mut unsafe_transcript_config = AppConfig::default();
+        unsafe_transcript_config.claude.transcript_root = Some("~/.claude/projects".to_owned());
+        let error = unsafe_transcript_config
+            .isolate_test_paths(&root)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("refuses production Claude transcript root"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn local_env_overlay_maps_mobile_auth_and_external_access() {

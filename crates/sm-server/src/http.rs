@@ -92,7 +92,12 @@ use crate::codex_events::{list_codex_events_from_path, CodexEventsResponse};
 use crate::codex_requests::{list_codex_pending_requests_from_path, CodexPendingRequestsResponse};
 #[cfg(test)]
 use crate::config::MobileTerminalDeviceKeyConfig;
-use crate::config::{trimmed, AppConfig, MobileTerminalUserConfig, PublicNodeConfig, UsageConfig};
+#[cfg(test)]
+use crate::config::TEST_ISOLATION_ROOT_ENV;
+use crate::config::{
+    test_isolation_root_from_environment, trimmed, AppConfig, MobileTerminalUserConfig,
+    PublicNodeConfig, UsageConfig,
+};
 use crate::email::{
     extract_reply_message_body, extract_routed_session_id, extract_subject_from_raw_email,
     extract_text_from_raw_email, normalize_explicit_session_id, EmailBridge,
@@ -407,7 +412,10 @@ impl AppState {
         Self::try_new(config).expect("session manager startup recovery failed")
     }
 
-    pub fn try_new(config: AppConfig) -> anyhow::Result<Self> {
+    pub fn try_new(mut config: AppConfig) -> anyhow::Result<Self> {
+        if let Some(root) = test_isolation_root_from_environment()? {
+            config.isolate_test_paths(&root)?;
+        }
         let state_file = expand_home(&config.paths.state_file);
         let queue_db_path = expand_home(&config.sm_send.db_path);
         let mut session_store = SessionStore::new_with_queue(state_file, queue_db_path)
@@ -13871,8 +13879,130 @@ mod tests {
     };
     use rusqlite::Connection;
     use serde::Serialize;
-    use std::{env, process};
+    use std::{env, fs, process};
     use tower::ServiceExt;
+
+    const DIRECT_HARNESS_PROBE_ENV: &str = "SM_DIRECT_HARNESS_ISOLATION_PROBE";
+
+    #[test]
+    fn direct_test_harness_without_wrapper_cannot_open_production_state_paths() {
+        if let Some(probe_path) = env::var_os(DIRECT_HARNESS_PROBE_ENV) {
+            let probe_path = PathBuf::from(probe_path);
+            let state = AppState::try_new(AppConfig::default()).unwrap();
+            let config = state.config();
+            let paths = [
+                config.paths.state_file.clone(),
+                config.sm_send.db_path.clone(),
+                config.mobile_analytics.message_queue_db.clone(),
+                config.tool_logging.db_path.clone(),
+                config.usage.db_path.clone(),
+                config.codex_events.db_path.clone(),
+                config.codex_requests.db_path.clone(),
+                config.codex_observability.db_path.clone(),
+                config.queue_runner.state_dir.clone(),
+                config.mobile_terminal.device_enrollment_db_path.clone(),
+                StdPath::new(&config.paths.state_file)
+                    .with_extension("reparent-apply.lock")
+                    .display()
+                    .to_string(),
+            ];
+            fs::write(
+                &probe_path,
+                format!("{}\n{}", process::id(), paths.join("\n")),
+            )
+            .unwrap();
+
+            let release_path = probe_path.with_extension("release");
+            for _ in 0..500 {
+                if release_path.exists() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("direct harness isolation probe was not released");
+        }
+
+        let probe_root = env::temp_dir().join(format!(
+            "sm-direct-harness-isolation-{}-{}",
+            process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        fs::create_dir_all(&probe_root).unwrap();
+        let probe_path = probe_root.join("probe");
+        let executable = env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .args([
+                "--exact",
+                "http::tests::direct_test_harness_without_wrapper_cannot_open_production_state_paths",
+                "--nocapture",
+            ])
+            .env_remove(TEST_ISOLATION_ROOT_ENV)
+            .env(DIRECT_HARNESS_PROBE_ENV, &probe_path)
+            .spawn()
+            .unwrap();
+
+        for _ in 0..500 {
+            if probe_path.exists() {
+                break;
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "isolation probe exited early"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(probe_path.exists(), "isolation probe did not become ready");
+
+        let probe = fs::read_to_string(&probe_path).unwrap();
+        let mut lines = probe.lines();
+        let child_pid = lines.next().unwrap().parse::<u32>().unwrap();
+        let production_root = env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap()
+            .join(".local/share/claude-sessions");
+        for path in lines {
+            assert!(
+                !StdPath::new(path).starts_with(&production_root),
+                "child resolved production durable path {path}"
+            );
+        }
+
+        let lsof = Command::new("/usr/sbin/lsof")
+            .args(["-p", &child_pid.to_string()])
+            .output()
+            .expect("lsof is required for the direct-harness isolation proof");
+        assert!(
+            lsof.status.success(),
+            "lsof could not inspect test child {child_pid}"
+        );
+        let open_files = String::from_utf8_lossy(&lsof.stdout);
+        assert!(
+            !open_files.contains(production_root.to_string_lossy().as_ref()),
+            "unwrapped test child opened production state path:\n{open_files}"
+        );
+
+        fs::write(probe_path.with_extension("release"), []).unwrap();
+        assert!(child.wait().unwrap().success());
+        fs::remove_dir_all(probe_root).unwrap();
+    }
+
+    #[test]
+    fn test_harness_rejects_explicit_production_state_before_appstate_startup() {
+        let production_state_file = env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap()
+            .join(".local/share/claude-sessions/explicit-test-state.json");
+        let mut config = AppConfig::default();
+        config.paths.state_file = production_state_file.display().to_string();
+
+        let error = match AppState::try_new(config) {
+            Ok(_) => panic!("test harness accepted an explicit production state file"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("refuses explicit production path"));
+    }
 
     #[test]
     fn codex_model_validation_errors_have_actionable_http_statuses() {
