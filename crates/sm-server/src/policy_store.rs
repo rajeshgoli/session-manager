@@ -75,6 +75,40 @@ pub struct BootstrapAuthority {
     pub binding_digest: String,
 }
 
+/// The post-bootstrap equivalent of `BootstrapAuthority`.  A canary is never
+/// widened merely because it has been migrated to stable-seat identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeatAuthority {
+    pub seat_key: String,
+    pub generation: u64,
+    pub holder_session_id: String,
+}
+
+impl SeatAuthority {
+    fn matches(&self, caller: &PolicyCallerBinding) -> bool {
+        matches!(caller, PolicyCallerBinding::Seat {
+            seat_key,
+            generation,
+            holder_session_id,
+            ..
+        } if seat_key == &self.seat_key
+            && generation == &self.generation
+            && holder_session_id == &self.holder_session_id)
+    }
+
+    fn validate(&self, lane: &str) -> Result<()> {
+        required(&self.seat_key, "seat authority seat_key")?;
+        required(&self.holder_session_id, "seat authority holder_session_id")?;
+        if self.generation == 0 || !self.seat_key.starts_with(&format!("{lane}-")) {
+            return Err(PolicyStoreError::Invalid(
+                "seat authority must name a current lane-prefixed seat generation".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl BootstrapAuthority {
     fn matches(&self, caller: &PolicyCallerBinding) -> bool {
         matches!(caller, PolicyCallerBinding::IncarnationBootstrap {
@@ -156,6 +190,8 @@ pub struct PolicyProjection {
     pub enabled: bool,
     #[serde(default)]
     pub bootstrap_authority: Option<BootstrapAuthority>,
+    #[serde(default)]
+    pub seat_authority: Option<SeatAuthority>,
     pub rules: Vec<MaterializedPolicyRule>,
     #[serde(default)]
     pub capacity_limits: Vec<PolicyCapacityLimit>,
@@ -168,6 +204,9 @@ impl PolicyProjection {
         sha256(&self.policy_digest, "projection policy_digest")?;
         if let Some(authority) = &self.bootstrap_authority {
             authority.validate()?;
+        }
+        if let Some(authority) = &self.seat_authority {
+            authority.validate(&self.lane)?;
         }
         if self.rules.is_empty() {
             return Err(PolicyStoreError::Invalid(
@@ -203,12 +242,20 @@ impl PolicyProjection {
                     "lease ttl must be positive".into(),
                 ));
             }
+            let mut claim_keys = std::collections::BTreeSet::new();
             for claim in &rule.capacity_claims {
                 claim
                     .validate()
                     .map_err(|error| PolicyStoreError::Invalid(error.to_string()))?;
+                if !claim_keys.insert((&claim.dimension, &claim.key)) {
+                    return Err(PolicyStoreError::Invalid(
+                        "a rule cannot contain duplicate capacity claims".into(),
+                    ));
+                }
             }
-            if matches!(rule.outcome, PolicyRuleOutcome::Allow) && rule.capacity_claims.is_empty() {
+            if (matches!(rule.outcome, PolicyRuleOutcome::Allow) || rule.overridable)
+                && rule.capacity_claims.is_empty()
+            {
                 return Err(PolicyStoreError::Invalid(
                     "allow rule must reserve at least one capacity claim".into(),
                 ));
@@ -225,6 +272,20 @@ impl PolicyProjection {
             }
             if !limits.insert((&limit.dimension, &limit.key)) {
                 return Err(PolicyStoreError::Invalid("duplicate capacity limit".into()));
+            }
+        }
+        for rule in &self.rules {
+            for claim in &rule.capacity_claims {
+                if !self
+                    .capacity_limits
+                    .iter()
+                    .any(|limit| limit.dimension == claim.dimension && limit.key == claim.key)
+                {
+                    return Err(PolicyStoreError::Invalid(format!(
+                        "rule {} has no capacity limit for {}/{}",
+                        rule.clause_id, claim.dimension, claim.key
+                    )));
+                }
             }
         }
         Ok(())
@@ -659,7 +720,16 @@ fn authorize_caller(projection: &PolicyProjection, request: &PolicySpawnRequest)
         ));
     }
     match &request.caller {
-        PolicyCallerBinding::Seat { .. } => Ok(()),
+        PolicyCallerBinding::Seat { .. } => projection
+            .seat_authority
+            .as_ref()
+            .filter(|authority| authority.matches(&request.caller))
+            .map(|_| ())
+            .ok_or_else(|| {
+                PolicyStoreError::CanaryDenied(
+                    "seat caller does not match externally configured canary authority".into(),
+                )
+            }),
         PolicyCallerBinding::IncarnationBootstrap { .. } => projection
             .bootstrap_authority
             .as_ref()
@@ -952,6 +1022,7 @@ mod tests {
             policy_digest: DIGEST.into(),
             enabled,
             bootstrap_authority: Some(bootstrap()),
+            seat_authority: None,
             capacity_limits: vec![PolicyCapacityLimit {
                 dimension: "concurrency".into(),
                 key: "lane".into(),
@@ -1132,8 +1203,31 @@ mod tests {
             ),
             Err(PolicyStoreError::CanaryDenied(_))
         ));
+        let (seat_store, seat_path) = store("unscoped-seat");
+        seat_store.install_projection(&projection(true, 1)).unwrap();
+        seat_store
+            .set_runtime_versions("sm-policy-1268", 1, 1)
+            .unwrap();
+        let mut seat_request = request("seat", PolicyVehicle::TaskAgent, None, "intent-seat");
+        seat_request.caller = PolicyCallerBinding::Seat {
+            lane: "sm-policy-1268".into(),
+            seat_key: "sm-policy-1268-maintainer".into(),
+            generation: 1,
+            holder_session_id: "maintainer-1".into(),
+        };
+        seat_store.create_request(&seat_request).unwrap();
+        assert!(matches!(
+            seat_store.prepare_admission(
+                "seat",
+                &class("routine_bounded", None),
+                None,
+                instant("2026-08-17T00:01:00Z")
+            ),
+            Err(PolicyStoreError::CanaryDenied(_))
+        ));
         std::fs::remove_file(path).ok();
         std::fs::remove_file(wrong_path).ok();
+        std::fs::remove_file(seat_path).ok();
     }
 
     #[test]
