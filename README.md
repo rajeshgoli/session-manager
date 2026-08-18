@@ -484,6 +484,20 @@ cd android-app
 - If the public app path fails, check Cloudflare Access mTLS first, then origin
   auth, then route-local attach proof.
 
+### Usage ledger
+
+`usage.db` stores minute-level `seat_tokens` facts. Do not sum rows across
+`window_kind`: a token can belong to more than one quota window. For correct
+current unscoped per-seat totals, use the `current_seat_token_totals` view,
+which selects the latest observed unscoped window and filters facts by that
+window's timestamp range. Scoped model pools remain available through `sm
+usage`'s model-aware report:
+
+```bash
+sqlite3 ~/.local/share/claude-sessions/usage.db \
+  'SELECT seat_id, window_kind, SUM(input_tokens + output_tokens + reasoning_tokens + cache_write_5m + cache_write_1h + cache_read_tokens) AS tokens FROM current_seat_token_totals GROUP BY seat_id, window_kind;'
+```
+
 ---
 
 ## Requirements
