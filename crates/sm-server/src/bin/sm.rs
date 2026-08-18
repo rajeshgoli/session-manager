@@ -3071,6 +3071,9 @@ fn print_reparent_tree_preview(preview: &Value) {
         preview["source_session_id"].as_str().unwrap_or("unknown"),
         preview["target_session_id"].as_str().unwrap_or("unknown")
     );
+    if preview["peer_root_succession"].as_bool().unwrap_or(false) {
+        println!("mode: peer-root succession");
+    }
     print_reparent_edges(preview["edge_changes"].as_array());
     for blocker in preview["blockers"].as_array().into_iter().flatten() {
         println!("blocker: {}", blocker.as_str().unwrap_or("unknown"));

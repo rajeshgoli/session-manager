@@ -65,6 +65,11 @@ pub struct SessionStore {
     codex_sessions_root: PathBuf,
     claude_projects_roots: Vec<PathBuf>,
     write_lock: Arc<Mutex<()>>,
+    /// Applies span the JSON registry and the retained queue, so their durable
+    /// lease must have exactly one in-process driver. The persisted lease still
+    /// provides restart recovery; this lock prevents a second HTTP request from
+    /// racing a completed driver and mistaking its released lease for failure.
+    reparent_apply_lock: Arc<Mutex<()>>,
     queue_store: Option<RetainedQueueStore>,
     /// Carried on the store rather than read per-request because the codex-fork
     /// event monitor threads evaluate the same thresholds and have no access to
@@ -183,6 +188,7 @@ impl SessionStore {
             codex_sessions_root: expand_home("~/.codex/sessions"),
             claude_projects_roots: claude_projects_roots(None),
             write_lock: Arc::new(Mutex::new(())),
+            reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
@@ -1396,6 +1402,7 @@ impl SessionStore {
             codex_sessions_root: expand_home("~/.codex/sessions"),
             claude_projects_roots: claude_projects_roots(None),
             write_lock: Arc::new(Mutex::new(())),
+            reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             context_monitor: ContextMonitorConfig::default(),
             delivery_runtime: None,
@@ -1982,6 +1989,7 @@ impl SessionStore {
             target_parent_session_id,
             expected_parent_session_id.as_deref(),
             &[],
+            false,
         );
         let approvals = vec![ReparentApprovalRecord {
             actor_kind: "agent".to_owned(),
@@ -2002,6 +2010,7 @@ impl SessionStore {
             expected_parent_session_id,
             expected_parent_is_live,
             detach_non_live_parent: false,
+            peer_root_succession: false,
             frozen_live_child_ids: Vec::new(),
             initiator_session_id: requester_session_id.to_owned(),
             required_agent_approvals,
@@ -2014,6 +2023,7 @@ impl SessionStore {
             decided_at: None,
             applied_at: None,
             failure_reason: None,
+            superseded_by_request_id: None,
             topology_fingerprint,
             apply_stage: None,
             apply_plan: None,
@@ -2086,9 +2096,12 @@ impl SessionStore {
                 "target session {target_session_id} cannot participate in credential-bound consent"
             ));
         }
-        if target.parent_session_id.as_deref() != Some(source_session_id) {
+        let target_is_direct_child = target.parent_session_id.as_deref() == Some(source_session_id);
+        let peer_root_succession =
+            source.parent_session_id.is_none() && target.parent_session_id.is_none();
+        if !target_is_direct_child && !peer_root_succession {
             blockers.push(format!(
-                "target session {target_session_id} is not a live direct child of {source_session_id}"
+                "target session {target_session_id} must be a live direct child of {source_session_id}, or both source and target must be roots for peer-root succession"
             ));
         }
         let expected_parent_session_id = source.parent_session_id.clone();
@@ -2137,6 +2150,7 @@ impl SessionStore {
             expected_parent_session_id.as_deref(),
             target_parent_session_id,
             &frozen_live_child_ids,
+            peer_root_succession,
         );
         if reparent_plan_would_create_cycle(&sessions, &edge_changes) {
             blockers.push("tree promotion would create a session hierarchy cycle".to_owned());
@@ -2156,6 +2170,7 @@ impl SessionStore {
             kind: "tree".to_owned(),
             source_session_id: source_session_id.to_owned(),
             target_session_id: target_session_id.to_owned(),
+            peer_root_succession,
             frozen_live_child_ids: frozen_live_child_ids.clone(),
             edge_changes,
             json_routing_changes,
@@ -2254,13 +2269,16 @@ impl SessionStore {
             decided_at: None,
             applied_at: None,
             failure_reason: None,
+            superseded_by_request_id: None,
             topology_fingerprint: reparent_topology_fingerprint(
                 "tree",
                 source_session_id,
                 target_session_id,
                 source.parent_session_id.as_deref(),
                 &preview.frozen_live_child_ids,
+                peer_root_succession,
             ),
+            peer_root_succession,
             apply_stage: None,
             apply_plan: None,
             notification_intents: Vec::new(),
@@ -2571,6 +2589,14 @@ impl SessionStore {
     }
 
     pub fn reconcile_reparent_requests(&self) -> Result<Option<ReparentRequestRecord>> {
+        let _apply_guard = self
+            .reparent_apply_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("reparent apply lock poisoned"))?;
+        self.reconcile_reparent_requests_locked()
+    }
+
+    fn reconcile_reparent_requests_locked(&self) -> Result<Option<ReparentRequestRecord>> {
         let mut first = None;
         loop {
             let request_id = match self.acquire_reparent_apply_lease()? {
@@ -2770,21 +2796,26 @@ impl SessionStore {
             store_reparent_request_records(&mut state, &records)?;
             self.write_raw_json_value(&state)?;
         }
-        match action {
-            ReparentRepairAction::Resume => {
-                if let Err(error) = self.apply_reparent_request(request_id) {
-                    self.fail_reparent_apply(request_id, &error.to_string())?;
+        let repaired = {
+            let _apply_guard = self
+                .reparent_apply_lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("reparent apply lock poisoned"))?;
+            match action {
+                ReparentRepairAction::Resume => {
+                    if let Err(error) = self.apply_reparent_request(request_id) {
+                        self.fail_reparent_apply(request_id, &error.to_string())?;
+                    }
+                }
+                ReparentRepairAction::RollbackPrecommit => {
+                    if let Err(error) = self.rollback_reparent_precommit(request_id, None) {
+                        self.fail_reparent_apply(request_id, &error.to_string())?;
+                    }
                 }
             }
-            ReparentRepairAction::RollbackPrecommit => {
-                if let Err(error) = self.rollback_reparent_precommit(request_id, None) {
-                    self.fail_reparent_apply(request_id, &error.to_string())?;
-                }
-            }
-        }
-        let repaired = self
-            .get_reparent_request(request_id)?
-            .filter(|record| matches!(record.status.as_str(), "applied" | "repaired"));
+            self.get_reparent_request(request_id)?
+                .filter(|record| matches!(record.status.as_str(), "applied" | "repaired"))
+        };
         if repaired.is_some() {
             self.verify_reparent_repair(request_id, &attempted_at)?;
             self.reconcile_reparent_requests()?;
@@ -2940,6 +2971,7 @@ impl SessionStore {
                 record.expected_parent_session_id.as_deref(),
                 tree_target_parent_session_id(record),
                 &record.frozen_live_child_ids,
+                record.peer_root_succession,
             )
         } else {
             vec![ReparentEdgeChange {
@@ -13127,16 +13159,22 @@ fn reparent_topology_fingerprint(
     target_parent_session_id: &str,
     expected_parent_session_id: Option<&str>,
     frozen_live_child_ids: &[String],
+    peer_root_succession: bool,
 ) -> String {
     let mut children = frozen_live_child_ids.to_vec();
     children.sort();
-    let canonical = json!({
+    let mut canonical = json!({
         "kind": kind,
         "subject_session_id": subject_session_id,
         "target_parent_session_id": target_parent_session_id,
         "expected_parent_session_id": expected_parent_session_id,
         "frozen_live_child_ids": children,
     });
+    // Keep the old canonical shape for existing direct-child requests so their
+    // persisted fingerprints remain valid across this schema extension.
+    if peer_root_succession {
+        canonical["tree_mode"] = Value::String("peer_root_succession".to_owned());
+    }
     let digest = Sha256::digest(serde_json::to_vec(&canonical).unwrap_or_default());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -13169,7 +13207,19 @@ fn refresh_reparent_requests(
     let decided_at = now
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned());
-    for record in records {
+    for index in 0..records.len() {
+        let superseded_by_request_id = records
+            .iter()
+            .filter(|other| {
+                other.id != records[index].id
+                    && other.status == "applied"
+                    && other.kind == records[index].kind
+                    && other.subject_session_id == records[index].subject_session_id
+                    && other.target_parent_session_id == records[index].target_parent_session_id
+            })
+            .min_by(|left, right| (&left.applied_at, &left.id).cmp(&(&right.applied_at, &right.id)))
+            .map(|record| record.id.clone());
+        let record = &mut records[index];
         if record.status != "pending" {
             continue;
         }
@@ -13193,9 +13243,15 @@ fn refresh_reparent_requests(
             _ => {}
         }
         if let Some(reason) = reparent_stale_reason(record, sessions) {
-            record.status = "stale".to_owned();
+            if let Some(winner) = superseded_by_request_id {
+                record.status = "superseded".to_owned();
+                record.superseded_by_request_id = Some(winner.clone());
+                record.failure_reason = Some(format!("request superseded by {winner}"));
+            } else {
+                record.status = "stale".to_owned();
+                record.failure_reason = Some(reason);
+            }
             record.decided_at = Some(decided_at.clone());
-            record.failure_reason = Some(reason);
             record.ready_to_apply = false;
             changed = true;
         }
@@ -13213,6 +13269,7 @@ fn reparent_stale_reason(
         &record.target_parent_session_id,
         record.expected_parent_session_id.as_deref(),
         &record.frozen_live_child_ids,
+        record.peer_root_succession,
     );
     if record.topology_fingerprint != expected_fingerprint {
         return Some("stored topology fingerprint does not match the request plan".to_owned());
@@ -13252,7 +13309,11 @@ fn reparent_stale_reason(
         return Some("target parent session is no longer live".to_owned());
     }
     if record.kind == "tree" {
-        if target.parent_session_id.as_deref() != Some(&record.subject_session_id) {
+        if record.peer_root_succession {
+            if target.parent_session_id.is_some() {
+                return Some("peer-root successor is no longer a root".to_owned());
+            }
+        } else if target.parent_session_id.as_deref() != Some(&record.subject_session_id) {
             return Some("tree target is no longer a direct child of the source".to_owned());
         }
         let current_live_children = sessions
@@ -13273,6 +13334,7 @@ fn reparent_stale_reason(
             record.expected_parent_session_id.as_deref(),
             tree_target_parent_session_id(record),
             &record.frozen_live_child_ids,
+            record.peer_root_succession,
         );
         if reparent_plan_would_create_cycle(sessions, &changes) {
             return Some("current tree plan would create a hierarchy cycle".to_owned());
@@ -13293,19 +13355,21 @@ fn tree_reparent_edge_changes(
     expected_source_parent_session_id: Option<&str>,
     target_parent_session_id: Option<&str>,
     frozen_live_child_ids: &[String],
+    peer_root_succession: bool,
 ) -> Vec<ReparentEdgeChange> {
-    let mut changes = vec![
-        ReparentEdgeChange {
+    let mut changes = Vec::new();
+    if !peer_root_succession {
+        changes.push(ReparentEdgeChange {
             session_id: target_session_id.to_owned(),
             expected_parent_session_id: Some(source_session_id.to_owned()),
             new_parent_session_id: target_parent_session_id.map(ToOwned::to_owned),
-        },
-        ReparentEdgeChange {
-            session_id: source_session_id.to_owned(),
-            expected_parent_session_id: expected_source_parent_session_id.map(ToOwned::to_owned),
-            new_parent_session_id: Some(target_session_id.to_owned()),
-        },
-    ];
+        });
+    }
+    changes.push(ReparentEdgeChange {
+        session_id: source_session_id.to_owned(),
+        expected_parent_session_id: expected_source_parent_session_id.map(ToOwned::to_owned),
+        new_parent_session_id: Some(target_session_id.to_owned()),
+    });
     changes.extend(
         frozen_live_child_ids
             .iter()
@@ -13692,6 +13756,7 @@ pub struct ReparentTreePreview {
     pub kind: String,
     pub source_session_id: String,
     pub target_session_id: String,
+    pub peer_root_succession: bool,
     pub frozen_live_child_ids: Vec<String>,
     pub edge_changes: Vec<ReparentEdgeChange>,
     pub json_routing_changes: Vec<ReparentRoutingChange>,
@@ -13767,7 +13832,7 @@ fn desired_reparent_notifications(
         }
     } else if matches!(
         record.status.as_str(),
-        "applied" | "rejected" | "expired" | "stale" | "failed" | "repaired"
+        "applied" | "rejected" | "expired" | "stale" | "superseded" | "failed" | "repaired"
     ) {
         let event = format!("terminal:{}", record.status);
         for recipient in record
@@ -13839,6 +13904,14 @@ fn reparent_progress_notification_text(
 }
 
 fn reparent_terminal_notification_text(record: &ReparentRequestRecord) -> String {
+    if let Some(winner) = record.superseded_by_request_id.as_deref() {
+        return format!(
+            "[sm reparent] Request {} was superseded by request {}. {}",
+            record.id,
+            winner,
+            reparent_edge_summary(record),
+        );
+    }
     format!(
         "[sm reparent] Request {} is {}. {}{}",
         record.id,
@@ -13865,6 +13938,7 @@ fn reparent_edge_summary(record: &ReparentRequestRecord) -> String {
                     record.expected_parent_session_id.as_deref(),
                     tree_target_parent_session_id(record),
                     &record.frozen_live_child_ids,
+                    record.peer_root_succession,
                 )
             } else {
                 vec![ReparentEdgeChange {
@@ -13925,6 +13999,10 @@ pub struct ReparentRequestRecord {
     pub expected_parent_is_live: bool,
     #[serde(default)]
     pub detach_non_live_parent: bool,
+    /// A root-to-root succession does not move the successor upward; it moves
+    /// the outgoing root and its frozen children underneath that peer root.
+    #[serde(default)]
+    pub peer_root_succession: bool,
     #[serde(default)]
     pub frozen_live_child_ids: Vec<String>,
     pub initiator_session_id: String,
@@ -13945,6 +14023,10 @@ pub struct ReparentRequestRecord {
     pub applied_at: Option<String>,
     #[serde(default)]
     pub failure_reason: Option<String>,
+    /// When a same-edge request completed elsewhere, retain this request as
+    /// audit history and tell a caller exactly which request won.
+    #[serde(default)]
+    pub superseded_by_request_id: Option<String>,
     pub topology_fingerprint: String,
     #[serde(default)]
     pub apply_stage: Option<String>,
@@ -20437,6 +20519,125 @@ mod tests {
         assert!(state["reparent_apply_lease"].is_null());
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn concurrent_reparent_reconcilers_return_committed_state_without_losing_the_lease() {
+        let (store, _queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-concurrent-reconcile");
+        let store = std::sync::Arc::new(store);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.reconcile_reparent_requests()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for worker in workers {
+            assert!(worker.join().unwrap().is_ok());
+        }
+
+        let record = store.get_reparent_request(&request_id).unwrap().unwrap();
+        assert_eq!(record.status, "applied");
+        assert_eq!(record.apply_stage.as_deref(), Some("applied"));
+        let state = store.load_raw_json_value().unwrap();
+        assert!(state["reparent_apply_lease"].is_null());
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn peer_root_succession_recovers_from_a_persisted_apply_stage_after_restart() {
+        let state_file = unique_temp_path("peer-root-restart");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("outgoing", None, "outgoing-secret"),
+                    reparent_test_session("successor", None, "successor-secret"),
+                    reparent_test_session("worker", Some("outgoing"), "worker-secret")
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(state_file.clone());
+        let request = match store
+            .create_reparent_tree_request(
+                "outgoing",
+                CreateReparentTreeRequest {
+                    requester_session_id: "outgoing".to_owned(),
+                    target_session_id: "successor".to_owned(),
+                    dry_run: false,
+                },
+                "outgoing-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Created(record) => record,
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+        assert!(request.peer_root_succession);
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            let mut records = reparent_request_records(&state).unwrap();
+            let record = records
+                .iter_mut()
+                .find(|record| record.id == request.id)
+                .unwrap();
+            record.approvals.push(ReparentApprovalRecord {
+                actor_kind: "agent".to_owned(),
+                actor_id: "successor".to_owned(),
+                decision: "approved".to_owned(),
+                decided_at: now_rfc3339(),
+            });
+            record.ready_to_apply = true;
+            store_reparent_request_records(&mut state, &records).unwrap();
+            store.write_raw_json_value(&state).unwrap();
+        }
+        assert_eq!(
+            store.acquire_reparent_apply_lease().unwrap().as_deref(),
+            Some(request.id.as_str())
+        );
+        store.quiesce_reparent_json_routing(&request.id).unwrap();
+        drop(store);
+
+        let recovered = SessionStore::new(state_file.clone())
+            .reconcile_reparent_requests()
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, "applied");
+        let final_store = SessionStore::new(state_file.clone());
+        assert_eq!(
+            final_store
+                .get_session("successor")
+                .unwrap()
+                .unwrap()
+                .parent_session_id,
+            None
+        );
+        for session_id in ["outgoing", "worker"] {
+            assert_eq!(
+                final_store
+                    .get_session(session_id)
+                    .unwrap()
+                    .unwrap()
+                    .parent_session_id
+                    .as_deref(),
+                Some("successor")
+            );
+        }
+        let state = final_store.load_raw_json_value().unwrap();
+        assert!(state["reparent_apply_lease"].is_null());
+
+        let _ = fs::remove_file(state_file);
     }
 
     #[test]
