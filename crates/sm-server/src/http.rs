@@ -104,6 +104,10 @@ use crate::google_auth::{
 };
 use crate::mobile_analytics::build_mobile_analytics_summary;
 use crate::mobile_devices::{self, mobile_device_db_path};
+use crate::policy_contracts::{
+    PolicyCallerBinding, PolicyClassification, PolicyRequestedLaunch, PolicySpawnRequest,
+    PolicyVehicle, SPAWN_REQUEST_SCHEMA,
+};
 use crate::policy_store::{PolicyProjection, PolicyStore};
 use crate::queue::{
     CodexReviewRequestFilters, CodexReviewRequestRegistration, CompleteCodexReviewRequest,
@@ -3613,6 +3617,165 @@ fn accept_spawn_brief(
         .read_spawn_brief(&intent.artifact)
         .map_err(core_session_create_api_error)?;
     Ok((accepted_prompt, intent.id, intent.artifact.sha256))
+}
+
+fn bootstrap_policy_caller(
+    state: &AppState,
+    headers: &HeaderMap,
+    parent_session_id: &str,
+) -> Result<PolicyCallerBinding, ApiError> {
+    let runtime = state.policy_runtime().ok_or_else(|| ApiError::Status {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        detail: "policy runtime is not active".to_owned(),
+    })?;
+    let authority = runtime
+        .projection
+        .bootstrap_authority
+        .as_ref()
+        .ok_or_else(|| ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "policy bootstrap authority is not configured".to_owned(),
+        })?;
+    let credential = reparent_session_credential(headers)?;
+    if !state
+        .session_store
+        .verify_session_credential(parent_session_id, &credential)?
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "session credential does not match the policy caller".to_owned(),
+        });
+    }
+    let credential_fingerprint = sha256_hex(credential.as_bytes());
+    if authority.session_id != parent_session_id
+        || authority.credential_fingerprint != credential_fingerprint
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "caller is outside the configured policy canary".to_owned(),
+        });
+    }
+    Ok(PolicyCallerBinding::IncarnationBootstrap {
+        lane: runtime.projection.lane.clone(),
+        session_id: parent_session_id.to_owned(),
+        credential_fingerprint,
+        binding_digest: authority.binding_digest.clone(),
+    })
+}
+
+fn deterministic_policy_classification(
+    projection: &PolicyProjection,
+    requested_name: &str,
+) -> Result<(PolicyVehicle, PolicyClassification), ApiError> {
+    let role_matches = projection
+        .rules
+        .iter()
+        .filter(|rule| rule.role_id.as_deref() == Some(requested_name))
+        .collect::<Vec<_>>();
+    let class_matches = projection
+        .rules
+        .iter()
+        .filter(|rule| rule.class_id.as_deref() == Some(requested_name))
+        .collect::<Vec<_>>();
+    let (matches, method, role_id) = if role_matches.is_empty() {
+        (class_matches, "explicit_class", None)
+    } else {
+        (
+            role_matches,
+            "explicit_role",
+            Some(requested_name.to_owned()),
+        )
+    };
+    let Some(first) = matches.first() else {
+        return Ok((
+            PolicyVehicle::TaskAgent,
+            PolicyClassification {
+                class_id: requested_name.to_owned(),
+                role_id: None,
+                turn_profile: "initial_task".to_owned(),
+                method: "unclassified_explicit_name".to_owned(),
+                confidence: "exact".to_owned(),
+            },
+        ));
+    };
+    if matches.iter().skip(1).any(|rule| {
+        rule.profile.vehicle != first.profile.vehicle || rule.class_id != first.class_id
+    }) {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: format!(
+                "policy clauses disagree on the deterministic vehicle or class for {requested_name}"
+            ),
+        });
+    }
+    Ok((
+        first.profile.vehicle.clone(),
+        PolicyClassification {
+            class_id: first
+                .class_id
+                .clone()
+                .unwrap_or_else(|| requested_name.to_owned()),
+            role_id,
+            turn_profile: "initial_task".to_owned(),
+            method: method.to_owned(),
+            confidence: "exact".to_owned(),
+        },
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn freeze_policy_spawn_request(
+    runtime: &PolicyRuntimeState,
+    caller: PolicyCallerBinding,
+    launch_intent_id: &str,
+    prompt_digest: &str,
+    requested_name: &str,
+    vehicle: PolicyVehicle,
+    provider: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    working_dir: &str,
+    node: &str,
+) -> Result<PolicySpawnRequest, ApiError> {
+    let request_id = sha256_hex(
+        format!(
+            "sm-policy-request-v1\0{}\0{}\0{}\0{}",
+            runtime.projection.lane,
+            runtime.projection.policy_digest,
+            launch_intent_id,
+            prompt_digest
+        )
+        .as_bytes(),
+    );
+    let created_at = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .map_err(|error| ApiError::Internal(error.into()))?;
+    let request = PolicySpawnRequest {
+        schema: SPAWN_REQUEST_SCHEMA.to_owned(),
+        request_id,
+        caller,
+        prompt_digest: prompt_digest.to_owned(),
+        launch_intent_id: launch_intent_id.to_owned(),
+        policy_version: runtime.projection.policy_version.clone(),
+        policy_digest: runtime.projection.policy_digest.clone(),
+        requested: PolicyRequestedLaunch {
+            name: requested_name.to_owned(),
+            vehicle,
+            provider: provider.to_owned(),
+            model: model.map(ToOwned::to_owned),
+            effort: effort.map(ToOwned::to_owned),
+            working_dir: working_dir.to_owned(),
+            node: node.to_owned(),
+        },
+        topology_version: 0,
+        capacity_version: 0,
+        created_at,
+    };
+    request.validate().map_err(|error| ApiError::Status {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        detail: error.to_string(),
+    })?;
+    Ok(request)
 }
 
 async fn spawn_session(
@@ -13732,6 +13895,103 @@ mod tests {
     use serde::Serialize;
     use std::{env, process};
     use tower::ServiceExt;
+
+    fn policy_projection_with_rules(
+        rules: Vec<crate::policy_store::MaterializedPolicyRule>,
+    ) -> PolicyProjection {
+        PolicyProjection {
+            lane: "sm-policy-1268".to_owned(),
+            policy_version: "v1".to_owned(),
+            policy_digest: "a".repeat(64),
+            enabled: true,
+            bootstrap_authority: None,
+            seat_authority: None,
+            rules,
+            capacity_limits: vec![crate::policy_store::PolicyCapacityLimit {
+                dimension: "provider".to_owned(),
+                key: "codex-fork".to_owned(),
+                maximum_units: 2,
+            }],
+        }
+    }
+
+    fn policy_rule(
+        clause_id: &str,
+        role_id: Option<&str>,
+        class_id: Option<&str>,
+        vehicle: PolicyVehicle,
+    ) -> crate::policy_store::MaterializedPolicyRule {
+        crate::policy_store::MaterializedPolicyRule {
+            clause_id: clause_id.to_owned(),
+            rank: 1,
+            class_id: class_id.map(ToOwned::to_owned),
+            role_id: role_id.map(ToOwned::to_owned),
+            vehicle: Some(vehicle.clone()),
+            profile: crate::policy_contracts::PolicyLaunchProfile {
+                vehicle,
+                provider: "codex-fork".to_owned(),
+                model: "gpt-5.6-terra".to_owned(),
+                effort: "high".to_owned(),
+                context_profile: "provider_native_compaction".to_owned(),
+            },
+            outcome: crate::policy_store::PolicyRuleOutcome::Allow,
+            overridable: true,
+            capacity_claims: vec![crate::policy_contracts::PolicyCapacityClaim {
+                dimension: "provider".to_owned(),
+                key: "codex-fork".to_owned(),
+                units: 1,
+            }],
+            lease_ttl_seconds: 900,
+            reason: "test policy".to_owned(),
+        }
+    }
+
+    #[test]
+    fn deterministic_policy_classification_distinguishes_named_seats_from_workers() {
+        let projection = policy_projection_with_rules(vec![policy_rule(
+            "role.watchdog",
+            Some("sm-policy-1268-watchdog"),
+            Some("monitoring"),
+            PolicyVehicle::NamedSeat,
+        )]);
+
+        let (vehicle, classification) =
+            deterministic_policy_classification(&projection, "sm-policy-1268-watchdog").unwrap();
+        assert_eq!(vehicle, PolicyVehicle::NamedSeat);
+        assert_eq!(classification.class_id, "monitoring");
+        assert_eq!(
+            classification.role_id.as_deref(),
+            Some("sm-policy-1268-watchdog")
+        );
+
+        let (vehicle, classification) =
+            deterministic_policy_classification(&projection, "ticket-1284").unwrap();
+        assert_eq!(vehicle, PolicyVehicle::TaskAgent);
+        assert_eq!(classification.class_id, "ticket-1284");
+        assert!(classification.role_id.is_none());
+    }
+
+    #[test]
+    fn deterministic_policy_classification_rejects_vehicle_conflicts() {
+        let projection = policy_projection_with_rules(vec![
+            policy_rule(
+                "role.one",
+                Some("sm-policy-1268-owner"),
+                Some("orchestration"),
+                PolicyVehicle::NamedSeat,
+            ),
+            policy_rule(
+                "role.two",
+                Some("sm-policy-1268-owner"),
+                Some("orchestration"),
+                PolicyVehicle::TaskAgent,
+            ),
+        ]);
+
+        let error =
+            deterministic_policy_classification(&projection, "sm-policy-1268-owner").unwrap_err();
+        assert_eq!(api_error_status_detail(error).0, StatusCode::CONFLICT);
+    }
 
     #[test]
     fn codex_model_validation_errors_have_actionable_http_statuses() {
