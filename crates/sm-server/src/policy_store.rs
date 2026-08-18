@@ -654,8 +654,8 @@ impl PolicyStore {
         let mut conn = self.open()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let released_at = now()?;
-        tx.execute("UPDATE policy_capacity_leases SET state = 'released', released_at = ?2 WHERE lease_id = ?1 AND state = 'active'", params![lease_id, released_at])?;
-        tx.execute("UPDATE policy_provisional_children SET state = 'released', released_at = ?2 WHERE lease_id = ?1 AND state = 'reserved'", params![lease_id, now()?])?;
+        tx.execute("UPDATE policy_capacity_leases SET state = 'released', released_at = ?2 WHERE lease_id = ?1 AND state IN ('active', 'committed')", params![lease_id, released_at])?;
+        tx.execute("UPDATE policy_provisional_children SET state = 'released', released_at = ?2 WHERE lease_id = ?1 AND state IN ('reserved', 'launched')", params![lease_id, now()?])?;
         tx.commit()?;
         Ok(())
     }
@@ -675,8 +675,36 @@ impl PolicyStore {
             .optional()?;
         if let Some(lease_id) = lease_id {
             let released_at = now()?;
-            tx.execute("UPDATE policy_capacity_leases SET state = 'released', released_at = ?2 WHERE lease_id = ?1 AND state = 'active'", params![lease_id, released_at])?;
-            tx.execute("UPDATE policy_provisional_children SET state = 'released', released_at = ?2 WHERE child_session_id = ?1 AND state = 'reserved'", params![child_session_id, now()?])?;
+            tx.execute("UPDATE policy_capacity_leases SET state = 'released', released_at = ?2 WHERE lease_id = ?1 AND state IN ('active', 'committed')", params![lease_id, released_at])?;
+            tx.execute("UPDATE policy_provisional_children SET state = 'released', released_at = ?2 WHERE child_session_id = ?1 AND state IN ('reserved', 'launched')", params![child_session_id, now()?])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// D3 promotes a persisted same-store provisional child after its core
+    /// runtime is materialized and attested. Committed leases never expire by
+    /// reservation TTL and remain capacity-counted until release_by_child.
+    pub fn mark_child_launched(&self, child_session_id: &str) -> Result<()> {
+        required(child_session_id, "provisional child session ID")?;
+        let mut conn = self.open()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let lease_id = tx
+            .query_row(
+                "SELECT lease_id FROM policy_provisional_children WHERE child_session_id = ?1 AND state = 'reserved'",
+                [child_session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(lease_id) = lease_id {
+            tx.execute(
+                "UPDATE policy_capacity_leases SET state = 'committed' WHERE lease_id = ?1 AND state = 'active'",
+                [&lease_id],
+            )?;
+            tx.execute(
+                "UPDATE policy_provisional_children SET state = 'launched' WHERE child_session_id = ?1 AND state = 'reserved'",
+                [child_session_id],
+            )?;
         }
         tx.commit()?;
         Ok(())
@@ -875,7 +903,7 @@ fn ensure_capacity(
             .ok_or_else(|| {
                 PolicyStoreError::CapacityUnavailable(format!("no limit for {dimension}/{key}"))
             })?;
-        let active: u64 = tx.query_row(r#"SELECT COALESCE(SUM(c.units), 0) FROM policy_capacity_claims c JOIN policy_capacity_leases l ON l.lease_id = c.lease_id WHERE c.dimension = ?1 AND c.claim_key = ?2 AND l.state = 'active'"#, params![dimension, key], |row| row.get(0))?;
+        let active: u64 = tx.query_row(r#"SELECT COALESCE(SUM(c.units), 0) FROM policy_capacity_claims c JOIN policy_capacity_leases l ON l.lease_id = c.lease_id WHERE c.dimension = ?1 AND c.claim_key = ?2 AND l.state IN ('active', 'committed')"#, params![dimension, key], |row| row.get(0))?;
         if active.saturating_add(units) > maximum {
             return Err(PolicyStoreError::CapacityUnavailable(format!(
                 "{dimension}/{key}: requested {units}, active {active}, maximum {maximum}"
@@ -1740,6 +1768,7 @@ mod tests {
             ),
             Err(PolicyStoreError::Invalid(_))
         ));
+        after_restart.mark_child_launched("provisional-1").unwrap();
         after_restart.release_by_child("provisional-1").unwrap();
         after_restart.release_by_child("provisional-1").unwrap();
         let conn = Connection::open(&path).unwrap();
