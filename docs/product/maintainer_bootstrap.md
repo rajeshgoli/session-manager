@@ -13,7 +13,7 @@ Workflow:
 - File or update a GitHub ticket when needed.
 - Implement the fix with focused changes and tests.
 - Restart Session Manager with `launchctl`.
-- Use the repository-owned `docs/working/pr_review_process.md` for the PR review
+- Use the repository-owned `specs/1268_pr_review_process.md` for the PR review
   and merge loop. Do not rely on an unsynchronized home-directory copy.
 - Work is not complete until the PR is reviewed, merged, and Session Manager is restarted on merged code.
 - When a problem reported by another agent is fixed, always report back to that agent via `sm send`.

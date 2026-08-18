@@ -36,7 +36,7 @@ The operator request referenced a home-directory workflow, but the operative,
 reviewed file in this repository is:
 
 ```text
-docs/working/pr_review_process.md
+specs/1268_pr_review_process.md
 ```
 
 This feature should automate that actual process doc:

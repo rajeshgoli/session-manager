@@ -12,7 +12,7 @@ Durable lessons from maintainer sessions. Read this before handling the maintain
 - The repo already supports generic file-driven service-role bootstrap via `service_roles.<role>.bootstrap_prompt_file` in `config.yaml`. Prefer that path over hard-coded prompt text when workflow instructions need to evolve.
 - The maintainer role should prefer `codex-fork`, then `codex`, then `claude` by default. Keep the file-backed `service_roles.maintainer.preferred_providers` entry and the legacy maintainer fallback defaults aligned.
 - The operative PR review workflow is the repository-owned
-  `docs/working/pr_review_process.md`. Maintainer bootstrap must reference that
+  `specs/1268_pr_review_process.md`. Maintainer bootstrap must reference that
   reviewed file directly; no synchronized `~/.agent-os` copy exists.
 - Maintainer work is not done at PR creation. It is done only after review feedback is handled, the PR is merged, Session Manager is restarted on merged code, and the reporting agent has been notified of the fix.
 - Use the reporting agent for missing repro/debug details sparingly. Ask only for specific facts you cannot recover from the running system or repository state.
