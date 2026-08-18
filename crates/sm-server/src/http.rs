@@ -13884,6 +13884,28 @@ mod tests {
 
     const DIRECT_HARNESS_PROBE_ENV: &str = "SM_DIRECT_HARNESS_ISOLATION_PROBE";
 
+    struct ProbeChild {
+        child: Child,
+        release_path: PathBuf,
+    }
+
+    impl ProbeChild {
+        fn release_and_wait(&mut self) {
+            fs::write(&self.release_path, []).unwrap();
+            assert!(self.child.wait().unwrap().success());
+        }
+    }
+
+    impl Drop for ProbeChild {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.release_path, []);
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+            }
+            let _ = self.child.wait();
+        }
+    }
+
     #[test]
     fn direct_test_harness_without_wrapper_cannot_open_production_state_paths() {
         if let Some(probe_path) = env::var_os(DIRECT_HARNESS_PROBE_ENV) {
@@ -13901,6 +13923,8 @@ mod tests {
                 config.codex_observability.db_path.clone(),
                 config.queue_runner.state_dir.clone(),
                 config.mobile_terminal.device_enrollment_db_path.clone(),
+                config.bug_reports.db_path.clone(),
+                config.app_artifacts.root_dir.clone(),
                 StdPath::new(&config.paths.state_file)
                     .with_extension("reparent-apply.lock")
                     .display()
@@ -13930,23 +13954,26 @@ mod tests {
         fs::create_dir_all(&probe_root).unwrap();
         let probe_path = probe_root.join("probe");
         let executable = env::current_exe().unwrap();
-        let mut child = Command::new(executable)
-            .args([
-                "--exact",
-                "http::tests::direct_test_harness_without_wrapper_cannot_open_production_state_paths",
-                "--nocapture",
-            ])
-            .env_remove(TEST_ISOLATION_ROOT_ENV)
-            .env(DIRECT_HARNESS_PROBE_ENV, &probe_path)
-            .spawn()
-            .unwrap();
+        let mut probe_child = ProbeChild {
+            child: Command::new(executable)
+                .args([
+                    "--exact",
+                    "http::tests::direct_test_harness_without_wrapper_cannot_open_production_state_paths",
+                    "--nocapture",
+                ])
+                .env_remove(TEST_ISOLATION_ROOT_ENV)
+                .env(DIRECT_HARNESS_PROBE_ENV, &probe_path)
+                .spawn()
+                .unwrap(),
+            release_path: probe_path.with_extension("release"),
+        };
 
         for _ in 0..500 {
             if probe_path.exists() {
                 break;
             }
             assert!(
-                child.try_wait().unwrap().is_none(),
+                probe_child.child.try_wait().unwrap().is_none(),
                 "isolation probe exited early"
             );
             std::thread::sleep(Duration::from_millis(10));
@@ -13972,26 +13999,34 @@ mod tests {
             effective_paths.join("\n")
         );
 
-        let lsof = Command::new("/usr/sbin/lsof")
+        match Command::new("lsof")
             .args(["-p", &child_pid.to_string()])
             .output()
-            .expect("lsof is required for the direct-harness isolation proof");
-        assert!(
-            lsof.status.success(),
-            "lsof could not inspect test child {child_pid}"
-        );
-        let open_files = String::from_utf8_lossy(&lsof.stdout);
-        assert!(
-            !open_files.contains(production_root.to_string_lossy().as_ref()),
-            "unwrapped test child opened production state path:\n{open_files}"
-        );
-        println!(
-            "direct-harness lsof proof: child pid {child_pid} has no open path below {}",
-            production_root.display()
-        );
+        {
+            Ok(lsof) => {
+                assert!(
+                    lsof.status.success(),
+                    "lsof could not inspect test child {child_pid}"
+                );
+                let open_files = String::from_utf8_lossy(&lsof.stdout);
+                assert!(
+                    !open_files.contains(production_root.to_string_lossy().as_ref()),
+                    "unwrapped test child opened production state path:\n{open_files}"
+                );
+                println!(
+                    "direct-harness lsof proof: child pid {child_pid} has no open path below {}",
+                    production_root.display()
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                println!(
+                    "direct-harness lsof unavailable; effective-path assertions remain the portable proof"
+                );
+            }
+            Err(error) => panic!("failed to invoke lsof for test child {child_pid}: {error}"),
+        }
 
-        fs::write(probe_path.with_extension("release"), []).unwrap();
-        assert!(child.wait().unwrap().success());
+        probe_child.release_and_wait();
         fs::remove_dir_all(probe_root).unwrap();
     }
 
@@ -14006,23 +14041,26 @@ mod tests {
         fs::create_dir_all(&wrapper_root).unwrap();
         let probe_path = probe_root.join("probe");
         let executable = env::current_exe().unwrap();
-        let mut child = Command::new(executable)
-            .args([
-                "--exact",
-                "http::tests::direct_test_harness_without_wrapper_cannot_open_production_state_paths",
-                "--nocapture",
-            ])
-            .env(TEST_ISOLATION_ROOT_ENV, &wrapper_root)
-            .env(DIRECT_HARNESS_PROBE_ENV, &probe_path)
-            .spawn()
-            .unwrap();
+        let mut probe_child = ProbeChild {
+            child: Command::new(executable)
+                .args([
+                    "--exact",
+                    "http::tests::direct_test_harness_without_wrapper_cannot_open_production_state_paths",
+                    "--nocapture",
+                ])
+                .env(TEST_ISOLATION_ROOT_ENV, &wrapper_root)
+                .env(DIRECT_HARNESS_PROBE_ENV, &probe_path)
+                .spawn()
+                .unwrap(),
+            release_path: probe_path.with_extension("release"),
+        };
 
         for _ in 0..500 {
             if probe_path.exists() {
                 break;
             }
             assert!(
-                child.try_wait().unwrap().is_none(),
+                probe_child.child.try_wait().unwrap().is_none(),
                 "wrapper probe exited early"
             );
             std::thread::sleep(Duration::from_millis(10));
@@ -14041,8 +14079,7 @@ mod tests {
             state_file.display()
         );
 
-        fs::write(probe_path.with_extension("release"), []).unwrap();
-        assert!(child.wait().unwrap().success());
+        probe_child.release_and_wait();
         fs::remove_dir_all(probe_root).unwrap();
     }
 
@@ -14062,6 +14099,39 @@ mod tests {
         assert!(error
             .to_string()
             .contains("refuses explicit production path"));
+    }
+
+    #[test]
+    fn test_isolation_rehomes_handler_writable_stores() {
+        let root = test_isolation_root_from_environment().unwrap().unwrap();
+        let state = AppState::try_new(AppConfig::default()).unwrap();
+        let bug_report_path = StdPath::new(&state.config().bug_reports.db_path);
+        let artifact_root = StdPath::new(&state.config().app_artifacts.root_dir);
+        assert!(bug_report_path.starts_with(&root));
+        assert!(artifact_root.starts_with(&root));
+
+        let reports = BugReportStore::new(
+            bug_report_path.to_path_buf(),
+            state.config().bug_reports.max_reports,
+        );
+        let report = reports
+            .create_report(CreateBugReport {
+                report_text: "isolated handler store proof".to_owned(),
+                reported_by: None,
+                selected_session_id: None,
+                route: None,
+                app_version: None,
+                artifact_hash: None,
+                include_debug_state: false,
+                client_state: None,
+                server_state: None,
+            })
+            .unwrap();
+        assert!(reports.report_exists(&report.id).unwrap());
+
+        let artifact =
+            store_artifact(artifact_root, "isolation-proof", b"apk", None, None, None).unwrap();
+        assert!(hashed_path(artifact_root, "isolation-proof", &artifact.artifact_hash).exists());
     }
 
     #[test]

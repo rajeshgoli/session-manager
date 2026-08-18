@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -161,6 +164,7 @@ impl AppConfig {
             )
         })?;
 
+        let custom_state_file = self.paths.state_file != default_state_file();
         self.paths.state_file =
             isolate_default_data_path(&self.paths.state_file, &default_state_file(), &instance)?;
         self.sm_send.db_path = isolate_default_data_path(
@@ -178,8 +182,14 @@ impl AppConfig {
             &default_tool_usage_db_path(),
             &instance,
         )?;
-        self.usage.db_path =
-            isolate_default_data_path(&self.usage.db_path, &default_usage_db_path(), &instance)?;
+        self.usage.db_path = if custom_state_file && self.usage.db_path == default_usage_db_path() {
+            Path::new(&self.paths.state_file)
+                .with_extension("usage.db")
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            isolate_default_data_path(&self.usage.db_path, &default_usage_db_path(), &instance)?
+        };
         self.codex_events.db_path = isolate_default_data_path(
             &self.codex_events.db_path,
             &default_codex_events_db_path(),
@@ -205,6 +215,20 @@ impl AppConfig {
             &default_mobile_terminal_device_enrollment_db_path(),
             &instance,
         )?;
+        self.bug_reports.db_path = isolate_path_from_protected_root(
+            &self.bug_reports.db_path,
+            &default_bug_reports_db_path(),
+            &instance,
+            Path::new("bug_reports.db"),
+            &expand_home_for_path_match(&default_bug_reports_db_path()),
+        )?;
+        self.app_artifacts.root_dir = isolate_path_from_protected_root(
+            &self.app_artifacts.root_dir,
+            &default_app_artifacts_dir(),
+            &instance,
+            Path::new("apps"),
+            &expand_home_for_path_match(&default_app_artifacts_dir()),
+        )?;
 
         // Default production indexes can make a test AppState scan live agent
         // artifacts during startup. Fixtures that explicitly point elsewhere
@@ -212,12 +236,12 @@ impl AppConfig {
         if let Some(path) = self.codex.session_index_path.as_deref() {
             if path == "~/.codex/session_index.jsonl" {
                 self.codex.session_index_path = None;
-            } else if path_is_under_home(path) {
+            } else if path_is_under_home(path)? {
                 anyhow::bail!("test isolation refuses production Codex index path {path}");
             }
         }
         if let Some(path) = self.claude.transcript_root.as_deref() {
-            if path_is_under_home(path) {
+            if path_is_under_home(path)? {
                 anyhow::bail!("test isolation refuses production Claude transcript root {path}");
             }
         }
@@ -279,31 +303,105 @@ fn expand_home_for_path_match(path: &str) -> PathBuf {
 }
 
 fn isolate_default_data_path(path: &str, default: &str, root: &Path) -> Result<String> {
-    let expanded = expand_home_for_path_match(path);
     let Some(production_root) = production_data_root() else {
         return Ok(path.to_owned());
     };
+    let canonical_production_root = canonicalize_path_for_containment(&production_root)?;
+    let canonical_default =
+        canonicalize_path_for_containment(&expand_home_for_path_match(default))?;
+    let relative = canonical_default
+        .strip_prefix(&canonical_production_root)
+        .with_context(|| {
+            format!(
+                "default test path {default} is not under {}",
+                canonical_production_root.display()
+            )
+        })?;
+    isolate_path_from_protected_root(path, default, root, relative, &canonical_production_root)
+}
+
+fn isolate_path_from_protected_root(
+    path: &str,
+    default: &str,
+    root: &Path,
+    replacement: &Path,
+    protected_root: &Path,
+) -> Result<String> {
     if path == default {
-        let default_expanded = expand_home_for_path_match(default);
-        let relative = default_expanded
-            .strip_prefix(&production_root)
-            .with_context(|| {
-                format!(
-                    "default test path {default} is not under {}",
-                    production_root.display()
-                )
-            })?;
-        return Ok(root.join(relative).to_string_lossy().into_owned());
+        return Ok(root.join(replacement).to_string_lossy().into_owned());
     }
-    if expanded.starts_with(&production_root) {
+    if path_resolves_under_root(path, protected_root)? {
         anyhow::bail!("test isolation refuses explicit production path {path}");
-    };
+    }
     Ok(path.to_owned())
 }
 
-fn path_is_under_home(path: &str) -> bool {
-    let expanded = expand_home_for_path_match(path);
-    env::var_os("HOME").is_some_and(|home| expanded.starts_with(PathBuf::from(home)))
+fn path_is_under_home(path: &str) -> Result<bool> {
+    let Some(home) = env::var_os("HOME") else {
+        return Ok(false);
+    };
+    path_resolves_under_root(path, Path::new(&home))
+}
+
+fn path_resolves_under_root(path: &str, root: &Path) -> Result<bool> {
+    let candidate = canonicalize_path_for_containment(&expand_home_for_path_match(path))?;
+    let root = canonicalize_path_for_containment(root)?;
+    Ok(candidate.starts_with(root))
+}
+
+/// Canonicalize the longest existing prefix, then append unresolved trailing
+/// components. This catches `..` and symlink aliases even when a prospective
+/// store file has not been created yet. Any unreadable or dangling prefix is
+/// rejected rather than accepted as a fixture.
+fn canonicalize_path_for_containment(path: &Path) -> Result<PathBuf> {
+    let mut existing = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("failed to determine current directory for test path isolation")?
+            .join(path)
+    };
+    let mut unresolved = Vec::<OsString>::new();
+    loop {
+        match fs::symlink_metadata(&existing) {
+            Ok(_) => break,
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+            {
+                let component = existing.file_name().map(OsString::from).with_context(|| {
+                    format!(
+                        "test isolation could not find an existing ancestor for {}",
+                        path.display()
+                    )
+                })?;
+                unresolved.push(component);
+                if !existing.pop() {
+                    anyhow::bail!(
+                        "test isolation could not find an existing ancestor for {}",
+                        path.display()
+                    );
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "test isolation could not inspect explicit path {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    let mut canonical = fs::canonicalize(&existing).with_context(|| {
+        format!(
+            "test isolation could not canonicalize explicit path prefix {}",
+            existing.display()
+        )
+    })?;
+    for component in unresolved.iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2105,6 +2203,8 @@ mod tests {
             &config.codex_observability.db_path,
             &config.queue_runner.state_dir,
             &config.mobile_terminal.device_enrollment_db_path,
+            &config.bug_reports.db_path,
+            &config.app_artifacts.root_dir,
         ];
         for path in durable_paths {
             assert!(
@@ -2176,6 +2276,66 @@ mod tests {
             .to_string()
             .contains("refuses explicit production path"));
 
+        let production_root = production_data_root().unwrap();
+        let mut dot_alias_config = AppConfig::default();
+        dot_alias_config.paths.state_file = production_root
+            .parent()
+            .unwrap()
+            .join("claude-sessions")
+            .join("..")
+            .join("claude-sessions/alias-sessions.json")
+            .display()
+            .to_string();
+        let error = dot_alias_config.isolate_test_paths(&root).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("refuses explicit production path"));
+
+        let symlink_root = root.join("production-alias");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&production_root, &symlink_root).unwrap();
+        let mut symlink_alias_config = AppConfig::default();
+        symlink_alias_config.paths.state_file = symlink_root
+            .join("alias-sessions.json")
+            .display()
+            .to_string();
+        let error = symlink_alias_config.isolate_test_paths(&root).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("refuses explicit production path"));
+
+        let mut unsafe_bug_report_config = AppConfig::default();
+        let default_bug_report_path = PathBuf::from(default_bug_reports_db_path());
+        unsafe_bug_report_config.bug_reports.db_path = default_bug_report_path
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(default_bug_report_path.file_name().unwrap())
+            .display()
+            .to_string();
+        let error = unsafe_bug_report_config
+            .isolate_test_paths(&root)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("refuses explicit production path"));
+
+        let mut unsafe_app_artifact_config = AppConfig::default();
+        let default_app_artifact_root = PathBuf::from(default_app_artifacts_dir());
+        unsafe_app_artifact_config.app_artifacts.root_dir = default_app_artifact_root
+            .parent()
+            .unwrap()
+            .join(".")
+            .join(default_app_artifact_root.file_name().unwrap())
+            .display()
+            .to_string();
+        let error = unsafe_app_artifact_config
+            .isolate_test_paths(&root)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("refuses explicit production path"));
+
         let mut unsafe_index_config = AppConfig::default();
         unsafe_index_config.codex.session_index_path =
             Some("~/.codex/sessions/index.jsonl".to_owned());
@@ -2194,6 +2354,26 @@ mod tests {
             .contains("refuses production Claude transcript root"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_isolation_preserves_custom_state_file_usage_db_lifecycle() {
+        let root = env::temp_dir().join(format!(
+            "sm-config-test-isolation-custom-state-{}-{}",
+            std::process::id(),
+            TEST_ISOLATION_INSTANCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let state_file = env::temp_dir().join("sm-isolated-custom-state.json");
+        let mut config = AppConfig::default();
+        config.paths.state_file = state_file.display().to_string();
+        config.isolate_test_paths(&root).unwrap();
+
+        assert_eq!(config.paths.state_file, state_file.display().to_string());
+        assert_eq!(
+            config.usage.db_path,
+            state_file.with_extension("usage.db").display().to_string()
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
