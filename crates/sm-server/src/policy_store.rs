@@ -827,26 +827,26 @@ fn expire_overrides_tx(tx: &Transaction<'_>, now: OffsetDateTime) -> Result<usiz
 }
 
 fn load_request(conn: &Connection, request_id: &str) -> Result<PolicySpawnRequest> {
-    let value = conn
+    let (digest, value): (String, String) = conn
         .query_row(
-            "SELECT request_json FROM policy_requests WHERE request_id = ?1",
+            "SELECT request_digest, request_json FROM policy_requests WHERE request_id = ?1",
             [request_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?
         .ok_or_else(|| PolicyStoreError::RequestNotFound(request_id.into()))?;
-    Ok(serde_json::from_str(&value)?)
+    parse_stored_request(request_id, &digest, &value)
 }
 fn load_request_tx(tx: &Transaction<'_>, request_id: &str) -> Result<PolicySpawnRequest> {
-    let value = tx
+    let (digest, value): (String, String) = tx
         .query_row(
-            "SELECT request_json FROM policy_requests WHERE request_id = ?1",
+            "SELECT request_digest, request_json FROM policy_requests WHERE request_id = ?1",
             [request_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?
         .ok_or_else(|| PolicyStoreError::RequestNotFound(request_id.into()))?;
-    Ok(serde_json::from_str(&value)?)
+    parse_stored_request(request_id, &digest, &value)
 }
 fn load_projection_tx(
     tx: &Transaction<'_>,
@@ -855,7 +855,35 @@ fn load_projection_tx(
     digest: &str,
 ) -> Result<PolicyProjection> {
     let value = tx.query_row("SELECT projection_json FROM policy_projections WHERE lane = ?1 AND policy_version = ?2 AND policy_digest = ?3", params![lane, version, digest], |row| row.get::<_, String>(0)).optional()?.ok_or_else(|| PolicyStoreError::ProjectionNotFound(lane.into()))?;
-    Ok(serde_json::from_str(&value)?)
+    let projection: PolicyProjection = serde_json::from_str(&value)?;
+    projection.validate()?;
+    if projection.lane != lane
+        || projection.policy_version != version
+        || projection.policy_digest != digest
+    {
+        return Err(PolicyStoreError::Invalid(
+            "stored projection does not match its immutable lookup key".into(),
+        ));
+    }
+    Ok(projection)
+}
+
+fn parse_stored_request(request_id: &str, digest: &str, value: &str) -> Result<PolicySpawnRequest> {
+    let request: PolicySpawnRequest = serde_json::from_str(value)?;
+    request
+        .validate()
+        .map_err(|error| PolicyStoreError::Invalid(error.to_string()))?;
+    if request.request_id != request_id
+        || request
+            .canonical_digest()
+            .map_err(|error| PolicyStoreError::Invalid(error.to_string()))?
+            != digest
+    {
+        return Err(PolicyStoreError::Invalid(
+            "stored request does not match its immutable lookup key".into(),
+        ));
+    }
+    Ok(request)
 }
 fn load_override_conn(conn: &Connection, override_id: &str) -> Result<PolicyOverrideRecord> {
     let value = conn
