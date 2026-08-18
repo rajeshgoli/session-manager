@@ -3856,6 +3856,7 @@ struct PreparedPolicySpawn {
 
 fn policy_store_api_error(error: PolicyStoreError) -> ApiError {
     let (status, detail) = match error {
+        PolicyStoreError::Schema(detail) => (StatusCode::SERVICE_UNAVAILABLE, detail),
         PolicyStoreError::Invalid(detail) => (StatusCode::UNPROCESSABLE_ENTITY, detail),
         PolicyStoreError::RequestNotFound(detail)
         | PolicyStoreError::OverrideNotFound(detail)

@@ -311,6 +311,46 @@ pub struct PreparedDecision {
     /// Present only for allow. D3 must use this exact ID when creating its
     /// provisional core-session record and release it at completion/retirement.
     pub provisional_child_session_id: Option<String>,
+    /// Durable lifecycle state of the returned child binding. Retries always
+    /// return the original binding, including after it terminalizes.
+    pub child_state: Option<PolicyChildState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyLeaseState {
+    Active,
+    Committed,
+    ReleasePending,
+    Released,
+    Expired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyChildState {
+    Reserved,
+    Launched,
+    ReleasePending,
+    Released,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyChildReservation {
+    pub child_session_id: String,
+    pub lease_id: String,
+    pub request_id: String,
+    pub decision_id: String,
+    pub lease_state: PolicyLeaseState,
+    pub child_state: PolicyChildState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyReconciliationSnapshot {
+    pub expected: usize,
+    pub reservations: Vec<PolicyChildReservation>,
+    pub blockers: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -485,12 +525,15 @@ impl PolicyStore {
             )));
         }
         if let Some(existing) = load_reusable_decision(&tx, &request, override_id)? {
-            let child = reusable_child_binding(&tx, &existing, provisional_child_session_id)?;
+            let reservation = reusable_child_binding(&tx, &existing)?;
             tx.commit()?;
             return Ok(PreparedDecision {
                 decision: existing,
                 reused: true,
-                provisional_child_session_id: child,
+                provisional_child_session_id: reservation
+                    .as_ref()
+                    .map(|reservation| reservation.child_session_id.clone()),
+                child_state: reservation.map(|reservation| reservation.child_state),
             });
         }
         let attempt = next_attempt(&tx, request_id)?;
@@ -525,6 +568,14 @@ impl PolicyStore {
             override_used = Some(override_id);
             override_terminal_decision_id = Some(override_record.decision_id);
         }
+        let resolved_profile = if override_used.is_some() {
+            resolved
+                .profile
+                .as_ref()
+                .map(|profile| override_granted_profile(&request, profile))
+        } else {
+            resolved.profile.clone()
+        };
         let decision_id = derived_id(
             "decision",
             &[
@@ -546,7 +597,7 @@ impl PolicyStore {
             outcome: outcome.clone(),
             classification: effective_classification,
             applicable_clause_ids: resolved.clause_ids.clone(),
-            resolved_profile: resolved.profile.clone(),
+            resolved_profile,
             reason: resolved.reason.clone(),
             override_command: None,
             capacity_lease: None,
@@ -601,6 +652,11 @@ impl PolicyStore {
             reused: false,
             provisional_child_session_id: if matches!(outcome, PolicyDecisionOutcome::Allow) {
                 Some(provisional_child_session_id.to_owned())
+            } else {
+                None
+            },
+            child_state: if matches!(outcome, PolicyDecisionOutcome::Allow) {
+                Some(PolicyChildState::Reserved)
             } else {
                 None
             },
@@ -707,11 +763,72 @@ impl PolicyStore {
         required(child_session_id, "provisional child session ID")?;
         let mut conn = self.open()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let lease_id = load_child_lease_tx(&tx, child_session_id, false)?;
-        if let Some(lease_id) = lease_id {
+        let reservation = load_child_reservation_tx(&tx, child_session_id)?;
+        if let Some(reservation) = reservation {
+            if matches!(
+                reservation.child_state,
+                PolicyChildState::Released | PolicyChildState::Expired
+            ) && matches!(
+                reservation.lease_state,
+                PolicyLeaseState::Released | PolicyLeaseState::Expired
+            ) {
+                tx.commit()?;
+                return Ok(());
+            }
             let released_at = now()?;
-            tx.execute("UPDATE policy_capacity_leases SET state = 'released', released_at = ?2 WHERE lease_id = ?1 AND state IN ('active', 'committed')", params![lease_id, released_at])?;
-            tx.execute("UPDATE policy_provisional_children SET state = 'released', released_at = ?2 WHERE child_session_id = ?1 AND state IN ('reserved', 'launched')", params![child_session_id, now()?])?;
+            let lease_changed = tx.execute("UPDATE policy_capacity_leases SET state = 'released', released_at = ?2 WHERE lease_id = ?1 AND state IN ('active', 'committed', 'release_pending')", params![reservation.lease_id, released_at])?;
+            let child_changed = tx.execute("UPDATE policy_provisional_children SET state = 'released', released_at = ?2 WHERE child_session_id = ?1 AND state IN ('reserved', 'launched', 'release_pending')", params![child_session_id, now()?])?;
+            if lease_changed != 1 || child_changed != 1 {
+                return Err(PolicyStoreError::Invalid(
+                    "child and lease could not be released from one matching lifecycle state"
+                        .into(),
+                ));
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persists release intent before D3 stops or detaches the runtime. A crash
+    /// after this point is resumed by startup reconciliation.
+    pub fn mark_child_release_pending(&self, child_session_id: &str) -> Result<()> {
+        required(child_session_id, "provisional child session ID")?;
+        let mut conn = self.open()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let reservation = load_child_reservation_tx(&tx, child_session_id)?.ok_or_else(|| {
+            PolicyStoreError::Invalid(
+                "release-pending requires exactly one matching child reservation".into(),
+            )
+        })?;
+        if reservation.child_state == PolicyChildState::ReleasePending
+            && reservation.lease_state == PolicyLeaseState::ReleasePending
+        {
+            tx.commit()?;
+            return Ok(());
+        }
+        let admissible = matches!(
+            (reservation.child_state, reservation.lease_state),
+            (PolicyChildState::Reserved, PolicyLeaseState::Active)
+                | (PolicyChildState::Launched, PolicyLeaseState::Committed)
+        );
+        if !admissible {
+            return Err(PolicyStoreError::Invalid(format!(
+                "cannot begin release from child/lease states {:?}/{:?}",
+                reservation.child_state, reservation.lease_state
+            )));
+        }
+        let lease_changed = tx.execute(
+            "UPDATE policy_capacity_leases SET state = 'release_pending' WHERE lease_id = ?1 AND state IN ('active', 'committed')",
+            [&reservation.lease_id],
+        )?;
+        let child_changed = tx.execute(
+            "UPDATE policy_provisional_children SET state = 'release_pending' WHERE child_session_id = ?1 AND state IN ('reserved', 'launched')",
+            [child_session_id],
+        )?;
+        if lease_changed != 1 || child_changed != 1 {
+            return Err(PolicyStoreError::Invalid(
+                "release-pending transition did not update exactly one child and lease".into(),
+            ));
         }
         tx.commit()?;
         Ok(())
@@ -724,19 +841,102 @@ impl PolicyStore {
         required(child_session_id, "provisional child session ID")?;
         let mut conn = self.open()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let lease_id = load_child_lease_tx(&tx, child_session_id, true)?;
-        if let Some(lease_id) = lease_id {
-            tx.execute(
-                "UPDATE policy_capacity_leases SET state = 'committed' WHERE lease_id = ?1 AND state = 'active'",
-                [&lease_id],
-            )?;
-            tx.execute(
-                "UPDATE policy_provisional_children SET state = 'launched' WHERE child_session_id = ?1 AND state = 'reserved'",
-                [child_session_id],
-            )?;
+        let reservation = load_child_reservation_tx(&tx, child_session_id)?.ok_or_else(|| {
+            PolicyStoreError::Invalid(
+                "launch promotion requires exactly one matching child reservation".into(),
+            )
+        })?;
+        if reservation.child_state != PolicyChildState::Reserved
+            || reservation.lease_state != PolicyLeaseState::Active
+        {
+            return Err(PolicyStoreError::Invalid(format!(
+                "launch promotion requires reserved/active state, found {:?}/{:?}",
+                reservation.child_state, reservation.lease_state
+            )));
+        }
+        let lease_changed = tx.execute(
+            "UPDATE policy_capacity_leases SET state = 'committed' WHERE lease_id = ?1 AND state = 'active'",
+            [&reservation.lease_id],
+        )?;
+        let child_changed = tx.execute(
+            "UPDATE policy_provisional_children SET state = 'launched' WHERE child_session_id = ?1 AND state = 'reserved'",
+            [child_session_id],
+        )?;
+        if lease_changed != 1 || child_changed != 1 {
+            return Err(PolicyStoreError::Invalid(
+                "launch promotion did not update exactly one matching child and lease".into(),
+            ));
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn resolve_child(&self, child_session_id: &str) -> Result<Option<PolicyChildReservation>> {
+        required(child_session_id, "provisional child session ID")?;
+        let mut conn = self.open()?;
+        let tx = conn.transaction()?;
+        let reservation = load_child_reservation_tx(&tx, child_session_id)?;
+        tx.commit()?;
+        Ok(reservation)
+    }
+
+    /// Enumerates every non-terminal lease/child pair before admission is
+    /// enabled. Structural mismatches are returned as exact blockers instead of
+    /// being silently omitted from the sweep denominator.
+    pub fn reconciliation_snapshot(&self) -> Result<PolicyReconciliationSnapshot> {
+        let mut conn = self.open()?;
+        let tx = conn.transaction()?;
+        let expected = tx.query_row(
+            "SELECT COUNT(*) FROM policy_capacity_leases WHERE state IN ('active', 'committed', 'release_pending')",
+            [],
+            |row| row.get::<_, usize>(0),
+        )?;
+        let rows = tx
+            .prepare("SELECT lease_id, provisional_child_session_id FROM policy_capacity_leases WHERE state IN ('active', 'committed', 'release_pending') ORDER BY lease_id")?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut reservations = Vec::new();
+        let mut blockers = Vec::new();
+        for (lease_id, child_session_id) in rows {
+            match load_child_reservation_tx(&tx, &child_session_id)? {
+                Some(reservation) if reservation.lease_id == lease_id => {
+                    if reservation_states_are_reconcilable(&reservation) {
+                        reservations.push(reservation);
+                    } else {
+                        blockers.push(format!(
+                            "child {} has ambiguous child/lease states {:?}/{:?}",
+                            child_session_id, reservation.child_state, reservation.lease_state
+                        ));
+                    }
+                }
+                Some(reservation) => blockers.push(format!(
+                    "lease {lease_id} points to child {child_session_id}, but that child binds lease {}",
+                    reservation.lease_id
+                )),
+                None => blockers.push(format!(
+                    "lease {lease_id} has no matching provisional child {child_session_id}"
+                )),
+            }
+        }
+        let orphan_children = tx
+            .prepare("SELECT child_session_id, lease_id FROM policy_provisional_children WHERE state IN ('reserved', 'launched', 'release_pending') AND lease_id NOT IN (SELECT lease_id FROM policy_capacity_leases WHERE state IN ('active', 'committed', 'release_pending')) ORDER BY child_session_id")?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (child_session_id, lease_id) in orphan_children {
+            blockers.push(format!(
+                "provisional child {child_session_id} has no matching non-terminal lease {lease_id}"
+            ));
+        }
+        let expected = expected
+            + blockers
+                .len()
+                .saturating_sub(expected.saturating_sub(reservations.len()));
+        tx.commit()?;
+        Ok(PolicyReconciliationSnapshot {
+            expected,
+            reservations,
+            blockers,
+        })
     }
 
     pub fn expire_overrides(&self, now: OffsetDateTime) -> Result<usize> {
@@ -894,6 +1094,8 @@ fn resolve_rule(
         rule.profile != first.profile
             || rule.outcome != first.outcome
             || rule.capacity_claims != first.capacity_claims
+            || rule.overridable != first.overridable
+            || rule.lease_ttl_seconds != first.lease_ttl_seconds
     });
     let clause_ids = winning.iter().map(|rule| rule.clause_id.clone()).collect();
     if conflicting {
@@ -936,6 +1138,26 @@ fn requested_profile_conflicts(
         || request.requested.provider != profile.provider
         || request.requested.model.as_deref() != Some(profile.model.as_str())
         || request.requested.effort.as_deref() != Some(profile.effort.as_str())
+}
+
+fn override_granted_profile(
+    request: &PolicySpawnRequest,
+    rewrite_target: &PolicyLaunchProfile,
+) -> PolicyLaunchProfile {
+    match (
+        request.requested.model.as_deref(),
+        request.requested.effort.as_deref(),
+    ) {
+        (Some(model), Some(effort)) => PolicyLaunchProfile {
+            vehicle: request.requested.vehicle.clone(),
+            provider: request.requested.provider.clone(),
+            model: model.to_owned(),
+            effort: effort.to_owned(),
+            // Context profiles are policy-owned and are not caller supplied.
+            context_profile: rewrite_target.context_profile.clone(),
+        },
+        _ => rewrite_target.clone(),
+    }
 }
 
 fn authorize_caller(projection: &PolicyProjection, request: &PolicySpawnRequest) -> Result<()> {
@@ -1397,7 +1619,7 @@ fn load_lease_tx(tx: &Transaction<'_>, lease_id: &str) -> Result<PolicyCapacityL
     if claims != expected_claims
         || !matches!(
             state.as_str(),
-            "active" | "committed" | "released" | "expired"
+            "active" | "committed" | "release_pending" | "released" | "expired"
         )
     {
         return Err(PolicyStoreError::Invalid(
@@ -1407,24 +1629,36 @@ fn load_lease_tx(tx: &Transaction<'_>, lease_id: &str) -> Result<PolicyCapacityL
     Ok(lease)
 }
 
-fn load_child_lease_tx(
+fn load_child_reservation_tx(
     tx: &Transaction<'_>,
     child_session_id: &str,
-    require_reserved: bool,
-) -> Result<Option<String>> {
-    let row: Option<(String, String, String, String)> = tx
-        .query_row(
-            "SELECT lease_id, request_id, decision_id, state FROM policy_provisional_children WHERE child_session_id = ?1",
-            [child_session_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    let Some((lease_id, request_id, decision_id, state)) = row else {
+) -> Result<Option<PolicyChildReservation>> {
+    let rows = tx
+        .prepare(
+            "SELECT p.lease_id, p.request_id, p.decision_id, p.state, l.state FROM policy_provisional_children p JOIN policy_capacity_leases l ON l.lease_id = p.lease_id WHERE p.child_session_id = ?1",
+        )?
+        .query_map([child_session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if rows.len() > 1 {
+        return Err(PolicyStoreError::Invalid(
+            "provisional child matched more than one lease".into(),
+        ));
+    }
+    let Some((lease_id, request_id, decision_id, child_state, lease_state)) =
+        rows.into_iter().next()
+    else {
         return Ok(None);
     };
-    if require_reserved && state != "reserved" {
-        return Ok(None);
-    }
+    let child_state = parse_child_state(&child_state)?;
+    let lease_state = parse_lease_state(&lease_state)?;
     let request = load_request_tx(tx, &request_id)?;
     let decision = load_terminal_decision(tx, &request, &decision_id)?;
     let lease = load_lease_tx(tx, &lease_id)?;
@@ -1440,7 +1674,52 @@ fn load_child_lease_tx(
             "provisional child does not match its decision and capacity lease".into(),
         ));
     }
-    Ok(Some(lease_id))
+    Ok(Some(PolicyChildReservation {
+        child_session_id: child_session_id.to_owned(),
+        lease_id,
+        request_id,
+        decision_id,
+        lease_state,
+        child_state,
+    }))
+}
+
+fn parse_lease_state(value: &str) -> Result<PolicyLeaseState> {
+    match value {
+        "active" => Ok(PolicyLeaseState::Active),
+        "committed" => Ok(PolicyLeaseState::Committed),
+        "release_pending" => Ok(PolicyLeaseState::ReleasePending),
+        "released" => Ok(PolicyLeaseState::Released),
+        "expired" => Ok(PolicyLeaseState::Expired),
+        _ => Err(PolicyStoreError::Invalid(format!(
+            "unknown capacity lease state {value}"
+        ))),
+    }
+}
+
+fn parse_child_state(value: &str) -> Result<PolicyChildState> {
+    match value {
+        "reserved" => Ok(PolicyChildState::Reserved),
+        "launched" => Ok(PolicyChildState::Launched),
+        "release_pending" => Ok(PolicyChildState::ReleasePending),
+        "released" => Ok(PolicyChildState::Released),
+        "expired" => Ok(PolicyChildState::Expired),
+        _ => Err(PolicyStoreError::Invalid(format!(
+            "unknown provisional child state {value}"
+        ))),
+    }
+}
+
+fn reservation_states_are_reconcilable(reservation: &PolicyChildReservation) -> bool {
+    matches!(
+        (reservation.child_state, reservation.lease_state),
+        (PolicyChildState::Reserved, PolicyLeaseState::Active)
+            | (PolicyChildState::Launched, PolicyLeaseState::Committed)
+            | (
+                PolicyChildState::ReleasePending,
+                PolicyLeaseState::ReleasePending
+            )
+    )
 }
 
 fn authorize_override_tx(
@@ -1508,33 +1787,19 @@ fn load_reusable_decision(
         &json,
         &created_at,
     )?;
-    if let Some(lease) = &decision.capacity_lease {
-        let active: bool = tx
-            .query_row(
-                "SELECT state = 'active' FROM policy_capacity_leases WHERE lease_id = ?1",
-                [&lease.lease_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .unwrap_or(false);
-        if !active {
-            return Ok(None);
-        }
-    }
     Ok(Some(decision))
 }
 
 fn reusable_child_binding(
     tx: &Transaction<'_>,
     decision: &PolicyDecision,
-    proposed_child_session_id: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<PolicyChildReservation>> {
     let Some(lease) = &decision.capacity_lease else {
         return Ok(None);
     };
     let child_session_id: String = tx
         .query_row(
-            "SELECT child_session_id FROM policy_provisional_children WHERE lease_id = ?1 AND request_id = ?2 AND decision_id = ?3 AND state = 'reserved'",
+            "SELECT child_session_id FROM policy_provisional_children WHERE lease_id = ?1 AND request_id = ?2 AND decision_id = ?3",
             params![lease.lease_id, decision.request_id, decision.decision_id],
             |row| row.get(0),
         )
@@ -1542,12 +1807,10 @@ fn reusable_child_binding(
         .ok_or_else(|| PolicyStoreError::Invalid(
             "active reusable lease has no matching provisional child reservation".into(),
         ))?;
-    if child_session_id != proposed_child_session_id {
-        return Err(PolicyStoreError::Invalid(
-            "reused admission must use its originally reserved provisional child ID".into(),
-        ));
-    }
-    Ok(Some(child_session_id))
+    let reservation = load_child_reservation_tx(tx, &child_session_id)?.ok_or_else(|| {
+        PolicyStoreError::Invalid("reusable decision has no matching child reservation".into())
+    })?;
+    Ok(Some(reservation))
 }
 fn next_attempt(tx: &Transaction<'_>, request_id: &str) -> Result<u32> {
     let current: u32 = tx.query_row(
@@ -1998,6 +2261,11 @@ mod tests {
             allowed.decision.outcome,
             PolicyDecisionOutcome::Allow
         ));
+        assert_eq!(
+            allowed.decision.resolved_profile.as_ref().unwrap().model,
+            "fable",
+            "a fully specified exact-request override grants the frozen requested model"
+        );
         assert!(!allowed.reused);
         assert!(matches!(
             store.override_record(&record.override_id).unwrap().state,
@@ -2121,16 +2389,22 @@ mod tests {
                 .unwrap()
                 .reused
         );
-        assert!(matches!(
-            after_restart.prepare_admission(
+        let retry_with_discarded_preallocation = after_restart
+            .prepare_admission(
                 "child-bound",
                 &class("routine_bounded", None),
                 None,
                 "other-provisional",
                 now,
-            ),
-            Err(PolicyStoreError::Invalid(_))
-        ));
+            )
+            .unwrap();
+        assert!(retry_with_discarded_preallocation.reused);
+        assert_eq!(
+            retry_with_discarded_preallocation
+                .provisional_child_session_id
+                .as_deref(),
+            Some("provisional-1")
+        );
         after_restart.mark_child_launched("provisional-1").unwrap();
         after_restart.release_by_child("provisional-1").unwrap();
         after_restart.release_by_child("provisional-1").unwrap();
@@ -2144,6 +2418,253 @@ mod tests {
             .unwrap();
         assert_eq!(states, ("released".into(), "released".into()));
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn ordinary_retries_reuse_terminal_decision_in_every_lease_state() {
+        for terminal in ["active", "committed", "released", "expired"] {
+            let (store, path) = store(&format!("retry-{terminal}"));
+            let mut projection = projection(true, 1);
+            for rule in &mut projection.rules {
+                rule.lease_ttl_seconds = 1;
+            }
+            install(&store, &projection);
+            store.set_runtime_versions("sm-policy-1268", 1, 1).unwrap();
+            let request_id = format!("retry-{terminal}");
+            let child_id = format!("child-{terminal}");
+            store
+                .create_request(&request(
+                    &request_id,
+                    PolicyVehicle::TaskAgent,
+                    None,
+                    &format!("intent-{terminal}"),
+                ))
+                .unwrap();
+            let now = instant("2026-08-17T00:01:00Z");
+            let first = store
+                .prepare_admission(
+                    &request_id,
+                    &class("routine_bounded", None),
+                    None,
+                    &child_id,
+                    now,
+                )
+                .unwrap();
+            match terminal {
+                "active" => {}
+                "committed" => store.mark_child_launched(&child_id).unwrap(),
+                "released" => store.release_by_child(&child_id).unwrap(),
+                "expired" => {
+                    let retry = store
+                        .prepare_admission(
+                            &request_id,
+                            &class("routine_bounded", None),
+                            None,
+                            "discarded-expiry-preallocation",
+                            now + time::Duration::seconds(2),
+                        )
+                        .unwrap();
+                    assert_eq!(retry.child_state, Some(PolicyChildState::Expired));
+                }
+                _ => unreachable!(),
+            }
+            let retried = store
+                .prepare_admission(
+                    &request_id,
+                    &class("routine_bounded", None),
+                    None,
+                    "discarded-retry-preallocation",
+                    now + time::Duration::seconds(if terminal == "active" { 0 } else { 2 }),
+                )
+                .unwrap();
+            assert!(retried.reused, "{terminal}");
+            assert_eq!(retried.decision.decision_id, first.decision.decision_id);
+            assert_eq!(
+                retried.provisional_child_session_id.as_deref(),
+                Some(child_id.as_str())
+            );
+            let conn = Connection::open(&path).unwrap();
+            let counts: (u64, u64, u64, u64) = conn
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM policy_decisions), (SELECT COUNT(*) FROM policy_capacity_leases), (SELECT COUNT(*) FROM policy_capacity_claims), (SELECT COUNT(*) FROM policy_provisional_children)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(counts, (1, 1, 1, 1), "{terminal}");
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
+    fn launch_promotion_requires_exactly_one_reserved_active_binding() {
+        let cases = ["missing", "released", "expired", "launched", "conflicting"];
+        for case in cases {
+            let (store, path) = store(&format!("strict-mark-{case}"));
+            let mut projection = projection(true, 1);
+            for rule in &mut projection.rules {
+                rule.lease_ttl_seconds = 1;
+            }
+            install(&store, &projection);
+            store.set_runtime_versions("sm-policy-1268", 1, 1).unwrap();
+            let child = format!("strict-child-{case}");
+            if case != "missing" {
+                let request_id = format!("strict-request-{case}");
+                store
+                    .create_request(&request(
+                        &request_id,
+                        PolicyVehicle::TaskAgent,
+                        None,
+                        &format!("strict-intent-{case}"),
+                    ))
+                    .unwrap();
+                let now = instant("2026-08-17T00:01:00Z");
+                store
+                    .prepare_admission(
+                        &request_id,
+                        &class("routine_bounded", None),
+                        None,
+                        &child,
+                        now,
+                    )
+                    .unwrap();
+                match case {
+                    "released" => store.release_by_child(&child).unwrap(),
+                    "expired" => {
+                        store
+                            .prepare_admission(
+                                &request_id,
+                                &class("routine_bounded", None),
+                                None,
+                                "discarded-expired-id",
+                                now + time::Duration::seconds(2),
+                            )
+                            .unwrap();
+                    }
+                    "launched" => store.mark_child_launched(&child).unwrap(),
+                    "conflicting" => {
+                        Connection::open(&path)
+                            .unwrap()
+                            .execute(
+                                "UPDATE policy_provisional_children SET state = 'launched' WHERE child_session_id = ?1",
+                                [&child],
+                            )
+                            .unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            assert!(matches!(
+                store.mark_child_launched(&child),
+                Err(PolicyStoreError::Invalid(_))
+            ));
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
+    fn omission_override_uses_rewrite_target_while_full_override_uses_request() {
+        let (store, path) = store("override-profile-semantics");
+        install(&store, &projection(true, 2));
+        store.set_runtime_versions("sm-policy-1268", 1, 1).unwrap();
+        let now = instant("2026-08-17T00:01:00Z");
+        for (request_id, specified, expected_model) in [
+            ("full-profile", true, "fable"),
+            ("omitted-profile", false, "opus"),
+        ] {
+            let mut frozen = request(
+                request_id,
+                PolicyVehicle::NamedSeat,
+                Some("fable"),
+                &format!("intent-{request_id}"),
+            );
+            if !specified {
+                frozen.requested.model = None;
+                frozen.requested.effort = None;
+            }
+            store.create_request(&frozen).unwrap();
+            store
+                .prepare_admission(
+                    request_id,
+                    &class("named_orchestrator", Some("maintainer")),
+                    None,
+                    &format!("rejected-{request_id}"),
+                    now,
+                )
+                .unwrap();
+            let authorization = store
+                .authorize_request_override(
+                    request_id,
+                    &frozen.caller,
+                    "frozen exception",
+                    now,
+                    time::Duration::minutes(1),
+                )
+                .unwrap();
+            let allowed = store
+                .prepare_admission(
+                    request_id,
+                    &class("named_orchestrator", Some("maintainer")),
+                    Some(&authorization.override_id),
+                    &format!("allowed-{request_id}"),
+                    now,
+                )
+                .unwrap();
+            assert_eq!(
+                allowed.decision.resolved_profile.unwrap().model,
+                expected_model
+            );
+        }
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn equal_rank_conflicts_include_all_enforcement_fields() {
+        for field in ["profile", "outcome", "claims", "overridable", "ttl"] {
+            let (store, path) = store(&format!("enforcement-conflict-{field}"));
+            let mut projection = projection(true, 1);
+            let mut conflict = projection.rules[1].clone();
+            conflict.clause_id = format!("sm-policy-1268.conflict-{field}");
+            match field {
+                "profile" => conflict.profile.model = "opus".into(),
+                "outcome" => conflict.outcome = PolicyRuleOutcome::Rewrite,
+                "claims" => conflict.capacity_claims[0].units = 2,
+                "overridable" => conflict.overridable = false,
+                "ttl" => conflict.lease_ttl_seconds += 1,
+                _ => unreachable!(),
+            }
+            if field == "claims" {
+                projection.capacity_limits[0].maximum_units = 2;
+            }
+            projection.rules.push(conflict);
+            install(&store, &projection);
+            store.set_runtime_versions("sm-policy-1268", 1, 1).unwrap();
+            let request_id = format!("conflict-{field}");
+            store
+                .create_request(&request(
+                    &request_id,
+                    PolicyVehicle::TaskAgent,
+                    None,
+                    &format!("intent-{field}"),
+                ))
+                .unwrap();
+            let decision = store
+                .prepare_admission(
+                    &request_id,
+                    &class("routine_bounded", None),
+                    None,
+                    &format!("child-{field}"),
+                    instant("2026-08-17T00:01:00Z"),
+                )
+                .unwrap()
+                .decision;
+            assert!(
+                matches!(decision.outcome, PolicyDecisionOutcome::Block),
+                "{field}"
+            );
+            assert!(decision.capacity_lease.is_none(), "{field}");
+            std::fs::remove_file(path).ok();
+        }
     }
 
     #[test]
