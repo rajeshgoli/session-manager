@@ -461,17 +461,35 @@ same action ID/version; prose such as `final` or `supersedes` has no authority b
 itself.
 
 The action state advances monotonically through proposed, authorized, started,
-and terminal. Immediately before its first side effect, the executor must claim
-`authorized -> started` with one compare-and-swap that verifies the current
-authority incarnation, highest decision version, exact scope, executor binding,
-and expiry. A failed claim performs no side effect and returns the current
-decision. The authority may revoke only before a successful `started` claim;
-once execution is recorded, later messages cannot authorize a competing action
-and recovery must reconcile the observed action first. Transferring decision
-authority is an atomic recorded handoff. Recipients act only on the highest
-durable version and default to inaction on conflicting or unverifiable
-messages. This prevents several coordinators from oscillating a one-shot probe
-or restart faster than the executing seat can observe the decisions.
+recovering, and terminal. Immediately before its first side effect, the executor
+must claim `authorized -> started` with one compare-and-swap that verifies the
+current authority incarnation, highest decision version, exact scope, executor
+binding, and expiry. The claim records an action-scoped idempotency key, attempt
+epoch, executor lease, and the evidence that can distinguish completed,
+not-executed, and ambiguous outcomes. A failed claim performs no side effect and
+returns the current decision. The authority may revoke only before a successful
+`started` claim; once execution is recorded, later messages cannot authorize a
+competing action.
+
+If the executor disappears after `started`, a replacement may claim
+`started -> recovering` only after the executor lease expires and only with a
+compare-and-swap over the same action ID, decision version, scope, and current
+attempt epoch. Recovery increments the attempt epoch and first reconciles the
+declared evidence. It marks terminal when execution is proved, resumes with the
+same idempotency key when non-execution is proved or the external operation
+provides equivalent idempotent replay, and otherwise records an explicit
+ambiguous blocker. It never creates a new authorization or performs a competing
+side effect merely because the original executor is absent. Actions whose
+effects cannot be made idempotent or distinguished after a crash are ineligible
+for automatic execution and require reconciliation before a new action ID can
+be authorized.
+
+Transferring decision authority is an atomic recorded handoff. Recipients act
+only on the highest durable version and default to inaction on conflicting or
+unverifiable messages. This prevents several coordinators from oscillating a
+one-shot probe or restart faster than the executing seat can observe the
+decisions, while leaving a bounded recovery path for a pre-effect executor
+crash.
 
 ### 6. Evaluation telemetry
 
