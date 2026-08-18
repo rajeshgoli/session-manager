@@ -2815,74 +2815,70 @@ impl SessionStore {
         // not an observation made by a losing apply driver.  Serialize the
         // projection with apply/recovery, then enqueue only intents that are
         // still desired by the durable record while this lock is held.
-        let _cross_process_guard = self.reparent_apply_file_lock()?;
-        let (pending, recipients) = {
-            let _guard = self.write_guard()?;
-            let mut state = self.load_raw_json_value()?;
-            let sessions = snapshot_from_raw_value(&state)?.into_sessions();
-            let mut records = reparent_request_records(&state)?;
-            let refreshed = refresh_reparent_requests(
-                &mut records,
-                &sessions,
-                &state,
-                OffsetDateTime::now_utc(),
-            );
-            let mut changed = refreshed;
-            for record in &mut records {
-                let desired = desired_reparent_notifications(record);
-                let desired_keys = desired
-                    .iter()
-                    .map(|desired| desired.intent.key.as_str())
-                    .collect::<BTreeSet<_>>();
-                // A prior process may have recorded a not-yet-enqueued
-                // terminal intent before a winning driver committed the
-                // request.  Keep delivered audit history, but remove any
-                // unsent losing projection before choosing outbox work.
-                let previous_len = record.notification_intents.len();
-                record.notification_intents.retain(|intent| {
-                    intent.enqueued_at.is_some()
-                        || !intent.event.starts_with("terminal:")
-                        || desired_keys.contains(intent.key.as_str())
-                });
-                changed |= record.notification_intents.len() != previous_len;
-                for desired in desired {
-                    if record
-                        .notification_intents
+        let recipients = {
+            let _cross_process_guard = self.reparent_apply_file_lock()?;
+            let (pending, recipients) = {
+                let _guard = self.write_guard()?;
+                let mut state = self.load_raw_json_value()?;
+                let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+                let mut records = reparent_request_records(&state)?;
+                let refreshed = refresh_reparent_requests(
+                    &mut records,
+                    &sessions,
+                    &state,
+                    OffsetDateTime::now_utc(),
+                );
+                let mut changed = refreshed;
+                for record in &mut records {
+                    let desired = desired_reparent_notifications(record);
+                    let desired_keys = desired
                         .iter()
-                        .all(|intent| intent.key != desired.intent.key)
-                    {
-                        record.notification_intents.push(desired.intent);
-                        changed = true;
+                        .map(|desired| desired.intent.key.as_str())
+                        .collect::<BTreeSet<_>>();
+                    // A prior process may have recorded a not-yet-enqueued
+                    // terminal intent before a winning driver committed the
+                    // request.  Keep delivered audit history, but remove any
+                    // unsent losing projection before choosing outbox work.
+                    let previous_len = record.notification_intents.len();
+                    record.notification_intents.retain(|intent| {
+                        intent.enqueued_at.is_some()
+                            || !intent.event.starts_with("terminal:")
+                            || desired_keys.contains(intent.key.as_str())
+                    });
+                    changed |= record.notification_intents.len() != previous_len;
+                    for desired in desired {
+                        if record
+                            .notification_intents
+                            .iter()
+                            .all(|intent| intent.key != desired.intent.key)
+                        {
+                            record.notification_intents.push(desired.intent);
+                            changed = true;
+                        }
                     }
                 }
-            }
-            if changed {
-                store_reparent_request_records(&mut state, &records)?;
-                self.write_raw_json_value(&state)?;
-            }
-            let pending = records
-                .iter()
-                .flat_map(|record| {
-                    desired_reparent_notifications(record)
-                        .into_iter()
-                        .filter(|desired| {
-                            record.notification_intents.iter().any(|intent| {
-                                intent.key == desired.intent.key && intent.enqueued_at.is_none()
+                if changed {
+                    store_reparent_request_records(&mut state, &records)?;
+                    self.write_raw_json_value(&state)?;
+                }
+                let pending = records
+                    .iter()
+                    .flat_map(|record| {
+                        desired_reparent_notifications(record)
+                            .into_iter()
+                            .filter(|desired| {
+                                record.notification_intents.iter().any(|intent| {
+                                    intent.key == desired.intent.key && intent.enqueued_at.is_none()
+                                })
                             })
-                        })
-                })
-                .collect::<Vec<_>>();
-            let recipients = records
-                .iter()
-                .flat_map(|record| {
-                    record
-                        .notification_intents
-                        .iter()
-                        .map(|intent| intent.recipient_session_id.clone())
-                })
-                .collect::<BTreeSet<_>>();
-            (pending, recipients)
-        };
+                    })
+                    .collect::<Vec<_>>();
+                let recipients = pending
+                    .iter()
+                    .map(|desired| desired.intent.recipient_session_id.clone())
+                    .collect::<BTreeSet<_>>();
+                (pending, recipients)
+            };
         for desired in pending {
             let desired = {
                 let _guard = self.write_guard()?;
@@ -2938,7 +2934,9 @@ impl SessionStore {
                 store_reparent_request_records(&mut state, &records)?;
                 self.write_raw_json_value(&state)?;
             }
-        }
+            }
+            recipients
+        };
         if let Some(runtime) = self.delivery_runtime.as_ref() {
             let mut first_error = None;
             for recipient in recipients {

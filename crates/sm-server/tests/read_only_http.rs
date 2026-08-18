@@ -17786,7 +17786,7 @@ async fn reparent_notification_retry_recovers_after_a_transient_mutation_failure
         .any(|intent| intent["enqueued_at"].is_null()));
     assert!(queued_message_texts(&queue_db, "newparent").is_empty());
 
-    state.retry_reparent_notifications().unwrap();
+    assert!(state.retry_reparent_notifications().unwrap());
 
     let messages = queued_message_texts(&queue_db, "newparent");
     assert_eq!(messages.len(), 1);
@@ -17797,6 +17797,7 @@ async fn reparent_notification_retry_recovers_after_a_transient_mutation_failure
         .unwrap()
         .iter()
         .all(|intent| intent["enqueued_at"].is_string()));
+    assert!(!state.retry_reparent_notifications().unwrap());
 }
 
 #[tokio::test]

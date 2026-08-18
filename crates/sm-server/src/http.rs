@@ -404,6 +404,7 @@ pub struct AppState {
     mobile_terminal_revoked_keys: Arc<Mutex<BTreeSet<(String, String)>>>,
     mobile_terminal_runtime_disabled: Arc<AtomicBool>,
     studio_ssh_enabled: Arc<AtomicBool>,
+    reparent_notification_retry_pending: Arc<AtomicBool>,
     mobile_terminal_secret: [u8; 32],
 }
 
@@ -462,6 +463,7 @@ impl AppState {
                 );
             session_store = session_store.with_usage_report_store(report_store);
         }
+        let reparent_notification_retry_pending = Arc::new(AtomicBool::new(false));
         session_store
             .recover_session_runtime_launches()
             .context("session runtime launch recovery failed")?;
@@ -470,6 +472,7 @@ impl AppState {
             .context("reparent authority recovery failed")?;
         if let Err(error) = session_store.reconcile_reparent_notifications() {
             eprintln!("reparent notification recovery failed: {error:#}");
+            reparent_notification_retry_pending.store(true, Ordering::SeqCst);
         }
         if let Err(error) = session_store.recover_session_credential_rotation_workers() {
             eprintln!("session credential rotation recovery failed: {error:#}");
@@ -504,6 +507,7 @@ impl AppState {
             mobile_terminal_revoked_keys: Arc::new(Mutex::new(BTreeSet::new())),
             mobile_terminal_runtime_disabled: Arc::new(AtomicBool::new(false)),
             studio_ssh_enabled: Arc::new(AtomicBool::new(studio_ssh_enabled)),
+            reparent_notification_retry_pending,
             mobile_terminal_secret,
         })
     }
@@ -513,13 +517,32 @@ impl AppState {
             .drain_runtime_pending_message_targets_by_category("queue-completion")
     }
 
+    /// Request a background retry for a durable reparent notification intent.
+    pub fn request_reparent_notification_retry(&self) {
+        self.reparent_notification_retry_pending
+            .store(true, Ordering::SeqCst);
+    }
+
     /// Retry durable reparent notification intents away from request handlers.
     ///
     /// The reconciliation lock and queue writes can block, so this work must
     /// stay off watch/poll reads. The server's single background retry driver
-    /// calls it after startup and after any transient mutation-time failure.
-    pub fn retry_reparent_notifications(&self) -> anyhow::Result<()> {
-        self.session_store.reconcile_reparent_notifications()
+    /// calls it only when startup, a mutation, or a poll observes outstanding
+    /// notification work.
+    pub fn retry_reparent_notifications(&self) -> anyhow::Result<bool> {
+        if !self
+            .reparent_notification_retry_pending
+            .swap(false, Ordering::SeqCst)
+        {
+            return Ok(false);
+        }
+        match self.session_store.reconcile_reparent_notifications() {
+            Ok(()) => Ok(true),
+            Err(error) => {
+                self.request_reparent_notification_retry();
+                Err(error)
+            }
+        }
     }
 
     pub fn with_github_review_poster(mut self, poster: Arc<dyn GitHubReviewPoster>) -> Self {
@@ -3208,6 +3231,7 @@ async fn list_reparent_requests(
         }
         state.session_store.list_reparent_requests()?
     };
+    request_reparent_notification_retry_if_needed(&state, &requests);
     Ok(Json(json!({
         "requests": requests,
     })))
@@ -3325,6 +3349,7 @@ async fn get_reparent_request(
             detail: "Operator authentication or managed session identity is required".to_owned(),
         });
     }
+    request_reparent_notification_retry_if_needed(&state, std::slice::from_ref(&record));
     Ok(Json(serde_json::to_value(record)?))
 }
 
@@ -3476,6 +3501,22 @@ fn human_decide_reparent_request(
 fn reconcile_reparent_notifications_best_effort(state: &AppState) {
     if let Err(error) = state.session_store.reconcile_reparent_notifications() {
         eprintln!("reparent notification reconciliation failed: {error:#}");
+        state.request_reparent_notification_retry();
+    }
+}
+
+fn request_reparent_notification_retry_if_needed(
+    state: &AppState,
+    records: &[crate::sessions::ReparentRequestRecord],
+) {
+    if records.iter().any(|record| {
+        record
+            .notification_intents
+            .iter()
+            .any(|intent| intent.enqueued_at.is_none())
+            || (record.status != "pending" && record.notification_intents.is_empty())
+    }) {
+        state.request_reparent_notification_retry();
     }
 }
 
