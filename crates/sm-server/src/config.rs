@@ -27,6 +27,7 @@ pub struct AppConfig {
     pub tool_logging: ToolLoggingConfig,
     pub context_monitor: ContextMonitorConfig,
     pub usage: UsageConfig,
+    pub policy: PolicyConfig,
     pub codex_rollout: CodexRolloutConfig,
     pub codex_requests: CodexRequestsConfig,
     pub codex_events: CodexEventsConfig,
@@ -60,6 +61,7 @@ impl Default for AppConfig {
             tool_logging: ToolLoggingConfig::default(),
             context_monitor: ContextMonitorConfig::default(),
             usage: UsageConfig::default(),
+            policy: PolicyConfig::default(),
             codex_rollout: CodexRolloutConfig::default(),
             codex_requests: CodexRequestsConfig::default(),
             codex_events: CodexEventsConfig::default(),
@@ -853,6 +855,30 @@ pub struct UsageConfig {
     pub accounts: Vec<UsageAccountConfig>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PolicyConfig {
+    /// Operator-owned activation gate. A stored projection cannot enable
+    /// policy admission by itself.
+    pub enabled: bool,
+    /// Exact externally approved materialized projection consumed at startup.
+    pub projection_path: String,
+    /// Durable request, decision, override, and capacity-lease store.
+    pub db_path: String,
+    pub override_ttl_seconds: u64,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            projection_path: String::new(),
+            db_path: "~/.local/share/claude-sessions/policy.db".to_owned(),
+            override_ttl_seconds: 900,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct UsageAccountConfig {
     pub key: String,
@@ -1288,6 +1314,8 @@ struct RawConfig {
     #[serde(default)]
     usage: UsageConfig,
     #[serde(default)]
+    policy: PolicyConfig,
+    #[serde(default)]
     codex_rollout: CodexRolloutConfig,
     #[serde(default)]
     codex_requests: Option<RawCodexRequestsConfig>,
@@ -1394,6 +1422,7 @@ impl From<RawConfig> for AppConfig {
             tool_logging: raw.tool_logging,
             context_monitor: raw.context_monitor,
             usage: raw.usage,
+            policy: raw.policy,
             codex_rollout: raw.codex_rollout,
             codex_requests,
             codex_events,
