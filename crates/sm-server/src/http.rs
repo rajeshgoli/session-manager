@@ -513,6 +513,15 @@ impl AppState {
             .drain_runtime_pending_message_targets_by_category("queue-completion")
     }
 
+    /// Keeps terminal-fenced runtime launches from publishing after startup.
+    /// The durable fence remains eligible for every later reconciliation
+    /// because tmux client completion is not synchronized with an absence
+    /// check made during recovery.
+    pub fn reconcile_terminal_runtime_launch_teardowns(&self) -> anyhow::Result<()> {
+        self.session_store
+            .reconcile_terminal_runtime_launch_teardowns()
+    }
+
     pub fn with_github_review_poster(mut self, poster: Arc<dyn GitHubReviewPoster>) -> Self {
         self.github_review_poster = poster;
         self

@@ -22,6 +22,7 @@ use tokio::net::TcpListener;
 /// How often the Studio SSH reconcile loop repairs toward the desired state.
 const STUDIO_SSH_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const QUEUE_COMPLETION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const TERMINAL_RUNTIME_TEARDOWN_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Rust Session Manager server scaffold")]
@@ -136,6 +137,14 @@ async fn main() -> Result<()> {
                 eprintln!("queue completion delivery retry failed: {error:#}");
             }
             thread::sleep(QUEUE_COMPLETION_RETRY_INTERVAL);
+        });
+        let terminal_runtime_state = state.clone();
+        thread::spawn(move || loop {
+            if let Err(error) = terminal_runtime_state.reconcile_terminal_runtime_launch_teardowns()
+            {
+                eprintln!("terminal runtime teardown retry failed: {error:#}");
+            }
+            thread::sleep(TERMINAL_RUNTIME_TEARDOWN_RETRY_INTERVAL);
         });
     }
     // Capture the artifact boundary before serving. The background scan may run
