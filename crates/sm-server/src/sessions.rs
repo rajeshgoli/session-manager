@@ -3859,6 +3859,20 @@ impl SessionStore {
         Ok(record)
     }
 
+    /// Allocates a collision-checked core session ID before policy admission.
+    /// Creation still verifies uniqueness, so a concurrent collision fails
+    /// closed and the caller can release its provisional policy lease.
+    pub fn allocate_core_session_id(&self) -> Result<String> {
+        let _guard = self.write_guard()?;
+        let state = self.load_raw_json_value()?;
+        let sessions = state
+            .get("sessions")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        generate_unique_session_id(sessions)
+    }
+
     pub fn create_core_session_with_runtime(
         &self,
         request: CreateCoreSessionRequest,
