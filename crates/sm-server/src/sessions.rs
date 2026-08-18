@@ -13703,7 +13703,13 @@ fn mark_runtime_launch_failed(
         finalize_active_credential_rotations_for_terminal_session(state, session_id)?;
         let sessions = ensure_sessions_array_mut(state)?;
         if let Some(session) = session_object_mut(sessions, session_id) {
-            if !raw_session_is_stopped(session) {
+            if raw_session_is_stopped(session) {
+                // A terminal completion marker may arrive before the runtime
+                // failure writer normalizes `status`. Keep the original
+                // terminal evidence intact while retaining the canonical
+                // stopped projection expected by recovery readers.
+                session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+            } else {
                 let now = now_rfc3339();
                 session.insert("status".to_owned(), Value::String("stopped".to_owned()));
                 session.insert("stopped_at".to_owned(), Value::String(now.clone()));
