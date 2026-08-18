@@ -1786,14 +1786,35 @@ fn claude_initial_brief_submission_observed(ready_pane: &str, pane: &str) -> boo
 /// completed-turn chrome above its new composer, so acknowledgement must
 /// observe an activity row that did not already exist before Enter.
 fn claude_main_thread_activity_markers(pane: &str) -> Vec<&str> {
-    pane.lines()
-        .map(str::trim_start)
-        .filter(|line| {
-            !line.starts_with('❯')
-                && !line.starts_with('>')
-                && claude_line_indicates_main_thread_activity(line)
-        })
+    let lines = pane.lines().collect::<Vec<_>>();
+    let composer = claude_live_composer_range(&lines);
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !composer.as_ref().is_some_and(|range| range.contains(index)))
+        .map(|(_, line)| line.trim_start())
+        .filter(|line| claude_line_indicates_main_thread_activity(line))
         .collect()
+}
+
+/// Locate the rendered input region, including wrapped continuation rows.
+/// Before Claude accepts Enter it leaves the complete pasted brief between the
+/// live composer row and its footer divider.  Those rows are user input, not
+/// provider acknowledgement, even if the brief itself begins with the same
+/// glyphs Claude uses for activity.  Once a turn starts, Claude renders its
+/// activity above a fresh composer, so excluding the final live composer keeps
+/// the provider transition observable.
+fn claude_live_composer_range(lines: &[&str]) -> Option<std::ops::Range<usize>> {
+    let composer_index = lines.iter().rposition(|line| {
+        let line = line.trim_start();
+        line.starts_with('❯') || line.starts_with('>')
+    })?;
+    let footer_index = lines
+        .iter()
+        .enumerate()
+        .skip(composer_index + 1)
+        .find_map(|(index, line)| claude_composer_footer_divider(line.trim()).then_some(index))?;
+    Some(composer_index..footer_index)
 }
 
 fn claude_composer_footer_divider(line: &str) -> bool {
@@ -2417,6 +2438,29 @@ esac
                 "────────────────────\n",
                 "Fable 5\n",
                 "✽ Thinking through the initial brief…\n",
+            ),
+        ));
+    }
+
+    #[test]
+    fn claude_initial_brief_acceptance_rejects_marker_shaped_multiline_input() {
+        let ready = concat!(
+            "⏺ Completed startup housekeeping\n",
+            "❯\n",
+            "────────────────────\n",
+            "Fable 5\n",
+        );
+
+        // A failed Enter leaves every continuation row in Claude's composer.
+        // The second row deliberately resembles a provider activity marker.
+        assert!(!claude_initial_brief_submission_observed(
+            ready,
+            concat!(
+                "⏺ Completed startup housekeeping\n",
+                "❯ first line of immutable brief\n",
+                "✽ marker-shaped continuation, still unsubmitted\n",
+                "────────────────────\n",
+                "Fable 5\n",
             ),
         ));
     }
