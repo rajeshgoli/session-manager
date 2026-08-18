@@ -880,16 +880,28 @@ impl SessionStore {
         // writes terminal evidence, so this startup pass owns the remaining
         // crash window and tears down any such late runtime before ordinary
         // launch recovery considers other work.
-        // Restoration holds this same mutation lock from its terminal-marker
-        // check through tmux creation and the durable running transition. Do
-        // not release it between terminal revalidation and kill: otherwise a
-        // stale terminal snapshot could tear down a just-restored runtime.
-        let _guard = self.write_guard()?;
-        let state = self.load_raw_json_value()?;
-        for launch in terminal_runtime_teardown_records(&state)? {
-            runtime
-                .for_socket_name(launch.tmux_socket_name.as_deref())
-                .kill_session(&launch.tmux_session)?;
+        let terminal_launches = {
+            let _guard = self.write_guard()?;
+            let state = self.load_raw_json_value()?;
+            terminal_runtime_teardown_records(&state)?
+        };
+        for candidate in terminal_launches {
+            // Restore and terminal teardown share this per-session gate. The
+            // state lock is held only for revalidation, while the potentially
+            // slow tmux commands run outside the global mutation lock.
+            let _lifecycle_guard = self.lock_terminal_runtime_fence(&candidate.session_id)?;
+            let launch = {
+                let _guard = self.write_guard()?;
+                let state = self.load_raw_json_value()?;
+                terminal_runtime_teardown_records(&state)?
+                    .into_iter()
+                    .find(|launch| launch.id == candidate.id)
+            };
+            if let Some(launch) = launch {
+                runtime
+                    .for_socket_name(launch.tmux_socket_name.as_deref())
+                    .kill_session(&launch.tmux_session)?;
+            }
         }
         Ok(())
     }
@@ -5331,6 +5343,10 @@ impl SessionStore {
         self.lock_codex_cli_binding_working_dir(&record.working_dir)
     }
 
+    fn lock_terminal_runtime_fence(&self, session_id: &str) -> Result<SessionClearGuard> {
+        self.lock_named_clear_operation(&format!("terminal-runtime-fence:{session_id}"))
+    }
+
     fn lock_codex_cli_binding_working_dir(&self, working_dir: &str) -> Result<SessionClearGuard> {
         let sessions_root = resolve_path_lossy(self.codex_sessions_root.clone());
         let working_dir = resolve_path_lossy(expand_home(working_dir));
@@ -5408,6 +5424,7 @@ impl SessionStore {
         session_id: &str,
         runtime: &TmuxRuntime,
     ) -> Result<Option<CoreRestoreOutcome>> {
+        let _lifecycle_guard = self.lock_terminal_runtime_fence(session_id)?;
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;
