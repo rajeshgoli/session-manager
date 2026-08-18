@@ -917,13 +917,20 @@ fn run() -> Result<()> {
             }
         }
         Command::Retire(args) => {
-            let requester_session_id = current_session_id()?;
-            let credential = current_session_credential(&requester_session_id)?;
-            let payload = client.post_json_with_session_credential(
-                &format!("/sessions/{}/retire", args.session_id),
-                retire_request_payload(Some(requester_session_id)),
-                &credential,
-            )?;
+            let requester_session_id = optional_current_session_id();
+            let payload = if let Some(requester_session_id) = requester_session_id {
+                let credential = current_session_credential(&requester_session_id)?;
+                client.post_json_with_session_credential(
+                    &format!("/sessions/{}/retire", args.session_id),
+                    retire_request_payload(Some(requester_session_id)),
+                    &credential,
+                )?
+            } else {
+                client.post_json(
+                    &format!("/sessions/{}/retire", args.session_id),
+                    retire_request_payload(None),
+                )?
+            };
             println!("{}", retire_response_status(&payload, &args.session_id)?);
         }
         Command::Reparent(args) => run_reparent(&client, args)?,

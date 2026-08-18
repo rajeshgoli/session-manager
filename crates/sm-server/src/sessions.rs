@@ -7525,10 +7525,11 @@ impl SessionStore {
         if !is_primary_node(&node) {
             return Ok(CoreRetireOutcome::UnsupportedNode(node));
         }
-        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
-        let tmux_was_killed = session_runtime.kill_session(&tmux_session)?;
         // A terminal write and its rotation finalization share this one atomic
-        // state replacement, so recovery cannot later relaunch the seat.
+        // state replacement, so recovery cannot later relaunch the seat. It
+        // must reach durable storage before the external kill: if this process
+        // exits after tmux accepts the kill, startup recovery retains the
+        // attributed retirement rather than inferring a disappearance.
         finalize_active_credential_rotations_for_terminal_session(&mut state, session_id)?;
         let now = now_rfc3339();
         let sessions = ensure_sessions_array_mut(&mut state)?;
@@ -7542,15 +7543,33 @@ impl SessionStore {
                 &now,
                 requester_session_id,
                 authority,
-                Some(if tmux_was_killed {
-                    "killed"
-                } else {
-                    "already_absent"
-                }),
+                Some("retire_requested"),
             ),
         );
         session.insert("stopped_at".to_owned(), Value::String(now.clone()));
         session.insert("last_activity".to_owned(), Value::String(now));
+        self.write_raw_json_value(&state)?;
+
+        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
+        let tmux_was_killed = session_runtime.kill_session(&tmux_session)?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let session = session_object_mut(sessions, session_id)
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during retire"))?;
+        let terminal_provenance = session
+            .get_mut("terminal_provenance")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| anyhow::anyhow!("session {session_id} lost retirement provenance"))?;
+        terminal_provenance.insert(
+            "tmux_disposition".to_owned(),
+            Value::String(
+                if tmux_was_killed {
+                    "killed"
+                } else {
+                    "already_absent"
+                }
+                .to_owned(),
+            ),
+        );
         complete_stop_notify_after_stop_raw(
             self,
             &mut state,
