@@ -22,6 +22,7 @@ use tokio::net::TcpListener;
 /// How often the Studio SSH reconcile loop repairs toward the desired state.
 const STUDIO_SSH_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const QUEUE_COMPLETION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const REPARENT_NOTIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Rust Session Manager server scaffold")]
@@ -123,6 +124,17 @@ async fn main() -> Result<()> {
     }
 
     let state = AppState::try_new(config).context("failed to initialize server state")?;
+    // Reparent notification reconciliation can wait on the cross-process
+    // apply lock and queue writes. Keep its durable retry driver on one
+    // dedicated background thread so poll reads never consume request workers
+    // waiting for the outbox.
+    let reparent_notification_state = state.clone();
+    thread::spawn(move || loop {
+        thread::sleep(REPARENT_NOTIFICATION_RETRY_INTERVAL);
+        if let Err(error) = reparent_notification_state.retry_reparent_notifications() {
+            eprintln!("reparent notification retry failed: {error:#}");
+        }
+    });
     if state.config().rust_core.runtime_enabled {
         let queue_delivery_state = state.clone();
         thread::spawn(move || loop {

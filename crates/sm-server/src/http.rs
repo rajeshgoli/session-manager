@@ -513,6 +513,15 @@ impl AppState {
             .drain_runtime_pending_message_targets_by_category("queue-completion")
     }
 
+    /// Retry durable reparent notification intents away from request handlers.
+    ///
+    /// The reconciliation lock and queue writes can block, so this work must
+    /// stay off watch/poll reads. The server's single background retry driver
+    /// calls it after startup and after any transient mutation-time failure.
+    pub fn retry_reparent_notifications(&self) -> anyhow::Result<()> {
+        self.session_store.reconcile_reparent_notifications()
+    }
+
     pub fn with_github_review_poster(mut self, poster: Arc<dyn GitHubReviewPoster>) -> Self {
         self.github_review_poster = poster;
         self

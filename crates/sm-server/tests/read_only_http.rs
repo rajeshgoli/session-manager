@@ -17753,6 +17753,53 @@ async fn reparent_request_poll_stays_available_while_apply_lock_is_held() {
 }
 
 #[tokio::test]
+async fn reparent_notification_retry_recovers_after_a_transient_mutation_failure() {
+    let state_file = write_reparent_fixture();
+    let queue_db = queue_db_path_for_state_file(&state_file);
+    let mut config = config_with_state_file_and_queue(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let state = Arc::new(AppState::new(config));
+    let app = router((*state).clone());
+
+    let queue_lock = Connection::open(&queue_db).unwrap();
+    queue_lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let (status, created) = post_json_with_headers_and_peer(
+        app,
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    queue_lock.execute_batch("ROLLBACK").unwrap();
+
+    let request_id = created["id"].as_str().unwrap();
+    let persisted: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert!(persisted["reparent_requests"][0]["notification_intents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|intent| intent["enqueued_at"].is_null()));
+    assert!(queued_message_texts(&queue_db, "newparent").is_empty());
+
+    state.retry_reparent_notifications().unwrap();
+
+    let messages = queued_message_texts(&queue_db, "newparent");
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].contains(request_id));
+    let retried: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    assert!(retried["reparent_requests"][0]["notification_intents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|intent| intent["enqueued_at"].is_string()));
+}
+
+#[tokio::test]
 async fn reparent_request_rejects_unauthorized_cycles_and_overlapping_edges() {
     let state_file = write_reparent_fixture();
     let mut config = config_with_state_file(&state_file);
