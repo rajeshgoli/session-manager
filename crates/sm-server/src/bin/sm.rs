@@ -462,7 +462,10 @@ struct QueueRunArgs {
 struct QueueListArgs {
     #[arg(long)]
     notify: Option<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Include terminal history; without --notify, show every notify target"
+    )]
     all: bool,
     #[arg(long = "type", value_parser = ["tests", "perf", "background"])]
     job_type: Option<String>,
@@ -1463,23 +1466,23 @@ where
 
 fn run_queue_list(client: &ApiClient, args: QueueListArgs) -> Result<()> {
     let mut query = Vec::new();
-    let effective_notify = args
+    let explicit_notify = args
         .notify
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            if args.all {
-                None
-            } else {
-                optional_current_session_id()
-            }
-        });
+        .map(ToOwned::to_owned);
+    let effective_notify = explicit_notify.clone().or_else(|| {
+        if args.all {
+            None
+        } else {
+            optional_current_session_id()
+        }
+    });
     if !args.all && effective_notify.is_none() {
         bail!("No session context. Use --notify or --all.");
     }
-    if let Some(notify) = effective_notify {
+    if let Some(ref notify) = effective_notify {
         query.push(format!("notify_target={}", encode_query_component(&notify)));
     }
     if let Some(job_type) = args
@@ -1512,8 +1515,50 @@ fn run_queue_list(client: &ApiClient, args: QueueListArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&jobs)?);
         return Ok(());
     }
+    println!(
+        "{}",
+        queue_list_scope_text(
+            effective_notify.as_deref(),
+            explicit_notify.is_some(),
+            args.all,
+            args.state.as_deref(),
+        )
+    );
     print_queue_jobs(&jobs);
     Ok(())
+}
+
+fn queue_list_scope_text(
+    notify_target: Option<&str>,
+    explicit_notify: bool,
+    include_terminal: bool,
+    state: Option<&str>,
+) -> String {
+    match (notify_target, explicit_notify, include_terminal, state) {
+        (Some(notify), true, false, None) => format!(
+            "Queue scope: active pending and running jobs for explicit notify target {notify}. --all retains this target and includes terminal history; use --all without --notify for history across notify targets."
+        ),
+        (Some(notify), true, _, Some(state)) => format!(
+            "Queue scope: explicit notify target {notify}, filtered to state {state}. --all retains this target; use --all without --notify for history across notify targets."
+        ),
+        (Some(notify), true, true, None) => format!(
+            "Queue scope: all jobs, including terminal history, for explicit notify target {notify}. Use --all without --notify for history across notify targets."
+        ),
+        (Some(notify), false, false, None) => format!(
+            "Queue scope: active pending and running jobs for notify target {notify}. Use --all for history across notify targets."
+        ),
+        (Some(notify), false, _, Some(state)) => format!(
+            "Queue scope: notify target {notify}, filtered to state {state}. Use --all with no --notify for history across notify targets."
+        ),
+        (Some(notify), false, true, None) => format!(
+            "Queue scope: all jobs, including terminal history, for notify target {notify}. Use --all with no --notify for history across notify targets."
+        ),
+        (None, _, true, Some(state)) => format!(
+            "Queue scope: all notify targets, filtered to state {state}."
+        ),
+        (None, _, true, _) => "Queue scope: all jobs, including terminal history, across notify targets.".to_owned(),
+        (None, _, false, _) => "Queue scope: active pending and running jobs across notify targets.".to_owned(),
+    }
 }
 
 fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
@@ -6184,6 +6229,34 @@ mod tests {
         assert_eq!(parse_duration_seconds("1d").unwrap(), 86400);
         assert_eq!(parse_queue_timeout_seconds("none").unwrap(), 0);
         assert_eq!(parse_queue_timeout_seconds("2h").unwrap(), 7200);
+    }
+
+    #[test]
+    fn queue_list_scope_labels_the_actual_projection() {
+        assert_eq!(
+            queue_list_scope_text(Some("session123"), false, false, None),
+            "Queue scope: active pending and running jobs for notify target session123. Use --all for history across notify targets."
+        );
+        assert_eq!(
+            queue_list_scope_text(Some("session123"), false, false, Some("running")),
+            "Queue scope: notify target session123, filtered to state running. Use --all with no --notify for history across notify targets."
+        );
+        assert_eq!(
+            queue_list_scope_text(Some("session123"), true, false, None),
+            "Queue scope: active pending and running jobs for explicit notify target session123. --all retains this target and includes terminal history; use --all without --notify for history across notify targets."
+        );
+        assert_eq!(
+            queue_list_scope_text(Some("session123"), true, true, None),
+            "Queue scope: all jobs, including terminal history, for explicit notify target session123. Use --all without --notify for history across notify targets."
+        );
+        assert_eq!(
+            queue_list_scope_text(None, false, true, None),
+            "Queue scope: all jobs, including terminal history, across notify targets."
+        );
+        assert_eq!(
+            queue_list_scope_text(None, false, true, Some("done")),
+            "Queue scope: all notify targets, filtered to state done."
+        );
     }
 
     #[test]
