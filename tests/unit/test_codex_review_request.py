@@ -384,6 +384,7 @@ async def test_codex_review_request_task_completes_and_queues_message(mq):
         next_retry_at=datetime(2026, 4, 17, 0, 10, 0),
         requested_head_sha="a" * 40,
     )
+    mq._persist_codex_review_request_replacement(reg, [])
     mq._codex_review_requests[reg.id] = reg
     mq.queue_message = MagicMock()
 
@@ -427,6 +428,7 @@ async def test_codex_review_request_task_still_checks_review_when_pickup_lookup_
         next_retry_at=datetime(2026, 4, 17, 0, 10, 0),
         requested_head_sha="a" * 40,
     )
+    mq._persist_codex_review_request_replacement(reg, [])
     mq._codex_review_requests[reg.id] = reg
     mq.queue_message = MagicMock()
 

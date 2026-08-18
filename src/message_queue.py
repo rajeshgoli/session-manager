@@ -1071,10 +1071,11 @@ class MessageQueueManager:
                         """,
                         (registration.id, superseded_at.isoformat(), prior.id),
                     )
-                    prior.is_active = False
-                    prior.state = "superseded"
-                    prior.superseded_by_request_id = registration.id
-                    prior.superseded_at = superseded_at
+                    if cursor.rowcount:
+                        prior.is_active = False
+                        prior.state = "superseded"
+                        prior.superseded_by_request_id = registration.id
+                        prior.superseded_at = superseded_at
                 cursor.execute(
                     """
                     INSERT INTO codex_review_request_registrations
@@ -1340,16 +1341,23 @@ class MessageQueueManager:
                 return False
 
             review_landed_at = self._parse_iso_datetime(review_match.get("created_at")) or now
-            updates = {
-                "review_landed_at": review_landed_at,
-                "review_source": review_match.get("source"),
-                "review_comment_id": review_match.get("id"),
-                "review_url": review_match.get("url"),
-                "state": "completed",
-                "is_active": False,
-                "last_error": None,
-            }
-            self._update_codex_review_request_db(registration.id, **updates)
+            with self._db_lock:
+                cursor = self._db_conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE codex_review_request_registrations
+                    SET review_landed_at = ?, review_source = ?, review_comment_id = ?,
+                        review_url = ?, state = 'completed', is_active = 0, last_error = NULL
+                    WHERE id = ? AND is_active = 1
+                    """,
+                    (
+                        review_landed_at.isoformat(), review_match.get("source"),
+                        review_match.get("id"), review_match.get("url"), registration.id,
+                    ),
+                )
+                self._db_conn.commit()
+                if not cursor.rowcount:
+                    return False
             registration.review_landed_at = review_landed_at
             registration.review_source = review_match.get("source")
             registration.review_comment_id = review_match.get("id")
