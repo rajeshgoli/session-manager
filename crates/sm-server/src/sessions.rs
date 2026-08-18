@@ -6086,13 +6086,20 @@ impl SessionStore {
         let is_self_alert = notify_target == session_id;
         let label = raw_session_label(session, session_id);
         let rounded = format_percentage(used_percentage);
+        let native_codex_compaction = json_text(session.get("provider"))
+            .is_some_and(|provider| provider_uses_native_context_compaction(&provider));
 
         if used_percentage >= self.context_monitor.critical_percentage {
             if flag_is_set(session, "context_critical_sent") {
                 return None;
             }
             session.insert("context_critical_sent".to_owned(), Value::Bool(true));
-            let text = if is_self_alert {
+            let text = if is_self_alert && native_codex_compaction {
+                format!(
+                    "[sm context] Context at {rounded}% — critically high. \
+                     Codex will compact inline; continue the current task and do not run `sm handoff`."
+                )
+            } else if is_self_alert {
                 format!(
                     "[sm context] Context at {rounded}% — critically high. \
                      Write your handoff doc NOW and run `sm handoff <path>`. \
@@ -6116,7 +6123,13 @@ impl SessionStore {
                 return None;
             }
             session.insert("context_warning_sent".to_owned(), Value::Bool(true));
-            let text = if is_self_alert {
+            let text = if is_self_alert && native_codex_compaction {
+                format!(
+                    "[sm context] Context at {rounded}% ({} tokens). \
+                     Codex will compact inline; continue the current task and do not run `sm handoff`.",
+                    format_thousands(tokens_used)
+                )
+            } else if is_self_alert {
                 format!(
                     "[sm context] Context at {rounded}% ({} tokens). \
                      Consider writing a handoff doc and running `sm handoff <path>`.",
@@ -8161,64 +8174,72 @@ impl SessionStore {
         // `/hooks/context-usage` usage update. The snapshot is always cached;
         // provider capability and registration only control warning/critical alerts.
         let mut context_alert = None;
-        if let Some(usage) = codex_fork_context_usage(event) {
-            let previous_used = session.get("tokens_used").and_then(Value::as_i64);
-            let previous_pct = session
-                .get("context_used_percentage")
-                .and_then(Value::as_f64);
-            let previous_context_tokens = session
-                .get("context_total_input_tokens")
-                .and_then(Value::as_i64);
-            let snapshot_changed = previous_used != Some(usage.tokens_used)
-                || previous_pct != Some(usage.used_percentage)
-                || previous_context_tokens != Some(usage.tokens_used)
-                || json_text(session.get("context_sampled_at")).is_none();
-            if snapshot_changed {
-                session.insert("tokens_used".to_owned(), json!(usage.tokens_used));
-                session.insert(
-                    "context_used_percentage".to_owned(),
-                    json!(usage.used_percentage),
-                );
-                session.insert(
-                    "context_total_input_tokens".to_owned(),
-                    json!(usage.tokens_used),
-                );
-                session.insert(
-                    "context_sampled_at".to_owned(),
-                    Value::String(now_rfc3339()),
-                );
-                changed = true;
-            }
-            let unsupported_provider = !provider_has_measured_context_gauge(
-                json_text(session.get("provider"))
-                    .as_deref()
-                    .unwrap_or("claude"),
-            );
-            if unsupported_provider {
-                let had_alert_state = flag_is_set(session, "context_monitor_enabled")
-                    || json_text(session.get("context_monitor_notify")).is_some()
-                    || flag_is_set(session, "context_warning_sent")
-                    || flag_is_set(session, "context_critical_sent");
-                if had_alert_state {
-                    session.insert("context_monitor_enabled".to_owned(), Value::Bool(false));
-                    session.insert("context_monitor_notify".to_owned(), Value::Null);
-                    session.insert(
-                        "context_monitor_notify_source".to_owned(),
-                        Value::String(default_context_monitor_notify_source()),
-                    );
+        if codex_fork_event_matches_root_thread(event, root_provider_resume_id.as_deref()) {
+            if let Some(usage) = codex_fork_context_usage(event) {
+                let previous_used = session.get("tokens_used").and_then(Value::as_i64);
+                let previous_pct = session
+                    .get("context_used_percentage")
+                    .and_then(Value::as_f64);
+                let previous_context_tokens = session
+                    .get("context_total_input_tokens")
+                    .and_then(Value::as_i64);
+                // Codex has no Claude-style PreCompact hook. Its measured resident
+                // input drops when native compaction replaces the active window,
+                // which begins the next durable alert cycle.
+                if previous_context_tokens
+                    .is_some_and(|previous_tokens| usage.tokens_used < previous_tokens)
+                {
                     reset_context_oneshot_flags(session);
-                    self.cancel_context_monitor_alerts(session_id)?;
+                }
+                let snapshot_changed = previous_used != Some(usage.tokens_used)
+                    || previous_pct != Some(usage.used_percentage)
+                    || previous_context_tokens != Some(usage.tokens_used)
+                    || json_text(session.get("context_sampled_at")).is_none();
+                if snapshot_changed {
+                    session.insert("tokens_used".to_owned(), json!(usage.tokens_used));
+                    session.insert(
+                        "context_used_percentage".to_owned(),
+                        json!(usage.used_percentage),
+                    );
+                    session.insert(
+                        "context_total_input_tokens".to_owned(),
+                        json!(usage.tokens_used),
+                    );
+                    session.insert(
+                        "context_sampled_at".to_owned(),
+                        Value::String(now_rfc3339()),
+                    );
                     changed = true;
                 }
-            } else if flag_is_set(session, "context_monitor_enabled") {
-                // This only notifies the configured target. Codex-fork retains
-                // provider-native compaction; monitoring never rotates it.
-                context_alert = self.latch_context_alert(
-                    session,
-                    session_id,
-                    usage.used_percentage,
-                    usage.tokens_used,
+                let unsupported_provider = !provider_has_measured_context_gauge(
+                    json_text(session.get("provider"))
+                        .as_deref()
+                        .unwrap_or("claude"),
                 );
+                if unsupported_provider {
+                    let had_alert_state = flag_is_set(session, "context_monitor_enabled")
+                        || json_text(session.get("context_monitor_notify")).is_some()
+                        || flag_is_set(session, "context_warning_sent")
+                        || flag_is_set(session, "context_critical_sent");
+                    if had_alert_state {
+                        session.insert("context_monitor_enabled".to_owned(), Value::Bool(false));
+                        session.insert("context_monitor_notify".to_owned(), Value::Null);
+                        session.insert(
+                            "context_monitor_notify_source".to_owned(),
+                            Value::String(default_context_monitor_notify_source()),
+                        );
+                        reset_context_oneshot_flags(session);
+                        self.cancel_context_monitor_alerts(session_id)?;
+                        changed = true;
+                    }
+                } else if flag_is_set(session, "context_monitor_enabled") {
+                    context_alert = self.latch_context_alert(
+                        session,
+                        session_id,
+                        usage.used_percentage,
+                        usage.tokens_used,
+                    );
+                }
             }
         }
 
@@ -15496,6 +15517,10 @@ fn provider_has_measured_context_gauge(provider: &str) -> bool {
     matches!(provider.trim(), "claude" | "codex-fork")
 }
 
+fn provider_uses_native_context_compaction(provider: &str) -> bool {
+    matches!(provider.trim(), "codex" | "codex-fork" | "codex-app")
+}
+
 fn session_supports_reparent_consent(session: &SessionRecord) -> bool {
     is_primary_node(&session.node)
         && matches!(session.provider.as_str(), "claude" | "codex" | "codex-fork")
@@ -20360,6 +20385,64 @@ mod tests {
             .apply_codex_fork_event_line("child001", line)
             .unwrap();
         assert_eq!(context_monitor_messages(&restarted).len(), 1);
+    }
+
+    #[test]
+    fn codex_fork_monitor_uses_only_root_usage_and_rearms_after_native_compaction() {
+        let store = store_with_provider_child("ctxcodexcycles", "codex-fork", "running");
+        let mut state = store.load_raw_json_value().unwrap();
+        let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+        session_object_mut(sessions, "child001").unwrap().insert(
+            "provider_resume_id".to_owned(),
+            Value::String("root-thread".to_owned()),
+        );
+        store.write_raw_json_value(&state).unwrap();
+        store
+            .set_context_monitor(
+                "child001",
+                ContextMonitorRequest {
+                    enabled: true,
+                    requester_session_id: "child001".to_owned(),
+                    notify_session_id: Some("child001".to_owned()),
+                },
+            )
+            .unwrap();
+
+        let usage_event = |thread_id: &str, tokens: i64| {
+            format!(
+                r#"{{"event_type":"thread/tokenUsage/updated","payload":{{"threadId":"{thread_id}","tokenUsage":{{"last":{{"totalTokens":{tokens}}},"modelContextWindow":258400}}}}}}"#
+            )
+        };
+        // Descendant activity belongs in the attribution ledger, not the
+        // managed root's occupancy or alert cycle.
+        store
+            .apply_codex_fork_event_line("child001", &usage_event("descendant", 181_000))
+            .unwrap();
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert_eq!(session.tokens_used, 0);
+        assert!(!session.context_critical_sent);
+        assert!(context_monitor_messages(&store).is_empty());
+
+        store
+            .apply_codex_fork_event_line("child001", &usage_event("root-thread", 181_000))
+            .unwrap();
+        let first_alert = context_monitor_messages(&store).pop().unwrap();
+        let first_text = first_alert["text"].as_str().unwrap();
+        assert!(first_text.contains("Codex will compact inline"));
+        assert!(!first_text.contains("run `sm handoff <path>`"));
+
+        // A lower resident-token count is Codex's observed native-compaction
+        // boundary, so the next high-water cycle must notify again.
+        store
+            .apply_codex_fork_event_line("child001", &usage_event("root-thread", 20_000))
+            .unwrap();
+        let compacted = store.get_session("child001").unwrap().unwrap();
+        assert!(!compacted.context_warning_sent);
+        assert!(!compacted.context_critical_sent);
+        store
+            .apply_codex_fork_event_line("child001", &usage_event("root-thread", 181_000))
+            .unwrap();
+        assert_eq!(context_monitor_messages(&store).len(), 2);
     }
 
     #[test]
