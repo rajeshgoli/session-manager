@@ -7417,7 +7417,7 @@ impl SessionStore {
                     return Ok(CoreRetireOutcome::NotChild);
                 }
             }
-            if raw_session_is_stopped(session) {
+            if raw_session_has_terminal_evidence(session) {
                 return Ok(CoreRetireOutcome::Retired(CoreRetireResult {
                     ok: true,
                     session_id: session_id.to_owned(),
@@ -7508,7 +7508,7 @@ impl SessionStore {
                     return Ok(CoreRetireOutcome::NotChild);
                 }
             }
-            if raw_session_is_stopped(session) {
+            if raw_session_has_terminal_evidence(session) {
                 return Ok(CoreRetireOutcome::Retired(CoreRetireResult {
                     ok: true,
                     session_id: session_id.to_owned(),
@@ -15959,6 +15959,66 @@ mod tests {
             "2026-06-01T00:02:00Z"
         );
         assert_eq!(state["session_runtime_launches"][0]["status"], "failed");
+    }
+
+    #[test]
+    fn authenticated_retire_marks_a_provisional_stopped_child_terminal() {
+        let state_file = unique_temp_path("retire-provisional-stopped-child");
+        let mut child = reparent_test_session("child001", Some("parent01"), "child-secret");
+        // Runtime creation persists this projection before releasing its state
+        // lock for provider startup. It is not terminal evidence yet.
+        child["status"] = json!("stopped");
+        child["stopped_at"] = json!("2026-06-01T00:01:00Z");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("parent01", None, "parent-secret"),
+                    child
+                ],
+                "session_runtime_launches": [{
+                    "id": "launch01",
+                    "operation_kind": "create",
+                    "session_id": "child001",
+                    "tmux_session": "claude-child001",
+                    "working_dir": "/repo",
+                    "log_file": "/tmp/child001.log",
+                    "provider": "claude",
+                    "credential_sha256": sha256_text("child-secret"),
+                    "status": "launching",
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "updated_at": "2026-06-01T00:00:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(state_file.clone());
+
+        assert!(matches!(
+            store.retire_core_session_authorized(
+                "child001",
+                Some("parent01"),
+                Some("parent-secret"),
+            ),
+            Ok(CoreRetireOutcome::Retired(_))
+        ));
+
+        let state = store.load_raw_json_value().unwrap();
+        assert_eq!(state["sessions"][1]["completion_status"], "retired");
+        assert_eq!(
+            state["sessions"][1]["terminal_provenance"]["cause"],
+            "explicit_retire"
+        );
+        assert_eq!(
+            state["sessions"][1]["terminal_provenance"]["actor_session_id"],
+            "parent01"
+        );
+        assert_eq!(
+            state["sessions"][1]["terminal_provenance"]["authority"],
+            "authenticated_parent"
+        );
+        let _ = fs::remove_file(state_file);
     }
 
     #[test]
