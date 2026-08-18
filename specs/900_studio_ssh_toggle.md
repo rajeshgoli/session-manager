@@ -190,7 +190,7 @@ Add a Studio SSH toggle + status chip in `src/App.tsx` (near the pause control) 
    then `cd` into it. (If `origin/feat/studio-ssh-toggle` isn't fetched yet, base off local
    `feat/studio-ssh-toggle`.)
 3. Implement ONLY your workstream's files. Keep commits scoped.
-4. Self-review to clean per `docs/working/pr_review_process.md`: push your branch, open a PR
+4. Self-review to clean per `specs/1268_pr_review_process.md`: push your branch, open a PR
    with `gh pr create --base feat/studio-ssh-toggle`, run the review loop
    (`sm request-codex-review <pr#>` or the fallback), and address any **P1** feedback. P2/lower is
    optional.
