@@ -107,6 +107,12 @@ pub struct CodexForkRuntimeArtifacts {
     pub control_socket_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+struct ClaudeInitialBriefReadyPane {
+    pane: String,
+    composer_y: usize,
+}
+
 #[derive(Debug)]
 pub enum CodexModelValidationError {
     Unsupported {
@@ -1348,7 +1354,7 @@ impl TmuxRuntime {
         &self,
         tmux_session: &str,
         provider: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<ClaudeInitialBriefReadyPane>> {
         let deadline = Instant::now() + self.initial_brief_ready_timeout;
         let mut directory_trust_accepted = false;
         loop {
@@ -1389,13 +1395,21 @@ impl TmuxRuntime {
     /// `Try "..."` suggestion, so pane text alone cannot distinguish it from
     /// typed input.  The cursor must still be immediately after the composer
     /// prefix on that exact row before an immutable brief may be submitted.
-    fn claude_initial_brief_composer_pane(&self, tmux_session: &str) -> Option<String> {
+    fn claude_initial_brief_composer_pane(
+        &self,
+        tmux_session: &str,
+    ) -> Option<ClaudeInitialBriefReadyPane> {
         let pane = self.capture_pane_text(tmux_session)?;
         if !claude_composer_is_ready(&pane) {
             return None;
         }
         let (cursor_x, cursor_y) = self.pane_cursor_position(tmux_session)?;
-        claude_empty_composer_cursor(&pane, cursor_x, cursor_y).then_some(pane)
+        claude_empty_composer_cursor(&pane, cursor_x, cursor_y).then_some(
+            ClaudeInitialBriefReadyPane {
+                pane,
+                composer_y: cursor_y,
+            },
+        )
     }
 
     fn pane_cursor_position(&self, tmux_session: &str) -> Option<(usize, usize)> {
@@ -1454,14 +1468,17 @@ impl TmuxRuntime {
     fn wait_for_claude_initial_brief_acceptance(
         &self,
         tmux_session: &str,
-        ready_pane: &str,
+        ready_pane: &ClaudeInitialBriefReadyPane,
     ) -> Result<()> {
         let deadline = Instant::now() + self.initial_brief_ack_timeout;
         loop {
-            if self
-                .capture_pane_text(tmux_session)
-                .is_some_and(|pane| claude_initial_brief_submission_observed(ready_pane, &pane))
-            {
+            if self.capture_pane_text(tmux_session).is_some_and(|pane| {
+                claude_initial_brief_submission_observed(
+                    &ready_pane.pane,
+                    ready_pane.composer_y,
+                    &pane,
+                )
+            }) {
                 return Ok(());
             }
             if !self.session_exists(tmux_session)? {
@@ -1761,60 +1778,56 @@ fn claude_empty_composer_cursor(pane: &str, cursor_x: usize, cursor_y: usize) ->
     claude_composer_line_is_ready(composer.trim()) && cursor_x == leading + prefix_width
 }
 
-fn claude_initial_brief_submission_observed(ready_pane: &str, pane: &str) -> bool {
+fn claude_initial_brief_submission_observed(
+    ready_pane: &str,
+    composer_y: usize,
+    pane: &str,
+) -> bool {
     if pane == ready_pane {
         return false;
     }
-    let mut previous_markers = claude_main_thread_activity_markers(ready_pane);
-    claude_main_thread_activity_markers(pane)
-        .into_iter()
-        .any(|marker| {
-            match previous_markers
-                .iter()
-                .position(|previous| *previous == marker)
-            {
-                Some(index) => {
-                    previous_markers.remove(index);
-                    false
-                }
-                None => true,
+    let Some(mut previous_markers) = claude_main_thread_activity_markers(ready_pane, composer_y)
+    else {
+        return false;
+    };
+    let Some(current_markers) = claude_main_thread_activity_markers(pane, composer_y) else {
+        return false;
+    };
+    current_markers.into_iter().any(|marker| {
+        match previous_markers
+            .iter()
+            .position(|previous| *previous == marker)
+        {
+            Some(index) => {
+                previous_markers.remove(index);
+                false
             }
-        })
+            None => true,
+        }
+    })
 }
 
 /// Return a multiset of provider activity rows.  A ready pane can retain old
 /// completed-turn chrome above its new composer, so acknowledgement must
 /// observe an activity row that did not already exist before Enter.
-fn claude_main_thread_activity_markers(pane: &str) -> Vec<&str> {
+fn claude_main_thread_activity_markers(pane: &str, composer_y: usize) -> Option<Vec<&str>> {
     let lines = pane.lines().collect::<Vec<_>>();
-    let composer = claude_live_composer_range(&lines);
-    lines
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !composer.as_ref().is_some_and(|range| range.contains(index)))
-        .map(|(_, line)| line.trim_start())
-        .filter(|line| claude_line_indicates_main_thread_activity(line))
-        .collect()
-}
-
-/// Locate the rendered input region, including wrapped continuation rows.
-/// Before Claude accepts Enter it leaves the complete pasted brief between the
-/// live composer row and its footer divider.  Those rows are user input, not
-/// provider acknowledgement, even if the brief itself begins with the same
-/// glyphs Claude uses for activity.  Once a turn starts, Claude renders its
-/// activity above a fresh composer, so excluding the final live composer keeps
-/// the provider transition observable.
-fn claude_live_composer_range(lines: &[&str]) -> Option<std::ops::Range<usize>> {
-    let composer_index = lines.iter().rposition(|line| {
-        let line = line.trim_start();
-        line.starts_with('❯') || line.starts_with('>')
-    })?;
-    let footer_index = lines
-        .iter()
-        .enumerate()
-        .skip(composer_index + 1)
-        .find_map(|(index, line)| claude_composer_footer_divider(line.trim()).then_some(index))?;
-    Some(composer_index..footer_index)
+    let composer = lines.get(composer_y)?.trim_start();
+    if !(composer.starts_with('❯') || composer.starts_with('>')) {
+        return None;
+    }
+    // The cursor-confirmed row is the actual boundary of the live input.
+    // Everything at or below it may be multiline prompt text, including
+    // quotes and rows that resemble activity. Provider turn rows render
+    // above the stationary composer. If that layout changes, fail closed.
+    Some(
+        lines
+            .iter()
+            .take(composer_y)
+            .map(|line| line.trim_start())
+            .filter(|line| claude_line_indicates_main_thread_activity(line))
+            .collect(),
+    )
 }
 
 fn claude_composer_footer_divider(line: &str) -> bool {
@@ -2397,18 +2410,21 @@ esac
 
     #[test]
     fn claude_initial_brief_acceptance_requires_a_provider_turn_transition() {
-        let ready = "❯\n────────────────────\nFable 5\n";
+        let ready = "Idle header\n❯\n────────────────────\nFable 5\n";
         assert!(!claude_initial_brief_submission_observed(
             ready,
-            "❯\n────────────────────\nFable 5\nupdated idle footer\n",
+            1,
+            "Idle header\n❯\n────────────────────\nFable 5\nupdated idle footer\n",
         ));
         assert!(!claude_initial_brief_submission_observed(
             ready,
-            "❯\n────────────────────\nFable 5\n",
+            1,
+            "Idle header\n❯\n────────────────────\nFable 5\n",
         ));
         assert!(claude_initial_brief_submission_observed(
             ready,
-            "❯\n────────────────────\nFable 5\n✽ Thinking through the task…\n",
+            1,
+            "✽ Thinking through the task…\n❯\n────────────────────\nFable 5\n",
         ));
     }
 
@@ -2423,6 +2439,7 @@ esac
 
         assert!(!claude_initial_brief_submission_observed(
             ready,
+            1,
             concat!(
                 "⏺ Completed startup housekeeping\n",
                 "❯ pasted-but-not-submitted\n",
@@ -2432,12 +2449,12 @@ esac
         ));
         assert!(claude_initial_brief_submission_observed(
             ready,
+            1,
             concat!(
-                "⏺ Completed startup housekeeping\n",
+                "✽ Thinking through the initial brief…\n",
                 "❯\n",
                 "────────────────────\n",
                 "Fable 5\n",
-                "✽ Thinking through the initial brief…\n",
             ),
         ));
     }
@@ -2455,10 +2472,34 @@ esac
         // The second row deliberately resembles a provider activity marker.
         assert!(!claude_initial_brief_submission_observed(
             ready,
+            1,
             concat!(
                 "⏺ Completed startup housekeeping\n",
                 "❯ first line of immutable brief\n",
                 "✽ marker-shaped continuation, still unsubmitted\n",
+                "────────────────────\n",
+                "Fable 5\n",
+            ),
+        ));
+    }
+
+    #[test]
+    fn claude_initial_brief_acceptance_anchors_input_at_the_ready_cursor_row() {
+        let ready = concat!(
+            "⏺ Completed startup housekeeping\n",
+            "❯\n",
+            "────────────────────\n",
+            "Fable 5\n",
+        );
+
+        assert!(!claude_initial_brief_submission_observed(
+            ready,
+            1,
+            concat!(
+                "⏺ Completed startup housekeeping\n",
+                "❯ first line of immutable brief\n",
+                "✽ marker-shaped continuation, still unsubmitted\n",
+                "> quoted continuation, still unsubmitted\n",
                 "────────────────────\n",
                 "Fable 5\n",
             ),

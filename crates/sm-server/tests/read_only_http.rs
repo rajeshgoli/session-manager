@@ -15041,7 +15041,7 @@ async fn runtime_core_claude_spawn_brief_accepts_provider_turn_transition() {
         &state_file,
         &log_dir,
         &tmux_socket,
-        r#"/bin/sh -lc 'printf ">"; while IFS= read -r line; do printf "\nreceived:%s\n✽ Thinking through the initial brief\n" "$line"; done' runtime-sh"#,
+        r#"/bin/sh -lc 'printf "Header\n>"; while IFS= read -r line; do printf "\nreceived:%s\n\033[2J\033[H✽ Thinking through the initial brief\n>" "$line"; done' runtime-sh"#,
     );
 
     let (status, payload) = post_json(
