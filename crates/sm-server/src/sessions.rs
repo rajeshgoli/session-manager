@@ -2006,7 +2006,7 @@ impl SessionStore {
 
         let now = OffsetDateTime::now_utc();
         let mut records = reparent_request_records(&state)?;
-        let _ = refresh_reparent_requests(&mut records, &sessions, now);
+        let _ = refresh_reparent_requests(&mut records, &sessions, &state, now);
         let affected_ids = BTreeSet::from([subject_session_id.to_owned()]);
         if let Some(conflict) = records.iter().find(|record| {
             record.is_active() && !record.affected_session_ids().is_disjoint(&affected_ids)
@@ -2036,7 +2036,9 @@ impl SessionStore {
             subject_session_id,
             target_parent_session_id,
             expected_parent_session_id.as_deref(),
+            None,
             &[],
+            false,
             false,
         );
         let approvals = vec![ReparentApprovalRecord {
@@ -2057,8 +2059,12 @@ impl SessionStore {
             target_parent_session_id: target_parent_session_id.to_owned(),
             expected_parent_session_id,
             expected_parent_is_live,
+            expected_target_parent_session_id: None,
+            expected_target_parent_is_live: false,
+            stopped_root_authorized_maintainer_session_id: None,
             detach_non_live_parent: false,
             peer_root_succession: false,
+            stopped_root_recovery: false,
             frozen_live_child_ids: Vec::new(),
             initiator_session_id: requester_session_id.to_owned(),
             required_agent_approvals,
@@ -2128,13 +2134,14 @@ impl SessionStore {
             ));
         };
         let mut blockers = Vec::new();
-        if !source.is_live_for_registry() {
+        let stopped_root_recovery = stopped_root_recovery_source_eligible(source);
+        if !source.is_live_for_registry() && !stopped_root_recovery {
             blockers.push(format!("source session {source_session_id} is stopped"));
         }
         if !target.is_live_for_registry() {
             blockers.push(format!("target session {target_session_id} is stopped"));
         }
-        if !session_supports_reparent_consent(source) {
+        if !stopped_root_recovery && !session_supports_reparent_consent(source) {
             blockers.push(format!(
                 "source session {source_session_id} cannot participate in credential-bound consent"
             ));
@@ -2145,14 +2152,16 @@ impl SessionStore {
             ));
         }
         let target_is_direct_child = target.parent_session_id.as_deref() == Some(source_session_id);
-        let peer_root_succession =
-            source.parent_session_id.is_none() && target.parent_session_id.is_none();
-        if !target_is_direct_child && !peer_root_succession {
+        let peer_root_succession = !stopped_root_recovery
+            && source.parent_session_id.is_none()
+            && target.parent_session_id.is_none();
+        if !stopped_root_recovery && !target_is_direct_child && !peer_root_succession {
             blockers.push(format!(
                 "target session {target_session_id} must be a live direct child of {source_session_id}, or both source and target must be roots for peer-root succession"
             ));
         }
         let expected_parent_session_id = source.parent_session_id.clone();
+        let expected_target_parent_session_id = target.parent_session_id.clone();
         let expected_parent_is_live = expected_parent_session_id.as_deref().is_some_and(|id| {
             sessions
                 .iter()
@@ -2171,10 +2180,69 @@ impl SessionStore {
                 ));
             }
         }
-        let initiator_allowed = requester_session_id == source_session_id
-            || requester_session_id == target_session_id
-            || (expected_parent_is_live
-                && expected_parent_session_id.as_deref() == Some(requester_session_id));
+        let expected_target_parent = expected_target_parent_session_id
+            .as_deref()
+            .and_then(|id| sessions.iter().find(|session| session.id == id));
+        let expected_target_parent_is_live =
+            expected_target_parent.is_some_and(SessionRecord::is_live_for_registry);
+        let stopped_root_authorized_maintainer_session_id = if stopped_root_recovery {
+            match expected_target_parent {
+                Some(target_parent) => {
+                    if !target_parent.is_live_for_registry()
+                        || !session_supports_reparent_consent(target_parent)
+                    {
+                        blockers.push(format!(
+                            "current target parent session {} cannot participate in credential-bound consent",
+                            target_parent.id
+                        ));
+                    }
+                    let maintainer = find_raw_registration(&state, "maintainer")?;
+                    match maintainer {
+                        Some(maintainer) if maintainer.session_id == target_parent.id => {
+                            Some(maintainer.session_id)
+                        }
+                        Some(_) => {
+                            blockers.push(
+                                "current target parent is not the durable maintainer".to_owned(),
+                            );
+                            None
+                        }
+                        None => {
+                            blockers.push(
+                                "stopped-root recovery requires a durable maintainer registration"
+                                    .to_owned(),
+                            );
+                            None
+                        }
+                    }
+                }
+                None => {
+                    blockers.push(
+                        "stopped-root recovery requires a live current target parent".to_owned(),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if stopped_root_recovery
+            && sessions
+                .iter()
+                .any(|session| session.parent_session_id.as_deref() == Some(target_session_id))
+        {
+            blockers.push(format!(
+                "stopped-root recovery requires target session {target_session_id} to have no existing children"
+            ));
+        }
+        let initiator_allowed = if stopped_root_recovery {
+            requester_session_id == target_session_id
+        } else {
+            requester_session_id == source_session_id
+                || requester_session_id == target_session_id
+                || (expected_parent_is_live
+                    && expected_parent_session_id.as_deref() == Some(requester_session_id))
+        };
         if !initiator_allowed {
             return Ok(ReparentMutationOutcome::Forbidden(
                 "only the source, target, or live source parent may request tree promotion"
@@ -2197,18 +2265,27 @@ impl SessionStore {
             target_session_id,
             expected_parent_session_id.as_deref(),
             target_parent_session_id,
+            expected_target_parent_session_id.as_deref(),
             &frozen_live_child_ids,
             peer_root_succession,
+            stopped_root_recovery,
         );
         if reparent_plan_would_create_cycle(&sessions, &edge_changes) {
             blockers.push("tree promotion would create a session hierarchy cycle".to_owned());
         }
         let (json_routing_changes, queue_routing_changes) =
             self.build_reparent_routing_changes(&state, &edge_changes)?;
-        let mut required_agent_approvals =
-            BTreeSet::from([source_session_id.to_owned(), target_session_id.to_owned()]);
+        let mut required_agent_approvals = BTreeSet::from([target_session_id.to_owned()]);
+        if !stopped_root_recovery {
+            required_agent_approvals.insert(source_session_id.to_owned());
+        }
         if expected_parent_is_live {
             if let Some(parent) = expected_parent_session_id.as_ref() {
+                required_agent_approvals.insert(parent.clone());
+            }
+        }
+        if stopped_root_recovery {
+            if let Some(parent) = expected_target_parent_session_id.as_ref() {
                 required_agent_approvals.insert(parent.clone());
             }
         }
@@ -2219,6 +2296,7 @@ impl SessionStore {
             source_session_id: source_session_id.to_owned(),
             target_session_id: target_session_id.to_owned(),
             peer_root_succession,
+            stopped_root_recovery,
             frozen_live_child_ids: frozen_live_child_ids.clone(),
             edge_changes,
             json_routing_changes,
@@ -2229,42 +2307,23 @@ impl SessionStore {
         };
         let now = OffsetDateTime::now_utc();
         let mut records = reparent_request_records(&state)?;
-        let refreshed = refresh_reparent_requests(&mut records, &sessions, now);
+        let refreshed = refresh_reparent_requests(&mut records, &sessions, &state, now);
         let affected_ids = preview
             .edge_changes
             .iter()
             .map(|change| change.session_id.clone())
             .chain(expected_parent_session_id.iter().cloned())
+            .chain(expected_target_parent_session_id.iter().cloned())
             .collect::<BTreeSet<_>>();
         let active_conflict = records.iter().find(|record| {
             record.is_active() && !record.affected_session_ids().is_disjoint(&affected_ids)
         });
-        if request.dry_run {
-            let mut preview = preview;
-            if let Some(conflict) = active_conflict {
-                let overlapping_session = if affected_ids.contains(&conflict.subject_session_id) {
-                    conflict.subject_session_id.clone()
-                } else {
-                    conflict
-                        .affected_session_ids()
-                        .intersection(&affected_ids)
-                        .next()
-                        .cloned()
-                        .unwrap_or_else(|| "unknown".to_owned())
-                };
-                preview.blockers.push(format!(
-                    "request {} already controls session {} in the tree promotion",
-                    conflict.id, overlapping_session
-                ));
-            }
+        if let Some(blocker) = blockers.first() {
             if refreshed {
                 store_reparent_request_records(&mut state, &records)?;
                 self.write_raw_json_value(&state)?;
             }
-            return Ok(ReparentMutationOutcome::Preview(preview));
-        }
-        if let Some(blocker) = blockers.into_iter().next() {
-            return Ok(ReparentMutationOutcome::BadRequest(blocker));
+            return Ok(ReparentMutationOutcome::BadRequest(blocker.clone()));
         }
         if let Some(conflict) = active_conflict {
             let overlapping_session = if affected_ids.contains(&conflict.subject_session_id) {
@@ -2284,6 +2343,13 @@ impl SessionStore {
                 conflict.id, overlapping_session
             )));
         }
+        if request.dry_run {
+            if refreshed {
+                store_reparent_request_records(&mut state, &records)?;
+                self.write_raw_json_value(&state)?;
+            }
+            return Ok(ReparentMutationOutcome::Preview(preview));
+        }
         let created_at = now.format(&Rfc3339)?;
         let expires_at =
             (now + TimeDuration::hours(REPARENT_REQUEST_TTL_HOURS)).format(&Rfc3339)?;
@@ -2300,7 +2366,11 @@ impl SessionStore {
             target_parent_session_id: target_session_id.to_owned(),
             expected_parent_session_id,
             expected_parent_is_live,
+            expected_target_parent_session_id,
+            expected_target_parent_is_live,
+            stopped_root_authorized_maintainer_session_id,
             detach_non_live_parent: true,
+            stopped_root_recovery,
             frozen_live_child_ids,
             initiator_session_id: requester_session_id.to_owned(),
             required_agent_approvals: required_agent_approvals.clone(),
@@ -2323,8 +2393,10 @@ impl SessionStore {
                 source_session_id,
                 target_session_id,
                 source.parent_session_id.as_deref(),
+                target.parent_session_id.as_deref(),
                 &preview.frozen_live_child_ids,
                 peer_root_succession,
+                stopped_root_recovery,
             ),
             peer_root_succession,
             apply_stage: None,
@@ -2365,7 +2437,7 @@ impl SessionStore {
         }
         let mut records = reparent_request_records(&state)?;
         let now = OffsetDateTime::now_utc();
-        let refreshed = refresh_reparent_requests(&mut records, &sessions, now);
+        let refreshed = refresh_reparent_requests(&mut records, &sessions, &state, now);
         let Some(index) = records.iter().position(|record| record.id == request_id) else {
             if refreshed {
                 store_reparent_request_records(&mut state, &records)?;
@@ -2468,7 +2540,7 @@ impl SessionStore {
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
         let mut records = reparent_request_records(&state)?;
         let now = OffsetDateTime::now_utc();
-        let refreshed = refresh_reparent_requests(&mut records, &sessions, now);
+        let refreshed = refresh_reparent_requests(&mut records, &sessions, &state, now);
         let Some(index) = records.iter().position(|record| record.id == request_id) else {
             if refreshed {
                 store_reparent_request_records(&mut state, &records)?;
@@ -2547,7 +2619,7 @@ impl SessionStore {
         let mut state = self.load_raw_json_value()?;
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
         let mut records = reparent_request_records(&state)?;
-        if refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc()) {
+        if refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc()) {
             store_reparent_request_records(&mut state, &records)?;
             self.write_raw_json_value(&state)?;
         }
@@ -2561,7 +2633,7 @@ impl SessionStore {
         let mut state = self.load_raw_json_value()?;
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
         let mut records = reparent_request_records(&state)?;
-        if refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc()) {
+        if refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc()) {
             store_reparent_request_records(&mut state, &records)?;
             self.write_raw_json_value(&state)?;
         }
@@ -2584,7 +2656,7 @@ impl SessionStore {
             return Ok(None);
         }
         let mut records = reparent_request_records(&state)?;
-        if refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc()) {
+        if refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc()) {
             store_reparent_request_records(&mut state, &records)?;
             self.write_raw_json_value(&state)?;
         }
@@ -2694,8 +2766,12 @@ impl SessionStore {
             let mut state = self.load_raw_json_value()?;
             let sessions = snapshot_from_raw_value(&state)?.into_sessions();
             let mut records = reparent_request_records(&state)?;
-            let refreshed =
-                refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc());
+            let refreshed = refresh_reparent_requests(
+                &mut records,
+                &sessions,
+                &state,
+                OffsetDateTime::now_utc(),
+            );
             let mut changed = refreshed;
             for record in &mut records {
                 let desired = desired_reparent_notifications(record);
@@ -3011,7 +3087,8 @@ impl SessionStore {
         }
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
         let mut records = reparent_request_records(&state)?;
-        let _ = refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc());
+        let _ =
+            refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc());
         let Some(index) = records
             .iter()
             .enumerate()
@@ -3029,7 +3106,7 @@ impl SessionStore {
             self.write_raw_json_value(&state)?;
             return Ok(None);
         };
-        if let Some(reason) = reparent_stale_reason(&records[index], &sessions) {
+        if let Some(reason) = reparent_stale_reason(&records[index], &sessions, &state) {
             records[index].status = "stale".to_owned();
             records[index].ready_to_apply = false;
             records[index].failure_reason = Some(reason);
@@ -3068,8 +3145,10 @@ impl SessionStore {
                 &record.target_parent_session_id,
                 record.expected_parent_session_id.as_deref(),
                 tree_target_parent_session_id(record),
+                record.expected_target_parent_session_id.as_deref(),
                 &record.frozen_live_child_ids,
                 record.peer_root_succession,
+                record.stopped_root_recovery,
             )
         } else {
             vec![ReparentEdgeChange {
@@ -3262,7 +3341,7 @@ impl SessionStore {
             .clone()
             .context("reparent apply plan is missing")?;
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
-        if let Some(reason) = reparent_stale_reason(record, &sessions) {
+        if let Some(reason) = reparent_stale_reason(record, &sessions, &state) {
             anyhow::bail!("reparent request became stale before quiesce: {reason}");
         }
         quiesce_json_reparent_routes(&mut state, &plan)?;
@@ -3311,7 +3390,7 @@ impl SessionStore {
             .clone()
             .context("reparent apply plan is missing")?;
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
-        if let Some(reason) = reparent_stale_reason(record, &sessions) {
+        if let Some(reason) = reparent_stale_reason(record, &sessions, &state) {
             return Ok(Some(reason));
         }
         commit_json_reparent_plan(&mut state, &plan)?;
@@ -13292,8 +13371,10 @@ fn reparent_topology_fingerprint(
     subject_session_id: &str,
     target_parent_session_id: &str,
     expected_parent_session_id: Option<&str>,
+    expected_target_parent_session_id: Option<&str>,
     frozen_live_child_ids: &[String],
     peer_root_succession: bool,
+    stopped_root_recovery: bool,
 ) -> String {
     let mut children = frozen_live_child_ids.to_vec();
     children.sort();
@@ -13308,6 +13389,14 @@ fn reparent_topology_fingerprint(
     // persisted fingerprints remain valid across this schema extension.
     if peer_root_succession {
         canonical["tree_mode"] = Value::String("peer_root_succession".to_owned());
+    }
+    if stopped_root_recovery {
+        canonical["tree_mode"] = Value::String("stopped_root_recovery".to_owned());
+        canonical["expected_target_parent_session_id"] = Value::String(
+            expected_target_parent_session_id
+                .unwrap_or_default()
+                .to_owned(),
+        );
     }
     let digest = Sha256::digest(serde_json::to_vec(&canonical).unwrap_or_default());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
@@ -13335,6 +13424,7 @@ fn approvals_satisfied(
 fn refresh_reparent_requests(
     records: &mut [ReparentRequestRecord],
     sessions: &[SessionRecord],
+    state: &Value,
     now: OffsetDateTime,
 ) -> bool {
     let mut changed = false;
@@ -13370,7 +13460,7 @@ fn refresh_reparent_requests(
             }
             _ => {}
         }
-        if let Some(reason) = reparent_stale_reason(record, sessions) {
+        if let Some(reason) = reparent_stale_reason(record, sessions, state) {
             if let Some(winner) = superseded_by_request_id {
                 record.status = "superseded".to_owned();
                 record.superseded_by_request_id = Some(winner.clone());
@@ -13412,14 +13502,17 @@ fn reparent_request_supersedes(
 fn reparent_stale_reason(
     record: &ReparentRequestRecord,
     sessions: &[SessionRecord],
+    state: &Value,
 ) -> Option<String> {
     let expected_fingerprint = reparent_topology_fingerprint(
         &record.kind,
         &record.subject_session_id,
         &record.target_parent_session_id,
         record.expected_parent_session_id.as_deref(),
+        record.expected_target_parent_session_id.as_deref(),
         &record.frozen_live_child_ids,
         record.peer_root_succession,
+        record.stopped_root_recovery,
     );
     if record.topology_fingerprint != expected_fingerprint {
         return Some("stored topology fingerprint does not match the request plan".to_owned());
@@ -13430,7 +13523,13 @@ fn reparent_stale_reason(
     else {
         return Some("subject session no longer exists".to_owned());
     };
-    if !subject.is_live_for_registry() {
+    if record.stopped_root_recovery {
+        if !stopped_root_recovery_source_eligible(subject) {
+            return Some(
+                "stopped-root predecessor terminal state changed after request creation".to_owned(),
+            );
+        }
+    } else if !subject.is_live_for_registry() {
         return Some("subject session is no longer live".to_owned());
     }
     if subject.parent_session_id != record.expected_parent_session_id {
@@ -13459,7 +13558,72 @@ fn reparent_stale_reason(
         return Some("target parent session is no longer live".to_owned());
     }
     if record.kind == "tree" {
-        if record.peer_root_succession {
+        if record.stopped_root_recovery {
+            if target.parent_session_id != record.expected_target_parent_session_id {
+                return Some(
+                    "stopped-root successor parent changed after request creation".to_owned(),
+                );
+            }
+            if !record.expected_target_parent_is_live {
+                return Some(
+                    "stopped-root successor did not have a live parent at request creation"
+                        .to_owned(),
+                );
+            }
+            let Some(target_parent_id) = record.expected_target_parent_session_id.as_deref() else {
+                return Some(
+                    "stopped-root successor parent is missing from request plan".to_owned(),
+                );
+            };
+            let Some(target_parent) = sessions
+                .iter()
+                .find(|session| session.id == target_parent_id)
+            else {
+                return Some("stopped-root successor parent no longer exists".to_owned());
+            };
+            if !target_parent.is_live_for_registry()
+                || !session_supports_reparent_consent(target_parent)
+            {
+                return Some("stopped-root successor parent can no longer consent".to_owned());
+            }
+            if record
+                .stopped_root_authorized_maintainer_session_id
+                .as_deref()
+                != Some(target_parent_id)
+            {
+                return Some(
+                    "stopped-root request lacks durable maintainer authorization binding"
+                        .to_owned(),
+                );
+            }
+            match find_raw_registration(state, "maintainer") {
+                Ok(Some(maintainer)) if maintainer.session_id == target_parent_id => {}
+                Ok(Some(_)) => {
+                    return Some(
+                        "durable maintainer registration changed after request creation".to_owned(),
+                    );
+                }
+                Ok(None) => {
+                    return Some(
+                        "durable maintainer registration disappeared after request creation"
+                            .to_owned(),
+                    );
+                }
+                Err(_) => {
+                    return Some(
+                        "durable maintainer registration could not be revalidated".to_owned(),
+                    );
+                }
+            }
+            if sessions.iter().any(|session| {
+                session.parent_session_id.as_deref()
+                    == Some(record.target_parent_session_id.as_str())
+            }) {
+                return Some(
+                    "stopped-root successor gained children after request creation".to_owned(),
+                );
+            }
+        } else if record.peer_root_succession {
             if target.parent_session_id.is_some() {
                 return Some("peer-root successor is no longer a root".to_owned());
             }
@@ -13483,8 +13647,10 @@ fn reparent_stale_reason(
             &record.target_parent_session_id,
             record.expected_parent_session_id.as_deref(),
             tree_target_parent_session_id(record),
+            record.expected_target_parent_session_id.as_deref(),
             &record.frozen_live_child_ids,
             record.peer_root_succession,
+            record.stopped_root_recovery,
         );
         if reparent_plan_would_create_cycle(sessions, &changes) {
             return Some("current tree plan would create a hierarchy cycle".to_owned());
@@ -13504,11 +13670,19 @@ fn tree_reparent_edge_changes(
     target_session_id: &str,
     expected_source_parent_session_id: Option<&str>,
     target_parent_session_id: Option<&str>,
+    expected_target_parent_session_id: Option<&str>,
     frozen_live_child_ids: &[String],
     peer_root_succession: bool,
+    stopped_root_recovery: bool,
 ) -> Vec<ReparentEdgeChange> {
     let mut changes = Vec::new();
-    if !peer_root_succession {
+    if stopped_root_recovery {
+        changes.push(ReparentEdgeChange {
+            session_id: target_session_id.to_owned(),
+            expected_parent_session_id: expected_target_parent_session_id.map(ToOwned::to_owned),
+            new_parent_session_id: None,
+        });
+    } else if !peer_root_succession {
         changes.push(ReparentEdgeChange {
             session_id: target_session_id.to_owned(),
             expected_parent_session_id: Some(source_session_id.to_owned()),
@@ -13531,6 +13705,13 @@ fn tree_reparent_edge_changes(
             }),
     );
     changes
+}
+
+/// The predecessor-side eligibility rule is deliberately shared by planning
+/// and commit freshness checks: a recovery can never silently widen to a live
+/// source or to a stopped non-root.
+fn stopped_root_recovery_source_eligible(source: &SessionRecord) -> bool {
+    source.is_stopped() && source.parent_session_id.is_none()
 }
 
 fn tree_target_parent_session_id(record: &ReparentRequestRecord) -> Option<&str> {
@@ -13907,6 +14088,7 @@ pub struct ReparentTreePreview {
     pub source_session_id: String,
     pub target_session_id: String,
     pub peer_root_succession: bool,
+    pub stopped_root_recovery: bool,
     pub frozen_live_child_ids: Vec<String>,
     pub edge_changes: Vec<ReparentEdgeChange>,
     pub json_routing_changes: Vec<ReparentRoutingChange>,
@@ -14123,8 +14305,10 @@ fn reparent_edge_summary(record: &ReparentRequestRecord) -> String {
                     &record.target_parent_session_id,
                     record.expected_parent_session_id.as_deref(),
                     tree_target_parent_session_id(record),
+                    record.expected_target_parent_session_id.as_deref(),
                     &record.frozen_live_child_ids,
                     record.peer_root_succession,
+                    record.stopped_root_recovery,
                 )
             } else {
                 vec![ReparentEdgeChange {
@@ -14184,11 +14368,21 @@ pub struct ReparentRequestRecord {
     #[serde(default)]
     pub expected_parent_is_live: bool,
     #[serde(default)]
+    pub expected_target_parent_session_id: Option<String>,
+    #[serde(default)]
+    pub expected_target_parent_is_live: bool,
+    #[serde(default)]
+    pub stopped_root_authorized_maintainer_session_id: Option<String>,
+    #[serde(default)]
     pub detach_non_live_parent: bool,
     /// A root-to-root succession does not move the successor upward; it moves
     /// the outgoing root and its frozen children underneath that peer root.
     #[serde(default)]
     pub peer_root_succession: bool,
+    /// A stopped root may only be recovered beneath an authorized live
+    /// successor whose durable maintainer parent approves its detachment.
+    #[serde(default)]
+    pub stopped_root_recovery: bool,
     #[serde(default)]
     pub frozen_live_child_ids: Vec<String>,
     pub initiator_session_id: String,
@@ -14308,6 +14502,9 @@ impl ReparentRequestRecord {
         affected.insert(self.subject_session_id.clone());
         affected.insert(self.target_parent_session_id.clone());
         if let Some(parent_id) = self.expected_parent_session_id.as_ref() {
+            affected.insert(parent_id.clone());
+        }
+        if let Some(parent_id) = self.expected_target_parent_session_id.as_ref() {
             affected.insert(parent_id.clone());
         }
         if let Some(plan) = self.apply_plan.as_ref() {
@@ -20864,6 +21061,402 @@ mod tests {
     }
 
     #[test]
+    fn stopped_root_recovery_has_exact_preview_apply_parity_and_post_state() {
+        let (store, state_file) = stopped_root_recovery_store("exact-parity");
+        let preview = match store
+            .create_reparent_tree_request(
+                "outgoing",
+                CreateReparentTreeRequest {
+                    requester_session_id: "successor".to_owned(),
+                    target_session_id: "successor".to_owned(),
+                    dry_run: true,
+                },
+                "successor-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Preview(preview) => preview,
+            other => panic!("unexpected preview outcome: {other:?}"),
+        };
+        assert!(preview.stopped_root_recovery);
+        assert!(preview.blockers.is_empty());
+        assert_eq!(
+            preview.edge_changes,
+            vec![
+                ReparentEdgeChange {
+                    session_id: "successor".to_owned(),
+                    expected_parent_session_id: Some("maintainer".to_owned()),
+                    new_parent_session_id: None,
+                },
+                ReparentEdgeChange {
+                    session_id: "outgoing".to_owned(),
+                    expected_parent_session_id: None,
+                    new_parent_session_id: Some("successor".to_owned()),
+                },
+                ReparentEdgeChange {
+                    session_id: "worker-a".to_owned(),
+                    expected_parent_session_id: Some("outgoing".to_owned()),
+                    new_parent_session_id: Some("successor".to_owned()),
+                },
+                ReparentEdgeChange {
+                    session_id: "worker-b".to_owned(),
+                    expected_parent_session_id: Some("outgoing".to_owned()),
+                    new_parent_session_id: Some("successor".to_owned()),
+                },
+            ]
+        );
+
+        let request = match store
+            .create_reparent_tree_request(
+                "outgoing",
+                CreateReparentTreeRequest {
+                    requester_session_id: "successor".to_owned(),
+                    target_session_id: "successor".to_owned(),
+                    dry_run: false,
+                },
+                "successor-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Created(record) => record,
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+        assert!(request.stopped_root_recovery);
+        assert_eq!(
+            request.expected_target_parent_session_id.as_deref(),
+            Some("maintainer")
+        );
+        assert_eq!(
+            request.required_agent_approvals,
+            vec!["maintainer", "successor"]
+        );
+        assert!(!request.ready_to_apply);
+        let applied = store
+            .decide_reparent_request(
+                &request.id,
+                DecideReparentRequest {
+                    requester_session_id: "maintainer".to_owned(),
+                },
+                ReparentDecision::Approved,
+                "maintainer-secret",
+            )
+            .unwrap();
+        let ReparentMutationOutcome::Updated(applied) = applied else {
+            panic!("unexpected approval outcome");
+        };
+        assert_eq!(applied.status, "applied");
+        assert_eq!(
+            applied.apply_plan.unwrap().edge_changes,
+            preview.edge_changes
+        );
+        assert_eq!(
+            store
+                .get_session("successor")
+                .unwrap()
+                .unwrap()
+                .parent_session_id,
+            None
+        );
+        for session_id in ["outgoing", "worker-a", "worker-b"] {
+            assert_eq!(
+                store
+                    .get_session(session_id)
+                    .unwrap()
+                    .unwrap()
+                    .parent_session_id
+                    .as_deref(),
+                Some("successor")
+            );
+        }
+        assert_eq!(
+            store
+                .get_session("stopped-worker")
+                .unwrap()
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("outgoing")
+        );
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn stopped_root_recovery_fails_closed_for_changed_children_and_pending_conflict() {
+        let (store, state_file) = stopped_root_recovery_store("stale-and-conflict");
+        let request = match store
+            .create_reparent_tree_request(
+                "outgoing",
+                CreateReparentTreeRequest {
+                    requester_session_id: "successor".to_owned(),
+                    target_session_id: "successor".to_owned(),
+                    dry_run: false,
+                },
+                "successor-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Created(record) => record,
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+        assert!(matches!(
+            store
+                .create_reparent_tree_request(
+                    "outgoing",
+                    CreateReparentTreeRequest {
+                        requester_session_id: "successor".to_owned(),
+                        target_session_id: "successor".to_owned(),
+                        dry_run: false,
+                    },
+                    "successor-secret",
+                )
+                .unwrap(),
+            ReparentMutationOutcome::Conflict(_)
+        ));
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            ensure_sessions_array_mut(&mut state)
+                .unwrap()
+                .push(reparent_test_session(
+                    "late-worker",
+                    Some("outgoing"),
+                    "late-secret",
+                ));
+            store.write_raw_json_value(&state).unwrap();
+        }
+        let stale = store.get_reparent_request(&request.id).unwrap().unwrap();
+        assert_eq!(stale.status, "stale");
+        for session_id in ["outgoing", "worker-a", "worker-b", "late-worker"] {
+            assert_eq!(
+                store
+                    .get_session(session_id)
+                    .unwrap()
+                    .unwrap()
+                    .parent_session_id
+                    .as_deref(),
+                Some("outgoing")
+            );
+        }
+        assert_eq!(
+            store
+                .get_session("successor")
+                .unwrap()
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("maintainer")
+        );
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn stopped_root_recovery_stales_on_maintainer_reassignment_without_edges() {
+        let (store, state_file) = stopped_root_recovery_store("maintainer-reassignment");
+        let request = match store
+            .create_reparent_tree_request(
+                "outgoing",
+                CreateReparentTreeRequest {
+                    requester_session_id: "successor".to_owned(),
+                    target_session_id: "successor".to_owned(),
+                    dry_run: false,
+                },
+                "successor-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Created(record) => record,
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            state["agent_registrations"] = json!([{
+                "role": "maintainer",
+                "session_id": "replacement-maintainer",
+                "created_at": now_rfc3339(),
+            }]);
+            store.write_raw_json_value(&state).unwrap();
+        }
+        let stale = store.get_reparent_request(&request.id).unwrap().unwrap();
+        assert_eq!(stale.status, "stale");
+        assert_eq!(
+            stale.failure_reason.as_deref(),
+            Some("durable maintainer registration changed after request creation")
+        );
+        assert_eq!(
+            store
+                .get_session("successor")
+                .unwrap()
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("maintainer")
+        );
+        for session_id in ["outgoing", "worker-a", "worker-b"] {
+            assert_eq!(
+                store
+                    .get_session(session_id)
+                    .unwrap()
+                    .unwrap()
+                    .parent_session_id
+                    .as_deref(),
+                Some("outgoing")
+            );
+        }
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn stopped_root_recovery_rejects_live_source_terminal_target_or_target_children() {
+        let (store, state_file) = stopped_root_recovery_store("hostile-eligibility");
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            session_object_mut(ensure_sessions_array_mut(&mut state).unwrap(), "outgoing")
+                .unwrap()
+                .insert("status".to_owned(), Value::String("idle".to_owned()));
+            store.write_raw_json_value(&state).unwrap();
+        }
+        assert!(matches!(
+            store
+                .create_reparent_tree_request(
+                    "outgoing",
+                    CreateReparentTreeRequest {
+                        requester_session_id: "successor".to_owned(),
+                        target_session_id: "successor".to_owned(),
+                        dry_run: true,
+                    },
+                    "successor-secret",
+                )
+                .unwrap(),
+            ReparentMutationOutcome::BadRequest(_)
+        ));
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            session_object_mut(ensure_sessions_array_mut(&mut state).unwrap(), "outgoing")
+                .unwrap()
+                .insert("status".to_owned(), Value::String("stopped".to_owned()));
+            session_object_mut(ensure_sessions_array_mut(&mut state).unwrap(), "successor")
+                .unwrap()
+                .insert("status".to_owned(), Value::String("stopped".to_owned()));
+            store.write_raw_json_value(&state).unwrap();
+        }
+        assert!(matches!(
+            store
+                .create_reparent_tree_request(
+                    "outgoing",
+                    CreateReparentTreeRequest {
+                        requester_session_id: "successor".to_owned(),
+                        target_session_id: "successor".to_owned(),
+                        dry_run: false,
+                    },
+                    "successor-secret",
+                )
+                .unwrap(),
+            ReparentMutationOutcome::BadRequest(_)
+        ));
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+            session_object_mut(sessions, "successor")
+                .unwrap()
+                .insert("status".to_owned(), Value::String("idle".to_owned()));
+            sessions.push(reparent_test_session(
+                "successor-child",
+                Some("successor"),
+                "successor-child-secret",
+            ));
+            store.write_raw_json_value(&state).unwrap();
+        }
+        assert!(matches!(
+            store
+                .create_reparent_tree_request(
+                    "outgoing",
+                    CreateReparentTreeRequest {
+                        requester_session_id: "successor".to_owned(),
+                        target_session_id: "successor".to_owned(),
+                        dry_run: false,
+                    },
+                    "successor-secret",
+                )
+                .unwrap(),
+            ReparentMutationOutcome::BadRequest(_)
+        ));
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
+    fn stopped_root_recovery_restarts_idempotently_from_a_persisted_stage() {
+        let (store, state_file) = stopped_root_recovery_store("restart");
+        let request = match store
+            .create_reparent_tree_request(
+                "outgoing",
+                CreateReparentTreeRequest {
+                    requester_session_id: "successor".to_owned(),
+                    target_session_id: "successor".to_owned(),
+                    dry_run: false,
+                },
+                "successor-secret",
+            )
+            .unwrap()
+        {
+            ReparentMutationOutcome::Created(record) => record,
+            other => panic!("unexpected create outcome: {other:?}"),
+        };
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            let mut records = reparent_request_records(&state).unwrap();
+            let record = records
+                .iter_mut()
+                .find(|record| record.id == request.id)
+                .unwrap();
+            record.approvals.push(ReparentApprovalRecord {
+                actor_kind: "agent".to_owned(),
+                actor_id: "maintainer".to_owned(),
+                decision: "approved".to_owned(),
+                decided_at: now_rfc3339(),
+            });
+            record.ready_to_apply = true;
+            store_reparent_request_records(&mut state, &records).unwrap();
+            store.write_raw_json_value(&state).unwrap();
+        }
+        assert_eq!(
+            store.acquire_reparent_apply_lease().unwrap().as_deref(),
+            Some(request.id.as_str())
+        );
+        store.quiesce_reparent_json_routing(&request.id).unwrap();
+        drop(store);
+
+        let recovered = SessionStore::new(state_file.clone())
+            .reconcile_reparent_requests()
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.status, "applied");
+        let final_store = SessionStore::new(state_file.clone());
+        assert_eq!(
+            final_store
+                .get_session("outgoing")
+                .unwrap()
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("successor")
+        );
+        assert_eq!(
+            final_store
+                .get_session("successor")
+                .unwrap()
+                .unwrap()
+                .parent_session_id,
+            None
+        );
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
     fn peer_root_succession_recovers_from_a_persisted_apply_stage_after_restart() {
         let state_file = unique_temp_path("peer-root-restart");
         fs::write(
@@ -21462,6 +22055,36 @@ mod tests {
             "parent_session_id": parent,
             "session_credential_sha256": sha256_text(credential)
         })
+    }
+
+    fn stopped_root_recovery_store(label: &str) -> (SessionStore, PathBuf) {
+        let state_file = unique_temp_path(label);
+        let mut outgoing = reparent_test_session("outgoing", None, "outgoing-secret");
+        outgoing["status"] = Value::String("stopped".to_owned());
+        let mut stopped_worker =
+            reparent_test_session("stopped-worker", Some("outgoing"), "stopped-secret");
+        stopped_worker["status"] = Value::String("stopped".to_owned());
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [
+                    reparent_test_session("maintainer", None, "maintainer-secret"),
+                    outgoing,
+                    reparent_test_session("successor", Some("maintainer"), "successor-secret"),
+                    reparent_test_session("worker-a", Some("outgoing"), "worker-a-secret"),
+                    reparent_test_session("worker-b", Some("outgoing"), "worker-b-secret"),
+                    stopped_worker
+                ],
+                "agent_registrations": [{
+                    "role": "maintainer",
+                    "session_id": "maintainer",
+                    "created_at": "2026-08-18T00:00:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        (SessionStore::new(state_file.clone()), state_file)
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {
