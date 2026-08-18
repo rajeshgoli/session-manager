@@ -15,7 +15,7 @@ use sha1::{Digest, Sha1};
 use sha2::Sha256;
 use sm_server::btw::BtwStore;
 use sm_server::config::RustShadowConfig;
-use sm_server::queue::{QueueAdmissionPolicy, RetainedQueueStore};
+use sm_server::queue::{CreateQueueJob, QueueAdmissionPolicy, RetainedQueueStore};
 use sm_server::{
     config::{
         AppArtifactsConfig, AppConfig, BugReportsConfig, CodexEventsConfig, CodexForkLaunchConfig,
@@ -4385,6 +4385,41 @@ async fn queue_job_background_accepts_explicit_no_timeout() {
 }
 
 #[tokio::test]
+async fn queue_job_service_requires_explicit_capacity_configuration() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-service-unconfigured");
+    let message_queue_db = state_file.with_extension("queue-service-unconfigured-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+
+    let (status, rejected) = post_json(
+        app,
+        "/queue-jobs",
+        json!({
+            "type": "service",
+            "label": "unconfigured service",
+            "script": "printf service",
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rejected["detail"],
+        "queue service jobs require queue_runner.types.service to be configured"
+    );
+}
+
+#[tokio::test]
 async fn queue_job_runtime_persists_failure_and_timeout() {
     let state_file = write_session_fixture();
     let queue_state_dir = state_file.with_extension("queue-runner-terminal");
@@ -5442,6 +5477,191 @@ async fn queue_runtime_recovery_polls_live_running_job_to_completion() {
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert_eq!(notifications.len(), 1);
     assert!(notifications[0].contains("log tail:\nrecovered-live"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn queue_runtime_recovery_at_service_capacity_preserves_non_service_reserve() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-recover-service-capacity");
+    let message_queue_db =
+        state_file.with_extension("queue-recover-service-capacity-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            cancel_grace_seconds: 0,
+            max_running_jobs: 4,
+            configured: true,
+            ..QueueRunnerConfig::default()
+        },
+        sm_send: SmSendConfig {
+            db_path: message_queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.queue_runner.types.service = Some(QueueRunnerTypeConfig {
+        max_concurrent: 2,
+        default_timeout_seconds: 60,
+    });
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+    let first_service = create_pending_queue_job_of_type(
+        app.clone(),
+        &working_dir,
+        "service",
+        "recover service one",
+        "printf placeholder",
+        60,
+    )
+    .await;
+    let second_service = create_pending_queue_job_of_type(
+        app.clone(),
+        &working_dir,
+        "service",
+        "recover service two",
+        "printf placeholder",
+        60,
+    )
+    .await;
+    let background = create_pending_queue_job_of_type(
+        app.clone(),
+        &working_dir,
+        "background",
+        "recover finite background",
+        "printf finite-background",
+        60,
+    )
+    .await;
+    let mut first_child = Command::new("/bin/zsh")
+        .arg("-lc")
+        .arg("sleep 0.3")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let mut second_child = Command::new("/bin/zsh")
+        .arg("-lc")
+        .arg("sleep 0.3")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    for (job_id, child) in [
+        (&first_service, &first_child),
+        (&second_service, &second_child),
+    ] {
+        let pid = i64::from(child.id());
+        mark_queue_job_running(&queue_state_dir, job_id, &test_now_rfc3339(), pid, pid);
+    }
+
+    let summary = RetainedQueueStore::recover_queue_jobs_in_state_dir_with_policy(
+        &queue_state_dir,
+        &message_queue_db,
+        0,
+        QueueAdmissionPolicy {
+            max_running_jobs: 4,
+            service_max_concurrent: 2,
+            ..QueueAdmissionPolicy::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(summary.recovered_running, 2);
+    assert_eq!(summary.polling_running, 2);
+    assert_eq!(summary.started_pending, 1);
+    let completed = wait_for_queue_job_state(app, &background, &["succeeded"]).await;
+    assert_eq!(completed["type"], "background");
+    assert_eq!(completed["exit_code"], 0);
+    let _ = first_child.wait();
+    let _ = second_child.wait();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn queue_runtime_recovery_rejects_live_services_above_reduced_capacity() {
+    let state_dir = unique_temp_path().with_extension("queue-recover-reduced-service-capacity");
+    let message_queue_db = state_dir.with_extension("message-queue.db");
+    let create_job = |job_type: &str, label: &str| {
+        RetainedQueueStore::create_queue_job_in_state_dir(
+            &state_dir,
+            CreateQueueJob {
+                job_type: job_type.to_owned(),
+                label: label.to_owned(),
+                requester_session_id: Some("requester".to_owned()),
+                notify_session_id: "notify".to_owned(),
+                cwd: "/tmp".to_owned(),
+                argv: Some(vec!["true".to_owned()]),
+                script: None,
+                env: Default::default(),
+                timeout_seconds: 60,
+            },
+        )
+        .unwrap()
+    };
+    let services = [
+        create_job("service", "old service one"),
+        create_job("service", "old service two"),
+        create_job("service", "old service three"),
+        create_job("service", "old service four"),
+    ];
+    let background = create_job("background", "must remain pending");
+    let mut children = services
+        .iter()
+        .map(|service| {
+            let child = Command::new("/bin/zsh")
+                .arg("-lc")
+                .arg("sleep 30")
+                .spawn()
+                .unwrap();
+            let pid = i64::from(child.id());
+            mark_queue_job_running(&state_dir, &service.id, &test_now_rfc3339(), pid, pid);
+            child
+        })
+        .collect::<Vec<_>>();
+
+    let error = RetainedQueueStore::recover_queue_jobs_in_state_dir_with_policy(
+        &state_dir,
+        &message_queue_db,
+        0,
+        QueueAdmissionPolicy {
+            // Previously admitted under 8/4; now reduced to 4/3.
+            max_running_jobs: 4,
+            service_max_concurrent: 3,
+            ..QueueAdmissionPolicy::default()
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("recovered_live_service_jobs=4"));
+    assert!(error.contains("service_cap=3"));
+    assert!(error.contains("global_capacity=4"));
+    assert!(error.contains("non_service_reserve=1"));
+    for service in &services {
+        assert!(error.contains(&service.id));
+        let record = RetainedQueueStore::get_queue_job_from_path(
+            &state_dir.join("queue_runner.db"),
+            &service.id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(record.state, "running");
+    }
+    let background_record = RetainedQueueStore::get_queue_job_from_path(
+        &state_dir.join("queue_runner.db"),
+        &background.id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(background_record.state, "pending");
+
+    for child in &mut children {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let _ = fs::remove_dir_all(&state_dir);
+    let _ = fs::remove_file(&message_queue_db);
 }
 
 #[cfg(unix)]

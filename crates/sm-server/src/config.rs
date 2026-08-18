@@ -11,7 +11,7 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_yaml::{Mapping as YamlMapping, Value as YamlValue};
 use sha2::{Digest, Sha256};
@@ -137,7 +137,31 @@ impl AppConfig {
             apply_local_auth_overrides(&mut config, &env_values);
         }
 
+        config.validate_queue_runner_capacity()?;
+
         Ok(config)
+    }
+
+    fn validate_queue_runner_capacity(&self) -> Result<()> {
+        let Some(service) = self.queue_runner.types.service.as_ref() else {
+            return Ok(());
+        };
+        if self.queue_runner.max_running_jobs <= 1 {
+            bail!(
+                "queue_runner.max_running_jobs must be greater than 1 when queue_runner.types.service is configured"
+            );
+        }
+        if service.max_concurrent == 0 {
+            bail!(
+                "queue_runner.types.service.max_concurrent must be greater than zero when service is configured"
+            );
+        }
+        if (service.max_concurrent as u128) >= (self.queue_runner.max_running_jobs as u128) {
+            bail!(
+                "queue_runner.types.service.max_concurrent must be less than queue_runner.max_running_jobs so service jobs cannot consume the entire global queue capacity"
+            );
+        }
+        Ok(())
     }
 
     pub fn queue_runner_state_dir(&self) -> PathBuf {
@@ -1336,6 +1360,8 @@ pub struct QueueRunnerTypesConfig {
         deserialize_with = "deserialize_queue_runner_background_config"
     )]
     pub background: QueueRunnerTypeConfig,
+    #[serde(default, deserialize_with = "deserialize_queue_runner_service_config")]
+    pub service: Option<QueueRunnerTypeConfig>,
 }
 
 impl Default for QueueRunnerTypesConfig {
@@ -1344,6 +1370,7 @@ impl Default for QueueRunnerTypesConfig {
             tests: default_queue_runner_tests_config(),
             perf: default_queue_runner_perf_config(),
             background: default_queue_runner_background_config(),
+            service: None,
         }
     }
 }
@@ -1403,6 +1430,23 @@ where
     deserialize_queue_runner_type_config(deserializer, default_queue_runner_background_config())
 }
 
+fn deserialize_queue_runner_service_config<'de, D>(
+    deserializer: D,
+) -> Result<Option<QueueRunnerTypeConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let overrides = Option::<QueueRunnerTypeConfigOverrides>::deserialize(deserializer)?;
+    Ok(overrides.map(|overrides| QueueRunnerTypeConfig {
+        max_concurrent: overrides
+            .max_concurrent
+            .unwrap_or(default_queue_runner_service_config().max_concurrent),
+        default_timeout_seconds: overrides
+            .default_timeout_seconds
+            .unwrap_or(default_queue_runner_service_config().default_timeout_seconds),
+    }))
+}
+
 impl Default for QueueRunnerConfig {
     fn default() -> Self {
         Self {
@@ -1450,6 +1494,13 @@ fn default_queue_runner_background_config() -> QueueRunnerTypeConfig {
     QueueRunnerTypeConfig {
         max_concurrent: 2,
         default_timeout_seconds: 3600,
+    }
+}
+
+fn default_queue_runner_service_config() -> QueueRunnerTypeConfig {
+    QueueRunnerTypeConfig {
+        max_concurrent: 1,
+        default_timeout_seconds: 86400,
     }
 }
 
@@ -3152,5 +3203,38 @@ codex_fork:
             config.codex_fork.args,
             vec!["-c", "check_for_update_on_startup=false"]
         );
+    }
+
+    #[test]
+    fn queue_service_config_is_explicit_and_cannot_consume_global_capacity() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+queue_runner:
+  max_running_jobs: 4
+  types:
+    service:
+      max_concurrent: 2
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+        let service = config.queue_runner.types.service.as_ref().unwrap();
+        assert_eq!(service.max_concurrent, 2);
+        assert_eq!(service.default_timeout_seconds, 86400);
+        assert!(config.validate_queue_runner_capacity().is_ok());
+
+        let mut invalid = config.clone();
+        invalid
+            .queue_runner
+            .types
+            .service
+            .as_mut()
+            .unwrap()
+            .max_concurrent = 4;
+        assert!(invalid
+            .validate_queue_runner_capacity()
+            .unwrap_err()
+            .to_string()
+            .contains("cannot consume the entire global queue capacity"));
     }
 }

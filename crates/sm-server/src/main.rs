@@ -94,6 +94,12 @@ async fn main() -> Result<()> {
             tests_max_concurrent: config.queue_runner.types.tests.max_concurrent,
             perf_max_concurrent: config.queue_runner.types.perf.max_concurrent,
             background_max_concurrent: config.queue_runner.types.background.max_concurrent,
+            service_max_concurrent: config
+                .queue_runner
+                .types
+                .service
+                .as_ref()
+                .map_or(0, |service| service.max_concurrent),
         };
         thread::spawn(move || {
             match RetainedQueueStore::recover_queue_jobs_in_state_dir_with_policy(

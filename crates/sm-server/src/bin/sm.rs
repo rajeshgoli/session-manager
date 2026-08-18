@@ -440,7 +440,7 @@ enum QueueCommand {
 
 #[derive(Args)]
 struct QueueRunArgs {
-    #[arg(long = "type", value_parser = ["tests", "perf", "background"], default_value = "tests")]
+    #[arg(long = "type", value_parser = ["tests", "perf", "background", "service"], default_value = "tests")]
     job_type: String,
     #[arg(long)]
     label: Option<String>,
@@ -464,7 +464,7 @@ struct QueueListArgs {
     notify: Option<String>,
     #[arg(long)]
     all: bool,
-    #[arg(long = "type", value_parser = ["tests", "perf", "background"])]
+    #[arg(long = "type", value_parser = ["tests", "perf", "background", "service"])]
     job_type: Option<String>,
     #[arg(long)]
     state: Option<String>,
