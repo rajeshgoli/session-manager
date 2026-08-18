@@ -105,10 +105,11 @@ use crate::google_auth::{
 use crate::mobile_analytics::build_mobile_analytics_summary;
 use crate::mobile_devices::{self, mobile_device_db_path};
 use crate::policy_contracts::{
-    PolicyCallerBinding, PolicyClassification, PolicyRequestedLaunch, PolicySpawnRequest,
-    PolicyVehicle, SPAWN_REQUEST_SCHEMA,
+    PolicyCallerBinding, PolicyClassification, PolicyDecisionOutcome, PolicyRequestedLaunch,
+    PolicySpawnRequest, PolicyVehicle, SPAWN_REQUEST_SCHEMA,
 };
-use crate::policy_store::{PolicyProjection, PolicyStore};
+use crate::policy_runtime_attestation::attest_codex_fork_launch_file;
+use crate::policy_store::{PolicyProjection, PolicyStore, PolicyStoreError, PreparedDecision};
 use crate::queue::{
     CodexReviewRequestFilters, CodexReviewRequestRegistration, CompleteCodexReviewRequest,
     CreateCodexReviewRequest, CreateQueueJob, QueueAdmissionPolicy, QueueJobFilters,
@@ -3778,6 +3779,120 @@ fn freeze_policy_spawn_request(
     Ok(request)
 }
 
+#[derive(Debug)]
+struct PreparedPolicySpawn {
+    request: PolicySpawnRequest,
+    prepared: PreparedDecision,
+}
+
+fn policy_store_api_error(error: PolicyStoreError) -> ApiError {
+    let (status, detail) = match error {
+        PolicyStoreError::Invalid(detail) => (StatusCode::UNPROCESSABLE_ENTITY, detail),
+        PolicyStoreError::RequestNotFound(detail)
+        | PolicyStoreError::OverrideNotFound(detail)
+        | PolicyStoreError::ProjectionNotFound(detail) => (StatusCode::NOT_FOUND, detail),
+        PolicyStoreError::Stale(detail) | PolicyStoreError::CapacityUnavailable(detail) => {
+            (StatusCode::CONFLICT, detail)
+        }
+        PolicyStoreError::CanaryDenied(detail) | PolicyStoreError::OverrideDenied(detail) => {
+            (StatusCode::FORBIDDEN, detail)
+        }
+        PolicyStoreError::Sqlite(error) => return ApiError::Internal(error.into()),
+        PolicyStoreError::Json(error) => return ApiError::Internal(error.into()),
+    };
+    ApiError::Status { status, detail }
+}
+
+fn prepare_policy_spawn(
+    state: &AppState,
+    headers: &HeaderMap,
+    parent: &SessionRecord,
+    payload: &SpawnCoreSessionRequest,
+    launch_intent_id: &str,
+    prompt_digest: &str,
+    provider: &str,
+    working_dir: &str,
+    node: &str,
+) -> Result<Option<PreparedPolicySpawn>, ApiError> {
+    let Some(runtime) = state.policy_runtime() else {
+        return Ok(None);
+    };
+    if payload
+        .id
+        .as_deref()
+        .is_some_and(|id| !id.trim().is_empty())
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "policy admission allocates the child ID; --id is not supported".to_owned(),
+        });
+    }
+    let requested_name = payload
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| ApiError::Status {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail:
+                "policy-enabled spawn requires an explicit name for deterministic classification"
+                    .to_owned(),
+        })?;
+    let caller = bootstrap_policy_caller(state, headers, &parent.id)?;
+    let (vehicle, classification) =
+        deterministic_policy_classification(&runtime.projection, requested_name)?;
+    let request = freeze_policy_spawn_request(
+        runtime,
+        caller,
+        launch_intent_id,
+        prompt_digest,
+        requested_name,
+        vehicle,
+        provider,
+        payload.model.as_deref(),
+        payload.reasoning_effort.as_deref(),
+        working_dir,
+        node,
+    )?;
+    runtime
+        .store
+        .create_request(&request)
+        .map_err(policy_store_api_error)?;
+    let child_session_id = state.session_store.allocate_core_session_id()?;
+    let prepared = runtime
+        .store
+        .prepare_admission(
+            &request.request_id,
+            &classification,
+            None,
+            &child_session_id,
+            OffsetDateTime::now_utc(),
+        )
+        .map_err(policy_store_api_error)?;
+    if !matches!(prepared.decision.outcome, PolicyDecisionOutcome::Allow) {
+        let command = prepared
+            .decision
+            .override_command
+            .as_deref()
+            .unwrap_or("no override is available");
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: format!(
+                "policy {:?} for request {}: {}. {}",
+                prepared.decision.outcome, request.request_id, prepared.decision.reason, command
+            ),
+        });
+    }
+    if prepared.provisional_child_session_id.as_deref() != Some(child_session_id.as_str()) {
+        let _ = runtime.store.release_by_child(&child_session_id);
+        return Err(ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "policy admission did not preserve the provisional child binding".to_owned(),
+        });
+    }
+    Ok(Some(PreparedPolicySpawn { request, prepared }))
+}
+
 async fn spawn_session(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
@@ -3823,7 +3938,7 @@ async fn spawn_session(
     let accepted = accept_spawn_brief(
         &state,
         Some(&payload.prompt),
-        payload.prompt_source.unwrap_or(SpawnBriefSource {
+        payload.prompt_source.clone().unwrap_or(SpawnBriefSource {
             kind: "positional".to_owned(),
             path: None,
         }),
@@ -3835,16 +3950,41 @@ async fn spawn_session(
         Some(node.clone()),
         Some(working_dir.clone()),
     )?;
+    let policy_spawn = prepare_policy_spawn(
+        &state,
+        &headers,
+        &parent,
+        &payload,
+        &accepted.1,
+        &accepted.2,
+        &provider,
+        &working_dir,
+        &node,
+    )?;
+    let policy_profile = policy_spawn
+        .as_ref()
+        .and_then(|policy| policy.prepared.decision.resolved_profile.as_ref());
     let create_payload = CreateCoreSessionRequest {
-        id: payload.id,
+        id: policy_spawn
+            .as_ref()
+            .and_then(|policy| policy.prepared.provisional_child_session_id.clone())
+            .or(payload.id),
         name: payload.name,
         working_dir: Some(working_dir),
-        provider: Some(provider),
+        provider: Some(
+            policy_profile
+                .map(|profile| profile.provider.clone())
+                .unwrap_or(provider),
+        ),
         parent_session_id: Some(parent.id.clone()),
         node: Some(node),
         initial_message: Some(accepted.0),
-        model: payload.model,
-        reasoning_effort: payload.reasoning_effort,
+        model: policy_profile
+            .map(|profile| profile.model.clone())
+            .or(payload.model),
+        reasoning_effort: policy_profile
+            .map(|profile| profile.effort.clone())
+            .or(payload.reasoning_effort),
         wait: wait_seconds,
         spawn_prompt_source: None,
         spawn_brief: Some(SpawnBriefBinding {
@@ -3853,14 +3993,26 @@ async fn spawn_session(
         }),
     };
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
-    let child = if state.config.rust_core.runtime_enabled {
+    let child_result = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_provider_supported(&create_payload)?;
         ensure_core_runtime_request_node_supported(&state, &create_payload)?;
-        create_runtime_core_session(state.clone(), create_payload, log_dir).await?
+        create_runtime_core_session(state.clone(), create_payload, log_dir).await
     } else {
         state
             .session_store
-            .create_core_session(create_payload, log_dir)?
+            .create_core_session(create_payload, log_dir)
+            .map_err(core_session_create_api_error)
+    };
+    let child = match child_result {
+        Ok(child) => child,
+        Err(error) => {
+            if let (Some(runtime), Some(policy)) = (state.policy_runtime(), policy_spawn.as_ref()) {
+                if let Some(child_id) = policy.prepared.provisional_child_session_id.as_deref() {
+                    let _ = runtime.store.release_by_child(child_id);
+                }
+            }
+            return Err(error);
+        }
     };
     if parent.is_em && child.provider != "codex-fork" {
         let _ = state.session_store.arm_stop_notify(
