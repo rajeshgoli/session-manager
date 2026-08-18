@@ -6861,10 +6861,21 @@ impl SessionStore {
             .collect::<Vec<_>>();
 
         for (session_id, event_stream_path) in &monitors {
-            self.reconcile_codex_fork_context_at_restart(session_id, event_stream_path)?;
-            self.start_codex_fork_event_monitor_from_current_end(
+            // Use one boundary for both the bounded recovery read and the
+            // monitor. Events appended after it are consumed by the monitor;
+            // none can fall into a restart-time gap.
+            let recovery_offset = fs::metadata(event_stream_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            self.reconcile_codex_fork_context_at_restart(
+                session_id,
+                event_stream_path,
+                recovery_offset,
+            )?;
+            self.start_codex_fork_event_monitor_at_offset(
                 session_id.clone(),
                 event_stream_path.clone(),
+                recovery_offset,
             )?;
         }
         Ok(monitors.len())
@@ -6879,12 +6890,16 @@ impl SessionStore {
         &self,
         session_id: &str,
         event_stream_path: &Path,
+        recovery_offset: u64,
     ) -> Result<()> {
         let root_thread_id = self
             .get_session(session_id)?
             .and_then(|session| session.provider_resume_id);
-        let usage =
-            latest_codex_fork_context_usage_from_tail(event_stream_path, root_thread_id.as_deref());
+        let usage = latest_codex_fork_context_usage_from_tail(
+            event_stream_path,
+            root_thread_id.as_deref(),
+            recovery_offset,
+        );
 
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
@@ -6907,7 +6922,7 @@ impl SessionStore {
             reset_context_oneshot_flags(session);
         }
 
-        let changed = match usage {
+        let mut changed = match usage.as_ref() {
             Some(usage) => {
                 let snapshot_changed = previous_tokens != Some(usage.tokens_used)
                     || session
@@ -6950,6 +6965,30 @@ impl SessionStore {
                 had_snapshot
             }
         };
+        let context_alert = if flag_is_set(session, "context_monitor_enabled") {
+            usage.as_ref().and_then(|usage| {
+                self.latch_context_alert(
+                    session,
+                    session_id,
+                    usage.used_percentage,
+                    usage.tokens_used,
+                )
+            })
+        } else {
+            None
+        };
+        if let Some(alert) = context_alert {
+            let runtime = self.delivery_runtime.clone();
+            self.queue_context_monitor_message(
+                &mut state,
+                session_id,
+                &alert.notify_target,
+                &alert.text,
+                alert.delivery_mode,
+                runtime.as_ref(),
+            )?;
+            changed = true;
+        }
         if changed || compaction_or_unknown {
             self.write_raw_json_value(&state)?;
         }
@@ -8888,18 +8927,23 @@ fn codex_fork_context_usage(event: &Map<String, Value>) -> Option<CodexContextUs
 fn latest_codex_fork_context_usage_from_tail(
     event_stream_path: &Path,
     root_thread_id: Option<&str>,
+    recovery_offset: u64,
 ) -> Option<CodexContextUsage> {
-    read_tail_lines(event_stream_path, CODEX_FORK_CONTEXT_RECOVERY_TAIL_LINES)
-        .ok()?
-        .lines()
-        .rev()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter_map(|event| event.as_object().cloned())
-        .find_map(|event| {
-            codex_fork_event_matches_root_thread(&event, root_thread_id)
-                .then(|| codex_fork_context_usage(&event))
-                .flatten()
-        })
+    read_tail_lines_at_offset(
+        event_stream_path,
+        recovery_offset,
+        CODEX_FORK_CONTEXT_RECOVERY_TAIL_LINES,
+    )
+    .ok()?
+    .lines()
+    .rev()
+    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    .filter_map(|event| event.as_object().cloned())
+    .find_map(|event| {
+        codex_fork_event_matches_root_thread(&event, root_thread_id)
+            .then(|| codex_fork_context_usage(&event))
+            .flatten()
+    })
 }
 
 fn codex_fork_item_completed_status(event: &Map<String, Value>) -> Option<&'static str> {
@@ -15575,18 +15619,24 @@ fn tail_lines(content: &str, lines: usize) -> String {
 }
 
 pub(crate) fn read_tail_lines(path: &Path, lines: usize) -> io::Result<String> {
+    let file_len = fs::metadata(path)?.len();
+    read_tail_lines_at_offset(path, file_len, lines)
+}
+
+fn read_tail_lines_at_offset(path: &Path, end_offset: u64, lines: usize) -> io::Result<String> {
     if lines == 0 {
         return Ok(String::new());
     }
 
     let mut file = fs::File::open(path)?;
     let file_len = file.metadata()?.len();
-    if file_len == 0 {
+    let end_offset = end_offset.min(file_len);
+    if end_offset == 0 {
         return Ok(String::new());
     }
 
-    let read_len = file_len.min(output_tail_byte_limit(lines));
-    file.seek(SeekFrom::End(-(read_len as i64)))?;
+    let read_len = end_offset.min(output_tail_byte_limit(lines));
+    file.seek(SeekFrom::Start(end_offset - read_len))?;
     let mut bytes = Vec::with_capacity(read_len as usize);
     file.take(read_len).read_to_end(&mut bytes)?;
     Ok(tail_lines(&String::from_utf8_lossy(&bytes), lines))
@@ -20566,8 +20616,9 @@ mod tests {
             format!("{}\n", usage_event("root-thread", 20_000)),
         )
         .unwrap();
+        let recovery_offset = fs::metadata(&event_stream).unwrap().len();
         store
-            .reconcile_codex_fork_context_at_restart("child001", &event_stream)
+            .reconcile_codex_fork_context_at_restart("child001", &event_stream, recovery_offset)
             .unwrap();
         let compacted = store.get_session("child001").unwrap().unwrap();
         assert!(!compacted.context_warning_sent);
@@ -20577,8 +20628,11 @@ mod tests {
             .pending_messages_for_target("child001", 10)
             .unwrap()
             .is_empty());
+        let recovered_high = usage_event("root-thread", 181_000);
+        fs::write(&event_stream, format!("{recovered_high}\n")).unwrap();
+        let recovery_offset = fs::metadata(&event_stream).unwrap().len();
         store
-            .apply_codex_fork_event_line("child001", &usage_event("root-thread", 181_000))
+            .reconcile_codex_fork_context_at_restart("child001", &event_stream, recovery_offset)
             .unwrap();
         assert_eq!(context_monitor_messages(&store).len(), 2);
         assert_eq!(
