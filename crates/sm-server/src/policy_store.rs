@@ -806,113 +806,36 @@ fn verify_schema_v1(conn: &Connection) -> std::result::Result<(), String> {
     if integrity != "ok" {
         return Err(format!("integrity check failed: {integrity}"));
     }
-    for (table, columns) in POLICY_SCHEMA_TABLES {
-        let actual = conn
-            .prepare(&format!("PRAGMA table_info({table})"))
-            .map_err(|error| format!("cannot inspect {table}: {error}"))?
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|error| format!("cannot read {table} columns: {error}"))?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| format!("cannot read {table} columns: {error}"))?;
-        if actual != *columns {
-            return Err(format!(
-                "v1 table {table} is missing or has different columns"
-            ));
-        }
+    let mut expected = POLICY_SCHEMA_V1
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        .map(normalize_schema_sql)
+        .collect::<Vec<_>>();
+    let mut actual = conn
+        .prepare("SELECT sql FROM sqlite_master WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .map_err(|error| format!("cannot inspect v1 schema: {error}"))?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("cannot read v1 schema: {error}"))?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| format!("cannot read v1 schema: {error}"))?
+        .into_iter()
+        .map(|statement| normalize_schema_sql(&statement))
+        .collect::<Vec<_>>();
+    expected.sort();
+    actual.sort();
+    if actual != expected {
+        return Err("v1 schema objects or constraints differ from the frozen definition".into());
     }
     Ok(())
 }
 
-const POLICY_SCHEMA_TABLES: &[(&str, &[&str])] = &[
-    (
-        "policy_projections",
-        &[
-            "lane",
-            "policy_version",
-            "policy_digest",
-            "projection_json",
-            "projection_record_digest",
-            "created_at",
-        ],
-    ),
-    (
-        "policy_active_projections",
-        &["lane", "policy_version", "policy_digest"],
-    ),
-    (
-        "policy_runtime_versions",
-        &["lane", "topology_version", "capacity_version"],
-    ),
-    (
-        "policy_requests",
-        &[
-            "request_id",
-            "lane",
-            "request_digest",
-            "request_json",
-            "created_at",
-        ],
-    ),
-    (
-        "policy_decisions",
-        &[
-            "decision_id",
-            "request_id",
-            "attempt",
-            "override_id",
-            "decision_json",
-            "decision_digest",
-            "created_at",
-        ],
-    ),
-    (
-        "policy_capacity_leases",
-        &[
-            "lease_id",
-            "request_id",
-            "topology_version",
-            "capacity_version",
-            "provisional_child_session_id",
-            "state",
-            "expires_at",
-            "released_at",
-            "lease_json",
-            "lease_digest",
-        ],
-    ),
-    (
-        "policy_capacity_claims",
-        &["lease_id", "dimension", "claim_key", "units"],
-    ),
-    (
-        "policy_provisional_children",
-        &[
-            "child_session_id",
-            "lease_id",
-            "request_id",
-            "decision_id",
-            "state",
-            "created_at",
-            "released_at",
-        ],
-    ),
-    (
-        "policy_overrides",
-        &[
-            "override_id",
-            "request_id",
-            "request_digest",
-            "decision_id",
-            "policy_version",
-            "state",
-            "override_json",
-            "override_digest",
-            "created_at",
-            "expires_at",
-            "consumed_at",
-        ],
-    ),
-];
+fn normalize_schema_sql(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
 
 #[derive(Debug)]
 struct ResolvedRule {
@@ -1062,7 +985,20 @@ fn ensure_capacity(
             .ok_or_else(|| {
                 PolicyStoreError::CapacityUnavailable(format!("no limit for {dimension}/{key}"))
             })?;
-        let active: u64 = tx.query_row(r#"SELECT COALESCE(SUM(c.units), 0) FROM policy_capacity_claims c JOIN policy_capacity_leases l ON l.lease_id = c.lease_id WHERE c.dimension = ?1 AND c.claim_key = ?2 AND l.state IN ('active', 'committed')"#, params![dimension, key], |row| row.get(0))?;
+        let lease_ids = tx
+            .prepare(r#"SELECT DISTINCT l.lease_id FROM policy_capacity_leases l JOIN policy_capacity_claims c ON c.lease_id = l.lease_id WHERE c.dimension = ?1 AND c.claim_key = ?2 AND l.state IN ('active', 'committed')"#)?
+            .query_map(params![dimension, key], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let active = lease_ids.into_iter().try_fold(0_u64, |total, lease_id| {
+            let lease = load_lease_tx(tx, &lease_id)?;
+            let units = lease
+                .claims
+                .iter()
+                .filter(|claim| claim.dimension == dimension && claim.key == key)
+                .map(|claim| claim.units)
+                .sum::<u64>();
+            Ok::<_, PolicyStoreError>(total.saturating_add(units))
+        })?;
         if active.saturating_add(units) > maximum {
             return Err(PolicyStoreError::CapacityUnavailable(format!(
                 "{dimension}/{key}: requested {units}, active {active}, maximum {maximum}"
@@ -1342,7 +1278,7 @@ fn parse_stored_decision(
     decision_id: &str,
     request_id: &str,
     attempt: u32,
-    _override_id: Option<&str>,
+    override_id: Option<&str>,
     digest: &str,
     value: &str,
     created_at: &str,
@@ -1360,6 +1296,16 @@ fn parse_stored_decision(
         return Err(PolicyStoreError::Invalid(
             "stored decision does not match authoritative row columns".into(),
         ));
+    }
+    if let Some(override_id) = override_id {
+        let override_record = load_override_tx(tx, override_id)?;
+        if override_record.request_id != request.request_id
+            || override_record.policy_version != request.policy_version
+        {
+            return Err(PolicyStoreError::Invalid(
+                "stored decision override does not bind to this frozen request".into(),
+            ));
+        }
     }
     if let Some(embedded_lease) = &decision.capacity_lease {
         let stored_lease = load_lease_tx(tx, &embedded_lease.lease_id)?;
@@ -2411,6 +2357,133 @@ mod tests {
             Err(PolicyStoreError::Invalid(_))
         ));
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn frozen_schema_override_binding_and_capacity_claims_fail_closed_when_tampered() {
+        let (schema_store, schema_path) = store("schema-constraint-tamper");
+        drop(schema_store);
+        let conn = Connection::open(&schema_path).unwrap();
+        conn.execute_batch("DROP INDEX idx_policy_leases_active;")
+            .unwrap();
+        drop(conn);
+        assert!(matches!(
+            PolicyStore::new(&schema_path),
+            Err(PolicyStoreError::Schema(_))
+        ));
+
+        let (override_store, override_path) = store("override-row-tamper");
+        let override_projection = projection(true, 2);
+        install(&override_store, &override_projection);
+        override_store
+            .set_runtime_versions(&override_projection.lane, 1, 1)
+            .unwrap();
+        let allow = request("override-allow", PolicyVehicle::TaskAgent, None, "intent-a");
+        let rewrite = request(
+            "override-rewrite",
+            PolicyVehicle::NamedSeat,
+            Some("fable"),
+            "intent-b",
+        );
+        override_store.create_request(&allow).unwrap();
+        override_store.create_request(&rewrite).unwrap();
+        let now = instant("2026-08-17T00:01:00Z");
+        let allowed = override_store
+            .prepare_admission(
+                &allow.request_id,
+                &class("routine_bounded", None),
+                None,
+                "override-child-a",
+                now,
+            )
+            .unwrap()
+            .decision;
+        override_store
+            .prepare_admission(
+                &rewrite.request_id,
+                &class("named_orchestrator", Some("maintainer")),
+                None,
+                "override-child-b",
+                now,
+            )
+            .unwrap();
+        let override_record = override_store
+            .authorize_request_override(
+                &rewrite.request_id,
+                &rewrite.caller,
+                "cross-request rebinding test",
+                now,
+                time::Duration::minutes(1),
+            )
+            .unwrap();
+        let conn = Connection::open(&override_path).unwrap();
+        conn.execute(
+            "UPDATE policy_decisions SET override_id = ?2 WHERE decision_id = ?1",
+            params![allowed.decision_id, override_record.override_id],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(matches!(
+            override_store.prepare_admission(
+                &allow.request_id,
+                &class("routine_bounded", None),
+                Some(&override_record.override_id),
+                "override-child-a",
+                now,
+            ),
+            Err(PolicyStoreError::Invalid(_))
+        ));
+
+        let (capacity_store, capacity_path) = store("capacity-claim-tamper");
+        let projection = projection(true, 1);
+        install(&capacity_store, &projection);
+        capacity_store
+            .set_runtime_versions(&projection.lane, 1, 1)
+            .unwrap();
+        let first = request(
+            "capacity-first",
+            PolicyVehicle::TaskAgent,
+            None,
+            "intent-first",
+        );
+        let second = request(
+            "capacity-second",
+            PolicyVehicle::TaskAgent,
+            None,
+            "intent-second",
+        );
+        capacity_store.create_request(&first).unwrap();
+        capacity_store.create_request(&second).unwrap();
+        let first_decision = capacity_store
+            .prepare_admission(
+                &first.request_id,
+                &class("routine_bounded", None),
+                None,
+                "capacity-child-a",
+                now,
+            )
+            .unwrap()
+            .decision;
+        let conn = Connection::open(&capacity_path).unwrap();
+        conn.execute(
+            "UPDATE policy_capacity_claims SET units = 0 WHERE lease_id = ?1",
+            [&first_decision.capacity_lease.unwrap().lease_id],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(matches!(
+            capacity_store.prepare_admission(
+                &second.request_id,
+                &class("routine_bounded", None),
+                None,
+                "capacity-child-b",
+                now,
+            ),
+            Err(PolicyStoreError::Invalid(_))
+        ));
+        for path in [schema_path, override_path, capacity_path] {
+            std::fs::remove_file(path).ok();
+        }
     }
 
     #[test]
