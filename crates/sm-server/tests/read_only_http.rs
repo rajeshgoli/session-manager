@@ -201,6 +201,7 @@ struct StubGitHubReviewPoster {
     result: Arc<Mutex<Result<GitHubReviewComment, String>>>,
     calls: Arc<Mutex<Vec<(String, i64, Option<String>)>>>,
     fresh_reviews: Arc<Mutex<VecDeque<GitHubReviewMatch>>>,
+    current_head_sha: Arc<Mutex<String>>,
 }
 
 impl StubGitHubReviewPoster {
@@ -216,6 +217,9 @@ impl StubGitHubReviewPoster {
             }))),
             calls: Arc::new(Mutex::new(Vec::new())),
             fresh_reviews: Arc::new(Mutex::new(VecDeque::new())),
+            current_head_sha: Arc::new(Mutex::new(
+                "1111111111111111111111111111111111111111".to_owned(),
+            )),
         }
     }
 
@@ -224,6 +228,9 @@ impl StubGitHubReviewPoster {
             result: Arc::new(Mutex::new(Err(message.to_owned()))),
             calls: Arc::new(Mutex::new(Vec::new())),
             fresh_reviews: Arc::new(Mutex::new(VecDeque::new())),
+            current_head_sha: Arc::new(Mutex::new(
+                "1111111111111111111111111111111111111111".to_owned(),
+            )),
         }
     }
 
@@ -239,6 +246,14 @@ impl StubGitHubReviewPoster {
     fn with_fresh_reviews(self, review_matches: Vec<GitHubReviewMatch>) -> Self {
         *self.fresh_reviews.lock().unwrap() = review_matches.into_iter().collect();
         self
+    }
+
+    fn set_current_head(&self, head_sha: &str) {
+        *self.current_head_sha.lock().unwrap() = head_sha.to_owned();
+    }
+
+    fn push_fresh_review(&self, review_match: GitHubReviewMatch) {
+        self.fresh_reviews.lock().unwrap().push_back(review_match);
     }
 }
 
@@ -256,18 +271,30 @@ impl GitHubReviewPoster for StubGitHubReviewPoster {
         self.result.lock().unwrap().clone()
     }
 
+    fn current_open_pr_head(&self, _repo: &str, _pr_number: i64) -> Result<String, String> {
+        Ok(self.current_head_sha.lock().unwrap().clone())
+    }
+
     fn find_fresh_codex_review_or_comment(
         &self,
         _repo: &str,
         _pr_number: i64,
         _since: &str,
+        requested_head_sha: &str,
+        request_comment_id: Option<i64>,
     ) -> Result<Option<GitHubReviewMatch>, String> {
         let mut fresh_reviews = self.fresh_reviews.lock().unwrap();
-        if fresh_reviews.len() > 1 {
-            Ok(fresh_reviews.pop_front())
-        } else {
-            Ok(fresh_reviews.front().cloned())
-        }
+        let position = fresh_reviews.iter().position(|review_match| {
+            review_match.head_sha.as_deref() == Some(requested_head_sha)
+                && review_match.id.as_ref().and_then(Value::as_i64) != request_comment_id
+        });
+        Ok(position.and_then(|position| {
+            if fresh_reviews.len() > 1 {
+                fresh_reviews.remove(position)
+            } else {
+                fresh_reviews.get(position).cloned()
+            }
+        }))
     }
 
     fn find_fresh_codex_review(
@@ -2488,6 +2515,7 @@ async fn pr_review_route_posts_comment_and_returns_python_shape() {
         url: Some(
             "https://github.com/rajeshgoli/session-manager/pull/967#pullrequestreview-1".to_owned(),
         ),
+        head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
     });
     let mut config = AppConfig::default();
     config.paths.state_file = state_file.display().to_string();
@@ -2563,6 +2591,7 @@ async fn pr_review_route_wait_ignores_issue_comments_until_review_or_timeout() {
             "https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701300000"
                 .to_owned(),
         ),
+        head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
     });
     let mut config = AppConfig::default();
     config.paths.state_file = state_file.display().to_string();
@@ -2624,6 +2653,7 @@ async fn pr_review_route_wait_completes_when_comment_precedes_review() {
                 "https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701300000"
                     .to_owned(),
             ),
+            head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
         },
         GitHubReviewMatch {
             source: "review".to_owned(),
@@ -2633,6 +2663,7 @@ async fn pr_review_route_wait_completes_when_comment_precedes_review() {
                 "https://github.com/rajeshgoli/session-manager/pull/967#pullrequestreview-1"
                     .to_owned(),
             ),
+            head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
         },
     ]);
     let mut config = AppConfig::default();
@@ -2737,6 +2768,7 @@ async fn codex_review_request_watcher_completes_and_queues_wake() {
             "https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701300000"
                 .to_owned(),
         ),
+        head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
     });
     let mut config = AppConfig {
         paths: PathsConfig {
@@ -2832,6 +2864,7 @@ async fn codex_review_request_watcher_delivers_sequential_wake_to_runtime_sessio
         url: Some(
             "https://github.com/rajeshgoli/session-manager/pull/978#pullrequestreview-1".to_owned(),
         ),
+        head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
     });
     let app = router(
         AppState::new(AppConfig {
@@ -2963,6 +2996,7 @@ async fn codex_review_request_recovery_spawns_active_watchers() {
         url: Some(
             "https://github.com/rajeshgoli/session-manager/pull/971#pullrequestreview-1".to_owned(),
         ),
+        head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
     });
     let mut config = AppConfig {
         paths: PathsConfig {
@@ -3053,7 +3087,7 @@ async fn codex_review_request_recovery_keeps_missing_notify_session_active() {
 }
 
 #[tokio::test]
-async fn codex_review_request_create_rejects_duplicates_before_github_post() {
+async fn codex_review_request_create_returns_actionable_conflict_for_other_owner() {
     let state_file = unique_temp_path();
     let queue_db = state_file.with_extension("codex-review-create-duplicate.db");
     fs::write(
@@ -3100,12 +3134,133 @@ async fn codex_review_request_create_rejects_duplicates_before_github_post() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        payload["detail"],
-        "Active Codex review request already exists for rajeshgoli/session-manager PR #830"
-    );
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(payload["detail"].as_str().unwrap().contains("active-old"));
+    assert!(payload["detail"].as_str().unwrap().contains("cancel it"));
     assert!(poster.calls().is_empty());
+}
+
+#[tokio::test]
+async fn codex_review_request_supersedes_same_owner_stale_head_and_ignores_late_completion() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-supersede.db");
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [{
+                "id": "notify1", "name": "notify1", "working_dir": "/repo/notify",
+                "tmux_session": "notify1", "log_file": "/tmp/notify1.log", "status": "running",
+                "created_at": "2026-06-01T00:00:00Z", "last_activity": "2026-06-01T00:01:00Z"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let poster = StubGitHubReviewPoster::successful();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, first) = post_json(
+        app.clone(),
+        "/codex-review-requests",
+        json!({
+            "pr_number": 992, "repo": "rajeshgoli/session-manager", "notify_target": "notify1",
+            "poll_interval_seconds": 1, "retry_interval_seconds": 900
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let first_id = first["id"].as_str().unwrap().to_owned();
+    let (status, repeated) = post_json(
+        app.clone(),
+        "/codex-review-requests",
+        json!({
+            "pr_number": 992, "repo": "rajeshgoli/session-manager", "notify_target": "notify1",
+            "poll_interval_seconds": 1, "retry_interval_seconds": 900
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(repeated["id"], first_id);
+    assert_eq!(
+        poster.calls().len(),
+        1,
+        "same-head retry must not post another trigger"
+    );
+    poster.push_fresh_review(GitHubReviewMatch {
+        source: "review".to_owned(),
+        created_at: "2026-06-14T02:31:00Z".to_owned(),
+        id: Some(json!(991)),
+        url: Some("https://example.test/review-a".to_owned()),
+        head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
+    });
+    poster.set_current_head("2222222222222222222222222222222222222222");
+    let (status, second) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 992, "repo": "rajeshgoli/session-manager", "notify_target": "notify1",
+            "poll_interval_seconds": 1, "retry_interval_seconds": 900
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let second_id = second["id"].as_str().unwrap().to_owned();
+    assert_ne!(first_id, second_id);
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let conn = Connection::open(&queue_db).unwrap();
+    let first_row: (String, i64, Option<String>) = conn.query_row(
+        "SELECT state, is_active, superseded_by_request_id FROM codex_review_request_registrations WHERE id = ?1",
+        [&first_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(
+        first_row,
+        ("superseded".to_owned(), 0, Some(second_id.clone()))
+    );
+    assert!(queued_message_texts(&queue_db, "notify1").is_empty());
+    drop(conn);
+
+    poster.push_fresh_review(GitHubReviewMatch {
+        source: "review".to_owned(),
+        created_at: "2026-06-14T02:32:00Z".to_owned(),
+        id: Some(json!(992)),
+        url: Some("https://example.test/review-b".to_owned()),
+        head_sha: Some("2222222222222222222222222222222222222222".to_owned()),
+    });
+    for _ in 0..30 {
+        let conn = Connection::open(&queue_db).unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM codex_review_request_registrations WHERE id = ?1",
+                [&second_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if state == "completed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let conn = Connection::open(&queue_db).unwrap();
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM codex_review_request_registrations WHERE id = ?1",
+            [&second_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "completed");
+    assert_eq!(queued_message_texts(&queue_db, "notify1").len(), 1);
 }
 
 #[tokio::test]
@@ -18849,6 +19004,9 @@ fn create_codex_review_request_fixture_db(path: &PathBuf) {
             requester_session_id TEXT,
             notify_session_id TEXT NOT NULL,
             steer TEXT,
+            requested_head_sha TEXT,
+            superseded_by_request_id TEXT,
+            superseded_at TIMESTAMP,
             requested_at TIMESTAMP NOT NULL,
             latest_request_comment_id INTEGER,
             latest_request_comment_url TEXT,
@@ -18874,26 +19032,26 @@ fn create_codex_review_request_fixture_db(path: &PathBuf) {
     conn.execute(
         r#"
         INSERT INTO codex_review_request_registrations
-            (id, repo, pr_number, requester_session_id, notify_session_id, steer,
+            (id, repo, pr_number, requester_session_id, notify_session_id, steer, requested_head_sha,
              requested_at, latest_request_comment_id, latest_request_comment_url,
              latest_request_posted_at, attempt_count, next_retry_at,
              poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
              pickup_source, review_landed_at, review_source, review_comment_id,
              review_url, last_polled_at, last_error, state, is_active)
         VALUES
-            ('active-old', 'rajeshgoli/session-manager', 830, 'requester1', 'notify1', 'focus nodes',
+            ('active-old', 'rajeshgoli/session-manager', 830, 'requester1', 'notify1', 'focus nodes', '1111111111111111111111111111111111111111',
              '2026-06-01T00:00:00', 111, 'https://example.com/comment/111',
              '2026-06-01T00:00:01', 2, '2026-06-01T00:10:00',
              30, 600, '2026-06-01T00:02:00',
              'issue_comment', '2026-06-01T00:03:00', 'pull_review', 222,
              'https://example.com/review/222', '2026-06-01T00:04:00', NULL, 'completed', 1),
-            ('inactive', 'rajeshgoli/session-manager', 831, NULL, 'notify1', NULL,
+            ('inactive', 'rajeshgoli/session-manager', 831, NULL, 'notify1', NULL, NULL,
              '2026-06-01T00:01:00', NULL, NULL,
              NULL, 1, NULL,
              30, 600, NULL,
              NULL, NULL, NULL, NULL,
              NULL, NULL, 'cancelled', 'cancelled', 0),
-            ('active-new', 'rajeshgoli/other', 7, NULL, 'notify2', NULL,
+            ('active-new', 'rajeshgoli/other', 7, NULL, 'notify2', NULL, '1111111111111111111111111111111111111111',
              '2026-06-01T00:02:00', NULL, NULL,
              NULL, 1, NULL,
              45, 900, NULL,
@@ -18921,6 +19079,9 @@ fn create_active_codex_review_request_fixture_db(
             requester_session_id TEXT,
             notify_session_id TEXT NOT NULL,
             steer TEXT,
+            requested_head_sha TEXT,
+            superseded_by_request_id TEXT,
+            superseded_at TIMESTAMP,
             requested_at TIMESTAMP NOT NULL,
             latest_request_comment_id INTEGER,
             latest_request_comment_url TEXT,
@@ -18946,14 +19107,14 @@ fn create_active_codex_review_request_fixture_db(
     conn.execute(
         r#"
         INSERT INTO codex_review_request_registrations
-            (id, repo, pr_number, requester_session_id, notify_session_id, steer,
+            (id, repo, pr_number, requester_session_id, notify_session_id, steer, requested_head_sha,
              requested_at, latest_request_comment_id, latest_request_comment_url,
              latest_request_posted_at, attempt_count, next_retry_at,
              poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
              pickup_source, review_landed_at, review_source, review_comment_id,
              review_url, last_polled_at, last_error, state, is_active)
         VALUES
-            (?1, 'rajeshgoli/session-manager', 971, 'requester1', ?2, 'recover watchers',
+            (?1, 'rajeshgoli/session-manager', 971, 'requester1', ?2, 'recover watchers', '1111111111111111111111111111111111111111',
              '2026-06-14T02:30:00Z', 4701290334,
              'https://github.com/rajeshgoli/session-manager/pull/971#issuecomment-4701290334',
              '2026-06-14T02:30:00Z', 1, '2026-06-14T02:45:00Z',

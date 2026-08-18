@@ -292,6 +292,7 @@ pub struct GitHubReviewMatch {
     pub created_at: String,
     pub id: Option<Value>,
     pub url: Option<String>,
+    pub head_sha: Option<String>,
 }
 
 pub trait GitHubReviewPoster: Send + Sync {
@@ -306,11 +307,17 @@ pub trait GitHubReviewPoster: Send + Sync {
         Ok(false)
     }
 
+    fn current_open_pr_head(&self, _repo: &str, _pr_number: i64) -> Result<String, String> {
+        Err("GitHub review poster cannot resolve the current PR head".to_owned())
+    }
+
     fn find_fresh_codex_review_or_comment(
         &self,
         _repo: &str,
         _pr_number: i64,
         _since: &str,
+        _requested_head_sha: &str,
+        _request_comment_id: Option<i64>,
     ) -> Result<Option<GitHubReviewMatch>, String> {
         Ok(None)
     }
@@ -343,13 +350,25 @@ impl GitHubReviewPoster for GhCliReviewPoster {
         detect_codex_pickup_with_gh(repo, comment_id)
     }
 
+    fn current_open_pr_head(&self, repo: &str, pr_number: i64) -> Result<String, String> {
+        current_open_pr_head_with_gh(repo, pr_number)
+    }
+
     fn find_fresh_codex_review_or_comment(
         &self,
         repo: &str,
         pr_number: i64,
         since: &str,
+        requested_head_sha: &str,
+        request_comment_id: Option<i64>,
     ) -> Result<Option<GitHubReviewMatch>, String> {
-        find_fresh_codex_review_or_comment_with_gh(repo, pr_number, since)
+        find_fresh_codex_review_or_comment_with_gh(
+            repo,
+            pr_number,
+            since,
+            requested_head_sha,
+            request_comment_id,
+        )
     }
 
     fn find_fresh_codex_review(
@@ -535,6 +554,8 @@ fn should_use_configured_usage_db_path(config: &UsageConfig) -> bool {
 #[derive(Debug, Deserialize)]
 struct GhPrViewPayload {
     state: Option<String>,
+    #[serde(rename = "headRefOid")]
+    head_ref_oid: Option<String>,
 }
 
 const GH_TRANSPORT_ATTEMPTS: usize = 3;
@@ -605,7 +626,7 @@ fn gh_command_output(args: &[String], timeout_duration: Duration) -> Result<Outp
     )
 }
 
-fn validate_open_pr_with_gh(repo: &str, pr_number: i64) -> Result<(), String> {
+fn current_open_pr_head_with_gh(repo: &str, pr_number: i64) -> Result<String, String> {
     let args = vec![
         "pr".to_owned(),
         "view".to_owned(),
@@ -613,7 +634,7 @@ fn validate_open_pr_with_gh(repo: &str, pr_number: i64) -> Result<(), String> {
         "--repo".to_owned(),
         repo.to_owned(),
         "--json".to_owned(),
-        "number,state,title,url".to_owned(),
+        "number,state,title,url,headRefOid".to_owned(),
     ];
     let output = gh_command_output(&args, Duration::from_secs(10))
         .map_err(|error| format!("gh pr view failed: {error}"))?;
@@ -634,7 +655,14 @@ fn validate_open_pr_with_gh(repo: &str, pr_number: i64) -> Result<(), String> {
             payload.state.as_deref().unwrap_or("unknown")
         ));
     }
-    Ok(())
+    payload
+        .head_ref_oid
+        .filter(|head| !head.trim().is_empty())
+        .ok_or_else(|| format!("PR #{} in {} has no head commit", pr_number, repo))
+}
+
+fn validate_open_pr_with_gh(repo: &str, pr_number: i64) -> Result<(), String> {
+    current_open_pr_head_with_gh(repo, pr_number).map(|_| ())
 }
 
 fn post_pr_review_comment_with_gh(
@@ -791,8 +819,96 @@ fn find_fresh_codex_review_or_comment_with_gh(
     repo: &str,
     pr_number: i64,
     since: &str,
+    requested_head_sha: &str,
+    request_comment_id: Option<i64>,
 ) -> Result<Option<GitHubReviewMatch>, String> {
-    find_fresh_codex_review_or_comment_with_gh_filtered(repo, pr_number, since, None)
+    let Some(since_dt) = parse_github_datetime(since) else {
+        return Ok(None);
+    };
+    let mut candidates = Vec::<GitHubReviewMatch>::new();
+    let reviews = gh_api_json(repo, &format!("pulls/{pr_number}/reviews"), true)?;
+    if let Some(items) = reviews.as_array() {
+        for review in items {
+            let Some(created_at) = review
+                .get("submitted_at")
+                .and_then(Value::as_str)
+                .and_then(parse_github_datetime)
+            else {
+                continue;
+            };
+            if created_at > since_dt
+                && github_actor_is_codex(review)
+                && review.get("commit_id").and_then(Value::as_str) == Some(requested_head_sha)
+            {
+                candidates.push(GitHubReviewMatch {
+                    source: "review".to_owned(),
+                    created_at: created_at
+                        .format(&Rfc3339)
+                        .unwrap_or_else(|_| now_rfc3339()),
+                    id: review.get("id").cloned(),
+                    url: review
+                        .get("html_url")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    head_sha: Some(requested_head_sha.to_owned()),
+                });
+            }
+        }
+    }
+    let comments = gh_api_json(
+        repo,
+        &format!(
+            "issues/{pr_number}/comments?since={}",
+            since_dt
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| since.to_owned())
+        ),
+        true,
+    )?;
+    if let Some(items) = comments.as_array() {
+        for comment in items {
+            let Some(created_at) = comment
+                .get("created_at")
+                .and_then(Value::as_str)
+                .and_then(parse_github_datetime)
+            else {
+                continue;
+            };
+            if created_at > since_dt
+                && codex_comment_is_bound(comment, requested_head_sha, request_comment_id)
+            {
+                candidates.push(GitHubReviewMatch {
+                    source: "comment".to_owned(),
+                    created_at: created_at
+                        .format(&Rfc3339)
+                        .unwrap_or_else(|_| now_rfc3339()),
+                    id: comment.get("id").cloned(),
+                    url: comment
+                        .get("html_url")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    head_sha: Some(requested_head_sha.to_owned()),
+                });
+            }
+        }
+    }
+    candidates.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    Ok(candidates.into_iter().next())
+}
+
+fn codex_comment_is_bound(
+    comment: &Value,
+    requested_head_sha: &str,
+    request_comment_id: Option<i64>,
+) -> bool {
+    let body = comment
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    comment.get("id").and_then(Value::as_i64) != request_comment_id
+        && github_actor_is_codex(comment)
+        && !body.to_ascii_lowercase().contains("@codex review")
+        && body.contains(&format!("Reviewed commit: `{requested_head_sha}`"))
 }
 
 fn find_fresh_codex_review_with_gh(
@@ -830,6 +946,7 @@ fn find_fresh_codex_review_or_comment_with_gh_filtered(
                     .get("url")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
+                head_sha: None,
             };
             if source_filter.map_or(true, |source| source == review_match.source) {
                 candidates.push(review_match);
@@ -868,6 +985,7 @@ fn find_fresh_codex_review_or_comment_with_gh_filtered(
                             .get("html_url")
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned),
+                        head_sha: None,
                     });
                 }
             }
@@ -1065,6 +1183,11 @@ pub fn router(state: AppState) -> Router {
         .map(|bridge| bridge.webhook_path())
         .unwrap_or_else(|| DEFAULT_EMAIL_WEBHOOK_PATH.to_owned());
     let state = Arc::new(state);
+    if let Err(error) = RetainedQueueStore::ensure_codex_review_requests_schema_from_path(
+        &expand_home(&state.config.sm_send.db_path),
+    ) {
+        eprintln!("Codex review request schema initialization failed: {error:#}");
+    }
     recover_codex_review_request_watchers(state.clone());
     recover_btw_requests(state.clone());
     if state.config.rust_core.runtime_enabled {
@@ -4311,17 +4434,14 @@ async fn create_codex_review_request(
     )
     .await?;
     let queue_db_path = expand_home(&state.config.sm_send.db_path);
-    let creation_key = format!(
-        "{}\u{1f}{}\u{1f}{}",
-        repo, payload.pr_number, notify_session.id
-    );
+    let creation_key = format!("{}\u{1f}{}", repo, payload.pr_number);
     {
         let mut locks = state.codex_review_creation_locks.lock().await;
         if !locks.insert(creation_key.clone()) {
             return Err(ApiError::Status {
-                status: StatusCode::BAD_REQUEST,
+                status: StatusCode::CONFLICT,
                 detail: format!(
-                    "Active Codex review request already exists for {} PR #{}",
+                    "A Codex review request is being created for {} PR #{}; retry after it finishes registration",
                     repo, payload.pr_number
                 ),
             });
@@ -4329,27 +4449,47 @@ async fn create_codex_review_request(
     }
 
     let create_result = async {
-        match RetainedQueueStore::active_codex_review_request_exists_from_path(
+        let poster = state.github_review_poster.clone();
+        let repo_for_head = repo.clone();
+        let requested_head_sha = tokio::task::spawn_blocking(move || {
+            poster.current_open_pr_head(&repo_for_head, payload.pr_number)
+        })
+        .await
+        .map_err(|error| ApiError::Status {
+            status: StatusCode::BAD_GATEWAY,
+            detail: format!("Failed to resolve current PR head: {error}"),
+        })?
+        .map_err(codex_review_poster_error)?;
+        let owner = trimmed(&payload.requester_session_id)
+            .unwrap_or_else(|| notify_session.id.clone());
+        let active = RetainedQueueStore::active_codex_review_requests_for_pr_from_path(
             &queue_db_path,
             &repo,
             payload.pr_number,
-            &notify_session.id,
-        ) {
-            Ok(true) => {
+        )
+        .map_err(|error| ApiError::Status {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            detail: format!("Failed to inspect Codex review requests: {error}"),
+        })?;
+        for existing in active {
+            let existing_owner = existing
+                .requester_session_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(&existing.notify_session_id);
+            if existing_owner != owner {
                 return Err(ApiError::Status {
-                    status: StatusCode::BAD_REQUEST,
+                    status: StatusCode::CONFLICT,
                     detail: format!(
-                        "Active Codex review request already exists for {} PR #{}",
-                        repo, payload.pr_number
+                        "Active Codex review request {} for {} PR #{} is owned by {}; cancel it or wait for completion",
+                        existing.id, repo, payload.pr_number, existing_owner
                     ),
                 });
             }
-            Ok(false) => {}
-            Err(error) => {
-                return Err(ApiError::Status {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    detail: format!("Failed to inspect Codex review requests: {error}"),
-                });
+            if existing.requested_head_sha.as_deref() == Some(requested_head_sha.as_str()) {
+                let response = codex_review_request_response(&state, existing.clone())?;
+                spawn_codex_review_request_watcher(state.clone(), existing.id);
+                return Ok(Json(response));
             }
         }
 
@@ -4378,6 +4518,7 @@ async fn create_codex_review_request(
                 requester_session_id: trimmed(&payload.requester_session_id),
                 notify_session_id: notify_session.id.clone(),
                 steer: trimmed(&payload.steer),
+                requested_head_sha,
                 latest_request_comment_id: comment.comment_id,
                 latest_request_comment_url: comment.comment_url,
                 latest_request_posted_at: comment.posted_at,
@@ -4385,7 +4526,16 @@ async fn create_codex_review_request(
                 retry_interval_seconds: payload.retry_interval_seconds,
             },
         )
-        .map_err(codex_review_store_error)?;
+        .map_err(|error| {
+            if error.to_string().starts_with("CONFLICT:") {
+                ApiError::Status {
+                    status: StatusCode::CONFLICT,
+                    detail: error.to_string().trim_start_matches("CONFLICT: ").to_owned(),
+                }
+            } else {
+                codex_review_store_error(error)
+            }
+        })?;
         let response = codex_review_request_response(&state, registration.clone())?;
         spawn_codex_review_request_watcher(state.clone(), registration.id);
         Ok(Json(response))
@@ -4590,6 +4740,12 @@ fn recover_codex_review_request_watchers(state: Arc<AppState>) {
         return;
     }
     let queue_db_path = expand_home(&state.config.sm_send.db_path);
+    if let Err(error) =
+        RetainedQueueStore::ensure_codex_review_requests_schema_from_path(&queue_db_path)
+    {
+        eprintln!("Codex review request recovery failed to migrate schema: {error:#}");
+        return;
+    }
     match RetainedQueueStore::list_active_codex_review_requests_from_path(&queue_db_path) {
         Ok(registrations) => {
             for registration in registrations {
@@ -4730,6 +4886,8 @@ async fn run_codex_review_request_watcher(
             &registration.repo,
             registration.pr_number,
             &since,
+            registration.requested_head_sha.as_deref(),
+            registration.latest_request_comment_id,
         )
         .await
         {
@@ -4821,11 +4979,23 @@ async fn github_find_fresh_review(
     repo: &str,
     pr_number: i64,
     since: &str,
+    requested_head_sha: Option<&str>,
+    request_comment_id: Option<i64>,
 ) -> Result<Option<GitHubReviewMatch>, String> {
     let repo = repo.to_owned();
     let since = since.to_owned();
+    let requested_head_sha = requested_head_sha.map(ToOwned::to_owned);
     tokio::task::spawn_blocking(move || {
-        poster.find_fresh_codex_review_or_comment(&repo, pr_number, &since)
+        let Some(requested_head_sha) = requested_head_sha else {
+            return Ok(None);
+        };
+        poster.find_fresh_codex_review_or_comment(
+            &repo,
+            pr_number,
+            &since,
+            &requested_head_sha,
+            request_comment_id,
+        )
     })
     .await
     .map_err(|error| format!("review poll task failed: {error}"))?
@@ -4867,35 +5037,38 @@ fn complete_codex_review_request(
     review_match: GitHubReviewMatch,
     last_polled_at: &str,
 ) -> Result<(), String> {
+    if review_match.head_sha.as_deref() != registration.requested_head_sha.as_deref() {
+        return Ok(());
+    }
     let text = render_codex_review_landed_message(registration, &review_match);
-    let queue = RetainedQueueStore::new(queue_db_path.to_path_buf());
-    queue
-        .enqueue_message(&registration.notify_session_id, &text, "sequential", None)
-        .map_err(|error| error.to_string())?;
+    let Some(completed) = RetainedQueueStore::complete_codex_review_request_and_enqueue_in_path(
+        queue_db_path,
+        request_id,
+        CompleteCodexReviewRequest {
+            review_landed_at: review_match.created_at.clone(),
+            review_source: Some(review_match.source.clone()),
+            review_comment_id: review_match.id.clone(),
+            review_url: review_match.url.clone(),
+            last_polled_at: last_polled_at.to_owned(),
+        },
+        &text,
+    )
+    .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
     if state.config.rust_core.runtime_enabled {
         let runtime = TmuxRuntime::from_app_config(&state.config);
         if let Err(error) = state
             .session_store
-            .drain_runtime_pending_messages_for_session(&registration.notify_session_id, &runtime)
+            .drain_runtime_pending_messages_for_session(&completed.notify_session_id, &runtime)
         {
             eprintln!(
                 "failed to immediately deliver Codex review completion message {request_id} to {}: {error:#}",
-                registration.notify_session_id
+                completed.notify_session_id
             );
         }
     }
-    RetainedQueueStore::complete_codex_review_request_in_path(
-        queue_db_path,
-        request_id,
-        CompleteCodexReviewRequest {
-            review_landed_at: review_match.created_at,
-            review_source: Some(review_match.source),
-            review_comment_id: review_match.id,
-            review_url: review_match.url,
-            last_polled_at: last_polled_at.to_owned(),
-        },
-    )
-    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -13432,6 +13605,9 @@ fn codex_review_request_response(
         "notify_session_id": registration.notify_session_id,
         "notify_name": notify_name,
         "steer": registration.steer,
+        "requested_head_sha": registration.requested_head_sha,
+        "superseded_by_request_id": registration.superseded_by_request_id,
+        "superseded_at": registration.superseded_at,
         "requested_at": registration.requested_at,
         "latest_request_comment_id": registration.latest_request_comment_id,
         "latest_request_comment_url": registration.latest_request_comment_url,
@@ -17383,5 +17559,37 @@ mod tests {
             .lock()
             .unwrap()
             .contains_key(ticket["ticket_id"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn codex_comment_binding_rejects_trigger_unrelated_and_stale_artifacts() {
+        let head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let trigger = json!({
+            "id": 77,
+            "body": "@codex review",
+            "user": { "login": "codex" }
+        });
+        assert!(!codex_comment_is_bound(&trigger, head, Some(77)));
+
+        let unrelated = json!({
+            "id": 78,
+            "body": "Looks good to me.",
+            "user": { "login": "codex" }
+        });
+        assert!(!codex_comment_is_bound(&unrelated, head, Some(77)));
+
+        let stale = json!({
+            "id": 79,
+            "body": "Reviewed commit: `bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`",
+            "user": { "login": "codex" }
+        });
+        assert!(!codex_comment_is_bound(&stale, head, Some(77)));
+
+        let exact = json!({
+            "id": 80,
+            "body": "Reviewed commit: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`\nNo findings.",
+            "user": { "login": "codex" }
+        });
+        assert!(codex_comment_is_bound(&exact, head, Some(77)));
     }
 }
