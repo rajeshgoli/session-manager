@@ -11,7 +11,17 @@ Apply evolving lane policy without a persistent watchdog/policy seat and without
 depending on orchestrators to remember `sm task`, context thresholds, rotation,
 or model-tier rules.
 
-## Lane 355 policy examples
+## Historical lane 355 policy examples
+
+The examples below motivated this specification but are not current authority.
+Policy activation always reads an approved source identity consisting of
+repository, commit/ref, path, and content digest. As of 2026-08-17, the active
+successor policy is `docs/policy/355_operating_model.md` on the
+`epic/355-journey-lattice` branch of `fractal-algo-rust`; despite the historical
+filename, that document states that it governs epic 360. A projection must use
+the governed lane from the document/approval record, not infer `355` from its
+filename or branch. The superseded examples below remain design evidence only;
+they must not be materialized unless a currently approved clause restates them.
 
 - Orchestrator: Claude Opus/high, successor rotation around 35%, policy ceiling
   40% unless a durable scoped override exists.
@@ -111,9 +121,12 @@ Separate:
 - scoped rulings bound to a role, task, issue, transition, spawn request, or
   immutable prompt digest.
 
-Each amendment records source evidence, approver identity, effective time,
-explicit supersession, scope, enforcement class, and optional expiry/one-shot
-consumption. Later text does not silently supersede active policy.
+Each amendment records source evidence, source repository/ref/path/content
+digest, approver identity, effective time, explicit supersession, scope,
+enforcement class, and optional expiry/one-shot consumption. Every attempted
+operation pins the activated source commit and digest. A changed digest stales
+pending decisions and unused leases; later text does not silently supersede
+active policy.
 
 Normative clauses have stable lane-scoped IDs; rulings and supersession records
 bind those IDs, never line numbers or prose snippets. Superseded text remains
@@ -121,6 +134,12 @@ readable in place with a forward pointer to the replacing clause and amendment.
 An open-to-settled status change is invalid unless the same amendment names the
 external settling record; a policy document cannot cite itself as authority for
 its own settlement.
+
+The human policy document need not contain SM-specific IDs. When it does not,
+the operator-approved activation manifest assigns stable IDs to the selected
+clauses and records their source anchors and text digests. A later activation
+must explicitly retain, supersede, or retire those IDs; it cannot manufacture a
+new identity from a shifted line number or heading.
 
 Agent-generated natural language creates a document change proposal. A
 registered human approves/rejects the document diff through an operator-only
@@ -130,7 +149,10 @@ projection contains stable SM primitives such as model/effort defaults,
 context thresholds, rotation behavior, routing, and prompt guidance. A policy
 concept SM cannot enforce remains advisory and is injected at the applicable
 decision point; adding a new enforcement primitive can require development
-without making the policy itself inexpressible.
+without making the policy itself inexpressible. Each applicable requirement is
+reported as `enforced`, `injected`, `observed`, or `deferred`. A capability-
+subset canary may activate only its declared subset and must not claim that the
+whole source policy is enforced.
 
 Initially every lane-policy rule is overridable by the seat holder with a
 durable, scoped reason. Non-overridable safety and authority properties are SM
@@ -750,11 +772,17 @@ contains only:
 - actual provider/model/effort attestation after launch;
 - linked decision, token, wall-time, child-lifecycle, forecast, and breaker
   evidence; and
-- read-only owner/maintainer inspection surfaces.
+- read-only owner/maintainer inspection surfaces; and
+- generic injection/observation records for applicable requirements outside
+  the first typed enforcement subset, including review tier and disposition.
 
-Stable cross-lane seats, generalized routing, cleanup/relocation, context
-profiles, and rotation are not prerequisites for this first slice. They remain
-in the full plan and are added to the live canary only after their own review.
+Stable cross-lane seats, generalized routing, cleanup/relocation, compound
+context/message profiles, two-step stand-by/brief acknowledgement, and rotation
+are not prerequisites for this first slice. They remain in the full plan and
+are added to the live canary only after their own review.
+Restart-safe bounded operational actions are likewise deferred to issue #1291;
+the spawn-policy canary does not implement or claim that control-plane
+transaction.
 This avoids paying for the complete identity and lifecycle substrate before the
 spawn-policy hypothesis produces evidence.
 
@@ -880,6 +908,22 @@ attempts without a governable spawn, the slice breaker fires: stop dispatch,
 preserve evidence, and either simplify the slice or amend the spec with owner
 approval. The response is not to continue toward the full 2-to-4-day build
 without first obtaining trial evidence.
+
+The first breaker fired on 2026-08-18. Canonical per-message rows plus bounded
+attribution of concurrent maintainer work estimate 225M Codex tokens consumed
+(215M-245M plausible range), with cache reads dominating. D1 design-return then
+estimated 36M-62M and 2.5-4 active hours to preserve the requested durable
+override, capacity, and restart-reconciliation capability. The owner delegated
+this bounded execution decision to the maintainer rather than accepting a code
+or scope adjudication task. The maintainer therefore preserves the intended
+canary and debits continuation from the conservative 245M attribution bound,
+not the 225M point estimate. The phase is capped at 65M incremental and 310M
+cumulative Codex tokens or four additional active hours. It adds no capability
+beyond D1/D3/D4, warns at 285M conservative cumulative usage or three hours, and
+hard-stops at either cap. Direct continuation usage is added to the frozen 245M
+bound, so attribution uncertainty cannot delay the warning or hard stop. A
+second rebaseline is not implicit: a miss produces split/park and a variance
+report.
 
 #### Economy controls
 
@@ -1029,8 +1073,8 @@ sole objective.
   and targets the epic branch; a dependency must be merged, not merely in
   review, before its consumer starts.
 - Each implementation agent owns its focused tests, full applicable gates,
-  `docs/working/pr_review_process.md`, merge to the epic branch, and worktree
-  cleanup. Codex review follows the bounded protocol below; a P1 blocks merge
+  `specs/1268_pr_review_process.md`, merge to the epic branch, and worktree
+  cleanup. Codex review follows the bounded protocol below; a P0/P1 blocks merge
   but does not authorize indefinite review rounds.
 - Limit active implementation to four agents: at most two Sol, two Terra, and
   one Luna where the wave permits. More parallelism would increase merge and
@@ -1038,39 +1082,41 @@ sole objective.
 - The canonical maintainer owns contracts, dependency ordering, integration,
   active canary deployment, final epic review, and production rollout.
 
-#### Bounded Codex review protocol
+#### Risk-tiered Codex review protocol
 
 Codex review is a sampled engineering gate, not a proof obtained by repeatedly
 requesting reviews until one happens to return no finding. Each package or final
-integration PR is limited to one deployable capability and receives at most
-three exact-head review rounds:
-
-1. **Broad review.** Review the current capability for correctness, concurrency,
-   authority, recovery, security, and missing tests.
-2. **Root-cause verification.** After one batched repair, verify every accepted
-   finding and search the touched subsystem for sibling instances of the same
-   failure class. The steer excludes unrelated roadmap and disabled capabilities.
-3. **Current-capability gate.** Run only when round 2 retains or introduces a
-   reachable P0/P1. Review the enabled path, rollback, and tests; do not reopen
-   future-wave design.
+integration PR is limited to one deployable capability and declares R0-R3 risk
+before review. R0 needs no cycle; R1 receives one broad round and promotes to R2
+on a reachable P0/P1; R2 receives at most three exact-head rounds; R3 receives
+at least two and at most five. Broad, root-cause/sibling, and current-capability
+steers remain the default sequence.
 
 Every round records requested/reviewed head, steer and scope, queue/review wait,
 estimated or direct token counters, findings, disposition, and resulting head.
-Unchanged heads are not re-requested. A head-expanding refactor discovered
-during review becomes a separate package rather than silently enlarging the
-review surface.
+Unchanged heads are not re-requested except for R3's mandatory second round: a
+differently scoped confirmation may review the same immutable head once when
+round 1 produced no change. A head-expanding refactor discovered during review
+becomes a separate package rather than silently enlarging the review surface.
 
-At the three-round cap:
+An R2 third-round P0/P1 or an R3 P0/P1 at/after round 3 triggers measured repair
+selection, not owner code review. A newly discovered localized R3 repair may use
+a focused confirming round within the five-round ceiling; a repeated finding
+class or architecture-changing repair enters design-return. R2 repairs needing
+confirmation become a fresh bounded package. Partitionable findings split by
+touched files/interfaces; structural or repeated findings enter design-return
+under a fresh design seat, then execute as independently gated subepic pieces
+with an original full-gate rerun and one integration review. Unresolved
+reachable P0/P1 remains unmergeable.
 
-- a reachable P0/P1 means the package is not mergeable; simplify, revert, split,
-  or block it with the residual finding and evidence;
-- a finding that can only affect a disabled or later capability becomes a
-  linked issue and acceptance criterion for that capability, not a blocker for
-  the current package;
-- each P2/P3 is fixed, explicitly accepted with rationale, or filed; and
-- no fourth round starts automatically. The owner may authorize one additional
-  bounded round with a stated benefit and token/time budget. That extension is
-  never recursively extended; another reachable P0/P1 forces split or redesign.
+At the R3 five-round ceiling, the maintainer selects revert, split, redesign, or
+park from recorded reachability, blast radius, recurrence, rollback, hostile
+tests, review cost, and expected benefit. A reachable P0/P1 remains unmergeable;
+owner residual-risk acceptance cannot waive that gate. The owner may accept only
+a named lower-severity residual risk, change product scope, or override policy
+to remove or disable the affected capability before a newly scoped head is
+reviewed. The owner is never asked to inspect the code finding. Without such a
+scope or policy decision, split/park is the fail-closed default.
 
 For an unusually high-risk transaction, up to two focused specialist reviews
 may run in parallel against the same immutable head and be aggregated as one
@@ -1168,12 +1214,13 @@ the later waves; it is not a final phase that waits for stable seats or rotation
    contributes evidence while building the remaining capabilities. Every policy
    result remains overridable by the seat holder with a durable scoped reason.
 2. After at least three governed package spawns produce complete decision,
-   launch-attestation, token, lifecycle, and forecast rows with no P1 admission
-   defect, and after 1B stable-seat identity plus 2B stable-seat caller binding
-   are reviewed and deployed, enable the proven capability subset for lane 355.
+   launch-attestation, token, lifecycle, and forecast rows with no P0/P1
+   admission defect, and after 1B stable-seat identity plus 2B stable-seat caller
+   binding are reviewed and deployed, enable the proven capability subset for
+   the governed lane named by the approved policy source identity.
    This is a promotion of reviewed deployed code, not a second implementation or
    a shadow run. The maintainer-only bootstrap incarnation binding is never
-   widened or reused for lane 355.
+   widened or reused for that governed lane.
    Lane-declared P0 artifacts and incident scopes are excluded from automatic
    gating or mutation; during a declared incident the canary fails closed and
    escalates rather than converting unavailable evidence into allow.
@@ -1209,7 +1256,7 @@ the later waves; it is not a final phase that waits for stable seats or rotation
 
 ### Expected critical path
 
-`#1265 -> spec and 0F approval -> D0 -> D1/D2/D3 -> D4 own-epic canary -> 1A/1B/1C/1D -> 2A/2B -> lane-355 promotion -> 3A/3B/3D/3E -> 4A`
+`#1265 -> spec and 0F approval -> D0 -> D1/D2/D3 -> D4 own-epic canary -> 1A/1B/1C/1D -> 2A/2B -> governed-lane promotion -> 3A/3B/3D/3E -> 4A`
 
 Telemetry (1C), corpus/tests (1D), watch UX (2C), routing audit (3C), and
 override UX (4B) run beside that path. This preserves wall-clock parallelism
