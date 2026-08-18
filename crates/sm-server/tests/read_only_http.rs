@@ -7,8 +7,12 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
-use futures_util::{future::join, StreamExt as _};
+use futures_util::{
+    future::{join, join_all},
+    StreamExt as _,
+};
 use hmac::{Hmac, Mac};
+use nix::fcntl::{Flock, FlockArg};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
@@ -17707,6 +17711,45 @@ async fn reparent_request_requires_bound_credentials_and_dual_agent_consent() {
     assert_eq!(child["parent_session_id"], "newparent");
     assert_eq!(raw_state["reparent_requests"][0]["status"], "applied");
     assert_eq!(raw_state["reparent_requests"][0]["ready_to_apply"], false);
+}
+
+#[tokio::test]
+async fn reparent_request_poll_stays_available_while_apply_lock_is_held() {
+    let state_file = write_reparent_fixture();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+    let lock_path = state_file.with_extension("reparent-apply.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .unwrap();
+    let _held_lock = Flock::lock(lock_file, FlockArg::LockExclusive).unwrap();
+
+    let headers = vec![
+        ("x-sm-session-id", "unrelated".to_owned()),
+        ("x-sm-session-credential", "unrelated-token".to_owned()),
+    ];
+    let polls = (0..32)
+        .map(|_| {
+            get_json_with_host_and_headers(app.clone(), "/reparent-requests", "localhost", &headers)
+        })
+        .collect::<Vec<_>>();
+    let results = tokio::time::timeout(Duration::from_millis(250), join_all(polls))
+        .await
+        .expect("reparent polls must not wait for the apply lock");
+    assert!(results
+        .iter()
+        .all(|result| result.0 == StatusCode::OK && result.1["requests"] == json!([])));
+
+    let detail = tokio::time::timeout(
+        Duration::from_millis(250),
+        get_json_with_host_and_headers(app, "/reparent-requests/missing", "localhost", &headers),
+    )
+    .await
+    .expect("reparent detail poll must not wait for the apply lock");
+
+    assert_eq!(detail.0, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

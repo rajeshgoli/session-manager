@@ -3171,7 +3171,12 @@ async fn list_reparent_requests(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
-    reconcile_reparent_notifications_best_effort(&state);
+    // This is a watch/poll read path. Reconciliation takes the cross-process
+    // reparent apply lock and may perform queue writes, so running it here can
+    // turn one contended outbox retry into enough blocked request workers to
+    // make unrelated reads (including /health) unavailable. Mutation and
+    // recovery paths still reconcile the durable outbox; this response reports
+    // the durable request/notification state as it exists now.
     let requests = if let Some(session_id) = header_text(request.headers(), "x-sm-session-id") {
         let credential = reparent_session_credential(request.headers())?;
         state
@@ -3278,7 +3283,9 @@ async fn get_reparent_request(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
-    reconcile_reparent_notifications_best_effort(&state);
+    // Keep detail reads non-blocking for the same reason as the collection
+    // poll above. A pending notification remains visible in the durable record
+    // instead of making the read path pretend the outbox was reconciled.
     let record = state
         .session_store
         .get_reparent_request(&request_id)?
