@@ -5546,10 +5546,10 @@ async fn create_queue_job(
 
     let job_type = payload.job_type.trim();
     let default_timeout =
-        queue_job_default_timeout_seconds(&state.config, job_type).ok_or_else(|| {
+        queue_job_default_timeout_seconds(&state.config, job_type).map_err(|detail| {
             ApiError::Status {
                 status: StatusCode::BAD_REQUEST,
-                detail: format!("unknown queue job type: {job_type}"),
+                detail,
             }
         })?;
     let argv = payload
@@ -5684,6 +5684,12 @@ fn queue_admission_policy(config: &AppConfig) -> QueueAdmissionPolicy {
         tests_max_concurrent: config.queue_runner.types.tests.max_concurrent,
         perf_max_concurrent: config.queue_runner.types.perf.max_concurrent,
         background_max_concurrent: config.queue_runner.types.background.max_concurrent,
+        service_max_concurrent: config
+            .queue_runner
+            .types
+            .service
+            .as_ref()
+            .map_or(0, |service| service.max_concurrent),
     }
 }
 
@@ -13152,12 +13158,24 @@ fn default_queue_job_type() -> String {
     "tests".to_owned()
 }
 
-fn queue_job_default_timeout_seconds(config: &AppConfig, job_type: &str) -> Option<i64> {
+fn queue_job_default_timeout_seconds(
+    config: &AppConfig,
+    job_type: &str,
+) -> std::result::Result<i64, String> {
     match job_type {
-        "tests" => Some(config.queue_runner.types.tests.default_timeout_seconds),
-        "perf" => Some(config.queue_runner.types.perf.default_timeout_seconds),
-        "background" => Some(config.queue_runner.types.background.default_timeout_seconds),
-        _ => None,
+        "tests" => Ok(config.queue_runner.types.tests.default_timeout_seconds),
+        "perf" => Ok(config.queue_runner.types.perf.default_timeout_seconds),
+        "background" => Ok(config.queue_runner.types.background.default_timeout_seconds),
+        "service" => config
+            .queue_runner
+            .types
+            .service
+            .as_ref()
+            .map(|service| service.default_timeout_seconds)
+            .ok_or_else(|| {
+                "queue service jobs require queue_runner.types.service to be configured".to_owned()
+            }),
+        _ => Err(format!("unknown queue job type: {job_type}")),
     }
 }
 

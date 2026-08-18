@@ -11,7 +11,7 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rand_core::{OsRng, RngCore};
 use rusqlite::{
     params,
@@ -171,6 +171,7 @@ pub struct QueueAdmissionPolicy {
     pub tests_max_concurrent: usize,
     pub perf_max_concurrent: usize,
     pub background_max_concurrent: usize,
+    pub service_max_concurrent: usize,
 }
 
 impl Default for QueueAdmissionPolicy {
@@ -181,6 +182,7 @@ impl Default for QueueAdmissionPolicy {
             tests_max_concurrent: 2,
             perf_max_concurrent: 1,
             background_max_concurrent: 2,
+            service_max_concurrent: 0,
         }
     }
 }
@@ -2787,6 +2789,12 @@ fn admit_pending_queue_jobs_conn(
     let _admission_guard = QUEUE_ADMISSION_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Validate before clearing any existing holds: after a restart, preserved
+    // service processes may outnumber a newly lowered configuration.  In that
+    // state, admitting even one finite job would violate the configured global
+    // reserve for non-service work.
+    let running_jobs = list_queue_job_runtime_records_conn(conn)?;
+    ensure_service_capacity_reserve_before_admission(&running_jobs, admission_policy)?;
     let requeued = conn.execute(
         "UPDATE queue_jobs SET holding_reason = NULL WHERE state = 'pending' AND holding_reason IS NOT NULL",
         [],
@@ -2872,6 +2880,47 @@ fn admit_pending_queue_jobs_conn(
     Ok(summary)
 }
 
+fn ensure_service_capacity_reserve_before_admission(
+    jobs: &[QueueJobRuntimeRecord],
+    admission_policy: QueueAdmissionPolicy,
+) -> Result<()> {
+    let global_capacity = usize::try_from(admission_policy.max_running_jobs)
+        .context("queue max_running_jobs must be a non-negative integer")?;
+    let service_capacity = admission_policy.service_max_concurrent;
+    if service_capacity >= global_capacity && service_capacity != 0 {
+        bail!(
+            "queue service capacity configuration is invalid before admission: \
+             service_cap={service_capacity} global_capacity={global_capacity}; \
+             service capacity must leave at least one non-service slot"
+        );
+    }
+
+    let non_service_reserve = global_capacity.saturating_sub(service_capacity);
+    let recovered_service_ids = jobs
+        .iter()
+        .filter(|job| job.state == "running" && job.job_type == "service")
+        .map(|job| job.id.as_str())
+        .collect::<Vec<_>>();
+    let recovered_service_count = recovered_service_ids.len();
+    let preserves_service_cap = recovered_service_count <= service_capacity;
+    let preserves_global_reserve = recovered_service_count
+        .checked_add(non_service_reserve)
+        .is_some_and(|required_capacity| required_capacity <= global_capacity);
+    if preserves_service_cap && preserves_global_reserve {
+        return Ok(());
+    }
+
+    bail!(
+        "queue admission blocked: recovered live service occupancy violates configured capacity; \
+         recovered_live_service_jobs={recovered_service_count} \
+         service_cap={service_capacity} global_capacity={global_capacity} \
+         non_service_reserve={non_service_reserve} \
+         job_ids=[{}]. Recovered jobs were left unchanged and no pending job was admitted; \
+         reduce live service occupancy or raise the configuration before retrying recovery.",
+        recovered_service_ids.join(", ")
+    );
+}
+
 fn schedule_queue_admission_retry(
     state_dir: PathBuf,
     message_queue_db_path: PathBuf,
@@ -2893,7 +2942,7 @@ fn schedule_queue_admission_retry(
 
 const DEFAULT_MAX_RUNNING_QUEUE_JOBS: i64 = 2;
 const DEFAULT_PERF_COOLDOWN_SECONDS: i64 = 30;
-const QUEUE_JOB_TYPE_ORDER: [&str; 3] = ["perf", "tests", "background"];
+const QUEUE_JOB_TYPE_ORDER: [&str; 4] = ["perf", "tests", "background", "service"];
 static QUEUE_ADMISSION_LOCK: Mutex<()> = Mutex::new(());
 
 fn next_admissible_queue_job_id_conn(
@@ -3006,6 +3055,7 @@ impl QueueAdmissionPolicy {
             "tests" => self.tests_max_concurrent,
             "perf" => self.perf_max_concurrent,
             "background" => self.background_max_concurrent,
+            "service" => self.service_max_concurrent,
             _ => 1,
         }
     }
@@ -4643,6 +4693,138 @@ mod tests {
 
         job.timeout_seconds = 10;
         assert!(queue_job_timed_out_at(&job, much_later));
+    }
+
+    #[test]
+    fn service_capacity_does_not_block_finite_background_admission() {
+        let state_dir = unique_temp_path("service-capacity");
+        let create_job = |job_type: &str, label: &str| {
+            RetainedQueueStore::create_queue_job_in_state_dir(
+                &state_dir,
+                CreateQueueJob {
+                    job_type: job_type.to_owned(),
+                    label: label.to_owned(),
+                    requester_session_id: Some("requester".to_owned()),
+                    notify_session_id: "notify".to_owned(),
+                    cwd: "/tmp".to_owned(),
+                    argv: Some(vec!["true".to_owned()]),
+                    script: None,
+                    env: BTreeMap::new(),
+                    timeout_seconds: 60,
+                },
+            )
+            .unwrap()
+        };
+        let first_service = create_job("service", "first service");
+        let second_service = create_job("service", "second service");
+        let background = create_job("background", "finite background");
+        let third_service = create_job("service", "third service");
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        for job_id in [&first_service.id, &second_service.id] {
+            conn.execute(
+                "UPDATE queue_jobs SET state = 'running', started_at = ?2 WHERE id = ?1",
+                params![job_id, now_rfc3339()],
+            )
+            .unwrap();
+        }
+        let policy = QueueAdmissionPolicy {
+            max_running_jobs: 4,
+            service_max_concurrent: 2,
+            ..QueueAdmissionPolicy::default()
+        };
+
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        let mut summary = QueueAdmissionSummary::default();
+        assert_eq!(
+            next_admissible_queue_job_id_conn(&conn, &jobs, policy, &mut summary).unwrap(),
+            Some(background.id.clone())
+        );
+
+        conn.execute(
+            "UPDATE queue_jobs SET state = 'running', started_at = ?2 WHERE id = ?1",
+            params![background.id, now_rfc3339()],
+        )
+        .unwrap();
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        let mut summary = QueueAdmissionSummary::default();
+        assert_eq!(
+            next_admissible_queue_job_id_conn(&conn, &jobs, policy, &mut summary).unwrap(),
+            None
+        );
+        let holding_reason: Option<String> = conn
+            .query_row(
+                "SELECT holding_reason FROM queue_jobs WHERE id = ?1",
+                params![third_service.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(holding_reason.as_deref(), Some("concurrency_cap"));
+
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn perf_displacement_never_selects_service_jobs() {
+        let state_dir = unique_temp_path("service-perf-displacement");
+        let create_job = |job_type: &str, label: &str| {
+            RetainedQueueStore::create_queue_job_in_state_dir(
+                &state_dir,
+                CreateQueueJob {
+                    job_type: job_type.to_owned(),
+                    label: label.to_owned(),
+                    requester_session_id: Some("requester".to_owned()),
+                    notify_session_id: "notify".to_owned(),
+                    cwd: "/tmp".to_owned(),
+                    argv: Some(vec!["true".to_owned()]),
+                    script: None,
+                    env: BTreeMap::new(),
+                    timeout_seconds: 60,
+                },
+            )
+            .unwrap()
+        };
+        let service = create_job("service", "long-lived service");
+        let perf = create_job("perf", "pending perf");
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET state = 'running', started_at = ?2 WHERE id = ?1",
+            params![service.id, now_rfc3339()],
+        )
+        .unwrap();
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+
+        assert!(!displace_background_for_perf_conn(
+            &conn,
+            &jobs,
+            &state_dir.join("message_queue.db"),
+            0,
+            QueueAdmissionPolicy {
+                max_running_jobs: 4,
+                service_max_concurrent: 2,
+                ..QueueAdmissionPolicy::default()
+            },
+        )
+        .unwrap());
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM queue_jobs WHERE id = ?1",
+                params![service.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "running");
+        let perf_state: String = conn
+            .query_row(
+                "SELECT state FROM queue_jobs WHERE id = ?1",
+                params![perf.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(perf_state, "pending");
+
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
     }
 
     #[test]
