@@ -373,8 +373,8 @@ impl PolicyStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         load_projection_tx(&tx, lane, policy_version, policy_digest)?;
         tx.execute(
-            "INSERT INTO policy_active_projections (lane, policy_version, policy_digest) VALUES (?1, ?2, ?3) ON CONFLICT(lane) DO UPDATE SET policy_version = excluded.policy_version, policy_digest = excluded.policy_digest",
-            params![lane, policy_version, policy_digest],
+            "INSERT INTO policy_active_projections (lane, policy_version, policy_digest, active_projection_digest) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(lane) DO UPDATE SET policy_version = excluded.policy_version, policy_digest = excluded.policy_digest, active_projection_digest = excluded.active_projection_digest",
+            params![lane, policy_version, policy_digest, active_projection_digest(lane, policy_version, policy_digest)?],
         )?;
         tx.commit()?;
         Ok(())
@@ -457,7 +457,7 @@ impl PolicyStore {
             &request.policy_version,
             &request.policy_digest,
         )?;
-        let active: (String, String) = tx.query_row("SELECT policy_version, policy_digest FROM policy_active_projections WHERE lane = ?1", [request.caller.lane()], |row| Ok((row.get(0)?, row.get(1)?))).optional()?.ok_or_else(|| PolicyStoreError::ProjectionNotFound(request.caller.lane().into()))?;
+        let active = load_active_projection_tx(&tx, request.caller.lane())?;
         if active
             != (
                 request.policy_version.clone(),
@@ -509,6 +509,7 @@ impl PolicyStore {
         let resolved = resolve_rule(&projection, &request, &effective_classification);
         let mut outcome = resolved.outcome.clone();
         let mut override_used = None;
+        let mut override_terminal_decision_id = None;
         if let Some(override_id) = override_id {
             let override_record = load_override_tx(&tx, override_id)?;
             let terminal = load_terminal_decision(&tx, &request, &override_record.decision_id)?;
@@ -522,6 +523,7 @@ impl PolicyStore {
             }
             outcome = PolicyDecisionOutcome::Allow;
             override_used = Some(override_id);
+            override_terminal_decision_id = Some(override_record.decision_id);
         }
         let decision_id = derived_id(
             "decision",
@@ -589,7 +591,7 @@ impl PolicyStore {
             .validate_for_request(&request)
             .map_err(|e| PolicyStoreError::Invalid(e.to_string()))?;
         let decision_json = serde_json::to_string(&decision)?;
-        tx.execute("INSERT INTO policy_decisions (decision_id, request_id, attempt, override_id, decision_json, decision_digest, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![decision.decision_id, request_id, attempt, override_used, decision_json, canonical_json_digest(&decision)?, decision.decided_at])?;
+        tx.execute("INSERT INTO policy_decisions (decision_id, request_id, attempt, override_id, override_terminal_decision_id, decision_json, decision_digest, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![decision.decision_id, request_id, attempt, override_used, override_terminal_decision_id, decision_json, canonical_json_digest(&decision)?, decision.decided_at])?;
         if let Some(override_id) = override_used {
             consume_override_tx(&tx, override_id, now)?;
         }
@@ -681,6 +683,17 @@ impl PolicyStore {
     pub fn release_lease(&self, lease_id: &str) -> Result<()> {
         let mut conn = self.open()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if tx
+            .query_row(
+                "SELECT lease_id FROM policy_capacity_leases WHERE lease_id = ?1",
+                [lease_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .is_some()
+        {
+            load_lease_tx(&tx, lease_id)?;
+        }
         let released_at = now()?;
         tx.execute("UPDATE policy_capacity_leases SET state = 'released', released_at = ?2 WHERE lease_id = ?1 AND state IN ('active', 'committed')", params![lease_id, released_at])?;
         tx.execute("UPDATE policy_provisional_children SET state = 'released', released_at = ?2 WHERE lease_id = ?1 AND state IN ('reserved', 'launched')", params![lease_id, now()?])?;
@@ -694,13 +707,7 @@ impl PolicyStore {
         required(child_session_id, "provisional child session ID")?;
         let mut conn = self.open()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let lease_id = tx
-            .query_row(
-                "SELECT lease_id FROM policy_provisional_children WHERE child_session_id = ?1",
-                [child_session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+        let lease_id = load_child_lease_tx(&tx, child_session_id, false)?;
         if let Some(lease_id) = lease_id {
             let released_at = now()?;
             tx.execute("UPDATE policy_capacity_leases SET state = 'released', released_at = ?2 WHERE lease_id = ?1 AND state IN ('active', 'committed')", params![lease_id, released_at])?;
@@ -717,13 +724,7 @@ impl PolicyStore {
         required(child_session_id, "provisional child session ID")?;
         let mut conn = self.open()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let lease_id = tx
-            .query_row(
-                "SELECT lease_id FROM policy_provisional_children WHERE child_session_id = ?1 AND state = 'reserved'",
-                [child_session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+        let lease_id = load_child_lease_tx(&tx, child_session_id, true)?;
         if let Some(lease_id) = lease_id {
             tx.execute(
                 "UPDATE policy_capacity_leases SET state = 'committed' WHERE lease_id = ?1 AND state = 'active'",
@@ -778,10 +779,10 @@ impl PolicyStore {
 
 const POLICY_SCHEMA_V1: &str = r#"
     CREATE TABLE policy_projections (lane TEXT NOT NULL, policy_version TEXT NOT NULL, policy_digest TEXT NOT NULL, projection_json TEXT NOT NULL, projection_record_digest TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (lane, policy_version, policy_digest));
-    CREATE TABLE policy_active_projections (lane TEXT PRIMARY KEY, policy_version TEXT NOT NULL, policy_digest TEXT NOT NULL);
+    CREATE TABLE policy_active_projections (lane TEXT PRIMARY KEY, policy_version TEXT NOT NULL, policy_digest TEXT NOT NULL, active_projection_digest TEXT NOT NULL);
     CREATE TABLE policy_runtime_versions (lane TEXT PRIMARY KEY, topology_version INTEGER NOT NULL, capacity_version INTEGER NOT NULL);
     CREATE TABLE policy_requests (request_id TEXT PRIMARY KEY, lane TEXT NOT NULL, request_digest TEXT NOT NULL, request_json TEXT NOT NULL, created_at TEXT NOT NULL);
-    CREATE TABLE policy_decisions (decision_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, attempt INTEGER NOT NULL, override_id TEXT, decision_json TEXT NOT NULL, decision_digest TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(request_id, attempt), UNIQUE(request_id, override_id));
+    CREATE TABLE policy_decisions (decision_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, attempt INTEGER NOT NULL, override_id TEXT, override_terminal_decision_id TEXT, decision_json TEXT NOT NULL, decision_digest TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(request_id, attempt), UNIQUE(request_id, override_id));
     CREATE TABLE policy_capacity_leases (lease_id TEXT PRIMARY KEY, request_id TEXT NOT NULL, topology_version INTEGER NOT NULL, capacity_version INTEGER NOT NULL, provisional_child_session_id TEXT NOT NULL, state TEXT NOT NULL, expires_at TEXT NOT NULL, released_at TEXT, lease_json TEXT NOT NULL, lease_digest TEXT NOT NULL);
     CREATE TABLE policy_capacity_claims (lease_id TEXT NOT NULL, dimension TEXT NOT NULL, claim_key TEXT NOT NULL, units INTEGER NOT NULL, PRIMARY KEY (lease_id, dimension, claim_key));
     CREATE TABLE policy_provisional_children (child_session_id TEXT PRIMARY KEY, lease_id TEXT NOT NULL UNIQUE, request_id TEXT NOT NULL, decision_id TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, released_at TEXT);
@@ -1023,7 +1024,15 @@ fn insert_lease(
 }
 
 fn expire_leases(tx: &Transaction<'_>, now: OffsetDateTime) -> Result<()> {
-    tx.execute("UPDATE policy_capacity_leases SET state = 'expired' WHERE state = 'active' AND expires_at <= ?1", [format_time(now)?])?;
+    let now = format_time(now)?;
+    let lease_ids = tx
+        .prepare("SELECT lease_id FROM policy_capacity_leases WHERE state = 'active' AND expires_at <= ?1")?
+        .query_map([&now], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for lease_id in lease_ids {
+        load_lease_tx(tx, &lease_id)?;
+    }
+    tx.execute("UPDATE policy_capacity_leases SET state = 'expired' WHERE state = 'active' AND expires_at <= ?1", [&now])?;
     tx.execute("UPDATE policy_provisional_children SET state = 'expired' WHERE state = 'reserved' AND lease_id IN (SELECT lease_id FROM policy_capacity_leases WHERE state = 'expired')", [])?;
     Ok(())
 }
@@ -1108,6 +1117,26 @@ fn load_projection_tx(
         ));
     }
     Ok(projection)
+}
+
+fn load_active_projection_tx(tx: &Transaction<'_>, lane: &str) -> Result<(String, String)> {
+    let (stored_lane, policy_version, policy_digest, digest): (String, String, String, String) = tx
+        .query_row(
+            "SELECT lane, policy_version, policy_digest, active_projection_digest FROM policy_active_projections WHERE lane = ?1",
+            [lane],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| PolicyStoreError::ProjectionNotFound(lane.into()))?;
+    if stored_lane != lane
+        || active_projection_digest(&stored_lane, &policy_version, &policy_digest)? != digest
+    {
+        return Err(PolicyStoreError::Invalid(
+            "active projection pointer does not match its canonical digest".into(),
+        ));
+    }
+    load_projection_tx(tx, &stored_lane, &policy_version, &policy_digest)?;
+    Ok((policy_version, policy_digest))
 }
 
 fn parse_stored_request(
@@ -1223,11 +1252,11 @@ fn load_terminal_decision(
     request: &PolicySpawnRequest,
     decision_id: &str,
 ) -> Result<PolicyDecision> {
-    let (stored_decision_id, stored_request_id, attempt, override_id, digest, value, created_at): (String, String, u32, Option<String>, String, String, String) = tx
+    let (stored_decision_id, stored_request_id, attempt, override_id, override_terminal_decision_id, digest, value, created_at): (String, String, u32, Option<String>, Option<String>, String, String, String) = tx
         .query_row(
-            "SELECT decision_id, request_id, attempt, override_id, decision_digest, decision_json, created_at FROM policy_decisions WHERE request_id = ?1 AND decision_id = ?2",
+            "SELECT decision_id, request_id, attempt, override_id, override_terminal_decision_id, decision_digest, decision_json, created_at FROM policy_decisions WHERE request_id = ?1 AND decision_id = ?2",
             params![request.request_id, decision_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
         )
         .optional()?
         .ok_or_else(|| {
@@ -1240,6 +1269,7 @@ fn load_terminal_decision(
         &stored_request_id,
         attempt,
         override_id.as_deref(),
+        override_terminal_decision_id.as_deref(),
         &digest,
         &value,
         &created_at,
@@ -1250,11 +1280,11 @@ fn load_latest_terminal_decision(
     tx: &Transaction<'_>,
     request: &PolicySpawnRequest,
 ) -> Result<PolicyDecision> {
-    let (decision_id, request_id, attempt, override_id, digest, value, created_at): (String, String, u32, Option<String>, String, String, String) = tx
+    let (decision_id, request_id, attempt, override_id, override_terminal_decision_id, digest, value, created_at): (String, String, u32, Option<String>, Option<String>, String, String, String) = tx
         .query_row(
-            "SELECT decision_id, request_id, attempt, override_id, decision_digest, decision_json, created_at FROM policy_decisions WHERE request_id = ?1 ORDER BY attempt DESC LIMIT 1",
+            "SELECT decision_id, request_id, attempt, override_id, override_terminal_decision_id, decision_digest, decision_json, created_at FROM policy_decisions WHERE request_id = ?1 ORDER BY attempt DESC LIMIT 1",
             [&request.request_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
         )
         .optional()?
         .ok_or_else(|| PolicyStoreError::OverrideDenied("request has no terminal decision".into()))?;
@@ -1265,6 +1295,7 @@ fn load_latest_terminal_decision(
         &request_id,
         attempt,
         override_id.as_deref(),
+        override_terminal_decision_id.as_deref(),
         &digest,
         &value,
         &created_at,
@@ -1279,6 +1310,7 @@ fn parse_stored_decision(
     request_id: &str,
     attempt: u32,
     override_id: Option<&str>,
+    override_terminal_decision_id: Option<&str>,
     digest: &str,
     value: &str,
     created_at: &str,
@@ -1297,15 +1329,22 @@ fn parse_stored_decision(
             "stored decision does not match authoritative row columns".into(),
         ));
     }
-    if let Some(override_id) = override_id {
+    if let (Some(override_id), Some(override_terminal_decision_id)) =
+        (override_id, override_terminal_decision_id)
+    {
         let override_record = load_override_tx(tx, override_id)?;
         if override_record.request_id != request.request_id
             || override_record.policy_version != request.policy_version
+            || override_record.decision_id != override_terminal_decision_id
         {
             return Err(PolicyStoreError::Invalid(
                 "stored decision override does not bind to this frozen request".into(),
             ));
         }
+    } else if override_id.is_some() || override_terminal_decision_id.is_some() {
+        return Err(PolicyStoreError::Invalid(
+            "stored decision has an incomplete override binding".into(),
+        ));
     }
     if let Some(embedded_lease) = &decision.capacity_lease {
         let stored_lease = load_lease_tx(tx, &embedded_lease.lease_id)?;
@@ -1368,6 +1407,42 @@ fn load_lease_tx(tx: &Transaction<'_>, lease_id: &str) -> Result<PolicyCapacityL
     Ok(lease)
 }
 
+fn load_child_lease_tx(
+    tx: &Transaction<'_>,
+    child_session_id: &str,
+    require_reserved: bool,
+) -> Result<Option<String>> {
+    let row: Option<(String, String, String, String)> = tx
+        .query_row(
+            "SELECT lease_id, request_id, decision_id, state FROM policy_provisional_children WHERE child_session_id = ?1",
+            [child_session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let Some((lease_id, request_id, decision_id, state)) = row else {
+        return Ok(None);
+    };
+    if require_reserved && state != "reserved" {
+        return Ok(None);
+    }
+    let request = load_request_tx(tx, &request_id)?;
+    let decision = load_terminal_decision(tx, &request, &decision_id)?;
+    let lease = load_lease_tx(tx, &lease_id)?;
+    if decision.request_id != request_id
+        || lease.request_id != request_id
+        || decision
+            .capacity_lease
+            .as_ref()
+            .map(|embedded| embedded.lease_id.as_str())
+            != Some(lease_id.as_str())
+    {
+        return Err(PolicyStoreError::Invalid(
+            "provisional child does not match its decision and capacity lease".into(),
+        ));
+    }
+    Ok(Some(lease_id))
+}
+
 fn authorize_override_tx(
     tx: &Transaction<'_>,
     record: &PolicyOverrideRecord,
@@ -1405,14 +1480,15 @@ fn load_reusable_decision(
     override_id: Option<&str>,
 ) -> Result<Option<PolicyDecision>> {
     let value = match override_id {
-        Some(id) => tx.query_row("SELECT decision_id, request_id, attempt, override_id, decision_digest, decision_json, created_at FROM policy_decisions WHERE request_id = ?1 AND override_id = ?2", params![request.request_id, id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?))).optional()?,
-        None => tx.query_row("SELECT decision_id, request_id, attempt, override_id, decision_digest, decision_json, created_at FROM policy_decisions WHERE request_id = ?1 AND override_id IS NULL ORDER BY attempt ASC LIMIT 1", [&request.request_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?))).optional()?,
+        Some(id) => tx.query_row("SELECT decision_id, request_id, attempt, override_id, override_terminal_decision_id, decision_digest, decision_json, created_at FROM policy_decisions WHERE request_id = ?1 AND override_id = ?2", params![request.request_id, id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?))).optional()?,
+        None => tx.query_row("SELECT decision_id, request_id, attempt, override_id, override_terminal_decision_id, decision_digest, decision_json, created_at FROM policy_decisions WHERE request_id = ?1 AND override_id IS NULL ORDER BY attempt ASC LIMIT 1", [&request.request_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, u32>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, String>(7)?))).optional()?,
     };
     let Some((
         stored_decision_id,
         stored_request_id,
         attempt,
         stored_override_id,
+        stored_override_terminal_decision_id,
         digest,
         json,
         created_at,
@@ -1427,6 +1503,7 @@ fn load_reusable_decision(
         &stored_request_id,
         attempt,
         stored_override_id.as_deref(),
+        stored_override_terminal_decision_id.as_deref(),
         &digest,
         &json,
         &created_at,
@@ -1529,6 +1606,13 @@ fn canonical_json_digest(value: &impl Serialize) -> Result<String> {
     serde_json::to_vec(value)
         .map(|encoded| format!("{:x}", Sha256::digest(encoded)))
         .map_err(PolicyStoreError::Json)
+}
+fn active_projection_digest(
+    lane: &str,
+    policy_version: &str,
+    policy_digest: &str,
+) -> Result<String> {
+    canonical_json_digest(&(lane, policy_version, policy_digest))
 }
 fn override_state_name(state: &PolicyOverrideState) -> &'static str {
     match state {
@@ -2482,6 +2566,167 @@ mod tests {
             Err(PolicyStoreError::Invalid(_))
         ));
         for path in [schema_path, override_path, capacity_path] {
+            std::fs::remove_file(path).ok();
+        }
+    }
+
+    #[test]
+    fn override_lifecycle_and_active_pointer_rebinding_fail_closed() {
+        let (override_store, path) = store("round-two-authority-tamper");
+        let mut override_projection = projection(true, 2);
+        for rule in &mut override_projection.rules {
+            rule.lease_ttl_seconds = 1;
+        }
+        install(&override_store, &override_projection);
+        override_store
+            .set_runtime_versions(&override_projection.lane, 1, 1)
+            .unwrap();
+        let rewrite = request(
+            "round-two-rewrite",
+            PolicyVehicle::NamedSeat,
+            Some("fable"),
+            "round-two-rewrite-intent",
+        );
+        override_store.create_request(&rewrite).unwrap();
+        let now = instant("2026-08-17T00:01:00Z");
+        let rejected = override_store
+            .prepare_admission(
+                &rewrite.request_id,
+                &class("named_orchestrator", Some("maintainer")),
+                None,
+                "round-two-rewrite-child",
+                now,
+            )
+            .unwrap()
+            .decision;
+        let override_record = override_store
+            .authorize_request_override(
+                &rewrite.request_id,
+                &rewrite.caller,
+                "same-request rebinding test",
+                now,
+                time::Duration::minutes(1),
+            )
+            .unwrap();
+        let allowed = override_store
+            .prepare_admission(
+                &rewrite.request_id,
+                &class("named_orchestrator", Some("maintainer")),
+                Some(&override_record.override_id),
+                "round-two-allowed-child",
+                now,
+            )
+            .unwrap()
+            .decision;
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE policy_decisions SET override_id = NULL WHERE decision_id = ?1",
+            [&allowed.decision_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE policy_decisions SET override_id = ?2 WHERE decision_id = ?1",
+            params![rejected.decision_id, override_record.override_id],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(matches!(
+            override_store.prepare_admission(
+                &rewrite.request_id,
+                &class("named_orchestrator", Some("maintainer")),
+                Some(&override_record.override_id),
+                "round-two-allowed-child",
+                now,
+            ),
+            Err(PolicyStoreError::Invalid(_))
+        ));
+
+        let (lease_store, lease_path) = store("round-two-expired-lease-tamper");
+        let mut lease_projection = projection(true, 1);
+        for rule in &mut lease_projection.rules {
+            rule.lease_ttl_seconds = 1;
+        }
+        install(&lease_store, &lease_projection);
+        lease_store
+            .set_runtime_versions(&lease_projection.lane, 1, 1)
+            .unwrap();
+        let first = request(
+            "round-two-first",
+            PolicyVehicle::TaskAgent,
+            None,
+            "round-two-first-intent",
+        );
+        let second = request(
+            "round-two-second",
+            PolicyVehicle::TaskAgent,
+            None,
+            "round-two-second-intent",
+        );
+        lease_store.create_request(&first).unwrap();
+        lease_store.create_request(&second).unwrap();
+        let first_decision = lease_store
+            .prepare_admission(
+                &first.request_id,
+                &class("routine_bounded", None),
+                None,
+                "round-two-first-child",
+                now,
+            )
+            .unwrap()
+            .decision;
+        let conn = Connection::open(&lease_path).unwrap();
+        conn.execute(
+            "UPDATE policy_capacity_leases SET lease_json = '{\"bad\":true}' WHERE lease_id = ?1",
+            [&first_decision.capacity_lease.unwrap().lease_id],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(matches!(
+            lease_store.prepare_admission(
+                &second.request_id,
+                &class("routine_bounded", None),
+                None,
+                "round-two-second-child",
+                now + time::Duration::seconds(2),
+            ),
+            Err(PolicyStoreError::Json(_))
+        ));
+
+        let (pointer_store, pointer_path) = store("round-two-pointer-tamper");
+        let v1 = projection(true, 1);
+        install(&pointer_store, &v1);
+        pointer_store.set_runtime_versions(&v1.lane, 1, 1).unwrap();
+        let v1_request = request(
+            "round-two-pointer",
+            PolicyVehicle::TaskAgent,
+            None,
+            "round-two-pointer-intent",
+        );
+        pointer_store.create_request(&v1_request).unwrap();
+        let mut v2 = v1.clone();
+        v2.policy_version = "v2".into();
+        pointer_store.install_projection(&v2).unwrap();
+        pointer_store
+            .activate_projection(&v2.lane, &v2.policy_version, &v2.policy_digest)
+            .unwrap();
+        let conn = Connection::open(&pointer_path).unwrap();
+        conn.execute(
+            "UPDATE policy_active_projections SET policy_version = ?2 WHERE lane = ?1",
+            params![v1.lane, v1.policy_version],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(matches!(
+            pointer_store.prepare_admission(
+                &v1_request.request_id,
+                &class("routine_bounded", None),
+                None,
+                "round-two-pointer-child",
+                now,
+            ),
+            Err(PolicyStoreError::Invalid(_))
+        ));
+        for path in [path, lease_path, pointer_path] {
             std::fs::remove_file(path).ok();
         }
     }
