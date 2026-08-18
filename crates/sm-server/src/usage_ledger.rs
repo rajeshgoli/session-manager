@@ -401,6 +401,7 @@ impl UsageLedgerStore {
                   SELECT DISTINCT msg_id, window_kind
                   FROM message_window_v1_rolling_cache
                 ) AS mapped ON mapped.msg_id = ledger.msg_id
+                WHERE ledger.model != '<synthetic>'
                 GROUP BY ledger.seat_id, ledger.account_key, ledger.project_key,
                          mapped.window_kind, ledger.bucket_ts, ledger.model, ledger.credit_metered;
 
