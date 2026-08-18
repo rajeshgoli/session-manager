@@ -1,3 +1,7 @@
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+
 use serde_json::{Map, Value};
 
 use crate::policy_contracts::{
@@ -6,6 +10,7 @@ use crate::policy_contracts::{
 
 const CODEX_FORK_PROVIDER: &str = "codex-fork";
 const CODEX_PROVIDER_ID: &str = "openai";
+const MAX_RELEVANT_LAUNCH_EVENTS: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeAttestationError {
@@ -35,6 +40,81 @@ struct CodexSessionStart {
     epoch: u64,
     seq: u64,
     model: String,
+}
+
+pub fn attest_codex_fork_launch_file(
+    event_stream_path: &Path,
+    expected: &PolicyLaunchProfile,
+    decision_id: &str,
+    launch_intent_id: &str,
+    child_session_id: &str,
+    provider_resume_id: &str,
+) -> Result<PolicyRuntimeAttestation, RuntimeAttestationError> {
+    let file = File::open(event_stream_path).map_err(|error| {
+        RuntimeAttestationError::new(
+            "codex_event_stream_unavailable",
+            format!(
+                "failed to open provider event stream {}: {error}",
+                event_stream_path.display()
+            ),
+        )
+    })?;
+    let mut relevant = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| {
+            RuntimeAttestationError::new(
+                "codex_event_stream_read_failed",
+                format!(
+                    "failed to read provider event stream {}: {error}",
+                    event_stream_path.display()
+                ),
+            )
+        })?;
+        let event = serde_json::from_str::<Value>(&line).map_err(|error| {
+            RuntimeAttestationError::new(
+                "invalid_codex_event_json",
+                format!(
+                    "provider event stream {} contains invalid JSON: {error}",
+                    event_stream_path.display()
+                ),
+            )
+        })?;
+        let event_type = event.get("event_type").and_then(Value::as_str);
+        if !matches!(
+            event_type,
+            Some("session_start" | "thread/settings/updated")
+        ) {
+            continue;
+        }
+        let is_target_settings = event_type == Some("thread/settings/updated")
+            && event.get("session_id").and_then(Value::as_str) == Some(provider_resume_id)
+            && event
+                .get("payload")
+                .and_then(|payload| payload.get("threadId"))
+                .and_then(Value::as_str)
+                == Some(provider_resume_id);
+        relevant.push(event);
+        if relevant.len() > MAX_RELEVANT_LAUNCH_EVENTS {
+            return Err(RuntimeAttestationError::new(
+                "codex_launch_evidence_limit_exceeded",
+                format!(
+                    "provider launch evidence exceeded {MAX_RELEVANT_LAUNCH_EVENTS} relevant events"
+                ),
+            ));
+        }
+        if is_target_settings {
+            break;
+        }
+    }
+
+    attest_codex_fork_launch(
+        &relevant,
+        expected,
+        decision_id,
+        launch_intent_id,
+        child_session_id,
+        provider_resume_id,
+    )
 }
 
 /// Builds provider-originated launch evidence from the bounded event range for
@@ -234,6 +314,9 @@ fn required_text_object<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use serde_json::json;
 
     use super::*;
@@ -360,5 +443,72 @@ mod tests {
         }));
 
         assert!(attest(&evidence).is_ok());
+    }
+
+    #[test]
+    fn codex_launch_file_reads_real_jsonl_shape_and_stops_at_initial_settings() {
+        let path = unique_temp_path("codex-launch-events");
+        let mut evidence = events("gpt-5.6-terra", "high");
+        evidence.insert(
+            1,
+            json!({
+                "schema_version": 2,
+                "ts": "2026-08-17T23:00:00.500Z",
+                "session_id": "thread-1",
+                "seq": 4,
+                "session_epoch": 7,
+                "event_type": "op_submitted",
+                "payload": {"UserTurn": {"items": [{"type": "text", "text": "brief"}]}}
+            }),
+        );
+        evidence.push(json!({"this later line": "does not need to be parsed"}));
+        let body = evidence
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, body).unwrap();
+
+        let attestation = attest_codex_fork_launch_file(
+            &path,
+            &expected(),
+            "decision-1",
+            "intent-1",
+            "child-1",
+            "thread-1",
+        )
+        .unwrap();
+
+        assert_eq!(attestation.evidence_id, "codex-fork:thread-1:7:8");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn codex_launch_file_fails_closed_on_malformed_evidence_before_settings() {
+        let path = unique_temp_path("codex-launch-malformed");
+        let start = events("gpt-5.6-terra", "high").remove(0);
+        fs::write(&path, format!("{}\nnot-json\n", start)).unwrap();
+
+        let error = attest_codex_fork_launch_file(
+            &path,
+            &expected(),
+            "decision-1",
+            "intent-1",
+            "child-1",
+            "thread-1",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "invalid_codex_event_json");
+        fs::remove_file(path).unwrap();
+    }
+
+    fn unique_temp_path(label: &str) -> std::path::PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "sm-policy-{label}-{}-{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 }
