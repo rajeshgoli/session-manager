@@ -8190,6 +8190,7 @@ impl SessionStore {
                     .is_some_and(|previous_tokens| usage.tokens_used < previous_tokens)
                 {
                     reset_context_oneshot_flags(session);
+                    self.cancel_context_monitor_alerts(session_id)?;
                 }
                 let snapshot_changed = previous_used != Some(usage.tokens_used)
                     || previous_pct != Some(usage.used_percentage)
@@ -20389,7 +20390,12 @@ mod tests {
 
     #[test]
     fn codex_fork_monitor_uses_only_root_usage_and_rearms_after_native_compaction() {
-        let store = store_with_provider_child("ctxcodexcycles", "codex-fork", "running");
+        let initial = store_with_provider_child("ctxcodexcycles", "codex-fork", "running");
+        let state_file = initial.state_file.clone();
+        let queue_db = state_file.with_extension("db");
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue.ensure_schema().unwrap();
+        let store = SessionStore::new_with_queue(state_file, queue_db);
         let mut state = store.load_raw_json_value().unwrap();
         let sessions = ensure_sessions_array_mut(&mut state).unwrap();
         session_object_mut(sessions, "child001").unwrap().insert(
@@ -20430,19 +20436,38 @@ mod tests {
         let first_text = first_alert["text"].as_str().unwrap();
         assert!(first_text.contains("Codex will compact inline"));
         assert!(!first_text.contains("run `sm handoff <path>`"));
+        assert_eq!(
+            queue
+                .pending_messages_for_target("child001", 10)
+                .unwrap()
+                .len(),
+            1
+        );
 
         // A lower resident-token count is Codex's observed native-compaction
-        // boundary, so the next high-water cycle must notify again.
+        // boundary, so stale alerts are discarded and the next high-water
+        // cycle can notify again.
         store
             .apply_codex_fork_event_line("child001", &usage_event("root-thread", 20_000))
             .unwrap();
         let compacted = store.get_session("child001").unwrap().unwrap();
         assert!(!compacted.context_warning_sent);
         assert!(!compacted.context_critical_sent);
+        assert!(queue
+            .pending_messages_for_target("child001", 10)
+            .unwrap()
+            .is_empty());
         store
             .apply_codex_fork_event_line("child001", &usage_event("root-thread", 181_000))
             .unwrap();
         assert_eq!(context_monitor_messages(&store).len(), 2);
+        assert_eq!(
+            queue
+                .pending_messages_for_target("child001", 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
