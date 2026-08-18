@@ -15,6 +15,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use nix::fcntl::{Flock, FlockArg};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -2589,6 +2590,13 @@ impl SessionStore {
     }
 
     pub fn reconcile_reparent_requests(&self) -> Result<Option<ReparentRequestRecord>> {
+        // `reparent_apply_lock` only protects HTTP calls served by this
+        // SessionStore.  Startup recovery and an overlapping server process
+        // construct distinct stores, so retain an advisory lock for the full
+        // JSON + queue transaction as well.  flock is released on crash,
+        // which leaves the persisted lease available to the next recovery
+        // driver rather than stranding it.
+        let _cross_process_guard = self.reparent_apply_file_lock()?;
         let _apply_guard = self
             .reparent_apply_lock
             .lock()
@@ -2629,6 +2637,11 @@ impl SessionStore {
     }
 
     pub fn reconcile_reparent_notifications(&self) -> Result<()> {
+        // A notification is an outbox projection of the committed request,
+        // not an observation made by a losing apply driver.  Serialize the
+        // projection with apply/recovery, then enqueue only intents that are
+        // still desired by the durable record while this lock is held.
+        let _cross_process_guard = self.reparent_apply_file_lock()?;
         let (pending, recipients) = {
             let _guard = self.write_guard()?;
             let mut state = self.load_raw_json_value()?;
@@ -2638,7 +2651,23 @@ impl SessionStore {
                 refresh_reparent_requests(&mut records, &sessions, OffsetDateTime::now_utc());
             let mut changed = refreshed;
             for record in &mut records {
-                for desired in desired_reparent_notifications(record) {
+                let desired = desired_reparent_notifications(record);
+                let desired_keys = desired
+                    .iter()
+                    .map(|desired| desired.intent.key.as_str())
+                    .collect::<BTreeSet<_>>();
+                // A prior process may have recorded a not-yet-enqueued
+                // terminal intent before a winning driver committed the
+                // request.  Keep delivered audit history, but remove any
+                // unsent losing projection before choosing outbox work.
+                let previous_len = record.notification_intents.len();
+                record.notification_intents.retain(|intent| {
+                    intent.enqueued_at.is_some()
+                        || !intent.event.starts_with("terminal:")
+                        || desired_keys.contains(intent.key.as_str())
+                });
+                changed |= record.notification_intents.len() != previous_len;
+                for desired in desired {
                     if record
                         .notification_intents
                         .iter()
@@ -2677,6 +2706,27 @@ impl SessionStore {
             (pending, recipients)
         };
         for desired in pending {
+            let desired = {
+                let _guard = self.write_guard()?;
+                let state = self.load_raw_json_value()?;
+                let records = reparent_request_records(&state)?;
+                let Some(record) = records
+                    .iter()
+                    .find(|record| record.id == desired.request_id)
+                else {
+                    continue;
+                };
+                let Some(current) = desired_reparent_notifications(record)
+                    .into_iter()
+                    .find(|current| current.intent.key == desired.intent.key)
+                else {
+                    // The request reached a different durable outcome after
+                    // this reconciliation pass selected its work.  Never
+                    // enqueue a stale terminal projection.
+                    continue;
+                };
+                current
+            };
             let queue = self
                 .queue_store
                 .as_ref()
@@ -2747,56 +2797,57 @@ impl SessionStore {
             ));
         }
         let attempted_at = now_rfc3339();
-        {
-            let _guard = self.write_guard()?;
-            let mut state = self.load_raw_json_value()?;
-            let mut records = reparent_request_records(&state)?;
-            let Some(record) = records.iter_mut().find(|record| record.id == request_id) else {
-                return Ok(ReparentMutationOutcome::RequestNotFound);
-            };
-            let lease = reparent_apply_lease(&state)?;
-            if record.status != "failed"
-                || lease.as_ref().map(|lease| lease.request_id.as_str()) != Some(request_id)
-            {
-                return Ok(ReparentMutationOutcome::Conflict(format!(
-                    "request {request_id} is not a quarantined apply transaction"
-                )));
-            }
-            let stage = record.apply_stage.as_deref().unwrap_or("applying");
-            let allowed = match action {
-                ReparentRepairAction::Resume => matches!(
-                    stage,
-                    "prequiesce_aborting"
-                        | "json_routing_quiesced"
-                        | "routing_quiesced"
-                        | "authority_committed"
-                ),
-                ReparentRepairAction::RollbackPrecommit => {
-                    matches!(stage, "json_routing_quiesced" | "routing_quiesced")
-                }
-            };
-            if !allowed {
-                return Ok(ReparentMutationOutcome::Conflict(format!(
-                    "repair action {} is not allowed from stage {stage}",
-                    action.as_str()
-                )));
-            }
-            record.repair_history.push(ReparentRepairRecord {
-                actor_kind: "human".to_owned(),
-                actor_id: actor_id.to_owned(),
-                action: action.as_str().to_owned(),
-                prior_failure: record.failure_reason.clone(),
-                attempted_at: attempted_at.clone(),
-                verified_state_fingerprint: None,
-            });
-            if action == ReparentRepairAction::Resume {
-                record.status = "applying".to_owned();
-                record.failure_reason = None;
-            }
-            store_reparent_request_records(&mut state, &records)?;
-            self.write_raw_json_value(&state)?;
-        }
         let repaired = {
+            let _cross_process_guard = self.reparent_apply_file_lock()?;
+            {
+                let _guard = self.write_guard()?;
+                let mut state = self.load_raw_json_value()?;
+                let mut records = reparent_request_records(&state)?;
+                let Some(record) = records.iter_mut().find(|record| record.id == request_id) else {
+                    return Ok(ReparentMutationOutcome::RequestNotFound);
+                };
+                let lease = reparent_apply_lease(&state)?;
+                if record.status != "failed"
+                    || lease.as_ref().map(|lease| lease.request_id.as_str()) != Some(request_id)
+                {
+                    return Ok(ReparentMutationOutcome::Conflict(format!(
+                        "request {request_id} is not a quarantined apply transaction"
+                    )));
+                }
+                let stage = record.apply_stage.as_deref().unwrap_or("applying");
+                let allowed = match action {
+                    ReparentRepairAction::Resume => matches!(
+                        stage,
+                        "prequiesce_aborting"
+                            | "json_routing_quiesced"
+                            | "routing_quiesced"
+                            | "authority_committed"
+                    ),
+                    ReparentRepairAction::RollbackPrecommit => {
+                        matches!(stage, "json_routing_quiesced" | "routing_quiesced")
+                    }
+                };
+                if !allowed {
+                    return Ok(ReparentMutationOutcome::Conflict(format!(
+                        "repair action {} is not allowed from stage {stage}",
+                        action.as_str()
+                    )));
+                }
+                record.repair_history.push(ReparentRepairRecord {
+                    actor_kind: "human".to_owned(),
+                    actor_id: actor_id.to_owned(),
+                    action: action.as_str().to_owned(),
+                    prior_failure: record.failure_reason.clone(),
+                    attempted_at: attempted_at.clone(),
+                    verified_state_fingerprint: None,
+                });
+                if action == ReparentRepairAction::Resume {
+                    record.status = "applying".to_owned();
+                    record.failure_reason = None;
+                }
+                store_reparent_request_records(&mut state, &records)?;
+                self.write_raw_json_value(&state)?;
+            }
             let _apply_guard = self
                 .reparent_apply_lock
                 .lock()
@@ -3101,6 +3152,18 @@ impl SessionStore {
             let stage = {
                 let _guard = self.write_guard()?;
                 let state = self.load_raw_json_value()?;
+                let records = reparent_request_records(&state)?;
+                if records
+                    .iter()
+                    .find(|record| record.id == request_id)
+                    .is_some_and(|record| record.status == "applied")
+                {
+                    // A competing completion may have won between an I/O
+                    // stage and this retry.  Its durable terminal state is
+                    // authoritative; never reinterpret the released lease
+                    // as a failure.
+                    return Ok(());
+                }
                 let lease =
                     reparent_apply_lease(&state)?.context("reparent apply lease disappeared")?;
                 if lease.request_id != request_id {
@@ -3109,7 +3172,7 @@ impl SessionStore {
                         lease.request_id
                     );
                 }
-                reparent_request_records(&state)?
+                records
                     .into_iter()
                     .find(|record| record.id == request_id)
                     .with_context(|| format!("reparent request {request_id} disappeared"))?
@@ -3572,6 +3635,16 @@ impl SessionStore {
             let _guard = self.write_guard()?;
             let mut state = self.load_raw_json_value()?;
             let mut records = reparent_request_records(&state)?;
+            if records
+                .iter()
+                .find(|record| record.id == request_id)
+                .is_some_and(|record| record.status == "applied")
+            {
+                // The apply error belongs to a losing/retried driver.  Do
+                // not overwrite, clear, or notify against an already
+                // committed terminal outcome.
+                return Ok(());
+            }
             let record = leased_reparent_request_mut(&state, &mut records, request_id)?;
             let before_quiesce = matches!(record.apply_stage.as_deref(), None | Some("applying"));
             record.status = "failed".to_owned();
@@ -7653,6 +7726,32 @@ impl SessionStore {
         self.write_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("session state write lock poisoned"))
+    }
+
+    /// Lock the complete reparent transaction across SessionStore instances.
+    /// The lock is intentionally separate from the atomically-replaced JSON
+    /// state file: replacing that file would otherwise drop an advisory lock
+    /// held on the old inode while an apply is still in progress.
+    fn reparent_apply_file_lock(&self) -> Result<Flock<fs::File>> {
+        let lock_path = self.state_file.with_extension("reparent-apply.lock");
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create reparent lock directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open reparent lock {}", lock_path.display()))?;
+        Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, error)| {
+            anyhow::anyhow!("failed to lock {}: {error}", lock_path.display())
+        })
     }
 
     fn start_codex_fork_event_monitor(
@@ -12586,24 +12685,12 @@ fn store_reparent_request_records(
     state: &mut Value,
     records: &[ReparentRequestRecord],
 ) -> Result<()> {
-    let mut records = records.to_vec();
-    for record in &mut records {
-        for desired in desired_reparent_notifications(record) {
-            if record
-                .notification_intents
-                .iter()
-                .all(|intent| intent.key != desired.intent.key)
-            {
-                record.notification_intents.push(desired.intent);
-            }
-        }
-    }
     let object = state
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("session state root must be an object"))?;
     object.insert(
         "reparent_requests".to_owned(),
-        serde_json::to_value(&records)?,
+        serde_json::to_value(records)?,
     );
     Ok(())
 }
@@ -13846,9 +13933,31 @@ fn desired_reparent_notifications(
                 ));
             }
         }
+    } else if record.status == "failed" {
+        // `failed` is an operator-repairable quarantine, not a terminal
+        // result: resume may still commit the plan and pre-commit rollback may
+        // produce `repaired`.  Calling it terminal creates contradictory
+        // notifications for a single request.
+        let event = format!(
+            "quarantined:{}",
+            record.apply_stage.as_deref().unwrap_or("applying")
+        );
+        for recipient in record
+            .required_agent_approvals
+            .iter()
+            .chain(std::iter::once(&record.initiator_session_id))
+            .collect::<BTreeSet<_>>()
+        {
+            desired.push(reparent_notification(
+                record,
+                &event,
+                recipient,
+                reparent_quarantined_notification_text(record),
+            ));
+        }
     } else if matches!(
         record.status.as_str(),
-        "applied" | "rejected" | "expired" | "stale" | "superseded" | "failed" | "repaired"
+        "applied" | "rejected" | "expired" | "stale" | "superseded" | "repaired"
     ) {
         let event = format!("terminal:{}", record.status);
         for recipient in record
@@ -13932,6 +14041,20 @@ fn reparent_terminal_notification_text(record: &ReparentRequestRecord) -> String
         "[sm reparent] Request {} is {}. {}{}",
         record.id,
         record.status,
+        reparent_edge_summary(record),
+        record
+            .failure_reason
+            .as_deref()
+            .map(|reason| format!(" Reason: {reason}."))
+            .unwrap_or_default(),
+    )
+}
+
+fn reparent_quarantined_notification_text(record: &ReparentRequestRecord) -> String {
+    format!(
+        "[sm reparent] Request {} is quarantined at {} and has no terminal outcome yet. {}{}",
+        record.id,
+        record.apply_stage.as_deref().unwrap_or("applying"),
         reparent_edge_summary(record),
         record
             .failure_reason
@@ -14987,6 +15110,7 @@ mod tests {
     use crate::config::AppConfig;
     use crate::usage_identity::{AccountIdentity, Provider, UsageIdentityStore};
     use rusqlite::Connection;
+    use std::sync::{Arc, Barrier};
 
     #[test]
     fn accepted_spawn_brief_is_private_immutable_and_records_launch_intent() {
@@ -20075,6 +20199,115 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(target_intents.len(), 1);
         assert!(target_intents[0]["enqueued_at"].is_string());
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn concurrent_approve_recovery_and_restart_emit_one_truthful_terminal_notification() {
+        // Reproduce the production interleaving: two independently-created
+        // stores (an approve handler and a recovering process) see one ready
+        // request.  Before the cross-process transaction lock, one could
+        // finish `applied` while the other persisted/enqueued `failed` after
+        // observing the released lease.
+        let (approve_store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-concurrent-terminal");
+        let recovery_store = SessionStore::new_with_queue(state_file.clone(), queue_db.clone());
+        let start = Arc::new(Barrier::new(2));
+
+        let approve_start = Arc::clone(&start);
+        let approve = thread::spawn(move || {
+            approve_start.wait();
+            approve_store.reconcile_reparent_requests()
+        });
+        let recovery_start = Arc::clone(&start);
+        let recovery = thread::spawn(move || {
+            recovery_start.wait();
+            recovery_store.reconcile_reparent_requests()
+        });
+
+        let approve = approve.join().unwrap().unwrap();
+        let recovery = recovery.join().unwrap().unwrap();
+        assert!([approve, recovery]
+            .into_iter()
+            .flatten()
+            .all(|record| record.status == "applied"));
+
+        // A fresh store represents restart recovery and must project only the
+        // committed topology's terminal state, even when reconciliation is
+        // retried.
+        let restarted = SessionStore::new_with_queue(state_file.clone(), queue_db.clone());
+        restarted.reconcile_reparent_notifications().unwrap();
+        restarted.reconcile_reparent_notifications().unwrap();
+
+        let record = restarted
+            .get_reparent_request(&request_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, "applied");
+        assert_eq!(record.apply_stage.as_deref(), Some("applied"));
+        assert_eq!(
+            restarted
+                .get_session("child001")
+                .unwrap()
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("newpar01")
+        );
+        for recipient in ["oldpar01", "newpar01"] {
+            let messages = queue.pending_messages_for_target(recipient, 10).unwrap();
+            assert_eq!(messages.len(), 1, "recipient {recipient}");
+            assert!(messages[0]
+                .text
+                .contains(&format!("Request {request_id} is applied.")));
+            assert!(!messages[0].text.contains(" is failed."));
+        }
+        assert!(record.notification_intents.iter().all(|intent| {
+            !intent.event.starts_with("terminal:") || intent.event == "terminal:applied"
+        }));
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn notification_retry_discards_an_unsent_losing_failed_terminal_projection() {
+        let (store, queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-losing-failed-notification");
+        store.reconcile_reparent_requests().unwrap();
+        {
+            let _guard = store.write_guard().unwrap();
+            let mut state = store.load_raw_json_value().unwrap();
+            let mut records = reparent_request_records(&state).unwrap();
+            let record = records
+                .iter_mut()
+                .find(|record| record.id == request_id)
+                .unwrap();
+            record
+                .notification_intents
+                .push(ReparentNotificationIntent {
+                    key: format!("reparent:{request_id}:terminal:failed:oldpar01"),
+                    event: "terminal:failed".to_owned(),
+                    recipient_session_id: "oldpar01".to_owned(),
+                    enqueued_at: None,
+                });
+            store_reparent_request_records(&mut state, &records).unwrap();
+            store.write_raw_json_value(&state).unwrap();
+        }
+
+        store.reconcile_reparent_notifications().unwrap();
+        let record = store.get_reparent_request(&request_id).unwrap().unwrap();
+        assert!(record.notification_intents.iter().all(|intent| {
+            intent.enqueued_at.is_some()
+                || !intent.event.starts_with("terminal:")
+                || intent.event == "terminal:applied"
+        }));
+        let messages = queue.pending_messages_for_target("oldpar01", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].text.contains(" is applied."));
+        assert!(!messages[0].text.contains(" is failed."));
 
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
