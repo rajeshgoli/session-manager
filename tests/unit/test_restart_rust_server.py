@@ -21,6 +21,7 @@ SCRIPT = REPO_ROOT / "scripts" / "restart-rust-server.sh"
 
 CALLS = "calls.log"
 LABEL = "com.example.test"
+SIGN_IDENTITY = "36FC54A873D584A34FCFEEA7D1F519B19A39DE72"
 
 
 def _write(path: Path, body: str, executable: bool = False) -> Path:
@@ -78,6 +79,13 @@ def env(tmp_path, request):
     (state / "cargo_rc").write_text("0")
     (state / "codesign_sign_rc").write_text("0")
     (state / "codesign_verify_rc").write_text("0")
+    (state / "codesign_inspect_rc").write_text("0")
+    (state / "codesign_requirement_rc").write_text("0")
+    (state / "signing_identity_present").write_text("1")
+    (state / "signed_identifier").write_text("com.rajeshgoli.sm-server")
+    (state / "signed_signature").write_text("")
+    (state / "signed_authority").write_text("Office Automate Local Signing")
+    (state / "requirement_identity").write_text(SIGN_IDENTITY.lower())
     (state / "start_rc").write_text("0")
     (state / "stop_rc").write_text("0")
     (state / "stop_leaves_loaded").write_text("0")
@@ -134,10 +142,36 @@ echo "codesign $* [registered=$reg]" >> "{log}"
 for a in "$@"; do
   case "$a" in
     --verify) exit "$(cat "{state}/codesign_verify_rc")" ;;
-    -dvvv) echo "Identifier=com.rajeshgoli.sm-server" >&2; exit 0 ;;
+    -dvvv)
+      echo "Identifier=$(cat "{state}/signed_identifier")" >&2
+      signature="$(cat "{state}/signed_signature")"
+      [[ -n "$signature" ]] && echo "Signature=$signature" >&2
+      authority="$(cat "{state}/signed_authority")"
+      [[ -n "$authority" ]] && echo "Authority=$authority" >&2
+      exit "$(cat "{state}/codesign_inspect_rc")"
+      ;;
+    -dr)
+      requirement="designated => identifier \\\"$(cat "{state}/signed_identifier")\\\" and certificate root = H\\\"$(cat "{state}/requirement_identity")\\\""
+      echo "$requirement" >> "{state}/requirements.log"
+      echo "$requirement" >&2
+      exit "$(cat "{state}/codesign_requirement_rc")"
+      ;;
   esac
 done
 exit "$(cat "{state}/codesign_sign_rc")"
+""",
+        executable=True,
+    )
+    _write(
+        bin_dir / "security",
+        f"""#!/bin/bash
+echo "security $*" >> "{log}"
+if [[ "$(cat "{state}/signing_identity_present")" == "1" ]]; then
+  echo '  1) {SIGN_IDENTITY} "Office Automate Local Signing"'
+  echo '     1 valid identities found'
+else
+  echo '     0 valid identities found'
+fi
 """,
         executable=True,
     )
@@ -251,6 +285,9 @@ exit 0
     )
 
     config = _write(tmp_path / "config.yaml", "server:\n  port: 8420\n")
+    signing_config = _write(
+        tmp_path / "rust-server-signing.env", f"SM_SIGN_IDENTITY={SIGN_IDENTITY}\n"
+    )
     # Matches the stub's render-plist output, so there is no divergence by default.
     plist = _write(tmp_path / "service.plist", "<plist>canned</plist>\n")
     authority_socket_path = Path("/tmp") / f"sm-rst-{uuid.uuid4().hex}.sock"
@@ -269,6 +306,7 @@ exit 0
         "log": log,
         "installed": installed,
         "cargo_output": cargo_output,
+        "signing_config": signing_config,
         "plist": plist,
         "authority_socket": authority_socket,
         "authority_socket_path": authority_socket_path,
@@ -280,6 +318,7 @@ exit 0
             installed,
             cargo_output,
             config,
+            signing_config,
             plist,
             authority_socket_path,
             authority_verifier,
@@ -293,6 +332,7 @@ def _make_runner(
     installed,
     cargo_output,
     config,
+    signing_config,
     plist,
     authority_socket_path,
     authority_verifier,
@@ -308,6 +348,7 @@ def _make_runner(
             "SM_PLIST": str(plist),
             "SM_CUTOVER": str(cutover),
             "SM_CONFIG": str(config),
+            "SM_SIGNING_CONFIG": str(signing_config),
             "SM_PYTHON_LABELS": "com.example.legacy-python",  # extra, on top of the enforced set
             "SM_HOST": "127.0.0.1",
             "SM_PORT": "9",
@@ -315,6 +356,7 @@ def _make_runner(
             "SM_PID_SETTLE_SECONDS": "2",
             "SM_UNLOAD_TIMEOUT": "2",
             "SM_LABEL": LABEL,
+            "SM_SIGN_IDENTITY": SIGN_IDENTITY,
             "SM_LOCK": str(binary_dir_lock),
             "SM_QUEUE_AUTHORITY_SOCKET": str(authority_socket_path),
             "SM_QUEUE_AUTHORITY_VERIFIER": str(authority_verifier),
@@ -372,7 +414,7 @@ def test_sign_failure_leaves_service_untouched(env):
     result = env["run"]()
 
     assert result.returncode != 0
-    assert "codesign failed" in result.stderr
+    assert "codesign with persistent identity" in result.stderr
     assert_service_untouched(env)
 
 
@@ -383,6 +425,57 @@ def test_verify_failure_leaves_service_untouched(env):
 
     assert result.returncode != 0
     assert "signature verification failed" in result.stderr
+    assert_service_untouched(env)
+
+
+def test_missing_signing_identity_blocks_before_service_mutation(env):
+    env["signing_config"].write_text("# identity deliberately missing\n")
+    result = env["run"](SM_SIGN_IDENTITY="")
+
+    assert result.returncode != 0
+    assert "signing config must contain exactly one" in result.stderr
+    assert "cargo build" not in calls(env)
+    assert_service_untouched(env)
+
+
+def test_unusable_keychain_identity_blocks_before_service_mutation(env):
+    (env["state"] / "signing_identity_present").write_text("0")
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "not a valid usable codesigning identity" in result.stderr
+    assert "cargo build" not in calls(env)
+    assert_service_untouched(env)
+
+
+def test_ad_hoc_staged_output_blocks_before_service_mutation(env):
+    (env["state"] / "signed_signature").write_text("adhoc")
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "staged signature is ad-hoc" in result.stderr
+    assert_service_untouched(env)
+
+
+def test_wrong_staged_identifier_blocks_before_service_mutation(env):
+    (env["state"] / "signed_identifier").write_text("com.example.wrong")
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "staged signature identifier is not" in result.stderr
+    assert_service_untouched(env)
+
+
+def test_wrong_staged_certificate_authority_blocks_before_service_mutation(env):
+    (env["state"] / "requirement_identity").write_text("0" * 40)
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "stable certificate-anchored requirement" in result.stderr
     assert_service_untouched(env)
 
 
@@ -632,6 +725,38 @@ def test_signs_with_a_stable_identifier(env):
     env["run"]()
 
     assert "--identifier com.rajeshgoli.sm-server" in calls(env)
+    assert f"--sign {SIGN_IDENTITY}" in calls(env)
+
+
+def test_tracked_signing_config_supplies_the_durable_default(env):
+    result = env["run"](SM_SIGN_IDENTITY="")
+
+    assert result.returncode == 0, result.stderr
+    assert f"--sign {SIGN_IDENTITY}" in calls(env)
+
+
+def test_two_different_staged_binaries_require_the_same_certificate_requirement(env):
+    """Changed bytes must not turn the TCC-facing identity back into a CDHash.
+
+    The two runs stage different fake cargo outputs. The codesign stub records
+    the exact designated requirement requested by the real script's inspection
+    path, so this catches a regression that checks only the identifier or only
+    the first staged binary.
+    """
+    first = env["run"]()
+    assert first.returncode == 0, first.stderr
+
+    _write(env["state"] / "rebuilt-binary", _fake(env, "REBUILT_CHANGED"))
+    second = env["run"]()
+    assert second.returncode == 0, second.stderr
+    assert "MARKER=REBUILT_CHANGED" in env["installed"].read_text()
+
+    requirements = (env["state"] / "requirements.log").read_text().splitlines()
+    expected = (
+        'designated => identifier "com.rajeshgoli.sm-server" '
+        f'and certificate root = H"{SIGN_IDENTITY.lower()}"'
+    )
+    assert requirements == [expected, expected]
 
 
 def test_restart_goes_through_the_cutover_script(env):

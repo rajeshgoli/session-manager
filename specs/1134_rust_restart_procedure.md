@@ -356,6 +356,44 @@ Notes on specific choices:
   investigation with no restart - so the escape hatch exists, but the default is
   strict.
 
+### TCC signing revision (#1301)
+
+The old `codesign --force --sign -` command produced a new ad-hoc CDHash
+requirement for each rebuilt `sm-server`. That is not a stable macOS TCC client
+identity and caused repeated protected-folder prompts in production.
+
+The supported restart contract now reads the exact uppercase 40-hex fingerprint
+from the tracked, non-secret `config/rust-server-signing.env`; an explicit
+`SM_SIGN_IDENTITY` override is reserved for a planned certificate rotation.
+The file is parsed as data (not sourced as shell code), must contain exactly one
+identity line, and is therefore durable and discoverable to future operators.
+The production machine's measured default is
+`36FC54A873D584A34FCFEEA7D1F519B19A39DE72` (`Office Automate Local Signing`),
+with a fail-closed override/rotation path.
+
+Before `stop-rust`, the script requires that identity to be available from the
+keychain, signs the disposable staged binary with it, verifies strictly, and
+rejects ad-hoc output, a wrong identifier, absent certificate authority, or a
+designated requirement other than:
+
+```
+designated => identifier "com.rajeshgoli.sm-server" and certificate root = H"<configured fingerprint lowercase>"
+```
+
+The certificate-root requirement is expected to remain identical across changed
+binary content, while CDHash may change. `--sign -` is never an allowed
+fallback. All of these gates run before the installed binary is replaced or the
+launchd job is stopped, so the atomic install, re-registration, rollback, queue
+authority, health, PID, and session checks are unchanged.
+
+Pre-deployment proof is performed only on disposable binaries: sign two
+different-content copies with the named fingerprint, run `codesign --verify
+--strict`, then compare `codesign -dr -` output. Do not use protected-folder
+access as a signing or TCC test. After deployment, inspect `codesign -dv`,
+`codesign -dr -`, launchd's live PID/executable path, health, session count, and
+queue authority. Do not clear the existing TCC record unless Rajesh explicitly
+approves it.
+
 ## Recovery
 
 If the service is down and the script cannot fix it:

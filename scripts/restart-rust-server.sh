@@ -83,6 +83,12 @@ else
   SM_BASE_URL="http://$SM_PROBE_HOST:$SM_PORT"
 fi
 SM_SIGN_IDENTIFIER="${SM_SIGN_IDENTIFIER:-com.rajeshgoli.sm-server}"
+# A persistent certificate identity is loaded from the tracked, non-secret
+# deployment config below, unless an explicit environment override is supplied
+# for a planned certificate rotation. This is the SHA-1 fingerprint reported by
+# `security find-identity -v -p codesigning`, not a keychain display name.
+SM_SIGN_IDENTITY="${SM_SIGN_IDENTITY:-}"
+SM_SIGNING_CONFIG="${SM_SIGNING_CONFIG:-$REPO_ROOT/config/rust-server-signing.env}"
 SM_QUEUE_AUTHORITY_SOCKET="${SM_QUEUE_AUTHORITY_SOCKET:-$HOME/.local/share/claude-sessions/queue-runner/authority.sock}"
 SM_QUEUE_AUTHORITY_VERIFIER="${SM_QUEUE_AUTHORITY_VERIFIER:-$REPO_ROOT/scripts/verify_queue_authority.py}"
 SM_HEALTH_TIMEOUT="${SM_HEALTH_TIMEOUT:-60}"
@@ -125,8 +131,17 @@ Options:
 Environment overrides: SM_LABEL, SM_BINARY, SM_TARGET_DIR, SM_CARGO_OUTPUT,
 SM_CUTOVER, SM_CONFIG, SM_LOCAL_ENV, SM_LOG_DIR, SM_PLIST, SM_HOST, SM_PORT,
 SM_PYTHON_LABELS (extra labels), SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT,
-SM_QUEUE_AUTHORITY_SOCKET, SM_QUEUE_AUTHORITY_VERIFIER, SM_PID_SETTLE_SECONDS,
-SM_UNLOAD_TIMEOUT, SM_ALLOW_SESSION_DROP, SM_LOCK.
+SM_SIGN_IDENTITY, SM_SIGNING_CONFIG, SM_QUEUE_AUTHORITY_SOCKET,
+SM_QUEUE_AUTHORITY_VERIFIER, SM_PID_SETTLE_SECONDS, SM_UNLOAD_TIMEOUT,
+SM_ALLOW_SESSION_DROP, SM_LOCK.
+
+The default identity is the sole `SM_SIGN_IDENTITY=...` line in the tracked,
+non-secret $SM_SIGNING_CONFIG. An explicit SM_SIGN_IDENTITY override supports
+planned certificate rotation. Every value must be the exact uppercase 40-hex
+fingerprint from `security find-identity -v -p codesigning`. The restart refuses
+a missing, unavailable, ad-hoc, wrong-identifier, or non-certificate-anchored
+staged signature before it stops the service. It never falls back to
+`codesign --sign -`.
 
 SM_LABEL, SM_BINARY, SM_CONFIG, SM_LOCAL_ENV, SM_LOG_DIR, SM_PLIST, SM_HOST, and
 SM_PORT are forwarded to the cutover script, so both phases act on the same
@@ -203,6 +218,63 @@ fi
 step() { printf '\n==> %s\n' "$1"; }
 fail() { echo "ERROR: $1" >&2; exit 1; }
 
+load_signing_identity() {
+  local configured count invalid
+  [[ -r "$SM_SIGNING_CONFIG" ]] \
+    || fail "signing config is not readable: $SM_SIGNING_CONFIG; the running service was not touched"
+  # This file is deployment data, not shell code. Parse only the one
+  # non-secret key so editing the config can never execute commands in the
+  # production restart path.
+  count="$(grep -Ec '^SM_SIGN_IDENTITY=[0-9A-F]{40}$' "$SM_SIGNING_CONFIG" || true)"
+  invalid="$(grep -Ev '^(#.*|[[:space:]]*|SM_SIGN_IDENTITY=[0-9A-F]{40})$' "$SM_SIGNING_CONFIG" || true)"
+  if [[ "$count" != "1" || -n "$invalid" ]]; then
+    fail "signing config must contain exactly one uppercase SM_SIGN_IDENTITY=40-hex-fingerprint line and only comments or blank lines; the running service was not touched"
+  fi
+  configured="$(sed -n -E 's/^SM_SIGN_IDENTITY=([0-9A-F]{40})$/\1/p' "$SM_SIGNING_CONFIG")"
+  if [[ -z "$SM_SIGN_IDENTITY" ]]; then
+    SM_SIGN_IDENTITY="$configured"
+  fi
+  if ! [[ "$SM_SIGN_IDENTITY" =~ ^[0-9A-F]{40}$ ]]; then
+    fail "SM_SIGN_IDENTITY must be the exact uppercase 40-hex fingerprint of a valid codesigning identity; no ad-hoc fallback is permitted"
+  fi
+  SM_SIGN_IDENTITY_LOWER="$(printf '%s' "$SM_SIGN_IDENTITY" | tr '[:upper:]' '[:lower:]')"
+}
+
+require_signing_identity() {
+  # `codesign --sign` is still the definitive usability check below, against
+  # the staged file. This early keychain check produces an actionable failure
+  # before a build/sign attempt and rejects a missing or unavailable identity
+  # while the currently registered service remains untouched.
+  if ! security find-identity -v -p codesigning 2>/dev/null \
+      | grep -Eq "^[[:space:]]*[0-9]+\\) $SM_SIGN_IDENTITY "; then
+    fail "configured signing identity $SM_SIGN_IDENTITY is not a valid usable codesigning identity; the running service was not touched"
+  fi
+}
+
+verify_staged_signature() {
+  local metadata requirement expected_requirement
+  metadata="$(codesign -dvvv "$SM_STAGING" 2>&1)" \
+    || fail "could not inspect the staged signature; the running service was not touched"
+
+  if ! printf '%s\n' "$metadata" | grep -Fx "Identifier=$SM_SIGN_IDENTIFIER" >/dev/null; then
+    fail "staged signature identifier is not $SM_SIGN_IDENTIFIER; the running service was not touched"
+  fi
+  if printf '%s\n' "$metadata" | grep -Fx 'Signature=adhoc' >/dev/null; then
+    fail "staged signature is ad-hoc; a persistent certificate identity is required and the running service was not touched"
+  fi
+  if ! printf '%s\n' "$metadata" | grep -Eq '^Authority=.+$'; then
+    fail "staged signature has no certificate authority; the running service was not touched"
+  fi
+
+  requirement="$(codesign -dr - "$SM_STAGING" 2>&1)" \
+    || fail "could not read the staged designated requirement; the running service was not touched"
+  expected_requirement="designated => identifier \"$SM_SIGN_IDENTIFIER\" and certificate root = H\"$SM_SIGN_IDENTITY_LOWER\""
+  if ! printf '%s\n' "$requirement" | grep -Fx "$expected_requirement" >/dev/null; then
+    fail "staged designated requirement is not the stable certificate-anchored requirement for $SM_SIGN_IDENTITY; the running service was not touched"
+  fi
+  echo "signature ok: $SM_SIGN_IDENTIFIER; certificate root $SM_SIGN_IDENTITY"
+}
+
 # Relative paths must resolve exactly as rust-service-cutover.sh resolves them
 # (against the repo root, not the caller's cwd). Otherwise we would stage and
 # install one file while registering another, and still pass every health check.
@@ -224,6 +296,7 @@ SM_TARGET_DIR="$(resolve_path "$SM_TARGET_DIR")"
 SM_CONFIG="$(resolve_path "$SM_CONFIG")"
 SM_PLIST="$(resolve_path "$SM_PLIST")"
 SM_CUTOVER="$(resolve_path "$SM_CUTOVER")"
+SM_SIGNING_CONFIG="$(resolve_path "$SM_SIGNING_CONFIG")"
 [[ -n "$SM_LOCAL_ENV" ]] && SM_LOCAL_ENV="$(resolve_path "$SM_LOCAL_ENV")"
 [[ -n "$SM_LOG_DIR" ]] && SM_LOG_DIR="$(resolve_path "$SM_LOG_DIR")"
 
@@ -412,6 +485,8 @@ step "Preflight: checking what the restart will require"
 # so a missing cutover would otherwise not surface until much later.
 [[ -x "$SM_CUTOVER" ]] || fail "cutover script not executable: $SM_CUTOVER - the running service was not touched"
 [[ -r "$SM_CONFIG" ]] || fail "config not readable: $SM_CONFIG - the running service was not touched"
+load_signing_identity
+require_signing_identity
 if [[ -n "$SM_LOCAL_ENV" && ! -r "$SM_LOCAL_ENV" ]]; then
   fail "local env overlay not readable: $SM_LOCAL_ENV - the running service was not touched"
 fi
@@ -529,16 +604,16 @@ mkdir -p "$(dirname "$SM_BINARY")" \
   || fail "could not create $(dirname "$SM_BINARY") - the running service was not touched"
 cp -p "$SOURCE_BINARY" "$SM_STAGING" \
   || fail "could not stage $SOURCE_BINARY - the running service was not touched"
-# A stable identifier keeps the signing identity from churning per build. Ad-hoc
-# signing otherwise derives the identifier from the Mach-O UUID (and the linker
-# derives it from cargo's deps/ filename), so it changed on every rebuild.
-codesign --force --sign - --identifier "$SM_SIGN_IDENTIFIER" "$SM_STAGING" \
-  || fail "codesign failed - the running service was not touched"
+# `SM_SIGN_IDENTITY` has already been required to name a usable keychain
+# identity. Never substitute `--sign -`: it would create a new CDHash-based TCC
+# identity every time a build changes.
+codesign --force --sign "$SM_SIGN_IDENTITY" --identifier "$SM_SIGN_IDENTIFIER" "$SM_STAGING" \
+  || fail "codesign with persistent identity $SM_SIGN_IDENTITY failed - the running service was not touched"
 
 step "Verifying signature"
 codesign --verify --strict "$SM_STAGING" \
   || fail "signature verification failed - the running service was not touched"
-echo "signature ok: $(codesign -dvvv "$SM_STAGING" 2>&1 | awk -F= '/^Identifier=/{print $2}')"
+verify_staged_signature
 
 step "Validating the configuration with the new binary"
 # Readability is not validity. A malformed config.yaml or local-env overlay would
