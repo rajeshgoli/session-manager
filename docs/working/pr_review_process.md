@@ -32,7 +32,8 @@ When Codex review lands:
 
 ## Exit Criteria
 
-- If there are any important feedback items (`P1`), the PR is **not mergeable**.
+- If there are any reachable critical/important feedback items (`P0`/`P1`), the
+  PR is **not mergeable**.
 - If there are no important feedback items (`P2` or lower only), exit criteria are **met**.
 - If the review is clean, exit criteria are **met**.
 
@@ -48,7 +49,7 @@ record it in the PR body:
   only if a reachable `P0`/`P1` remains.
 - **R3 - high risk:** persisted shapes, authority, recovery, concurrency,
   security, ambiguity semantics, hot paths, and public contracts. Run at least
-  two rounds and no more than five. A repeated or structural P1 at round 3
+  two rounds and no more than five. A repeated or structural P0/P1 at round 3
   triggers design-return rather than more local patching.
 
 Record the requested and reviewed head, scope/steer, findings, disposition,
@@ -68,7 +69,7 @@ If exit criteria are not met:
 2. Request the next bounded round only when the selected tier permits it and
    the new head stays inside the frozen capability.
 
-At an R2 third-round P1 or an R3 design-return trigger:
+At an R2 third-round P0/P1 or an R3 design-return trigger:
 
 1. A reachable `P0`/`P1` still blocks merge. Never merge a repair for the final
    blocking finding without review of that repaired head.
@@ -96,7 +97,7 @@ or park from the recorded risk and cost evidence. Do not ask the owner to read
 or adjudicate code findings. Owner input is required only to accept a named
 residual risk, change product scope, or override policy. If owner input is not
 available, the fail-closed default is split/park, not an indefinite review loop
-and not a merge with unresolved P1s.
+and not a merge with unresolved P0/P1 findings.
 
 If exit criteria are met:
 
@@ -110,7 +111,8 @@ If exit criteria are met:
 - Prefer Session Manager ownership of the review loop when available. It handles retries, restart recovery, and "fresh review after current request" disambiguation better than ad-hoc shell polling.
 - Do not treat “a review exists” as sufficient by itself.
 - When using Session Manager wakeups, still verify that the landed review/comment is tied to the current request cycle before acting on it.
-- The blocking threshold is whether unresolved feedback contains any `P1` items.
+- The blocking threshold is whether unresolved feedback contains any reachable
+  `P0`/`P1` items.
 - `P2` or lower feedback can still be worth fixing before merge, but it does not block exit criteria.
 - Keep one deployable capability per PR. A head-expanding refactor discovered
   during review belongs in a separate PR rather than silently increasing the

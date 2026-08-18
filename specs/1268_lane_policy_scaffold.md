@@ -461,13 +461,17 @@ same action ID/version; prose such as `final` or `supersedes` has no authority b
 itself.
 
 The action state advances monotonically through proposed, authorized, started,
-and terminal. The authority may revoke only before `started`; once execution is
-recorded, later messages cannot authorize a competing action and recovery must
-reconcile the observed action first. Transferring decision authority is an
-atomic recorded handoff. Recipients act only on the highest durable version and
-default to inaction on conflicting or unverifiable messages. This prevents
-several coordinators from oscillating a one-shot probe or restart faster than
-the executing seat can observe the decisions.
+and terminal. Immediately before its first side effect, the executor must claim
+`authorized -> started` with one compare-and-swap that verifies the current
+authority incarnation, highest decision version, exact scope, executor binding,
+and expiry. A failed claim performs no side effect and returns the current
+decision. The authority may revoke only before a successful `started` claim;
+once execution is recorded, later messages cannot authorize a competing action
+and recovery must reconcile the observed action first. Transferring decision
+authority is an atomic recorded handoff. Recipients act only on the highest
+durable version and default to inaction on conflicting or unverifiable
+messages. This prevents several coordinators from oscillating a one-shot probe
+or restart faster than the executing seat can observe the decisions.
 
 ### 6. Evaluation telemetry
 
@@ -1073,7 +1077,7 @@ sole objective.
   review, before its consumer starts.
 - Each implementation agent owns its focused tests, full applicable gates,
   `docs/working/pr_review_process.md`, merge to the epic branch, and worktree
-  cleanup. Codex review follows the bounded protocol below; a P1 blocks merge
+  cleanup. Codex review follows the bounded protocol below; a P0/P1 blocks merge
   but does not authorize indefinite review rounds.
 - Limit active implementation to four agents: at most two Sol, two Terra, and
   one Luna where the wave permits. More parallelism would increase merge and
@@ -1098,7 +1102,7 @@ differently scoped confirmation may review the same immutable head once when
 round 1 produced no change. A head-expanding refactor discovered during review
 becomes a separate package rather than silently enlarging the review surface.
 
-An R2 third-round P1 or an R3 P1 at/after round 3 triggers measured repair
+An R2 third-round P0/P1 or an R3 P0/P1 at/after round 3 triggers measured repair
 selection, not owner code review. A newly discovered localized R3 repair may use
 a focused confirming round within the five-round ceiling; a repeated finding
 class or architecture-changing repair enters design-return. R2 repairs needing
