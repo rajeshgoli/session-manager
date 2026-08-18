@@ -81,6 +81,18 @@ fn resolve_project_key_with_command(
     canonical_path(working_dir)
 }
 
+fn primary_key_includes(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(columns
+        .into_iter()
+        .any(|(name, primary_key_position)| name == column && primary_key_position > 0))
+}
+
 fn command_output_with_timeout(mut command: Command, timeout: Duration) -> Option<Output> {
     let mut child = command
         .stdout(Stdio::piped())
@@ -167,7 +179,6 @@ impl UsageLedgerStore {
                   account_key        TEXT NOT NULL,
                   project_key        TEXT NOT NULL,
                   window_kind        TEXT NOT NULL,
-                  window_start       TEXT NOT NULL,
                   bucket_ts          TEXT NOT NULL,
                   model              TEXT NOT NULL,
                   effort             TEXT,
@@ -180,7 +191,7 @@ impl UsageLedgerStore {
                   cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
                   message_count      INTEGER NOT NULL DEFAULT 0,
                   updated_at         TEXT NOT NULL,
-                  PRIMARY KEY (seat_id, account_key, project_key, window_kind, window_start,
+                  PRIMARY KEY (seat_id, account_key, project_key, window_kind,
                                bucket_ts, model, credit_metered)
                 );
                 CREATE INDEX IF NOT EXISTS idx_seat_tokens_fit
@@ -269,10 +280,10 @@ impl UsageLedgerStore {
                   msg_id       INTEGER NOT NULL REFERENCES message_ledger(msg_id) ON DELETE CASCADE,
                   window_kind  TEXT NOT NULL,
                   window_start TEXT NOT NULL,
-                  PRIMARY KEY (msg_id, window_kind, window_start)
+                  PRIMARY KEY (msg_id, window_kind)
                 );
                 CREATE INDEX IF NOT EXISTS idx_mw_rollup
-                  ON message_window(window_kind, window_start);
+                  ON message_window(window_kind);
 
                 CREATE TABLE IF NOT EXISTS burn_window_materialization (
                   account_key  TEXT NOT NULL,
@@ -312,6 +323,140 @@ impl UsageLedgerStore {
                 "#,
             )
             .context("failed to initialize usage token ledger schema")?;
+        self.migrate_rolling_bucket_schema()?;
+        self.create_usage_views()?;
+        Ok(())
+    }
+
+    /// Rebuild the v1 rolling-window cache from durable ledger facts in one transaction.
+    ///
+    /// The previous key included a moving rolling-window start, so copying its rows would retain
+    /// the inflation. `message_ledger` is the source of truth; its distinct window-kind mappings
+    /// let this migration retain every real contribution exactly once per window kind.
+    fn migrate_rolling_bucket_schema(&self) -> Result<()> {
+        let connection = self.open()?;
+        let legacy_seat_tokens = primary_key_includes(&connection, "seat_tokens", "window_start")?;
+        let legacy_message_window =
+            primary_key_includes(&connection, "message_window", "window_start")?;
+        if !legacy_seat_tokens && !legacy_message_window {
+            return Ok(());
+        }
+        if legacy_seat_tokens != legacy_message_window {
+            bail!("usage rollup schema is partially migrated; refusing to rewrite cached token history");
+        }
+
+        connection
+            .execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                ALTER TABLE seat_tokens RENAME TO seat_tokens_v1_rolling_cache;
+                ALTER TABLE message_window RENAME TO message_window_v1_rolling_cache;
+
+                CREATE TABLE seat_tokens (
+                  seat_id            TEXT NOT NULL,
+                  account_key        TEXT NOT NULL,
+                  project_key        TEXT NOT NULL,
+                  window_kind        TEXT NOT NULL,
+                  bucket_ts          TEXT NOT NULL,
+                  model              TEXT NOT NULL,
+                  effort             TEXT,
+                  credit_metered     INTEGER NOT NULL DEFAULT 0,
+                  input_tokens       INTEGER NOT NULL DEFAULT 0,
+                  output_tokens      INTEGER NOT NULL DEFAULT 0,
+                  reasoning_tokens   INTEGER NOT NULL DEFAULT 0,
+                  cache_write_5m     INTEGER NOT NULL DEFAULT 0,
+                  cache_write_1h     INTEGER NOT NULL DEFAULT 0,
+                  cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+                  message_count      INTEGER NOT NULL DEFAULT 0,
+                  updated_at         TEXT NOT NULL,
+                  PRIMARY KEY (seat_id, account_key, project_key, window_kind,
+                               bucket_ts, model, credit_metered)
+                );
+
+                CREATE TABLE message_window (
+                  msg_id       INTEGER NOT NULL REFERENCES message_ledger(msg_id) ON DELETE CASCADE,
+                  window_kind  TEXT NOT NULL,
+                  window_start TEXT NOT NULL,
+                  PRIMARY KEY (msg_id, window_kind)
+                );
+
+                INSERT INTO message_window (msg_id, window_kind, window_start)
+                SELECT msg_id, window_kind, MIN(window_start)
+                FROM message_window_v1_rolling_cache
+                GROUP BY msg_id, window_kind;
+
+                INSERT INTO seat_tokens (
+                  seat_id, account_key, project_key, window_kind, bucket_ts, model, effort,
+                  credit_metered, input_tokens, output_tokens, reasoning_tokens, cache_write_5m,
+                  cache_write_1h, cache_read_tokens, message_count, updated_at
+                )
+                SELECT ledger.seat_id, ledger.account_key, ledger.project_key,
+                       mapped.window_kind, ledger.bucket_ts, ledger.model, MAX(ledger.effort),
+                       ledger.credit_metered, SUM(ledger.input_tokens), SUM(ledger.output_tokens),
+                       SUM(ledger.reasoning_tokens), SUM(ledger.cache_write_5m),
+                       SUM(ledger.cache_write_1h), SUM(ledger.cache_read_tokens), COUNT(*),
+                       MAX(ledger.recorded_at)
+                FROM message_ledger AS ledger
+                JOIN (
+                  SELECT DISTINCT msg_id, window_kind
+                  FROM message_window_v1_rolling_cache
+                ) AS mapped ON mapped.msg_id = ledger.msg_id
+                WHERE ledger.model != '<synthetic>'
+                GROUP BY ledger.seat_id, ledger.account_key, ledger.project_key,
+                         mapped.window_kind, ledger.bucket_ts, ledger.model, ledger.credit_metered;
+
+                DROP TABLE seat_tokens_v1_rolling_cache;
+                DROP TABLE message_window_v1_rolling_cache;
+                CREATE INDEX idx_seat_tokens_fit
+                  ON seat_tokens(account_key, window_kind, bucket_ts);
+                CREATE INDEX idx_mw_rollup ON message_window(window_kind);
+                COMMIT;
+                "#,
+            )
+            .context("failed to migrate usage rollups to stable bucket facts")?;
+        Ok(())
+    }
+
+    fn create_usage_views(&self) -> Result<()> {
+        self.open()?
+            .execute_batch(
+                r#"
+                CREATE VIEW IF NOT EXISTS current_seat_token_totals AS
+                WITH ranked_windows AS (
+                  SELECT account_key, window_kind, window_scope, window_start, resets_at,
+                         ROW_NUMBER() OVER (
+                           PARTITION BY account_key, window_kind, COALESCE(window_scope, '')
+                           ORDER BY observed_at DESC, id DESC
+                         ) AS window_rank
+                  FROM burn_samples
+                )
+                SELECT windows.account_key, windows.window_kind, windows.window_scope,
+                       windows.window_start, windows.resets_at, ledger.seat_id,
+                       ledger.project_key, ledger.model, ledger.credit_metered,
+                       SUM(ledger.input_tokens) AS input_tokens,
+                       SUM(ledger.output_tokens) AS output_tokens,
+                       SUM(ledger.reasoning_tokens) AS reasoning_tokens,
+                       SUM(ledger.cache_write_5m) AS cache_write_5m,
+                       SUM(ledger.cache_write_1h) AS cache_write_1h,
+                       SUM(ledger.cache_read_tokens) AS cache_read_tokens,
+                       COUNT(*) AS message_count
+                FROM ranked_windows AS windows
+                JOIN message_ledger AS ledger
+                  ON ledger.account_key = windows.account_key
+                 AND ledger.recorded_at >= windows.window_start
+                 AND ledger.recorded_at < windows.resets_at
+                JOIN message_window AS mapped
+                  ON mapped.msg_id = ledger.msg_id
+                 AND mapped.window_kind = windows.window_kind
+                WHERE windows.window_rank = 1
+                  AND windows.window_scope IS NULL
+                  AND ledger.model != '<synthetic>'
+                GROUP BY windows.account_key, windows.window_kind, windows.window_scope,
+                         windows.window_start, windows.resets_at, ledger.seat_id,
+                         ledger.project_key, ledger.model, ledger.credit_metered;
+                "#,
+            )
+            .context("failed to create usage ledger views")?;
         Ok(())
     }
 
@@ -1127,7 +1272,6 @@ impl UsageLedgerStore {
                       FROM message_window AS mapped
                       WHERE mapped.msg_id = ledger.msg_id
                         AND mapped.window_kind = ?4
-                        AND mapped.window_start = ?2
                   )
                 ORDER BY ledger.recorded_at, ledger.msg_id
                 "#,
@@ -2102,13 +2246,13 @@ fn apply_rollup(
     tx.execute(
         r#"
         INSERT INTO seat_tokens (
-          seat_id, account_key, project_key, window_kind, window_start, bucket_ts,
+          seat_id, account_key, project_key, window_kind, bucket_ts,
           model, effort, credit_metered, input_tokens, output_tokens, reasoning_tokens,
           cache_write_5m, cache_write_1h, cache_read_tokens, message_count, updated_at
         ) VALUES (
-          ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17
+          ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
         )
-        ON CONFLICT(seat_id, account_key, project_key, window_kind, window_start,
+        ON CONFLICT(seat_id, account_key, project_key, window_kind,
                     bucket_ts, model, credit_metered) DO UPDATE SET
           effort = COALESCE(excluded.effort, seat_tokens.effort),
           input_tokens = seat_tokens.input_tokens + excluded.input_tokens,
@@ -2125,7 +2269,6 @@ fn apply_rollup(
             value.account_key,
             value.project_key,
             window.kind,
-            window.start,
             value.bucket_ts,
             value.model,
             value.effort,
@@ -2144,8 +2287,8 @@ fn apply_rollup(
         r#"
         DELETE FROM seat_tokens
         WHERE seat_id = ?1 AND account_key = ?2 AND project_key = ?3
-          AND window_kind = ?4 AND window_start = ?5 AND bucket_ts = ?6
-          AND model = ?7 AND credit_metered = ?8 AND message_count = 0
+          AND window_kind = ?4 AND bucket_ts = ?5
+          AND model = ?6 AND credit_metered = ?7 AND message_count = 0
           AND input_tokens = 0 AND output_tokens = 0 AND reasoning_tokens = 0
           AND cache_write_5m = 0 AND cache_write_1h = 0 AND cache_read_tokens = 0
         "#,
@@ -2154,7 +2297,6 @@ fn apply_rollup(
             value.account_key,
             value.project_key,
             window.kind,
-            window.start,
             value.bucket_ts,
             value.model,
             value.credit_metered,
@@ -2781,10 +2923,28 @@ mod tests {
         resets_at: &str,
         source: &str,
     ) {
+        record_window_for(
+            db_path,
+            "claude:account-one",
+            kind,
+            duration_minutes,
+            resets_at,
+            source,
+        );
+    }
+
+    fn record_window_for(
+        db_path: &Path,
+        account_key: &str,
+        kind: &str,
+        duration_minutes: i64,
+        resets_at: &str,
+        source: &str,
+    ) {
         UsageBurnStore::new(db_path)
             .unwrap()
             .record_for_account(
-                "claude:account-one",
+                account_key,
                 &[BurnWindowSample {
                     window_kind: kind.to_owned(),
                     window_scope: None,
@@ -2798,6 +2958,239 @@ mod tests {
                 at("2026-08-10T15:30:00Z"),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn rolling_codex_windows_do_not_duplicate_a_visible_bucket() {
+        let dir = TestDir::new("rolling-codex-stable-bucket");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Codex,
+            "account-one",
+            "pro",
+            "codex_10080",
+            10_080,
+        );
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        record_window_for(
+            &db_path,
+            "codex:account-one",
+            "codex_10080",
+            10_080,
+            "2026-08-24T16:00:00Z",
+            "first-codex-scan",
+        );
+        let mut connection = Connection::open(&db_path).unwrap();
+        let tx = connection.transaction().unwrap();
+        let mut value = contribution_at("codex-visible", "turn-one", "2026-08-17T16:02:00Z");
+        value.account_key = "codex:account-one".to_owned();
+        value.model = "gpt-5.6-terra".to_owned();
+        ingest_contribution(&tx, &value).unwrap();
+        tx.commit().unwrap();
+
+        // Codex advances this boundary with every scan while the same bucket remains visible.
+        record_window_for(
+            &db_path,
+            "codex:account-one",
+            "codex_10080",
+            10_080,
+            "2026-08-24T16:01:00Z",
+            "second-codex-scan",
+        );
+        let summary = store.materialize_pending_windows().unwrap();
+        assert!(summary.windows_examined >= 2);
+        assert_eq!(summary.messages_selected, 0);
+        let connection = Connection::open(&db_path).unwrap();
+        let facts: (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*), SUM(input_tokens + output_tokens + cache_read_tokens) FROM seat_tokens WHERE window_kind = 'codex_10080'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(facts, (1, 25));
+        let mappings: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM message_window WHERE window_kind = 'codex_10080'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mappings, 1);
+        let view_tokens: i64 = connection
+            .query_row(
+                "SELECT SUM(input_tokens + output_tokens + cache_read_tokens) FROM current_seat_token_totals WHERE window_kind = 'codex_10080'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(view_tokens, 25);
+    }
+
+    #[test]
+    fn rolling_bucket_migration_rebuilds_from_ledger_not_inflated_cache() {
+        let dir = TestDir::new("rolling-bucket-migration");
+        let db_path = dir.0.join("usage.db");
+        UsageLedgerStore::new(&db_path).unwrap();
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                DROP TABLE seat_tokens;
+                DROP TABLE message_window;
+                CREATE TABLE seat_tokens (
+                  seat_id TEXT NOT NULL, account_key TEXT NOT NULL, project_key TEXT NOT NULL,
+                  window_kind TEXT NOT NULL, window_start TEXT NOT NULL, bucket_ts TEXT NOT NULL,
+                  model TEXT NOT NULL, effort TEXT, credit_metered INTEGER NOT NULL DEFAULT 0,
+                  input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+                  reasoning_tokens INTEGER NOT NULL DEFAULT 0, cache_write_5m INTEGER NOT NULL DEFAULT 0,
+                  cache_write_1h INTEGER NOT NULL DEFAULT 0, cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                  message_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+                  PRIMARY KEY (seat_id, account_key, project_key, window_kind, window_start,
+                               bucket_ts, model, credit_metered)
+                );
+                CREATE TABLE message_window (
+                  msg_id INTEGER NOT NULL REFERENCES message_ledger(msg_id) ON DELETE CASCADE,
+                  window_kind TEXT NOT NULL, window_start TEXT NOT NULL,
+                  PRIMARY KEY (msg_id, window_kind, window_start)
+                );
+                "#,
+            )
+            .unwrap();
+        connection
+            .execute(
+                r#"
+                INSERT INTO message_ledger (
+                  message_id, request_id, is_sidechain, has_speed, total_tokens, seat_id,
+                  account_key, project_key, source_ref, source_seq, bucket_ts, model, effort,
+                  input_tokens, output_tokens, reasoning_tokens, cache_write_5m, cache_write_1h,
+                  cache_read_tokens, credit_metered, recorded_at
+                ) VALUES ('source', NULL, 0, 0, 100, 'seat', 'codex:account', '/repo/.git',
+                          'thread', 1, '2026-08-17T16:02:00.000000000Z', 'gpt-5.6-terra',
+                          'high', 80, 20, 0, 0, 0, 0, 0, '2026-08-17T16:02:00.000000000Z')
+                "#,
+                [],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO message_window VALUES (1, 'codex_10080', '2026-08-17T16:00:00.000000000Z');
+                INSERT INTO message_window VALUES (1, 'codex_10080', '2026-08-17T16:01:00.000000000Z');
+                INSERT INTO seat_tokens VALUES ('seat', 'codex:account', '/repo/.git', 'codex_10080',
+                  '2026-08-17T16:00:00.000000000Z', '2026-08-17T16:02:00.000000000Z',
+                  'gpt-5.6-terra', 'high', 0, 80, 20, 0, 0, 0, 0, 1, '2026-08-17T16:02:00.000000000Z');
+                INSERT INTO seat_tokens VALUES ('seat', 'codex:account', '/repo/.git', 'codex_10080',
+                  '2026-08-17T16:01:00.000000000Z', '2026-08-17T16:02:00.000000000Z',
+                  'gpt-5.6-terra', 'high', 0, 80, 20, 0, 0, 0, 0, 1, '2026-08-17T16:02:00.000000000Z');
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        UsageLedgerStore::new(&db_path).unwrap();
+        let connection = Connection::open(&db_path).unwrap();
+        let facts: (i64, i64) = connection
+            .query_row(
+                "SELECT COUNT(*), SUM(input_tokens + output_tokens) FROM seat_tokens",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(facts, (1, 100));
+        let mappings: i64 = connection
+            .query_row("SELECT COUNT(*) FROM message_window", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mappings, 1);
+        assert!(!primary_key_includes(&connection, "seat_tokens", "window_start").unwrap());
+    }
+
+    #[test]
+    fn current_totals_view_excludes_overlapping_scoped_windows() {
+        let dir = TestDir::new("current-totals-unscoped-only");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Claude,
+            "account-one",
+            "max",
+            "weekly_all",
+            10_080,
+        );
+        UsageLedgerStore::new(&db_path).unwrap();
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO burn_samples (
+                  account_key, window_kind, window_scope, window_start, percent, resets_at,
+                  severity, is_active, source, observed_at
+                ) VALUES
+                  ('claude:account-one', 'weekly_scoped', 'sonnet',
+                   '2026-08-17T00:00:00.000000000Z', 10, '2026-08-24T00:00:00.000000000Z',
+                   NULL, 1, 'test', '2026-08-17T00:01:00.000000000Z'),
+                  ('claude:account-one', 'weekly_scoped', 'opus',
+                   '2026-08-17T00:00:00.000000000Z', 10, '2026-08-24T00:00:00.000000000Z',
+                   NULL, 1, 'test', '2026-08-17T00:01:00.000000000Z');
+                INSERT INTO seat_tokens (
+                  seat_id, account_key, project_key, window_kind, bucket_ts, model, effort,
+                  credit_metered, input_tokens, output_tokens, reasoning_tokens, cache_write_5m,
+                  cache_write_1h, cache_read_tokens, message_count, updated_at
+                ) VALUES ('seat', 'claude:account-one', '/repo/.git', 'weekly_scoped',
+                          '2026-08-17T01:00:00.000000000Z', 'claude-sonnet-5', NULL,
+                          0, 100, 0, 0, 0, 0, 0, 1, '2026-08-17T01:00:00.000000000Z');
+                "#,
+            )
+            .unwrap();
+        let rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM current_seat_token_totals WHERE window_kind = 'weekly_scoped'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn current_totals_view_keeps_subminute_window_membership() {
+        let dir = TestDir::new("current-totals-subminute-boundary");
+        let db_path = dir.0.join("usage.db");
+        seed_provider(
+            &db_path,
+            Provider::Claude,
+            "account-one",
+            "max",
+            "session_5h",
+            300,
+        );
+        let _store = UsageLedgerStore::new(&db_path).unwrap();
+        record_window(
+            &db_path,
+            "session_5h",
+            300,
+            "2026-08-10T21:05:30Z",
+            "subminute-window",
+        );
+        let mut connection = Connection::open(&db_path).unwrap();
+        let tx = connection.transaction().unwrap();
+        ingest_contribution(
+            &tx,
+            &contribution_at("subminute", "subminute-request", "2026-08-10T16:05:45Z"),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let connection = Connection::open(&db_path).unwrap();
+        let tokens: i64 = connection
+            .query_row(
+                "SELECT SUM(input_tokens + output_tokens + cache_read_tokens) FROM current_seat_token_totals WHERE window_kind = 'session_5h'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tokens, 25);
     }
 
     #[test]
