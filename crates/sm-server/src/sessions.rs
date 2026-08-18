@@ -13703,11 +13703,14 @@ fn mark_runtime_launch_failed(
         finalize_active_credential_rotations_for_terminal_session(state, session_id)?;
         let sessions = ensure_sessions_array_mut(state)?;
         if let Some(session) = session_object_mut(sessions, session_id) {
-            if raw_session_is_stopped(session) {
-                // A terminal completion marker may arrive before the runtime
-                // failure writer normalizes `status`. Keep the original
-                // terminal evidence intact while retaining the canonical
-                // stopped projection expected by recovery readers.
+            if raw_session_has_terminal_evidence(session) {
+                // A terminal completion marker or existing provenance may
+                // arrive before the runtime failure writer normalizes
+                // `status`. Keep that original terminal evidence intact
+                // while retaining the canonical stopped projection expected
+                // by recovery readers. A stopped status alone is
+                // transitional during credential rotation and is not
+                // terminal evidence.
                 session.insert("status".to_owned(), Value::String("stopped".to_owned()));
             } else {
                 let now = now_rfc3339();
@@ -15504,6 +15507,13 @@ fn raw_session_is_stopped(session: &Map<String, Value>) -> bool {
         || completion_status_is_retired(json_text(session.get("completion_status")).as_deref())
 }
 
+fn raw_session_has_terminal_evidence(session: &Map<String, Value>) -> bool {
+    completion_status_is_retired(json_text(session.get("completion_status")).as_deref())
+        || session
+            .get("terminal_provenance")
+            .is_some_and(|provenance| !provenance.is_null())
+}
+
 fn effective_raw_session_status(session: &Map<String, Value>) -> String {
     if raw_session_is_stopped(session) {
         "stopped".to_owned()
@@ -16562,6 +16572,14 @@ mod tests {
             assert_eq!(
                 recovered["session_runtime_launches"][0]["failure_reason"],
                 "runtime launch recovery is disabled"
+            );
+            assert_eq!(
+                recovered["sessions"][0]["terminal_provenance"]["cause"],
+                "startup_reconciliation"
+            );
+            assert_eq!(
+                recovered["sessions"][0]["terminal_provenance"]["source"],
+                "runtime_launch_failed"
             );
             let _ = fs::remove_file(state_file);
         }
