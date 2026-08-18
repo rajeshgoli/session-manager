@@ -810,6 +810,45 @@ async fn session_teardown_fails_requested_what_and_marks_response_undeliverable(
     assert!(store.list_recoverable().unwrap().is_empty());
 }
 
+#[test]
+fn startup_btw_recovery_tears_down_a_pending_retirement_participant() {
+    let state_file = write_session_fixture();
+    let queue_db = queue_db_path_for_state_file(&state_file);
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let retired = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == "oldstate")
+        .unwrap();
+    // This is the durable record left after an authenticated runtime retirement
+    // wrote its intent but the process exited before HTTP BTW teardown.
+    retired["status"] = json!("stopped");
+    retired["completion_status"] = json!("retired");
+    retired["terminal_provenance"] = json!({
+        "cause": "explicit_retire",
+        "observed_at": "2026-08-18T04:00:00Z",
+        "actor_session_id": "run12345",
+        "authority": "authenticated_parent",
+        "source": "api_retire",
+        "tmux_disposition": "retire_requested"
+    });
+    fs::write(&state_file, state.to_string()).unwrap();
+    let store = BtwStore::new(queue_db).unwrap();
+    let request = store
+        .create(Some("run12345"), "oldstate", "claude", "poll", "summary")
+        .unwrap();
+
+    let _app = router(AppState::new(config_with_state_file_and_queue(&state_file)));
+
+    let recovered = store.get(&request.request_id).unwrap().unwrap();
+    assert_eq!(recovered.status, "failed");
+    assert_eq!(
+        recovered.error.as_deref(),
+        Some("session oldstate was torn down")
+    );
+}
+
 #[tokio::test]
 async fn legacy_kill_route_preserves_deployed_client_response() {
     let state_file = write_session_fixture();

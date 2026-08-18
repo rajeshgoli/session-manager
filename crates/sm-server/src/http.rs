@@ -7357,6 +7357,16 @@ fn recover_btw_requests(state: Arc<AppState>) {
     let Ok(requests) = store.list_recoverable() else {
         return;
     };
+    // Runtime retirement recovery runs before the router starts. A process may
+    // have exited after persisting an attributed retire intent but before the
+    // HTTP request reached its BTW cleanup below. Reconcile those now-terminal
+    // request participants synchronously before starting any BTW workers.
+    if let Err(error) = teardown_btw_requests_for_terminal_sessions(&state, &requests) {
+        eprintln!("BTW terminal-session recovery failed: {error:#}");
+    }
+    let Ok(requests) = store.list_recoverable() else {
+        return;
+    };
     for request in requests {
         let worker_state = state.clone();
         let worker_store = store.clone();
@@ -7430,6 +7440,30 @@ fn recover_btw_requests(state: Arc<AppState>) {
             let _ = deliver_btw_response(&worker_state, &worker_store, &request.request_id);
         });
     }
+}
+
+fn teardown_btw_requests_for_terminal_sessions(
+    state: &AppState,
+    requests: &[BtwRequestRecord],
+) -> anyhow::Result<()> {
+    let mut terminal_session_ids = BTreeSet::new();
+    for request in requests {
+        for session_id in
+            std::iter::once(&request.target_session_id).chain(request.requester_session_id.as_ref())
+        {
+            if state
+                .session_store
+                .get_session(session_id)?
+                .is_some_and(|session| session.is_stopped())
+            {
+                terminal_session_ids.insert(session_id.as_str());
+            }
+        }
+    }
+    for session_id in terminal_session_ids {
+        teardown_btw_requests_for_session(state, session_id)?;
+    }
+    Ok(())
 }
 
 fn run_btw_request(state: &AppState, request_id: &str) -> anyhow::Result<()> {
