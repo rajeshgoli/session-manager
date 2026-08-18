@@ -1993,6 +1993,10 @@ fn codex_review_requests_list_path(
     include_inactive: bool,
 ) -> Result<String> {
     let mut query = Vec::new();
+    let status_without_id = matches!(
+        &args.command,
+        Some(RequestCodexReviewCommand::Status { request_id: None })
+    );
     let effective_notify = args
         .notify
         .as_deref()
@@ -2000,13 +2004,13 @@ fn codex_review_requests_list_path(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .or_else(|| {
-            if args.all {
+            if args.all || status_without_id {
                 None
             } else {
                 optional_current_session_id()
             }
         });
-    if !args.all && effective_notify.is_none() {
+    if !args.all && !status_without_id && effective_notify.is_none() {
         bail!("No session context. Use --notify or --all.");
     }
     if let Some(notify) = effective_notify {
@@ -6512,6 +6516,24 @@ mod tests {
         assert_eq!(
             codex_review_requests_list_path(&all_args, true).unwrap(),
             "/codex-review-requests?include_inactive=true"
+        );
+
+        let status_args = RequestCodexReviewArgs {
+            action_or_pr: None,
+            notify: None,
+            repo: Some("rajeshgoli/session-manager".to_owned()),
+            steer: None,
+            all: false,
+            inactive: false,
+            json: false,
+            pr_number: Some(964),
+            poll_interval_seconds: 30,
+            retry_interval_seconds: 600,
+            command: Some(RequestCodexReviewCommand::Status { request_id: None }),
+        };
+        assert_eq!(
+            codex_review_requests_list_path(&status_args, true).unwrap(),
+            "/codex-review-requests?repo=rajeshgoli%2Fsession-manager&pr_number=964&include_inactive=true"
         );
     }
 

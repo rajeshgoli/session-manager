@@ -78,6 +78,9 @@ pub struct CodexReviewRequestRegistration {
     pub requester_session_id: Option<String>,
     pub notify_session_id: String,
     pub steer: Option<String>,
+    pub requested_head_sha: Option<String>,
+    pub superseded_by_request_id: Option<String>,
+    pub superseded_at: Option<String>,
     pub requested_at: String,
     pub latest_request_comment_id: Option<i64>,
     pub latest_request_comment_url: Option<String>,
@@ -105,6 +108,7 @@ pub struct CreateCodexReviewRequest {
     pub requester_session_id: Option<String>,
     pub notify_session_id: String,
     pub steer: Option<String>,
+    pub requested_head_sha: String,
     pub latest_request_comment_id: Option<i64>,
     pub latest_request_comment_url: Option<String>,
     pub latest_request_posted_at: String,
@@ -350,6 +354,16 @@ impl RetainedQueueStore {
         list_codex_review_requests_conn(&conn, filters)
     }
 
+    pub fn ensure_codex_review_requests_schema_from_path(db_path: &Path) -> Result<()> {
+        if !db_path.exists() {
+            return Ok(());
+        }
+        let conn = Connection::open(db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        init_codex_review_requests_schema(&conn)
+    }
+
     pub fn list_active_codex_review_requests_from_path(
         db_path: &Path,
     ) -> Result<Vec<CodexReviewRequestRegistration>> {
@@ -457,7 +471,18 @@ impl RetainedQueueStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         init_codex_review_requests_schema(&conn)?;
-        create_codex_review_request_conn(&conn, request)
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = create_codex_review_request_conn(&conn, request);
+        match result {
+            Ok(registration) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(registration)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     pub fn active_codex_review_request_exists_from_path(
@@ -476,6 +501,22 @@ impl RetainedQueueStore {
         active_codex_review_request_exists_conn(&conn, repo, pr_number, notify_session_id)
     }
 
+    pub fn active_codex_review_requests_for_pr_from_path(
+        db_path: &Path,
+        repo: &str,
+        pr_number: i64,
+    ) -> Result<Vec<CodexReviewRequestRegistration>> {
+        Self::list_codex_review_requests_from_path(
+            db_path,
+            CodexReviewRequestFilters {
+                repo: Some(repo.to_owned()),
+                pr_number: Some(pr_number),
+                include_inactive: false,
+                ..CodexReviewRequestFilters::default()
+            },
+        )
+    }
+
     pub fn mark_codex_review_request_pickup_in_path(
         db_path: &Path,
         request_id: &str,
@@ -485,7 +526,7 @@ impl RetainedQueueStore {
             return Ok(None);
         }
         let conn = Connection::open(db_path)?;
-        conn.execute(
+        let changed = conn.execute(
             r#"
             UPDATE codex_review_request_registrations
             SET pickup_detected_at = COALESCE(pickup_detected_at, ?2),
@@ -496,6 +537,9 @@ impl RetainedQueueStore {
             "#,
             params![request_id, last_polled_at],
         )?;
+        if changed == 0 {
+            return Ok(None);
+        }
         get_codex_review_request_conn(&conn, request_id)
     }
 
@@ -510,7 +554,7 @@ impl RetainedQueueStore {
             return Ok(None);
         }
         let conn = Connection::open(db_path)?;
-        conn.execute(
+        let changed = conn.execute(
             r#"
             UPDATE codex_review_request_registrations
             SET last_polled_at = ?2,
@@ -520,6 +564,9 @@ impl RetainedQueueStore {
             "#,
             params![request_id, last_polled_at, last_error, next_retry_at],
         )?;
+        if changed == 0 {
+            return Ok(None);
+        }
         get_codex_review_request_conn(&conn, request_id)
     }
 
@@ -532,7 +579,7 @@ impl RetainedQueueStore {
             return Ok(None);
         }
         let conn = Connection::open(db_path)?;
-        conn.execute(
+        let changed = conn.execute(
             r#"
             UPDATE codex_review_request_registrations
             SET last_polled_at = ?2,
@@ -541,6 +588,9 @@ impl RetainedQueueStore {
             "#,
             params![request_id, last_polled_at],
         )?;
+        if changed == 0 {
+            return Ok(None);
+        }
         get_codex_review_request_conn(&conn, request_id)
     }
 
@@ -554,7 +604,7 @@ impl RetainedQueueStore {
             return Ok(None);
         }
         let conn = Connection::open(db_path)?;
-        conn.execute(
+        let changed = conn.execute(
             r#"
             UPDATE codex_review_request_registrations
             SET attempt_count = attempt_count + 1,
@@ -577,6 +627,9 @@ impl RetainedQueueStore {
                 last_polled_at,
             ],
         )?;
+        if changed == 0 {
+            return Ok(None);
+        }
         get_codex_review_request_conn(&conn, request_id)
     }
 
@@ -590,7 +643,7 @@ impl RetainedQueueStore {
         }
         let conn = Connection::open(db_path)?;
         let review_comment_id = completion.review_comment_id.map(json_scalar_to_sql_value);
-        conn.execute(
+        let changed = conn.execute(
             r#"
             UPDATE codex_review_request_registrations
             SET review_landed_at = ?2,
@@ -612,7 +665,74 @@ impl RetainedQueueStore {
                 completion.last_polled_at,
             ],
         )?;
+        if changed == 0 {
+            return Ok(None);
+        }
         get_codex_review_request_conn(&conn, request_id)
+    }
+
+    pub fn complete_codex_review_request_and_enqueue_in_path(
+        db_path: &Path,
+        request_id: &str,
+        completion: CompleteCodexReviewRequest,
+        wake_text: &str,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        init_schema(&conn)?;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let review_comment_id = completion.review_comment_id.map(json_scalar_to_sql_value);
+            let changed = conn.execute(
+                r#"
+                UPDATE codex_review_request_registrations
+                SET review_landed_at = ?2,
+                    review_source = ?3,
+                    review_comment_id = ?4,
+                    review_url = ?5,
+                    state = 'completed',
+                    is_active = 0,
+                    last_polled_at = ?6,
+                    last_error = NULL
+                WHERE id = ?1 AND is_active = 1
+                "#,
+                params![
+                    request_id,
+                    completion.review_landed_at,
+                    completion.review_source,
+                    review_comment_id,
+                    completion.review_url,
+                    completion.last_polled_at,
+                ],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            let registration = get_codex_review_request_conn(&conn, request_id)?
+                .ok_or_else(|| anyhow::anyhow!("completed Codex review request disappeared"))?;
+            enqueue_message_with_metadata_conn(
+                &conn,
+                &registration.notify_session_id,
+                wake_text,
+                "sequential",
+                QueueMessageMetadata::default(),
+            )?;
+            Ok(Some(registration))
+        })();
+        match result {
+            Ok(registration) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(registration)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     pub fn list_queue_jobs_from_path(
@@ -2299,6 +2419,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "persistent_tracking",
         "INTEGER DEFAULT 0",
     )?;
+    init_codex_review_requests_schema(conn)?;
     Ok(())
 }
 
@@ -2372,6 +2493,9 @@ fn init_codex_review_requests_schema(conn: &Connection) -> Result<()> {
             requester_session_id TEXT,
             notify_session_id TEXT NOT NULL,
             steer TEXT,
+            requested_head_sha TEXT,
+            superseded_by_request_id TEXT,
+            superseded_at TIMESTAMP,
             requested_at TIMESTAMP NOT NULL,
             latest_request_comment_id INTEGER,
             latest_request_comment_url TEXT,
@@ -2392,6 +2516,24 @@ fn init_codex_review_requests_schema(conn: &Connection) -> Result<()> {
             is_active INTEGER DEFAULT 1
         );
         "#,
+    )?;
+    ensure_column(
+        conn,
+        "codex_review_request_registrations",
+        "requested_head_sha",
+        "TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "codex_review_request_registrations",
+        "superseded_by_request_id",
+        "TEXT",
+    )?;
+    ensure_column(
+        conn,
+        "codex_review_request_registrations",
+        "superseded_at",
+        "TIMESTAMP",
     )?;
     Ok(())
 }
@@ -3681,6 +3823,7 @@ fn list_codex_review_requests_conn(
 
     let mut query = r#"
         SELECT id, repo, pr_number, requester_session_id, notify_session_id, steer,
+               requested_head_sha, superseded_by_request_id, superseded_at,
                requested_at, latest_request_comment_id, latest_request_comment_url,
                latest_request_posted_at, attempt_count, next_retry_at,
                poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
@@ -3750,17 +3893,39 @@ fn create_codex_review_request_conn(
     if request.retry_interval_seconds <= 0 {
         anyhow::bail!("retry_interval_seconds must be > 0");
     }
-    if active_codex_review_request_exists_conn(
+    let owner = request
+        .requester_session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&request.notify_session_id)
+        .to_owned();
+    let active = list_codex_review_requests_conn(
         conn,
-        &request.repo,
-        request.pr_number,
-        &request.notify_session_id,
-    )? {
-        anyhow::bail!(
-            "Active Codex review request already exists for {} PR #{}",
-            request.repo,
-            request.pr_number
-        );
+        CodexReviewRequestFilters {
+            repo: Some(request.repo.clone()),
+            pr_number: Some(request.pr_number),
+            include_inactive: false,
+            ..CodexReviewRequestFilters::default()
+        },
+    )?;
+    for existing in &active {
+        let existing_owner = existing
+            .requester_session_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&existing.notify_session_id);
+        if existing_owner != owner {
+            anyhow::bail!(
+                "CONFLICT: active Codex review request {} for {} PR #{} is owned by {}; cancel it or wait for completion",
+                existing.id,
+                request.repo,
+                request.pr_number,
+                existing_owner
+            );
+        }
+        if existing.requested_head_sha.as_deref() == Some(request.requested_head_sha.as_str()) {
+            return Ok(existing.clone());
+        }
     }
 
     let latest_posted_at = request.latest_request_posted_at;
@@ -3773,6 +3938,9 @@ fn create_codex_review_request_conn(
         requester_session_id: request.requester_session_id,
         notify_session_id: request.notify_session_id,
         steer: request.steer,
+        requested_head_sha: Some(request.requested_head_sha),
+        superseded_by_request_id: None,
+        superseded_at: None,
         requested_at: latest_posted_at.clone(),
         latest_request_comment_id: request.latest_request_comment_id,
         latest_request_comment_url: request.latest_request_comment_url,
@@ -3794,8 +3962,30 @@ fn create_codex_review_request_conn(
     };
     conn.execute(
         r#"
+        UPDATE codex_review_request_registrations
+        SET is_active = 0,
+            state = 'superseded',
+            superseded_by_request_id = ?1,
+            superseded_at = ?2,
+            last_error = 'Superseded by a newer requested PR head'
+        WHERE repo = ?3
+            AND pr_number = ?4
+            AND is_active = 1
+            AND COALESCE(NULLIF(requester_session_id, ''), notify_session_id) = ?5
+        "#,
+        params![
+            registration.id,
+            registration.requested_at,
+            registration.repo,
+            registration.pr_number,
+            owner,
+        ],
+    )?;
+    conn.execute(
+        r#"
         INSERT INTO codex_review_request_registrations
             (id, repo, pr_number, requester_session_id, notify_session_id, steer,
+             requested_head_sha, superseded_by_request_id, superseded_at,
              requested_at, latest_request_comment_id, latest_request_comment_url,
              latest_request_posted_at, attempt_count, next_retry_at,
              poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
@@ -3803,11 +3993,12 @@ fn create_codex_review_request_conn(
              review_url, last_polled_at, last_error, state, is_active)
         VALUES
             (?1, ?2, ?3, ?4, ?5, ?6,
-             ?7, ?8, ?9,
-             ?10, ?11, ?12,
-             ?13, ?14, NULL,
+             ?7, NULL, NULL,
+             ?8, ?9, ?10,
+             ?11, ?12, ?13,
+             ?14, ?15, NULL,
              NULL, NULL, NULL, NULL,
-             NULL, NULL, NULL, ?15, 1)
+             NULL, NULL, NULL, ?16, 1)
         "#,
         params![
             registration.id,
@@ -3816,6 +4007,7 @@ fn create_codex_review_request_conn(
             registration.requester_session_id,
             registration.notify_session_id,
             registration.steer,
+            registration.requested_head_sha,
             registration.requested_at,
             registration.latest_request_comment_id,
             registration.latest_request_comment_url,
@@ -3837,6 +4029,7 @@ fn get_codex_review_request_conn(
     let mut statement = match conn.prepare(
         r#"
         SELECT id, repo, pr_number, requester_session_id, notify_session_id, steer,
+               requested_head_sha, superseded_by_request_id, superseded_at,
                requested_at, latest_request_comment_id, latest_request_comment_url,
                latest_request_posted_at, attempt_count, next_retry_at,
                poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
@@ -3874,24 +4067,27 @@ fn codex_review_request_registration_from_row(
         requester_session_id: row.get(3)?,
         notify_session_id: row.get(4)?,
         steer: row.get(5)?,
-        requested_at: row.get(6)?,
-        latest_request_comment_id: row.get(7)?,
-        latest_request_comment_url: row.get(8)?,
-        latest_request_posted_at: row.get(9)?,
-        attempt_count: row.get(10)?,
-        next_retry_at: row.get(11)?,
-        poll_interval_seconds: row.get(12)?,
-        retry_interval_seconds: row.get(13)?,
-        pickup_detected_at: row.get(14)?,
-        pickup_source: row.get(15)?,
-        review_landed_at: row.get(16)?,
-        review_source: row.get(17)?,
-        review_comment_id: optional_sqlite_json_scalar(row.get_ref(18)?),
-        review_url: row.get(19)?,
-        last_polled_at: row.get(20)?,
-        last_error: row.get(21)?,
-        state: row.get(22)?,
-        is_active: row.get::<_, Option<i64>>(23)?.unwrap_or(1) != 0,
+        requested_head_sha: row.get(6)?,
+        superseded_by_request_id: row.get(7)?,
+        superseded_at: row.get(8)?,
+        requested_at: row.get(9)?,
+        latest_request_comment_id: row.get(10)?,
+        latest_request_comment_url: row.get(11)?,
+        latest_request_posted_at: row.get(12)?,
+        attempt_count: row.get(13)?,
+        next_retry_at: row.get(14)?,
+        poll_interval_seconds: row.get(15)?,
+        retry_interval_seconds: row.get(16)?,
+        pickup_detected_at: row.get(17)?,
+        pickup_source: row.get(18)?,
+        review_landed_at: row.get(19)?,
+        review_source: row.get(20)?,
+        review_comment_id: optional_sqlite_json_scalar(row.get_ref(21)?),
+        review_url: row.get(22)?,
+        last_polled_at: row.get(23)?,
+        last_error: row.get(24)?,
+        state: row.get(25)?,
+        is_active: row.get::<_, Option<i64>>(26)?.unwrap_or(1) != 0,
     })
 }
 
