@@ -329,6 +329,12 @@ class SessionManager:
         self.codex_fork_fork_timeout_seconds = float(
             codex_fork_config.get("fork_timeout_seconds", 30.0)
         )
+        self.codex_fork_restore_acceptance_timeout_seconds = float(
+            codex_fork_config.get("restore_acceptance_timeout_seconds", 5.0)
+        )
+        self.codex_fork_restore_acceptance_window_seconds = float(
+            codex_fork_config.get("restore_acceptance_window_seconds", 0.5)
+        )
         self.codex_fork_control_tmux_fallback_enabled = _coerce_rollout_flag(
             codex_fork_config.get("control_tmux_fallback_enabled"),
             default=True,
@@ -1221,6 +1227,7 @@ class SessionManager:
         cleaned_sessions: list[dict] = []
         retired_codex_app_sessions = False
         registry_backfilled = False
+        interrupted_restore_recovered = False
         for session_data in data.get("sessions", []):
             raw_provider = session_data.get("provider")
             raw_tmux_session = session_data.get("tmux_session")
@@ -1270,6 +1277,28 @@ class SessionManager:
                     retired_codex_app_sessions = True
                 self.sessions[session.id] = session
                 logger.info(f"Restored codex app session: {session.name}")
+                continue
+
+            if session.provider == "codex-fork" and session.restore_launch_pending:
+                # A process restart can occur after tmux accepted the command but
+                # before SM observed provider acceptance.  That runtime is
+                # deliberately ambiguous: do not heal it to idle/running or bind
+                # its identity on startup.
+                session.restore_launch_pending = False
+                session.restore_pending_resume_id = None
+                session.status = SessionStatus.STOPPED
+                session.stopped_at = datetime.now()
+                session.error_message = (
+                    "Codex-fork restore acceptance was interrupted; "
+                    "the runtime was not applied. Restore again only after "
+                    "verifying the stored provider resume identity."
+                )
+                self.sessions[session.id] = session
+                interrupted_restore_recovered = True
+                logger.warning(
+                    "Preserved ambiguous codex-fork restore as stopped: %s",
+                    session.name,
+                )
                 continue
 
             if session.status == SessionStatus.STOPPED:
@@ -1392,7 +1421,7 @@ class SessionManager:
             self.adoption_proposals[proposal.id] = proposal
         registry_recovered = self._recover_missing_maintainer_registration()
         registry_changed = self._prune_agent_registrations(persist=False)
-        if retired_codex_app_sessions or registry_recovered or registry_changed:
+        if retired_codex_app_sessions or registry_recovered or registry_changed or interrupted_restore_recovered:
             self._save_state()
 
     def _rewrite_state_raw(self, sessions_data: list[dict], extra_state: Optional[dict] = None) -> bool:
@@ -3996,6 +4025,132 @@ done
             await asyncio.sleep(poll_interval)
 
         return False, None, "Timed out waiting for provider fork confirmation"
+
+    async def _wait_for_codex_fork_restore_acceptance(
+        self,
+        session: Session,
+        *,
+        expected_resume_id: str,
+        remote_events: Optional[asyncio.Queue[Optional[str]]] = None,
+    ) -> tuple[bool, str]:
+        """Prove that a codex-fork restore resumed its recorded provider identity.
+
+        Tmux command creation is only process admission.  A restore becomes live
+        only after the provider emits ``thread_started`` for the exact stored
+        resume id and does not terminally exit during the acceptance window.
+        Raw events are inspected before normal ingestion so a rejected launch
+        cannot replace the durable resume id with a newly-created thread.
+        """
+        deadline = time.monotonic() + max(
+            0.1, self.codex_fork_restore_acceptance_timeout_seconds
+        )
+        poll_interval = max(0.02, min(0.2, self.codex_fork_event_poll_interval_seconds))
+        survival_deadline: Optional[float] = None
+        stream_path = self._codex_fork_event_stream_path(session)
+        offset = 0
+        buffer = ""
+
+        while time.monotonic() < deadline:
+            lines: list[str] = []
+            if remote_events is not None:
+                try:
+                    line = await asyncio.wait_for(remote_events.get(), timeout=poll_interval)
+                except asyncio.TimeoutError:
+                    line = ""
+                if line is None:
+                    return False, "Codex-fork restore lost its remote event stream before provider acceptance"
+                if line:
+                    lines.append(line)
+            elif stream_path.exists():
+                with open(stream_path, "r", encoding="utf-8", errors="ignore") as handle:
+                    handle.seek(offset)
+                    chunk = handle.read()
+                    offset = handle.tell()
+                if chunk:
+                    buffer += chunk
+                    lines = buffer.splitlines()
+                    if buffer and not buffer.endswith("\n"):
+                        buffer = lines.pop() if lines else buffer
+                    else:
+                        buffer = ""
+
+            for line in lines:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_type = event.get("event_type") or event.get("type")
+                normalized = self._normalize_codex_fork_event_type(event_type)
+                payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+
+                if normalized == "session_end":
+                    return False, "Codex-fork provider ended before restore acceptance"
+                if normalized == "error":
+                    return False, "Codex-fork provider reported an error before restore acceptance"
+
+                thread_id, _ = self._extract_codex_fork_thread_started(event_type, payload)
+                if thread_id:
+                    if thread_id != expected_resume_id:
+                        return (
+                            False,
+                            "Codex-fork provider resumed a different thread "
+                            f"({thread_id} != {expected_resume_id})",
+                        )
+                    if survival_deadline is None:
+                        survival_deadline = time.monotonic() + max(
+                            0.0, self.codex_fork_restore_acceptance_window_seconds
+                        )
+
+            try:
+                tmux_exists = self._tmux_session_exists_for_session(session)
+            except Exception as exc:
+                return False, f"Codex-fork restore could not verify tmux liveness: {exc}"
+            if not tmux_exists:
+                return False, "Codex-fork tmux runtime disappeared before restore acceptance"
+
+            if survival_deadline is not None and time.monotonic() >= survival_deadline:
+                return True, ""
+
+            if remote_events is None:
+                await asyncio.sleep(poll_interval)
+
+        if survival_deadline is not None:
+            return False, "Codex-fork provider did not survive the restore acceptance window"
+        return (
+            False,
+            "Codex-fork provider did not confirm the expected resume identity before timeout",
+        )
+
+    async def _fail_codex_fork_restore_acceptance(
+        self,
+        session: Session,
+        reason: str,
+        *,
+        remote_bridge_registered: bool,
+    ) -> str:
+        """Return a rejected restore to durable stopped state without retrying it."""
+        with contextlib.suppress(Exception):
+            if self._tmux_session_exists_for_session(session):
+                self.tmux.kill_session(session.tmux_session)
+        if remote_bridge_registered:
+            with contextlib.suppress(Exception):
+                await self.codex_fork_node_agents.unregister_session(session.id)
+        self._unlink_codex_fork_runtime_artifacts(session)
+        self.codex_fork_runtime_owner.pop(session.id, None)
+        session.restore_launch_pending = False
+        session.restore_pending_resume_id = None
+        session.status = SessionStatus.STOPPED
+        session.stopped_at = datetime.now()
+        session.error_message = reason
+        self._set_codex_fork_lifecycle_state(
+            session_id=session.id,
+            state="shutdown",
+            cause_event_type="restore_acceptance_rejected",
+        )
+        self._save_state()
+        return reason
 
     async def fork_session(
         self,
@@ -7531,13 +7686,23 @@ done
                     )
                     session.provider = effective_provider
             remote_bridge_registered = False
+            remote_event_queue: Optional[asyncio.Queue[Optional[str]]] = None
             if session.provider == "codex-fork" and normalize_node_id(session.node) != PRIMARY_NODE:
                 try:
-                    await self._register_codex_fork_remote_bridge(session)
+                    remote_event_queue = await self._register_codex_fork_remote_bridge(session)
                     remote_bridge_registered = True
                 except Exception as exc:
                     self.mark_node_unreachable(session.id, True)
                     return False, session, str(exc)
+            if session.provider == "codex-fork":
+                # Persist the in-flight state before launching.  If SM restarts
+                # now, hydrate must leave this record stopped rather than turn an
+                # unobserved provider process into a false live session.
+                session.restore_launch_pending = True
+                session.restore_pending_resume_id = resume_id
+                session.status = SessionStatus.STOPPED
+                session.error_message = "Codex-fork restore awaiting provider acceptance"
+                self._save_state()
             if not self.tmux.create_session_with_command(
                 session.tmux_session,
                 session.working_dir,
@@ -7552,11 +7717,30 @@ done
                 if remote_bridge_registered:
                     with contextlib.suppress(Exception):
                         await self.codex_fork_node_agents.unregister_session(session.id)
-                if tmux_error:
+                if session.provider == "codex-fork":
+                    await self._fail_codex_fork_restore_acceptance(
+                        session,
+                        tmux_error or "Failed to restore Codex session runtime",
+                        remote_bridge_registered=False,
+                    )
+                elif tmux_error:
                     session.error_message = tmux_error
                     self._save_state()
                 return False, session, tmux_error or "Failed to restore Codex session runtime"
             session.tmux_socket_name = self._tmux_socket_name()
+            if session.provider == "codex-fork":
+                accepted, acceptance_error = await self._wait_for_codex_fork_restore_acceptance(
+                    session,
+                    expected_resume_id=resume_id,
+                    remote_events=remote_event_queue,
+                )
+                if not accepted:
+                    error = await self._fail_codex_fork_restore_acceptance(
+                        session,
+                        acceptance_error,
+                        remote_bridge_registered=remote_bridge_registered,
+                    )
+                    return False, session, error
         elif session.provider == "codex-app":
             thread_id = session.codex_thread_id or resume_id
             if not thread_id:
@@ -7586,6 +7770,8 @@ done
             return False, session, f"Restore not supported for provider={session.provider}"
 
         session.error_message = None
+        session.restore_launch_pending = False
+        session.restore_pending_resume_id = None
         session.completion_status = None
         session.completion_message = None
         session.completed_at = None

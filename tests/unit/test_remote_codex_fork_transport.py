@@ -793,9 +793,21 @@ async def test_restore_remote_codex_fork_registers_bridge_before_launch_and_uses
     manager.node_runner.run = Mock(
         return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
     )
-    manager._register_codex_fork_remote_bridge = AsyncMock()
+    acceptance_events: asyncio.Queue[object] = asyncio.Queue()
+    acceptance_events.put_nowait(
+        json.dumps(
+            {
+                "event_type": "thread_started",
+                "payload": {"thread": {"id": "resume-restoreremote1"}},
+            }
+        )
+    )
+    manager._register_codex_fork_remote_bridge = AsyncMock(return_value=acceptance_events)
     manager._start_codex_fork_event_monitor = Mock()
-    manager.tmux.session_exists = Mock(return_value=False)
+    manager.codex_fork_restore_acceptance_timeout_seconds = 0.1
+    manager.codex_fork_restore_acceptance_window_seconds = 0.01
+    manager.codex_fork_event_poll_interval_seconds = 0.01
+    manager.tmux.session_exists = Mock(return_value=True)
     manager.tmux.create_session_with_command = Mock(return_value=True)
 
     success, restored, error = await manager.restore_session(session.id)

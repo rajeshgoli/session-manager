@@ -309,6 +309,11 @@ class Session:
     error_message: Optional[str] = None
     transcript_path: Optional[str] = None  # Claude's transcript file path
     provider_resume_id: Optional[str] = None  # Provider-native conversation/thread/session id for restore
+    # A codex-fork restore is durable but not live until the provider confirms it
+    # resumed the exact stored identity.  Keeping this marker lets startup reject
+    # a server crash in the middle of that acceptance handshake conservatively.
+    restore_launch_pending: bool = False
+    restore_pending_resume_id: Optional[str] = None
     model: Optional[str] = None  # Explicit provider model passed at launch; replayed on restore
     forked_from_session_id: Optional[str] = None  # SM session id this session was forked from
     forked_from_provider_resume_id: Optional[str] = None  # Source provider resume id captured before fork
@@ -411,6 +416,8 @@ class Session:
             "error_message": self.error_message,
             "transcript_path": self.transcript_path,
             "provider_resume_id": self.provider_resume_id,
+            "restore_launch_pending": self.restore_launch_pending,
+            "restore_pending_resume_id": self.restore_pending_resume_id,
             "model": self.model,
             "forked_from_session_id": self.forked_from_session_id,
             "forked_from_provider_resume_id": self.forked_from_provider_resume_id,
@@ -514,6 +521,8 @@ class Session:
             error_message=data.get("error_message"),
             transcript_path=data.get("transcript_path"),
             provider_resume_id=data.get("provider_resume_id"),
+            restore_launch_pending=bool(data.get("restore_launch_pending", False)),
+            restore_pending_resume_id=data.get("restore_pending_resume_id"),
             model=data.get("model"),
             forked_from_session_id=data.get("forked_from_session_id"),
             forked_from_provider_resume_id=data.get("forked_from_provider_resume_id"),
