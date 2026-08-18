@@ -16245,7 +16245,7 @@ mod tests {
         assert_eq!(recovered["session_runtime_launches"][0]["status"], "failed");
         assert_eq!(
             recovered["session_runtime_launches"][0]["failure_reason"],
-            "Claude initial brief recovery could not reconcile provider evidence; refusing replay: Claude transcript root is unavailable for structured initial-brief acknowledgement"
+            "Claude initial brief recovery could not reconcile provider evidence; refusing replay: Claude transcript root is unavailable or ambiguous for structured initial-brief acknowledgement"
         );
         let _ = fs::remove_dir_all(root);
     }

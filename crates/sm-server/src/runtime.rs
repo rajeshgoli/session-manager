@@ -419,18 +419,16 @@ impl TmuxRuntime {
             return Ok(None);
         }
         let provider_session_id = claude_provider_session_id(&spec.session_id);
-        let transcripts = self.claude_initial_brief_transcript(spec)?;
-        Ok(transcripts
-            .iter()
-            .any(|transcript| {
-                claude_transcript_has_user_turn_after(
-                    &transcript.path,
-                    0,
-                    &provider_session_id,
-                    prompt,
-                )
-            })
-            .then_some(provider_session_id))
+        let transcript = self.claude_initial_brief_transcript(spec)?;
+        Ok(
+            claude_transcript_has_user_turn_after(
+                &transcript.path,
+                0,
+                &provider_session_id,
+                prompt,
+            )
+            .then_some(provider_session_id),
+        )
     }
 
     pub fn create_session(&self, spec: &TmuxSessionSpec) -> Result<()> {
@@ -1503,28 +1501,21 @@ impl TmuxRuntime {
     fn claude_initial_brief_transcript(
         &self,
         spec: &TmuxSessionSpec,
-    ) -> Result<Vec<ClaudeInitialBriefTranscript>> {
+    ) -> Result<ClaudeInitialBriefTranscript> {
         let provider_session_id = claude_provider_session_id(&spec.session_id);
         let project_dir = claude_project_dir_name(&spec.working_dir);
-        let paths = self
-            .claude_transcript_roots
-            .iter()
-            .map(|root| {
-                let path = root
-                    .join(&project_dir)
-                    .join(format!("{provider_session_id}.jsonl"));
-                ClaudeInitialBriefTranscript {
-                    offset: fs::metadata(&path)
-                        .map(|metadata| metadata.len())
-                        .unwrap_or(0),
-                    path,
-                }
-            })
-            .collect::<Vec<_>>();
-        if paths.is_empty() {
-            bail!("Claude transcript root is unavailable for structured initial-brief acknowledgement");
-        }
-        Ok(paths)
+        let [root] = self.claude_transcript_roots.as_slice() else {
+            bail!("Claude transcript root is unavailable or ambiguous for structured initial-brief acknowledgement");
+        };
+        let path = root
+            .join(&project_dir)
+            .join(format!("{provider_session_id}.jsonl"));
+        Ok(ClaudeInitialBriefTranscript {
+            offset: fs::metadata(&path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+            path,
+        })
     }
 
     /// Confirm the exact submitted brief appears in the provider-owned
@@ -1533,20 +1524,18 @@ impl TmuxRuntime {
     fn wait_for_claude_initial_brief_acceptance(
         &self,
         tmux_session: &str,
-        transcripts: &[ClaudeInitialBriefTranscript],
+        transcript: &ClaudeInitialBriefTranscript,
         provider_session_id: &str,
         prompt: &str,
     ) -> Result<()> {
         let deadline = Instant::now() + self.initial_brief_ack_timeout;
         loop {
-            if transcripts.iter().any(|transcript| {
-                claude_transcript_has_user_turn_after(
-                    &transcript.path,
-                    transcript.offset,
-                    provider_session_id,
-                    prompt,
-                )
-            }) {
+            if claude_transcript_has_user_turn_after(
+                &transcript.path,
+                transcript.offset,
+                provider_session_id,
+                prompt,
+            ) {
                 return Ok(());
             }
             if !self.session_exists(tmux_session)? {
@@ -1870,36 +1859,39 @@ fn claude_line_indicates_main_thread_activity(line: &str) -> bool {
 }
 
 fn claude_projects_roots(configured_transcript_root: Option<&str>) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    let mut push = |path: PathBuf| {
-        if !roots.contains(&path) {
-            roots.push(path);
-        }
-    };
     if let Some(root) = configured_transcript_root
         .map(str::trim)
         .filter(|root| !root.is_empty())
     {
-        push(expand_home(root));
+        return vec![expand_home(root)];
     }
     if let Some(config_dirs) = env::var_os("CLAUDE_CONFIG_DIR") {
-        for config_dir in config_dirs.to_string_lossy().split(',') {
-            let config_dir = config_dir.trim();
-            if !config_dir.is_empty() {
-                push(expand_home(config_dir).join("projects"));
-            }
-        }
+        return claude_config_dir_project_root(&config_dirs.to_string_lossy())
+            .into_iter()
+            .collect();
     }
     if let Some(xdg_config_home) = env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
     {
-        push(xdg_config_home.join("claude").join("projects"));
+        return vec![xdg_config_home.join("claude").join("projects")];
     } else {
-        push(expand_home("~/.config/claude/projects"));
+        return vec![expand_home("~/.claude/projects")];
     }
-    push(expand_home("~/.claude/projects"));
-    roots
+}
+
+/// Claude itself has one active configuration root.  Accepting matching files
+/// from several discovery locations would allow an old copied transcript to
+/// acknowledge a new submission, so a multi-directory override is deliberately
+/// unavailable until the operator selects one explicit transcript root.
+fn claude_config_dir_project_root(config_dirs: &str) -> Option<PathBuf> {
+    let roots = config_dirs
+        .split(',')
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .map(expand_home)
+        .collect::<Vec<_>>();
+    (roots.len() == 1).then(|| roots[0].join("projects"))
 }
 
 fn claude_project_dir_name(working_dir: &str) -> String {
@@ -1946,7 +1938,7 @@ fn claude_transcript_has_user_turn_after(
             };
             entry.get("type").and_then(Value::as_str) == Some("user")
                 && entry.get("sessionId").and_then(Value::as_str) == Some(provider_session_id)
-                && entry.get("isSidechain").and_then(Value::as_bool) != Some(true)
+                && entry.get("isSidechain").and_then(Value::as_bool) == Some(false)
                 && entry
                     .get("message")
                     .and_then(Value::as_object)
@@ -2541,6 +2533,10 @@ esac
                 "message": {"role": "user", "content": prompt},
             }),
             serde_json::json!({
+                "type": "user", "sessionId": provider_session_id.as_str(),
+                "message": {"role": "user", "content": prompt},
+            }),
+            serde_json::json!({
                 "type": "user", "sessionId": provider_session_id.as_str(), "isSidechain": false,
                 "message": {"role": "user", "content": "exact immutable brief\nwith a changed line\n"},
             }),
@@ -2578,6 +2574,45 @@ esac
             prompt
         ));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn claude_config_dir_rejects_ambiguous_transcript_roots() {
+        assert_eq!(
+            claude_config_dir_project_root("/tmp/claude-a"),
+            Some(PathBuf::from("/tmp/claude-a/projects"))
+        );
+        assert_eq!(
+            claude_config_dir_project_root(" /tmp/claude-a, /tmp/claude-b "),
+            None
+        );
+        assert_eq!(claude_config_dir_project_root(" , "), None);
+    }
+
+    #[test]
+    fn claude_initial_brief_reconciliation_rejects_multiple_roots() {
+        let root = env::temp_dir().join(format!("sm-rust-claude-ambiguous-root-{}", process::id()));
+        let working_dir = root.join("repo");
+        fs::create_dir_all(&working_dir).unwrap();
+        let spec = TmuxSessionSpec {
+            session_id: "seat-1289-ambiguous".to_owned(),
+            session_credential: None,
+            tmux_session: "sm-test".to_owned(),
+            working_dir: working_dir.display().to_string(),
+            log_file: root.join("session.log"),
+            provider: "claude".to_owned(),
+            initial_message: Some("immutable brief\n".to_owned()),
+            force_initial_prompt_stdin: true,
+            model: None,
+            reasoning_effort: None,
+        };
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.claude_transcript_roots = vec![root.clone(), root.join("other")];
+        let error = runtime
+            .reconciled_claude_initial_brief_session(&spec, "immutable brief\n")
+            .unwrap_err();
+        assert!(error.to_string().contains("unavailable or ambiguous"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
