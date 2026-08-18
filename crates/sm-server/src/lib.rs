@@ -13,6 +13,7 @@ pub mod mobile_analytics;
 pub mod mobile_devices;
 pub mod policy_contracts;
 pub mod policy_runtime_attestation;
+pub mod policy_store;
 pub mod queue;
 pub mod queue_authority;
 pub mod runtime;
