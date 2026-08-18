@@ -2021,6 +2021,35 @@ sm_send:
     }
 
     #[test]
+    fn policy_admission_is_disabled_without_explicit_operator_config() {
+        let config = AppConfig::default();
+
+        assert!(!config.policy.enabled);
+        assert!(config.policy.projection_path.is_empty());
+        assert_eq!(config.policy.override_ttl_seconds, 900);
+    }
+
+    #[test]
+    fn raw_config_reads_explicit_policy_activation() {
+        let raw: RawConfig = serde_yaml::from_str(
+            r#"
+policy:
+  enabled: true
+  projection_path: /tmp/policy-projection.json
+  db_path: /tmp/policy.db
+  override_ttl_seconds: 300
+"#,
+        )
+        .unwrap();
+        let config = AppConfig::from(raw);
+
+        assert!(config.policy.enabled);
+        assert_eq!(config.policy.projection_path, "/tmp/policy-projection.json");
+        assert_eq!(config.policy.db_path, "/tmp/policy.db");
+        assert_eq!(config.policy.override_ttl_seconds, 300);
+    }
+
+    #[test]
     fn raw_config_reads_top_level_human_names_and_aliases() {
         let raw: RawConfig = serde_yaml::from_str(
             r#"

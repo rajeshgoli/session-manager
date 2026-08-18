@@ -104,6 +104,7 @@ use crate::google_auth::{
 };
 use crate::mobile_analytics::build_mobile_analytics_summary;
 use crate::mobile_devices::{self, mobile_device_db_path};
+use crate::policy_store::{PolicyProjection, PolicyStore};
 use crate::queue::{
     CodexReviewRequestFilters, CodexReviewRequestRegistration, CompleteCodexReviewRequest,
     CreateCodexReviewRequest, CreateQueueJob, QueueAdmissionPolicy, QueueJobFilters,
@@ -366,6 +367,7 @@ impl GitHubReviewPoster for GhCliReviewPoster {
 pub struct AppState {
     config: AppConfig,
     session_store: SessionStore,
+    policy_runtime: Option<PolicyRuntimeState>,
     github_review_poster: Arc<dyn GitHubReviewPoster>,
     codex_review_creation_locks: Arc<AsyncMutex<BTreeSet<String>>>,
     codex_review_watcher_ids: Arc<Mutex<BTreeSet<String>>>,
@@ -381,6 +383,12 @@ pub struct AppState {
     mobile_terminal_runtime_disabled: Arc<AtomicBool>,
     studio_ssh_enabled: Arc<AtomicBool>,
     mobile_terminal_secret: [u8; 32],
+}
+
+#[derive(Clone)]
+struct PolicyRuntimeState {
+    store: PolicyStore,
+    projection: PolicyProjection,
 }
 
 impl AppState {
@@ -456,6 +464,7 @@ impl AppState {
         if let Err(error) = session_store.recover_codex_fork_event_monitors() {
             eprintln!("codex-fork event monitor recovery failed: {error:#}");
         }
+        let policy_runtime = load_policy_runtime(&config)?;
         let mut mobile_terminal_secret = [0u8; 32];
         OsRng.fill_bytes(&mut mobile_terminal_secret);
         let (tmux_client_event_tx, _) = broadcast::channel(128);
@@ -463,6 +472,7 @@ impl AppState {
         Ok(Self {
             config,
             session_store,
+            policy_runtime,
             github_review_poster: Arc::new(GhCliReviewPoster),
             codex_review_creation_locks: Arc::new(AsyncMutex::new(BTreeSet::new())),
             codex_review_watcher_ids: Arc::new(Mutex::new(BTreeSet::new())),
@@ -501,6 +511,10 @@ impl AppState {
         &self.config
     }
 
+    fn policy_runtime(&self) -> Option<&PolicyRuntimeState> {
+        self.policy_runtime.as_ref()
+    }
+
     pub fn reconcile_current_seat_sessions(&self) -> anyhow::Result<()> {
         self.session_store.reconcile_current_seat_sessions()
     }
@@ -523,6 +537,46 @@ impl AppState {
     pub fn scan_usage_ledger(&self) -> anyhow::Result<ScanSummary> {
         self.session_store.scan_usage_ledger()
     }
+}
+
+fn load_policy_runtime(config: &AppConfig) -> anyhow::Result<Option<PolicyRuntimeState>> {
+    if !config.policy.enabled {
+        return Ok(None);
+    }
+    if config.policy.override_ttl_seconds == 0 {
+        anyhow::bail!("policy override_ttl_seconds must be greater than zero");
+    }
+    let projection_path = config.policy.projection_path.trim();
+    if projection_path.is_empty() {
+        anyhow::bail!("policy projection_path is required when policy is enabled");
+    }
+    let projection_path = expand_home(projection_path);
+    let encoded = fs::read_to_string(&projection_path).with_context(|| {
+        format!(
+            "failed to read policy projection {}",
+            projection_path.display()
+        )
+    })?;
+    let projection = serde_json::from_str::<PolicyProjection>(&encoded)
+        .or_else(|_| serde_yaml::from_str::<PolicyProjection>(&encoded))
+        .with_context(|| {
+            format!(
+                "failed to parse policy projection {}",
+                projection_path.display()
+            )
+        })?;
+    if !projection.enabled {
+        anyhow::bail!(
+            "policy projection {} is not explicitly enabled",
+            projection_path.display()
+        );
+    }
+    let store = PolicyStore::new(expand_home(&config.policy.db_path))
+        .context("failed to initialize policy store")?;
+    store
+        .install_projection(&projection)
+        .context("failed to install policy projection")?;
+    Ok(Some(PolicyRuntimeState { store, projection }))
 }
 
 fn should_use_configured_usage_db_path(config: &UsageConfig) -> bool {

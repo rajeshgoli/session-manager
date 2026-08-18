@@ -252,6 +252,25 @@ impl SessionStore {
         self.write_raw_json_value(&state)
     }
 
+    pub fn spawn_launch_intent(&self, intent_id: &str) -> Result<Option<SpawnLaunchIntentRecord>> {
+        let intent_id = intent_id.trim();
+        if intent_id.is_empty() {
+            return Ok(None);
+        }
+        let _guard = self.write_guard()?;
+        let state = self.load_raw_json_value()?;
+        state
+            .get("spawn_launch_intents")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|intent| intent.get("id").and_then(Value::as_str) == Some(intent_id))
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(Into::into)
+    }
+
     pub fn read_spawn_brief(&self, artifact: &SpawnBriefArtifact) -> Result<String> {
         let bytes = fs::read(&artifact.path)
             .with_context(|| format!("failed to read accepted spawn brief {}", artifact.path))?;
@@ -3871,6 +3890,14 @@ impl SessionStore {
             .map(Vec::as_slice)
             .unwrap_or_default();
         generate_unique_session_id(sessions)
+    }
+
+    pub fn codex_fork_event_stream_path(
+        &self,
+        session: &SessionRecord,
+        runtime: &TmuxRuntime,
+    ) -> Option<PathBuf> {
+        codex_fork_event_stream_path(session, runtime)
     }
 
     pub fn create_core_session_with_runtime(
