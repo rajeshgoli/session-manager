@@ -5607,6 +5607,7 @@ async fn queue_runtime_recovery_rejects_live_services_above_reduced_capacity() {
         create_job("service", "old service four"),
     ];
     let background = create_job("background", "must remain pending");
+    set_queue_job_holding_reason(&state_dir, &background.id, "memory_pressure");
     let mut children = services
         .iter()
         .map(|service| {
@@ -5655,6 +5656,10 @@ async fn queue_runtime_recovery_rejects_live_services_above_reduced_capacity() {
     .unwrap()
     .unwrap();
     assert_eq!(background_record.state, "pending");
+    assert_eq!(
+        background_record.holding_reason.as_deref(),
+        Some("memory_pressure")
+    );
 
     for child in &mut children {
         let _ = child.kill();
