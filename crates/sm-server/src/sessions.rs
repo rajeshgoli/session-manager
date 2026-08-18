@@ -16714,6 +16714,7 @@ mod tests {
             completion_message: None,
             completed_at: None,
             stopped_at: None,
+            terminal_provenance: None,
             is_em: false,
             role: None,
             status: status.to_owned(),

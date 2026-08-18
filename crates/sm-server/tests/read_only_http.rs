@@ -206,6 +206,54 @@ fn set_fixture_session_credential(state_file: &PathBuf, session_id: &str, creden
     fs::write(state_file, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
 }
 
+const RETIRE_FIXTURE_CREDENTIAL: &str = "fixture-retire-owner-credential";
+
+fn prepare_fixture_retire_authority(
+    state_file: &PathBuf,
+    session_id: &str,
+    owner_session_id: &str,
+) {
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(state_file).unwrap()).unwrap();
+    let sessions = state["sessions"].as_array_mut().unwrap();
+    {
+        let session = sessions
+            .iter_mut()
+            .find(|session| session["id"] == session_id)
+            .unwrap_or_else(|| panic!("fixture session {session_id} not found"));
+        session["parent_session_id"] = json!(owner_session_id);
+    }
+    let owner = if let Some(owner) = sessions
+        .iter_mut()
+        .find(|session| session["id"] == owner_session_id)
+    {
+        owner
+    } else {
+        sessions.push(json!({
+            "id": owner_session_id,
+            "name": owner_session_id,
+            "working_dir": "/repo",
+            "tmux_session": owner_session_id,
+            "provider": "claude",
+            "status": "running",
+            "created_at": "2026-08-18T04:00:00Z",
+            "last_activity": "2026-08-18T04:00:00Z"
+        }));
+        sessions.last_mut().unwrap()
+    };
+    owner["session_credential_sha256"] = json!(session_credential_hash(RETIRE_FIXTURE_CREDENTIAL));
+    fs::write(state_file, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+}
+
+async fn post_fixture_retire(
+    app: axum::Router,
+    state_file: &PathBuf,
+    session_id: &str,
+    owner_session_id: &str,
+) -> (StatusCode, Value) {
+    prepare_fixture_retire_authority(state_file, session_id, owner_session_id);
+    post_retire(app, session_id, owner_session_id, RETIRE_FIXTURE_CREDENTIAL).await
+}
+
 fn queue_job_completion_notified_at(queue_state_dir: &PathBuf, job_id: &str) -> Option<String> {
     for attempt in 0..50 {
         let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
@@ -752,7 +800,8 @@ async fn session_teardown_fails_requested_what_and_marks_response_undeliverable(
         .create(Some("run12345"), "oldstate", "claude", "session", "summary")
         .unwrap();
 
-    let (status, payload) = post_json(app, "/sessions/run12345/retire", json!({})).await;
+    let (status, payload) =
+        post_fixture_retire(app, &state_file, "run12345", "fixture-retire-owner").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
     let request = store.get(&request.request_id).unwrap().unwrap();
@@ -768,7 +817,15 @@ async fn legacy_kill_route_preserves_deployed_client_response() {
     config.rust_core.fixture_writes_enabled = true;
     let app = router(AppState::new(config));
 
-    let (status, payload) = post_json(app, "/sessions/run12345/kill", json!({})).await;
+    prepare_fixture_retire_authority(&state_file, "run12345", "fixture-retire-owner");
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/sessions/run12345/kill",
+        json!({ "requester_session_id": "fixture-retire-owner" }),
+        &[("X-SM-Session-Credential", RETIRE_FIXTURE_CREDENTIAL)],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "killed");
 }
@@ -13561,7 +13618,13 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
     )
     .await;
 
-    let (status, payload) = post_json(app.clone(), "/sessions/runtimecore/retire", json!({})).await;
+    let (status, payload) = post_fixture_retire(
+        app.clone(),
+        &state_file,
+        "runtimecore",
+        "fixture-retire-owner",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
 
@@ -14350,8 +14413,13 @@ async fn runtime_core_retire_delivers_stop_notify_side_effects() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "ok");
 
-    let (status, payload) =
-        post_json(app.clone(), "/sessions/runtimestopchild/retire", json!({})).await;
+    let (status, payload) = post_fixture_retire(
+        app.clone(),
+        &state_file,
+        "runtimestopchild",
+        "runtimestopem",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
     wait_for_output_contains(
@@ -14458,8 +14526,13 @@ async fn runtime_core_retire_delivers_stop_notify_side_effects() {
     )
     .unwrap();
 
-    let (status, payload) =
-        post_json(app.clone(), "/sessions/runtimeghostchild/retire", json!({})).await;
+    let (status, payload) = post_fixture_retire(
+        app.clone(),
+        &state_file,
+        "runtimeghostchild",
+        "fixture-retire-owner",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
     let stale_sender_notification_count: i64 = queue_conn
@@ -15439,7 +15512,7 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
     );
 
     let (status, payload) =
-        post_json(app.clone(), "/sessions/runtimechild/retire", json!({})).await;
+        post_fixture_retire(app.clone(), &state_file, "runtimechild", "runtimeparent").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
@@ -15451,8 +15524,13 @@ async fn runtime_core_spawn_endpoint_uses_tmux_and_parent_fields() {
     )
     .await;
 
-    let (status, payload) =
-        post_json(app.clone(), "/sessions/runtimeparent/retire", json!({})).await;
+    let (status, payload) = post_fixture_retire(
+        app.clone(),
+        &state_file,
+        "runtimeparent",
+        "fixture-retire-owner",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&tmux_socket, &parent_tmux_session));
@@ -15768,8 +15846,13 @@ async fn runtime_core_spawn_wait_detects_naturally_exited_tmux_child() {
     .await;
     assert!(!tmux_session_exists(&tmux_socket, child_tmux_session));
 
-    let (status, payload) =
-        post_json(app.clone(), "/sessions/naturalparent/retire", json!({})).await;
+    let (status, payload) = post_fixture_retire(
+        app.clone(),
+        &state_file,
+        "naturalparent",
+        "fixture-retire-owner",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&tmux_socket, &parent_tmux_session));
@@ -15846,8 +15929,13 @@ async fn runtime_core_spawn_wait_uses_runtime_output_as_activity() {
         .contains("Idle for"));
     assert!(!tmux_session_exists(&tmux_socket, child_tmux_session));
 
-    let (status, payload) =
-        post_json(app.clone(), "/sessions/activeparent/retire", json!({})).await;
+    let (status, payload) = post_fixture_retire(
+        app.clone(),
+        &state_file,
+        "activeparent",
+        "fixture-retire-owner",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&tmux_socket, &parent_tmux_session));
@@ -15913,7 +16001,13 @@ async fn runtime_core_send_and_retire_use_persisted_tmux_socket() {
     )
     .await;
 
-    let (status, payload) = post_json(app_b, "/sessions/runtimepersisted/retire", json!({})).await;
+    let (status, payload) = post_fixture_retire(
+        app_b,
+        &state_file,
+        "runtimepersisted",
+        "fixture-retire-owner",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&socket_a, &tmux_session));
@@ -15961,7 +16055,13 @@ async fn runtime_core_expands_bare_home_working_dir_for_tmux() {
         Some(home_path.as_path())
     );
 
-    let (status, payload) = post_json(app.clone(), "/sessions/runtimehome/retire", json!({})).await;
+    let (status, payload) = post_fixture_retire(
+        app.clone(),
+        &state_file,
+        "runtimehome",
+        "fixture-retire-owner",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
 
@@ -16099,10 +16199,11 @@ async fn runtime_core_marks_missing_tmux_stopped_on_send_and_retire() {
     let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
     assert!(tmux_kill_session(&tmux_socket, &tmux_session));
 
-    let (status, payload) = post_json(
+    let (status, payload) = post_fixture_retire(
         app.clone(),
-        "/sessions/runtimemissingretire/retire",
-        json!({}),
+        &state_file,
+        "runtimemissingretire",
+        "fixture-retire-owner",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -16239,8 +16340,13 @@ async fn runtime_core_restores_codex_session() {
     let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
     wait_for_output_contains(app.clone(), "runtimecodex", "stock codex initial prompt").await;
 
-    let (status, payload) =
-        post_json(app.clone(), "/sessions/runtimecodex/retire", json!({})).await;
+    let (status, payload) = post_fixture_retire(
+        app.clone(),
+        &state_file,
+        "runtimecodex",
+        "fixture-retire-owner",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
@@ -17390,7 +17496,13 @@ while true; do sleep 1; done
     }
 
     let tmux_session = payload["tmux_session"].as_str().unwrap().to_owned();
-    let (status, payload) = post_json(app.clone(), "/sessions/runtimefork/retire", json!({})).await;
+    let (status, payload) = post_fixture_retire(
+        app.clone(),
+        &state_file,
+        "runtimefork",
+        "fixture-retire-owner",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
     assert!(!tmux_session_exists(&tmux_socket, &tmux_session));
@@ -17823,8 +17935,13 @@ async fn runtime_core_rejects_remote_node_send_and_retire_without_mutating_state
         json!({ "detail": "Rust runtime does not support remote node macbook" })
     );
 
-    let (status, payload) =
-        post_json(app.clone(), "/sessions/remoteruntime/retire", json!({})).await;
+    let (status, payload) = post_fixture_retire(
+        app.clone(),
+        &state_file,
+        "remoteruntime",
+        "fixture-retire-owner",
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
         payload,
