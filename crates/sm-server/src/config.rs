@@ -2134,12 +2134,24 @@ mod tests {
             TEST_ISOLATION_INSTANCE.fetch_add(1, Ordering::Relaxed)
         ));
         let safe_state_file = env::temp_dir().join("sm-safe-fixture-sessions.json");
+        let safe_codex_index = env::temp_dir().join("sm-safe-fixture-codex-index.jsonl");
+        let safe_transcript_root = env::temp_dir().join("sm-safe-fixture-transcripts");
         let mut config = AppConfig::default();
         config.paths.state_file = safe_state_file.display().to_string();
+        config.codex.session_index_path = Some(safe_codex_index.display().to_string());
+        config.claude.transcript_root = Some(safe_transcript_root.display().to_string());
         config.isolate_test_paths(&root).unwrap();
         assert_eq!(
             config.paths.state_file,
             safe_state_file.display().to_string()
+        );
+        assert_eq!(
+            config.codex.session_index_path.as_deref(),
+            Some(safe_codex_index.to_str().unwrap())
+        );
+        assert_eq!(
+            config.claude.transcript_root.as_deref(),
+            Some(safe_transcript_root.to_str().unwrap())
         );
 
         let mut unsafe_config = AppConfig::default();

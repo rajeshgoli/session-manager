@@ -13996,6 +13996,57 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_supplied_absolute_root_is_honored_by_default_appstate() {
+        let probe_root = env::temp_dir().join(format!(
+            "sm-wrapper-harness-isolation-{}-{}",
+            process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let wrapper_root = probe_root.join("wrapper-root");
+        fs::create_dir_all(&wrapper_root).unwrap();
+        let probe_path = probe_root.join("probe");
+        let executable = env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .args([
+                "--exact",
+                "http::tests::direct_test_harness_without_wrapper_cannot_open_production_state_paths",
+                "--nocapture",
+            ])
+            .env(TEST_ISOLATION_ROOT_ENV, &wrapper_root)
+            .env(DIRECT_HARNESS_PROBE_ENV, &probe_path)
+            .spawn()
+            .unwrap();
+
+        for _ in 0..500 {
+            if probe_path.exists() {
+                break;
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "wrapper probe exited early"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let probe = fs::read_to_string(&probe_path).unwrap();
+        let mut lines = probe.lines();
+        let child_pid = lines.next().unwrap().parse::<u32>().unwrap();
+        let state_file = StdPath::new(lines.next().unwrap());
+        assert!(
+            state_file.starts_with(&wrapper_root),
+            "wrapper root was ignored: {}",
+            state_file.display()
+        );
+        println!(
+            "wrapper-harness child pid {child_pid} state path {}",
+            state_file.display()
+        );
+
+        fs::write(probe_path.with_extension("release"), []).unwrap();
+        assert!(child.wait().unwrap().success());
+        fs::remove_dir_all(probe_root).unwrap();
+    }
+
+    #[test]
     fn test_harness_rejects_explicit_production_state_before_appstate_startup() {
         let production_state_file = env::var_os("HOME")
             .map(PathBuf::from)

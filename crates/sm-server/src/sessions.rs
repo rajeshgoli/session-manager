@@ -15417,6 +15417,21 @@ mod tests {
     }
 
     #[test]
+    fn test_isolation_prevents_default_home_scans_from_being_restored() {
+        let root = test_isolation_root_from_environment().unwrap().unwrap();
+        let state_file = root.join("external-scan-fixture.json");
+        let store = SessionStore::new(state_file)
+            .with_codex_session_index_path(Some("~/.codex/session_index.jsonl"))
+            .with_claude_transcript_root(None);
+
+        assert!(store.codex_sessions_root.starts_with(&root));
+        assert!(store
+            .claude_projects_roots
+            .iter()
+            .all(|path| path.starts_with(&root)));
+    }
+
+    #[test]
     fn generated_session_ids_match_python_short_hex_contract() {
         let session_id = generate_session_id();
 
