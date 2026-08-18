@@ -1061,6 +1061,7 @@ impl SessionStore {
             session.insert("completion_status".to_owned(), Value::Null);
             session.insert("completion_message".to_owned(), Value::Null);
             session.insert("completed_at".to_owned(), Value::Null);
+            session.insert("terminal_provenance".to_owned(), Value::Null);
             session.insert("agent_task_completed_at".to_owned(), Value::Null);
         }
         if let Some(provider_resume_id) = recovered_provider_resume_id.as_deref() {
@@ -5335,6 +5336,7 @@ impl SessionStore {
         session.insert("completion_status".to_owned(), Value::Null);
         session.insert("completion_message".to_owned(), Value::Null);
         session.insert("completed_at".to_owned(), Value::Null);
+        session.insert("terminal_provenance".to_owned(), Value::Null);
         session.insert("agent_task_completed_at".to_owned(), Value::Null);
         session.insert("last_activity".to_owned(), Value::String(now));
         if let Some(log_file) = json_text(session.get("log_file")) {
@@ -5542,6 +5544,7 @@ impl SessionStore {
         session.insert("completion_status".to_owned(), Value::Null);
         session.insert("completion_message".to_owned(), Value::Null);
         session.insert("completed_at".to_owned(), Value::Null);
+        session.insert("terminal_provenance".to_owned(), Value::Null);
         session.insert("agent_task_completed_at".to_owned(), Value::Null);
         session.insert("last_activity".to_owned(), Value::String(now));
         if let Some(socket_name) = session_runtime.socket_name() {
@@ -5644,6 +5647,7 @@ impl SessionStore {
         session.insert("completion_status".to_owned(), Value::Null);
         session.insert("completion_message".to_owned(), Value::Null);
         session.insert("completed_at".to_owned(), Value::Null);
+        session.insert("terminal_provenance".to_owned(), Value::Null);
         session.insert("agent_task_completed_at".to_owned(), Value::Null);
         session.insert("error_message".to_owned(), Value::Null);
         session.insert("last_activity".to_owned(), Value::String(now));
@@ -7370,18 +7374,45 @@ impl SessionStore {
         session_id: &str,
         requester_session_id: Option<&str>,
     ) -> Result<CoreRetireOutcome> {
+        self.retire_core_session_authorized(session_id, requester_session_id, None)
+    }
+
+    pub fn retire_core_session_authorized(
+        &self,
+        session_id: &str,
+        requester_session_id: Option<&str>,
+        session_credential: Option<&str>,
+    ) -> Result<CoreRetireOutcome> {
+        let authority = retire_authority(requester_session_id, session_credential);
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;
+        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        if requester_session_id.is_some() && session_credential.is_none() {
+            return Ok(CoreRetireOutcome::Forbidden);
+        }
+        if let Some((requester_session_id, session_credential)) =
+            requester_session_id.zip(session_credential)
+        {
+            if !active_session_credential_matches(
+                &sessions,
+                requester_session_id,
+                session_credential,
+            ) {
+                return Ok(CoreRetireOutcome::Forbidden);
+            }
+        }
         let recipient_name = {
             let sessions = ensure_sessions_array_mut(&mut state)?;
             let Some(session) = session_object_mut(sessions, session_id) else {
                 return Ok(CoreRetireOutcome::NotFound);
             };
             if let Some(requester_session_id) = requester_session_id {
-                if !requester_session_id.is_empty()
-                    && json_text(session.get("parent_session_id")).as_deref()
-                        != Some(requester_session_id)
+                if json_text(session.get("parent_session_id")).is_none() {
+                    return Ok(CoreRetireOutcome::RootProtected);
+                }
+                if json_text(session.get("parent_session_id")).as_deref()
+                    != Some(requester_session_id)
                 {
                     return Ok(CoreRetireOutcome::NotChild);
                 }
@@ -7396,7 +7427,11 @@ impl SessionStore {
             .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during retire"))?;
         let now = now_rfc3339();
         session.insert("status".to_owned(), Value::String("stopped".to_owned()));
-        mark_session_retired(session, &now);
+        mark_session_retired(
+            session,
+            &now,
+            TerminalProvenance::explicit_retire(&now, requester_session_id, authority, None),
+        );
         session.insert("stopped_at".to_owned(), Value::String(now.clone()));
         session.insert("last_activity".to_owned(), Value::String(now));
         if let Some(log_file) = json_text(session.get("log_file")) {
@@ -7417,18 +7452,51 @@ impl SessionStore {
         requester_session_id: Option<&str>,
         runtime: &TmuxRuntime,
     ) -> Result<CoreRetireOutcome> {
+        self.retire_core_session_with_runtime_authorized(
+            session_id,
+            requester_session_id,
+            None,
+            runtime,
+        )
+    }
+
+    pub fn retire_core_session_with_runtime_authorized(
+        &self,
+        session_id: &str,
+        requester_session_id: Option<&str>,
+        session_credential: Option<&str>,
+        runtime: &TmuxRuntime,
+    ) -> Result<CoreRetireOutcome> {
+        let authority = retire_authority(requester_session_id, session_credential);
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         ensure_session_not_reparent_fenced(&state, session_id)?;
+        let sessions_snapshot = snapshot_from_raw_value(&state)?.into_sessions();
+        if requester_session_id.is_some() && session_credential.is_none() {
+            return Ok(CoreRetireOutcome::Forbidden);
+        }
+        if let Some((requester_session_id, session_credential)) =
+            requester_session_id.zip(session_credential)
+        {
+            if !active_session_credential_matches(
+                &sessions_snapshot,
+                requester_session_id,
+                session_credential,
+            ) {
+                return Ok(CoreRetireOutcome::Forbidden);
+            }
+        }
         let (node, tmux_session, session_socket_name, recipient_name) = {
             let sessions = ensure_sessions_array_mut(&mut state)?;
             let Some(session) = session_object_mut(sessions, session_id) else {
                 return Ok(CoreRetireOutcome::NotFound);
             };
             if let Some(requester_session_id) = requester_session_id {
-                if !requester_session_id.is_empty()
-                    && json_text(session.get("parent_session_id")).as_deref()
-                        != Some(requester_session_id)
+                if json_text(session.get("parent_session_id")).is_none() {
+                    return Ok(CoreRetireOutcome::RootProtected);
+                }
+                if json_text(session.get("parent_session_id")).as_deref()
+                    != Some(requester_session_id)
                 {
                     return Ok(CoreRetireOutcome::NotChild);
                 }
@@ -7444,7 +7512,7 @@ impl SessionStore {
             return Ok(CoreRetireOutcome::UnsupportedNode(node));
         }
         let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
-        let _ = session_runtime.kill_session(&tmux_session)?;
+        let tmux_was_killed = session_runtime.kill_session(&tmux_session)?;
         // A terminal write and its rotation finalization share this one atomic
         // state replacement, so recovery cannot later relaunch the seat.
         finalize_active_credential_rotations_for_terminal_session(&mut state, session_id)?;
@@ -7453,7 +7521,20 @@ impl SessionStore {
         let session = session_object_mut(sessions, session_id)
             .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during retire"))?;
         session.insert("status".to_owned(), Value::String("stopped".to_owned()));
-        mark_session_retired(session, &now);
+        mark_session_retired(
+            session,
+            &now,
+            TerminalProvenance::explicit_retire(
+                &now,
+                requester_session_id,
+                authority,
+                Some(if tmux_was_killed {
+                    "killed"
+                } else {
+                    "already_absent"
+                }),
+            ),
+        );
         session.insert("stopped_at".to_owned(), Value::String(now.clone()));
         session.insert("last_activity".to_owned(), Value::String(now));
         complete_stop_notify_after_stop_raw(
@@ -8146,10 +8227,18 @@ impl SessionStore {
             let now = now_rfc3339();
             session.insert("last_activity".to_owned(), Value::String(now.clone()));
             if next_status == "stopped" {
-                session.insert("stopped_at".to_owned(), Value::String(now));
+                session.insert("stopped_at".to_owned(), Value::String(now.clone()));
                 terminal_provider_event = true;
+                session.insert(
+                    "terminal_provenance".to_owned(),
+                    serde_json::to_value(TerminalProvenance::provider_natural_exit(
+                        &now,
+                        "codex_fork_lifecycle_event",
+                    ))?,
+                );
             } else {
                 session.insert("stopped_at".to_owned(), Value::Null);
+                session.insert("terminal_provenance".to_owned(), Value::Null);
             }
             changed = true;
         }
@@ -8360,6 +8449,7 @@ impl SessionStore {
             completion_message: None,
             completed_at: None,
             stopped_at: None,
+            terminal_provenance: None,
             is_em: false,
             role: None,
             status: "running".to_owned(),
@@ -9291,6 +9381,8 @@ pub enum CoreRetireOutcome {
     Retired(CoreRetireResult),
     NotFound,
     NotChild,
+    RootProtected,
+    Forbidden,
     UnsupportedNode(String),
 }
 
@@ -10356,7 +10448,14 @@ fn deliver_runtime_text_to_session_raw(
         status = "stopped".to_owned();
         session.insert("status".to_owned(), Value::String(status.clone()));
         session.insert("stopped_at".to_owned(), Value::String(now.clone()));
-        session.insert("last_activity".to_owned(), Value::String(now));
+        session.insert("last_activity".to_owned(), Value::String(now.clone()));
+        session.insert(
+            "terminal_provenance".to_owned(),
+            serde_json::to_value(TerminalProvenance::tmux_disappearance(
+                &now,
+                "runtime_delivery_failed",
+            ))?,
+        );
     }
     Ok((status, delivered))
 }
@@ -10419,7 +10518,14 @@ fn deliver_urgent_runtime_text_to_session_raw(
         status = "stopped".to_owned();
         session.insert("status".to_owned(), Value::String(status.clone()));
         session.insert("stopped_at".to_owned(), Value::String(now.clone()));
-        session.insert("last_activity".to_owned(), Value::String(now));
+        session.insert("last_activity".to_owned(), Value::String(now.clone()));
+        session.insert(
+            "terminal_provenance".to_owned(),
+            serde_json::to_value(TerminalProvenance::tmux_disappearance(
+                &now,
+                "runtime_urgent_delivery_failed",
+            ))?,
+        );
     }
     Ok((status, delivered))
 }
@@ -11698,6 +11804,7 @@ fn reset_session_after_clear(session: &mut Map<String, Value>, now: &str) {
     session.insert("completion_status".to_owned(), Value::Null);
     session.insert("completion_message".to_owned(), Value::Null);
     session.insert("completed_at".to_owned(), Value::Null);
+    session.insert("terminal_provenance".to_owned(), Value::Null);
     session.insert("last_activity".to_owned(), Value::String(now.to_owned()));
     mark_review_dispatch_completed(session, now);
 }
@@ -11707,7 +11814,11 @@ fn mark_session_followup_activity(session: &mut Map<String, Value>, now: &str) {
     session.insert("last_activity".to_owned(), Value::String(now.to_owned()));
 }
 
-fn mark_session_retired(session: &mut Map<String, Value>, now: &str) {
+fn mark_session_retired(
+    session: &mut Map<String, Value>,
+    now: &str,
+    mut provenance: TerminalProvenance,
+) {
     session.insert(
         "completion_status".to_owned(),
         Value::String("retired".to_owned()),
@@ -11717,6 +11828,13 @@ fn mark_session_retired(session: &mut Map<String, Value>, now: &str) {
         Value::String("Retired via sm retire".to_owned()),
     );
     session.insert("completed_at".to_owned(), Value::String(now.to_owned()));
+    // Use the same terminal timestamp for the provenance record. A new clock
+    // sample would make ordering with `stopped_at` needlessly ambiguous.
+    provenance.observed_at = now.to_owned();
+    session.insert(
+        "terminal_provenance".to_owned(),
+        serde_json::to_value(provenance).expect("terminal provenance serializes"),
+    );
 }
 
 fn clear_authorization_error(
@@ -12864,6 +12982,29 @@ fn session_credential_matches(
         return false;
     };
     constant_time_text_eq(expected, &sha256_text(credential))
+}
+
+fn active_session_credential_matches(
+    sessions: &[SessionRecord],
+    session_id: &str,
+    credential: &str,
+) -> bool {
+    sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .is_some_and(|session| !session.is_stopped())
+        && session_credential_matches(sessions, session_id, credential)
+}
+
+fn retire_authority(
+    requester_session_id: Option<&str>,
+    session_credential: Option<&str>,
+) -> &'static str {
+    if requester_session_id.is_some() && session_credential.is_some() {
+        "authenticated_parent"
+    } else {
+        "server_owned"
+    }
 }
 
 fn credential_rotation_has_fresh_idle_proof(
@@ -14828,6 +14969,11 @@ pub struct SessionRecord {
     pub completed_at: Option<String>,
     #[serde(default)]
     pub stopped_at: Option<String>,
+    /// Durable evidence for the terminal transition. Older records have no
+    /// provenance and must remain explicitly unknown rather than being inferred
+    /// from a later server restart or a missing tmux session.
+    #[serde(default)]
+    pub terminal_provenance: Option<TerminalProvenance>,
     #[serde(default)]
     pub is_em: bool,
     #[serde(default)]
@@ -14880,6 +15026,78 @@ pub struct SessionRecord {
     pub aliases: Vec<String>,
     #[serde(skip)]
     pub pending_adoption_proposals: Vec<AdoptionProposalResponse>,
+}
+
+/// The observed mechanism that made a seat terminal. This is deliberately not
+/// an operational-role label: a successor being live is not evidence that its
+/// predecessor was intentionally retired.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalCause {
+    ExplicitRetire,
+    ProviderNaturalExit,
+    TmuxDisappearance,
+    StartupReconciliation,
+    RestartInducedTeardown,
+}
+
+/// Persisted attribution for a terminal session transition.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TerminalProvenance {
+    pub cause: TerminalCause,
+    pub observed_at: String,
+    #[serde(default)]
+    pub actor_session_id: Option<String>,
+    /// The authority that was verified before the terminal mutation.  The
+    /// actor field is meaningful only for an authenticated parent authority.
+    pub authority: String,
+    pub source: String,
+    #[serde(default)]
+    pub tmux_disposition: Option<String>,
+}
+
+impl TerminalProvenance {
+    fn explicit_retire(
+        observed_at: &str,
+        actor_session_id: Option<&str>,
+        authority: &str,
+        tmux_disposition: Option<&str>,
+    ) -> Self {
+        Self {
+            cause: TerminalCause::ExplicitRetire,
+            observed_at: observed_at.to_owned(),
+            actor_session_id: actor_session_id.map(ToOwned::to_owned),
+            authority: authority.to_owned(),
+            source: if authority == "authenticated_parent" {
+                "api_retire".to_owned()
+            } else {
+                "server_owned_retire".to_owned()
+            },
+            tmux_disposition: tmux_disposition.map(ToOwned::to_owned),
+        }
+    }
+
+    fn provider_natural_exit(observed_at: &str, source: &str) -> Self {
+        Self {
+            cause: TerminalCause::ProviderNaturalExit,
+            observed_at: observed_at.to_owned(),
+            actor_session_id: None,
+            authority: "provider_observed".to_owned(),
+            source: source.to_owned(),
+            tmux_disposition: None,
+        }
+    }
+
+    fn tmux_disappearance(observed_at: &str, source: &str) -> Self {
+        Self {
+            cause: TerminalCause::TmuxDisappearance,
+            observed_at: observed_at.to_owned(),
+            actor_session_id: None,
+            authority: "runtime_observed".to_owned(),
+            source: source.to_owned(),
+            tmux_disposition: Some("absent".to_owned()),
+        }
+    }
 }
 
 fn root_seat_id(record: &SessionRecord, records: &BTreeMap<&str, &SessionRecord>) -> String {
@@ -15005,6 +15223,7 @@ pub struct SessionResponse {
     last_activity: String,
     completed_at: Option<String>,
     stopped_at: Option<String>,
+    terminal_provenance: Option<TerminalProvenance>,
     tmux_session: String,
     tmux_socket_name: Option<String>,
     node: String,
@@ -15057,6 +15276,7 @@ impl From<SessionRecord> for SessionResponse {
             last_activity: session.last_activity,
             completed_at: session.completed_at,
             stopped_at: session.stopped_at,
+            terminal_provenance: session.terminal_provenance,
             tmux_session: session.tmux_session,
             tmux_socket_name: session.tmux_socket_name,
             node: non_empty_or(session.node, "primary"),
@@ -20796,11 +21016,19 @@ mod tests {
             true
         );
         assert!(matches!(
-            store.retire_core_session("child001", Some("oldpar01")),
+            store.retire_core_session_authorized(
+                "child001",
+                Some("oldpar01"),
+                Some(old_credential),
+            ),
             Ok(CoreRetireOutcome::NotChild)
         ));
         assert!(matches!(
-            store.retire_core_session("child001", Some("newpar01")),
+            store.retire_core_session_authorized(
+                "child001",
+                Some("newpar01"),
+                Some(new_credential),
+            ),
             Ok(CoreRetireOutcome::Retired(_))
         ));
 

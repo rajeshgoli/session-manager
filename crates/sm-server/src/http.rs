@@ -8168,42 +8168,61 @@ async fn retire_session(
         &format!("/sessions/{session_id}/retire"),
     )?;
     ensure_core_writes_enabled(&state)?;
+    if state.session_store.get_session(&session_id)?.is_none() {
+        return Ok(Json(json!({
+            "error": format!("Session {session_id} not found")
+        })));
+    }
     let requester_session_id = payload
         .requester_session_id
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let may_retire = state
-        .session_store
-        .get_session(&session_id)?
-        .is_some_and(|session| {
-            requester_session_id.is_none_or(|requester| {
-                requester.is_empty() || session.parent_session_id.as_deref() == Some(requester)
-            }) && (!state.config.rust_core.runtime_enabled || is_primary_node(&session.node))
+    let Some(requester_session_id) = requester_session_id else {
+        return Err(ApiError::Status {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail: "requester_session_id is required to retire a child session".to_owned(),
         });
-    if may_retire {
-        teardown_btw_requests_for_session(&state, &session_id)?;
-    }
+    };
+    let session_credential = reparent_session_credential(&headers)?;
     let outcome = if state.config.rust_core.runtime_enabled {
         let runtime = TmuxRuntime::from_app_config(&state.config);
-        state.session_store.retire_core_session_with_runtime(
-            &session_id,
-            requester_session_id,
-            &runtime,
-        )?
-    } else {
         state
             .session_store
-            .retire_core_session(&session_id, requester_session_id)?
+            .retire_core_session_with_runtime_authorized(
+                &session_id,
+                Some(requester_session_id),
+                Some(&session_credential),
+                &runtime,
+            )?
+    } else {
+        state.session_store.retire_core_session_authorized(
+            &session_id,
+            Some(requester_session_id),
+            Some(&session_credential),
+        )?
     };
     match outcome {
-        CoreRetireOutcome::Retired(result) => Ok(Json(serde_json::to_value(result)?)),
+        CoreRetireOutcome::Retired(result) => {
+            if let Err(error) = teardown_btw_requests_for_session(&state, &session_id) {
+                eprintln!("retired session {session_id} but BTW teardown failed: {error:#}");
+            }
+            Ok(Json(serde_json::to_value(result)?))
+        }
         CoreRetireOutcome::NotFound => Ok(Json(json!({
             "error": format!("Session {session_id} not found")
         }))),
         CoreRetireOutcome::NotChild => Ok(Json(json!({
             "error": format!("Cannot retire session {session_id} - not your child session")
         }))),
+        CoreRetireOutcome::RootProtected => Ok(Json(json!({
+            "error": format!("Cannot retire session {session_id} - root sessions require server-owned lifecycle authority")
+        }))),
+        CoreRetireOutcome::Forbidden => Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "session credential is missing, stale, or does not match the claimed requester"
+                .to_owned(),
+        }),
         CoreRetireOutcome::UnsupportedNode(node) => Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
             detail: format!("Rust runtime does not support remote node {node}"),

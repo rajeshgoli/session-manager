@@ -91,6 +91,22 @@ async fn post_json_with_headers_and_peer(
     json_request_with_headers_and_peer(app, "POST", uri, payload, headers, peer_addr).await
 }
 
+async fn post_retire(
+    app: axum::Router,
+    session_id: &str,
+    requester_session_id: &str,
+    session_credential: &str,
+) -> (StatusCode, Value) {
+    post_json_with_headers_and_peer(
+        app,
+        &format!("/sessions/{session_id}/retire"),
+        json!({ "requester_session_id": requester_session_id }),
+        &[("X-SM-Session-Credential", session_credential)],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await
+}
+
 async fn put_json(app: axum::Router, uri: &str, payload: Value) -> (StatusCode, Value) {
     json_request_with_headers_and_peer(
         app,
@@ -176,6 +192,18 @@ fn session_credential_hash(credential: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn set_fixture_session_credential(state_file: &PathBuf, session_id: &str, credential: &str) {
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|session| session["id"] == session_id)
+        .unwrap_or_else(|| panic!("fixture session {session_id} not found"));
+    session["session_credential_sha256"] = json!(session_credential_hash(credential));
+    fs::write(state_file, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
 }
 
 fn queue_job_completion_notified_at(queue_state_dir: &PathBuf, job_id: &str) -> Option<String> {
@@ -10995,6 +11023,37 @@ rust_core:
 async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
     let state_file = unique_temp_path();
     let log_dir = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "fixture-owner",
+                    "name": "fixture-owner",
+                    "working_dir": "/repo",
+                    "tmux_session": "fixture-owner",
+                    "provider": "claude",
+                    "status": "running",
+                    "session_credential_sha256": session_credential_hash("fixture-owner-credential"),
+                    "created_at": "2026-08-18T04:00:00Z",
+                    "last_activity": "2026-08-18T04:00:00Z"
+                },
+                {
+                    "id": "otherparent",
+                    "name": "otherparent",
+                    "working_dir": "/repo",
+                    "tmux_session": "otherparent",
+                    "provider": "claude",
+                    "status": "running",
+                    "session_credential_sha256": session_credential_hash("otherparent-credential"),
+                    "created_at": "2026-08-18T04:00:00Z",
+                    "last_activity": "2026-08-18T04:00:00Z"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
@@ -11013,6 +11072,7 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
         json!({
             "id": "rustcore",
             "name": "rust-core",
+            "parent_session_id": "fixture-owner",
             "working_dir": "/repo",
             "provider": "claude",
             "initial_message": "initial fixture prompt"
@@ -11023,6 +11083,7 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
     assert_eq!(payload["id"], "rustcore");
     assert_eq!(payload["status"], "running");
     assert_eq!(payload["friendly_name"], "rust-core");
+    set_fixture_session_credential(&state_file, "rustcore", "rustcore-credential");
 
     let (status, payload) = post_json(
         app.clone(),
@@ -11107,10 +11168,11 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["agent_status_text"], "writing Rust status");
 
-    let (status, payload) = post_json(
+    let (status, payload) = post_retire(
         app.clone(),
-        "/sessions/rustchild/retire",
-        json!({ "requester_session_id": "otherparent" }),
+        "rustchild",
+        "otherparent",
+        "otherparent-credential",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -11123,22 +11185,19 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "running");
 
-    let (status, payload) = post_json(
-        app.clone(),
-        "/sessions/rustcore/retire",
-        json!({ "requester_session_id": "rustcore" }),
-    )
-    .await;
+    let (status, payload) =
+        post_retire(app.clone(), "rustcore", "rustcore", "rustcore-credential").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         payload["error"],
         "Cannot retire session rustcore - not your child session"
     );
 
-    let (status, payload) = post_json(
+    let (status, payload) = post_retire(
         app.clone(),
-        "/sessions/rustgrandchild/retire",
-        json!({ "requester_session_id": "rustcore" }),
+        "rustgrandchild",
+        "rustcore",
+        "rustcore-credential",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -11151,12 +11210,8 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "running");
 
-    let (status, payload) = post_json(
-        app.clone(),
-        "/sessions/rustchild/retire",
-        json!({ "requester_session_id": "rustcore" }),
-    )
-    .await;
+    let (status, payload) =
+        post_retire(app.clone(), "rustchild", "rustcore", "rustcore-credential").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
     assert_eq!(payload["session_id"], "rustchild");
@@ -11169,14 +11224,187 @@ async fn fixture_core_lifecycle_creates_sends_outputs_and_retires() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["error"], "Session missingcore not found");
 
-    let (status, payload) = post_json(app.clone(), "/sessions/rustcore/retire", json!({})).await;
+    let (status, payload) = post_retire(
+        app.clone(),
+        "rustcore",
+        "fixture-owner",
+        "fixture-owner-credential",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
 
     let (status, payload) = get_json(app, "/sessions?include_stopped=true").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["sessions"][0]["id"], "rustcore");
-    assert_eq!(payload["sessions"][0]["status"], "stopped");
+    let rustcore = payload["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "rustcore")
+        .unwrap();
+    assert_eq!(rustcore["status"], "stopped");
+    assert_eq!(rustcore["terminal_provenance"]["cause"], "explicit_retire");
+    assert_eq!(
+        rustcore["terminal_provenance"]["actor_session_id"],
+        "fixture-owner"
+    );
+    assert_eq!(
+        rustcore["terminal_provenance"]["authority"],
+        "authenticated_parent"
+    );
+}
+
+#[tokio::test]
+async fn runtime_restart_preserves_real_tmux_child_until_an_attributed_parent_retire() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-restart-provenance-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let tmux_session = "restart-provenance-child";
+    assert!(Command::new("tmux")
+        .args([
+            "-L",
+            &tmux_socket,
+            "new-session",
+            "-d",
+            "-s",
+            tmux_session,
+            "sleep 120",
+        ])
+        .status()
+        .unwrap()
+        .success());
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "restartparent",
+                    "name": "restart-parent",
+                    "working_dir": working_dir,
+                    "tmux_session": "restart-provenance-parent",
+                    "tmux_socket_name": tmux_socket,
+                    "node": "primary",
+                    "provider": "claude",
+                    "status": "running",
+                    "session_credential_sha256": session_credential_hash("restart-parent-credential"),
+                    "created_at": "2026-08-18T04:00:00Z",
+                    "last_activity": "2026-08-18T04:00:00Z"
+                },
+                {
+                    "id": "restartchild",
+                    "name": "restart-child",
+                    "parent_session_id": "restartparent",
+                    "working_dir": working_dir,
+                    "tmux_session": tmux_session,
+                    "tmux_socket_name": tmux_socket,
+                    "node": "primary",
+                    "provider": "claude",
+                    "status": "idle",
+                    "created_at": "2026-08-18T04:00:00Z",
+                    "last_activity": "2026-08-18T04:00:00Z"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.runtime_enabled = true;
+    config.rust_core.log_dir = Some(log_dir.display().to_string());
+    config.rust_core.tmux_socket_name = Some(tmux_socket.clone());
+
+    // AppState construction is the server-owned state recovery performed on a
+    // fresh process. It must observe this already-live tmux child, not tear it
+    // down merely because a server instance was replaced.
+    let _first_server = AppState::new(config.clone());
+    let app_after_restart = router(AppState::new(config));
+    assert!(tmux_session_exists(&tmux_socket, tmux_session));
+
+    let (status, payload) = post_json(
+        app_after_restart.clone(),
+        "/sessions/restartchild/retire",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        payload["detail"],
+        "requester_session_id is required to retire a child session"
+    );
+    assert!(tmux_session_exists(&tmux_socket, tmux_session));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app_after_restart.clone(),
+        "/sessions/restartchild/retire",
+        json!({ "requester_session_id": "restartparent" }),
+        &[("X-SM-Session-Credential", "incorrect-credential")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        payload["detail"],
+        "session credential is missing, stale, or does not match the claimed requester"
+    );
+    assert!(tmux_session_exists(&tmux_socket, tmux_session));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app_after_restart.clone(),
+        "/sessions/restartparent/retire",
+        json!({ "requester_session_id": "restartparent" }),
+        &[("X-SM-Session-Credential", "restart-parent-credential")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["error"],
+        "Cannot retire session restartparent - root sessions require server-owned lifecycle authority"
+    );
+    assert!(tmux_session_exists(&tmux_socket, tmux_session));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app_after_restart.clone(),
+        "/sessions/restartchild/retire",
+        json!({ "requester_session_id": "restartparent" }),
+        &[("X-SM-Session-Credential", "restart-parent-credential")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "retired");
+    assert!(!tmux_session_exists(&tmux_socket, tmux_session));
+
+    let (status, payload) = get_json(app_after_restart, "/sessions/restartchild").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["terminal_provenance"]["cause"], "explicit_retire");
+    let persisted: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let provenance = persisted["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "restartchild")
+        .unwrap()
+        .get("terminal_provenance")
+        .unwrap();
+    assert_eq!(provenance["cause"], "explicit_retire");
+    assert_eq!(provenance["actor_session_id"], "restartparent");
+    assert_eq!(provenance["authority"], "authenticated_parent");
+    assert_eq!(provenance["source"], "api_retire");
+    assert_eq!(provenance["tmux_disposition"], "killed");
 }
 
 #[tokio::test]
@@ -11195,6 +11423,20 @@ async fn fixture_core_input_batch_reports_per_recipient_results() {
         ..AppConfig::default()
     }));
 
+    let (status, _payload) = post_json(
+        app.clone(),
+        "/sessions",
+        json!({
+            "id": "batch-owner",
+            "name": "batch-owner",
+            "working_dir": "/repo",
+            "provider": "claude"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    set_fixture_session_credential(&state_file, "batch-owner", "batch-owner-credential");
+
     for (id, name) in [
         ("batchfixturea", "batch-fixture-a"),
         ("batchfixtureb", "batch-fixture-b"),
@@ -11206,6 +11448,7 @@ async fn fixture_core_input_batch_reports_per_recipient_results() {
             json!({
                 "id": id,
                 "name": name,
+                "parent_session_id": "batch-owner",
                 "working_dir": "/repo",
                 "provider": "claude"
             }),
@@ -11214,8 +11457,13 @@ async fn fixture_core_input_batch_reports_per_recipient_results() {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(payload["id"], id);
     }
-    let (status, payload) =
-        post_json(app.clone(), "/sessions/batchstopped/retire", json!({})).await;
+    let (status, payload) = post_retire(
+        app.clone(),
+        "batchstopped",
+        "batch-owner",
+        "batch-owner-credential",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
 
@@ -11294,6 +11542,7 @@ async fn fixture_core_session_graph_endpoints_round_trip_state() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    set_fixture_session_credential(&state_file, "graphparent", "graphparent-credential");
 
     let (status, _payload) = post_json(
         app.clone(),
@@ -11535,7 +11784,13 @@ async fn fixture_core_session_graph_endpoints_round_trip_state() {
         .unwrap();
     assert_eq!(graph_child["pending_handoff_path"], "/tmp/handoff.md");
 
-    let (status, payload) = post_json(app.clone(), "/sessions/graphchild/retire", json!({})).await;
+    let (status, payload) = post_retire(
+        app.clone(),
+        "graphchild",
+        "graphparent",
+        "graphparent-credential",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
 
@@ -11945,6 +12200,7 @@ async fn fixture_notify_on_stop_preserves_authorization_and_state_contract() {
 async fn fixture_retire_honors_delayed_stop_notify_without_runtime() {
     let state_file = write_completion_fixture();
     let queue_db_path = queue_db_path_for_state_file(&state_file);
+    set_fixture_session_credential(&state_file, "em001", "em001-credential");
     let mut config = config_with_state_file_and_queue(&state_file);
     config.rust_core.fixture_writes_enabled = true;
     let app = router(AppState::new(config));
@@ -11962,7 +12218,7 @@ async fn fixture_retire_honors_delayed_stop_notify_without_runtime() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "ok");
 
-    let (status, payload) = post_json(app.clone(), "/sessions/child001/retire", json!({})).await;
+    let (status, payload) = post_retire(app.clone(), "child001", "em001", "em001-credential").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "retired");
 
@@ -15818,6 +16074,14 @@ async fn runtime_core_marks_missing_tmux_stopped_on_send_and_retire() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["status"], "stopped");
     assert!(payload["stopped_at"].as_str().is_some());
+    assert_eq!(
+        payload["terminal_provenance"]["cause"],
+        "tmux_disappearance"
+    );
+    assert_eq!(
+        payload["terminal_provenance"]["authority"],
+        "runtime_observed"
+    );
 
     let (status, payload) = post_json(
         app.clone(),
