@@ -217,54 +217,77 @@ impl UsageBurnStore {
             .or_else(|| json_string(rate_limits, "rate_limit_reached_type"))
             .map(|_| "critical".to_owned());
         let observed_at_text = format_timestamp(observed_at)?;
-        let mut connection = self.open()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut windows = Vec::new();
-        for slot in ["primary", "secondary"] {
-            let Some(update) = rate_limits.get(slot).and_then(Value::as_object) else {
-                continue;
-            };
-            let Some(duration_minutes) = json_i64(
-                update
-                    .get("windowDurationMins")
-                    .or_else(|| update.get("window_minutes")),
-            ) else {
-                continue;
-            };
-            let percent_update = json_f64(
-                update
-                    .get("usedPercent")
-                    .or_else(|| update.get("used_percent")),
-            );
-            let reset_update = codex_reset_at(update, observed_at);
-            if percent_update.is_none() && reset_update.is_none() {
-                continue;
+        let changed_windows = |connection: &Connection| -> Result<Vec<BurnWindowSample>> {
+            let mut windows = Vec::new();
+            for slot in ["primary", "secondary"] {
+                let Some(update) = rate_limits.get(slot).and_then(Value::as_object) else {
+                    continue;
+                };
+                let Some(duration_minutes) = json_i64(
+                    update
+                        .get("windowDurationMins")
+                        .or_else(|| update.get("window_minutes")),
+                ) else {
+                    continue;
+                };
+                let percent_update = json_f64(
+                    update
+                        .get("usedPercent")
+                        .or_else(|| update.get("used_percent")),
+                );
+                let reset_update = codex_reset_at(update, observed_at);
+                if percent_update.is_none() && reset_update.is_none() {
+                    continue;
+                }
+                let window_kind = format!("codex_{duration_minutes}");
+                let previous = latest_window(
+                    connection,
+                    &attribution.account_key,
+                    &window_kind,
+                    scope.as_deref(),
+                    &observed_at_text,
+                )?;
+                let percent = percent_update.or_else(|| previous.as_ref().map(|window| window.0));
+                let resets_at = reset_update.or_else(|| previous.as_ref().map(|window| window.1));
+                let (Some(percent), Some(resets_at)) = (percent, resets_at) else {
+                    continue;
+                };
+                if previous.as_ref().is_some_and(|window| {
+                    window.0 == percent && window.1 == resets_at && window.2 == severity
+                }) {
+                    continue;
+                }
+                let window = BurnWindowSample {
+                    window_kind,
+                    window_scope: scope.clone(),
+                    duration_minutes,
+                    percent,
+                    resets_at,
+                    severity: severity.clone(),
+                    is_active: None,
+                };
+                validate_window(&window)?;
+                windows.push(window);
             }
-            let window_kind = format!("codex_{duration_minutes}");
-            let previous = latest_window(
-                &transaction,
-                &attribution.account_key,
-                &window_kind,
-                scope.as_deref(),
-                &observed_at_text,
-            )?;
-            let percent = percent_update.or_else(|| previous.as_ref().map(|window| window.0));
-            let resets_at = reset_update.or_else(|| previous.as_ref().map(|window| window.1));
-            let (Some(percent), Some(resets_at)) = (percent, resets_at) else {
-                continue;
-            };
-            windows.push(BurnWindowSample {
-                window_kind,
-                window_scope: scope.clone(),
-                duration_minutes,
-                percent,
-                resets_at,
-                severity: severity.clone(),
-                is_active: None,
-            });
+            Ok(windows)
+        };
+
+        let mut connection = self.open()?;
+        // Most Codex events repeat the current rate-limit snapshot. Read before
+        // requesting SQLite's single writer lock so duplicate telemetry cannot
+        // queue behind unrelated usage ingestion and starve request workers.
+        if changed_windows(&connection)?.is_empty() {
+            return Ok(0);
         }
-        for window in &windows {
-            validate_window(window)?;
+
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // A writer may have committed the same snapshot between the preflight
+        // read and acquiring the lock. Recheck while serialized to preserve
+        // deduplication under concurrent monitors.
+        let windows = changed_windows(&transaction)?;
+        if windows.is_empty() {
+            transaction.commit()?;
+            return Ok(0);
         }
         let inserted = insert_windows(
             &transaction,
@@ -279,16 +302,16 @@ impl UsageBurnStore {
 }
 
 fn latest_window(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     account_key: &str,
     window_kind: &str,
     window_scope: Option<&str>,
     observed_at: &str,
-) -> Result<Option<(f64, OffsetDateTime)>> {
-    let row = transaction
+) -> Result<Option<(f64, OffsetDateTime, Option<String>)>> {
+    let row = connection
         .query_row(
             r#"
-            SELECT percent, resets_at
+            SELECT percent, resets_at, severity
             FROM burn_samples
             WHERE account_key = ?1
               AND window_kind = ?2
@@ -298,11 +321,23 @@ fn latest_window(
             LIMIT 1
             "#,
             params![account_key, window_kind, window_scope, observed_at],
-            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, f64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()?;
-    row.map(|(percent, resets_at)| Ok((percent, OffsetDateTime::parse(&resets_at, &Rfc3339)?)))
-        .transpose()
+    row.map(|(percent, resets_at, severity)| {
+        Ok((
+            percent,
+            OffsetDateTime::parse(&resets_at, &Rfc3339)?,
+            severity,
+        ))
+    })
+    .transpose()
 }
 
 fn insert_windows(
@@ -1108,6 +1143,122 @@ mod tests {
             )
             .unwrap();
         assert_eq!(merged_percent, 20.0);
+    }
+
+    #[test]
+    fn codex_duplicate_snapshot_skips_a_held_writer_lock() {
+        let db_path = temp_db("codex-duplicate-writer-lock");
+        seed_account(
+            &db_path,
+            Provider::Codex,
+            "codex-account",
+            "2026-08-10T12:00:00Z",
+        );
+        let store = UsageBurnStore::new(&db_path).unwrap();
+        let baseline = json!({
+            "event_type": "account/rateLimits/updated",
+            "ts": "2026-08-10T12:01:00Z",
+            "payload": {"rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                    "usedPercent": 10,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1786381200_i64
+                }
+            }}
+        });
+        assert_eq!(
+            store
+                .record_codex_event(baseline.as_object().unwrap(), at("2026-08-10T12:01:00Z"))
+                .unwrap(),
+            1
+        );
+
+        let mut blocker_connection = store.open().unwrap();
+        let blocker = blocker_connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let duplicate = json!({
+            "event_type": "account/rateLimits/updated",
+            "ts": "2026-08-10T12:02:00Z",
+            "payload": {"rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                    "usedPercent": 10,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1786381200_i64
+                }
+            }}
+        });
+
+        // A duplicate has no durable state to change. It must use the read
+        // preflight and return while another usage writer owns SQLite's lock.
+        assert_eq!(
+            store
+                .record_codex_event(duplicate.as_object().unwrap(), at("2026-08-10T12:02:00Z"))
+                .unwrap(),
+            0
+        );
+        blocker.commit().unwrap();
+
+        let count: i64 = Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_samples WHERE source = 'codex_event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn codex_duplicate_snapshot_burst_writes_no_extra_rows() {
+        let db_path = temp_db("codex-duplicate-burst");
+        seed_account(
+            &db_path,
+            Provider::Codex,
+            "codex-account",
+            "2026-08-10T12:00:00Z",
+        );
+        let store = UsageBurnStore::new(&db_path).unwrap();
+        let snapshot = json!({
+            "event_type": "account/rateLimits/updated",
+            "ts": "2026-08-10T12:01:00Z",
+            "payload": {"rateLimits": {
+                "limitId": "codex",
+                "primary": {
+                    "usedPercent": 10,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1786381200_i64
+                }
+            }}
+        });
+        assert_eq!(
+            store
+                .record_codex_event(snapshot.as_object().unwrap(), at("2026-08-10T12:01:00Z"))
+                .unwrap(),
+            1
+        );
+
+        for _ in 0..128 {
+            assert_eq!(
+                store
+                    .record_codex_event(snapshot.as_object().unwrap(), at("2026-08-10T12:02:00Z"),)
+                    .unwrap(),
+                0
+            );
+        }
+
+        let count: i64 = Connection::open(db_path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM burn_samples WHERE source = 'codex_event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
