@@ -20355,13 +20355,12 @@ mod tests {
             )
             .unwrap();
 
-        let ReparentMutationOutcome::Preview(preview) = outcome else {
-            panic!("unexpected tree preview outcome: {outcome:?}");
-        };
-        assert!(preview.blockers.iter().any(|blocker| {
-            blocker.contains("target session target01")
-                && blocker.contains("cannot participate in credential-bound consent")
-        }));
+        assert!(matches!(
+            outcome,
+            ReparentMutationOutcome::BadRequest(message)
+                if message.contains("target session target01")
+                    && message.contains("cannot participate in credential-bound consent")
+        ));
         let _ = fs::remove_file(state_file);
     }
 
@@ -21226,7 +21225,15 @@ mod tests {
         }
         let stale = store.get_reparent_request(&request.id).unwrap().unwrap();
         assert_eq!(stale.status, "stale");
-        for session_id in ["outgoing", "worker-a", "worker-b", "late-worker"] {
+        assert_eq!(
+            store
+                .get_session("outgoing")
+                .unwrap()
+                .unwrap()
+                .parent_session_id,
+            None
+        );
+        for session_id in ["worker-a", "worker-b", "late-worker"] {
             assert_eq!(
                 store
                     .get_session(session_id)
@@ -21292,7 +21299,15 @@ mod tests {
                 .as_deref(),
             Some("maintainer")
         );
-        for session_id in ["outgoing", "worker-a", "worker-b"] {
+        assert_eq!(
+            store
+                .get_session("outgoing")
+                .unwrap()
+                .unwrap()
+                .parent_session_id,
+            None
+        );
+        for session_id in ["worker-a", "worker-b"] {
             assert_eq!(
                 store
                     .get_session(session_id)
