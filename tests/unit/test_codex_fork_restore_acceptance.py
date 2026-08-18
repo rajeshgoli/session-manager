@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -161,6 +162,31 @@ async def test_restore_rejects_live_runtime_that_never_confirms_resume_identity(
     assert error == "Codex-fork provider did not confirm the expected resume identity before timeout"
     assert session.status == SessionStatus.STOPPED
     assert session.provider_resume_id == "account-bound-resume-id"
+
+
+@pytest.mark.asyncio
+async def test_restore_rejects_an_overlapping_attempt_while_acceptance_is_pending(monkeypatch, tmp_path):
+    manager, tmux, session = _manager(
+        tmp_path,
+        monkeypatch,
+        [{"event_type": "session_start", "seq": 1}],
+        remains_live=True,
+    )
+    first_restore = asyncio.create_task(manager.restore_session(session.id))
+    for _ in range(20):
+        if session.restore_launch_pending:
+            break
+        await asyncio.sleep(0.01)
+
+    second_success, second_session, second_error = await manager.restore_session(session.id)
+    first_success, _first_session, first_error = await first_restore
+
+    assert second_success is False
+    assert second_session is session
+    assert second_error == "Codex-fork restore is already awaiting provider acceptance"
+    assert len(tmux.launches) == 1
+    assert first_success is False
+    assert first_error == "Codex-fork provider did not confirm the expected resume identity before timeout"
 
 
 @pytest.mark.asyncio

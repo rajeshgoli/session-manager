@@ -5992,6 +5992,11 @@ done
                 should_remove = True
             elif session.provider != "codex-fork":
                 should_remove = True
+            elif session.restore_launch_pending:
+                # Restore admission persists stopped until the provider proves
+                # the exact resume identity; its artifacts are live evidence
+                # during that short acceptance window.
+                should_remove = False
             elif session.status == SessionStatus.STOPPED:
                 should_remove = True
             elif not self._tmux_session_exists_for_session(session):
@@ -7606,6 +7611,8 @@ done
         session = self.sessions.get(session_id)
         if not session:
             return False, None, "Session not found"
+        if session.provider == "codex-fork" and session.restore_launch_pending:
+            return False, session, "Codex-fork restore is already awaiting provider acceptance"
         try:
             tmux_runtime_missing = (
                 session.provider != "codex-app"

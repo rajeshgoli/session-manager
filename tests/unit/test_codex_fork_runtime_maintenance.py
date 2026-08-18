@@ -28,8 +28,20 @@ def test_prune_codex_fork_runtime_artifacts_removes_dead_files(tmp_path):
         log_file=str(tmp_path / "dead1234.log"),
         provider_resume_id="resume-dead1234",
     )
+    pending = Session(
+        id="pending1",
+        name="codex-fork-pending1",
+        working_dir=str(tmp_path),
+        provider="codex-fork",
+        status=SessionStatus.STOPPED,
+        log_file=str(tmp_path / "pending1.log"),
+        provider_resume_id="resume-pending1",
+        restore_launch_pending=True,
+        restore_pending_resume_id="resume-pending1",
+    )
     manager.sessions[live.id] = live
     manager.sessions[dead.id] = dead
+    manager.sessions[pending.id] = pending
     manager.tmux.session_exists = lambda name: name == live.tmux_session
 
     live_event = manager._codex_fork_event_stream_path(live)
@@ -37,8 +49,19 @@ def test_prune_codex_fork_runtime_artifacts_removes_dead_files(tmp_path):
     orphan_event = tmp_path / "orphan123.codex-fork.events.jsonl"
     live_socket = manager._codex_fork_control_socket_path(live)
     dead_socket = manager._codex_fork_control_socket_path(dead)
+    pending_event = manager._codex_fork_event_stream_path(pending)
+    pending_socket = manager._codex_fork_control_socket_path(pending)
     orphan_socket = tmp_path / "orphan123.codex-fork.control.sock"
-    for path in (live_event, dead_event, orphan_event, live_socket, dead_socket, orphan_socket):
+    for path in (
+        live_event,
+        dead_event,
+        orphan_event,
+        live_socket,
+        dead_socket,
+        pending_event,
+        pending_socket,
+        orphan_socket,
+    ):
         path.write_text("x")
 
     removed = sorted(manager.prune_codex_fork_runtime_artifacts())
@@ -53,6 +76,8 @@ def test_prune_codex_fork_runtime_artifacts_removes_dead_files(tmp_path):
     )
     assert live_event.exists()
     assert live_socket.exists()
+    assert pending_event.exists()
+    assert pending_socket.exists()
     assert not dead_event.exists()
     assert not dead_socket.exists()
     assert not orphan_event.exists()
