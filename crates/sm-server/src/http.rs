@@ -105,11 +105,17 @@ use crate::google_auth::{
 use crate::mobile_analytics::build_mobile_analytics_summary;
 use crate::mobile_devices::{self, mobile_device_db_path};
 use crate::policy_contracts::{
-    PolicyCallerBinding, PolicyClassification, PolicyDecisionOutcome, PolicyRequestedLaunch,
-    PolicySpawnRequest, PolicyVehicle, SPAWN_REQUEST_SCHEMA,
+    EstimatedAmount, EstimatedCounter, PolicyAdmissionOutcome, PolicyAdmissionResult,
+    PolicyCallerBinding, PolicyClassification, PolicyDecision, PolicyDecisionOutcome,
+    PolicyEventEnvelope, PolicyRequestedLaunch, PolicyRuntimeAttestation, PolicySpawnRequest,
+    PolicyUsageCounters, PolicyVehicle, ADMISSION_RESULT_SCHEMA, EVENT_SCHEMA,
+    SPAWN_REQUEST_SCHEMA, USAGE_SCHEMA,
 };
 use crate::policy_runtime_attestation::attest_codex_fork_launch_file;
-use crate::policy_store::{PolicyProjection, PolicyStore, PolicyStoreError, PreparedDecision};
+use crate::policy_store::{
+    PolicyChildAdmission, PolicyChildState, PolicyProjection, PolicyStore, PolicyStoreError,
+    PreparedDecision,
+};
 use crate::queue::{
     CodexReviewRequestFilters, CodexReviewRequestRegistration, CompleteCodexReviewRequest,
     CreateCodexReviewRequest, CreateQueueJob, QueueAdmissionPolicy, QueueJobFilters,
@@ -396,6 +402,17 @@ pub struct AppState {
 struct PolicyRuntimeState {
     store: PolicyStore,
     projection: PolicyProjection,
+    reconciliation: PolicyReconciliationReport,
+    admission_blocker: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct PolicyReconciliationReport {
+    expected: usize,
+    visited: usize,
+    resolved: usize,
+    blocked: usize,
+    blockers: Vec<String>,
 }
 
 impl AppState {
@@ -476,7 +493,7 @@ impl AppState {
         if let Err(error) = session_store.recover_codex_fork_event_monitors() {
             eprintln!("codex-fork event monitor recovery failed: {error:#}");
         }
-        let policy_runtime = load_policy_runtime(&config)?;
+        let policy_runtime = load_policy_runtime(&config, &session_store, &policy_evidence_store)?;
         let mut mobile_terminal_secret = [0u8; 32];
         OsRng.fill_bytes(&mut mobile_terminal_secret);
         let (tmux_client_event_tx, _) = broadcast::channel(128);
@@ -558,7 +575,11 @@ impl AppState {
     }
 }
 
-fn load_policy_runtime(config: &AppConfig) -> anyhow::Result<Option<PolicyRuntimeState>> {
+fn load_policy_runtime(
+    config: &AppConfig,
+    session_store: &SessionStore,
+    evidence_store: &PolicyEvidenceStore,
+) -> anyhow::Result<Option<PolicyRuntimeState>> {
     if !config.policy.enabled {
         return Ok(None);
     }
@@ -595,7 +616,357 @@ fn load_policy_runtime(config: &AppConfig) -> anyhow::Result<Option<PolicyRuntim
     store
         .install_projection(&projection)
         .context("failed to install policy projection")?;
-    Ok(Some(PolicyRuntimeState { store, projection }))
+    store
+        .activate_projection(
+            &projection.lane,
+            &projection.policy_version,
+            &projection.policy_digest,
+        )
+        .context("failed to activate configured policy projection")?;
+    let reconciliation =
+        reconcile_policy_runtime(config, session_store, evidence_store, &store, &projection)?;
+    let admission_blocker = (!reconciliation.blockers.is_empty()).then(|| {
+        format!(
+            "policy admission disabled: restart reconciliation blocked {}/{} items: {}",
+            reconciliation.blocked,
+            reconciliation.expected,
+            reconciliation.blockers.join("; ")
+        )
+    });
+    Ok(Some(PolicyRuntimeState {
+        store,
+        projection,
+        reconciliation,
+        admission_blocker,
+    }))
+}
+
+fn reconcile_policy_runtime(
+    config: &AppConfig,
+    session_store: &SessionStore,
+    evidence_store: &PolicyEvidenceStore,
+    store: &PolicyStore,
+    projection: &PolicyProjection,
+) -> anyhow::Result<PolicyReconciliationReport> {
+    let snapshot = store
+        .reconciliation_snapshot()
+        .context("failed to snapshot policy admission reconciliation")?;
+    let mut report = PolicyReconciliationReport {
+        expected: snapshot.expected,
+        visited: snapshot.blockers.len(),
+        blocked: snapshot.blockers.len(),
+        blockers: snapshot.blockers,
+        ..PolicyReconciliationReport::default()
+    };
+    for reservation in snapshot.reservations {
+        report.visited += 1;
+        let admission = store
+            .admission_for_child(&reservation.child_session_id)
+            .with_context(|| {
+                format!(
+                    "failed to load policy admission for child {}",
+                    reservation.child_session_id
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "reconciliation snapshot child {} disappeared",
+                    reservation.child_session_id
+                )
+            })?;
+        let result =
+            reconcile_policy_child(config, session_store, evidence_store, store, &admission);
+        match result {
+            Ok(()) => report.resolved += 1,
+            Err(error) => {
+                report.blocked += 1;
+                report.blockers.push(format!(
+                    "child {}: {error:#}",
+                    admission.reservation.child_session_id
+                ));
+            }
+        }
+    }
+    let occurred_at = OffsetDateTime::now_utc().format(&Rfc3339)?;
+    append_policy_event(
+        evidence_store,
+        &projection.lane,
+        "restart_reconciliation",
+        &format!(
+            "restart-reconciliation:{}:{}",
+            projection.policy_version, occurred_at
+        ),
+        0,
+        None,
+        &occurred_at,
+        "sm.policy.reconciliation.v1",
+        serde_json::to_value(&report)?,
+    )
+    .context("failed to append policy restart reconciliation evidence")?;
+    Ok(report)
+}
+
+fn reconcile_policy_child(
+    config: &AppConfig,
+    session_store: &SessionStore,
+    evidence_store: &PolicyEvidenceStore,
+    store: &PolicyStore,
+    admission: &PolicyChildAdmission,
+) -> anyhow::Result<()> {
+    let child_id = admission.reservation.child_session_id.as_str();
+    let session = session_store.get_session(child_id)?;
+    match admission.reservation.child_state {
+        PolicyChildState::Reserved => match session {
+            None => release_policy_child(
+                config,
+                session_store,
+                evidence_store,
+                store,
+                admission,
+                None,
+                "restart found reserved admission without a materialized session",
+            ),
+            Some(session) => {
+                if !policy_session_is_live(config, &session)? {
+                    return release_policy_child(
+                        config,
+                        session_store,
+                        evidence_store,
+                        store,
+                        admission,
+                        Some(&session),
+                        "restart found a dead pre-mark policy session",
+                    );
+                }
+                match attest_policy_session(config, session_store, admission, &session) {
+                    Ok(attestation) => {
+                        append_policy_attestation_event(
+                            evidence_store,
+                            &admission.request,
+                            &admission.decision,
+                            &attestation,
+                        )?;
+                        if let Err(error) = store.mark_child_launched(child_id) {
+                            return release_policy_child(
+                                config,
+                                session_store,
+                                evidence_store,
+                                store,
+                                admission,
+                                Some(&session),
+                                &format!("restart launch promotion failed: {error}"),
+                            );
+                        }
+                        if let Err(error) = promote_policy_session(session_store, admission) {
+                            return release_policy_child(
+                                config,
+                                session_store,
+                                evidence_store,
+                                store,
+                                admission,
+                                Some(&session),
+                                &format!("restart hierarchy promotion failed: {error:#}"),
+                            );
+                        }
+                        append_policy_lifecycle_event(
+                            evidence_store,
+                            &admission.request,
+                            &admission.decision,
+                            child_id,
+                            "launched",
+                            4,
+                            "provider profile attested and capacity lease committed",
+                        )
+                    }
+                    Err(error) => release_policy_child(
+                        config,
+                        session_store,
+                        evidence_store,
+                        store,
+                        admission,
+                        Some(&session),
+                        &format!("restart attestation failed: {error:#}"),
+                    ),
+                }
+            }
+        },
+        PolicyChildState::Launched => match session {
+            Some(session) if policy_session_is_live(config, &session)? => {
+                promote_policy_session(session_store, admission)?;
+                append_policy_lifecycle_event(
+                    evidence_store,
+                    &admission.request,
+                    &admission.decision,
+                    child_id,
+                    "launched",
+                    4,
+                    "provider profile attested and capacity lease committed",
+                )
+            }
+            Some(session) => release_policy_child(
+                config,
+                session_store,
+                evidence_store,
+                store,
+                admission,
+                Some(&session),
+                "restart found launched policy child dead",
+            ),
+            None => release_policy_child(
+                config,
+                session_store,
+                evidence_store,
+                store,
+                admission,
+                None,
+                "restart found launched policy child missing",
+            ),
+        },
+        PolicyChildState::ReleasePending => release_policy_child(
+            config,
+            session_store,
+            evidence_store,
+            store,
+            admission,
+            session.as_ref(),
+            "restart resumed pending policy child release",
+        ),
+        PolicyChildState::Released | PolicyChildState::Expired => anyhow::bail!(
+            "terminal child state {:?} appeared in non-terminal reconciliation snapshot",
+            admission.reservation.child_state
+        ),
+    }
+}
+
+fn policy_session_is_live(config: &AppConfig, session: &SessionRecord) -> anyhow::Result<bool> {
+    if session.is_stopped() {
+        return Ok(false);
+    }
+    if !config.rust_core.runtime_enabled {
+        return Ok(true);
+    }
+    if !is_primary_node(&session.node) {
+        anyhow::bail!(
+            "cannot determine liveness for policy child {} on node {}",
+            session.id,
+            session.node
+        );
+    }
+    TmuxRuntime::from_app_config(config)
+        .for_socket_name(session.tmux_socket_name.as_deref())
+        .session_exists(&session.tmux_session)
+        .with_context(|| {
+            format!(
+                "failed to inspect runtime liveness for policy child {}",
+                session.id
+            )
+        })
+}
+
+fn attest_policy_session(
+    config: &AppConfig,
+    session_store: &SessionStore,
+    admission: &PolicyChildAdmission,
+    child: &SessionRecord,
+) -> anyhow::Result<PolicyRuntimeAttestation> {
+    let profile = admission
+        .decision
+        .resolved_profile
+        .as_ref()
+        .context("allow decision is missing its resolved profile")?;
+    let provider_resume_id = child
+        .provider_resume_id
+        .as_deref()
+        .context("provider did not publish a runtime thread ID")?;
+    let runtime = TmuxRuntime::from_app_config(config);
+    let event_stream_path = session_store
+        .codex_fork_event_stream_path(child, &runtime)
+        .context("provider event stream path is unavailable")?;
+    let attestation = attest_codex_fork_launch_file(
+        &event_stream_path,
+        profile,
+        &admission.decision.decision_id,
+        &admission.request.launch_intent_id,
+        &child.id,
+        provider_resume_id,
+    )?;
+    let result = PolicyAdmissionResult {
+        schema: ADMISSION_RESULT_SCHEMA.to_owned(),
+        outcome: PolicyAdmissionOutcome::Allowed {
+            decision_id: admission.decision.decision_id.clone(),
+            child_session_id: child.id.clone(),
+            profile: profile.clone(),
+        },
+    };
+    result.validate_allowed_launch(&admission.request, &admission.decision, &attestation)?;
+    Ok(attestation)
+}
+
+fn policy_parent_session_id(request: &PolicySpawnRequest) -> &str {
+    match &request.caller {
+        PolicyCallerBinding::Seat {
+            holder_session_id, ..
+        } => holder_session_id,
+        PolicyCallerBinding::IncarnationBootstrap { session_id, .. } => session_id,
+    }
+}
+
+fn promote_policy_session(
+    session_store: &SessionStore,
+    admission: &PolicyChildAdmission,
+) -> anyhow::Result<()> {
+    session_store.promote_policy_provisional_session(
+        &admission.reservation.child_session_id,
+        policy_parent_session_id(&admission.request),
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn release_policy_child(
+    config: &AppConfig,
+    session_store: &SessionStore,
+    evidence_store: &PolicyEvidenceStore,
+    store: &PolicyStore,
+    admission: &PolicyChildAdmission,
+    session: Option<&SessionRecord>,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let child_id = admission.reservation.child_session_id.as_str();
+    if admission.reservation.child_state != PolicyChildState::ReleasePending {
+        store.mark_child_release_pending(child_id)?;
+    }
+    if session.is_some() {
+        let runtime = config
+            .rust_core
+            .runtime_enabled
+            .then(|| TmuxRuntime::from_app_config(config));
+        let retained =
+            session_store.reject_policy_provisional_session(child_id, reason, runtime.as_ref())?;
+        if !retained {
+            anyhow::bail!("policy child disappeared before rejected audit row was retained");
+        }
+        append_policy_lifecycle_event(
+            evidence_store,
+            &admission.request,
+            &admission.decision,
+            child_id,
+            "launch_rejected",
+            6,
+            reason,
+        )?;
+    }
+    store.release_by_child(child_id)?;
+    append_policy_lifecycle_event(
+        evidence_store,
+        &admission.request,
+        &admission.decision,
+        child_id,
+        "released",
+        7,
+        reason,
+    )?;
+    Ok(())
 }
 
 fn should_use_configured_usage_db_path(config: &UsageConfig) -> bool {
@@ -3533,9 +3904,19 @@ async fn get_policy_status(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_policy_evidence_read_allowed(&state, &request, &query.lane)?;
-    Ok(Json(serde_json::to_value(
-        state.policy_evidence_store().status(&query.lane)?,
-    )?))
+    let mut status = serde_json::to_value(state.policy_evidence_store().status(&query.lane)?)?;
+    if let Some(runtime) = state
+        .policy_runtime()
+        .filter(|runtime| runtime.projection.lane == query.lane)
+    {
+        status["admission_enabled"] = Value::Bool(runtime.admission_blocker.is_none());
+        status["admission_blocker"] = runtime
+            .admission_blocker
+            .as_ref()
+            .map_or(Value::Null, |value| Value::String(value.clone()));
+        status["restart_reconciliation"] = serde_json::to_value(&runtime.reconciliation)?;
+    }
+    Ok(Json(status))
 }
 
 async fn get_policy_explain(
@@ -3793,6 +4174,32 @@ fn deterministic_policy_classification(
     ))
 }
 
+fn frozen_policy_request_vehicle(
+    projection: &PolicyProjection,
+    requested_name: &str,
+) -> Result<PolicyVehicle, ApiError> {
+    let role_vehicles = projection
+        .rules
+        .iter()
+        .filter(|rule| rule.role_id.as_deref() == Some(requested_name))
+        .map(|rule| rule.profile.vehicle.clone())
+        .collect::<Vec<_>>();
+    let vehicle = role_vehicles.first();
+    if role_vehicles
+        .iter()
+        .skip(1)
+        .any(|candidate| Some(candidate) != vehicle)
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: format!(
+                "policy clauses disagree on the frozen requested vehicle for {requested_name}"
+            ),
+        });
+    }
+    Ok(vehicle.cloned().unwrap_or(PolicyVehicle::TaskAgent))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn freeze_policy_spawn_request(
     runtime: &PolicyRuntimeState,
@@ -3873,6 +4280,257 @@ fn policy_store_api_error(error: PolicyStoreError) -> ApiError {
     ApiError::Status { status, detail }
 }
 
+fn append_policy_event(
+    store: &PolicyEvidenceStore,
+    lane: &str,
+    event_type: &str,
+    operation_id: &str,
+    sequence: u64,
+    session_id: Option<&str>,
+    occurred_at: &str,
+    payload_schema: &str,
+    payload: Value,
+) -> anyhow::Result<()> {
+    let event_id = sha256_hex(
+        format!(
+            "sm-policy-event-v1\0{}\0{}\0{}\0{}\0{}",
+            lane,
+            operation_id,
+            sequence,
+            event_type,
+            session_id.unwrap_or("")
+        )
+        .as_bytes(),
+    );
+    store.append(&PolicyEventEnvelope {
+        schema: EVENT_SCHEMA.to_owned(),
+        event_id,
+        sequence,
+        event_type: event_type.to_owned(),
+        operation_id: operation_id.to_owned(),
+        lane: lane.to_owned(),
+        seat_key: None,
+        session_id: session_id.map(ToOwned::to_owned),
+        occurred_at: occurred_at.to_owned(),
+        payload_schema: payload_schema.to_owned(),
+        payload,
+    })?;
+    Ok(())
+}
+
+fn append_policy_decision_event(
+    store: &PolicyEvidenceStore,
+    projection: &PolicyProjection,
+    request: &PolicySpawnRequest,
+    prepared: &PreparedDecision,
+) -> anyhow::Result<()> {
+    append_policy_event(
+        store,
+        &projection.lane,
+        "admission_decision",
+        &prepared.decision.decision_id,
+        1,
+        prepared.provisional_child_session_id.as_deref(),
+        &prepared.decision.decided_at,
+        "sm.policy.admission_decision.v1",
+        json!({
+            "request": request,
+            "decision": prepared.decision,
+            "reused": prepared.reused,
+            "child_state": prepared.child_state,
+            "links": {"decision_id": prepared.decision.decision_id, "request_id": request.request_id}
+        }),
+    )
+}
+
+fn append_policy_lifecycle_event(
+    store: &PolicyEvidenceStore,
+    request: &PolicySpawnRequest,
+    decision: &PolicyDecision,
+    child_session_id: &str,
+    lifecycle: &str,
+    sequence: u64,
+    detail: &str,
+) -> anyhow::Result<()> {
+    append_policy_event(
+        store,
+        request.caller.lane(),
+        "child_lifecycle",
+        &decision.decision_id,
+        sequence,
+        Some(child_session_id),
+        &decision.decided_at,
+        "sm.policy.child_lifecycle.v1",
+        json!({
+            "decision_id": decision.decision_id,
+            "request_id": request.request_id,
+            "child_session_id": child_session_id,
+            "lifecycle": lifecycle,
+            "detail": detail,
+            "links": {"decision_id": decision.decision_id, "request_id": request.request_id}
+        }),
+    )
+}
+
+fn zero_policy_usage(source: &str) -> PolicyUsageCounters {
+    let counter = || EstimatedCounter {
+        value: 0,
+        lower_bound: 0,
+        upper_bound: 0,
+        source: source.to_owned(),
+        estimated: false,
+        method: "provider_event_boundary".to_owned(),
+        confidence: "exact".to_owned(),
+    };
+    let amount = |unit: &str| EstimatedAmount {
+        value: 0.0,
+        lower_bound: 0.0,
+        upper_bound: 0.0,
+        unit: unit.to_owned(),
+        source: source.to_owned(),
+        estimated: false,
+        method: "provider_event_boundary".to_owned(),
+        confidence: "exact".to_owned(),
+    };
+    PolicyUsageCounters {
+        schema: USAGE_SCHEMA.to_owned(),
+        input_tokens: counter(),
+        cache_read_tokens: counter(),
+        cache_write_5m_tokens: counter(),
+        cache_write_1h_tokens: counter(),
+        output_tokens: counter(),
+        reasoning_tokens: counter(),
+        cost_usd: amount("usd"),
+        quota_points: amount("quota_points"),
+    }
+}
+
+fn append_policy_attestation_event(
+    store: &PolicyEvidenceStore,
+    request: &PolicySpawnRequest,
+    decision: &PolicyDecision,
+    attestation: &PolicyRuntimeAttestation,
+) -> anyhow::Result<()> {
+    append_policy_event(
+        store,
+        request.caller.lane(),
+        "provider_attestation",
+        &decision.decision_id,
+        3,
+        Some(&attestation.session_id),
+        &attestation.observed_at,
+        "sm.policy.provider_attestation.v1",
+        json!({
+            "decision_id": decision.decision_id,
+            "request_id": request.request_id,
+            "attestation": attestation,
+            "usage": zero_policy_usage("provider_attestation_event"),
+            "provider_boundary": {
+                "thread_id": attestation.evidence_id,
+                "before": {"event": "launch_requested"},
+                "after": {"event": "profile_attested"}
+            },
+            "links": {"decision_id": decision.decision_id, "request_id": request.request_id}
+        }),
+    )
+}
+
+fn cleanup_failed_policy_spawn(
+    state: &AppState,
+    policy: &PreparedPolicySpawn,
+    reason: &str,
+) -> Result<(), ApiError> {
+    let runtime = state.policy_runtime().ok_or_else(|| ApiError::Status {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        detail: "policy runtime disappeared during launch cleanup".to_owned(),
+    })?;
+    let child_id = policy
+        .prepared
+        .provisional_child_session_id
+        .as_deref()
+        .ok_or_else(|| ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: "policy launch cleanup has no provisional child binding".to_owned(),
+        })?;
+    // Cleanup crosses two durable stores plus the provider runtime. Attempt
+    // every convergent action even when an earlier one fails, then surface all
+    // failures. In particular, a policy-store error must never leave a
+    // provisional runtime attached, and a runtime/evidence error must never
+    // hide a capacity-release failure.
+    let mut failures = Vec::new();
+    if let Err(error) = runtime.store.mark_child_release_pending(child_id) {
+        failures.push(format!("persist release intent: {error}"));
+    }
+    match state.session_store.get_session(child_id) {
+        Ok(Some(_)) => {
+            let provider_runtime = state
+                .config
+                .rust_core
+                .runtime_enabled
+                .then(|| TmuxRuntime::from_app_config(&state.config));
+            match state.session_store.reject_policy_provisional_session(
+                child_id,
+                reason,
+                provider_runtime.as_ref(),
+            ) {
+                Ok(true) => {
+                    if let Err(error) = append_policy_lifecycle_event(
+                        state.policy_evidence_store(),
+                        &policy.request,
+                        &policy.prepared.decision,
+                        child_id,
+                        "launch_rejected",
+                        6,
+                        reason,
+                    ) {
+                        failures.push(format!("append rejection evidence: {error:#}"));
+                    }
+                }
+                Ok(false) => failures.push(
+                    "provisional session disappeared before rejected audit row was retained"
+                        .to_owned(),
+                ),
+                Err(error) => {
+                    failures.push(format!("stop and detach provisional runtime: {error:#}"))
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => failures.push(format!("load provisional session: {error:#}")),
+    }
+    let released = match runtime.store.release_by_child(child_id) {
+        Ok(()) => true,
+        Err(error) => {
+            failures.push(format!("release capacity lease: {error}"));
+            false
+        }
+    };
+    if released {
+        if let Err(error) = append_policy_lifecycle_event(
+            state.policy_evidence_store(),
+            &policy.request,
+            &policy.prepared.decision,
+            child_id,
+            "released",
+            7,
+            reason,
+        ) {
+            failures.push(format!("append release evidence: {error:#}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: format!(
+                "policy launch cleanup failed for child {child_id}: {}",
+                failures.join("; ")
+            ),
+        })
+    }
+}
+
 fn prepare_policy_spawn(
     state: &AppState,
     headers: &HeaderMap,
@@ -3887,6 +4545,12 @@ fn prepare_policy_spawn(
     let Some(runtime) = state.policy_runtime() else {
         return Ok(None);
     };
+    if let Some(blocker) = runtime.admission_blocker.as_deref() {
+        return Err(ApiError::Status {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            detail: blocker.to_owned(),
+        });
+    }
     if payload
         .id
         .as_deref()
@@ -3909,8 +4573,9 @@ fn prepare_policy_spawn(
                     .to_owned(),
         })?;
     let caller = bootstrap_policy_caller(state, headers, &parent.id)?;
-    let (vehicle, classification) =
-        deterministic_policy_classification(&runtime.projection, requested_name)?;
+    // Freeze caller authority and all launch inputs before deriving the
+    // classification that will be persisted on the terminal decision.
+    let vehicle = frozen_policy_request_vehicle(&runtime.projection, requested_name)?;
     let request = freeze_policy_spawn_request(
         runtime,
         caller,
@@ -3928,6 +4593,14 @@ fn prepare_policy_spawn(
         .store
         .create_request(&request)
         .map_err(policy_store_api_error)?;
+    let (classified_vehicle, classification) =
+        deterministic_policy_classification(&runtime.projection, requested_name)?;
+    if classified_vehicle != request.requested.vehicle {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "deterministic classification changed the frozen requested vehicle".to_owned(),
+        });
+    }
     let child_session_id = state.session_store.allocate_core_session_id()?;
     let prepared = runtime
         .store
@@ -3939,6 +4612,13 @@ fn prepare_policy_spawn(
             OffsetDateTime::now_utc(),
         )
         .map_err(policy_store_api_error)?;
+    append_policy_decision_event(
+        state.policy_evidence_store(),
+        &runtime.projection,
+        &request,
+        &prepared,
+    )
+    .map_err(ApiError::Internal)?;
     if !matches!(prepared.decision.outcome, PolicyDecisionOutcome::Allow) {
         let command = prepared
             .decision
@@ -3953,11 +4633,10 @@ fn prepare_policy_spawn(
             ),
         });
     }
-    if prepared.provisional_child_session_id.as_deref() != Some(child_session_id.as_str()) {
-        let _ = runtime.store.release_by_child(&child_session_id);
+    if prepared.provisional_child_session_id.is_none() || prepared.child_state.is_none() {
         return Err(ApiError::Status {
             status: StatusCode::SERVICE_UNAVAILABLE,
-            detail: "policy admission did not preserve the provisional child binding".to_owned(),
+            detail: "allow decision is missing its durable provisional child binding".to_owned(),
         });
     }
     Ok(Some(PreparedPolicySpawn { request, prepared }))
@@ -4034,6 +4713,89 @@ async fn spawn_session(
     let policy_profile = policy_spawn
         .as_ref()
         .and_then(|policy| policy.prepared.decision.resolved_profile.as_ref());
+    let existing_policy_child = if let Some(policy) = policy_spawn.as_ref() {
+        let child_id = policy
+            .prepared
+            .provisional_child_session_id
+            .as_deref()
+            .expect("allow binding checked by prepare_policy_spawn");
+        match policy
+            .prepared
+            .child_state
+            .expect("allow lifecycle checked")
+        {
+            PolicyChildState::Released | PolicyChildState::Expired => {
+                return Err(ApiError::Status {
+                    status: StatusCode::CONFLICT,
+                    detail: format!(
+                        "policy request {} already terminalized with child reservation state {:?}; no new child or capacity claim was created",
+                        policy.request.request_id,
+                        policy.prepared.child_state.expect("checked above")
+                    ),
+                });
+            }
+            PolicyChildState::ReleasePending => {
+                return Err(ApiError::Status {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    detail: format!(
+                        "policy request {} is awaiting durable release reconciliation for child {child_id}",
+                        policy.request.request_id
+                    ),
+                });
+            }
+            PolicyChildState::Launched => {
+                let child = state.session_store.get_session(child_id)?.ok_or_else(|| {
+                    ApiError::Status {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        detail: format!(
+                            "committed policy child {child_id} is missing; restart reconciliation is required"
+                        ),
+                    }
+                })?;
+                if !policy_session_is_live(&state.config, &child).map_err(ApiError::Internal)? {
+                    cleanup_failed_policy_spawn(
+                        &state,
+                        policy,
+                        "ordinary retry found committed policy child dead",
+                    )?;
+                    return Err(ApiError::Status {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        detail: format!("committed policy child {child_id} was dead and released"),
+                    });
+                }
+                if let Err(error) = state.session_store.promote_policy_provisional_session(
+                    child_id,
+                    policy_parent_session_id(&policy.request),
+                ) {
+                    cleanup_failed_policy_spawn(
+                        &state,
+                        policy,
+                        &format!("ordinary retry found unpublishable hierarchy: {error:#}"),
+                    )?;
+                    return Err(ApiError::Status {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        detail: format!(
+                            "committed policy child {child_id} could not publish its hierarchy: {error:#}"
+                        ),
+                    });
+                }
+                let child = state.session_store.get_session(child_id)?.ok_or_else(|| {
+                    ApiError::Status {
+                        status: StatusCode::SERVICE_UNAVAILABLE,
+                        detail: format!(
+                            "committed policy child {child_id} disappeared after hierarchy promotion"
+                        ),
+                    }
+                })?;
+                return Ok(Json(serde_json::to_value(SpawnSessionResponse::from(
+                    child,
+                ))?));
+            }
+            PolicyChildState::Reserved => state.session_store.get_session(child_id)?,
+        }
+    } else {
+        None
+    };
     let create_payload = CreateCoreSessionRequest {
         id: policy_spawn
             .as_ref()
@@ -4046,7 +4808,9 @@ async fn spawn_session(
                 .map(|profile| profile.provider.clone())
                 .unwrap_or(provider),
         ),
-        parent_session_id: Some(parent.id.clone()),
+        // A policy child remains outside active hierarchy/routing until its
+        // provider profile is attested and its lease is committed.
+        parent_session_id: policy_spawn.is_none().then(|| parent.id.clone()),
         node: Some(node),
         initial_message: Some(accepted.0),
         model: policy_profile
@@ -4063,9 +4827,21 @@ async fn spawn_session(
         }),
     };
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
-    let child_result = if state.config.rust_core.runtime_enabled {
-        ensure_core_runtime_provider_supported(&create_payload)?;
-        ensure_core_runtime_request_node_supported(&state, &create_payload)?;
+    let child_result = if let Some(existing) = existing_policy_child {
+        Ok(existing)
+    } else if state.config.rust_core.runtime_enabled {
+        if let Err(error) = ensure_core_runtime_provider_supported(&create_payload)
+            .and_then(|_| ensure_core_runtime_request_node_supported(&state, &create_payload))
+        {
+            if let Some(policy) = policy_spawn.as_ref() {
+                cleanup_failed_policy_spawn(
+                    &state,
+                    policy,
+                    &format!("launch validation failed: {error:?}"),
+                )?;
+            }
+            return Err(error);
+        }
         create_runtime_core_session(state.clone(), create_payload, log_dir).await
     } else {
         state
@@ -4073,17 +4849,132 @@ async fn spawn_session(
             .create_core_session(create_payload, log_dir)
             .map_err(core_session_create_api_error)
     };
-    let child = match child_result {
+    let mut child = match child_result {
         Ok(child) => child,
         Err(error) => {
-            if let (Some(runtime), Some(policy)) = (state.policy_runtime(), policy_spawn.as_ref()) {
-                if let Some(child_id) = policy.prepared.provisional_child_session_id.as_deref() {
-                    let _ = runtime.store.release_by_child(child_id);
-                }
+            if let Some(policy) = policy_spawn.as_ref() {
+                cleanup_failed_policy_spawn(
+                    &state,
+                    policy,
+                    &format!("provider launch failed: {error:?}"),
+                )?;
             }
             return Err(error);
         }
     };
+    if let Some(policy) = policy_spawn.as_ref() {
+        let runtime = state
+            .policy_runtime()
+            .expect("policy runtime remains loaded");
+        if let Err(error) = append_policy_lifecycle_event(
+            state.policy_evidence_store(),
+            &policy.request,
+            &policy.prepared.decision,
+            &child.id,
+            "materialized",
+            2,
+            "provider runtime materialized provisionally",
+        ) {
+            cleanup_failed_policy_spawn(
+                &state,
+                policy,
+                &format!("materialization evidence append failed: {error:#}"),
+            )?;
+            return Err(ApiError::Internal(error));
+        }
+        let admission = match runtime.store.admission_for_child(&child.id) {
+            Ok(Some(admission)) => admission,
+            Ok(None) => {
+                cleanup_failed_policy_spawn(
+                    &state,
+                    policy,
+                    "materialized policy child lost its admission binding",
+                )?;
+                return Err(ApiError::Status {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    detail: format!("policy child {} lost its admission binding", child.id),
+                });
+            }
+            Err(error) => {
+                cleanup_failed_policy_spawn(
+                    &state,
+                    policy,
+                    &format!("cannot reload materialized admission binding: {error}"),
+                )?;
+                return Err(policy_store_api_error(error));
+            }
+        };
+        let attestation =
+            match attest_policy_session(&state.config, &state.session_store, &admission, &child) {
+                Ok(attestation) => attestation,
+                Err(error) => {
+                    cleanup_failed_policy_spawn(
+                        &state,
+                        policy,
+                        &format!("provider attestation failed: {error:#}"),
+                    )?;
+                    return Err(ApiError::Status {
+                        status: StatusCode::BAD_GATEWAY,
+                        detail: format!("policy provider attestation failed: {error:#}"),
+                    });
+                }
+            };
+        if let Err(error) = append_policy_attestation_event(
+            state.policy_evidence_store(),
+            &policy.request,
+            &policy.prepared.decision,
+            &attestation,
+        ) {
+            cleanup_failed_policy_spawn(
+                &state,
+                policy,
+                &format!("attestation evidence append failed: {error:#}"),
+            )?;
+            return Err(ApiError::Internal(error));
+        }
+        if let Err(error) = runtime.store.mark_child_launched(&child.id) {
+            cleanup_failed_policy_spawn(
+                &state,
+                policy,
+                &format!("launch commit failed after attestation: {error}"),
+            )?;
+            return Err(policy_store_api_error(error));
+        }
+        if let Err(error) = promote_policy_session(&state.session_store, &admission) {
+            cleanup_failed_policy_spawn(
+                &state,
+                policy,
+                &format!("hierarchy promotion failed after launch commit: {error:#}"),
+            )?;
+            return Err(ApiError::Status {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                detail: format!("policy hierarchy promotion failed: {error:#}"),
+            });
+        }
+        child = state
+            .session_store
+            .get_session(&child.id)?
+            .ok_or_else(|| ApiError::Status {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                detail: "policy child disappeared after hierarchy promotion".to_owned(),
+            })?;
+        if let Err(error) = append_policy_lifecycle_event(
+            state.policy_evidence_store(),
+            &policy.request,
+            &policy.prepared.decision,
+            &child.id,
+            "launched",
+            4,
+            "provider profile attested and capacity lease committed",
+        ) {
+            cleanup_failed_policy_spawn(
+                &state,
+                policy,
+                &format!("launch evidence append failed after commit: {error:#}"),
+            )?;
+            return Err(ApiError::Internal(error));
+        }
+    }
     if parent.is_em && child.provider != "codex-fork" {
         let _ = state.session_store.arm_stop_notify(
             &child.id,
@@ -8414,6 +9305,27 @@ async fn retire_session(
                 requester.is_empty() || session.parent_session_id.as_deref() == Some(requester)
             }) && (!state.config.rust_core.runtime_enabled || is_primary_node(&session.node))
         });
+    let policy_admission = if may_retire {
+        state
+            .policy_runtime()
+            .map(|runtime| runtime.store.admission_for_child(&session_id))
+            .transpose()
+            .map_err(policy_store_api_error)?
+            .flatten()
+    } else {
+        None
+    };
+    if let (Some(runtime), Some(admission)) = (state.policy_runtime(), policy_admission.as_ref()) {
+        if matches!(
+            admission.reservation.child_state,
+            PolicyChildState::Reserved | PolicyChildState::Launched
+        ) {
+            runtime
+                .store
+                .mark_child_release_pending(&session_id)
+                .map_err(policy_store_api_error)?;
+        }
+    }
     if may_retire {
         teardown_btw_requests_for_session(&state, &session_id)?;
     }
@@ -8430,7 +9342,27 @@ async fn retire_session(
             .retire_core_session(&session_id, requester_session_id)?
     };
     match outcome {
-        CoreRetireOutcome::Retired(result) => Ok(Json(serde_json::to_value(result)?)),
+        CoreRetireOutcome::Retired(result) => {
+            if let (Some(runtime), Some(admission)) =
+                (state.policy_runtime(), policy_admission.as_ref())
+            {
+                runtime
+                    .store
+                    .release_by_child(&session_id)
+                    .map_err(policy_store_api_error)?;
+                append_policy_lifecycle_event(
+                    state.policy_evidence_store(),
+                    &admission.request,
+                    &admission.decision,
+                    &session_id,
+                    "released",
+                    7,
+                    "policy child retired and capacity released",
+                )
+                .map_err(ApiError::Internal)?;
+            }
+            Ok(Json(serde_json::to_value(result)?))
+        }
         CoreRetireOutcome::NotFound => Ok(Json(json!({
             "error": format!("Session {session_id} not found")
         }))),
@@ -14212,6 +15144,498 @@ mod tests {
             lease_ttl_seconds: 900,
             reason: "test policy".to_owned(),
         }
+    }
+
+    struct PolicyCrashFixture {
+        config: AppConfig,
+        session_store: SessionStore,
+        evidence_store: PolicyEvidenceStore,
+        store: PolicyStore,
+        projection: PolicyProjection,
+        state_path: PathBuf,
+        root: PathBuf,
+    }
+
+    fn policy_crash_fixture(label: &str) -> PolicyCrashFixture {
+        let root = env::temp_dir().join(format!(
+            "sm-policy-crash-{label}-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let state_path = root.join("sessions.json");
+        fs::write(&state_path, r#"{"sessions":[]}"#).unwrap();
+        let session_store = SessionStore::new(state_path.clone());
+        session_store
+            .create_core_session(
+                CreateCoreSessionRequest {
+                    id: Some("maintainer-1".to_owned()),
+                    name: Some("maintainer".to_owned()),
+                    working_dir: Some(root.display().to_string()),
+                    provider: Some("codex-fork".to_owned()),
+                    parent_session_id: None,
+                    node: Some("primary".to_owned()),
+                    initial_message: None,
+                    model: Some("gpt-5.6-terra".to_owned()),
+                    reasoning_effort: Some("high".to_owned()),
+                    wait: None,
+                    spawn_prompt_source: None,
+                    spawn_brief: None,
+                },
+                Some(root.clone()),
+            )
+            .unwrap();
+        let evidence_store = PolicyEvidenceStore::new(root.join("evidence.db")).unwrap();
+        let store = PolicyStore::new(root.join("policy.db")).unwrap();
+        let mut projection = policy_projection_with_rules(vec![policy_rule(
+            "sm-policy-1268.routine",
+            None,
+            Some("routine_bounded"),
+            PolicyVehicle::TaskAgent,
+        )]);
+        projection.bootstrap_authority = Some(crate::policy_store::BootstrapAuthority {
+            session_id: "maintainer-1".to_owned(),
+            credential_fingerprint: "credential-1".to_owned(),
+            binding_digest: "b".repeat(64),
+        });
+        store.install_projection(&projection).unwrap();
+        store
+            .activate_projection(
+                &projection.lane,
+                &projection.policy_version,
+                &projection.policy_digest,
+            )
+            .unwrap();
+        let mut config = AppConfig::default();
+        config.paths.state_file = state_path.display().to_string();
+        PolicyCrashFixture {
+            config,
+            session_store,
+            evidence_store,
+            store,
+            projection,
+            state_path,
+            root,
+        }
+    }
+
+    fn prepare_policy_crash(fixture: &PolicyCrashFixture, suffix: &str) -> PolicyChildAdmission {
+        let request = PolicySpawnRequest {
+            schema: SPAWN_REQUEST_SCHEMA.to_owned(),
+            request_id: format!("request-{suffix}"),
+            caller: PolicyCallerBinding::IncarnationBootstrap {
+                lane: fixture.projection.lane.clone(),
+                session_id: "maintainer-1".to_owned(),
+                credential_fingerprint: "credential-1".to_owned(),
+                binding_digest: "b".repeat(64),
+            },
+            prompt_digest: "c".repeat(64),
+            launch_intent_id: format!("intent-{suffix}"),
+            policy_version: fixture.projection.policy_version.clone(),
+            policy_digest: fixture.projection.policy_digest.clone(),
+            requested: PolicyRequestedLaunch {
+                name: format!("worker-{suffix}"),
+                vehicle: PolicyVehicle::TaskAgent,
+                provider: "codex-fork".to_owned(),
+                model: Some("gpt-5.6-terra".to_owned()),
+                effort: Some("high".to_owned()),
+                working_dir: fixture.root.display().to_string(),
+                node: "primary".to_owned(),
+            },
+            topology_version: 0,
+            capacity_version: 0,
+            created_at: "2026-08-17T00:00:00Z".to_owned(),
+        };
+        fixture.store.create_request(&request).unwrap();
+        let child_id = format!("child-{suffix}");
+        fixture
+            .store
+            .prepare_admission(
+                &request.request_id,
+                &PolicyClassification {
+                    class_id: "routine_bounded".to_owned(),
+                    role_id: None,
+                    turn_profile: "initial_task".to_owned(),
+                    method: "deterministic".to_owned(),
+                    confidence: "exact".to_owned(),
+                },
+                None,
+                &child_id,
+                OffsetDateTime::parse("2026-08-17T00:01:00Z", &Rfc3339).unwrap(),
+            )
+            .unwrap();
+        fixture
+            .store
+            .admission_for_child(&child_id)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn materialize_policy_fixture_session(
+        fixture: &PolicyCrashFixture,
+        admission: &PolicyChildAdmission,
+        with_attestation: bool,
+    ) -> SessionRecord {
+        let child_id = admission.reservation.child_session_id.clone();
+        fixture
+            .session_store
+            .create_core_session(
+                CreateCoreSessionRequest {
+                    id: Some(child_id.clone()),
+                    name: Some(format!("policy-{child_id}")),
+                    working_dir: Some(fixture.root.display().to_string()),
+                    provider: Some("codex-fork".to_owned()),
+                    parent_session_id: None,
+                    node: Some("primary".to_owned()),
+                    initial_message: Some("frozen brief".to_owned()),
+                    model: Some("gpt-5.6-terra".to_owned()),
+                    reasoning_effort: Some("high".to_owned()),
+                    wait: None,
+                    spawn_prompt_source: None,
+                    spawn_brief: None,
+                },
+                Some(fixture.root.clone()),
+            )
+            .unwrap();
+        let mut state: Value =
+            serde_json::from_slice(&fs::read(&fixture.state_path).unwrap()).unwrap();
+        let child = state["sessions"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|session| session["id"] == child_id)
+            .unwrap();
+        child["provider_resume_id"] = Value::String("thread-policy-1".to_owned());
+        fs::write(&fixture.state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let record = fixture
+            .session_store
+            .get_session(&child_id)
+            .unwrap()
+            .unwrap();
+        if with_attestation {
+            let runtime = TmuxRuntime::from_app_config(&fixture.config);
+            let path = fixture
+                .session_store
+                .codex_fork_event_stream_path(&record, &runtime)
+                .unwrap();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let events = [
+                json!({
+                    "schema_version": 2,
+                    "session_epoch": 7,
+                    "seq": 1,
+                    "event_type": "session_start",
+                    "ts": "2026-08-17T00:01:01Z",
+                    "payload": {"model_provider_id": "openai", "model": "gpt-5.6-terra"}
+                }),
+                json!({
+                    "schema_version": 2,
+                    "session_epoch": 7,
+                    "seq": 2,
+                    "event_type": "thread/settings/updated",
+                    "session_id": "thread-policy-1",
+                    "ts": "2026-08-17T00:01:02Z",
+                    "payload": {
+                        "threadId": "thread-policy-1",
+                        "threadSettings": {
+                            "model": "gpt-5.6-terra",
+                            "effort": "high",
+                            "modelProvider": "openai"
+                        }
+                    }
+                }),
+            ];
+            fs::write(
+                path,
+                format!(
+                    "{}\n{}\n",
+                    serde_json::to_string(&events[0]).unwrap(),
+                    serde_json::to_string(&events[1]).unwrap()
+                ),
+            )
+            .unwrap();
+        }
+        record
+    }
+
+    #[test]
+    fn policy_restart_crash_matrix_converges_without_capacity_or_child_leaks() {
+        // Crash after admission commit: reserved/no-session releases.
+        let fixture = policy_crash_fixture("after-admission");
+        let admission = prepare_policy_crash(&fixture, "after-admission");
+        let report = reconcile_policy_runtime(
+            &fixture.config,
+            &fixture.session_store,
+            &fixture.evidence_store,
+            &fixture.store,
+            &fixture.projection,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                report.expected,
+                report.visited,
+                report.resolved,
+                report.blocked
+            ),
+            (1, 1, 1, 0)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .resolve_child(&admission.reservation.child_session_id)
+                .unwrap()
+                .unwrap()
+                .child_state,
+            PolicyChildState::Released
+        );
+
+        // Crash after session create: missing attestation rejects, detaches, and releases.
+        let fixture = policy_crash_fixture("after-session-create");
+        let admission = prepare_policy_crash(&fixture, "after-session-create");
+        materialize_policy_fixture_session(&fixture, &admission, false);
+        let report = reconcile_policy_runtime(
+            &fixture.config,
+            &fixture.session_store,
+            &fixture.evidence_store,
+            &fixture.store,
+            &fixture.projection,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                report.expected,
+                report.visited,
+                report.resolved,
+                report.blocked
+            ),
+            (1, 1, 1, 0)
+        );
+        let rejected = fixture
+            .session_store
+            .get_session(&admission.reservation.child_session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rejected.completion_status.as_deref(),
+            Some("launch_rejected")
+        );
+        assert!(rejected.parent_session_id.is_none());
+
+        // Crash after attestation but before mark: restart re-attests and promotes.
+        let fixture = policy_crash_fixture("after-attestation");
+        let admission = prepare_policy_crash(&fixture, "after-attestation");
+        materialize_policy_fixture_session(&fixture, &admission, true);
+        let report = reconcile_policy_runtime(
+            &fixture.config,
+            &fixture.session_store,
+            &fixture.evidence_store,
+            &fixture.store,
+            &fixture.projection,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                report.expected,
+                report.visited,
+                report.resolved,
+                report.blocked
+            ),
+            (1, 1, 1, 0)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .resolve_child(&admission.reservation.child_session_id)
+                .unwrap()
+                .unwrap()
+                .child_state,
+            PolicyChildState::Launched
+        );
+        assert_eq!(
+            fixture
+                .session_store
+                .get_session(&admission.reservation.child_session_id)
+                .unwrap()
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("maintainer-1")
+        );
+        let event_types = fixture
+            .evidence_store
+            .events(&fixture.projection.lane)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.envelope.event_type)
+            .collect::<Vec<_>>();
+        assert!(event_types.contains(&"provider_attestation".to_owned()));
+        assert!(event_types.contains(&"child_lifecycle".to_owned()));
+
+        // Crash after mark with a dead child: restart releases committed capacity.
+        let fixture = policy_crash_fixture("after-mark");
+        let admission = prepare_policy_crash(&fixture, "after-mark");
+        materialize_policy_fixture_session(&fixture, &admission, true);
+        fixture
+            .store
+            .mark_child_launched(&admission.reservation.child_session_id)
+            .unwrap();
+        fixture
+            .session_store
+            .retire_core_session(&admission.reservation.child_session_id, None)
+            .unwrap();
+        let report = reconcile_policy_runtime(
+            &fixture.config,
+            &fixture.session_store,
+            &fixture.evidence_store,
+            &fixture.store,
+            &fixture.projection,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                report.expected,
+                report.visited,
+                report.resolved,
+                report.blocked
+            ),
+            (1, 1, 1, 0)
+        );
+        assert_eq!(
+            fixture
+                .store
+                .resolve_child(&admission.reservation.child_session_id)
+                .unwrap()
+                .unwrap()
+                .child_state,
+            PolicyChildState::Released
+        );
+
+        // Crash during release: the durable pending state is completed.
+        let fixture = policy_crash_fixture("during-release");
+        let admission = prepare_policy_crash(&fixture, "during-release");
+        materialize_policy_fixture_session(&fixture, &admission, true);
+        fixture
+            .store
+            .mark_child_launched(&admission.reservation.child_session_id)
+            .unwrap();
+        fixture
+            .store
+            .mark_child_release_pending(&admission.reservation.child_session_id)
+            .unwrap();
+        let report = reconcile_policy_runtime(
+            &fixture.config,
+            &fixture.session_store,
+            &fixture.evidence_store,
+            &fixture.store,
+            &fixture.projection,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                report.expected,
+                report.visited,
+                report.resolved,
+                report.blocked
+            ),
+            (1, 1, 1, 0)
+        );
+        assert_eq!(
+            fixture.store.reconciliation_snapshot().unwrap().expected,
+            0,
+            "release completion leaves no capacity-counted reconciliation item"
+        );
+
+        // Crash after release: terminal audit rows remain outside admission
+        // reconciliation and cannot reacquire capacity.
+        let fixture = policy_crash_fixture("after-release");
+        let admission = prepare_policy_crash(&fixture, "after-release");
+        let session = materialize_policy_fixture_session(&fixture, &admission, true);
+        fixture
+            .store
+            .mark_child_launched(&admission.reservation.child_session_id)
+            .unwrap();
+        fixture
+            .store
+            .mark_child_release_pending(&admission.reservation.child_session_id)
+            .unwrap();
+        fixture
+            .session_store
+            .reject_policy_provisional_session(
+                &admission.reservation.child_session_id,
+                "release completed before crash",
+                None,
+            )
+            .unwrap();
+        fixture
+            .store
+            .release_by_child(&admission.reservation.child_session_id)
+            .unwrap();
+        let report = reconcile_policy_runtime(
+            &fixture.config,
+            &fixture.session_store,
+            &fixture.evidence_store,
+            &fixture.store,
+            &fixture.projection,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                report.expected,
+                report.visited,
+                report.resolved,
+                report.blocked
+            ),
+            (0, 0, 0, 0)
+        );
+        let retained = fixture
+            .session_store
+            .get_session(&session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retained.completion_status.as_deref(),
+            Some("launch_rejected")
+        );
+        assert!(retained.parent_session_id.is_none());
+    }
+
+    #[test]
+    fn ambiguous_policy_restart_state_reports_exact_blocker_and_disables_admission() {
+        let fixture = policy_crash_fixture("ambiguous");
+        let admission = prepare_policy_crash(&fixture, "ambiguous");
+        let conn = Connection::open(fixture.root.join("policy.db")).unwrap();
+        conn.execute(
+            "UPDATE policy_provisional_children SET state = 'launched' WHERE child_session_id = ?1",
+            [&admission.reservation.child_session_id],
+        )
+        .unwrap();
+        drop(conn);
+        let report = reconcile_policy_runtime(
+            &fixture.config,
+            &fixture.session_store,
+            &fixture.evidence_store,
+            &fixture.store,
+            &fixture.projection,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                report.expected,
+                report.visited,
+                report.resolved,
+                report.blocked
+            ),
+            (1, 1, 0, 1)
+        );
+        assert!(report.blockers[0].contains("Launched/Active"));
+        let blocker = format!(
+            "policy admission disabled: restart reconciliation blocked {}/{} items: {}",
+            report.blocked,
+            report.expected,
+            report.blockers.join("; ")
+        );
+        assert!(blocker.contains(&admission.reservation.child_session_id));
     }
 
     #[test]

@@ -7209,6 +7209,135 @@ impl SessionStore {
         }))
     }
 
+    /// Fail-closed cleanup for a policy-admitted runtime that did not complete
+    /// attestation. The row is retained as audit evidence, but it no longer
+    /// owns a live hierarchy edge, role alias, wake, reminder, or runtime.
+    pub fn reject_policy_provisional_session(
+        &self,
+        session_id: &str,
+        reason: &str,
+        runtime: Option<&TmuxRuntime>,
+    ) -> Result<bool> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            anyhow::bail!("policy provisional session ID is required");
+        }
+        if reason.trim().is_empty() {
+            anyhow::bail!("policy launch rejection reason is required");
+        }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let (node, tmux_session, socket_name) = {
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let Some(session) = session_object_mut(sessions, session_id) else {
+                return Ok(false);
+            };
+            (
+                json_text(session.get("node")).unwrap_or_else(default_node),
+                json_text(session.get("tmux_session")),
+                json_text(session.get("tmux_socket_name")),
+            )
+        };
+        if let (Some(runtime), Some(tmux_session)) = (runtime, tmux_session.as_deref()) {
+            if !is_primary_node(&node) {
+                anyhow::bail!(
+                    "cannot stop policy provisional session {session_id} on unsupported node {node}"
+                );
+            }
+            runtime
+                .for_socket_name(socket_name.as_deref())
+                .kill_session(tmux_session)?;
+        }
+        let now = now_rfc3339();
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let session = session_object_mut(sessions, session_id).ok_or_else(|| {
+            anyhow::anyhow!("policy provisional session {session_id} disappeared during cleanup")
+        })?;
+        session.insert("status".to_owned(), Value::String("stopped".to_owned()));
+        session.insert(
+            "completion_status".to_owned(),
+            Value::String("launch_rejected".to_owned()),
+        );
+        session.insert(
+            "completion_message".to_owned(),
+            Value::String(reason.to_owned()),
+        );
+        session.insert("completed_at".to_owned(), Value::String(now.clone()));
+        session.insert("stopped_at".to_owned(), Value::String(now.clone()));
+        session.insert("last_activity".to_owned(), Value::String(now));
+        session.insert("parent_session_id".to_owned(), Value::Null);
+        session.insert("role".to_owned(), Value::Null);
+        session.insert("aliases".to_owned(), Value::Array(Vec::new()));
+        prune_agent_registrations_raw(&mut state)?;
+        self.write_raw_json_value(&state)?;
+        if let Some(queue) = &self.queue_store {
+            queue.cancel_parent_wake(session_id)?;
+            queue.cancel_remind(session_id)?;
+        }
+        Ok(true)
+    }
+
+    /// Publishes the hierarchy edge for an already attested policy child.
+    /// Policy materialization deliberately creates the runtime without an
+    /// active parent edge, so it cannot receive routed work before admission
+    /// commits. The operation is idempotent only for the exact intended edge.
+    pub fn promote_policy_provisional_session(
+        &self,
+        session_id: &str,
+        parent_session_id: &str,
+    ) -> Result<bool> {
+        let session_id = session_id.trim();
+        let parent_session_id = parent_session_id.trim();
+        if session_id.is_empty() || parent_session_id.is_empty() {
+            anyhow::bail!("policy child and parent session IDs are required");
+        }
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        ensure_session_not_reparent_fenced(&state, session_id)?;
+        ensure_session_not_reparent_fenced(&state, parent_session_id)?;
+        let snapshot = snapshot_from_raw_value(&state)?.into_sessions();
+        let parent = snapshot
+            .iter()
+            .find(|session| session.id == parent_session_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!("policy parent session {parent_session_id} does not exist")
+            })?;
+        if !parent.is_live_for_registry() {
+            anyhow::bail!("policy parent session {parent_session_id} is stopped");
+        }
+        let child = snapshot
+            .iter()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| anyhow::anyhow!("policy child session {session_id} does not exist"))?;
+        if !child.is_live_for_registry() {
+            anyhow::bail!("policy child session {session_id} is stopped");
+        }
+        if let Some(current_parent) = child.parent_session_id.as_deref() {
+            if current_parent == parent_session_id {
+                return Ok(false);
+            }
+            anyhow::bail!(
+                "policy child {session_id} already belongs to conflicting parent {current_parent}"
+            );
+        }
+        if reparent_would_create_cycle(&snapshot, session_id, parent_session_id) {
+            anyhow::bail!(
+                "publishing policy child {session_id} under {parent_session_id} would create a cycle"
+            );
+        }
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let child = session_object_mut(sessions, session_id).ok_or_else(|| {
+            anyhow::anyhow!("policy child session {session_id} disappeared during promotion")
+        })?;
+        child.insert(
+            "parent_session_id".to_owned(),
+            Value::String(parent_session_id.to_owned()),
+        );
+        child.insert("last_activity".to_owned(), Value::String(now_rfc3339()));
+        self.write_raw_json_value(&state)?;
+        Ok(true)
+    }
+
     pub fn set_agent_status(
         &self,
         session_id: &str,
@@ -14623,7 +14752,7 @@ fn normalized_status(status: &str) -> &str {
 }
 
 fn completion_status_is_retired(status: Option<&str>) -> bool {
-    matches!(status, Some("retired" | "killed"))
+    matches!(status, Some("retired" | "killed" | "launch_rejected"))
 }
 
 fn raw_session_is_stopped(session: &Map<String, Value>) -> bool {

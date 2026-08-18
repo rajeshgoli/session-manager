@@ -353,6 +353,13 @@ pub struct PolicyReconciliationSnapshot {
     pub blockers: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyChildAdmission {
+    pub reservation: PolicyChildReservation,
+    pub request: PolicySpawnRequest,
+    pub decision: PolicyDecision,
+}
+
 #[derive(Debug, Clone)]
 pub struct PolicyStore {
     db_path: PathBuf,
@@ -766,11 +773,9 @@ impl PolicyStore {
         let reservation = load_child_reservation_tx(&tx, child_session_id)?;
         if let Some(reservation) = reservation {
             if matches!(
-                reservation.child_state,
-                PolicyChildState::Released | PolicyChildState::Expired
-            ) && matches!(
-                reservation.lease_state,
-                PolicyLeaseState::Released | PolicyLeaseState::Expired
+                (reservation.child_state, reservation.lease_state),
+                (PolicyChildState::Released, PolicyLeaseState::Released)
+                    | (PolicyChildState::Expired, PolicyLeaseState::Expired)
             ) {
                 tx.commit()?;
                 return Ok(());
@@ -880,13 +885,34 @@ impl PolicyStore {
         Ok(reservation)
     }
 
+    pub fn admission_for_child(
+        &self,
+        child_session_id: &str,
+    ) -> Result<Option<PolicyChildAdmission>> {
+        required(child_session_id, "provisional child session ID")?;
+        let mut conn = self.open()?;
+        let tx = conn.transaction()?;
+        let Some(reservation) = load_child_reservation_tx(&tx, child_session_id)? else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let request = load_request_tx(&tx, &reservation.request_id)?;
+        let decision = load_terminal_decision(&tx, &request, &reservation.decision_id)?;
+        tx.commit()?;
+        Ok(Some(PolicyChildAdmission {
+            reservation,
+            request,
+            decision,
+        }))
+    }
+
     /// Enumerates every non-terminal lease/child pair before admission is
     /// enabled. Structural mismatches are returned as exact blockers instead of
     /// being silently omitted from the sweep denominator.
     pub fn reconciliation_snapshot(&self) -> Result<PolicyReconciliationSnapshot> {
         let mut conn = self.open()?;
         let tx = conn.transaction()?;
-        let expected = tx.query_row(
+        let expected_leases = tx.query_row(
             "SELECT COUNT(*) FROM policy_capacity_leases WHERE state IN ('active', 'committed', 'release_pending')",
             [],
             |row| row.get::<_, usize>(0),
@@ -922,15 +948,13 @@ impl PolicyStore {
             .prepare("SELECT child_session_id, lease_id FROM policy_provisional_children WHERE state IN ('reserved', 'launched', 'release_pending') AND lease_id NOT IN (SELECT lease_id FROM policy_capacity_leases WHERE state IN ('active', 'committed', 'release_pending')) ORDER BY child_session_id")?
             .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let orphan_count = orphan_children.len();
         for (child_session_id, lease_id) in orphan_children {
             blockers.push(format!(
                 "provisional child {child_session_id} has no matching non-terminal lease {lease_id}"
             ));
         }
-        let expected = expected
-            + blockers
-                .len()
-                .saturating_sub(expected.saturating_sub(reservations.len()));
+        let expected = expected_leases + orphan_count;
         tx.commit()?;
         Ok(PolicyReconciliationSnapshot {
             expected,
