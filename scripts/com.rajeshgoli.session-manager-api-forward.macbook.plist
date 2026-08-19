@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rajeshgoli.session-manager-api-forward.macbook</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Installed copy in ~/bin: the repo lives under ~/Desktop (TCC-protected),
+             which a launchd agent without Full Disk Access cannot read. -->
+        <string>/Users/rajesh/bin/session-manager-api-forward</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/session-manager-api-forward-macbook.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/session-manager-api-forward-macbook.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- ssh + nc live in /usr/bin; cloudflared (studio-away ProxyCommand) in homebrew. -->
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin</string>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+</dict>
+</plist>
