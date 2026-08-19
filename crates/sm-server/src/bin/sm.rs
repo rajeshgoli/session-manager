@@ -383,8 +383,22 @@ struct ContextMonitorArgs {
 
 #[derive(Subcommand)]
 enum ContextMonitorCommand {
-    Enable { target: Option<String> },
-    Disable { target: Option<String> },
+    Enable {
+        target: Option<String>,
+        /// Warning percentage for this seat (for example, 40).
+        #[arg(long, value_name = "PERCENT")]
+        threshold: Option<f64>,
+        /// Critical percentage for this seat. Defaults to the current global
+        /// critical threshold unless an existing seat override is present.
+        #[arg(long, value_name = "PERCENT")]
+        critical_threshold: Option<f64>,
+        /// Clear seat-specific thresholds and use the server defaults.
+        #[arg(long, conflicts_with_all = ["threshold", "critical_threshold"])]
+        use_default_thresholds: bool,
+    },
+    Disable {
+        target: Option<String>,
+    },
     Status,
 }
 
@@ -3856,11 +3870,16 @@ fn run_context(client: &ApiClient, args: ContextArgs) -> Result<()> {
         Some(value) => value.to_owned(),
         None => "none".to_owned(),
     };
-    let monitor = if payload["context_monitor_enabled"]
+    let monitor = if payload["context_monitor_enforced"]
         .as_bool()
         .unwrap_or(false)
     {
         "enabled"
+    } else if payload["context_monitor_enabled"]
+        .as_bool()
+        .unwrap_or(false)
+    {
+        "enabled but NOT enforced (invalid thresholds)"
     } else {
         "disabled"
     };
@@ -3879,7 +3898,10 @@ fn run_context(client: &ApiClient, args: ContextArgs) -> Result<()> {
         "Lifecycle: {}",
         payload["lifecycle_status"].as_str().unwrap_or("unknown")
     );
-    println!("State: {state} (warning {warning}, critical {critical})");
+    println!(
+        "State: {state} (warning {warning}, critical {critical}; {})",
+        payload["threshold_source"].as_str().unwrap_or("unknown")
+    );
     println!("Monitor: {monitor}, alerts -> {notify_text}");
     println!("Compaction: {compaction}");
     println!(
@@ -4007,16 +4029,27 @@ fn run_context_monitor(client: &ApiClient, args: ContextMonitorArgs) -> Result<(
                 println!("No sessions currently registered for context monitoring.");
                 return Ok(());
             }
-            println!("{:<12} {:<24} Notify Target", "Session", "Name");
-            println!("{}", "-".repeat(52));
+            println!(
+                "{:<12} {:<24} {:<14} Thresholds",
+                "Session", "Name", "Notify Target"
+            );
+            println!("{}", "-".repeat(78));
             for entry in monitored {
                 let session_id = entry["session_id"].as_str().unwrap_or("unknown");
                 let name = entry["friendly_name"].as_str().unwrap_or("");
                 let notify = entry["notify_session_id"].as_str().unwrap_or("(none)");
-                println!("{session_id:<12} {name:<24} {notify}");
+                println!(
+                    "{session_id:<12} {name:<24} {notify:<14} {}",
+                    format_context_monitor_thresholds(&entry)
+                );
             }
         }
-        ContextMonitorCommand::Enable { target } => {
+        ContextMonitorCommand::Enable {
+            target,
+            threshold,
+            critical_threshold,
+            use_default_thresholds,
+        } => {
             let requester = current_session_id()?;
             let target = target.unwrap_or_else(|| requester.clone());
             let response = client.post_json(
@@ -4024,14 +4057,23 @@ fn run_context_monitor(client: &ApiClient, args: ContextMonitorArgs) -> Result<(
                 json!({
                     "enabled": true,
                     "requester_session_id": requester,
-                    "notify_session_id": requester
+                    "notify_session_id": requester,
+                    "warning_percentage": threshold,
+                    "critical_percentage": critical_threshold,
+                    "use_default_thresholds": use_default_thresholds
                 }),
             )?;
             ensure_context_monitor_enabled(&response)?;
             if target == requester {
-                println!("Context monitoring enabled - notifications -> self ({requester})");
+                println!(
+                    "Context monitoring enabled - notifications -> self ({requester}); thresholds {}",
+                    format_context_monitor_thresholds(&response)
+                );
             } else {
-                println!("Context monitoring enabled for {target} - notifications -> {requester}");
+                println!(
+                    "Context monitoring enabled for {target} - notifications -> {requester}; thresholds {}",
+                    format_context_monitor_thresholds(&response)
+                );
             }
         }
         ContextMonitorCommand::Disable { target } => {
@@ -4059,6 +4101,16 @@ fn ensure_context_monitor_enabled(response: &Value) -> Result<()> {
         "Context monitoring was not enrolled: server returned enabled={:?}. Run `sm context-monitor status` to verify coverage.",
         response["enabled"]
     );
+}
+
+fn format_context_monitor_thresholds(payload: &Value) -> String {
+    if payload["enforced"].as_bool() != Some(true) {
+        return "INVALID / NOT ENFORCED".to_owned();
+    }
+    let warning = format_context_percentage(payload.get("warning_percentage"));
+    let critical = format_context_percentage(payload.get("critical_percentage"));
+    let source = payload["threshold_source"].as_str().unwrap_or("unknown");
+    format!("{warning} warning / {critical} critical ({source})")
 }
 
 fn lookup_identifier(client: &ApiClient, identifier: &str) -> Result<Option<String>> {
@@ -7123,6 +7175,35 @@ mod tests {
         assert_eq!(format_context_percentage(Some(&json!(43.5))), "43.5%");
         assert_eq!(format_context_percentage(Some(&Value::Null)), "unknown");
         assert_eq!(format_context_percentage(None), "unknown");
+    }
+
+    #[test]
+    fn context_monitor_threshold_formatter_is_truthful_for_default_custom_and_invalid_rows() {
+        assert_eq!(
+            format_context_monitor_thresholds(&json!({
+                "enforced": true,
+                "warning_percentage": 65.0,
+                "critical_percentage": 75.0,
+                "threshold_source": "default"
+            })),
+            "65% warning / 75% critical (default)"
+        );
+        assert_eq!(
+            format_context_monitor_thresholds(&json!({
+                "enforced": true,
+                "warning_percentage": 40.0,
+                "critical_percentage": 60.0,
+                "threshold_source": "custom"
+            })),
+            "40% warning / 60% critical (custom)"
+        );
+        assert_eq!(
+            format_context_monitor_thresholds(&json!({
+                "enforced": false,
+                "threshold_source": "invalid"
+            })),
+            "INVALID / NOT ENFORCED"
+        );
     }
 
     #[test]

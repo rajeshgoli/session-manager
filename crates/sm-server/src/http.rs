@@ -8342,6 +8342,10 @@ async fn set_context_monitor(
                 "Context monitoring cannot enroll provider {provider:?}: no measured context gauge is available; use `sm context` on each heartbeat until provider support is added"
             ),
         }),
+        ContextMonitorOutcome::InvalidThresholdConfig(detail) => Err(ApiError::Status {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail,
+        }),
         ContextMonitorOutcome::MissingNotifyTarget => Err(ApiError::Status {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             detail: "notify_session_id required when enabling".to_owned(),
@@ -13898,7 +13902,7 @@ mod tests {
     };
     use axum::{
         body::{to_bytes, Body},
-        http::Method,
+        http::{header::CONTENT_TYPE, Method},
     };
     use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
     use p256::{
@@ -15523,6 +15527,109 @@ mod tests {
         config.rust_core.fixture_writes_enabled = true;
         config.rust_core.runtime_enabled = false;
         (config, queue_path)
+    }
+
+    #[tokio::test]
+    async fn context_monitor_http_persists_effective_thresholds_and_rejects_invalid_values() {
+        let state_file = PathBuf::from(write_session_state("threshold-agent", "running"));
+        let mut fixture: Value = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+        fixture["sessions"][0]["provider"] = json!("claude");
+        fs::write(&state_file, serde_json::to_vec(&fixture).unwrap()).unwrap();
+        let mut config = AppConfig::default();
+        config.paths.state_file = state_file.display().to_string();
+        config.sm_send.db_path = state_file
+            .with_file_name("context-monitor-threshold-queue.db")
+            .display()
+            .to_string();
+        config.rust_core.fixture_writes_enabled = true;
+        config.rust_core.runtime_enabled = false;
+        let app = router(AppState::new(config));
+
+        let mut custom = local_request(
+            Method::POST,
+            "/sessions/threshold-agent/context-monitor",
+            Body::from(
+                serde_json::to_vec(&json!({
+                    "enabled": true,
+                    "requester_session_id": "threshold-agent",
+                    "notify_session_id": "threshold-agent",
+                    "warning_percentage": 40.0,
+                    "critical_percentage": 60.0
+                }))
+                .unwrap(),
+            ),
+        );
+        custom
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        let (status, body) = response_json(app.clone().oneshot(custom).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["warning_percentage"], json!(40.0));
+        assert_eq!(body["critical_percentage"], json!(60.0));
+        assert_eq!(body["threshold_source"], json!("custom"));
+        assert_eq!(body["enforced"], json!(true));
+
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(local_request(
+                    Method::GET,
+                    "/sessions/context-monitor",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["monitored"][0]["warning_percentage"], json!(40.0));
+        assert_eq!(body["monitored"][0]["critical_percentage"], json!(60.0));
+        assert_eq!(body["monitored"][0]["threshold_source"], json!("custom"));
+        assert_eq!(body["monitored"][0]["enforced"], json!(true));
+
+        let persisted_before_invalid = fs::read(&state_file).unwrap();
+        let mut invalid = local_request(
+            Method::POST,
+            "/sessions/threshold-agent/context-monitor",
+            Body::from(
+                serde_json::to_vec(&json!({
+                    "enabled": true,
+                    "requester_session_id": "threshold-agent",
+                    "notify_session_id": "threshold-agent",
+                    "warning_percentage": 80.0,
+                    "critical_percentage": 40.0
+                }))
+                .unwrap(),
+            ),
+        );
+        invalid
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        let (status, body) = response_json(app.clone().oneshot(invalid).await.unwrap()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(body["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("strictly lower")));
+        assert_eq!(fs::read(&state_file).unwrap(), persisted_before_invalid);
+
+        let mut malformed = local_request(
+            Method::POST,
+            "/sessions/threshold-agent/context-monitor",
+            Body::from(
+                serde_json::to_vec(&json!({
+                    "enabled": true,
+                    "requester_session_id": "threshold-agent",
+                    "notify_session_id": "threshold-agent",
+                    "warning_percentage": "forty"
+                }))
+                .unwrap(),
+            ),
+        );
+        malformed
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        let response = app.oneshot(malformed).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(fs::read(&state_file).unwrap(), persisted_before_invalid);
     }
 
     #[tokio::test]

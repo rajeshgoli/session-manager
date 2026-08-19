@@ -1953,10 +1953,28 @@ impl SessionStore {
             })
             .map(|session| {
                 let friendly_name = session.cached_display_name();
+                let thresholds = resolve_context_monitor_thresholds(
+                    session.context_monitor_warning_percentage,
+                    session.context_monitor_critical_percentage,
+                    &self.context_monitor,
+                );
                 ContextMonitorStatus {
                     session_id: session.id,
                     friendly_name,
                     notify_session_id: session.context_monitor_notify,
+                    warning_percentage: thresholds
+                        .as_ref()
+                        .ok()
+                        .map(|value| value.warning_percentage),
+                    critical_percentage: thresholds
+                        .as_ref()
+                        .ok()
+                        .map(|value| value.critical_percentage),
+                    threshold_source: thresholds
+                        .as_ref()
+                        .map(|value| value.source.as_str().to_owned())
+                        .unwrap_or_else(|_| "invalid".to_owned()),
+                    enforced: thresholds.is_ok(),
                 }
             })
             .collect())
@@ -5720,15 +5738,67 @@ impl SessionStore {
                 ));
             }
         }
+        if !request.enabled
+            && (request.warning_percentage.is_some()
+                || request.critical_percentage.is_some()
+                || request.use_default_thresholds)
+        {
+            return Ok(ContextMonitorOutcome::InvalidThresholdConfig(
+                "threshold options require enabled=true".to_owned(),
+            ));
+        }
+        if request.use_default_thresholds
+            && (request.warning_percentage.is_some() || request.critical_percentage.is_some())
+        {
+            return Ok(ContextMonitorOutcome::InvalidThresholdConfig(
+                "use_default_thresholds conflicts with custom thresholds".to_owned(),
+            ));
+        }
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(ContextMonitorOutcome::NotFound);
         };
         let effective_enabled = request.enabled;
+        let current_warning = session
+            .get("context_monitor_warning_percentage")
+            .and_then(Value::as_f64);
+        let current_critical = session
+            .get("context_monitor_critical_percentage")
+            .and_then(Value::as_f64);
+        let (next_warning, next_critical) = if request.use_default_thresholds {
+            (None, None)
+        } else {
+            (
+                request.warning_percentage.or(current_warning),
+                request.critical_percentage.or(current_critical),
+            )
+        };
+        let thresholds = if request.enabled {
+            match resolve_context_monitor_thresholds(
+                next_warning,
+                next_critical,
+                &self.context_monitor,
+            ) {
+                Ok(thresholds) => Some(thresholds),
+                Err(detail) => return Ok(ContextMonitorOutcome::InvalidThresholdConfig(detail)),
+            }
+        } else {
+            None
+        };
+        let thresholds_changed =
+            current_warning != next_warning || current_critical != next_critical;
         session.insert(
             "context_monitor_enabled".to_owned(),
             Value::Bool(effective_enabled),
         );
         if effective_enabled {
+            session.insert(
+                "context_monitor_warning_percentage".to_owned(),
+                next_warning.map_or(Value::Null, |value| json!(value)),
+            );
+            session.insert(
+                "context_monitor_critical_percentage".to_owned(),
+                next_critical.map_or(Value::Null, |value| json!(value)),
+            );
             let notify_session_id = notify_session_id.unwrap();
             session.insert(
                 "context_monitor_notify".to_owned(),
@@ -5766,10 +5836,20 @@ impl SessionStore {
                 reset_context_oneshot_flags(session);
             }
         }
+        if thresholds_changed {
+            self.cancel_context_monitor_alerts(session_id)?;
+        }
         self.write_raw_json_value(&state)?;
         Ok(ContextMonitorOutcome::Updated(ContextMonitorResult {
             status: "ok".to_owned(),
             enabled: effective_enabled,
+            warning_percentage: thresholds.as_ref().map(|value| value.warning_percentage),
+            critical_percentage: thresholds.as_ref().map(|value| value.critical_percentage),
+            threshold_source: thresholds
+                .as_ref()
+                .map(|value| value.source.as_str().to_owned())
+                .unwrap_or_else(|| "disabled".to_owned()),
+            enforced: effective_enabled && thresholds.is_some(),
         }))
     }
 
@@ -6096,13 +6176,23 @@ impl SessionStore {
         tokens_used: i64,
     ) -> Option<ContextAlert> {
         let notify_target = json_text(session.get("context_monitor_notify"))?;
+        let thresholds = resolve_context_monitor_thresholds(
+            session
+                .get("context_monitor_warning_percentage")
+                .and_then(Value::as_f64),
+            session
+                .get("context_monitor_critical_percentage")
+                .and_then(Value::as_f64),
+            &self.context_monitor,
+        )
+        .ok()?;
         let is_self_alert = notify_target == session_id;
         let label = raw_session_label(session, session_id);
         let rounded = format_percentage(used_percentage);
         let native_codex_compaction = json_text(session.get("provider"))
             .is_some_and(|provider| provider_uses_native_context_compaction(&provider));
 
-        if used_percentage >= self.context_monitor.critical_percentage {
+        if used_percentage >= thresholds.critical_percentage {
             if flag_is_set(session, "context_critical_sent") {
                 return None;
             }
@@ -6131,7 +6221,7 @@ impl SessionStore {
             });
         }
 
-        if used_percentage >= self.context_monitor.warning_percentage {
+        if used_percentage >= thresholds.warning_percentage {
             if flag_is_set(session, "context_warning_sent") {
                 return None;
             }
@@ -8543,6 +8633,8 @@ impl SessionStore {
             context_monitor_enabled: false,
             context_monitor_notify: None,
             context_monitor_notify_source: default_context_monitor_notify_source(),
+            context_monitor_warning_percentage: None,
+            context_monitor_critical_percentage: None,
             context_warning_sent: false,
             context_critical_sent: false,
             aliases: Vec::new(),
@@ -9201,6 +9293,17 @@ pub struct ContextMonitorRequest {
     pub requester_session_id: String,
     #[serde(default)]
     pub notify_session_id: Option<String>,
+    /// Per-seat warning threshold percentage. Absent values preserve an
+    /// existing override or resolve to the configured global default.
+    #[serde(default)]
+    pub warning_percentage: Option<f64>,
+    /// Per-seat critical threshold percentage. Absent values preserve an
+    /// existing override or resolve to the configured global default.
+    #[serde(default)]
+    pub critical_percentage: Option<f64>,
+    /// Clear both seat overrides and return to the configured global defaults.
+    #[serde(default)]
+    pub use_default_thresholds: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -9519,6 +9622,10 @@ pub struct ContextMonitorStatus {
     pub session_id: String,
     pub friendly_name: Option<String>,
     pub notify_session_id: Option<String>,
+    pub warning_percentage: Option<f64>,
+    pub critical_percentage: Option<f64>,
+    pub threshold_source: String,
+    pub enforced: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -9531,9 +9638,11 @@ pub struct ContextSnapshotResponse {
     pub sampled_at: Option<String>,
     pub lifecycle_status: String,
     pub state: String,
-    pub warning_percentage: f64,
-    pub critical_percentage: f64,
+    pub warning_percentage: Option<f64>,
+    pub critical_percentage: Option<f64>,
+    pub threshold_source: String,
     pub context_monitor_enabled: bool,
+    pub context_monitor_enforced: bool,
     pub notify_session_id: Option<String>,
     pub compaction_active: bool,
     pub last_handoff_path: Option<String>,
@@ -9547,12 +9656,20 @@ impl ContextSnapshotResponse {
         let friendly_name = session.cached_display_name();
         let provider = non_empty_or(session.provider, "claude");
         let unsupported_provider = !provider_has_measured_context_gauge(&provider);
+        let thresholds = resolve_context_monitor_thresholds(
+            session.context_monitor_warning_percentage,
+            session.context_monitor_critical_percentage,
+            config,
+        );
         let state = if compaction_active {
             "compacting"
+        } else if thresholds.is_err() {
+            "thresholds_unavailable"
         } else if let Some(used_percentage) = used_percentage {
-            if used_percentage >= config.critical_percentage {
+            let thresholds = thresholds.as_ref().expect("checked above");
+            if used_percentage >= thresholds.critical_percentage {
                 "critical"
-            } else if used_percentage >= config.warning_percentage {
+            } else if used_percentage >= thresholds.warning_percentage {
                 "warning"
             } else {
                 "normal"
@@ -9571,9 +9688,22 @@ impl ContextSnapshotResponse {
             sampled_at: session.context_sampled_at,
             lifecycle_status,
             state,
-            warning_percentage: config.warning_percentage,
-            critical_percentage: config.critical_percentage,
+            warning_percentage: thresholds
+                .as_ref()
+                .ok()
+                .map(|value| value.warning_percentage),
+            critical_percentage: thresholds
+                .as_ref()
+                .ok()
+                .map(|value| value.critical_percentage),
+            threshold_source: thresholds
+                .as_ref()
+                .map(|value| value.source.as_str().to_owned())
+                .unwrap_or_else(|_| "invalid".to_owned()),
             context_monitor_enabled: session.context_monitor_enabled && !unsupported_provider,
+            context_monitor_enforced: session.context_monitor_enabled
+                && !unsupported_provider
+                && thresholds.is_ok(),
             notify_session_id: if unsupported_provider {
                 None
             } else {
@@ -9589,11 +9719,16 @@ impl ContextSnapshotResponse {
 pub struct ContextMonitorResult {
     pub status: String,
     pub enabled: bool,
+    pub warning_percentage: Option<f64>,
+    pub critical_percentage: Option<f64>,
+    pub threshold_source: String,
+    pub enforced: bool,
 }
 
 #[derive(Debug, Clone)]
 pub enum ContextMonitorOutcome {
     Updated(ContextMonitorResult),
+    InvalidThresholdConfig(String),
     NotFound,
     NotRunning,
     UnsupportedProvider(String),
@@ -15137,6 +15272,14 @@ pub struct SessionRecord {
     pub context_monitor_notify: Option<String>,
     #[serde(default = "default_context_monitor_notify_source")]
     pub context_monitor_notify_source: String,
+    /// Optional per-seat warning override. When absent, the configured global
+    /// context-monitor warning threshold remains effective.
+    #[serde(default)]
+    pub context_monitor_warning_percentage: Option<f64>,
+    /// Optional per-seat critical override. When absent, the configured global
+    /// context-monitor critical threshold remains effective.
+    #[serde(default)]
+    pub context_monitor_critical_percentage: Option<f64>,
     /// One-shot latches for the current accumulation cycle. Persisted rather
     /// than held in memory (as the Python server did) so a server restart does
     /// not re-fire a warning the agent has already been told about; the cycle
@@ -15802,6 +15945,70 @@ fn provider_has_measured_context_gauge(provider: &str) -> bool {
 
 fn provider_uses_native_context_compaction(provider: &str) -> bool {
     matches!(provider.trim(), "codex" | "codex-fork" | "codex-app")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextMonitorThresholdSource {
+    Default,
+    Custom,
+}
+
+impl ContextMonitorThresholdSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EffectiveContextMonitorThresholds {
+    warning_percentage: f64,
+    critical_percentage: f64,
+    source: ContextMonitorThresholdSource,
+}
+
+/// Resolve the values that will actually govern a seat. A missing seat override
+/// is deliberately normal: it means the existing server-level default remains
+/// authoritative. Invalid persisted or global values fail closed so status and
+/// alerting never claim an unenforceable policy is active.
+fn resolve_context_monitor_thresholds(
+    warning_override: Option<f64>,
+    critical_override: Option<f64>,
+    config: &ContextMonitorConfig,
+) -> Result<EffectiveContextMonitorThresholds, String> {
+    let warning_percentage = warning_override.unwrap_or(config.warning_percentage);
+    let critical_percentage = critical_override.unwrap_or(config.critical_percentage);
+    for (name, value) in [
+        ("warning_percentage", warning_percentage),
+        ("critical_percentage", critical_percentage),
+    ] {
+        if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+            return Err(format!(
+                "{name} must be a finite percentage in the range (0, 100]"
+            ));
+        }
+        if value == 0.0 {
+            return Err(format!(
+                "{name} must be a finite percentage in the range (0, 100]"
+            ));
+        }
+    }
+    if warning_percentage >= critical_percentage {
+        return Err(
+            "warning_percentage must be strictly lower than critical_percentage".to_owned(),
+        );
+    }
+    Ok(EffectiveContextMonitorThresholds {
+        warning_percentage,
+        critical_percentage,
+        source: if warning_override.is_some() || critical_override.is_some() {
+            ContextMonitorThresholdSource::Custom
+        } else {
+            ContextMonitorThresholdSource::Default
+        },
+    })
 }
 
 fn session_supports_reparent_consent(session: &SessionRecord) -> bool {
@@ -16836,6 +17043,8 @@ mod tests {
             context_monitor_enabled: false,
             context_monitor_notify: None,
             context_monitor_notify_source: default_context_monitor_notify_source(),
+            context_monitor_warning_percentage: None,
+            context_monitor_critical_percentage: None,
             context_warning_sent: false,
             context_critical_sent: false,
             aliases: Vec::new(),
@@ -20456,6 +20665,41 @@ mod tests {
             .collect()
     }
 
+    fn queued_context_monitor_messages(store: &SessionStore) -> Vec<PendingMessage> {
+        store
+            .queue_store
+            .as_ref()
+            .unwrap()
+            .pending_messages_for_target_by_category("parent01", "context_monitor", 10)
+            .unwrap()
+    }
+
+    fn store_with_queued_monitored_child(
+        label: &str,
+        enabled: bool,
+        notify: Option<&str>,
+    ) -> (SessionStore, PathBuf) {
+        let legacy_store = store_with_monitored_child(label, enabled, notify);
+        let queue_path = unique_temp_path(&format!("{label}-queue"));
+        let store =
+            SessionStore::new_with_queue(legacy_store.state_file.clone(), queue_path.clone());
+        (store, queue_path)
+    }
+
+    fn context_monitor_request(
+        warning_percentage: Option<f64>,
+        critical_percentage: Option<f64>,
+    ) -> ContextMonitorRequest {
+        ContextMonitorRequest {
+            enabled: true,
+            requester_session_id: "parent01".to_owned(),
+            notify_session_id: Some("parent01".to_owned()),
+            warning_percentage,
+            critical_percentage,
+            use_default_thresholds: false,
+        }
+    }
+
     #[test]
     fn context_usage_update_persists_tokens_and_warns_once_per_cycle() {
         let store = store_with_monitored_child("ctxwarn", true, Some("parent01"));
@@ -20500,11 +20744,147 @@ mod tests {
         assert_eq!(snapshot.used_percentage, Some(43.0));
         assert_eq!(snapshot.total_input_tokens, Some(86_214));
         assert_eq!(snapshot.state, "normal");
-        assert_eq!(snapshot.warning_percentage, 50.0);
-        assert_eq!(snapshot.critical_percentage, 65.0);
+        assert_eq!(snapshot.warning_percentage, Some(50.0));
+        assert_eq!(snapshot.critical_percentage, Some(65.0));
+        assert_eq!(snapshot.threshold_source, "default");
         assert!(snapshot.context_monitor_enabled);
+        assert!(snapshot.context_monitor_enforced);
         assert_eq!(snapshot.notify_session_id.as_deref(), Some("parent01"));
         assert!(!snapshot.compaction_active);
+    }
+
+    #[test]
+    fn seat_threshold_override_persists_across_restart_and_controls_alerting() {
+        let (store, queue_path) =
+            store_with_queued_monitored_child("ctxseatthreshold", true, Some("parent01"));
+        assert!(matches!(
+            store
+                .set_context_monitor("child001", context_monitor_request(Some(40.0), Some(60.0)),)
+                .unwrap(),
+            ContextMonitorOutcome::Updated(ContextMonitorResult {
+                enabled: true,
+                warning_percentage: Some(40.0),
+                critical_percentage: Some(60.0),
+                ..
+            })
+        ));
+
+        store
+            .apply_context_usage_event(&usage_event("child001", 39.9, 79_800), None)
+            .unwrap();
+        assert!(queued_context_monitor_messages(&store).is_empty());
+        store
+            .apply_context_usage_event(&usage_event("child001", 40.0, 80_000), None)
+            .unwrap();
+        assert_eq!(queued_context_monitor_messages(&store).len(), 1);
+
+        let restarted = SessionStore::new_with_queue(store.state_file.clone(), queue_path);
+        let status = restarted.list_context_monitors().unwrap();
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].warning_percentage, Some(40.0));
+        assert_eq!(status[0].critical_percentage, Some(60.0));
+        assert_eq!(status[0].threshold_source, "custom");
+        assert!(status[0].enforced);
+        let snapshot = restarted.get_context_snapshot("child001").unwrap().unwrap();
+        assert_eq!(snapshot.warning_percentage, Some(40.0));
+        assert_eq!(snapshot.critical_percentage, Some(60.0));
+        assert_eq!(snapshot.threshold_source, "custom");
+        assert!(snapshot.context_monitor_enforced);
+
+        // The warning latch survives the restart while the critical threshold
+        // remains independently available for the same cycle.
+        restarted
+            .apply_context_usage_event(&usage_event("child001", 55.0, 110_000), None)
+            .unwrap();
+        restarted
+            .apply_context_usage_event(&usage_event("child001", 60.0, 120_000), None)
+            .unwrap();
+        assert_eq!(queued_context_monitor_messages(&restarted).len(), 2);
+    }
+
+    #[test]
+    fn invalid_or_inverted_threshold_requests_leave_durable_state_unchanged() {
+        let store = store_with_monitored_child("ctxinvalidthreshold", true, Some("parent01"));
+        let before = store.load_raw_json_value().unwrap();
+        for (warning, critical) in [
+            (Some(0.0), None),
+            (Some(70.0), Some(70.0)),
+            (Some(80.0), Some(40.0)),
+        ] {
+            assert!(matches!(
+                store
+                    .set_context_monitor("child001", context_monitor_request(warning, critical),)
+                    .unwrap(),
+                ContextMonitorOutcome::InvalidThresholdConfig(_)
+            ));
+            assert_eq!(store.load_raw_json_value().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn threshold_reconfiguration_cancels_stale_alerts_and_waits_for_a_fresh_sample() {
+        let (store, _) =
+            store_with_queued_monitored_child("ctxthresholdstale", true, Some("parent01"));
+        store
+            .apply_context_usage_event(
+                &usage_event_at("child001", 70.0, 140_000, "2026-08-17T10:00:00Z"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(queued_context_monitor_messages(&store).len(), 1);
+
+        store
+            .set_context_monitor("child001", context_monitor_request(Some(40.0), Some(60.0)))
+            .unwrap();
+        // Reconfiguration cancels a pending alert that was generated under the
+        // previous policy. Cached telemetry must not manufacture a replacement.
+        assert!(queued_context_monitor_messages(&store).is_empty());
+        assert_eq!(
+            store
+                .apply_context_usage_event(
+                    &usage_event_at("child001", 70.0, 140_000, "2026-08-17T09:59:59Z"),
+                    None,
+                )
+                .unwrap(),
+            ContextUsageOutcome::StaleSample
+        );
+        assert!(queued_context_monitor_messages(&store).is_empty());
+
+        store
+            .apply_context_usage_event(
+                &usage_event_at("child001", 40.0, 80_000, "2026-08-17T10:00:01Z"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(queued_context_monitor_messages(&store).len(), 1);
+    }
+
+    #[test]
+    fn invalid_persisted_threshold_is_visible_as_unenforced_and_never_alerts() {
+        let store = store_with_monitored_child("ctxpersistedinvalid", true, Some("parent01"));
+        let mut state = store.load_raw_json_value().unwrap();
+        session_object_mut(ensure_sessions_array_mut(&mut state).unwrap(), "child001")
+            .unwrap()
+            .insert(
+                "context_monitor_warning_percentage".to_owned(),
+                json!(100.0),
+            );
+        store.write_raw_json_value(&state).unwrap();
+
+        let status = store.list_context_monitors().unwrap();
+        assert_eq!(status[0].threshold_source, "invalid");
+        assert!(!status[0].enforced);
+        assert_eq!(status[0].warning_percentage, None);
+        assert_eq!(status[0].critical_percentage, None);
+        let snapshot = store.get_context_snapshot("child001").unwrap().unwrap();
+        assert_eq!(snapshot.state, "thresholds_unavailable");
+        assert_eq!(snapshot.threshold_source, "invalid");
+        assert!(!snapshot.context_monitor_enforced);
+
+        store
+            .apply_context_usage_event(&usage_event("child001", 99.0, 198_000), None)
+            .unwrap();
+        assert!(context_monitor_messages(&store).is_empty());
     }
 
     #[test]
@@ -20621,6 +21001,9 @@ mod tests {
                     enabled: true,
                     requester_session_id: "parent01".to_owned(),
                     notify_session_id: Some("parent01".to_owned()),
+                    warning_percentage: None,
+                    critical_percentage: None,
+                    use_default_thresholds: false,
                 },
             )
             .unwrap();
@@ -20972,6 +21355,9 @@ mod tests {
             enabled: true,
             requester_session_id: "parent01".to_owned(),
             notify_session_id: Some("parent01".to_owned()),
+            warning_percentage: None,
+            critical_percentage: None,
+            use_default_thresholds: false,
         };
         assert!(matches!(
             store
@@ -21044,6 +21430,9 @@ mod tests {
                     enabled: true,
                     requester_session_id: "child001".to_owned(),
                     notify_session_id: Some("child001".to_owned()),
+                    warning_percentage: None,
+                    critical_percentage: None,
+                    use_default_thresholds: false,
                 },
             )
             .unwrap();
@@ -21137,6 +21526,9 @@ mod tests {
                     enabled: true,
                     requester_session_id: "child001".to_owned(),
                     notify_session_id: Some("child001".to_owned()),
+                    warning_percentage: None,
+                    critical_percentage: None,
+                    use_default_thresholds: false,
                 },
             )
             .unwrap();
@@ -21202,6 +21594,9 @@ mod tests {
                     enabled: true,
                     requester_session_id: "child001".to_owned(),
                     notify_session_id: Some("child001".to_owned()),
+                    warning_percentage: None,
+                    critical_percentage: None,
+                    use_default_thresholds: false,
                 },
             )
             .unwrap();
@@ -21227,6 +21622,9 @@ mod tests {
                         enabled: false,
                         requester_session_id: "child001".to_owned(),
                         notify_session_id: None,
+                        warning_percentage: None,
+                        critical_percentage: None,
+                        use_default_thresholds: false,
                     },
                 )
                 .unwrap(),
@@ -21258,6 +21656,9 @@ mod tests {
                             enabled: true,
                             requester_session_id: "parent01".to_owned(),
                             notify_session_id: Some("parent01".to_owned()),
+                            warning_percentage: None,
+                            critical_percentage: None,
+                            use_default_thresholds: false,
                         },
                     )
                     .unwrap(),
@@ -21277,6 +21678,9 @@ mod tests {
                         enabled: true,
                         requester_session_id: "parent01".to_owned(),
                         notify_session_id: Some("parent01".to_owned()),
+                        warning_percentage: None,
+                        critical_percentage: None,
+                        use_default_thresholds: false,
                     },
                 )
                 .unwrap(),
@@ -21292,6 +21696,9 @@ mod tests {
                         enabled: true,
                         requester_session_id: "parent01".to_owned(),
                         notify_session_id: Some("parent01".to_owned()),
+                        warning_percentage: None,
+                        critical_percentage: None,
+                        use_default_thresholds: false,
                     },
                 )
                 .unwrap(),
