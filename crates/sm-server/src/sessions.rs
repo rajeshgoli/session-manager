@@ -5750,6 +5750,11 @@ impl SessionStore {
             // already high when it registered.
             reset_context_oneshot_flags(session);
         } else {
+            // Disabling is an explicit end to this alert cycle. A retained
+            // context_monitor message describes state the operator has
+            // deliberately stopped monitoring, so it must not surface on a
+            // later queue drain.
+            self.cancel_context_monitor_alerts(session_id)?;
             session.insert("context_monitor_notify".to_owned(), Value::Null);
             session.insert(
                 "context_monitor_notify_source".to_owned(),
@@ -6864,9 +6869,7 @@ impl SessionStore {
             // Use one boundary for both the bounded recovery read and the
             // monitor. Events appended after it are consumed by the monitor;
             // none can fall into a restart-time gap.
-            let recovery_offset = fs::metadata(event_stream_path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
+            let recovery_offset = codex_fork_complete_jsonl_boundary(event_stream_path);
             self.reconcile_codex_fork_context_at_restart(
                 session_id,
                 event_stream_path,
@@ -15642,6 +15645,41 @@ fn read_tail_lines_at_offset(path: &Path, end_offset: u64, lines: usize) -> io::
     Ok(tail_lines(&String::from_utf8_lossy(&bytes), lines))
 }
 
+/// Capture a restart boundary that ends on a complete JSONL record.
+///
+/// Codex can be appending while the server starts. Starting a live monitor at
+/// raw EOF would skip the suffix of such an in-flight record because recovery
+/// correctly ignores incomplete JSON. Moving the shared boundary back to the
+/// last newline lets the monitor replay that record once it is complete.
+fn codex_fork_complete_jsonl_boundary(path: &Path) -> u64 {
+    let Ok(mut file) = fs::File::open(path) else {
+        return 0;
+    };
+    let Ok(file_len) = file.metadata().map(|metadata| metadata.len()) else {
+        return 0;
+    };
+    if file_len == 0 {
+        return 0;
+    }
+
+    // A record is normally tiny, but if its partial prefix exceeds the bounded
+    // read, returning zero is conservative: recovery/monitoring may replay
+    // history, but no event can be skipped.
+    let read_len = file_len.min(MAX_OUTPUT_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(file_len - read_len)).is_err() {
+        return 0;
+    }
+    let mut bytes = Vec::with_capacity(read_len as usize);
+    if file.take(read_len).read_to_end(&mut bytes).is_err() {
+        return 0;
+    }
+    bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| file_len - read_len + index as u64 + 1)
+        .unwrap_or(0)
+}
+
 fn output_tail_byte_limit(lines: usize) -> u64 {
     let requested = (lines as u64).saturating_mul(OUTPUT_TAIL_BYTES_PER_LINE);
     requested.clamp(MIN_OUTPUT_TAIL_BYTES, MAX_OUTPUT_TAIL_BYTES)
@@ -20642,6 +20680,137 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn codex_fork_restart_boundary_replays_a_completed_partial_jsonl_record() {
+        let initial = store_with_provider_child("ctxcodexpartial", "codex-fork", "running");
+        let state_file = initial.state_file.clone();
+        let queue_db = state_file.with_extension("db");
+        let event_stream = state_file.with_extension("events.jsonl");
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue.ensure_schema().unwrap();
+        let store = SessionStore::new_with_queue(state_file, queue_db);
+        let mut state = store.load_raw_json_value().unwrap();
+        let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+        session_object_mut(sessions, "child001").unwrap().insert(
+            "provider_resume_id".to_owned(),
+            Value::String("root-thread".to_owned()),
+        );
+        store.write_raw_json_value(&state).unwrap();
+        store
+            .set_context_monitor(
+                "child001",
+                ContextMonitorRequest {
+                    enabled: true,
+                    requester_session_id: "child001".to_owned(),
+                    notify_session_id: Some("child001".to_owned()),
+                },
+            )
+            .unwrap();
+
+        let complete = r#"{"event_type":"thread/tokenUsage/updated","payload":{"threadId":"root-thread","tokenUsage":{"last":{"totalTokens":20000},"modelContextWindow":258400}}}"#;
+        let later = r#"{"event_type":"thread/tokenUsage/updated","payload":{"threadId":"root-thread","tokenUsage":{"last":{"totalTokens":181000},"modelContextWindow":258400}}}"#;
+        let partial_len = later.len() - 7;
+        fs::write(
+            &event_stream,
+            format!("{complete}\n{}", &later[..partial_len]),
+        )
+        .unwrap();
+
+        let recovery_offset = codex_fork_complete_jsonl_boundary(&event_stream);
+        assert_eq!(recovery_offset, (complete.len() + 1) as u64);
+        store
+            .reconcile_codex_fork_context_at_restart("child001", &event_stream, recovery_offset)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_session("child001")
+                .unwrap()
+                .unwrap()
+                .context_total_input_tokens,
+            Some(20_000)
+        );
+
+        let mut stream = fs::OpenOptions::new()
+            .append(true)
+            .open(&event_stream)
+            .unwrap();
+        stream.write_all(later[partial_len..].as_bytes()).unwrap();
+        stream.write_all(b"\n").unwrap();
+        let resumed = fs::read_to_string(&event_stream).unwrap();
+        for line in resumed[recovery_offset as usize..].lines() {
+            store.apply_codex_fork_event_line("child001", line).unwrap();
+        }
+
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert_eq!(session.context_total_input_tokens, Some(181_000));
+        assert!(session.context_critical_sent);
+        assert_eq!(
+            queue
+                .pending_messages_for_target("child001", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn disabling_codex_monitor_cancels_its_queued_context_alerts() {
+        let initial = store_with_provider_child("ctxcodexdisable", "codex-fork", "running");
+        let state_file = initial.state_file.clone();
+        let queue_db = state_file.with_extension("db");
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue.ensure_schema().unwrap();
+        let store = SessionStore::new_with_queue(state_file, queue_db);
+        store
+            .set_context_monitor(
+                "child001",
+                ContextMonitorRequest {
+                    enabled: true,
+                    requester_session_id: "child001".to_owned(),
+                    notify_session_id: Some("child001".to_owned()),
+                },
+            )
+            .unwrap();
+        store
+            .apply_codex_fork_event_line(
+                "child001",
+                r#"{"event_type":"thread/tokenUsage/updated","payload":{"tokenUsage":{"last":{"totalTokens":181000},"modelContextWindow":258400}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            queue
+                .pending_messages_for_target("child001", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert!(matches!(
+            store
+                .set_context_monitor(
+                    "child001",
+                    ContextMonitorRequest {
+                        enabled: false,
+                        requester_session_id: "child001".to_owned(),
+                        notify_session_id: None,
+                    },
+                )
+                .unwrap(),
+            ContextMonitorOutcome::Updated(ContextMonitorResult { enabled: false, .. })
+        ));
+        assert!(
+            !store
+                .get_session("child001")
+                .unwrap()
+                .unwrap()
+                .context_monitor_enabled
+        );
+        assert!(queue
+            .pending_messages_for_target("child001", 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
