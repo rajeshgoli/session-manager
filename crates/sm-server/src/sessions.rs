@@ -54,6 +54,12 @@ const CODEX_CLI_DEFERRED_BIND_TIMEOUT: Duration = Duration::from_secs(30);
 const CODEX_CLI_SESSION_BIND_POLL: Duration = Duration::from_millis(50);
 const CODEX_FORK_THREAD_STARTED_TIMEOUT: Duration = Duration::from_secs(10);
 const CODEX_FORK_EVENT_MONITOR_POLL: Duration = Duration::from_millis(250);
+// Recovery must inspect a bounded tail before it starts at EOF: a native
+// compaction while the service was down otherwise leaves an obsolete alert
+// pending forever. Event streams are line-oriented; this covers the recent
+// activity needed to establish the current root-thread occupancy without
+// replaying unbounded history during startup.
+const CODEX_FORK_CONTEXT_RECOVERY_TAIL_LINES: usize = 256;
 const CODEX_FORK_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const CODEX_FORK_CONTROL_RECOVERY_TIMEOUT: Duration = Duration::from_secs(1);
 const CODEX_FORK_CONTROL_RECOVERY_POLL: Duration = Duration::from_millis(50);
@@ -282,7 +288,7 @@ impl SessionStore {
     pub fn new_with_queue(state_file: PathBuf, queue_db_path: PathBuf) -> Self {
         let mut store = Self::new(state_file);
         store.queue_store = Some(RetainedQueueStore::new(queue_db_path));
-        let _ = store.cancel_informational_context_alerts();
+        let _ = store.cancel_unsupported_context_alerts();
         store
     }
 
@@ -807,12 +813,12 @@ impl SessionStore {
         Ok(())
     }
 
-    fn cancel_informational_context_alerts(&self) -> Result<()> {
+    fn cancel_unsupported_context_alerts(&self) -> Result<()> {
         for session in self
             .load_snapshot()?
             .into_sessions()
             .into_iter()
-            .filter(|session| provider_manages_context_inline(&session.provider))
+            .filter(|session| !provider_has_measured_context_gauge(&session.provider))
         {
             self.cancel_context_monitor_alerts(&session.id)?;
         }
@@ -1943,7 +1949,7 @@ impl SessionStore {
             .into_iter()
             .filter(|session| {
                 session.context_monitor_enabled
-                    && !provider_manages_context_inline(&session.provider)
+                    && provider_has_measured_context_gauge(&session.provider)
             })
             .map(|session| {
                 let friendly_name = session.cached_display_name();
@@ -5679,6 +5685,22 @@ impl SessionStore {
         if requester_session_id.is_empty() {
             return Ok(ContextMonitorOutcome::Unauthorized);
         }
+        let Some(session) = session_object(sessions, session_id) else {
+            return Ok(ContextMonitorOutcome::NotFound);
+        };
+        let is_self = requester_session_id == session_id;
+        let is_parent =
+            json_text(session.get("parent_session_id")).as_deref() == Some(requester_session_id);
+        if !is_self && !is_parent {
+            return Ok(ContextMonitorOutcome::Unauthorized);
+        }
+        let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
+        if request.enabled && raw_session_is_stopped(session) {
+            return Ok(ContextMonitorOutcome::NotRunning);
+        }
+        if request.enabled && !provider_has_measured_context_gauge(&provider) {
+            return Ok(ContextMonitorOutcome::UnsupportedProvider(provider));
+        }
         let notify_session_id = request
             .notify_session_id
             .as_deref()
@@ -5699,18 +5721,7 @@ impl SessionStore {
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(ContextMonitorOutcome::NotFound);
         };
-        let is_self = requester_session_id == session_id;
-        let is_parent =
-            json_text(session.get("parent_session_id")).as_deref() == Some(requester_session_id);
-        if !is_self && !is_parent {
-            return Ok(ContextMonitorOutcome::Unauthorized);
-        }
-        let informational_only = provider_manages_context_inline(
-            json_text(session.get("provider"))
-                .as_deref()
-                .unwrap_or("claude"),
-        );
-        let effective_enabled = request.enabled && !informational_only;
+        let effective_enabled = request.enabled;
         session.insert(
             "context_monitor_enabled".to_owned(),
             Value::Bool(effective_enabled),
@@ -5739,6 +5750,11 @@ impl SessionStore {
             // already high when it registered.
             reset_context_oneshot_flags(session);
         } else {
+            // Disabling is an explicit end to this alert cycle. A retained
+            // context_monitor message describes state the operator has
+            // deliberately stopped monitoring, so it must not surface on a
+            // later queue drain.
+            self.cancel_context_monitor_alerts(session_id)?;
             session.insert("context_monitor_notify".to_owned(), Value::Null);
             session.insert(
                 "context_monitor_notify_source".to_owned(),
@@ -5749,9 +5765,6 @@ impl SessionStore {
             }
         }
         self.write_raw_json_value(&state)?;
-        if informational_only {
-            self.cancel_context_monitor_alerts(session_id)?;
-        }
         Ok(ContextMonitorOutcome::Updated(ContextMonitorResult {
             status: "ok".to_owned(),
             enabled: effective_enabled,
@@ -5819,7 +5832,7 @@ impl SessionStore {
         emitted_at: Option<&str>,
         runtime: Option<&TmuxRuntime>,
     ) -> Result<ContextUsageOutcome> {
-        let (notify_target, notify_source, label, informational_only) = {
+        let (notify_target, notify_source, label, unsupported_provider) = {
             let sessions = ensure_sessions_array_mut(state)?;
             let Some(session) = session_object_mut(sessions, session_id) else {
                 return Ok(ContextUsageOutcome::UnknownSession);
@@ -5831,12 +5844,12 @@ impl SessionStore {
             reset_context_oneshot_flags(session);
             set_context_cycle_boundary(session, emitted_at);
             session.insert("context_compaction_active".to_owned(), Value::Bool(true));
-            let informational_only = provider_manages_context_inline(
+            let unsupported_provider = !provider_has_measured_context_gauge(
                 json_text(session.get("provider"))
                     .as_deref()
                     .unwrap_or("claude"),
             );
-            let (notify_target, notify_source) = if informational_only {
+            let (notify_target, notify_source) = if unsupported_provider {
                 session.insert("context_monitor_enabled".to_owned(), Value::Bool(false));
                 session.insert("context_monitor_notify".to_owned(), Value::Null);
                 session.insert(
@@ -5864,7 +5877,7 @@ impl SessionStore {
                 notify_target,
                 notify_source,
                 raw_session_label(session, session_id),
-                informational_only,
+                unsupported_provider,
             )
         };
 
@@ -5900,7 +5913,7 @@ impl SessionStore {
             }
         }
 
-        if informational_only {
+        if unsupported_provider {
             self.cancel_context_monitor_alerts(session_id)?;
         }
         self.write_raw_json_value(state)?;
@@ -5940,8 +5953,8 @@ impl SessionStore {
         runtime: Option<&TmuxRuntime>,
     ) -> Result<ContextUsageOutcome> {
         let session_snapshot = raw_session_object(state, session_id);
-        let informational_only = session_snapshot.is_some_and(|session| {
-            provider_manages_context_inline(
+        let unsupported_provider = session_snapshot.is_some_and(|session| {
+            !provider_has_measured_context_gauge(
                 json_text(session.get("provider"))
                     .as_deref()
                     .unwrap_or("claude"),
@@ -5951,7 +5964,7 @@ impl SessionStore {
             .and_then(|session| session.get("context_monitor_enabled"))
             .and_then(Value::as_bool)
             .unwrap_or(false)
-            && !informational_only;
+            && !unsupported_provider;
         // A sample emitted before the current cycle began describes context that
         // no longer exists. Both stamps come from the session's own host, so this
         // never compares clocks across machines. Samples from a hook too old to
@@ -6018,7 +6031,7 @@ impl SessionStore {
                 session.insert("context_sampled_at".to_owned(), Value::String(sampled_at));
                 session.insert("context_compaction_active".to_owned(), Value::Bool(false));
             }
-            if informational_only {
+            if unsupported_provider {
                 let had_alert_state = flag_is_set(session, "context_monitor_enabled")
                     || json_text(session.get("context_monitor_notify")).is_some()
                     || flag_is_set(session, "context_warning_sent")
@@ -6084,13 +6097,20 @@ impl SessionStore {
         let is_self_alert = notify_target == session_id;
         let label = raw_session_label(session, session_id);
         let rounded = format_percentage(used_percentage);
+        let native_codex_compaction = json_text(session.get("provider"))
+            .is_some_and(|provider| provider_uses_native_context_compaction(&provider));
 
         if used_percentage >= self.context_monitor.critical_percentage {
             if flag_is_set(session, "context_critical_sent") {
                 return None;
             }
             session.insert("context_critical_sent".to_owned(), Value::Bool(true));
-            let text = if is_self_alert {
+            let text = if is_self_alert && native_codex_compaction {
+                format!(
+                    "[sm context] Context at {rounded}% — critically high. \
+                     Codex will compact inline; continue the current task and do not run `sm handoff`."
+                )
+            } else if is_self_alert {
                 format!(
                     "[sm context] Context at {rounded}% — critically high. \
                      Write your handoff doc NOW and run `sm handoff <path>`. \
@@ -6114,7 +6134,13 @@ impl SessionStore {
                 return None;
             }
             session.insert("context_warning_sent".to_owned(), Value::Bool(true));
-            let text = if is_self_alert {
+            let text = if is_self_alert && native_codex_compaction {
+                format!(
+                    "[sm context] Context at {rounded}% ({} tokens). \
+                     Codex will compact inline; continue the current task and do not run `sm handoff`.",
+                    format_thousands(tokens_used)
+                )
+            } else if is_self_alert {
                 format!(
                     "[sm context] Context at {rounded}% ({} tokens). \
                      Consider writing a handoff doc and running `sm handoff <path>`.",
@@ -6840,12 +6866,136 @@ impl SessionStore {
             .collect::<Vec<_>>();
 
         for (session_id, event_stream_path) in &monitors {
-            self.start_codex_fork_event_monitor_from_current_end(
+            // Use one boundary for both the bounded recovery read and the
+            // monitor. Events appended after it are consumed by the monitor;
+            // none can fall into a restart-time gap.
+            let recovery_offset = codex_fork_complete_jsonl_boundary(event_stream_path);
+            self.reconcile_codex_fork_context_at_restart(
+                session_id,
+                event_stream_path,
+                recovery_offset,
+            )?;
+            self.start_codex_fork_event_monitor_at_offset(
                 session_id.clone(),
                 event_stream_path.clone(),
+                recovery_offset,
             )?;
         }
         Ok(monitors.len())
+    }
+
+    /// Bring a persisted Codex context snapshot in line with the latest
+    /// root-thread gauge before monitoring resumes at EOF. If the bounded tail
+    /// cannot establish a current gauge, discard any pending alert and expose
+    /// unknown occupancy rather than delivering an alert for context Codex may
+    /// have compacted while the service was down.
+    fn reconcile_codex_fork_context_at_restart(
+        &self,
+        session_id: &str,
+        event_stream_path: &Path,
+        recovery_offset: u64,
+    ) -> Result<()> {
+        let root_thread_id = self
+            .get_session(session_id)?
+            .and_then(|session| session.provider_resume_id);
+        let usage = latest_codex_fork_context_usage_from_tail(
+            event_stream_path,
+            root_thread_id.as_deref(),
+            recovery_offset,
+        );
+
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(session) = session_object_mut(sessions, session_id) else {
+            return Ok(());
+        };
+        if json_text(session.get("provider")).as_deref() != Some("codex-fork") {
+            return Ok(());
+        }
+
+        let previous_tokens = session
+            .get("context_total_input_tokens")
+            .and_then(Value::as_i64);
+        let compaction_or_unknown = usage.as_ref().is_none_or(|usage| {
+            previous_tokens.is_some_and(|previous_tokens| usage.tokens_used < previous_tokens)
+        });
+        if compaction_or_unknown {
+            self.cancel_context_monitor_alerts(session_id)?;
+            reset_context_oneshot_flags(session);
+        }
+
+        let mut changed = match usage.as_ref() {
+            Some(usage) => {
+                let snapshot_changed = previous_tokens != Some(usage.tokens_used)
+                    || session
+                        .get("context_used_percentage")
+                        .and_then(Value::as_f64)
+                        != Some(usage.used_percentage)
+                    || json_text(session.get("context_sampled_at")).is_none();
+                if snapshot_changed {
+                    session.insert("tokens_used".to_owned(), json!(usage.tokens_used));
+                    session.insert(
+                        "context_used_percentage".to_owned(),
+                        json!(usage.used_percentage),
+                    );
+                    session.insert(
+                        "context_total_input_tokens".to_owned(),
+                        json!(usage.tokens_used),
+                    );
+                    session.insert(
+                        "context_sampled_at".to_owned(),
+                        Value::String(now_rfc3339()),
+                    );
+                }
+                snapshot_changed
+            }
+            None => {
+                let had_snapshot = session
+                    .get("context_used_percentage")
+                    .is_some_and(|value| !value.is_null())
+                    || session
+                        .get("context_total_input_tokens")
+                        .is_some_and(|value| !value.is_null())
+                    || session
+                        .get("context_sampled_at")
+                        .is_some_and(|value| !value.is_null());
+                if had_snapshot {
+                    session.insert("context_used_percentage".to_owned(), Value::Null);
+                    session.insert("context_total_input_tokens".to_owned(), Value::Null);
+                    session.insert("context_sampled_at".to_owned(), Value::Null);
+                }
+                had_snapshot
+            }
+        };
+        let context_alert = if flag_is_set(session, "context_monitor_enabled") {
+            usage.as_ref().and_then(|usage| {
+                self.latch_context_alert(
+                    session,
+                    session_id,
+                    usage.used_percentage,
+                    usage.tokens_used,
+                )
+            })
+        } else {
+            None
+        };
+        if let Some(alert) = context_alert {
+            let runtime = self.delivery_runtime.clone();
+            self.queue_context_monitor_message(
+                &mut state,
+                session_id,
+                &alert.notify_target,
+                &alert.text,
+                alert.delivery_mode,
+                runtime.as_ref(),
+            )?;
+            changed = true;
+        }
+        if changed || compaction_or_unknown {
+            self.write_raw_json_value(&state)?;
+        }
+        Ok(())
     }
 
     fn start_codex_fork_handoff_monitor(
@@ -8159,62 +8309,73 @@ impl SessionStore {
         // `/hooks/context-usage` usage update. The snapshot is always cached;
         // provider capability and registration only control warning/critical alerts.
         let mut context_alert = None;
-        if let Some(usage) = codex_fork_context_usage(event) {
-            let previous_used = session.get("tokens_used").and_then(Value::as_i64);
-            let previous_pct = session
-                .get("context_used_percentage")
-                .and_then(Value::as_f64);
-            let previous_context_tokens = session
-                .get("context_total_input_tokens")
-                .and_then(Value::as_i64);
-            let snapshot_changed = previous_used != Some(usage.tokens_used)
-                || previous_pct != Some(usage.used_percentage)
-                || previous_context_tokens != Some(usage.tokens_used)
-                || json_text(session.get("context_sampled_at")).is_none();
-            if snapshot_changed {
-                session.insert("tokens_used".to_owned(), json!(usage.tokens_used));
-                session.insert(
-                    "context_used_percentage".to_owned(),
-                    json!(usage.used_percentage),
-                );
-                session.insert(
-                    "context_total_input_tokens".to_owned(),
-                    json!(usage.tokens_used),
-                );
-                session.insert(
-                    "context_sampled_at".to_owned(),
-                    Value::String(now_rfc3339()),
-                );
-                changed = true;
-            }
-            let informational_only = provider_manages_context_inline(
-                json_text(session.get("provider"))
-                    .as_deref()
-                    .unwrap_or("claude"),
-            );
-            if informational_only {
-                let had_alert_state = flag_is_set(session, "context_monitor_enabled")
-                    || json_text(session.get("context_monitor_notify")).is_some()
-                    || flag_is_set(session, "context_warning_sent")
-                    || flag_is_set(session, "context_critical_sent");
-                if had_alert_state {
-                    session.insert("context_monitor_enabled".to_owned(), Value::Bool(false));
-                    session.insert("context_monitor_notify".to_owned(), Value::Null);
-                    session.insert(
-                        "context_monitor_notify_source".to_owned(),
-                        Value::String(default_context_monitor_notify_source()),
-                    );
+        if codex_fork_event_matches_root_thread(event, root_provider_resume_id.as_deref()) {
+            if let Some(usage) = codex_fork_context_usage(event) {
+                let previous_used = session.get("tokens_used").and_then(Value::as_i64);
+                let previous_pct = session
+                    .get("context_used_percentage")
+                    .and_then(Value::as_f64);
+                let previous_context_tokens = session
+                    .get("context_total_input_tokens")
+                    .and_then(Value::as_i64);
+                // Codex has no Claude-style PreCompact hook. Its measured resident
+                // input drops when native compaction replaces the active window,
+                // which begins the next durable alert cycle.
+                if previous_context_tokens
+                    .is_some_and(|previous_tokens| usage.tokens_used < previous_tokens)
+                {
                     reset_context_oneshot_flags(session);
                     self.cancel_context_monitor_alerts(session_id)?;
+                }
+                let snapshot_changed = previous_used != Some(usage.tokens_used)
+                    || previous_pct != Some(usage.used_percentage)
+                    || previous_context_tokens != Some(usage.tokens_used)
+                    || json_text(session.get("context_sampled_at")).is_none();
+                if snapshot_changed {
+                    session.insert("tokens_used".to_owned(), json!(usage.tokens_used));
+                    session.insert(
+                        "context_used_percentage".to_owned(),
+                        json!(usage.used_percentage),
+                    );
+                    session.insert(
+                        "context_total_input_tokens".to_owned(),
+                        json!(usage.tokens_used),
+                    );
+                    session.insert(
+                        "context_sampled_at".to_owned(),
+                        Value::String(now_rfc3339()),
+                    );
                     changed = true;
                 }
-            } else if flag_is_set(session, "context_monitor_enabled") {
-                context_alert = self.latch_context_alert(
-                    session,
-                    session_id,
-                    usage.used_percentage,
-                    usage.tokens_used,
+                let unsupported_provider = !provider_has_measured_context_gauge(
+                    json_text(session.get("provider"))
+                        .as_deref()
+                        .unwrap_or("claude"),
                 );
+                if unsupported_provider {
+                    let had_alert_state = flag_is_set(session, "context_monitor_enabled")
+                        || json_text(session.get("context_monitor_notify")).is_some()
+                        || flag_is_set(session, "context_warning_sent")
+                        || flag_is_set(session, "context_critical_sent");
+                    if had_alert_state {
+                        session.insert("context_monitor_enabled".to_owned(), Value::Bool(false));
+                        session.insert("context_monitor_notify".to_owned(), Value::Null);
+                        session.insert(
+                            "context_monitor_notify_source".to_owned(),
+                            Value::String(default_context_monitor_notify_source()),
+                        );
+                        reset_context_oneshot_flags(session);
+                        self.cancel_context_monitor_alerts(session_id)?;
+                        changed = true;
+                    }
+                } else if flag_is_set(session, "context_monitor_enabled") {
+                    context_alert = self.latch_context_alert(
+                        session,
+                        session_id,
+                        usage.used_percentage,
+                        usage.tokens_used,
+                    );
+                }
             }
         }
 
@@ -8760,6 +8921,31 @@ fn codex_fork_context_usage(event: &Map<String, Value>) -> Option<CodexContextUs
     Some(CodexContextUsage {
         tokens_used,
         used_percentage: (tokens_used as f64 / context_window as f64) * 100.0,
+    })
+}
+
+/// Return the newest complete root-thread context gauge from a bounded event
+/// stream tail. The first tail line may be partial, so malformed lines are
+/// ignored rather than making restart recovery fail.
+fn latest_codex_fork_context_usage_from_tail(
+    event_stream_path: &Path,
+    root_thread_id: Option<&str>,
+    recovery_offset: u64,
+) -> Option<CodexContextUsage> {
+    read_tail_lines_at_offset(
+        event_stream_path,
+        recovery_offset,
+        CODEX_FORK_CONTEXT_RECOVERY_TAIL_LINES,
+    )
+    .ok()?
+    .lines()
+    .rev()
+    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    .filter_map(|event| event.as_object().cloned())
+    .find_map(|event| {
+        codex_fork_event_matches_root_thread(&event, root_thread_id)
+            .then(|| codex_fork_context_usage(&event))
+            .flatten()
     })
 }
 
@@ -9356,7 +9542,7 @@ impl ContextSnapshotResponse {
         let lifecycle_status = session.lifecycle_status().to_owned();
         let friendly_name = session.cached_display_name();
         let provider = non_empty_or(session.provider, "claude");
-        let informational_only = provider_manages_context_inline(&provider);
+        let unsupported_provider = !provider_has_measured_context_gauge(&provider);
         let state = if compaction_active {
             "compacting"
         } else if let Some(used_percentage) = used_percentage {
@@ -9383,8 +9569,8 @@ impl ContextSnapshotResponse {
             state,
             warning_percentage: config.warning_percentage,
             critical_percentage: config.critical_percentage,
-            context_monitor_enabled: session.context_monitor_enabled && !informational_only,
-            notify_session_id: if informational_only {
+            context_monitor_enabled: session.context_monitor_enabled && !unsupported_provider,
+            notify_session_id: if unsupported_provider {
                 None
             } else {
                 session.context_monitor_notify
@@ -9405,6 +9591,8 @@ pub struct ContextMonitorResult {
 pub enum ContextMonitorOutcome {
     Updated(ContextMonitorResult),
     NotFound,
+    NotRunning,
+    UnsupportedProvider(String),
     MissingNotifyTarget,
     NotifyTargetNotFound(String),
     Unauthorized,
@@ -15434,21 +15622,62 @@ fn tail_lines(content: &str, lines: usize) -> String {
 }
 
 pub(crate) fn read_tail_lines(path: &Path, lines: usize) -> io::Result<String> {
+    let file_len = fs::metadata(path)?.len();
+    read_tail_lines_at_offset(path, file_len, lines)
+}
+
+fn read_tail_lines_at_offset(path: &Path, end_offset: u64, lines: usize) -> io::Result<String> {
     if lines == 0 {
         return Ok(String::new());
     }
 
     let mut file = fs::File::open(path)?;
     let file_len = file.metadata()?.len();
-    if file_len == 0 {
+    let end_offset = end_offset.min(file_len);
+    if end_offset == 0 {
         return Ok(String::new());
     }
 
-    let read_len = file_len.min(output_tail_byte_limit(lines));
-    file.seek(SeekFrom::End(-(read_len as i64)))?;
+    let read_len = end_offset.min(output_tail_byte_limit(lines));
+    file.seek(SeekFrom::Start(end_offset - read_len))?;
     let mut bytes = Vec::with_capacity(read_len as usize);
     file.take(read_len).read_to_end(&mut bytes)?;
     Ok(tail_lines(&String::from_utf8_lossy(&bytes), lines))
+}
+
+/// Capture a restart boundary that ends on a complete JSONL record.
+///
+/// Codex can be appending while the server starts. Starting a live monitor at
+/// raw EOF would skip the suffix of such an in-flight record because recovery
+/// correctly ignores incomplete JSON. Moving the shared boundary back to the
+/// last newline lets the monitor replay that record once it is complete.
+fn codex_fork_complete_jsonl_boundary(path: &Path) -> u64 {
+    let Ok(mut file) = fs::File::open(path) else {
+        return 0;
+    };
+    let Ok(file_len) = file.metadata().map(|metadata| metadata.len()) else {
+        return 0;
+    };
+    if file_len == 0 {
+        return 0;
+    }
+
+    // A record is normally tiny, but if its partial prefix exceeds the bounded
+    // read, returning zero is conservative: recovery/monitoring may replay
+    // history, but no event can be skipped.
+    let read_len = file_len.min(MAX_OUTPUT_TAIL_BYTES);
+    if file.seek(SeekFrom::Start(file_len - read_len)).is_err() {
+        return 0;
+    }
+    let mut bytes = Vec::with_capacity(read_len as usize);
+    if file.take(read_len).read_to_end(&mut bytes).is_err() {
+        return 0;
+    }
+    bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| file_len - read_len + index as u64 + 1)
+        .unwrap_or(0)
 }
 
 fn output_tail_byte_limit(lines: usize) -> u64 {
@@ -15480,7 +15709,17 @@ fn default_context_monitor_notify_source() -> String {
     "explicit".to_owned()
 }
 
-fn provider_manages_context_inline(provider: &str) -> bool {
+/// Return whether the provider emits a measured current-context sample.
+///
+/// Codex-fork's `thread/tokenUsage/updated` event carries both resident input
+/// tokens and `modelContextWindow`; generic Codex transports do not. Native
+/// Codex compaction is deliberately not a reason to enroll an unmeasurable
+/// session, nor does enrollment authorize any rotation.
+fn provider_has_measured_context_gauge(provider: &str) -> bool {
+    matches!(provider.trim(), "claude" | "codex-fork")
+}
+
+fn provider_uses_native_context_compaction(provider: &str) -> bool {
     matches!(provider.trim(), "codex" | "codex-fork" | "codex-app")
 }
 
@@ -19730,6 +19969,17 @@ mod tests {
         SessionStore::new_with_legacy_fallback(state_file.clone(), state_file)
     }
 
+    fn store_with_provider_child(label: &str, provider: &str, status: &str) -> SessionStore {
+        let store = store_with_monitored_child(label, false, None);
+        let mut state = store.load_raw_json_value().unwrap();
+        let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+        let child = session_object_mut(sessions, "child001").unwrap();
+        child.insert("provider".to_owned(), Value::String(provider.to_owned()));
+        child.insert("status".to_owned(), Value::String(status.to_owned()));
+        store.write_raw_json_value(&state).unwrap();
+        store
+    }
+
     fn usage_event(session_id: &str, used_percentage: f64, tokens: i64) -> ContextUsageEvent {
         ContextUsageEvent {
             session_id: session_id.to_owned(),
@@ -20284,63 +20534,337 @@ mod tests {
     }
 
     #[test]
-    fn codex_token_usage_event_populates_tokens_without_alerts() {
-        let state_file = unique_temp_path("ctxcodex");
-        fs::write(
-            &state_file,
-            json!({
-                "sessions": [
-                    {
-                        "id": "parent01",
-                        "name": "claude-parent01",
-                        "working_dir": "/repo",
-                        "tmux_session": "claude-parent01",
-                        "status": "running",
-                        "created_at": "2026-06-01T00:00:00",
-                        "last_activity": "2026-06-01T00:01:00"
-                    },
-                    {
-                        "id": "codex001",
-                        "name": "codex-codex001",
-                        "provider": "codex-fork",
-                        "working_dir": "/repo",
-                        "tmux_session": "codex-codex001",
-                        "parent_session_id": "parent01",
-                        "status": "running",
-                        "created_at": "2026-06-01T00:00:00",
-                        "last_activity": "2026-06-01T00:01:00",
-                        "context_monitor_enabled": true,
-                        "context_monitor_notify": "parent01"
-                    }
-                ]
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let store = SessionStore::new_with_legacy_fallback(state_file.clone(), state_file);
+    fn codex_fork_monitor_enrolls_persists_across_restart_and_notifies_without_rotation() {
+        let store = store_with_provider_child("ctxcodex", "codex-fork", "running");
+        let request = ContextMonitorRequest {
+            enabled: true,
+            requester_session_id: "parent01".to_owned(),
+            notify_session_id: Some("parent01".to_owned()),
+        };
+        assert!(matches!(
+            store
+                .set_context_monitor("child001", request.clone())
+                .unwrap(),
+            ContextMonitorOutcome::Updated(ContextMonitorResult { enabled: true, .. })
+        ));
+        // Repeating enable is idempotent from the operator's perspective: one
+        // durable status row, with a freshly armed alert cycle.
+        assert!(matches!(
+            store.set_context_monitor("child001", request).unwrap(),
+            ContextMonitorOutcome::Updated(ContextMonitorResult { enabled: true, .. })
+        ));
+        assert_eq!(store.list_context_monitors().unwrap().len(), 1);
+
+        let restarted = SessionStore::new_with_legacy_fallback(
+            store.state_file.clone(),
+            store.state_file.clone(),
+        );
+        assert_eq!(restarted.list_context_monitors().unwrap().len(), 1);
 
         let line = r#"{"event_type":"thread/tokenUsage/updated","payload":{"tokenUsage":{
             "total":{"totalTokens":900000},
             "last":{"totalTokens":181000},
             "modelContextWindow":258400}}}"#;
-        store.apply_codex_fork_event_line("codex001", line).unwrap();
+        restarted
+            .apply_codex_fork_event_line("child001", line)
+            .unwrap();
 
-        let session = store.get_session("codex001").unwrap().unwrap();
+        let session = restarted.get_session("child001").unwrap().unwrap();
         assert_eq!(session.tokens_used, 181_000);
         assert_eq!(session.context_total_input_tokens, Some(181_000));
         assert!((session.context_used_percentage.unwrap() - 70.046_439_628_482_98).abs() < 1e-9);
         assert!(session.context_sampled_at.is_some());
-        // Codex compacts inline, so even a stale enabled registration is FYI-only.
-        assert!(!session.context_critical_sent);
-        assert!(!session.context_monitor_enabled);
-        assert!(session.context_monitor_notify.is_none());
-        assert!(context_monitor_messages(&store).is_empty());
-        let snapshot = store.get_context_snapshot("codex001").unwrap().unwrap();
-        assert!(!snapshot.context_monitor_enabled);
-        assert!(snapshot.notify_session_id.is_none());
+        assert!(session.context_critical_sent);
+        assert!(session.context_monitor_enabled);
+        assert_eq!(session.context_monitor_notify.as_deref(), Some("parent01"));
+        assert_eq!(session.status, "running");
+        assert_eq!(context_monitor_messages(&restarted).len(), 1);
+        let snapshot = restarted.get_context_snapshot("child001").unwrap().unwrap();
+        assert!(snapshot.context_monitor_enabled);
+        assert_eq!(snapshot.notify_session_id.as_deref(), Some("parent01"));
 
-        store.apply_codex_fork_event_line("codex001", line).unwrap();
+        restarted
+            .apply_codex_fork_event_line("child001", line)
+            .unwrap();
+        assert_eq!(context_monitor_messages(&restarted).len(), 1);
+    }
+
+    #[test]
+    fn codex_fork_monitor_uses_only_root_usage_and_rearms_after_native_compaction() {
+        let initial = store_with_provider_child("ctxcodexcycles", "codex-fork", "running");
+        let state_file = initial.state_file.clone();
+        let queue_db = state_file.with_extension("db");
+        let event_stream = state_file.with_extension("events.jsonl");
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue.ensure_schema().unwrap();
+        let store = SessionStore::new_with_queue(state_file, queue_db);
+        let mut state = store.load_raw_json_value().unwrap();
+        let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+        session_object_mut(sessions, "child001").unwrap().insert(
+            "provider_resume_id".to_owned(),
+            Value::String("root-thread".to_owned()),
+        );
+        store.write_raw_json_value(&state).unwrap();
+        store
+            .set_context_monitor(
+                "child001",
+                ContextMonitorRequest {
+                    enabled: true,
+                    requester_session_id: "child001".to_owned(),
+                    notify_session_id: Some("child001".to_owned()),
+                },
+            )
+            .unwrap();
+
+        let usage_event = |thread_id: &str, tokens: i64| {
+            format!(
+                r#"{{"event_type":"thread/tokenUsage/updated","payload":{{"threadId":"{thread_id}","tokenUsage":{{"last":{{"totalTokens":{tokens}}},"modelContextWindow":258400}}}}}}"#
+            )
+        };
+        // Descendant activity belongs in the attribution ledger, not the
+        // managed root's occupancy or alert cycle.
+        store
+            .apply_codex_fork_event_line("child001", &usage_event("descendant", 181_000))
+            .unwrap();
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert_eq!(session.tokens_used, 0);
+        assert!(!session.context_critical_sent);
         assert!(context_monitor_messages(&store).is_empty());
+
+        store
+            .apply_codex_fork_event_line("child001", &usage_event("root-thread", 181_000))
+            .unwrap();
+        let first_alert = context_monitor_messages(&store).pop().unwrap();
+        let first_text = first_alert["text"].as_str().unwrap();
+        assert!(first_text.contains("Codex will compact inline"));
+        assert!(!first_text.contains("run `sm handoff <path>`"));
+        assert_eq!(
+            queue
+                .pending_messages_for_target("child001", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // A lower resident-token count is Codex's observed native-compaction
+        // boundary. Recovery begins at EOF, so it must reconcile that current
+        // gauge before retaining the pre-restart high-context alert.
+        fs::write(
+            &event_stream,
+            format!("{}\n", usage_event("root-thread", 20_000)),
+        )
+        .unwrap();
+        let recovery_offset = fs::metadata(&event_stream).unwrap().len();
+        store
+            .reconcile_codex_fork_context_at_restart("child001", &event_stream, recovery_offset)
+            .unwrap();
+        let compacted = store.get_session("child001").unwrap().unwrap();
+        assert!(!compacted.context_warning_sent);
+        assert!(!compacted.context_critical_sent);
+        assert_eq!(compacted.context_total_input_tokens, Some(20_000));
+        assert!(queue
+            .pending_messages_for_target("child001", 10)
+            .unwrap()
+            .is_empty());
+        let recovered_high = usage_event("root-thread", 181_000);
+        fs::write(&event_stream, format!("{recovered_high}\n")).unwrap();
+        let recovery_offset = fs::metadata(&event_stream).unwrap().len();
+        store
+            .reconcile_codex_fork_context_at_restart("child001", &event_stream, recovery_offset)
+            .unwrap();
+        assert_eq!(context_monitor_messages(&store).len(), 2);
+        assert_eq!(
+            queue
+                .pending_messages_for_target("child001", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn codex_fork_restart_boundary_replays_a_completed_partial_jsonl_record() {
+        let initial = store_with_provider_child("ctxcodexpartial", "codex-fork", "running");
+        let state_file = initial.state_file.clone();
+        let queue_db = state_file.with_extension("db");
+        let event_stream = state_file.with_extension("events.jsonl");
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue.ensure_schema().unwrap();
+        let store = SessionStore::new_with_queue(state_file, queue_db);
+        let mut state = store.load_raw_json_value().unwrap();
+        let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+        session_object_mut(sessions, "child001").unwrap().insert(
+            "provider_resume_id".to_owned(),
+            Value::String("root-thread".to_owned()),
+        );
+        store.write_raw_json_value(&state).unwrap();
+        store
+            .set_context_monitor(
+                "child001",
+                ContextMonitorRequest {
+                    enabled: true,
+                    requester_session_id: "child001".to_owned(),
+                    notify_session_id: Some("child001".to_owned()),
+                },
+            )
+            .unwrap();
+
+        let complete = r#"{"event_type":"thread/tokenUsage/updated","payload":{"threadId":"root-thread","tokenUsage":{"last":{"totalTokens":20000},"modelContextWindow":258400}}}"#;
+        let later = r#"{"event_type":"thread/tokenUsage/updated","payload":{"threadId":"root-thread","tokenUsage":{"last":{"totalTokens":181000},"modelContextWindow":258400}}}"#;
+        let partial_len = later.len() - 7;
+        fs::write(
+            &event_stream,
+            format!("{complete}\n{}", &later[..partial_len]),
+        )
+        .unwrap();
+
+        let recovery_offset = codex_fork_complete_jsonl_boundary(&event_stream);
+        assert_eq!(recovery_offset, (complete.len() + 1) as u64);
+        store
+            .reconcile_codex_fork_context_at_restart("child001", &event_stream, recovery_offset)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_session("child001")
+                .unwrap()
+                .unwrap()
+                .context_total_input_tokens,
+            Some(20_000)
+        );
+
+        let mut stream = fs::OpenOptions::new()
+            .append(true)
+            .open(&event_stream)
+            .unwrap();
+        stream.write_all(later[partial_len..].as_bytes()).unwrap();
+        stream.write_all(b"\n").unwrap();
+        let resumed = fs::read_to_string(&event_stream).unwrap();
+        for line in resumed[recovery_offset as usize..].lines() {
+            store.apply_codex_fork_event_line("child001", line).unwrap();
+        }
+
+        let session = store.get_session("child001").unwrap().unwrap();
+        assert_eq!(session.context_total_input_tokens, Some(181_000));
+        assert!(session.context_critical_sent);
+        assert_eq!(
+            queue
+                .pending_messages_for_target("child001", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn disabling_codex_monitor_cancels_its_queued_context_alerts() {
+        let initial = store_with_provider_child("ctxcodexdisable", "codex-fork", "running");
+        let state_file = initial.state_file.clone();
+        let queue_db = state_file.with_extension("db");
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        queue.ensure_schema().unwrap();
+        let store = SessionStore::new_with_queue(state_file, queue_db);
+        store
+            .set_context_monitor(
+                "child001",
+                ContextMonitorRequest {
+                    enabled: true,
+                    requester_session_id: "child001".to_owned(),
+                    notify_session_id: Some("child001".to_owned()),
+                },
+            )
+            .unwrap();
+        store
+            .apply_codex_fork_event_line(
+                "child001",
+                r#"{"event_type":"thread/tokenUsage/updated","payload":{"tokenUsage":{"last":{"totalTokens":181000},"modelContextWindow":258400}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            queue
+                .pending_messages_for_target("child001", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert!(matches!(
+            store
+                .set_context_monitor(
+                    "child001",
+                    ContextMonitorRequest {
+                        enabled: false,
+                        requester_session_id: "child001".to_owned(),
+                        notify_session_id: None,
+                    },
+                )
+                .unwrap(),
+            ContextMonitorOutcome::Updated(ContextMonitorResult { enabled: false, .. })
+        ));
+        assert!(
+            !store
+                .get_session("child001")
+                .unwrap()
+                .unwrap()
+                .context_monitor_enabled
+        );
+        assert!(queue
+            .pending_messages_for_target("child001", 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn context_monitor_enable_fails_closed_without_a_gauge_or_live_session() {
+        for provider in ["codex", "codex-app"] {
+            let codex = store_with_provider_child("ctxcodexnogauge", provider, "running");
+            let unsupported_before = codex.load_raw_json_value().unwrap();
+            assert!(matches!(
+                codex
+                    .set_context_monitor(
+                        "child001",
+                        ContextMonitorRequest {
+                            enabled: true,
+                            requester_session_id: "parent01".to_owned(),
+                            notify_session_id: Some("parent01".to_owned()),
+                        },
+                    )
+                    .unwrap(),
+                ContextMonitorOutcome::UnsupportedProvider(reported) if reported == provider
+            ));
+            assert_eq!(codex.load_raw_json_value().unwrap(), unsupported_before);
+            assert!(codex.list_context_monitors().unwrap().is_empty());
+        }
+
+        let stopped = store_with_provider_child("ctxstopped", "claude", "stopped");
+        let stopped_before = stopped.load_raw_json_value().unwrap();
+        assert!(matches!(
+            stopped
+                .set_context_monitor(
+                    "child001",
+                    ContextMonitorRequest {
+                        enabled: true,
+                        requester_session_id: "parent01".to_owned(),
+                        notify_session_id: Some("parent01".to_owned()),
+                    },
+                )
+                .unwrap(),
+            ContextMonitorOutcome::NotRunning
+        ));
+        assert_eq!(stopped.load_raw_json_value().unwrap(), stopped_before);
+
+        assert!(matches!(
+            stopped
+                .set_context_monitor(
+                    "missing01",
+                    ContextMonitorRequest {
+                        enabled: true,
+                        requester_session_id: "parent01".to_owned(),
+                        notify_session_id: Some("parent01".to_owned()),
+                    },
+                )
+                .unwrap(),
+            ContextMonitorOutcome::NotFound
+        ));
     }
 
     #[test]
@@ -20642,11 +21166,12 @@ mod tests {
     }
 
     #[test]
-    fn every_codex_provider_manages_context_inline() {
-        assert!(provider_manages_context_inline("codex"));
-        assert!(provider_manages_context_inline("codex-fork"));
-        assert!(provider_manages_context_inline("codex-app"));
-        assert!(!provider_manages_context_inline("claude"));
+    fn measured_context_gauge_capability_is_explicit_per_provider() {
+        assert!(provider_has_measured_context_gauge("claude"));
+        assert!(provider_has_measured_context_gauge("codex-fork"));
+        assert!(!provider_has_measured_context_gauge("codex"));
+        assert!(!provider_has_measured_context_gauge("codex-app"));
+        assert!(!provider_has_measured_context_gauge("unknown"));
     }
 
     #[test]

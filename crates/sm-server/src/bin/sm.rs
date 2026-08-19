@@ -16,8 +16,6 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8420";
 const CONTEXT_COMPACT_STALE_SECONDS: i64 = 10 * 60;
-const CODEX_CONTEXT_MONITOR_FYI: &str =
-    "Context monitoring is FYI only for Codex agents; they manage compaction inline.";
 const CLIENT_CONFIG_ENV: &str = "SM_CLIENT_CONFIG";
 const CLIENT_CONFIG_SUBPATH: &str = "session-manager/client.yaml";
 const WATCH_PYTHON_ENV: &str = "SM_WATCH_PYTHON";
@@ -4029,10 +4027,7 @@ fn run_context_monitor(client: &ApiClient, args: ContextMonitorArgs) -> Result<(
                     "notify_session_id": requester
                 }),
             )?;
-            if context_monitor_is_informational(&response) {
-                println!("{CODEX_CONTEXT_MONITOR_FYI}");
-                return Ok(());
-            }
+            ensure_context_monitor_enabled(&response)?;
             if target == requester {
                 println!("Context monitoring enabled - notifications -> self ({requester})");
             } else {
@@ -4056,8 +4051,14 @@ fn run_context_monitor(client: &ApiClient, args: ContextMonitorArgs) -> Result<(
     Ok(())
 }
 
-fn context_monitor_is_informational(response: &Value) -> bool {
-    response["enabled"].as_bool() == Some(false)
+fn ensure_context_monitor_enabled(response: &Value) -> Result<()> {
+    if response["enabled"].as_bool() == Some(true) {
+        return Ok(());
+    }
+    bail!(
+        "Context monitoring was not enrolled: server returned enabled={:?}. Run `sm context-monitor status` to verify coverage.",
+        response["enabled"]
+    );
 }
 
 fn lookup_identifier(client: &ApiClient, identifier: &str) -> Result<Option<String>> {
@@ -7153,17 +7154,32 @@ mod tests {
     }
 
     #[test]
-    fn context_monitor_false_response_uses_codex_fyi_contract() {
-        assert!(context_monitor_is_informational(
-            &json!({"status": "ok", "enabled": false})
-        ));
-        assert!(!context_monitor_is_informational(
-            &json!({"status": "ok", "enabled": true})
-        ));
-        assert_eq!(
-            CODEX_CONTEXT_MONITOR_FYI,
-            "Context monitoring is FYI only for Codex agents; they manage compaction inline."
-        );
+    fn context_monitor_enable_success_contract_requires_enabled_response() {
+        let response = json!({"status": "ok", "enabled": true});
+        assert!(ensure_context_monitor_enabled(&response).is_ok());
+        let missing = ensure_context_monitor_enabled(&json!({"status": "ok"}))
+            .unwrap_err()
+            .to_string();
+        assert!(missing.contains("was not enrolled"));
+        let false_response =
+            ensure_context_monitor_enabled(&json!({"status": "ok", "enabled": false}))
+                .unwrap_err()
+                .to_string();
+        assert!(false_response.contains("enabled=Bool(false)"));
+    }
+
+    #[test]
+    fn context_monitor_enable_rejects_an_actionable_server_failure_before_printing_success() {
+        let error = ApiResponse {
+            status: 422,
+            body: r#"{"detail":"Context monitoring cannot enroll provider \\\"codex\\\": no measured context gauge is available"}"#.to_owned(),
+        }
+        .into_json()
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("HTTP 422"));
+        assert!(error.contains("cannot enroll provider"));
     }
 
     #[test]
