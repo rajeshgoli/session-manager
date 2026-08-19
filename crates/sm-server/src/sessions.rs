@@ -2699,28 +2699,30 @@ impl SessionStore {
     }
 
     pub fn get_reparent_request(&self, request_id: &str) -> Result<Option<ReparentRequestRecord>> {
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
+        // Poll routes call this method.  The registry is atomically replaced,
+        // so a direct snapshot read sees either the old or new complete state
+        // without waiting for a writer.  Lifecycle transitions belong to the
+        // reparent worker, not to a GET request.
+        let state = self.load_raw_json_value()?;
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
         let mut records = reparent_request_records(&state)?;
-        if refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc()) {
-            store_reparent_request_records(&mut state, &records)?;
-            self.write_raw_json_value(&state)?;
-        }
+        // This projection is intentionally not persisted.  It keeps the
+        // response truthful at an expiry boundary while the lifecycle worker
+        // performs the durable transition and outbox derivation separately.
+        refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc());
         Ok(records
             .into_iter()
             .find(|record| record.id == request_id.trim()))
     }
 
     pub fn list_reparent_requests(&self) -> Result<Vec<ReparentRequestRecord>> {
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
+        // Keep collection reads in the same lock-free snapshot class as
+        // `list_sessions`.  In particular, do not refresh expiry/staleness
+        // here: doing so turns a watch poll into a durable mutation.
+        let state = self.load_raw_json_value()?;
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
         let mut records = reparent_request_records(&state)?;
-        if refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc()) {
-            store_reparent_request_records(&mut state, &records)?;
-            self.write_raw_json_value(&state)?;
-        }
+        refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc());
         records.sort_by(|left, right| {
             (&left.created_at, &left.id).cmp(&(&right.created_at, &right.id))
         });
@@ -2733,17 +2735,13 @@ impl SessionStore {
         session_credential: &str,
     ) -> Result<Option<Vec<ReparentRequestRecord>>> {
         let session_id = session_id.trim();
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
+        let state = self.load_raw_json_value()?;
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
         if !session_credential_matches(&sessions, session_id, session_credential) {
             return Ok(None);
         }
         let mut records = reparent_request_records(&state)?;
-        if refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc()) {
-            store_reparent_request_records(&mut state, &records)?;
-            self.write_raw_json_value(&state)?;
-        }
+        refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc());
         records.retain(|record| record.involves_session(session_id));
         records.sort_by(|left, right| {
             (&left.created_at, &left.id).cmp(&(&right.created_at, &right.id))
@@ -2857,34 +2855,7 @@ impl SessionStore {
                 OffsetDateTime::now_utc(),
             );
             let mut changed = refreshed;
-            for record in &mut records {
-                let desired = desired_reparent_notifications(record);
-                let desired_keys = desired
-                    .iter()
-                    .map(|desired| desired.intent.key.as_str())
-                    .collect::<BTreeSet<_>>();
-                // A prior process may have recorded a not-yet-enqueued
-                // terminal intent before a winning driver committed the
-                // request.  Keep delivered audit history, but remove any
-                // unsent losing projection before choosing outbox work.
-                let previous_len = record.notification_intents.len();
-                record.notification_intents.retain(|intent| {
-                    intent.enqueued_at.is_some()
-                        || !intent.event.starts_with("terminal:")
-                        || desired_keys.contains(intent.key.as_str())
-                });
-                changed |= record.notification_intents.len() != previous_len;
-                for desired in desired {
-                    if record
-                        .notification_intents
-                        .iter()
-                        .all(|intent| intent.key != desired.intent.key)
-                    {
-                        record.notification_intents.push(desired.intent);
-                        changed = true;
-                    }
-                }
-            }
+            changed |= reconcile_reparent_notification_intents(&mut records);
             if changed {
                 store_reparent_request_records(&mut state, &records)?;
                 self.write_raw_json_value(&state)?;
@@ -2901,14 +2872,12 @@ impl SessionStore {
                         })
                 })
                 .collect::<Vec<_>>();
-            let recipients = records
+            // Runtime delivery is only meaningful for items this pass actually
+            // enqueued.  Historical delivered intents must never turn an idle
+            // retry into one full-state write and tmux call per old recipient.
+            let recipients = pending
                 .iter()
-                .flat_map(|record| {
-                    record
-                        .notification_intents
-                        .iter()
-                        .map(|intent| intent.recipient_session_id.clone())
-                })
+                .map(|desired| desired.intent.recipient_session_id.clone())
                 .collect::<BTreeSet<_>>();
             (pending, recipients)
         };
@@ -2968,6 +2937,10 @@ impl SessionStore {
                 self.write_raw_json_value(&state)?;
             }
         }
+        // Queue projection is complete. Runtime delivery is deliberately
+        // outside the cross-process apply lock so a hung tmux cannot block
+        // state transitions or make another process wait on this lock.
+        drop(_cross_process_guard);
         if let Some(runtime) = self.delivery_runtime.as_ref() {
             let mut first_error = None;
             for recipient in recipients {
@@ -3171,7 +3144,7 @@ impl SessionStore {
         }
         let sessions = snapshot_from_raw_value(&state)?.into_sessions();
         let mut records = reparent_request_records(&state)?;
-        let _ =
+        let refreshed =
             refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc());
         let Some(index) = records
             .iter()
@@ -3186,8 +3159,12 @@ impl SessionStore {
             })
             .map(|(index, _)| index)
         else {
-            store_reparent_request_records(&mut state, &records)?;
-            self.write_raw_json_value(&state)?;
+            // The lifecycle worker may inspect an idle registry frequently.
+            // An idle pass must not rewrite the complete sessions file.
+            if refreshed || state.get("reparent_requests").is_none() {
+                store_reparent_request_records(&mut state, &records)?;
+                self.write_raw_json_value(&state)?;
+            }
             return Ok(None);
         };
         if let Some(reason) = reparent_stale_reason(&records[index], &sessions, &state) {
@@ -4864,6 +4841,9 @@ impl SessionStore {
         runtime: &TmuxRuntime,
         message_category: Option<&str>,
     ) -> Result<()> {
+        if message_category == Some("reparent") {
+            return self.drain_reparent_runtime_messages(session_id, runtime);
+        }
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         if let Some(queue) = &self.queue_store {
@@ -4881,6 +4861,62 @@ impl SessionStore {
             self.write_raw_json_value(&state)?;
         }
         Ok(())
+    }
+
+    /// Deliver reparent outbox messages without holding the sessions write
+    /// guard.  tmux can block indefinitely; holding the guard here used to
+    /// make unrelated readers queue behind a notification retry.
+    fn drain_reparent_runtime_messages(
+        &self,
+        session_id: &str,
+        runtime: &TmuxRuntime,
+    ) -> Result<()> {
+        let Some(queue) = self.queue_store.as_ref() else {
+            return Ok(());
+        };
+        loop {
+            let Some(message) = queue
+                .pending_messages_for_target_by_category(session_id, "reparent", 1)?
+                .into_iter()
+                .next()
+            else {
+                return Ok(());
+            };
+            let target = {
+                let _guard = self.write_guard()?;
+                let state = self.load_raw_json_value()?;
+                reparent_runtime_delivery_target(&state, session_id)?
+            };
+            let Some(target) = target else {
+                return Ok(());
+            };
+
+            // This is the only potentially blocking operation in this path.
+            // No state or apply lock is held while it runs.
+            let delivered = runtime
+                .for_socket_name(target.tmux_socket_name.as_deref())
+                .send_input(&target.tmux_session, &message.text)?;
+            if !delivered {
+                return Ok(());
+            }
+
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            if !reparent_runtime_delivery_target(&state, session_id)?
+                .is_some_and(|current| current == target)
+            {
+                // The session changed while tmux was handling the message.
+                // Leave the queue row pending for a fresh, validated attempt.
+                return Ok(());
+            }
+            queue.mark_delivered_and_apply_side_effects(&message)?;
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let session = session_object_mut(sessions, session_id).ok_or_else(|| {
+                anyhow::anyhow!("session {session_id} disappeared during delivery")
+            })?;
+            mark_session_followup_activity(session, &now_rfc3339());
+            self.write_raw_json_value(&state)?;
+        }
     }
 
     fn drain_runtime_pending_messages_for_writable_session(
@@ -10675,6 +10711,32 @@ fn deliver_runtime_text_to_session_raw(
     deliver_runtime_text_to_session_with_ready_fence_raw(state, session_id, text, runtime, false)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct ReparentRuntimeDeliveryTarget {
+    tmux_session: String,
+    tmux_socket_name: Option<String>,
+}
+
+fn reparent_runtime_delivery_target(
+    state: &Value,
+    session_id: &str,
+) -> Result<Option<ReparentRuntimeDeliveryTarget>> {
+    let Some(session) = raw_session_object(state, session_id) else {
+        return Ok(None);
+    };
+    let node = json_text(session.get("node")).unwrap_or_else(default_node);
+    ensure_runtime_local_node(&node)?;
+    if raw_session_is_stopped(session) || claude_handoff_is_reserved_raw(session) {
+        return Ok(None);
+    }
+    let tmux_session = json_text(session.get("tmux_session"))
+        .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+    Ok(Some(ReparentRuntimeDeliveryTarget {
+        tmux_session,
+        tmux_socket_name: json_text(session.get("tmux_socket_name")),
+    }))
+}
+
 fn deliver_runtime_background_text_to_session_raw(
     state: &mut Value,
     session_id: &str,
@@ -13345,6 +13407,13 @@ fn store_reparent_request_records(
     state: &mut Value,
     records: &[ReparentRequestRecord],
 ) -> Result<()> {
+    // Notification intents are part of the durable reparent state machine,
+    // not an observation made later by a polling GET.  Every request-state
+    // write therefore carries its exact, idempotency-keyed outbox projection.
+    // This also lets a later worker retry an enqueue after a process crash
+    // without requiring another client request to repair the record.
+    let mut records = records.to_vec();
+    reconcile_reparent_notification_intents(&mut records);
     let object = state
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("session state root must be an object"))?;
@@ -13353,6 +13422,37 @@ fn store_reparent_request_records(
         serde_json::to_value(records)?,
     );
     Ok(())
+}
+
+fn reconcile_reparent_notification_intents(records: &mut [ReparentRequestRecord]) -> bool {
+    let mut changed = false;
+    for record in records {
+        let desired = desired_reparent_notifications(record);
+        let desired_keys = desired
+            .iter()
+            .map(|desired| desired.intent.key.as_str())
+            .collect::<BTreeSet<_>>();
+        // Preserve enqueued audit history, but discard an unqueued terminal
+        // projection if a later durable outcome superseded it.
+        let previous_len = record.notification_intents.len();
+        record.notification_intents.retain(|intent| {
+            intent.enqueued_at.is_some()
+                || !intent.event.starts_with("terminal:")
+                || desired_keys.contains(intent.key.as_str())
+        });
+        changed |= record.notification_intents.len() != previous_len;
+        for desired in desired {
+            if record
+                .notification_intents
+                .iter()
+                .all(|intent| intent.key != desired.intent.key)
+            {
+                record.notification_intents.push(desired.intent);
+                changed = true;
+            }
+        }
+    }
+    changed
 }
 
 fn reparent_apply_lease(state: &Value) -> Result<Option<ReparentApplyLease>> {
