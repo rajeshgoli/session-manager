@@ -11185,16 +11185,9 @@ fn drain_pending_runtime_messages_raw(
 
         let mut should_continue = true;
         for message in messages {
-            let (next_status, delivered) = if require_ready_fence
-                && (message.message_category.as_deref() == Some("native_rename")
-                    || normalized_delivery_mode(&message.delivery_mode) == "urgent")
+            let (next_status, delivered) = if message.message_category.as_deref()
+                == Some("native_rename")
             {
-                // The completion reconciler owns only background delivery. It
-                // must not repurpose an urgent or provider-control message as
-                // an unfenced predecessor while it holds the live readiness
-                // proof for a sequential completion wake.
-                (status.clone(), false)
-            } else if message.message_category.as_deref() == Some("native_rename") {
                 deliver_runtime_native_rename_to_session_raw(
                     state,
                     session_id,
@@ -17900,6 +17893,37 @@ mod tests {
             1
         );
         assert!(pane.input_lines().is_empty());
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn completion_reconciler_drains_urgent_predecessor_before_ready_completion() {
+        let pane = queue_completion_test_pane(true);
+        let (store, queue, state_file, queue_db) = queue_completion_test_store(&pane, "running");
+        queue
+            .enqueue_message_once_with_metadata(
+                "queue-completion-urgent-predecessor",
+                "queue-target",
+                "[sm queue] urgent predecessor",
+                "urgent",
+                QueueMessageMetadata::default(),
+            )
+            .unwrap();
+        enqueue_queue_completion(&queue, "queue-completion-after-urgent-predecessor");
+
+        store
+            .drain_runtime_pending_message_targets_by_category("queue-completion")
+            .unwrap();
+
+        assert!(queue
+            .pending_messages_for_target("queue-target", 10)
+            .unwrap()
+            .is_empty());
+        let inputs = pane.input_lines();
+        assert_eq!(inputs.len(), 2);
+        assert!(inputs[0].ends_with("[sm queue] urgent predecessor"));
+        assert_eq!(inputs[1], "[sm queue] test job completed");
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }
