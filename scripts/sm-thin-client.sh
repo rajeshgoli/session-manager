@@ -75,6 +75,23 @@ case "$command_name" in
   watch|attach) reconnect_safe=1 ;;
 esac
 
+# Mouse reporting is enabled on the laptop terminal by bytes received over the
+# SSH channel. If that channel drops, a remote cleanup handler cannot send the
+# matching disable sequence back. Sanitize locally after every interactive SSH
+# attempt and again from shell exit/signal traps. Repeated writes are harmless.
+sanitize_terminal() {
+  (( reconnect_safe )) || return 0
+
+  local reset_sequence=$'\e[?1000l\e[?1002l\e[?1003l\e[?1005l\e[?1006l\e[?1015l\e[?25h'
+  if [[ -t 1 ]]; then
+    print -rn -- "$reset_sequence"
+  elif [[ -t 2 ]]; then
+    print -rn -u2 -- "$reset_sequence"
+  elif [[ -w /dev/tty ]]; then
+    print -rn -- "$reset_sequence" >/dev/tty 2>/dev/null || true
+  fi
+}
+
 # Allocate a tty only when we have one locally, so interactive commands
 # (attach/watch) get a pty while piped output (sm all | grep) stays clean.
 ssh_tty=(-T)
@@ -86,9 +103,13 @@ max_attempts=8
 backoff=1
 backoff_cap=30
 
-# Ctrl-C: when ssh holds the pty the signal goes to the remote; this trap is the
-# fallback for when we're sleeping between retries.
-trap 'exit 130' INT
+# When ssh holds the pty, signals normally reach the remote. These traps cover
+# local delivery while the shim is between retries. EXIT also covers ordinary
+# watch/attach termination.
+trap 'sanitize_terminal' EXIT
+trap 'sanitize_terminal; exit 129' HUP
+trap 'sanitize_terminal; exit 130' INT
+trap 'sanitize_terminal; exit 143' TERM
 
 while :; do
   host=$(pick_host)
@@ -108,6 +129,10 @@ while :; do
     -o ServerAliveCountMax=3 \
     "$host" "$remote_cmd"
   rc=$?
+
+  # In particular, run this before handling rc=255: once ssh has returned, the
+  # remote process can no longer repair terminal modes on this machine.
+  sanitize_terminal
 
   # Non-255 => remote sm exited on its own terms. Propagate and stop.
   if [[ $rc -ne 255 ]]; then

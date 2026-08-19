@@ -5,10 +5,14 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+from src.cli import watch_tui
 from src.cli.watch_tui import (
     DetailFetchWorker,
     DetailSnapshot,
+    _TERMINAL_RESET_SEQUENCE,
+    _attach_tmux,
     _codex_projection_enabled,
+    _sanitize_terminal,
     _arm_retire_confirmation,
     _create_watch_session,
     _fork_watch_session,
@@ -61,6 +65,72 @@ def test_tmux_attach_command_includes_socket_when_available():
         "-t",
         "claude-test",
     ]
+
+
+class _FakeTTY:
+    def __init__(self, is_tty=True):
+        self._is_tty = is_tty
+        self.written = []
+        self.flushed = False
+
+    def isatty(self):
+        return self._is_tty
+
+    def write(self, text):
+        self.written.append(text)
+
+    def flush(self):
+        self.flushed = True
+
+
+def test_sanitize_terminal_disables_mouse_reporting(monkeypatch):
+    fake = _FakeTTY(is_tty=True)
+    monkeypatch.setattr(watch_tui.sys, "stdout", fake)
+
+    _sanitize_terminal()
+
+    out = "".join(fake.written)
+    assert out == _TERMINAL_RESET_SEQUENCE
+    assert "\033[?1006l" in out  # SGR mouse reporting off
+    assert "\033[?1003l" in out  # any-motion tracking off
+    assert "\033[?25h" in out    # cursor restored
+    assert fake.flushed
+
+
+def test_sanitize_terminal_never_raises_without_a_tty(monkeypatch):
+    monkeypatch.setattr(watch_tui.sys, "stdout", _FakeTTY(is_tty=False))
+    monkeypatch.setattr(watch_tui.sys, "stderr", _FakeTTY(is_tty=False))
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("no controlling terminal")
+
+    monkeypatch.setattr(watch_tui.os, "open", _boom)
+
+    # Must be a no-op rather than propagate.
+    _sanitize_terminal()
+
+
+def test_attach_tmux_sanitizes_terminal_after_attach(monkeypatch):
+    calls = []
+
+    class _FakeStdscr:
+        def nodelay(self, _value):
+            pass
+
+        def clear(self):
+            pass
+
+    monkeypatch.setattr(watch_tui.curses, "def_prog_mode", lambda: None)
+    monkeypatch.setattr(watch_tui.curses, "endwin", lambda: None)
+    monkeypatch.setattr(watch_tui.curses, "reset_prog_mode", lambda: None)
+    monkeypatch.setattr(watch_tui.curses, "curs_set", lambda _value: None)
+    monkeypatch.setattr(watch_tui.subprocess, "run", lambda *a, **k: calls.append("run"))
+    monkeypatch.setattr(watch_tui, "_sanitize_terminal", lambda: calls.append("sanitize"))
+
+    _attach_tmux(_FakeStdscr(), "claude-test", "session-manager-test")
+
+    # The terminal must be sanitized, and only after the attach child returns.
+    assert calls == ["run", "sanitize"]
 
 
 def test_resolve_tmux_attach_target_hydrates_descriptor_socket():

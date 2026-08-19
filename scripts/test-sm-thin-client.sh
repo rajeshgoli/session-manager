@@ -73,4 +73,51 @@ run_shim '' all >/dev/null 2>&1
 test "$(cat "$TMP/ssh.count")" -eq 1
 grep -Fq 'ConnectTimeout=10' "$TMP/ssh.log"
 
+# Run watch under a real pseudo-terminal. A transport drop must emit the local
+# mouse-disable sequence even though the remote channel is already gone.
+PYTHON_BIN="$(command -v python3)"
+export SHIM TMP
+"$PYTHON_BIN" <<'PY'
+import errno
+import os
+import pty
+import subprocess
+
+master, slave = pty.openpty()
+env = os.environ.copy()
+env.update(
+    {
+        "HOME": f"{env['TMP']}/home",
+        "PATH": f"{env['TMP']}/bin:/usr/bin:/bin",
+        "MOCK_SSH_COUNT": f"{env['TMP']}/pty-ssh.count",
+        "MOCK_SSH_LOG": f"{env['TMP']}/pty-ssh.log",
+        "MOCK_SSH_RESULTS": "1:255",
+    }
+)
+proc = subprocess.Popen(
+    [env["SHIM"], "watch"],
+    stdin=slave,
+    stdout=slave,
+    stderr=slave,
+    env=env,
+    close_fds=True,
+)
+os.close(slave)
+output = bytearray()
+while True:
+    try:
+        chunk = os.read(master, 4096)
+    except OSError as exc:
+        if exc.errno == errno.EIO:
+            break
+        raise
+    if not chunk:
+        break
+    output.extend(chunk)
+os.close(master)
+assert proc.wait(timeout=10) == 0
+reset = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?25h"
+assert reset in output, output
+PY
+
 echo "sm thin-client tests passed"
