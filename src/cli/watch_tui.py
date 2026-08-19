@@ -6,7 +6,9 @@ import curses
 import os
 import queue
 import re
+import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -1319,6 +1321,43 @@ def _tmux_attach_command(tmux_session: str, tmux_socket_name: str | None = None)
     return cmd
 
 
+# Escape sequences that leave the terminal usable again. An attached child
+# (tmux with `mouse on`, or an ssh wrapper) can enable mouse reporting and fail
+# to disable it if the connection drops uncleanly, leaving the shell echoing
+# raw mouse events like `35;14;6M`. curses' endwin() does not undo these, so we
+# emit the disables ourselves on every exit path.
+_TERMINAL_RESET_SEQUENCE = (
+    "\033[?1000l"  # normal (click) mouse tracking
+    "\033[?1002l"  # button-event (drag) tracking
+    "\033[?1003l"  # any-motion tracking
+    "\033[?1005l"  # UTF-8 extended coordinates
+    "\033[?1006l"  # SGR extended coordinates
+    "\033[?1015l"  # urxvt extended coordinates
+    "\033[?25h"    # show cursor
+)
+
+
+def _sanitize_terminal() -> None:
+    """Best-effort disable of mouse reporting / restore of the cursor on the
+    controlling terminal. Safe to call multiple times and never raises."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and stream.isatty():
+                stream.write(_TERMINAL_RESET_SEQUENCE)
+                stream.flush()
+                return
+        except Exception:
+            continue
+    try:
+        fd = os.open("/dev/tty", os.O_WRONLY)
+        try:
+            os.write(fd, _TERMINAL_RESET_SEQUENCE.encode("ascii", "ignore"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
 def _attach_tmux(
     stdscr,
     tmux_session: str,
@@ -1331,6 +1370,9 @@ def _attach_tmux(
         command = attach_command if attach_command else _tmux_attach_command(tmux_session, tmux_socket_name)
         subprocess.run(command, check=False)
     finally:
+        # The attached session may have left mouse reporting enabled; clear it
+        # before we hand control back to curses.
+        _sanitize_terminal()
         curses.reset_prog_mode()
         curses.curs_set(0)
         stdscr.nodelay(True)
@@ -2088,7 +2130,33 @@ def run_watch_tui(
             if detail_worker:
                 detail_worker.stop()
 
-    curses.wrapper(_loop)
+    def _handle_terminal_signal(signum, _frame):
+        # An ssh drop delivers SIGHUP; SIGTERM may arrive from tooling. Neither
+        # runs the finally blocks below, so sanitize here before exiting with
+        # the default disposition.
+        _sanitize_terminal()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    previous_handlers: dict[int, object] = {}
+    for signame in ("SIGHUP", "SIGTERM"):
+        sig = getattr(signal, signame, None)
+        if sig is None:
+            continue
+        try:
+            previous_handlers[sig] = signal.signal(sig, _handle_terminal_signal)
+        except (ValueError, OSError):
+            pass
+
+    try:
+        curses.wrapper(_loop)
+    finally:
+        _sanitize_terminal()
+        for sig, handler in previous_handlers.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
     return 0
 
 
