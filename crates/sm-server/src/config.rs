@@ -1138,6 +1138,10 @@ fn default_tool_usage_db_path() -> String {
 /// `context_window.used_percentage`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContextMonitorConfig {
+    /// Ordered notification milestones. When omitted, the legacy warning and
+    /// critical values below remain the two default milestones.
+    #[serde(default)]
+    pub threshold_percentages: Vec<f64>,
     #[serde(default = "default_context_warning_percentage")]
     pub warning_percentage: f64,
     #[serde(default = "default_context_critical_percentage")]
@@ -1147,6 +1151,7 @@ pub struct ContextMonitorConfig {
 impl Default for ContextMonitorConfig {
     fn default() -> Self {
         Self {
+            threshold_percentages: Vec::new(),
             warning_percentage: default_context_warning_percentage(),
             critical_percentage: default_context_critical_percentage(),
         }
