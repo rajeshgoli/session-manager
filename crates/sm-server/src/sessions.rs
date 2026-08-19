@@ -865,7 +865,19 @@ impl SessionStore {
             .collect::<Vec<_>>();
         drop(_guard);
         for session_id in pending_ids {
-            self.retire_core_session_with_runtime_authorized(&session_id, None, None, runtime)?;
+            // This recovery runs before the HTTP server binds. Keep one
+            // unresponsive tmux socket from preventing startup or starving
+            // other durable retirement intents; the pending disposition stays
+            // in state and the periodic reconciler retries it.
+            if let Err(error) = self.retire_core_session_with_runtime_authorized_with_timeout(
+                &session_id,
+                None,
+                None,
+                runtime,
+                Some(TERMINAL_RUNTIME_TEARDOWN_COMMAND_TIMEOUT),
+            ) {
+                eprintln!("pending runtime retirement recovery for {session_id} failed: {error:#}");
+            }
         }
         Ok(())
     }
@@ -875,6 +887,10 @@ impl SessionStore {
     /// observation, so absence alone is not evidence that the launcher can no
     /// longer create the target runtime.
     pub fn reconcile_terminal_runtime_launch_teardowns(&self) -> Result<()> {
+        // Retire intents that could not finish at startup remain durable and
+        // are retried with the same bounded, per-session behavior as terminal
+        // launch teardown below.
+        self.recover_pending_runtime_retires()?;
         let Some(runtime) = self.delivery_runtime.as_ref() else {
             return Ok(());
         };
@@ -7584,6 +7600,23 @@ impl SessionStore {
         session_credential: Option<&str>,
         runtime: &TmuxRuntime,
     ) -> Result<CoreRetireOutcome> {
+        self.retire_core_session_with_runtime_authorized_with_timeout(
+            session_id,
+            requester_session_id,
+            session_credential,
+            runtime,
+            None,
+        )
+    }
+
+    fn retire_core_session_with_runtime_authorized_with_timeout(
+        &self,
+        session_id: &str,
+        requester_session_id: Option<&str>,
+        session_credential: Option<&str>,
+        runtime: &TmuxRuntime,
+        tmux_timeout: Option<Duration>,
+    ) -> Result<CoreRetireOutcome> {
         let authority = retire_authority(requester_session_id, session_credential);
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
@@ -7671,7 +7704,10 @@ impl SessionStore {
         }
 
         let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
-        let tmux_was_killed = session_runtime.kill_session(&tmux_session)?;
+        let tmux_was_killed = match tmux_timeout {
+            Some(timeout) => session_runtime.kill_session_with_timeout(&tmux_session, timeout)?,
+            None => session_runtime.kill_session(&tmux_session)?,
+        };
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let session = session_object_mut(sessions, session_id)
             .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during retire"))?;
@@ -16838,6 +16874,73 @@ mod tests {
         );
         assert_eq!(session["terminal_provenance"]["source"], "api_retire");
         assert_eq!(session["terminal_provenance"]["tmux_disposition"], "killed");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_retire_recovery_bounds_stalled_tmux_and_continues_later_intents() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let root = unique_temp_path("pending-retire-timeout");
+        fs::create_dir_all(&root).unwrap();
+        let tmux = root.join("tmux");
+        let invoked = root.join("runtime-invoked");
+        fs::write(
+            &tmux,
+            "#!/bin/sh\nif [ \"$3\" = \"claude-blocked\" ]; then while :; do :; done; fi\nprintf '%s\\n' \"$*\" >> \"$SM_1314_FAKE_TMUX_SENTINEL\"\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        let old_path = env::var_os("PATH").unwrap_or_default();
+        let _path = EnvVarRestore::set(
+            "PATH",
+            format!("{}:{}", root.display(), old_path.to_string_lossy()),
+        );
+        let _sentinel = EnvVarRestore::set("SM_1314_FAKE_TMUX_SENTINEL", &invoked);
+
+        let pending = |id: &str| {
+            let mut child = reparent_test_session(id, Some("parent01"), "child-secret");
+            child["status"] = json!("stopped");
+            child["completion_status"] = json!("retired");
+            child["node"] = json!("primary");
+            child["terminal_provenance"] = json!({
+                "cause": "explicit_retire",
+                "observed_at": "2026-08-18T04:00:00Z",
+                "actor_session_id": "parent01",
+                "authority": "authenticated_parent",
+                "source": "api_retire",
+                "tmux_disposition": "retire_requested"
+            });
+            child
+        };
+        let state_file = root.join("state.json");
+        fs::write(
+            &state_file,
+            json!({ "sessions": [pending("blocked"), pending("healthy")] }).to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(state_file.clone()).with_delivery_runtime(Some(
+            TmuxRuntime::from_config(&crate::config::RustCoreConfig::default()),
+        ));
+        let started = Instant::now();
+
+        store.recover_pending_runtime_retires().unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let recovered = store.load_raw_json_value().unwrap();
+        assert_eq!(
+            recovered["sessions"][0]["terminal_provenance"]["tmux_disposition"],
+            "retire_requested"
+        );
+        assert_eq!(
+            recovered["sessions"][1]["terminal_provenance"]["tmux_disposition"],
+            "killed"
+        );
+        let invocation = fs::read_to_string(&invoked).unwrap();
+        assert!(invocation.contains("has-session -t claude-healthy"));
+        assert!(invocation.contains("kill-session -t claude-healthy"));
         let _ = fs::remove_dir_all(root);
     }
 
