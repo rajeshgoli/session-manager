@@ -513,6 +513,13 @@ impl AppState {
             .drain_runtime_pending_message_targets_by_category("queue-completion")
     }
 
+    /// Advance time/topology-derived reparent state and retry the durable
+    /// notification outbox away from HTTP request workers.
+    pub fn reconcile_reparent_background(&self) -> anyhow::Result<()> {
+        self.session_store.reconcile_reparent_requests()?;
+        self.session_store.reconcile_reparent_notifications()
+    }
+
     pub fn with_github_review_poster(mut self, poster: Arc<dyn GitHubReviewPoster>) -> Self {
         self.github_review_poster = poster;
         self
@@ -3171,7 +3178,9 @@ async fn list_reparent_requests(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
-    reconcile_reparent_notifications_best_effort(&state);
+    // Watch polls are a pure snapshot projection. Reconciliation may wait on
+    // the cross-process apply lock, write the queue, and invoke tmux; the
+    // dedicated background worker owns that work.
     let requests = if let Some(session_id) = header_text(request.headers(), "x-sm-session-id") {
         let credential = reparent_session_credential(request.headers())?;
         state
@@ -3278,7 +3287,8 @@ async fn get_reparent_request(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
-    reconcile_reparent_notifications_best_effort(&state);
+    // Keep detail polling in the same non-blocking snapshot class as the
+    // collection endpoint above.
     let record = state
         .session_store
         .get_reparent_request(&request_id)?

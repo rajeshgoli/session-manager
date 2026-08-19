@@ -22,6 +22,7 @@ use tokio::net::TcpListener;
 /// How often the Studio SSH reconcile loop repairs toward the desired state.
 const STUDIO_SSH_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const QUEUE_COMPLETION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const REPARENT_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Rust Session Manager server scaffold")]
@@ -129,6 +130,17 @@ async fn main() -> Result<()> {
     }
 
     let state = AppState::try_new(config).context("failed to initialize server state")?;
+    // Reparent lifecycle and notification delivery can take the cross-process
+    // apply lock, access the retained queue, and talk to tmux.  Keep all of
+    // that work on one dedicated worker: watch polling is a snapshot read and
+    // must never wait behind it.
+    let reparent_state = state.clone();
+    thread::spawn(move || loop {
+        thread::sleep(REPARENT_RECONCILE_INTERVAL);
+        if let Err(error) = reparent_state.reconcile_reparent_background() {
+            eprintln!("reparent background reconciliation failed: {error:#}");
+        }
+    });
     if state.config().rust_core.runtime_enabled {
         let queue_delivery_state = state.clone();
         thread::spawn(move || loop {

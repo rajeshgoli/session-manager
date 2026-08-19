@@ -9,6 +9,7 @@ use base64::{
 };
 use futures_util::{future::join, StreamExt as _};
 use hmac::{Hmac, Mac};
+use nix::fcntl::{Flock, FlockArg};
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
@@ -18327,6 +18328,140 @@ async fn reparent_request_read_marks_changed_topology_stale() {
         .as_str()
         .unwrap()
         .contains("parent changed"));
+}
+
+#[tokio::test]
+async fn reparent_request_polls_are_snapshot_only_while_apply_lock_is_held() {
+    let state_file = write_reparent_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config));
+
+    let (status, created) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let request_id = created["id"].as_str().unwrap().to_owned();
+
+    let before = fs::read(&state_file).unwrap();
+    let before_modified = fs::metadata(&state_file).unwrap().modified().unwrap();
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(state_file.with_extension("reparent-apply.lock"))
+        .unwrap();
+    let _apply_lock = Flock::lock(lock_file, FlockArg::LockExclusive).unwrap();
+
+    let polls = (0..32).map(|_| get_json(app.clone(), "/reparent-requests"));
+    let detail_uri = format!("/reparent-requests/{request_id}");
+    let detail = get_json(app.clone(), &detail_uri);
+    let (collections, (detail_status, detail)) =
+        tokio::time::timeout(Duration::from_millis(250), async {
+            (futures_util::future::join_all(polls).await, detail.await)
+        })
+        .await
+        .expect("reparent polls waited on the apply lock");
+    for (status, payload) in collections {
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(payload["requests"].as_array().unwrap().len(), 1);
+    }
+    assert_eq!(detail_status, StatusCode::OK);
+    assert_eq!(detail["id"], request_id);
+    assert_eq!(fs::read(&state_file).unwrap(), before);
+    assert_eq!(
+        fs::metadata(&state_file).unwrap().modified().unwrap(),
+        before_modified
+    );
+}
+
+#[tokio::test]
+async fn idle_reparent_background_pass_does_not_rewrite_state() {
+    let state_file = write_reparent_fixture();
+    let queue_db = queue_db_path_for_state_file(&state_file);
+    let mut config = config_with_state_file_and_queue(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let state = AppState::new(config);
+    let app = router(state.clone());
+
+    let (status, _) = post_json_with_headers_and_peer(
+        app,
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(queued_message_texts(&queue_db, "newparent").len(), 1);
+
+    let before = fs::read(&state_file).unwrap();
+    let before_modified = fs::metadata(&state_file).unwrap().modified().unwrap();
+    state.reconcile_reparent_background().unwrap();
+    assert_eq!(fs::read(&state_file).unwrap(), before);
+    assert_eq!(
+        fs::metadata(&state_file).unwrap().modified().unwrap(),
+        before_modified
+    );
+}
+
+#[tokio::test]
+async fn reparent_background_transition_persists_and_enqueues_terminal_intents() {
+    let state_file = write_reparent_fixture();
+    let queue_db = queue_db_path_for_state_file(&state_file);
+    let mut config = config_with_state_file_and_queue(&state_file);
+    config.rust_core.fixture_writes_enabled = true;
+    let state = AppState::new(config);
+    let app = router(state.clone());
+
+    let (status, created) = post_json_with_headers_and_peer(
+        app,
+        "/sessions/child/reparent-requests",
+        json!({
+            "requester_session_id": "oldparent",
+            "target_parent_session_id": "newparent"
+        }),
+        &[("x-sm-session-credential", "old-token")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let request_id = created["id"].as_str().unwrap();
+
+    let mut raw_state: Value =
+        serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    raw_state["reparent_requests"][0]["expires_at"] = json!("2020-01-01T00:00:00Z");
+    fs::write(&state_file, serde_json::to_vec_pretty(&raw_state).unwrap()).unwrap();
+
+    state.reconcile_reparent_background().unwrap();
+
+    let raw_state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let record = &raw_state["reparent_requests"][0];
+    assert_eq!(record["id"], request_id);
+    assert_eq!(record["status"], "expired");
+    let terminal_intents = record["notification_intents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|intent| intent["event"] == "terminal:expired")
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_intents.len(), 2);
+    assert!(terminal_intents
+        .iter()
+        .all(|intent| intent["enqueued_at"].as_str().is_some()));
+    assert_eq!(queued_message_texts(&queue_db, "newparent").len(), 2);
+    assert_eq!(queued_message_texts(&queue_db, "oldparent").len(), 1);
 }
 
 #[tokio::test]
