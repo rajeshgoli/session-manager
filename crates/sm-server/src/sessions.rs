@@ -5834,10 +5834,10 @@ impl SessionStore {
                 reset_context_oneshot_flags(session);
             }
         }
-        self.write_raw_json_value(&state)?;
         if thresholds_changed {
             self.cancel_context_monitor_alerts(session_id)?;
         }
+        self.write_raw_json_value(&state)?;
         Ok(ContextMonitorOutcome::Updated(ContextMonitorResult {
             status: "ok".to_owned(),
             enabled: effective_enabled,
