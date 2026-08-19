@@ -10541,7 +10541,10 @@ fn deliver_runtime_text_to_session_with_ready_fence_raw(
         let node = json_text(session.get("node")).unwrap_or_else(default_node);
         ensure_runtime_local_node(&node)?;
         let status = effective_raw_session_status(session);
-        if raw_session_is_stopped(session) || claude_handoff_is_pending_raw(session) {
+        if raw_session_is_stopped(session)
+            || (require_ready_fence && claude_handoff_is_pending_raw(session))
+            || (!require_ready_fence && claude_handoff_is_reserved_raw(session))
+        {
             return Ok((status, false));
         }
         let tmux_session = json_text(session.get("tmux_session"))
@@ -10610,7 +10613,7 @@ fn deliver_urgent_runtime_text_to_session_raw(
         let node = json_text(session.get("node")).unwrap_or_else(default_node);
         ensure_runtime_local_node(&node)?;
         let status = effective_raw_session_status(session);
-        if raw_session_is_stopped(session) || claude_handoff_is_pending_raw(session) {
+        if raw_session_is_stopped(session) || claude_handoff_is_reserved_raw(session) {
             return Ok((status, false));
         }
         let tmux_session = json_text(session.get("tmux_session"))
@@ -10675,7 +10678,7 @@ fn deliver_runtime_native_rename_to_session_raw(
     if raw_session_is_stopped(session) {
         return Ok((status, false));
     }
-    if claude_handoff_is_pending_raw(session) {
+    if claude_handoff_is_reserved_raw(session) {
         return Ok((status, false));
     }
     let Some(friendly_name) = extract_provider_native_rename_name(text) else {
@@ -11100,6 +11103,11 @@ fn claude_handoff_is_pending_raw(session: &Map<String, Value>) -> bool {
     json_text(session.get("provider")).as_deref() == Some("claude")
         && json_text(session.get("pending_handoff_path")).is_some()
         && json_text(session.get("pending_handoff_recorded_at")).is_some()
+}
+
+fn claude_handoff_is_reserved_raw(session: &Map<String, Value>) -> bool {
+    json_text(session.get("provider")).as_deref() == Some("claude")
+        && json_text(session.get("claude_handoff_in_progress_at")).is_some()
 }
 
 fn claude_handoff_reservation_replaced_raw(
@@ -17904,6 +17912,37 @@ mod tests {
             1
         );
         assert!(pane.input_lines().is_empty());
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn direct_delivery_allows_retryable_unreserved_claude_handoff() {
+        let pane = queue_completion_test_pane(true);
+        let (_store, _queue, state_file, queue_db) = queue_completion_test_store(&pane, "idle");
+        let mut state: Value =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        let session = state["sessions"][0].as_object_mut().unwrap();
+        session.insert(
+            "pending_handoff_path".to_owned(),
+            Value::String("/tmp/retryable-handoff.md".to_owned()),
+        );
+        session.insert(
+            "pending_handoff_recorded_at".to_owned(),
+            Value::String("2026-06-01T00:02:00Z".to_owned()),
+        );
+
+        let (status, delivered) = deliver_runtime_text_to_session_raw(
+            &mut state,
+            "queue-target",
+            "[sm queue] handoff retry drain",
+            &pane.runtime,
+        )
+        .unwrap();
+
+        assert_eq!(status, "idle");
+        assert!(delivered);
+        assert_eq!(pane.input_lines(), vec!["[sm queue] handoff retry drain"]);
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }
