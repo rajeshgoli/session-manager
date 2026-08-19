@@ -63,6 +63,12 @@ test "$(cat "$TMP/ssh.count")" -eq 2
 run_shim '1:255' attach abc123 >/dev/null 2>&1
 test "$(cat "$TMP/ssh.count")" -eq 2
 
+run_shim '1:255' --api-url http://127.0.0.1:8420 watch >/dev/null 2>&1
+test "$(cat "$TMP/ssh.count")" -eq 2
+
+run_shim '1:255' --api-url=http://127.0.0.1:8420 attach abc123 >/dev/null 2>&1
+test "$(cat "$TMP/ssh.count")" -eq 2
+
 run_shim '' all >/dev/null 2>&1
 test "$(cat "$TMP/ssh.count")" -eq 1
 grep -Fq 'ConnectTimeout=10' "$TMP/ssh.log"

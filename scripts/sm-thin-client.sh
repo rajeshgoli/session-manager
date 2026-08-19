@@ -44,8 +44,34 @@ done
 # Re-running a mutation after an SSH 255 is unsafe: the remote command may have
 # committed and only its response was lost. Only commands whose whole purpose is
 # to maintain an interactive view/session are safe to reopen automatically.
+command_name=''
+arg_index=1
+while (( arg_index <= $# )); do
+  arg=${argv[arg_index]}
+  case "$arg" in
+    --api-url)
+      arg_index=$(( arg_index + 2 ))
+      ;;
+    --api-url=*)
+      arg_index=$(( arg_index + 1 ))
+      ;;
+    --)
+      arg_index=$(( arg_index + 1 ))
+      (( arg_index <= $# )) && command_name=${argv[arg_index]}
+      break
+      ;;
+    -*)
+      break
+      ;;
+    *)
+      command_name=$arg
+      break
+      ;;
+  esac
+done
+
 reconnect_safe=0
-case "${1:-}" in
+case "$command_name" in
   watch|attach) reconnect_safe=1 ;;
 esac
 
@@ -89,7 +115,7 @@ while :; do
   fi
 
   if (( ! reconnect_safe )); then
-    command_name=${1:-<none>}
+    [[ -n "$command_name" ]] || command_name='<none>'
     print -u2 -- "sm: connection lost while running '${command_name}'; outcome is unknown, refusing to retry."
     exit 255
   fi
