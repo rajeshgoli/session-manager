@@ -31,10 +31,12 @@ pick_host() {
 }
 
 # --- build the remote command (single remote-shell layer) -----------------
-# ssh joins our argv with spaces and hands the result to studio's login shell,
-# which re-splits it. Quote each arg once with zsh ${(q)} so it survives that
-# single re-parse intact.
-remote_cmd="$STUDIO_SM"
+# ssh hands our command to a NON-login remote shell whose PATH lacks Homebrew,
+# so tools `sm` shells out to (notably `tmux` for attach) aren't found. Prepend
+# Homebrew bins — `$PATH` stays literal locally and is expanded on studio.
+# ssh joins our argv with spaces and the remote shell re-splits it, so quote
+# each arg once with zsh ${(q)} to survive that single re-parse intact.
+remote_cmd='PATH=/opt/homebrew/bin:/usr/local/bin:$PATH'" $STUDIO_SM"
 for a in "$@"; do
   remote_cmd+=" ${(q)a}"
 done
@@ -58,7 +60,15 @@ while :; do
   host=$(pick_host)
   start=$SECONDS
 
+  # ControlMaster: the first call opens a shared master that persists briefly,
+  # so back-to-back `sm` calls (and follow-ups after `watch`) reuse it instead of
+  # paying a fresh TCP+auth handshake each time. Per-host socket (%n) keeps
+  # home/away separate. On sleep the master dies with the channel (exit 255) and
+  # the loop below reopens it.
   ssh "${ssh_tty[@]}" \
+    -o ControlMaster=auto \
+    -o ControlPath="$HOME/.ssh/cm-%r@%n:%p" \
+    -o ControlPersist=120 \
     -o ServerAliveInterval=5 \
     -o ServerAliveCountMax=3 \
     "$host" "$remote_cmd"
