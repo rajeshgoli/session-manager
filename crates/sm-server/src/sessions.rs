@@ -11185,6 +11185,9 @@ fn drain_pending_runtime_messages_raw(
 
         let mut should_continue = true;
         for message in messages {
+            let control_predecessor = require_ready_fence
+                && (message.message_category.as_deref() == Some("native_rename")
+                    || normalized_delivery_mode(&message.delivery_mode) == "urgent");
             let (next_status, delivered) = if message.message_category.as_deref()
                 == Some("native_rename")
             {
@@ -11219,6 +11222,14 @@ fn drain_pending_runtime_messages_raw(
                 break;
             }
             complete_runtime_message_delivery_raw(store, state, runtime, queue, &message)?;
+            if control_predecessor {
+                // An urgent or provider-control predecessor can have just
+                // started a turn. Wait for the next reconciliation, which
+                // will take a fresh readiness proof under the input lock,
+                // before considering a following completion wake.
+                should_continue = false;
+                break;
+            }
             let delivered_target =
                 stop_after_message_id.is_some_and(|target_id| target_id == message.id);
             delivered_message_ids.push(message.id);
@@ -17898,7 +17909,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_reconciler_drains_urgent_predecessor_before_ready_completion() {
+    fn completion_reconciler_rechecks_after_urgent_predecessor_before_completion() {
         let pane = queue_completion_test_pane(true);
         let (store, queue, state_file, queue_db) = queue_completion_test_store(&pane, "running");
         queue
@@ -17916,14 +17927,32 @@ mod tests {
             .drain_runtime_pending_message_targets_by_category("queue-completion")
             .unwrap();
 
+        let inputs = pane.input_lines();
+        assert_eq!(inputs.len(), 1);
+        assert!(inputs[0].ends_with("[sm queue] urgent predecessor"));
+        assert_eq!(
+            queue
+                .pending_messages_for_target_by_category("queue-target", "queue-completion", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        store
+            .drain_runtime_pending_message_targets_by_category("queue-completion")
+            .unwrap();
+
         assert!(queue
             .pending_messages_for_target("queue-target", 10)
             .unwrap()
             .is_empty());
-        let inputs = pane.input_lines();
-        assert_eq!(inputs.len(), 2);
-        assert!(inputs[0].ends_with("[sm queue] urgent predecessor"));
-        assert_eq!(inputs[1], "[sm queue] test job completed");
+        assert_eq!(
+            pane.input_lines(),
+            vec![
+                inputs[0].clone(),
+                "[sm queue] test job completed".to_owned()
+            ]
+        );
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }
