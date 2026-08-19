@@ -10479,14 +10479,20 @@ fn runtime_session_accepts_background_delivery_raw(
     session_id: &str,
     runtime: &TmuxRuntime,
 ) -> Result<bool> {
-    let Some(status) = runtime_session_status_raw(state, session_id)? else {
+    let Some(_status) = runtime_session_status_raw(state, session_id)? else {
         return Ok(false);
     };
-    if normalized_status(&status) != "idle" {
-        return Ok(false);
-    }
     let session = raw_session_object(state, session_id)
         .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared"))?;
+    // A Claude Stop hook is the durable lifecycle signal, but it is dispatched
+    // through a detached curl and can be stale or lost.  Delivery must not wait
+    // for that projection once the provider itself proves that its live composer
+    // is empty.  The provider-specific readiness check below is the
+    // authoritative, immediate safety fence; stopped and reserved-handoff
+    // sessions still cannot receive background input.
+    if raw_session_is_stopped(session) {
+        return Ok(false);
+    }
     if claude_handoff_is_reserved_raw(session) {
         return Ok(false);
     }
@@ -15786,7 +15792,11 @@ mod tests {
     use crate::config::AppConfig;
     use crate::usage_identity::{AccountIdentity, Provider, UsageIdentityStore};
     use rusqlite::Connection;
-    use std::sync::{Arc, Barrier};
+    use std::{
+        process::Command,
+        sync::{Arc, Barrier},
+        time::Duration,
+    };
 
     #[test]
     fn accepted_spawn_brief_is_private_immutable_and_records_launch_intent() {
@@ -17639,6 +17649,217 @@ mod tests {
             Some("running")
         );
         assert!(!session.contains_key("stopped_at"));
+    }
+
+    struct QueueCompletionTestPane {
+        socket_name: String,
+        input_path: PathBuf,
+        runtime: TmuxRuntime,
+        session_name: String,
+    }
+
+    impl Drop for QueueCompletionTestPane {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["-L", &self.socket_name, "kill-server"])
+                .status();
+            let _ = fs::remove_file(&self.input_path);
+        }
+    }
+
+    impl QueueCompletionTestPane {
+        fn input_lines(&self) -> Vec<String> {
+            for _ in 0..100 {
+                if let Ok(text) = fs::read_to_string(&self.input_path) {
+                    return text.lines().map(ToOwned::to_owned).collect();
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Vec::new()
+        }
+    }
+
+    fn queue_completion_test_shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    fn queue_completion_test_pane(input_ready: bool) -> QueueCompletionTestPane {
+        let (socket_name, runtime) = isolated_test_tmux_runtime();
+        let session_name = "queue-completion-target".to_owned();
+        let input_path = unique_temp_path("queue-completion-input");
+        let pane = if input_ready { ">" } else { ">\n✽ Thinking" };
+        let command = format!(
+            "printf '%s\\n' {}; while IFS= read -r line; do printf '%s\\n' \"$line\" >> {}; printf '%s\\n' {}; done",
+            queue_completion_test_shell_quote(pane),
+            queue_completion_test_shell_quote(&input_path.display().to_string()),
+            queue_completion_test_shell_quote(pane),
+        );
+        let output = Command::new("tmux")
+            .args([
+                "-L",
+                &socket_name,
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "sh",
+                "-c",
+                &command,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "failed to create isolated queue test pane: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        QueueCompletionTestPane {
+            socket_name,
+            input_path,
+            runtime,
+            session_name,
+        }
+    }
+
+    fn queue_completion_test_store(
+        pane: &QueueCompletionTestPane,
+        status: &str,
+    ) -> (SessionStore, RetainedQueueStore, PathBuf, PathBuf) {
+        let state_file = unique_temp_path("queue-completion-state");
+        let queue_db = state_file.with_extension("message-queue.db");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "queue-target",
+                    "name": "queue-target",
+                    "working_dir": "/repo",
+                    "tmux_session": pane.session_name,
+                    "tmux_socket_name": pane.socket_name,
+                    "provider": "claude",
+                    "status": status,
+                    "created_at": "2026-06-01T00:00:00Z",
+                    "last_activity": "2026-06-01T00:00:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let queue = RetainedQueueStore::new(queue_db.clone());
+        let store = SessionStore::new_with_queue(state_file.clone(), queue_db.clone())
+            .with_delivery_runtime(Some(pane.runtime.clone()));
+        (store, queue, state_file, queue_db)
+    }
+
+    fn enqueue_queue_completion(queue: &RetainedQueueStore, id: &str) {
+        queue
+            .enqueue_message_once_with_metadata(
+                id,
+                "queue-target",
+                "[sm queue] test job completed",
+                "sequential",
+                QueueMessageMetadata {
+                    message_category: Some("queue-completion".to_owned()),
+                    ..QueueMessageMetadata::default()
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn completion_reconciler_delivers_to_a_provider_ready_stale_running_target() {
+        let pane = queue_completion_test_pane(true);
+        let (store, queue, state_file, queue_db) = queue_completion_test_store(&pane, "running");
+        enqueue_queue_completion(&queue, "queue-completion-stale-running");
+
+        store
+            .drain_runtime_pending_message_targets_by_category("queue-completion")
+            .unwrap();
+
+        assert!(queue
+            .pending_messages_for_target_by_category("queue-target", "queue-completion", 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(pane.input_lines(), vec!["[sm queue] test job completed"]);
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn completion_reconciler_retains_idle_projection_when_provider_is_still_active() {
+        let pane = queue_completion_test_pane(false);
+        let (store, queue, state_file, queue_db) = queue_completion_test_store(&pane, "idle");
+        enqueue_queue_completion(&queue, "queue-completion-active-pane");
+
+        store
+            .drain_runtime_pending_message_targets_by_category("queue-completion")
+            .unwrap();
+
+        assert_eq!(
+            queue
+                .pending_messages_for_target_by_category("queue-target", "queue-completion", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(pane.input_lines().is_empty());
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn completion_reconciler_delivers_after_restart_from_the_durable_queue() {
+        let pane = queue_completion_test_pane(true);
+        let (store, queue, state_file, queue_db) = queue_completion_test_store(&pane, "running");
+        enqueue_queue_completion(&queue, "queue-completion-after-restart");
+        drop(store);
+        let restarted = SessionStore::new_with_queue(state_file.clone(), queue_db.clone())
+            .with_delivery_runtime(Some(pane.runtime.clone()));
+
+        restarted
+            .drain_runtime_pending_message_targets_by_category("queue-completion")
+            .unwrap();
+
+        assert!(queue
+            .pending_messages_for_target_by_category("queue-target", "queue-completion", 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(pane.input_lines(), vec!["[sm queue] test job completed"]);
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn concurrent_completion_reconcilers_deliver_one_durable_message_once() {
+        let pane = queue_completion_test_pane(true);
+        let (store, queue, state_file, queue_db) = queue_completion_test_store(&pane, "running");
+        enqueue_queue_completion(&queue, "queue-completion-concurrent");
+        let store = Arc::new(store);
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = (0..2)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store
+                        .drain_runtime_pending_message_targets_by_category("queue-completion")
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert!(queue
+            .pending_messages_for_target_by_category("queue-target", "queue-completion", 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(pane.input_lines(), vec!["[sm queue] test job completed"]);
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
     }
 
     #[test]
