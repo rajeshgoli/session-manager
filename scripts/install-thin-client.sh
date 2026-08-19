@@ -38,9 +38,6 @@ teardown_node_agent() {   # B
   echo "== B: tearing down node_agent"
   launchctl bootout "gui/$UID_NUM/$NODE_LABEL" 2>/dev/null || true
   rm -f "$NODE_PLIST"
-  # Stray in-repo copies from the old node-agent setup.
-  rm -f "$SCRIPT_DIR/$NODE_LABEL.plist" \
-        "$SCRIPT_DIR/session-manager-node-agent-wrapper.sh"
   # Optional: retire a leftover server-anchor tmux if one lingers.
   tmux kill-session -t __sm_server_anchor 2>/dev/null || true
   echo "   node_agent removed (SM_API_URL / client.yaml left in place)."
@@ -48,12 +45,12 @@ teardown_node_agent() {   # B
 
 install_forward() {       # C1
   echo "== C1: installing self-healing API forward"
-  mkdir -p "$HOME/bin"
+  mkdir -p "$HOME/bin" "$HOME/Library/LaunchAgents"
   install -m 0755 "$FWD_SCRIPT_SRC" "$FWD_SCRIPT_DST"
   cp "$FWD_PLIST_SRC" "$FWD_PLIST_DST"
   launchctl bootout "gui/$UID_NUM/$FWD_LABEL" 2>/dev/null || true
-  launchctl bootstrap "gui/$UID_NUM" "$FWD_PLIST_DST"
   launchctl enable "gui/$UID_NUM/$FWD_LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$UID_NUM" "$FWD_PLIST_DST"
   echo "   forward loaded. Logs: /tmp/session-manager-api-forward-macbook.log"
 }
 

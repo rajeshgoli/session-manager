@@ -41,6 +41,14 @@ for a in "$@"; do
   remote_cmd+=" ${(q)a}"
 done
 
+# Re-running a mutation after an SSH 255 is unsafe: the remote command may have
+# committed and only its response was lost. Only commands whose whole purpose is
+# to maintain an interactive view/session are safe to reopen automatically.
+reconnect_safe=0
+case "${1:-}" in
+  watch|attach) reconnect_safe=1 ;;
+esac
+
 # Allocate a tty only when we have one locally, so interactive commands
 # (attach/watch) get a pty while piped output (sm all | grep) stays clean.
 ssh_tty=(-T)
@@ -69,6 +77,7 @@ while :; do
     -o ControlMaster=auto \
     -o ControlPath="$HOME/.ssh/cm-%r@%n:%p" \
     -o ControlPersist=120 \
+    -o ConnectTimeout=10 \
     -o ServerAliveInterval=5 \
     -o ServerAliveCountMax=3 \
     "$host" "$remote_cmd"
@@ -77,6 +86,12 @@ while :; do
   # Non-255 => remote sm exited on its own terms. Propagate and stop.
   if [[ $rc -ne 255 ]]; then
     exit $rc
+  fi
+
+  if (( ! reconnect_safe )); then
+    command_name=${1:-<none>}
+    print -u2 -- "sm: connection lost while running '${command_name}'; outcome is unknown, refusing to retry."
+    exit 255
   fi
 
   # Transport drop. If the connection had been stable (~30s+), a fresh sleep on a

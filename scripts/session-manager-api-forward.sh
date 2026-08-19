@@ -37,6 +37,9 @@ while :; do
   # BatchMode + accept-new so an unattended daemon never hangs on a prompt.
   ssh -N \
     -o BatchMode=yes \
+    -o ConnectTimeout=10 \
+    -o ControlMaster=no \
+    -o ControlPath=none \
     -o StrictHostKeyChecking=accept-new \
     -o ExitOnForwardFailure=yes \
     -o ServerAliveInterval=5 \
