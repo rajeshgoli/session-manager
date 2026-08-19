@@ -1088,8 +1088,8 @@ Codex review is a sampled engineering gate, not a proof obtained by repeatedly
 requesting reviews until one happens to return no finding. Each package or final
 integration PR is limited to one deployable capability and declares R0-R3 risk
 before review. R0 needs no cycle; R1 receives one broad round and promotes to R2
-on a reachable P0/P1; R2 receives at most three exact-head rounds; R3 receives
-at least two and at most five. Broad, root-cause/sibling, and current-capability
+on a reachable P0/P1; R2 and R3 receive at most three exact-head rounds, with
+R3 requiring at least two. Broad, root-cause/sibling, and current-capability
 steers remain the default sequence.
 
 Every round records requested/reviewed head, steer and scope, queue/review wait,
@@ -1099,24 +1099,26 @@ differently scoped confirmation may review the same immutable head once when
 round 1 produced no change. A head-expanding refactor discovered during review
 becomes a separate package rather than silently enlarging the review surface.
 
-An R2 third-round P0/P1 or an R3 P0/P1 at/after round 3 triggers measured repair
-selection, not owner code review. A newly discovered localized R3 repair may use
-a focused confirming round within the five-round ceiling; a repeated finding
-class or architecture-changing repair enters design-return. R2 repairs needing
-confirmation become a fresh bounded package. Partitionable findings split by
-touched files/interfaces; structural or repeated findings enter design-return
-under a fresh design seat, then execute as independently gated subepic pieces
-with an original full-gate rerun and one integration review. Unresolved
-reachable P0/P1 remains unmergeable.
+An R2 or R3 round-3 finding that requires another code change triggers measured
+repair selection, not owner code review and not a fourth round. A localized
+repair needing confirmation becomes a fresh, smaller package with an
+independently useful capability and its own three-round ceiling; cosmetic
+repartition does not reset the cap. Partitionable findings split by touched
+files/interfaces; structural or repeated findings enter design-return under a
+fresh design seat, then execute as independently gated subepic pieces with an
+original full-gate rerun and one integration review. Unresolved reachable
+P0/P1 remains unmergeable.
 
-At the R3 five-round ceiling, the maintainer selects revert, split, redesign, or
-park from recorded reachability, blast radius, recurrence, rollback, hostile
-tests, review cost, and expected benefit. A reachable P0/P1 remains unmergeable;
-owner residual-risk acceptance cannot waive that gate. The owner may accept only
-a named lower-severity residual risk, change product scope, or override policy
-to remove or disable the affected capability before a newly scoped head is
-reviewed. The owner is never asked to inspect the code finding. Without such a
-scope or policy decision, split/park is the fail-closed default.
+At the three-round ceiling, the maintainer stops review activity and selects
+revert, split, redesign, or park from recorded reachability, blast radius,
+recurrence, rollback, hostile tests, review cost, and expected benefit.
+Independently testable, useful, review-clean slices may merge without the risky
+remainder. A reachable P0/P1 remains unmergeable; owner residual-risk acceptance
+cannot waive that gate. The owner may accept only a named lower-severity
+residual risk, change product scope, or override policy to remove or disable the
+affected capability before a newly scoped head is reviewed. The owner is never
+asked to inspect the code finding. Without such a scope or policy decision,
+split/park is the fail-closed default.
 
 For an unusually high-risk transaction, up to two focused specialist reviews
 may run in parallel against the same immutable head and be aggregated as one

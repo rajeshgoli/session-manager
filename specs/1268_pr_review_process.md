@@ -55,8 +55,9 @@ record it in the PR body:
   only if a reachable `P0`/`P1` remains.
 - **R3 - high risk:** persisted shapes, authority, recovery, concurrency,
   security, ambiguity semantics, hot paths, and public contracts. Run at least
-  two rounds and no more than five. A repeated or structural P0/P1 at round 3
-  triggers design-return rather than more local patching.
+  two rounds and no more than three. Round 3 is a hard stop for that PR: any
+  finding that requires another code change triggers split, revert, redesign,
+  or park rather than a fourth review.
 
 Tier assignment uses the highest matching row; lower-risk labels never override
 a higher-risk characteristic:
@@ -101,11 +102,11 @@ At an R2 third-round P0/P1 or an R3 design-return trigger:
 2. Classify the finding as localized, partitionable, or structural using its
    enabled-path reachability, blast radius, recurrence across rounds, touched
    files/interfaces, rollback quality, and hostile-test coverage.
-3. A newly discovered, localized R3 repair may receive a focused confirming
-   round while still below the five-round ceiling. A repeated finding class or
-   a repair that changes architecture goes to design-return. R2 does not grow a
-   fourth round; split the localized repair into a fresh bounded package if
-   confirmation is required.
+3. Neither R2 nor R3 grows a fourth round. A localized repair that requires
+   confirmation becomes a fresh, smaller package with an independently useful
+   capability and its own three-round ceiling. Cosmetic repartition, an
+   unchanged resubmission, or moving the same coupled diff to another PR does
+   not reset the cap.
 4. A partitionable finding produces a split proposal keyed by the findings'
    file/interface list. Land no partition until its own bounded review passes.
 5. A structural or repeated finding enters design-return: a fresh design seat
@@ -117,12 +118,15 @@ At an R2 third-round P0/P1 or an R3 design-return trigger:
    issue and an activation criterion for that capability.
 7. Fix, explicitly accept with rationale, or file every `P2`/`P3`.
 
-At the R3 five-round ceiling, the maintainer chooses revert, split, redesign,
-or park from the recorded risk and cost evidence. Do not ask the owner to read
-or adjudicate code findings. Owner input is required only to accept a named
-residual risk, change product scope, or override policy. If owner input is not
-available, the fail-closed default is split/park, not an indefinite review loop
-and not a merge with unresolved P0/P1 findings.
+At the three-round ceiling, the maintainer stops review activity and chooses
+revert, split, redesign, or park from the recorded risk and cost evidence.
+Risk-free slices may merge only when they are independently testable, useful,
+and already satisfy their own bounded review gate; the unresolved slice does
+not ride along. Do not ask the owner to read or adjudicate code findings. Owner
+input is required only to accept a named residual risk, change product scope,
+or override policy. If owner input is not available, the fail-closed default is
+split/park, not an indefinite review loop and not a merge with unresolved
+P0/P1 findings.
 
 If exit criteria are met:
 
