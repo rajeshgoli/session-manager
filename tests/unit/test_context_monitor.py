@@ -316,7 +316,7 @@ class TestCriticalThreshold:
         queue_mgr = mock_session_manager.message_queue_manager
         assert queue_mgr.queue_message.called
         call_kwargs = queue_mgr.queue_message.call_args[1]
-        assert "critically high" in call_kwargs["text"].lower()
+        assert call_kwargs["text"] == "[sm context] Your context is now at 65%."
         assert call_kwargs["delivery_mode"] == "urgent"
 
     def test_critical_flag_set_after_firing(self, client, session):
@@ -1064,7 +1064,7 @@ class TestChildForwardedNotifications:
         _post_context(client, session.id, used_pct=70)
 
         call_kwargs = mock_session_manager.message_queue_manager.queue_message.call_args[1]
-        assert "Child" in call_kwargs["text"]
+        assert "Context for" in call_kwargs["text"]
         assert "engineer-abc" in call_kwargs["text"]
 
     def test_child_critical_falls_back_to_session_id(self, mock_session_manager):
@@ -1078,7 +1078,7 @@ class TestChildForwardedNotifications:
         _post_context(client, session.id, used_pct=70)
 
         call_kwargs = mock_session_manager.message_queue_manager.queue_message.call_args[1]
-        assert "Child" in call_kwargs["text"]
+        assert "Context for" in call_kwargs["text"]
         assert session.id in call_kwargs["text"]
 
     def test_child_critical_omits_handoff_instruction(self, mock_session_manager):
@@ -1105,7 +1105,7 @@ class TestChildForwardedNotifications:
         _post_context(client, session.id, used_pct=55)
 
         call_kwargs = mock_session_manager.message_queue_manager.queue_message.call_args[1]
-        assert "Child" in call_kwargs["text"]
+        assert "Context for" in call_kwargs["text"]
         assert session.id in call_kwargs["text"]
 
     def test_child_warning_omits_handoff_suggestion(self, mock_session_manager):
@@ -1121,22 +1121,22 @@ class TestChildForwardedNotifications:
         call_kwargs = mock_session_manager.message_queue_manager.queue_message.call_args[1]
         assert "Consider writing a handoff" not in call_kwargs["text"]
 
-    def test_self_critical_includes_handoff_instruction(self, mock_session_manager, session):
-        """Self critical alert (context_monitor_notify == session.id) includes handoff instruction."""
+    def test_self_critical_is_a_neutral_context_reading(self, mock_session_manager, session):
+        """Self alerts report context without prescribing a recovery policy."""
         # session fixture has context_monitor_notify = session.id (self-alert path)
         _post_context(TestClient(create_app(session_manager=mock_session_manager)), session.id, used_pct=70)
 
         call_kwargs = mock_session_manager.message_queue_manager.queue_message.call_args[1]
-        assert "Write your handoff doc" in call_kwargs["text"]
-        assert "Child" not in call_kwargs["text"]
+        assert call_kwargs["text"] == "[sm context] Your context is now at 70%."
+        assert "handoff" not in call_kwargs["text"].lower()
 
-    def test_self_warning_includes_handoff_suggestion(self, mock_session_manager, session):
-        """Self warning alert (context_monitor_notify == session.id) includes handoff suggestion."""
+    def test_self_warning_is_a_neutral_context_reading(self, mock_session_manager, session):
+        """Self alerts report context without prescribing a recovery policy."""
         _post_context(TestClient(create_app(session_manager=mock_session_manager)), session.id, used_pct=55)
 
         call_kwargs = mock_session_manager.message_queue_manager.queue_message.call_args[1]
-        assert "Consider writing a handoff" in call_kwargs["text"]
-        assert "Child" not in call_kwargs["text"]
+        assert call_kwargs["text"] == "[sm context] Your context is now at 55%."
+        assert "handoff" not in call_kwargs["text"].lower()
 
 
 # ---------------------------------------------------------------------------

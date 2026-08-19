@@ -5458,7 +5458,7 @@ def cmd_clear(
 
 def cmd_handoff(client: SessionManagerClient, session_id: str, file_path: str) -> int:
     """
-    Schedule a self-directed context rotation via handoff doc.
+    Schedule a destructive self-directed context rotation via handoff doc.
 
     Agent writes handoff state to a doc, then calls sm handoff. The server
     executes /clear + prompt injection after the current turn completes (Stop hook).
@@ -5498,7 +5498,9 @@ def cmd_handoff(client: SessionManagerClient, session_id: str, file_path: str) -
         print(f"Error: {result.get('error') or result.get('detail')}", file=sys.stderr)
         return 1
 
-    print("Handoff scheduled — will execute after current turn completes")
+    print(
+        "Handoff scheduled — after this turn it will /clear this session and inject the handoff prompt"
+    )
     return 0
 
 

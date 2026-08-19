@@ -15608,7 +15608,7 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert!(body["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("strictly lower")));
+            .is_some_and(|detail| detail.contains("strictly increasing")));
         assert_eq!(fs::read(&state_file).unwrap(), persisted_before_invalid);
 
         let mut malformed = local_request(

@@ -1954,6 +1954,7 @@ impl SessionStore {
             .map(|session| {
                 let friendly_name = session.cached_display_name();
                 let thresholds = resolve_context_monitor_thresholds(
+                    session.context_monitor_threshold_percentages.clone(),
                     session.context_monitor_warning_percentage,
                     session.context_monitor_critical_percentage,
                     &self.context_monitor,
@@ -1970,6 +1971,10 @@ impl SessionStore {
                         .as_ref()
                         .ok()
                         .map(|value| value.critical_percentage),
+                    threshold_percentages: thresholds
+                        .as_ref()
+                        .ok()
+                        .map(|value| value.percentages.clone()),
                     threshold_source: thresholds
                         .as_ref()
                         .map(|value| value.source.as_str().to_owned())
@@ -5739,7 +5744,8 @@ impl SessionStore {
             }
         }
         if !request.enabled
-            && (request.warning_percentage.is_some()
+            && (request.threshold_percentages.is_some()
+                || request.warning_percentage.is_some()
                 || request.critical_percentage.is_some()
                 || request.use_default_thresholds)
         {
@@ -5748,7 +5754,9 @@ impl SessionStore {
             ));
         }
         if request.use_default_thresholds
-            && (request.warning_percentage.is_some() || request.critical_percentage.is_some())
+            && (request.threshold_percentages.is_some()
+                || request.warning_percentage.is_some()
+                || request.critical_percentage.is_some())
         {
             return Ok(ContextMonitorOutcome::InvalidThresholdConfig(
                 "use_default_thresholds conflicts with custom thresholds".to_owned(),
@@ -5764,16 +5772,24 @@ impl SessionStore {
         let current_critical = session
             .get("context_monitor_critical_percentage")
             .and_then(Value::as_f64);
-        let (next_warning, next_critical) = if request.use_default_thresholds {
-            (None, None)
+        let current_percentages =
+            json_percentages(session.get("context_monitor_threshold_percentages"));
+        let (next_percentages, next_warning, next_critical) = if request.use_default_thresholds {
+            (None, None, None)
+        } else if let Some(percentages) = request.threshold_percentages.clone() {
+            // A new arbitrary-size override supersedes the legacy two-value
+            // override instead of combining incompatible policies.
+            (Some(percentages), None, None)
         } else {
             (
+                current_percentages.clone(),
                 request.warning_percentage.or(current_warning),
                 request.critical_percentage.or(current_critical),
             )
         };
         let thresholds = if request.enabled {
             match resolve_context_monitor_thresholds(
+                next_percentages.clone(),
                 next_warning,
                 next_critical,
                 &self.context_monitor,
@@ -5784,13 +5800,20 @@ impl SessionStore {
         } else {
             None
         };
-        let thresholds_changed =
-            current_warning != next_warning || current_critical != next_critical;
+        let thresholds_changed = current_percentages != next_percentages
+            || current_warning != next_warning
+            || current_critical != next_critical;
         session.insert(
             "context_monitor_enabled".to_owned(),
             Value::Bool(effective_enabled),
         );
         if effective_enabled {
+            session.insert(
+                "context_monitor_threshold_percentages".to_owned(),
+                next_percentages.map_or(Value::Null, |values| {
+                    Value::Array(values.into_iter().map(|value| json!(value)).collect())
+                }),
+            );
             session.insert(
                 "context_monitor_warning_percentage".to_owned(),
                 next_warning.map_or(Value::Null, |value| json!(value)),
@@ -5845,6 +5868,7 @@ impl SessionStore {
             enabled: effective_enabled,
             warning_percentage: thresholds.as_ref().map(|value| value.warning_percentage),
             critical_percentage: thresholds.as_ref().map(|value| value.critical_percentage),
+            threshold_percentages: thresholds.as_ref().map(|value| value.percentages.clone()),
             threshold_source: thresholds
                 .as_ref()
                 .map(|value| value.source.as_str().to_owned())
@@ -6165,18 +6189,19 @@ impl SessionStore {
         Ok(ContextUsageOutcome::Recorded { used_percentage })
     }
 
-    /// Decide whether this usage sample trips a threshold, latching the
-    /// corresponding one-shot flag when it does. Returns the alert to queue, or
-    /// `None` when the threshold is not reached or has already fired this cycle.
+    /// Decide whether this usage sample reaches a previously unreported
+    /// notification milestone. The monitor reports measured context only; it
+    /// deliberately does not prescribe any provider or workflow policy.
     fn latch_context_alert(
         &self,
         session: &mut Map<String, Value>,
         session_id: &str,
         used_percentage: f64,
-        tokens_used: i64,
+        _tokens_used: i64,
     ) -> Option<ContextAlert> {
         let notify_target = json_text(session.get("context_monitor_notify"))?;
         let thresholds = resolve_context_monitor_thresholds(
+            json_percentages(session.get("context_monitor_threshold_percentages")),
             session
                 .get("context_monitor_warning_percentage")
                 .and_then(Value::as_f64),
@@ -6186,69 +6211,48 @@ impl SessionStore {
             &self.context_monitor,
         )
         .ok()?;
-        let is_self_alert = notify_target == session_id;
         let label = raw_session_label(session, session_id);
         let rounded = format_percentage(used_percentage);
-        let native_codex_compaction = json_text(session.get("provider"))
-            .is_some_and(|provider| provider_uses_native_context_compaction(&provider));
-
-        if used_percentage >= thresholds.critical_percentage {
-            if flag_is_set(session, "context_critical_sent") {
-                return None;
-            }
-            session.insert("context_critical_sent".to_owned(), Value::Bool(true));
-            let text = if is_self_alert && native_codex_compaction {
-                format!(
-                    "[sm context] Context at {rounded}% — critically high. \
-                     Codex will compact inline; continue the current task and do not run `sm handoff`."
-                )
-            } else if is_self_alert {
-                format!(
-                    "[sm context] Context at {rounded}% — critically high. \
-                     Write your handoff doc NOW and run `sm handoff <path>`. \
-                     Compaction is imminent."
-                )
-            } else {
-                format!(
-                    "[sm context] Child {label} ({session_id}) context at {rounded}% \
-                     — critically high. Compaction is imminent."
-                )
-            };
-            return Some(ContextAlert {
-                notify_target,
-                text,
-                delivery_mode: "urgent",
-            });
+        let mut reported = context_reported_thresholds(session, &thresholds.percentages);
+        let reached = thresholds
+            .percentages
+            .iter()
+            .any(|threshold| used_percentage >= *threshold && !reported.contains(threshold));
+        if !reached {
+            return None;
         }
 
+        // A sampled value can jump over several milestones. Report the actual
+        // current value once, then mark every crossed milestone so later
+        // renders cannot manufacture a burst of stale notifications.
+        for threshold in &thresholds.percentages {
+            if used_percentage >= *threshold && !reported.contains(threshold) {
+                reported.push(*threshold);
+            }
+        }
+        session.insert(
+            "context_reported_thresholds".to_owned(),
+            Value::Array(reported.into_iter().map(|value| json!(value)).collect()),
+        );
+        // Preserve the legacy latches as a migration projection. They are no
+        // longer used to decide notification text or delivery, but existing
+        // persisted-state consumers still expose the first and final level.
         if used_percentage >= thresholds.warning_percentage {
-            if flag_is_set(session, "context_warning_sent") {
-                return None;
-            }
             session.insert("context_warning_sent".to_owned(), Value::Bool(true));
-            let text = if is_self_alert && native_codex_compaction {
-                format!(
-                    "[sm context] Context at {rounded}% ({} tokens). \
-                     Codex will compact inline; continue the current task and do not run `sm handoff`.",
-                    format_thousands(tokens_used)
-                )
-            } else if is_self_alert {
-                format!(
-                    "[sm context] Context at {rounded}% ({} tokens). \
-                     Consider writing a handoff doc and running `sm handoff <path>`.",
-                    format_thousands(tokens_used)
-                )
-            } else {
-                format!("[sm context] Child {label} ({session_id}) context at {rounded}%.")
-            };
-            return Some(ContextAlert {
-                notify_target,
-                text,
-                delivery_mode: "sequential",
-            });
         }
-
-        None
+        if used_percentage >= thresholds.critical_percentage {
+            session.insert("context_critical_sent".to_owned(), Value::Bool(true));
+        }
+        let text = if notify_target == session_id {
+            format!("[sm context] Your context is now at {rounded}%.")
+        } else {
+            format!("[sm context] Context for {label} ({session_id}) is now at {rounded}%.")
+        };
+        Some(ContextAlert {
+            notify_target,
+            text,
+            delivery_mode: "sequential",
+        })
     }
 
     fn queue_context_monitor_message(
@@ -8633,6 +8637,7 @@ impl SessionStore {
             context_monitor_enabled: false,
             context_monitor_notify: None,
             context_monitor_notify_source: default_context_monitor_notify_source(),
+            context_monitor_threshold_percentages: None,
             context_monitor_warning_percentage: None,
             context_monitor_critical_percentage: None,
             context_warning_sent: false,
@@ -9293,6 +9298,10 @@ pub struct ContextMonitorRequest {
     pub requester_session_id: String,
     #[serde(default)]
     pub notify_session_id: Option<String>,
+    /// Ordered per-seat notification milestones. This is the policy-neutral
+    /// interface; every reached percentage emits a factual context update.
+    #[serde(default)]
+    pub threshold_percentages: Option<Vec<f64>>,
     /// Per-seat warning threshold percentage. Absent values preserve an
     /// existing override or resolve to the configured global default.
     #[serde(default)]
@@ -9624,6 +9633,7 @@ pub struct ContextMonitorStatus {
     pub notify_session_id: Option<String>,
     pub warning_percentage: Option<f64>,
     pub critical_percentage: Option<f64>,
+    pub threshold_percentages: Option<Vec<f64>>,
     pub threshold_source: String,
     pub enforced: bool,
 }
@@ -9640,6 +9650,7 @@ pub struct ContextSnapshotResponse {
     pub state: String,
     pub warning_percentage: Option<f64>,
     pub critical_percentage: Option<f64>,
+    pub threshold_percentages: Option<Vec<f64>>,
     pub threshold_source: String,
     pub context_monitor_enabled: bool,
     pub context_monitor_enforced: bool,
@@ -9657,6 +9668,7 @@ impl ContextSnapshotResponse {
         let provider = non_empty_or(session.provider, "claude");
         let unsupported_provider = !provider_has_measured_context_gauge(&provider);
         let thresholds = resolve_context_monitor_thresholds(
+            session.context_monitor_threshold_percentages.clone(),
             session.context_monitor_warning_percentage,
             session.context_monitor_critical_percentage,
             config,
@@ -9696,6 +9708,10 @@ impl ContextSnapshotResponse {
                 .as_ref()
                 .ok()
                 .map(|value| value.critical_percentage),
+            threshold_percentages: thresholds
+                .as_ref()
+                .ok()
+                .map(|value| value.percentages.clone()),
             threshold_source: thresholds
                 .as_ref()
                 .map(|value| value.source.as_str().to_owned())
@@ -9721,6 +9737,7 @@ pub struct ContextMonitorResult {
     pub enabled: bool,
     pub warning_percentage: Option<f64>,
     pub critical_percentage: Option<f64>,
+    pub threshold_percentages: Option<Vec<f64>>,
     pub threshold_source: String,
     pub enforced: bool,
 }
@@ -9997,6 +10014,10 @@ fn clear_stop_notify_raw(state: &mut Value, session_id: &str) -> Result<()> {
 fn reset_context_oneshot_flags(session: &mut Map<String, Value>) {
     session.insert("context_warning_sent".to_owned(), Value::Bool(false));
     session.insert("context_critical_sent".to_owned(), Value::Bool(false));
+    session.insert(
+        "context_reported_thresholds".to_owned(),
+        Value::Array(Vec::new()),
+    );
     session.insert("context_cycle_reset_emitted_at".to_owned(), Value::Null);
 }
 
@@ -10050,6 +10071,7 @@ fn format_percentage(value: f64) -> String {
     }
 }
 
+#[cfg(test)]
 fn format_thousands(value: i64) -> String {
     let negative = value < 0;
     let digits = value.unsigned_abs().to_string();
@@ -15272,6 +15294,10 @@ pub struct SessionRecord {
     pub context_monitor_notify: Option<String>,
     #[serde(default = "default_context_monitor_notify_source")]
     pub context_monitor_notify_source: String,
+    /// Optional ordered per-seat notification milestones. When absent, the
+    /// configured global milestone list (or the legacy pair) applies.
+    #[serde(default)]
+    pub context_monitor_threshold_percentages: Option<Vec<f64>>,
     /// Optional per-seat warning override. When absent, the configured global
     /// context-monitor warning threshold remains effective.
     #[serde(default)]
@@ -15943,10 +15969,6 @@ fn provider_has_measured_context_gauge(provider: &str) -> bool {
     matches!(provider.trim(), "claude" | "codex-fork")
 }
 
-fn provider_uses_native_context_compaction(provider: &str) -> bool {
-    matches!(provider.trim(), "codex" | "codex-fork" | "codex-app")
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextMonitorThresholdSource {
     Default,
@@ -15962,8 +15984,9 @@ impl ContextMonitorThresholdSource {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct EffectiveContextMonitorThresholds {
+    percentages: Vec<f64>,
     warning_percentage: f64,
     critical_percentage: f64,
     source: ContextMonitorThresholdSource,
@@ -15974,41 +15997,87 @@ struct EffectiveContextMonitorThresholds {
 /// authoritative. Invalid persisted or global values fail closed so status and
 /// alerting never claim an unenforceable policy is active.
 fn resolve_context_monitor_thresholds(
+    percentages_override: Option<Vec<f64>>,
     warning_override: Option<f64>,
     critical_override: Option<f64>,
     config: &ContextMonitorConfig,
 ) -> Result<EffectiveContextMonitorThresholds, String> {
-    let warning_percentage = warning_override.unwrap_or(config.warning_percentage);
-    let critical_percentage = critical_override.unwrap_or(config.critical_percentage);
-    for (name, value) in [
-        ("warning_percentage", warning_percentage),
-        ("critical_percentage", critical_percentage),
-    ] {
-        if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+    let has_custom_override =
+        percentages_override.is_some() || warning_override.is_some() || critical_override.is_some();
+    let configured_percentages = if config.threshold_percentages.is_empty() {
+        vec![config.warning_percentage, config.critical_percentage]
+    } else {
+        config.threshold_percentages.clone()
+    };
+    let percentages = if let Some(percentages) = percentages_override {
+        percentages
+    } else if warning_override.is_some() || critical_override.is_some() {
+        vec![
+            warning_override.unwrap_or(configured_percentages[0]),
+            critical_override.unwrap_or(
+                *configured_percentages
+                    .last()
+                    .expect("configured thresholds exist"),
+            ),
+        ]
+    } else {
+        configured_percentages
+    };
+    for value in &percentages {
+        if !value.is_finite() || !(0.0..=100.0).contains(value) {
             return Err(format!(
-                "{name} must be a finite percentage in the range (0, 100]"
+                "context-monitor thresholds must be finite percentages in the range (0, 100]"
             ));
         }
-        if value == 0.0 {
+        if *value == 0.0 {
             return Err(format!(
-                "{name} must be a finite percentage in the range (0, 100]"
+                "context-monitor thresholds must be finite percentages in the range (0, 100]"
             ));
         }
     }
-    if warning_percentage >= critical_percentage {
+    if percentages.is_empty() || percentages.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(
-            "warning_percentage must be strictly lower than critical_percentage".to_owned(),
+            "context-monitor thresholds must be non-empty and strictly increasing".to_owned(),
         );
     }
     Ok(EffectiveContextMonitorThresholds {
-        warning_percentage,
-        critical_percentage,
-        source: if warning_override.is_some() || critical_override.is_some() {
+        warning_percentage: percentages[0],
+        critical_percentage: *percentages.last().expect("non-empty thresholds checked"),
+        percentages,
+        source: if has_custom_override {
             ContextMonitorThresholdSource::Custom
         } else {
             ContextMonitorThresholdSource::Default
         },
     })
+}
+
+/// Read durable notification latches, translating the pre-list two-threshold
+/// representation exactly once for existing sessions.
+fn context_reported_thresholds(session: &Map<String, Value>, thresholds: &[f64]) -> Vec<f64> {
+    if let Some(values) = session
+        .get("context_reported_thresholds")
+        .and_then(Value::as_array)
+    {
+        return values.iter().filter_map(Value::as_f64).collect();
+    }
+    let mut reported = Vec::new();
+    if flag_is_set(session, "context_warning_sent") {
+        reported.push(thresholds[0]);
+    }
+    if flag_is_set(session, "context_critical_sent") {
+        let final_threshold = *thresholds.last().expect("non-empty thresholds checked");
+        if !reported.contains(&final_threshold) {
+            reported.push(final_threshold);
+        }
+    }
+    reported
+}
+
+fn json_percentages(value: Option<&Value>) -> Option<Vec<f64>> {
+    value
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_f64).collect::<Vec<_>>())
 }
 
 fn session_supports_reparent_consent(session: &SessionRecord) -> bool {
@@ -17043,6 +17112,7 @@ mod tests {
             context_monitor_enabled: false,
             context_monitor_notify: None,
             context_monitor_notify_source: default_context_monitor_notify_source(),
+            context_monitor_threshold_percentages: None,
             context_monitor_warning_percentage: None,
             context_monitor_critical_percentage: None,
             context_warning_sent: false,
@@ -20694,8 +20764,24 @@ mod tests {
             enabled: true,
             requester_session_id: "parent01".to_owned(),
             notify_session_id: Some("parent01".to_owned()),
+            threshold_percentages: None,
             warning_percentage,
             critical_percentage,
+            use_default_thresholds: false,
+        }
+    }
+
+    fn context_monitor_levels_request(
+        levels: Vec<f64>,
+        notify_session_id: &str,
+    ) -> ContextMonitorRequest {
+        ContextMonitorRequest {
+            enabled: true,
+            requester_session_id: "child001".to_owned(),
+            notify_session_id: Some(notify_session_id.to_owned()),
+            threshold_percentages: Some(levels),
+            warning_percentage: None,
+            critical_percentage: None,
             use_default_thresholds: false,
         }
     }
@@ -20728,6 +20814,57 @@ mod tests {
         assert!(session.context_warning_sent);
         assert!(!session.context_critical_sent);
         assert_eq!(context_monitor_messages(&store).len(), 1);
+    }
+
+    #[test]
+    fn context_monitor_reports_each_registered_level_without_prescribing_policy() {
+        let store = store_with_monitored_child("ctxlevels", true, Some("child001"));
+        store
+            .set_context_monitor(
+                "child001",
+                context_monitor_levels_request(vec![10.0, 20.0, 30.0], "child001"),
+            )
+            .unwrap();
+
+        store
+            .apply_context_usage_event(&usage_event("child001", 9.0, 18_000), None)
+            .unwrap();
+        assert!(context_monitor_messages(&store).is_empty());
+
+        store
+            .apply_context_usage_event(&usage_event("child001", 10.0, 20_000), None)
+            .unwrap();
+        let first = context_monitor_messages(&store);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["text"], "[sm context] Your context is now at 10%.");
+        assert!(!first[0]["text"].as_str().unwrap().contains("handoff"));
+        assert!(!first[0]["text"].as_str().unwrap().contains("critical"));
+
+        // A delayed status-line sample may cross multiple levels. It produces
+        // one factual reading and latches every crossed level, so later
+        // unchanged renders do not create stale alert bursts.
+        store
+            .apply_context_usage_event(&usage_event("child001", 25.0, 50_000), None)
+            .unwrap();
+        store
+            .apply_context_usage_event(&usage_event("child001", 25.0, 50_000), None)
+            .unwrap();
+        let messages = context_monitor_messages(&store);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[1]["text"],
+            "[sm context] Your context is now at 25%."
+        );
+
+        store
+            .apply_context_usage_event(&usage_event("child001", 30.0, 60_000), None)
+            .unwrap();
+        let messages = context_monitor_messages(&store);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages[2]["text"],
+            "[sm context] Your context is now at 30%."
+        );
     }
 
     #[test]
@@ -21001,6 +21138,7 @@ mod tests {
                     enabled: true,
                     requester_session_id: "parent01".to_owned(),
                     notify_session_id: Some("parent01".to_owned()),
+                    threshold_percentages: None,
                     warning_percentage: None,
                     critical_percentage: None,
                     use_default_thresholds: false,
@@ -21178,7 +21316,7 @@ mod tests {
     }
 
     #[test]
-    fn context_critical_fires_separately_from_the_warning() {
+    fn context_levels_notify_separately_without_priority_policy() {
         let store = store_with_monitored_child("ctxcrit", true, Some("parent01"));
         store
             .apply_context_usage_event(&usage_event("child001", 52.0, 104_000), None)
@@ -21196,7 +21334,7 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(
             messages[1].get("delivery_mode").and_then(Value::as_str),
-            Some("urgent")
+            Some("sequential")
         );
     }
 
@@ -21355,6 +21493,7 @@ mod tests {
             enabled: true,
             requester_session_id: "parent01".to_owned(),
             notify_session_id: Some("parent01".to_owned()),
+            threshold_percentages: None,
             warning_percentage: None,
             critical_percentage: None,
             use_default_thresholds: false,
@@ -21430,6 +21569,7 @@ mod tests {
                     enabled: true,
                     requester_session_id: "child001".to_owned(),
                     notify_session_id: Some("child001".to_owned()),
+                    threshold_percentages: None,
                     warning_percentage: None,
                     critical_percentage: None,
                     use_default_thresholds: false,
@@ -21457,8 +21597,8 @@ mod tests {
             .unwrap();
         let first_alert = context_monitor_messages(&store).pop().unwrap();
         let first_text = first_alert["text"].as_str().unwrap();
-        assert!(first_text.contains("Codex will compact inline"));
-        assert!(!first_text.contains("run `sm handoff <path>`"));
+        assert_eq!(first_text, "[sm context] Your context is now at 70.0%.");
+        assert!(!first_text.contains("handoff"));
         assert_eq!(
             queue
                 .pending_messages_for_target("child001", 10)
@@ -21526,6 +21666,7 @@ mod tests {
                     enabled: true,
                     requester_session_id: "child001".to_owned(),
                     notify_session_id: Some("child001".to_owned()),
+                    threshold_percentages: None,
                     warning_percentage: None,
                     critical_percentage: None,
                     use_default_thresholds: false,
@@ -21594,6 +21735,7 @@ mod tests {
                     enabled: true,
                     requester_session_id: "child001".to_owned(),
                     notify_session_id: Some("child001".to_owned()),
+                    threshold_percentages: None,
                     warning_percentage: None,
                     critical_percentage: None,
                     use_default_thresholds: false,
@@ -21622,6 +21764,7 @@ mod tests {
                         enabled: false,
                         requester_session_id: "child001".to_owned(),
                         notify_session_id: None,
+                        threshold_percentages: None,
                         warning_percentage: None,
                         critical_percentage: None,
                         use_default_thresholds: false,
@@ -21656,6 +21799,7 @@ mod tests {
                             enabled: true,
                             requester_session_id: "parent01".to_owned(),
                             notify_session_id: Some("parent01".to_owned()),
+                            threshold_percentages: None,
                             warning_percentage: None,
                             critical_percentage: None,
                             use_default_thresholds: false,
@@ -21678,6 +21822,7 @@ mod tests {
                         enabled: true,
                         requester_session_id: "parent01".to_owned(),
                         notify_session_id: Some("parent01".to_owned()),
+                        threshold_percentages: None,
                         warning_percentage: None,
                         critical_percentage: None,
                         use_default_thresholds: false,
@@ -21696,6 +21841,7 @@ mod tests {
                         enabled: true,
                         requester_session_id: "parent01".to_owned(),
                         notify_session_id: Some("parent01".to_owned()),
+                        threshold_percentages: None,
                         warning_percentage: None,
                         critical_percentage: None,
                         use_default_thresholds: false,

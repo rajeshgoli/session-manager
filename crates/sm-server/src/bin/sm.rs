@@ -360,6 +360,9 @@ struct TailArgs {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Destructive operation: after the current turn, this sends /clear to the calling Claude session and injects the handoff prompt."
+)]
 struct HandoffArgs {
     file_path: Option<String>,
 }
@@ -385,12 +388,12 @@ struct ContextMonitorArgs {
 enum ContextMonitorCommand {
     Enable {
         target: Option<String>,
-        /// Warning percentage for this seat (for example, 40).
+        /// Notification percentage for this seat. Repeat to register multiple
+        /// levels, for example: --threshold 10 --threshold 20 --threshold 30.
         #[arg(long, value_name = "PERCENT")]
-        threshold: Option<f64>,
-        /// Critical percentage for this seat. Defaults to the current global
-        /// critical threshold unless an existing seat override is present.
-        #[arg(long, value_name = "PERCENT")]
+        threshold: Vec<f64>,
+        /// Legacy second threshold. Prefer repeating --threshold instead.
+        #[arg(long, value_name = "PERCENT", conflicts_with = "threshold")]
         critical_threshold: Option<f64>,
         /// Clear seat-specific thresholds and use the server defaults.
         #[arg(long, conflicts_with_all = ["threshold", "critical_threshold"])]
@@ -980,7 +983,9 @@ fn run() -> Result<()> {
             match payload["status"].as_str() {
                 Some("executed") => println!("Handoff executed"),
                 Some("recorded") => println!("Handoff recorded"),
-                _ => println!("Handoff scheduled - will execute after current turn completes"),
+                _ => println!(
+                    "Handoff scheduled - after this turn it will /clear this session and inject the handoff prompt"
+                ),
             }
         }
         Command::TaskComplete(_) => {
@@ -3862,8 +3867,20 @@ fn run_context(client: &ApiClient, args: ContextArgs) -> Result<()> {
     let label = payload["friendly_name"].as_str().unwrap_or(session_id);
     let provider = payload["provider"].as_str().unwrap_or("-");
     let state = payload["state"].as_str().unwrap_or("unknown");
-    let warning = format_context_percentage(payload.get("warning_percentage"));
-    let critical = format_context_percentage(payload.get("critical_percentage"));
+    let levels = payload["threshold_percentages"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| format_context_percentage(Some(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| {
+            let warning = format_context_percentage(payload.get("warning_percentage"));
+            let critical = format_context_percentage(payload.get("critical_percentage"));
+            format!("{warning}, {critical}")
+        });
     let notify = payload["notify_session_id"].as_str();
     let notify_text = match notify {
         Some(value) if value == session_id => "self".to_owned(),
@@ -3899,7 +3916,7 @@ fn run_context(client: &ApiClient, args: ContextArgs) -> Result<()> {
         payload["lifecycle_status"].as_str().unwrap_or("unknown")
     );
     println!(
-        "State: {state} (warning {warning}, critical {critical}; {})",
+        "State: {state} (levels {levels}; {})",
         payload["threshold_source"].as_str().unwrap_or("unknown")
     );
     println!("Monitor: {monitor}, alerts -> {notify_text}");
@@ -4058,7 +4075,8 @@ fn run_context_monitor(client: &ApiClient, args: ContextMonitorArgs) -> Result<(
                     "enabled": true,
                     "requester_session_id": requester,
                     "notify_session_id": requester,
-                    "warning_percentage": threshold,
+                    "threshold_percentages": (!threshold.is_empty()).then_some(threshold),
+                    "warning_percentage": null,
                     "critical_percentage": critical_threshold,
                     "use_default_thresholds": use_default_thresholds
                 }),
@@ -4107,10 +4125,22 @@ fn format_context_monitor_thresholds(payload: &Value) -> String {
     if payload["enforced"].as_bool() != Some(true) {
         return "INVALID / NOT ENFORCED".to_owned();
     }
-    let warning = format_context_percentage(payload.get("warning_percentage"));
-    let critical = format_context_percentage(payload.get("critical_percentage"));
     let source = payload["threshold_source"].as_str().unwrap_or("unknown");
-    format!("{warning} warning / {critical} critical ({source})")
+    let levels = payload["threshold_percentages"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| format_context_percentage(Some(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_else(|| {
+            let warning = format_context_percentage(payload.get("warning_percentage"));
+            let critical = format_context_percentage(payload.get("critical_percentage"));
+            format!("{warning}, {critical}")
+        });
+    format!("{levels} ({source})")
 }
 
 fn lookup_identifier(client: &ApiClient, identifier: &str) -> Result<Option<String>> {
@@ -7186,7 +7216,7 @@ mod tests {
                 "critical_percentage": 75.0,
                 "threshold_source": "default"
             })),
-            "65% warning / 75% critical (default)"
+            "65%, 75% (default)"
         );
         assert_eq!(
             format_context_monitor_thresholds(&json!({
@@ -7195,7 +7225,7 @@ mod tests {
                 "critical_percentage": 60.0,
                 "threshold_source": "custom"
             })),
-            "40% warning / 60% critical (custom)"
+            "40%, 60% (custom)"
         );
         assert_eq!(
             format_context_monitor_thresholds(&json!({

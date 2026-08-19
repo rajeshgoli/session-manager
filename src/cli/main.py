@@ -831,7 +831,14 @@ def main():
     )
 
     # sm handoff <file_path>
-    handoff_parser = subparsers.add_parser("handoff", help="Self-directed context rotation via handoff doc")
+    handoff_parser = subparsers.add_parser(
+        "handoff",
+        help="Destructive self-directed context rotation via handoff doc",
+        description=(
+            "After the current turn, this sends /clear to the calling Claude session "
+            "and injects the handoff prompt."
+        ),
+    )
     handoff_parser.add_argument("file_path", help="Path to handoff document")
 
     # sm task-complete

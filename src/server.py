@@ -9201,17 +9201,10 @@ Provide ONLY the summary, no preamble or questions."""
                 if queue_mgr:
                     is_self_alert = (session.context_monitor_notify == session.id)
                     if is_self_alert:
-                        msg = (
-                            f"[sm context] Context at {used_pct}% — critically high. "
-                            "Write your handoff doc NOW and run `sm handoff <path>`. "
-                            "Compaction is imminent."
-                        )
+                        msg = f"[sm context] Your context is now at {used_pct}%."
                     else:
                         child_label = _effective_session_name(session)
-                        msg = (
-                            f"[sm context] Child {child_label} ({session.id}) context at {used_pct}% — critically high. "
-                            "Compaction is imminent."
-                        )
+                        msg = f"[sm context] Context for {child_label} ({session.id}) is now at {used_pct}%."
                     queue_mgr.queue_message(
                         target_session_id=session.context_monitor_notify,
                         text=msg,
@@ -9226,14 +9219,10 @@ Provide ONLY the summary, no preamble or questions."""
                 if queue_mgr:
                     is_self_alert = (session.context_monitor_notify == session.id)
                     if is_self_alert:
-                        total = data.get("total_input_tokens", 0)
-                        msg = (
-                            f"[sm context] Context at {used_pct}% ({total:,} tokens). "
-                            "Consider writing a handoff doc and running `sm handoff <path>`."
-                        )
+                        msg = f"[sm context] Your context is now at {used_pct}%."
                     else:
                         child_label = _effective_session_name(session)
-                        msg = f"[sm context] Child {child_label} ({session.id}) context at {used_pct}%."
+                        msg = f"[sm context] Context for {child_label} ({session.id}) is now at {used_pct}%."
                     queue_mgr.queue_message(
                         target_session_id=session.context_monitor_notify,
                         text=msg,
