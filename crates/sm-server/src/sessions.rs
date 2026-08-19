@@ -3764,7 +3764,7 @@ impl SessionStore {
                     .unwrap_or_else(default_node);
                 if is_primary_node(&node) {
                     drain_pending_runtime_messages_raw(
-                        self, &mut state, target, runtime, queue, None, None, None,
+                        self, &mut state, target, runtime, queue, None, None, None, false,
                     )?;
                 }
             }
@@ -4600,6 +4600,7 @@ impl SessionStore {
                         },
                         None,
                         Some(&message_id),
+                        false,
                     )?
                 };
                 self.write_raw_json_value(&state)?;
@@ -4852,6 +4853,7 @@ impl SessionStore {
                 None,
                 message_category,
                 None,
+                false,
             )?;
             self.write_raw_json_value(&state)?;
         }
@@ -4872,7 +4874,7 @@ impl SessionStore {
             return Ok(false);
         }
         drain_pending_runtime_messages_raw(
-            self, &mut state, session_id, runtime, queue, None, None, None,
+            self, &mut state, session_id, runtime, queue, None, None, None, true,
         )?;
         self.write_raw_json_value(&state)?;
         Ok(true)
@@ -6217,6 +6219,7 @@ impl SessionStore {
                         None,
                         None,
                         Some(&message_id),
+                        false,
                     )?;
                 }
             }
@@ -7786,6 +7789,7 @@ impl SessionStore {
                                 Some("important"),
                                 None,
                                 Some(&message_id),
+                                false,
                             )?;
                             if drain
                                 .delivered_message_ids
@@ -10493,7 +10497,7 @@ fn runtime_session_accepts_background_delivery_raw(
     if raw_session_is_stopped(session) {
         return Ok(false);
     }
-    if claude_handoff_is_reserved_raw(session) {
+    if claude_handoff_is_pending_raw(session) {
         return Ok(false);
     }
     let tmux_session = json_text(session.get("tmux_session"))
@@ -10511,6 +10515,25 @@ fn deliver_runtime_text_to_session_raw(
     text: &str,
     runtime: &TmuxRuntime,
 ) -> Result<(String, bool)> {
+    deliver_runtime_text_to_session_with_ready_fence_raw(state, session_id, text, runtime, false)
+}
+
+fn deliver_runtime_background_text_to_session_raw(
+    state: &mut Value,
+    session_id: &str,
+    text: &str,
+    runtime: &TmuxRuntime,
+) -> Result<(String, bool)> {
+    deliver_runtime_text_to_session_with_ready_fence_raw(state, session_id, text, runtime, true)
+}
+
+fn deliver_runtime_text_to_session_with_ready_fence_raw(
+    state: &mut Value,
+    session_id: &str,
+    text: &str,
+    runtime: &TmuxRuntime,
+    require_ready_fence: bool,
+) -> Result<(String, bool)> {
     let (mut status, delivered, terminal_delivery_failure) = {
         let sessions = ensure_sessions_array_mut(state)?;
         let session = session_object_mut(sessions, session_id)
@@ -10518,23 +10541,42 @@ fn deliver_runtime_text_to_session_raw(
         let node = json_text(session.get("node")).unwrap_or_else(default_node);
         ensure_runtime_local_node(&node)?;
         let status = effective_raw_session_status(session);
-        if raw_session_is_stopped(session) || claude_handoff_is_reserved_raw(session) {
+        if raw_session_is_stopped(session) || claude_handoff_is_pending_raw(session) {
             return Ok((status, false));
         }
         let tmux_session = json_text(session.get("tmux_session"))
             .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+        let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
         let session_socket_name = json_text(session.get("tmux_socket_name"));
         let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
+        let _input_guard = require_ready_fence
+            .then(|| session_runtime.lock_session_input(&tmux_session))
+            .transpose()?;
+        if require_ready_fence && !session_runtime.session_input_ready(&tmux_session, &provider) {
+            return Ok((status, false));
+        }
         let (delivered, mark_stopped_on_failure) =
             match deliver_codex_fork_control_text_to_session_raw(
                 session_id, session, text, runtime,
             )? {
                 Some(true) => (true, true),
                 Some(false) if runtime.codex_fork_control_tmux_fallback_enabled() => {
-                    (session_runtime.send_input(&tmux_session, text)?, true)
+                    let delivered = if require_ready_fence {
+                        session_runtime.send_input_while_locked(&tmux_session, text)?
+                    } else {
+                        session_runtime.send_input(&tmux_session, text)?
+                    };
+                    (delivered, true)
                 }
                 Some(false) => (false, false),
-                None => (session_runtime.send_input(&tmux_session, text)?, true),
+                None => {
+                    let delivered = if require_ready_fence {
+                        session_runtime.send_input_while_locked(&tmux_session, text)?
+                    } else {
+                        session_runtime.send_input(&tmux_session, text)?
+                    };
+                    (delivered, true)
+                }
             };
         if delivered {
             mark_session_followup_activity(session, &now_rfc3339());
@@ -10568,7 +10610,7 @@ fn deliver_urgent_runtime_text_to_session_raw(
         let node = json_text(session.get("node")).unwrap_or_else(default_node);
         ensure_runtime_local_node(&node)?;
         let status = effective_raw_session_status(session);
-        if raw_session_is_stopped(session) || claude_handoff_is_reserved_raw(session) {
+        if raw_session_is_stopped(session) || claude_handoff_is_pending_raw(session) {
             return Ok((status, false));
         }
         let tmux_session = json_text(session.get("tmux_session"))
@@ -10633,7 +10675,7 @@ fn deliver_runtime_native_rename_to_session_raw(
     if raw_session_is_stopped(session) {
         return Ok((status, false));
     }
-    if claude_handoff_is_reserved_raw(session) {
+    if claude_handoff_is_pending_raw(session) {
         return Ok((status, false));
     }
     let Some(friendly_name) = extract_provider_native_rename_name(text) else {
@@ -11054,9 +11096,10 @@ fn clear_claude_handoff_error_raw(session: &mut Map<String, Value>) {
     }
 }
 
-fn claude_handoff_is_reserved_raw(session: &Map<String, Value>) -> bool {
+fn claude_handoff_is_pending_raw(session: &Map<String, Value>) -> bool {
     json_text(session.get("provider")).as_deref() == Some("claude")
-        && json_text(session.get("claude_handoff_in_progress_at")).is_some()
+        && json_text(session.get("pending_handoff_path")).is_some()
+        && json_text(session.get("pending_handoff_recorded_at")).is_some()
 }
 
 fn claude_handoff_reservation_replaced_raw(
@@ -11121,6 +11164,7 @@ fn drain_pending_runtime_messages_raw(
     delivery_mode_filter: Option<&str>,
     message_category_filter: Option<&str>,
     stop_after_message_id: Option<&str>,
+    require_ready_fence: bool,
 ) -> Result<QueueDrainResult> {
     let mut status =
         runtime_session_status_raw(state, session_id)?.unwrap_or_else(|| "stopped".to_owned());
@@ -11141,16 +11185,32 @@ fn drain_pending_runtime_messages_raw(
 
         let mut should_continue = true;
         for message in messages {
-            let (next_status, delivered) =
-                if message.message_category.as_deref() == Some("native_rename") {
-                    deliver_runtime_native_rename_to_session_raw(
-                        state,
-                        session_id,
-                        &message.text,
-                        runtime,
-                    )?
-                } else if normalized_delivery_mode(&message.delivery_mode) == "urgent" {
-                    deliver_urgent_runtime_text_to_session_raw(
+            let (next_status, delivered) = if require_ready_fence
+                && (message.message_category.as_deref() == Some("native_rename")
+                    || normalized_delivery_mode(&message.delivery_mode) == "urgent")
+            {
+                // The completion reconciler owns only background delivery. It
+                // must not repurpose an urgent or provider-control message as
+                // an unfenced predecessor while it holds the live readiness
+                // proof for a sequential completion wake.
+                (status.clone(), false)
+            } else if message.message_category.as_deref() == Some("native_rename") {
+                deliver_runtime_native_rename_to_session_raw(
+                    state,
+                    session_id,
+                    &message.text,
+                    runtime,
+                )?
+            } else if normalized_delivery_mode(&message.delivery_mode) == "urgent" {
+                deliver_urgent_runtime_text_to_session_raw(
+                    state,
+                    session_id,
+                    &message.text,
+                    runtime,
+                )?
+            } else {
+                if require_ready_fence {
+                    deliver_runtime_background_text_to_session_raw(
                         state,
                         session_id,
                         &message.text,
@@ -11158,7 +11218,8 @@ fn drain_pending_runtime_messages_raw(
                     )?
                 } else {
                     deliver_runtime_text_to_session_raw(state, session_id, &message.text, runtime)?
-                };
+                }
+            };
             status = next_status;
             if !delivered {
                 should_continue = false;
@@ -11281,6 +11342,7 @@ fn complete_runtime_message_delivery_raw(
                 Some("sequential"),
                 None,
                 None,
+                false,
             )?;
         }
     }
@@ -11451,6 +11513,7 @@ fn enqueue_stop_notification_raw(
             Some("important"),
             None,
             None,
+            false,
         )?;
     }
     Ok(())
@@ -17802,6 +17865,62 @@ mod tests {
                 .len(),
             1
         );
+        assert!(pane.input_lines().is_empty());
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn completion_reconciler_retains_ready_target_with_pending_claude_handoff() {
+        let pane = queue_completion_test_pane(true);
+        let (store, queue, state_file, queue_db) = queue_completion_test_store(&pane, "running");
+        let mut state: Value =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        let session = state["sessions"][0].as_object_mut().unwrap();
+        session.insert(
+            "pending_handoff_path".to_owned(),
+            Value::String("/tmp/queued-handoff.md".to_owned()),
+        );
+        session.insert(
+            "pending_handoff_recorded_at".to_owned(),
+            Value::String("2026-06-01T00:02:00Z".to_owned()),
+        );
+        fs::write(&state_file, state.to_string()).unwrap();
+        enqueue_queue_completion(&queue, "queue-completion-pending-handoff");
+
+        store
+            .drain_runtime_pending_message_targets_by_category("queue-completion")
+            .unwrap();
+
+        assert_eq!(
+            queue
+                .pending_messages_for_target_by_category("queue-target", "queue-completion", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(pane.input_lines().is_empty());
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn background_delivery_rechecks_provider_ready_state_under_input_lock() {
+        let pane = queue_completion_test_pane(false);
+        let (_store, _queue, state_file, queue_db) = queue_completion_test_store(&pane, "running");
+        let mut state: Value =
+            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+
+        let (status, delivered) = deliver_runtime_background_text_to_session_raw(
+            &mut state,
+            "queue-target",
+            "[sm queue] stale readiness proof must not inject",
+            &pane.runtime,
+        )
+        .unwrap();
+
+        assert_eq!(status, "running");
+        assert!(!delivered);
         assert!(pane.input_lines().is_empty());
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
