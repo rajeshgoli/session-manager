@@ -11409,8 +11409,10 @@ async fn fixture_core_session_graph_endpoints_round_trip_state() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload, json!({ "status": "ok", "enabled": false }));
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(payload["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("no measured context gauge")));
 
     let (status, payload) = get_json(app.clone(), "/sessions/context-monitor").await;
     assert_eq!(status, StatusCode::OK);
