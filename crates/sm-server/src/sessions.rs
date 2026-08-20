@@ -16856,7 +16856,7 @@ mod tests {
             &tmux,
             r#"#!/bin/sh
 case "$1" in
-  kill-session) echo "permission denied while contacting tmux server" >&2; exit 1 ;;
+  kill-session) echo "error connecting to /tmp/tmux-501/codex-fork-restore01 (No such file or directory)" >&2; exit 1 ;;
   *) exit 99 ;;
 esac
 "#,
@@ -16894,7 +16894,7 @@ esac
         let error = store
             .restore_core_session_with_runtime("restore01", &runtime)
             .unwrap_err();
-        assert!(error.to_string().contains("permission denied"));
+        assert!(error.to_string().contains("No such file or directory"));
 
         let state = store.load_raw_json_value().unwrap();
         let session = &state["sessions"][0];
@@ -16905,12 +16905,12 @@ esac
         assert!(session["error_message"]
             .as_str()
             .unwrap()
-            .contains("permission denied"));
+            .contains("No such file or directory"));
         assert_eq!(state["session_runtime_launches"][0]["status"], "failed");
         assert!(state["session_runtime_launches"][0]["failure_reason"]
             .as_str()
             .unwrap()
-            .contains("permission denied"));
+            .contains("No such file or directory"));
         assert!(matches!(
             store
                 .restore_core_session_with_runtime("restore01", &runtime)
@@ -17170,6 +17170,33 @@ esac
         (socket_name, runtime)
     }
 
+    fn authoritative_absent_target_test_tmux_runtime() -> (String, TmuxRuntime, PathBuf) {
+        let root = unique_temp_path("tmux-authoritative-absent-target");
+        fs::create_dir_all(&root).unwrap();
+        let tmux = root.join("tmux");
+        fs::write(
+            &tmux,
+            r#"#!/bin/sh
+if [ "$1" = "-L" ]; then
+  shift 2
+fi
+case "$1" in
+  has-session) echo "can't find session: $3" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        let socket_name = "sm-test-known-absent".to_owned();
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
+            .with_tmux_binary_for_test(tmux.display().to_string())
+            .for_socket_name(Some(&socket_name));
+        (socket_name, runtime, root)
+    }
+
     #[test]
     fn credential_rotation_stopped_before_admission_is_first_call_truthful_and_idempotent() {
         let state_file = unique_temp_path("credential-rotation-stopped-admission");
@@ -17204,7 +17231,7 @@ esac
         // Deliberately stale-looking log content is present but is not read by
         // admission; only the missing tmux runtime decides terminal liveness.
         state["sessions"][0]["log_file"] = json!("/tmp/stale-auth-scrollback.log");
-        let (tmux_socket_name, runtime) = isolated_test_tmux_runtime();
+        let (tmux_socket_name, runtime, root) = authoritative_absent_target_test_tmux_runtime();
         state["sessions"][0]["tmux_socket_name"] = json!(tmux_socket_name);
         fs::write(&state_file, state.to_string()).unwrap();
         let store = SessionStore::new(state_file.clone()).with_delivery_runtime(Some(runtime));
@@ -17220,6 +17247,7 @@ esac
             .unwrap()
             .is_empty());
         let _ = fs::remove_file(state_file);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -17241,7 +17269,7 @@ esac
     #[test]
     fn credential_rotation_send_undeliverable_finalizes_waiting_record() {
         let mut state = terminal_rotation_fixture("waiting_idle", None);
-        let (tmux_socket_name, runtime) = isolated_test_tmux_runtime();
+        let (tmux_socket_name, runtime, root) = authoritative_absent_target_test_tmux_runtime();
         state["sessions"][0]["tmux_socket_name"] = json!(tmux_socket_name);
 
         let (status, delivered) =
@@ -17255,6 +17283,7 @@ esac
             state["session_credential_rotations"][0]["failure_reason"],
             "target_terminal"
         );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

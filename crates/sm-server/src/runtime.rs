@@ -1708,12 +1708,12 @@ fn is_tmux_session_gone_error(error: &anyhow::Error) -> bool {
 }
 
 fn is_tmux_session_gone_message(message: &str) -> bool {
+    // A missing socket is deliberately not an absent-target signal: a live
+    // tmux server can recreate an accidentally unlinked socket on SIGUSR1.
     message.contains("no server running")
         || message.contains("can't find session")
         || message.contains("no current target")
         || message.contains("server exited unexpectedly")
-        || (message.contains("error connecting to ")
-            && message.contains("No such file or directory"))
 }
 
 fn shell_quote_path(path: &Path) -> String {
@@ -2658,10 +2658,41 @@ esac
     }
 
     #[test]
+    fn kill_session_rejects_a_missing_socket_as_a_transport_failure() {
+        let (tmux_binary, _log_path, _temp_dir) = fake_tmux_binary();
+        fs::write(
+            &tmux_binary,
+            r#"#!/bin/sh
+if [ "$1" = "-L" ]; then
+  shift 2
+fi
+case "$1" in
+  kill-session)
+    echo "error connecting to /tmp/tmux-501/sm-test (No such file or directory)" >&2
+    exit 1
+    ;;
+  *) exit 0 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux_binary, permissions).unwrap();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        let error = runtime.kill_session("sm-test").unwrap_err();
+        assert!(error.to_string().contains("error connecting to"));
+        assert!(error.to_string().contains("No such file or directory"));
+    }
+
+    #[test]
     fn session_exists_rejects_permission_socket_and_transport_failures() {
         for failure in [
             "permission denied while contacting tmux server",
             "error connecting to /tmp/tmux-501/default: Connection refused",
+            "error connecting to /tmp/tmux-501/sm-test (No such file or directory)",
             "lost server connection",
         ] {
             let (tmux_binary, _log_path, _temp_dir) = fake_tmux_binary();
