@@ -17371,6 +17371,7 @@ esac
         let tmux_log = root.join("tmux.log");
         let old_credential_sha256 = sha256_text("old-runtime-secret");
         let state_file = root.join("sessions.json");
+        let provider_launch_state_file = root.join("provider-launch-state.json");
         fs::write(
             &tmux,
             format!(
@@ -17383,13 +17384,19 @@ case "$1" in
     exit 1
     ;;
   has-session) exit 1 ;;
-  new-session) echo "provider launch rejected by fixture" >&2; exit 1 ;;
+  new-session)
+    cp '{}' '{}' || {{ echo "could not capture provider-launch state" >&2; exit 97; }}
+    echo "provider launch rejected by fixture" >&2
+    exit 1
+    ;;
   *) exit 0 ;;
 esac
 "#,
                 tmux_log.display(),
                 old_credential_sha256,
-                state_file.display()
+                state_file.display(),
+                state_file.display(),
+                provider_launch_state_file.display()
             ),
         )
         .unwrap();
@@ -17427,6 +17434,20 @@ esac
         assert!(error
             .to_string()
             .contains("provider launch rejected by fixture"));
+
+        let provider_launch_state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&provider_launch_state_file).unwrap())
+                .unwrap();
+        let provider_launch_session = &provider_launch_state["sessions"][0];
+        let provider_launch = &provider_launch_state["session_runtime_launches"][0];
+        assert_ne!(
+            provider_launch_session["session_credential_sha256"],
+            old_credential_sha256
+        );
+        assert_eq!(
+            provider_launch_session["session_credential_sha256"],
+            provider_launch["credential_sha256"]
+        );
 
         let state = store.load_raw_json_value().unwrap();
         let session = &state["sessions"][0];
