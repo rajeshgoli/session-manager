@@ -793,9 +793,11 @@ impl TmuxRuntime {
     }
 
     pub fn kill_session(&self, tmux_session: &str) -> Result<bool> {
-        if !self.session_exists(tmux_session)? {
-            return Ok(false);
-        }
+        // Do not preflight this with `has-session`: its nonzero status can
+        // mean either a genuinely absent target or that tmux could not be
+        // reached.  `kill-session` gives us the authoritative result for the
+        // operation we need to perform, and its known absent-target errors
+        // remain safely idempotent.
         match self.run_tmux(["kill-session", "-t", tmux_session]) {
             Ok(()) => Ok(true),
             // `kill_session` is intentionally idempotent. The session may
@@ -828,7 +830,14 @@ impl TmuxRuntime {
             .stderr(Stdio::piped())
             .output()
             .with_context(|| "failed to run tmux has-session")?;
-        Ok(output.status.success())
+        if output.status.success() {
+            return Ok(true);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_tmux_session_gone_message(&stderr) {
+            return Ok(false);
+        }
+        bail!("tmux has-session failed: {}", stderr.trim());
     }
 
     fn create_session_with_bootstrap(&self, spec: &TmuxSessionSpec, command: &str) -> Result<()> {
@@ -1690,11 +1699,16 @@ fn duration_from_seconds(seconds: f64) -> Duration {
 }
 
 fn is_tmux_session_gone_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
+    is_tmux_session_gone_message(&error.to_string())
+}
+
+fn is_tmux_session_gone_message(message: &str) -> bool {
     message.contains("no server running")
         || message.contains("can't find session")
         || message.contains("no current target")
         || message.contains("server exited unexpectedly")
+        || (message.contains("error connecting to ")
+            && message.contains("No such file or directory"))
 }
 
 fn shell_quote_path(path: &Path) -> String {
@@ -2611,6 +2625,32 @@ esac
     }
 
     #[test]
+    fn session_exists_rejects_tmux_transport_failures() {
+        let (tmux_binary, _log_path, _temp_dir) = fake_tmux_binary();
+        fs::write(
+            &tmux_binary,
+            r#"#!/bin/sh
+if [ "$1" = "-L" ]; then
+  shift 2
+fi
+case "$1" in
+  has-session) echo "permission denied while contacting tmux server" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux_binary, permissions).unwrap();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        let error = runtime.session_exists("sm-test").unwrap_err();
+        assert!(error.to_string().contains("permission denied"));
+    }
+
+    #[test]
     fn set_status_bar_updates_tmux_status_left() {
         let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary();
         let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
@@ -3207,7 +3247,12 @@ if [ "$1" = "-L" ]; then
   shift 2
 fi
 case "$1" in
-  has-session) exit {} ;;
+  has-session)
+    if [ {} -ne 0 ]; then
+      echo "can't find session: sm-test" >&2
+    fi
+    exit {}
+    ;;
   display-message) echo 0; exit 0 ;;
   capture-pane) printf 'ready\n>\n'; exit 0 ;;
   show-options) exit 0 ;;
@@ -3215,6 +3260,7 @@ case "$1" in
 esac
 "#,
                 log_path.display(),
+                if has_session { 0 } else { 1 },
                 if has_session { 0 } else { 1 }
             ),
         )

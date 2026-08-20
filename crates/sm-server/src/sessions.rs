@@ -5730,6 +5730,7 @@ impl SessionStore {
                 CODEX_FORK_THREAD_STARTED_TIMEOUT,
                 session_runtime.startup_settle_duration(),
                 || session_runtime.session_exists(&record.tmux_session),
+                || session_runtime.accept_codex_directory_trust_prompt(&record.tmux_session),
             ) {
                 if let Err(teardown_error) = session_runtime.kill_session(&record.tmux_session) {
                     mark_runtime_launch_teardown_failed(
@@ -8968,21 +8969,24 @@ fn wait_for_codex_fork_provider_resume_id_after_offset(
 /// did not immediately disappear. Unlike a fresh launch, a restore must never
 /// accept a newly-created root thread in place of the identity it was asked to
 /// resume.
-fn wait_for_codex_fork_restore_acceptance<F>(
+fn wait_for_codex_fork_restore_acceptance<F, H>(
     event_stream_path: &Path,
     initial_offset: u64,
     expected_provider_resume_id: &str,
     timeout: Duration,
     liveness_window: Duration,
     mut runtime_is_live: F,
+    mut handle_startup_prompt: H,
 ) -> Result<()>
 where
     F: FnMut() -> Result<bool>,
+    H: FnMut() -> Result<bool>,
 {
     let started = Instant::now();
     let mut accepted_at = None;
     let mut offset = initial_offset;
     let mut buffer = String::new();
+    let mut directory_trust_accepted = false;
     loop {
         if !runtime_is_live()? {
             anyhow::bail!(
@@ -9012,6 +9016,9 @@ where
                     accepted_at.get_or_insert_with(Instant::now);
                 }
             }
+        }
+        if !directory_trust_accepted {
+            directory_trust_accepted = handle_startup_prompt()?;
         }
         if let Some(accepted_at) = accepted_at {
             if accepted_at.elapsed() >= liveness_window {
@@ -20195,9 +20202,44 @@ mod tests {
             Duration::from_millis(50),
             Duration::ZERO,
             || Ok(true),
+            || Ok(false),
         )
         .unwrap();
 
+        let _ = fs::remove_file(event_stream_path);
+    }
+
+    #[test]
+    fn codex_fork_restore_acceptance_accepts_directory_trust_before_thread_start() {
+        let event_stream_path = unique_temp_path("codex-restore-trust-events");
+        fs::write(&event_stream_path, "").unwrap();
+        let writer_path = event_stream_path.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(125));
+            fs::write(
+                writer_path,
+                "{\"event_type\":\"thread_started\",\"payload\":{\"thread\":{\"id\":\"durable-root\"}}}\n",
+            )
+            .unwrap();
+        });
+        let mut prompt_checks = 0;
+
+        wait_for_codex_fork_restore_acceptance(
+            &event_stream_path,
+            0,
+            "durable-root",
+            Duration::from_secs(1),
+            Duration::ZERO,
+            || Ok(true),
+            || {
+                prompt_checks += 1;
+                Ok(true)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(prompt_checks, 1);
+        writer.join().unwrap();
         let _ = fs::remove_file(event_stream_path);
     }
 
@@ -20219,6 +20261,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::ZERO,
             || Ok(true),
+            || Ok(false),
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("provider ended"));
@@ -20242,6 +20285,7 @@ mod tests {
             Duration::from_millis(50),
             Duration::ZERO,
             || Ok(true),
+            || Ok(false),
         )
         .unwrap_err();
         assert!(mismatch
@@ -20257,6 +20301,7 @@ mod tests {
             Duration::ZERO,
             Duration::ZERO,
             || Ok(true),
+            || Ok(false),
         )
         .unwrap_err();
         assert!(timeout.to_string().contains("timed out waiting"));
@@ -20267,6 +20312,7 @@ mod tests {
             "durable-root",
             Duration::from_millis(50),
             Duration::ZERO,
+            || Ok(false),
             || Ok(false),
         )
         .unwrap_err();
