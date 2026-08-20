@@ -15029,7 +15029,30 @@ async fn runtime_core_claude_handoff_executes_after_stop_without_interrupting_ac
         json!({
             "session_id": "runtimehandoff",
             "event": "context_reset",
-            "sm_hook_emitted_at": "2026-08-11T20:00:01.000000Z"
+            "sm_hook_emitted_at": "2020-01-01T00:00:00.000000Z"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "flags_reset");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (status, output) = get_json(app.clone(), "/sessions/runtimehandoff/output?lines=20").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!output["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("continue from where you left off"));
+
+    let reset_emitted_at = (time::OffsetDateTime::now_utc() + time::Duration::seconds(1))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/context-usage",
+        json!({
+            "session_id": "runtimehandoff",
+            "event": "context_reset",
+            "sm_hook_emitted_at": reset_emitted_at
         }),
     )
     .await;
@@ -15259,13 +15282,16 @@ async fn runtime_core_claude_handoff_failure_retains_pending_and_restart_recover
         .as_str()
         .unwrap_or_default()
         .contains("continue from where you left off"));
+    let reset_emitted_at = (time::OffsetDateTime::now_utc() + time::Duration::seconds(1))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
     let (status, payload) = post_json(
         restarted.clone(),
         "/hooks/context-usage",
         json!({
             "session_id": "runtimehandoffrecovery",
             "event": "context_reset",
-            "sm_hook_emitted_at": "2026-08-11T20:00:02.000000Z"
+            "sm_hook_emitted_at": reset_emitted_at
         }),
     )
     .await;

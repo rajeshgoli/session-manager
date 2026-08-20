@@ -6859,7 +6859,13 @@ impl SessionStore {
             return Ok(false);
         }
         let reset_emitted_at = json_text(session.get("context_cycle_reset_emitted_at"));
-        Ok(reset_emitted_at.is_some() && reset_emitted_at.as_deref() != previous_reset_emitted_at)
+        let reset_is_new = reset_emitted_at.as_deref() != previous_reset_emitted_at;
+        let reset_follows_reservation = reset_emitted_at
+            .as_deref()
+            .and_then(parse_timestamp)
+            .zip(parse_timestamp(reservation_at))
+            .is_some_and(|(reset, reservation)| reset > reservation);
+        Ok(reset_is_new && reset_follows_reservation)
     }
 
     fn execute_pending_claude_handoff(&self, session_id: &str) -> Result<bool> {
