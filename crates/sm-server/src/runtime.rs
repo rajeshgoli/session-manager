@@ -25,6 +25,8 @@ const DEFAULT_SEND_KEYS_MAX_CHUNK_CHARS: usize = 4096;
 const CODEX_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_INITIAL_BRIEF_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_INITIAL_BRIEF_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+const SERVER_ANCHOR_SESSION: &str = "__sm_server_anchor";
+const SERVER_ANCHOR_COMMAND: &str = "sleep 315360000";
 static SESSION_INPUT_LOCKS: OnceLock<Mutex<HashMap<String, Weak<SessionInputLock>>>> =
     OnceLock::new();
 
@@ -449,6 +451,8 @@ impl TmuxRuntime {
             &spec.session_id,
             spec.session_credential.as_deref(),
         );
+
+        self.ensure_server_anchor()?;
 
         let create_result = if self.tmux_history_limit.is_some()
             || (self.socket_name.is_some() && self.tmux_native_scrollback)
@@ -875,6 +879,60 @@ impl TmuxRuntime {
                 reason: error.to_string(),
             },
         }
+    }
+
+    /// Keep a configured shared tmux server under an SM-owned neutral argv.
+    ///
+    /// tmux retains the argv of the command that first created its server. If
+    /// that command names an agent session, process cleanup can mistake the
+    /// server itself for that agent and kill every session on the socket. The
+    /// anchor also keeps the server reachable after the last agent exits.
+    fn ensure_server_anchor(&self) -> Result<()> {
+        if self.socket_name.is_none() {
+            return Ok(());
+        }
+        let exact_anchor = format!("={SERVER_ANCHOR_SESSION}");
+        if self
+            .tmux_command(["has-session", "-t", exact_anchor.as_str()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| "failed to check tmux server anchor")?
+            .success()
+        {
+            return Ok(());
+        }
+
+        let anchor_cwd = env::temp_dir();
+        let create_result = self.run_tmux([
+            "new-session",
+            "-d",
+            "-s",
+            SERVER_ANCHOR_SESSION,
+            "-n",
+            "anchor",
+            "-c",
+            anchor_cwd.to_string_lossy().as_ref(),
+            SERVER_ANCHOR_COMMAND,
+        ]);
+        if create_result.is_ok() {
+            return Ok(());
+        }
+
+        // Another concurrent creator may have won between the exact check and
+        // `new-session`. Verify the invariant instead of parsing localized
+        // duplicate-session stderr.
+        if self
+            .tmux_command(["has-session", "-t", exact_anchor.as_str()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| "failed to verify tmux server anchor after create race")?
+            .success()
+        {
+            return Ok(());
+        }
+        create_result
     }
 
     pub fn set_status_bar(&self, tmux_session: &str, friendly_name: &str) -> Result<bool> {
@@ -3200,7 +3258,16 @@ esac
 
         let log = fs::read_to_string(log_path).unwrap();
         let lines = log.lines().collect::<Vec<_>>();
-        let bootstrap = position_after(&lines, "-L session-manager new-session -d -s sm-test", 0);
+        let anchor = position_after(
+            &lines,
+            "-L session-manager new-session -d -s __sm_server_anchor",
+            0,
+        );
+        let bootstrap = position_after(
+            &lines,
+            "-L session-manager new-session -d -s sm-test",
+            anchor + 1,
+        );
         let focus_events = position_after(
             &lines,
             "-L session-manager set-option -g focus-events on",
@@ -3227,6 +3294,7 @@ esac
             provider_window + 1,
         );
 
+        assert!(anchor < bootstrap);
         assert!(bootstrap < focus_events);
         assert!(focus_events < terminal_overrides);
         assert!(terminal_overrides < history_limit);
@@ -3317,6 +3385,129 @@ esac
         assert!(!log.contains("set-option -g focus-events on"));
         assert!(!log.contains("terminal-overrides ,*:smcup@:rmcup@"));
         assert!(!log.contains("-L session-manager"));
+        assert!(!log.contains(SERVER_ANCHOR_SESSION));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_tmux_configured_socket_has_one_neutral_anchor_before_agents() {
+        if !Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket_name = format!("sm-anchor-{}-{unique}", std::process::id());
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            tmux_socket_name: Some(socket_name),
+            tmux_native_scrollback: Some(false),
+            tmux_history_limit: None,
+            ..RustCoreConfig::default()
+        });
+        runtime.claude_command = "/bin/sleep".to_owned();
+        runtime.claude_args = vec!["30".to_owned()];
+
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let creators = (0..8)
+            .map(|_| {
+                let runtime = runtime.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    runtime.ensure_server_anchor()
+                })
+            })
+            .collect::<Vec<_>>();
+        for creator in creators {
+            creator.join().unwrap().unwrap();
+        }
+
+        struct ServerGuard(TmuxRuntime);
+        impl Drop for ServerGuard {
+            fn drop(&mut self) {
+                let _ = self.0.run_tmux(["kill-server"]);
+            }
+        }
+        let _server_guard = ServerGuard(runtime.clone());
+        let temp_dir = tempfile_path("anchor-real");
+        fs::create_dir_all(&temp_dir).unwrap();
+        let agent_name = format!("sm-anchor-agent-{}", std::process::id());
+        let spec = TmuxSessionSpec {
+            session_id: "anchor01".to_owned(),
+            session_credential: None,
+            tmux_session: agent_name.clone(),
+            working_dir: temp_dir.display().to_string(),
+            log_file: temp_dir.join("agent.log"),
+            provider: "claude".to_owned(),
+            initial_message: None,
+            force_initial_prompt_stdin: false,
+            claude_session_id: None,
+            model: None,
+            reasoning_effort: None,
+        };
+        runtime.create_session(&spec).unwrap();
+
+        let exact_anchor = format!("={SERVER_ANCHOR_SESSION}");
+        assert!(runtime
+            .tmux_command(["has-session", "-t", exact_anchor.as_str()])
+            .status()
+            .unwrap()
+            .success());
+        let anchor_count = runtime
+            .tmux_command(["list-sessions", "-F", "#{session_name}"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(anchor_count.stdout)
+                .unwrap()
+                .lines()
+                .filter(|name| *name == SERVER_ANCHOR_SESSION)
+                .count(),
+            1
+        );
+        let server_pid = runtime
+            .tmux_command([
+                "display-message",
+                "-p",
+                "-t",
+                exact_anchor.as_str(),
+                "#{pid}",
+            ])
+            .output()
+            .unwrap();
+        let server_pid = String::from_utf8(server_pid.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let process = Command::new("ps")
+            .args(["-p", server_pid.as_str(), "-o", "command="])
+            .output()
+            .unwrap();
+        let process = String::from_utf8_lossy(&process.stdout);
+        assert!(
+            process.contains(SERVER_ANCHOR_SESSION),
+            "server process was not neutral: {process}"
+        );
+        assert!(!process.contains(&agent_name));
+
+        assert!(runtime.kill_session(&agent_name).unwrap());
+        assert!(runtime
+            .tmux_command(["has-session", "-t", exact_anchor.as_str()])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("kill")
+            .args(["-0", server_pid.as_str()])
+            .status()
+            .unwrap()
+            .success());
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]
