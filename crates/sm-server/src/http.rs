@@ -412,6 +412,11 @@ impl AppState {
         Self::try_new(config).expect("session manager startup recovery failed")
     }
 
+    fn runtime(&self) -> TmuxRuntime {
+        TmuxRuntime::from_app_config(&self.config)
+            .with_claude_transcript_roots(self.session_store.claude_transcript_roots())
+    }
+
     pub fn try_new(mut config: AppConfig) -> anyhow::Result<Self> {
         if let Some(root) = test_isolation_root_from_environment()? {
             config.isolate_test_paths(&root)?;
@@ -421,13 +426,12 @@ impl AppState {
         let mut session_store = SessionStore::new_with_queue(state_file, queue_db_path)
             .with_codex_session_index_path(config.codex.session_index_path.as_deref())
             .with_claude_transcript_root(config.claude.transcript_root.as_deref())
-            .with_context_monitor_config(config.context_monitor.clone())
-            .with_delivery_runtime(
-                config
-                    .rust_core
-                    .runtime_enabled
-                    .then(|| TmuxRuntime::from_app_config(&config)),
-            );
+            .with_context_monitor_config(config.context_monitor.clone());
+        if config.rust_core.runtime_enabled {
+            let runtime = TmuxRuntime::from_app_config(&config)
+                .with_claude_transcript_roots(session_store.claude_transcript_roots());
+            session_store = session_store.with_delivery_runtime(Some(runtime));
+        }
         if should_use_configured_usage_db_path(&config.usage) {
             session_store = session_store.with_usage_db_path(expand_home(&config.usage.db_path));
         }
@@ -3830,7 +3834,7 @@ async fn create_runtime_core_session(
     payload: CreateCoreSessionRequest,
     log_dir: Option<PathBuf>,
 ) -> Result<SessionRecord, ApiError> {
-    let runtime = TmuxRuntime::from_app_config(&state.config);
+    let runtime = state.runtime();
     let store = state.session_store.clone();
     tokio::task::spawn_blocking(move || {
         store.create_core_session_with_runtime(payload, log_dir, &runtime)
@@ -3858,7 +3862,7 @@ async fn start_session_review(
         &format!("/sessions/{session_id}/review"),
     )?;
     ensure_core_writes_enabled(&state)?;
-    let runtime = TmuxRuntime::from_app_config(&state.config);
+    let runtime = state.runtime();
     let wait_seconds = payload.wait;
     let watcher_session_id = payload
         .watcher_session_id
@@ -10322,6 +10326,7 @@ fn codex_fork_event_stream_path_for_session(
         provider: session.provider.clone(),
         initial_message: None,
         force_initial_prompt_stdin: false,
+        claude_session_id: None,
         model: session.model.clone(),
         reasoning_effort: session.reasoning_effort.clone(),
     };
@@ -14862,6 +14867,7 @@ mod tests {
             provider: session.provider.clone(),
             initial_message: None,
             force_initial_prompt_stdin: false,
+            claude_session_id: None,
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort.clone(),
         };
@@ -14913,6 +14919,7 @@ mod tests {
             provider: session.provider.clone(),
             initial_message: None,
             force_initial_prompt_stdin: false,
+            claude_session_id: None,
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort.clone(),
         };
@@ -14967,6 +14974,7 @@ mod tests {
             provider: session.provider.clone(),
             initial_message: None,
             force_initial_prompt_stdin: false,
+            claude_session_id: None,
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort.clone(),
         };

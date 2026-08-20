@@ -564,6 +564,10 @@ impl SessionStore {
         self
     }
 
+    pub(crate) fn claude_transcript_roots(&self) -> Vec<PathBuf> {
+        self.claude_projects_roots.clone()
+    }
+
     fn append_seat_session(
         &self,
         seat_id: &str,
@@ -873,6 +877,21 @@ impl SessionStore {
         if !matches!(launch.status.as_str(), "prepared" | "launching") {
             return Ok(());
         }
+        if launch.provider == "claude" && launch.force_initial_prompt_stdin {
+            // A restart cannot determine whether tmux delivered the immutable
+            // first brief before the process died. Replaying it risks
+            // duplicate work, so retain the artifact and require an explicit
+            // recovery decision instead.
+            mark_runtime_launch_failed(
+                &mut state,
+                launch_id,
+                &launch.session_id,
+                launch.operation_kind == "create",
+                "refusing to recover an unacknowledged Claude spawn brief because it may already have been submitted",
+            )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(());
+        }
         let terminal_session = snapshot_from_raw_value(&state)?
             .sessions
             .iter()
@@ -952,6 +971,9 @@ impl SessionStore {
             provider: launch.provider.clone(),
             initial_message: launch.initial_message.clone(),
             force_initial_prompt_stdin: launch.force_initial_prompt_stdin,
+            claude_session_id: (launch.provider == "claude" && launch.force_initial_prompt_stdin)
+                .then(|| launch.provider_resume_id.clone())
+                .flatten(),
             model: launch.model.clone(),
             reasoning_effort: launch.reasoning_effort.clone(),
         };
@@ -1328,6 +1350,7 @@ impl SessionStore {
             provider: session.provider.clone(),
             initial_message: None,
             force_initial_prompt_stdin: false,
+            claude_session_id: None,
             model: session.model.clone(),
             reasoning_effort: session.reasoning_effort.clone(),
         };
@@ -4208,6 +4231,12 @@ impl SessionStore {
         let session_credential = generate_session_credential();
         let credential_sha256 = sha256_text(&session_credential);
         record.session_credential_sha256 = Some(credential_sha256.clone());
+        if record.provider == "claude" && request.spawn_brief.is_some() {
+            // Claude owns this UUID and records it in its JSONL transcript.
+            // Persist it before launching so the initial brief can be bound to
+            // one provider session rather than a rendered terminal frame.
+            record.provider_resume_id = Some(generate_claude_provider_session_id());
+        }
         if record.provider == "codex"
             && codex_cli_working_dir.as_deref() != Some(record.working_dir.as_str())
         {
@@ -4230,6 +4259,9 @@ impl SessionStore {
             provider: record.provider.clone(),
             initial_message: runtime_initial_message.clone(),
             force_initial_prompt_stdin,
+            claude_session_id: (record.provider == "claude" && request.spawn_brief.is_some())
+                .then(|| record.provider_resume_id.clone())
+                .flatten(),
             model: request.model.clone(),
             reasoning_effort: request.reasoning_effort.clone(),
         };
@@ -4263,7 +4295,7 @@ impl SessionStore {
             working_dir: spec.working_dir.clone(),
             log_file: spec.log_file.display().to_string(),
             provider: record.provider.clone(),
-            provider_resume_id: None,
+            provider_resume_id: record.provider_resume_id.clone(),
             credential_rotation_id: None,
             restore_authorized: false,
             initial_message: runtime_initial_message,
@@ -5549,6 +5581,7 @@ impl SessionStore {
             provider: record.provider.clone(),
             initial_message: None,
             force_initial_prompt_stdin: false,
+            claude_session_id: None,
             model: record.model.clone(),
             reasoning_effort: record.reasoning_effort.clone(),
         };
@@ -11248,6 +11281,7 @@ fn codex_fork_spec_for_session_raw(
         provider: "codex-fork".to_owned(),
         initial_message: None,
         force_initial_prompt_stdin: false,
+        claude_session_id: None,
         model: json_text(session.get("model")),
         reasoning_effort: json_text(session.get("reasoning_effort")),
     })
@@ -11289,6 +11323,7 @@ pub fn submit_codex_fork_btw(
         provider: "codex-fork".to_owned(),
         initial_message: None,
         force_initial_prompt_stdin: false,
+        claude_session_id: None,
         model: session.model.clone(),
         reasoning_effort: session.reasoning_effort.clone(),
     };
@@ -13013,6 +13048,7 @@ fn codex_fork_event_stream_path(session: &SessionRecord, runtime: &TmuxRuntime) 
         provider: session.provider.clone(),
         initial_message: None,
         force_initial_prompt_stdin: false,
+        claude_session_id: None,
         model: session.model.clone(),
         reasoning_effort: session.reasoning_effort.clone(),
     };
@@ -13355,6 +13391,20 @@ fn generate_session_id() -> String {
         id.push(hex_char(byte & 0x0f));
     }
     id
+}
+
+fn generate_claude_provider_session_id() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    // RFC 4122 variant and version-4 layout, required by Claude's
+    // `--session-id` validation.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
 }
 
 fn generate_unique_session_id(sessions: &[Value]) -> Result<String> {
@@ -17261,6 +17311,32 @@ mod tests {
     }
 
     #[test]
+    fn recovery_never_replays_an_unacknowledged_claude_spawn_brief() {
+        let state_file = unique_temp_path("claude-spawn-brief-recovery");
+        let mut state = terminal_rotation_fixture("relaunching", Some("launching"));
+        state["session_credential_rotations"] = json!([]);
+        let launch = &mut state["session_runtime_launches"][0];
+        launch["operation_kind"] = json!("create");
+        launch["credential_rotation_id"] = Value::Null;
+        launch["provider"] = json!("claude");
+        launch["force_initial_prompt_stdin"] = json!(true);
+        launch["initial_message"] = json!("immutable brief");
+        launch["provider_resume_id"] = json!("11111111-1111-4111-8111-111111111111");
+        fs::write(&state_file, state.to_string()).unwrap();
+
+        let store = SessionStore::new(state_file.clone());
+        store.recover_session_runtime_launches().unwrap();
+
+        let recovered = store.load_raw_json_value().unwrap();
+        assert_eq!(recovered["session_runtime_launches"][0]["status"], "failed");
+        assert_eq!(
+            recovered["session_runtime_launches"][0]["failure_reason"],
+            "refusing to recover an unacknowledged Claude spawn brief because it may already have been submitted"
+        );
+        let _ = fs::remove_file(state_file);
+    }
+
+    #[test]
     fn credential_rotation_worker_recovers_a_relaunching_runtime_transaction() {
         let state_file = unique_temp_path("credential-rotation-relaunch-recovery");
         fs::write(
@@ -19489,6 +19565,7 @@ mod tests {
             provider: record.provider.clone(),
             initial_message: None,
             force_initial_prompt_stdin: false,
+            claude_session_id: None,
             model: None,
             reasoning_effort: None,
         };
@@ -22990,6 +23067,7 @@ mod tests {
                 provider: "codex-fork".to_owned(),
                 initial_message: None,
                 force_initial_prompt_stdin: false,
+                claude_session_id: None,
                 model: None,
                 reasoning_effort: None,
             })
