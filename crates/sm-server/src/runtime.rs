@@ -678,10 +678,9 @@ impl TmuxRuntime {
         if !precondition()? {
             return Ok(ConditionalClearOutcome::PreconditionFailed);
         }
-        if !self.wait_for_prompt(tmux_session, Duration::from_secs_f64(3.0)) {
-            return Ok(ConditionalClearOutcome::IdlePromptNotReady);
-        }
-        let Some(pre_clear_pane) = self.capture_pane_text(tmux_session) else {
+        let Some(pre_clear_pane) =
+            self.wait_for_claude_empty_composer(tmux_session, None, Duration::from_secs_f64(3.0))
+        else {
             return Ok(ConditionalClearOutcome::IdlePromptNotReady);
         };
         let mut send_clear = || self.send_text_then_enter(tmux_session, "/clear");
@@ -689,7 +688,13 @@ impl TmuxRuntime {
             return Ok(ConditionalClearOutcome::PreconditionFailed);
         }
 
-        if !self.wait_for_fresh_prompt(tmux_session, &pre_clear_pane, Duration::from_secs_f64(5.0))
+        if self
+            .wait_for_claude_empty_composer(
+                tmux_session,
+                Some(&pre_clear_pane),
+                Duration::from_secs_f64(5.0),
+            )
+            .is_none()
         {
             bail!("Claude handoff timed out waiting for /clear to finish");
         }
@@ -978,21 +983,21 @@ impl TmuxRuntime {
         }
     }
 
-    fn wait_for_fresh_prompt(
+    fn wait_for_claude_empty_composer(
         &self,
         tmux_session: &str,
-        previous_pane: &str,
+        previous_pane: Option<&str>,
         timeout: Duration,
-    ) -> bool {
+    ) -> Option<String> {
         let deadline = Instant::now() + timeout;
         loop {
-            if self.capture_pane_text(tmux_session).is_some_and(|pane| {
-                pane != previous_pane && pane_last_line(&pane).as_deref() == Some(">")
-            }) {
-                return true;
+            if let Some(pane) = self.claude_empty_composer_pane(tmux_session) {
+                if previous_pane.is_none_or(|previous| pane != previous) {
+                    return Some(pane);
+                }
             }
             if Instant::now() >= deadline {
-                return false;
+                return None;
             }
             thread::sleep(Duration::from_millis(100));
         }
@@ -1410,16 +1415,20 @@ impl TmuxRuntime {
     /// Claude's empty composer must be at the active cursor, not merely occur
     /// in scrollback or resemble a typed prompt in a startup frame.
     fn claude_initial_brief_composer_ready(&self, tmux_session: &str) -> bool {
+        self.claude_empty_composer_pane(tmux_session).is_some()
+    }
+
+    fn claude_empty_composer_pane(&self, tmux_session: &str) -> Option<String> {
         let Some(pane) = self.capture_pane_text(tmux_session) else {
-            return false;
+            return None;
         };
         if !claude_composer_is_ready(&pane) {
-            return false;
+            return None;
         }
         let Some((cursor_x, cursor_y)) = self.pane_cursor_position(tmux_session) else {
-            return false;
+            return None;
         };
-        claude_empty_composer_cursor(&pane, cursor_x, cursor_y)
+        claude_empty_composer_cursor(&pane, cursor_x, cursor_y).then_some(pane)
     }
 
     fn pane_cursor_position(&self, tmux_session: &str) -> Option<(usize, usize)> {
@@ -2975,7 +2984,7 @@ esac
 
     #[test]
     fn conditional_claude_clear_revalidates_before_touching_the_pane() {
-        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary();
+        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary_with_fresh_clear();
         let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
             send_keys_settle_ms: Some(0.0),
             send_keys_settle_max_ms: Some(0.0),
@@ -3074,12 +3083,76 @@ esac
     }
 
     #[test]
-    fn fresh_prompt_wait_rejects_the_unchanged_pre_clear_prompt() {
-        let (tmux_binary, _log_path, _temp_dir) = fake_tmux_binary();
+    fn conditional_claude_clear_accepts_current_placeholder_composer() {
+        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary_with_fresh_clear();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            send_keys_settle_ms: Some(0.0),
+            send_keys_settle_max_ms: Some(0.0),
+            ..RustCoreConfig::default()
+        });
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        let outcome = runtime
+            .clear_claude_session_if(
+                "sm-test",
+                "handoff prompt",
+                || Ok(true),
+                |send_clear| {
+                    send_clear()?;
+                    Ok(true)
+                },
+                |send_prompt| {
+                    send_prompt()?;
+                    Ok(true)
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome, ConditionalClearOutcome::Cleared);
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("send-keys -t sm-test -l -- /clear"));
+        assert!(log.contains("send-keys -t sm-test -l -- handoff prompt"));
+    }
+
+    #[test]
+    fn conditional_claude_clear_rejects_typed_placeholder_lookalike() {
+        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary_with_typed_claude_composer();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            send_keys_settle_ms: Some(0.0),
+            send_keys_settle_max_ms: Some(0.0),
+            ..RustCoreConfig::default()
+        });
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        let outcome = runtime
+            .clear_claude_session_if(
+                "sm-test",
+                "handoff prompt",
+                || Ok(true),
+                |_send_clear| unreachable!("typed input must not be cleared"),
+                |_send_prompt| unreachable!("handoff prompt must not be submitted"),
+            )
+            .unwrap();
+
+        assert_eq!(outcome, ConditionalClearOutcome::IdlePromptNotReady);
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(!log.contains("send-keys -t sm-test -l -- /clear"));
+        assert!(!log.contains("handoff prompt"));
+    }
+
+    #[test]
+    fn claude_composer_wait_rejects_the_unchanged_pre_clear_pane() {
+        let (tmux_binary, _log_path, _temp_dir) = fake_tmux_binary_with_fresh_clear();
         let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
         runtime.tmux_binary = tmux_binary.display().to_string();
 
-        assert!(!runtime.wait_for_fresh_prompt("sm-test", "ready\n>\n", Duration::ZERO,));
+        assert!(runtime
+            .wait_for_claude_empty_composer(
+                "sm-test",
+                Some("ready\n❯\u{a0}Try \"fix typecheck errors\"\n"),
+                Duration::ZERO,
+            )
+            .is_none());
     }
 
     #[test]
@@ -3347,6 +3420,7 @@ esac
 
     fn fake_tmux_binary_with_stuck_clear() -> (PathBuf, PathBuf, PathBuf) {
         let (tmux_binary, log_path, temp_dir) = fake_tmux_binary();
+        let clear_marker = temp_dir.join("clear-sent");
         fs::write(
             &tmux_binary,
             format!(
@@ -3354,12 +3428,24 @@ esac
 printf '%s\n' "$*" >> "{}"
 case "$1" in
   has-session) exit 0 ;;
-  display-message) echo 0; exit 0 ;;
+  send-keys)
+    if [ "$*" = 'send-keys -t sm-test -l -- /clear' ]; then
+      : > "{}"
+    fi
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *'#{{cursor_x}},#{{cursor_y}}'*) echo '2,1' ;;
+      *) echo 0 ;;
+    esac
+    exit 0
+    ;;
   capture-pane)
-    if grep -q 'send-keys -t sm-test -l -- /clear' "{}"; then
+    if [ -f "{}" ]; then
       printf 'clearing\n'
     else
-      printf 'ready\n>\n'
+      printf 'ready\n❯\302\240Try "fix typecheck errors"\n'
     fi
     exit 0
     ;;
@@ -3368,7 +3454,8 @@ case "$1" in
 esac
 "#,
                 log_path.display(),
-                log_path.display(),
+                clear_marker.display(),
+                clear_marker.display(),
             ),
         )
         .unwrap();
@@ -3380,6 +3467,7 @@ esac
 
     fn fake_tmux_binary_with_fresh_clear() -> (PathBuf, PathBuf, PathBuf) {
         let (tmux_binary, log_path, temp_dir) = fake_tmux_binary();
+        let clear_marker = temp_dir.join("clear-sent");
         fs::write(
             &tmux_binary,
             format!(
@@ -3387,12 +3475,24 @@ esac
 printf '%s\n' "$*" >> "{}"
 case "$1" in
   has-session) exit 0 ;;
-  display-message) echo 0; exit 0 ;;
+  send-keys)
+    if [ "$*" = 'send-keys -t sm-test -l -- /clear' ]; then
+      : > "{}"
+    fi
+    exit 0
+    ;;
+  display-message)
+    case "$*" in
+      *'#{{cursor_x}},#{{cursor_y}}'*) echo '2,1' ;;
+      *) echo 0 ;;
+    esac
+    exit 0
+    ;;
   capture-pane)
-    if grep -q 'send-keys -t sm-test -l -- /clear' "{}"; then
-      printf 'cleared\n>\n'
+    if [ -f "{}" ]; then
+      printf 'cleared\n❯\302\240Try "write a function"\n'
     else
-      printf 'ready\n>\n'
+      printf 'ready\n❯\302\240Try "fix typecheck errors"\n'
     fi
     exit 0
     ;;
@@ -3401,6 +3501,38 @@ case "$1" in
 esac
 "#,
                 log_path.display(),
+                clear_marker.display(),
+                clear_marker.display(),
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux_binary, permissions).unwrap();
+        (tmux_binary, log_path, temp_dir)
+    }
+
+    fn fake_tmux_binary_with_typed_claude_composer() -> (PathBuf, PathBuf, PathBuf) {
+        let (tmux_binary, log_path, temp_dir) = fake_tmux_binary();
+        fs::write(
+            &tmux_binary,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> "{}"
+case "$1" in
+  has-session) exit 0 ;;
+  display-message)
+    case "$*" in
+      *'#{{cursor_x}},#{{cursor_y}}'*) echo '27,1' ;;
+      *) echo 0 ;;
+    esac
+    exit 0
+    ;;
+  capture-pane) printf 'ready\n❯\302\240Try "fix typecheck errors"\n'; exit 0 ;;
+  show-options) exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
                 log_path.display(),
             ),
         )
