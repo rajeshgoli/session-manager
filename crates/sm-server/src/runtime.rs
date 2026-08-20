@@ -94,7 +94,6 @@ pub(crate) enum ConditionalClearOutcome {
 /// retain their existing behavior, while restore can distinguish authoritative
 /// absence from a transport failure that leaves runtime liveness unknown.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Introduced as the isolated prerequisite consumed by #1362.
 pub(crate) enum RestoreTmuxTeardownOutcome {
     Killed,
     AlreadyAbsent,
@@ -297,6 +296,12 @@ impl TmuxRuntime {
         runtime.codex_fork_control_tmux_fallback_enabled =
             config.codex_fork.control_tmux_fallback_enabled;
         runtime
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_tmux_binary_for_test(mut self, tmux_binary: impl Into<String>) -> Self {
+        self.tmux_binary = tmux_binary.into();
+        self
     }
 
     pub fn with_claude_transcript_roots(mut self, roots: Vec<PathBuf>) -> Self {
@@ -862,7 +867,6 @@ impl TmuxRuntime {
     /// missing socket is inconclusive: it is emitted for both a cold named
     /// server and a live server whose socket pathname was accidentally
     /// removed.
-    #[allow(dead_code)] // Introduced as the isolated prerequisite consumed by #1362.
     pub(crate) fn teardown_session_for_restore(
         &self,
         tmux_session: &str,
