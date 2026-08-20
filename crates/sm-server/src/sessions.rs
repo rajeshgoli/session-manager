@@ -36,7 +36,7 @@ use crate::{
         path_is_under_home, test_isolation_root_from_environment, CodexReviewConfig,
         ContextMonitorConfig,
     },
-    runtime::{ConditionalClearOutcome, TmuxRuntime, TmuxSessionSpec},
+    runtime::{ConditionalClearOutcome, RestoreTmuxTeardownOutcome, TmuxRuntime, TmuxSessionSpec},
     seat_sessions::{SeatSessionIdentity, SeatSessionStore},
     usage_burn::UsageBurnStore,
     usage_identity::{Provider as UsageProvider, UsageIdentityStore},
@@ -915,6 +915,77 @@ impl SessionStore {
                 false,
                 "target_terminal",
             )?;
+            self.write_raw_json_value(&state)?;
+            return Ok(());
+        }
+        if launch.provider == "codex-fork" && launch.is_authorized_restore_intent() {
+            let Some(runtime) = self.delivery_runtime.as_ref() else {
+                let failure_reason =
+                    "cannot confirm interrupted codex-fork restore teardown because runtime recovery is disabled";
+                mark_runtime_launch_restore_recovery_inconclusive(
+                    &mut state,
+                    launch_id,
+                    &launch.session_id,
+                    failure_reason,
+                )?;
+                self.write_raw_json_value(&state)?;
+                return Ok(());
+            };
+            let session_runtime = runtime.for_socket_name(launch.tmux_socket_name.as_deref());
+            let session_credential_matches_launch = state
+                .get("sessions")
+                .and_then(Value::as_array)
+                .and_then(|sessions| {
+                    sessions.iter().find(|session| {
+                        session.get("id").and_then(Value::as_str)
+                            == Some(launch.session_id.as_str())
+                    })
+                })
+                .and_then(|session| {
+                    session
+                        .get("session_credential_sha256")
+                        .and_then(Value::as_str)
+                })
+                == Some(launch.credential_sha256.as_str());
+            match session_runtime.teardown_session_for_restore(&launch.tmux_session) {
+                RestoreTmuxTeardownOutcome::Killed | RestoreTmuxTeardownOutcome::AlreadyAbsent => {
+                    let boundary = if session_credential_matches_launch {
+                        "after replacement credential commit"
+                    } else {
+                        "before replacement credential commit"
+                    };
+                    let failure_reason = format!(
+                        "interrupted codex-fork restore {boundary} was conservatively reconciled without replay; explicit restore is required"
+                    );
+                    mark_runtime_launch_failed(
+                        &mut state,
+                        launch_id,
+                        &launch.session_id,
+                        false,
+                        &failure_reason,
+                    )?;
+                    let sessions = ensure_sessions_array_mut(&mut state)?;
+                    if let Some(session) = session_object_mut(sessions, &launch.session_id) {
+                        session.insert(
+                            "error_message".to_owned(),
+                            Value::String(format!(
+                                "codex_fork_restore_recovery_failed: {failure_reason}"
+                            )),
+                        );
+                    }
+                }
+                RestoreTmuxTeardownOutcome::Inconclusive { reason } => {
+                    let failure_reason = format!(
+                        "failed to confirm interrupted codex-fork restore teardown during recovery: {reason}"
+                    );
+                    mark_runtime_launch_restore_recovery_inconclusive(
+                        &mut state,
+                        launch_id,
+                        &launch.session_id,
+                        &failure_reason,
+                    )?;
+                }
+            }
             self.write_raw_json_value(&state)?;
             return Ok(());
         }
@@ -14462,6 +14533,44 @@ fn mark_runtime_launch_failed(
     Ok(())
 }
 
+/// Preserve a possibly-live restore runtime when tmux transport cannot prove
+/// teardown during startup reconciliation.
+fn mark_runtime_launch_restore_recovery_inconclusive(
+    state: &mut Value,
+    launch_id: &str,
+    session_id: &str,
+    failure_reason: &str,
+) -> Result<()> {
+    let mut records = session_runtime_launch_records(state)?;
+    let record = records
+        .iter_mut()
+        .find(|record| record.id == launch_id)
+        .ok_or_else(|| anyhow::anyhow!("runtime launch {launch_id} disappeared"))?;
+    record.status = "failed".to_owned();
+    record.updated_at = now_rfc3339();
+    record.failure_reason = Some(failure_reason.to_owned());
+    store_session_runtime_launch_records(state, &records)?;
+
+    let sessions = ensure_sessions_array_mut(state)?;
+    if let Some(session) = session_object_mut(sessions, session_id) {
+        session.insert("status".to_owned(), Value::String("error".to_owned()));
+        session.insert("stopped_at".to_owned(), Value::Null);
+        session.insert("completion_status".to_owned(), Value::Null);
+        session.insert("completion_message".to_owned(), Value::Null);
+        session.insert("completed_at".to_owned(), Value::Null);
+        session.insert("terminal_provenance".to_owned(), Value::Null);
+        session.insert("retirement_intent".to_owned(), Value::Null);
+        session.insert("agent_task_completed_at".to_owned(), Value::Null);
+        session.insert(
+            "error_message".to_owned(),
+            Value::String(format!(
+                "codex_fork_restore_recovery_inconclusive: {failure_reason}"
+            )),
+        );
+    }
+    Ok(())
+}
+
 fn reparent_topology_fingerprint(
     kind: &str,
     subject_session_id: &str,
@@ -17365,6 +17474,197 @@ mod tests {
                 recovered["session_runtime_launches"][0]["failure_reason"],
                 "runtime launch recovery is disabled"
             );
+            let _ = fs::remove_file(state_file);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_fork_restore_recovery_never_replays_across_credential_and_teardown_boundaries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_temp_path("codex-fork-restore-recovery");
+        fs::create_dir_all(&root).unwrap();
+
+        for (credential_boundary, session_credential) in [
+            ("before replacement credential commit", "old-credential"),
+            (
+                "after replacement credential commit",
+                "replacement-credential",
+            ),
+        ] {
+            for (teardown_outcome, tmux_body, expected_status) in [
+                ("killed", "exit 0\n", "stopped"),
+                (
+                    "already-absent",
+                    "echo \"can't find session: codex-fork-restore01\" >&2\nexit 1\n",
+                    "stopped",
+                ),
+                (
+                    "inconclusive",
+                    "echo \"error connecting to /tmp/tmux-501/default (No such file or directory)\" >&2\nexit 1\n",
+                    "error",
+                ),
+            ] {
+                let case = format!(
+                    "{}-{teardown_outcome}",
+                    credential_boundary.replace(' ', "-")
+                );
+                let state_file = root.join(format!("{case}.json"));
+                let tmux_log = root.join(format!("{case}.tmux.log"));
+                let tmux_binary = root.join(format!("{case}.tmux"));
+                fs::write(
+                    &tmux_binary,
+                    format!(
+                        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{tmux_body}",
+                        tmux_log.display()
+                    ),
+                )
+                .unwrap();
+                let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+                permissions.set_mode(0o755);
+                fs::set_permissions(&tmux_binary, permissions).unwrap();
+
+                fs::write(
+                    &state_file,
+                    json!({
+                        "sessions": [{
+                            "id": "restore01",
+                            "name": "restore01",
+                            "provider": "codex-fork",
+                            "provider_resume_id": "durable-root",
+                            "session_credential_sha256": session_credential,
+                            "working_dir": "/repo",
+                            "tmux_session": "codex-fork-restore01",
+                            "log_file": "/tmp/restore01.log",
+                            "status": "stopped",
+                            "completion_status": "killed",
+                            "stopped_at": "2026-08-20T00:00:00Z",
+                            "created_at": "2026-08-19T00:00:00Z",
+                            "last_activity": "2026-08-20T00:00:00Z"
+                        }],
+                        "session_runtime_launches": [{
+                            "id": "launch01",
+                            "operation_kind": "restore",
+                            "session_id": "restore01",
+                            "tmux_session": "codex-fork-restore01",
+                            "working_dir": "/repo",
+                            "log_file": "/tmp/restore01.log",
+                            "provider": "codex-fork",
+                            "provider_resume_id": "durable-root",
+                            "restore_authorized": true,
+                            "credential_sha256": "replacement-credential",
+                            "status": "launching",
+                            "created_at": "2026-08-20T00:00:00Z",
+                            "updated_at": "2026-08-20T00:00:01Z"
+                        }]
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+
+                let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
+                    .with_tmux_binary_for_test(tmux_binary.display().to_string());
+                let store = SessionStore::new(state_file.clone())
+                    .with_delivery_runtime(Some(runtime));
+                store.recover_session_runtime_launches().unwrap();
+
+                let recovered = store.load_raw_json_value().unwrap();
+                assert_eq!(recovered["session_runtime_launches"][0]["status"], "failed");
+                assert_eq!(recovered["sessions"][0]["status"], expected_status);
+                assert_eq!(
+                    recovered["sessions"][0]["provider_resume_id"],
+                    "durable-root"
+                );
+                assert_eq!(
+                    recovered["sessions"][0]["session_credential_sha256"],
+                    session_credential
+                );
+                assert_eq!(
+                    fs::read_to_string(&tmux_log).unwrap(),
+                    "kill-session -t =codex-fork-restore01\n",
+                    "{case} must perform only exact checked teardown"
+                );
+                let failure_reason = recovered["session_runtime_launches"][0]["failure_reason"]
+                    .as_str()
+                    .unwrap();
+                if teardown_outcome == "inconclusive" {
+                    assert!(failure_reason.contains("failed to confirm"));
+                    assert!(recovered["sessions"][0]["stopped_at"].is_null());
+                    assert!(recovered["sessions"][0]["completion_status"].is_null());
+                } else {
+                    assert!(failure_reason.contains(credential_boundary));
+                    assert!(failure_reason.contains("without replay"));
+                    assert!(failure_reason.contains("explicit restore is required"));
+                }
+            }
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_fork_restore_recovery_without_runtime_is_inconclusive_at_both_credential_boundaries() {
+        for session_credential in ["old-credential", "replacement-credential"] {
+            let state_file = unique_temp_path("codex-fork-restore-recovery-no-runtime");
+            fs::write(
+                &state_file,
+                json!({
+                    "sessions": [{
+                        "id": "restore01",
+                        "name": "restore01",
+                        "provider": "codex-fork",
+                        "provider_resume_id": "durable-root",
+                        "session_credential_sha256": session_credential,
+                        "working_dir": "/repo",
+                        "tmux_session": "codex-fork-restore01",
+                        "log_file": "/tmp/restore01.log",
+                        "status": "stopped",
+                        "completion_status": "killed",
+                        "stopped_at": "2026-08-20T00:00:00Z",
+                        "created_at": "2026-08-19T00:00:00Z",
+                        "last_activity": "2026-08-20T00:00:00Z"
+                    }],
+                    "session_runtime_launches": [{
+                        "id": "launch01",
+                        "operation_kind": "restore",
+                        "session_id": "restore01",
+                        "tmux_session": "codex-fork-restore01",
+                        "working_dir": "/repo",
+                        "log_file": "/tmp/restore01.log",
+                        "provider": "codex-fork",
+                        "provider_resume_id": "durable-root",
+                        "restore_authorized": true,
+                        "credential_sha256": "replacement-credential",
+                        "status": "launching",
+                        "created_at": "2026-08-20T00:00:00Z",
+                        "updated_at": "2026-08-20T00:00:01Z"
+                    }]
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+            let store = SessionStore::new(state_file.clone());
+            store.recover_session_runtime_launches().unwrap();
+
+            let recovered = store.load_raw_json_value().unwrap();
+            assert_eq!(recovered["session_runtime_launches"][0]["status"], "failed");
+            assert_eq!(recovered["sessions"][0]["status"], "error");
+            assert!(recovered["sessions"][0]["stopped_at"].is_null());
+            assert!(recovered["sessions"][0]["completion_status"].is_null());
+            assert_eq!(
+                recovered["sessions"][0]["provider_resume_id"],
+                "durable-root"
+            );
+            assert_eq!(
+                recovered["sessions"][0]["session_credential_sha256"],
+                session_credential
+            );
+            assert!(recovered["session_runtime_launches"][0]["failure_reason"]
+                .as_str()
+                .unwrap()
+                .contains("runtime recovery is disabled"));
             let _ = fs::remove_file(state_file);
         }
     }

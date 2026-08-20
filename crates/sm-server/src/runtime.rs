@@ -299,6 +299,12 @@ impl TmuxRuntime {
         runtime
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_tmux_binary_for_test(mut self, tmux_binary: impl Into<String>) -> Self {
+        self.tmux_binary = tmux_binary.into();
+        self
+    }
+
     pub fn with_claude_transcript_roots(mut self, roots: Vec<PathBuf>) -> Self {
         self.claude_projects_roots = roots;
         self
