@@ -86,6 +86,19 @@ pub(crate) enum ConditionalClearOutcome {
     SessionMissing,
 }
 
+/// Result of the conservative tmux teardown used by Codex-fork restore.
+///
+/// This is intentionally separate from `kill_session`: generic runtime callers
+/// retain their existing behavior, while restore can distinguish authoritative
+/// absence from a transport failure that leaves runtime liveness unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Introduced as the isolated prerequisite consumed by #1362.
+pub(crate) enum RestoreTmuxTeardownOutcome {
+    Killed,
+    AlreadyAbsent,
+    Inconclusive { reason: String },
+}
+
 #[derive(Clone)]
 pub struct TmuxSessionSpec {
     pub session_id: String,
@@ -837,6 +850,28 @@ impl TmuxRuntime {
         }
         self.run_tmux(["kill-session", "-t", tmux_session])?;
         Ok(true)
+    }
+
+    /// Tear down a restore target without a racy existence preflight.
+    ///
+    /// Only tmux's explicit absent-target responses establish absence. A
+    /// missing socket is inconclusive: it is emitted for both a cold named
+    /// server and a live server whose socket pathname was accidentally
+    /// removed.
+    #[allow(dead_code)] // Introduced as the isolated prerequisite consumed by #1362.
+    pub(crate) fn teardown_session_for_restore(
+        &self,
+        tmux_session: &str,
+    ) -> RestoreTmuxTeardownOutcome {
+        match self.run_tmux(["kill-session", "-t", tmux_session]) {
+            Ok(()) => RestoreTmuxTeardownOutcome::Killed,
+            Err(error) if is_tmux_session_gone_error(&error) => {
+                RestoreTmuxTeardownOutcome::AlreadyAbsent
+            }
+            Err(error) => RestoreTmuxTeardownOutcome::Inconclusive {
+                reason: error.to_string(),
+            },
+        }
     }
 
     pub fn set_status_bar(&self, tmux_session: &str, friendly_name: &str) -> Result<bool> {
@@ -2375,6 +2410,24 @@ mod tests {
         ))
     }
 
+    #[cfg(unix)]
+    struct RealTmuxServerGuard {
+        runtime: TmuxRuntime,
+        server_pid: String,
+    }
+
+    #[cfg(unix)]
+    impl Drop for RealTmuxServerGuard {
+        fn drop(&mut self) {
+            // SIGUSR1 recreates an accidentally unlinked server socket, which
+            // makes the ordinary tmux cleanup command reachable again.
+            let _ = Command::new("kill")
+                .args(["-USR1", self.server_pid.as_str()])
+                .status();
+            let _ = self.runtime.run_tmux(["kill-server"]);
+        }
+    }
+
     #[test]
     fn verified_spawn_stdin_prompt_preserves_outer_whitespace() {
         let prompt = "  # Exact brief\n\n  indented detail  \n";
@@ -2763,6 +2816,178 @@ esac
     fn tmux_no_current_target_counts_as_session_gone() {
         let error = anyhow::anyhow!("tmux command failed: no current target");
         assert!(is_tmux_session_gone_error(&error));
+    }
+
+    #[test]
+    fn restore_teardown_kills_without_an_existence_preflight() {
+        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        assert_eq!(
+            runtime.teardown_session_for_restore("sm-test"),
+            RestoreTmuxTeardownOutcome::Killed
+        );
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("kill-session -t sm-test"));
+        assert!(!log.contains("has-session"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_teardown_treats_only_authoritative_absence_as_idempotent() {
+        for message in [
+            "can't find session: sm-test",
+            "no current target",
+            "no server running on /tmp/tmux-501/session-manager",
+            "server exited unexpectedly",
+        ] {
+            let (tmux_binary, _log_path, _temp_dir) = fake_tmux_binary();
+            fs::write(
+                &tmux_binary,
+                format!(
+                    "#!/bin/sh\necho '{}' >&2\nexit 1\n",
+                    message.replace('\'', "'\\''")
+                ),
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&tmux_binary, permissions).unwrap();
+            let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+            runtime.tmux_binary = tmux_binary.display().to_string();
+
+            assert_eq!(
+                runtime.teardown_session_for_restore("sm-test"),
+                RestoreTmuxTeardownOutcome::AlreadyAbsent,
+                "message: {message}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_teardown_keeps_transport_failures_inconclusive() {
+        for message in [
+            "error connecting to /tmp/tmux-501/session-manager (No such file or directory)",
+            "error connecting to /tmp/tmux-501/session-manager (Connection refused)",
+            "permission denied while contacting tmux server",
+            "lost server connection",
+        ] {
+            let (tmux_binary, _log_path, _temp_dir) = fake_tmux_binary();
+            fs::write(
+                &tmux_binary,
+                format!(
+                    "#!/bin/sh\necho '{}' >&2\nexit 1\n",
+                    message.replace('\'', "'\\''")
+                ),
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&tmux_binary, permissions).unwrap();
+            let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+            runtime.tmux_binary = tmux_binary.display().to_string();
+
+            assert!(matches!(
+                runtime.teardown_session_for_restore("sm-test"),
+                RestoreTmuxTeardownOutcome::Inconclusive { reason }
+                    if reason.contains(message)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_tmux_missing_socket_is_inconclusive_both_cold_and_live() {
+        if !Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let socket_name = format!("sm-restore-teardown-{}-{unique}", std::process::id());
+        let session_name = format!("sm-restore-{}", std::process::id());
+        let runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            tmux_socket_name: Some(socket_name.clone()),
+            ..RustCoreConfig::default()
+        });
+
+        assert!(matches!(
+            runtime.teardown_session_for_restore(&session_name),
+            RestoreTmuxTeardownOutcome::Inconclusive { reason }
+                if reason.contains("No such file or directory")
+        ));
+
+        let created = runtime
+            .tmux_command(["new-session", "-d", "-s", session_name.as_str(), "sleep 30"])
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "failed to create real tmux fixture: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let server_pid = runtime
+            .tmux_command([
+                "display-message",
+                "-p",
+                "-t",
+                session_name.as_str(),
+                "#{pid}",
+            ])
+            .output()
+            .unwrap();
+        let server_pid = String::from_utf8(server_pid.stdout).unwrap();
+        let server_pid = server_pid.trim().to_owned();
+        let _server_guard = RealTmuxServerGuard {
+            runtime: runtime.clone(),
+            server_pid: server_pid.clone(),
+        };
+        let socket_path = runtime
+            .tmux_command([
+                "display-message",
+                "-p",
+                "-t",
+                session_name.as_str(),
+                "#{socket_path}",
+            ])
+            .output()
+            .unwrap();
+        let socket_path = PathBuf::from(String::from_utf8(socket_path.stdout).unwrap().trim());
+        assert!(socket_path.ends_with(&socket_name));
+        fs::remove_file(&socket_path).unwrap();
+
+        let outcome = runtime.teardown_session_for_restore(&session_name);
+        let server_still_live = Command::new("kill")
+            .args(["-0", server_pid.as_str()])
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(matches!(
+            outcome,
+            RestoreTmuxTeardownOutcome::Inconclusive { reason }
+                if reason.contains("No such file or directory")
+        ));
+        assert!(
+            server_still_live,
+            "tmux server exited after its socket was unlinked"
+        );
+
+        Command::new("kill")
+            .args(["-USR1", server_pid.as_str()])
+            .status()
+            .unwrap();
+        let recovered = runtime
+            .tmux_command(["has-session", "-t", session_name.as_str()])
+            .status()
+            .unwrap();
+        assert!(recovered.success());
     }
 
     #[test]
