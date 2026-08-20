@@ -17363,6 +17363,110 @@ esac
     }
 
     #[cfg(unix)]
+    #[test]
+    fn codex_fork_restore_request_commits_new_credential_after_authoritative_absence() {
+        let root = unique_temp_path("codex-fork-restore-request-absent");
+        fs::create_dir_all(&root).unwrap();
+        let tmux = root.join("tmux");
+        let tmux_log = root.join("tmux.log");
+        let old_credential_sha256 = sha256_text("old-runtime-secret");
+        let state_file = root.join("sessions.json");
+        let provider_launch_state_file = root.join("provider-launch-state.json");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> "{}"
+case "$1" in
+  kill-session)
+    grep -q '{}' '{}' || {{ echo "credential rotated before teardown" >&2; exit 98; }}
+    echo "can't find session: codex-fork-restore-absent" >&2
+    exit 1
+    ;;
+  has-session) exit 1 ;;
+  new-session)
+    cp '{}' '{}' || {{ echo "could not capture provider-launch state" >&2; exit 97; }}
+    echo "provider launch rejected by fixture" >&2
+    exit 1
+    ;;
+  *) exit 0 ;;
+esac
+"#,
+                tmux_log.display(),
+                old_credential_sha256,
+                state_file.display(),
+                state_file.display(),
+                provider_launch_state_file.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "restore-absent",
+                    "name": "restore-codex-fork",
+                    "provider": "codex-fork",
+                    "provider_resume_id": "durable-root",
+                    "session_credential_sha256": old_credential_sha256,
+                    "working_dir": root,
+                    "tmux_session": "codex-fork-restore-absent",
+                    "log_file": root.join("restore.log"),
+                    "status": "stopped",
+                    "completion_status": "killed",
+                    "created_at": "2026-08-18T00:00:00Z",
+                    "last_activity": "2026-08-18T00:00:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(state_file.clone());
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
+            .with_tmux_binary_for_test(tmux.display().to_string());
+
+        let error = store
+            .restore_core_session_with_runtime("restore-absent", &runtime)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("provider launch rejected by fixture"));
+
+        let provider_launch_state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&provider_launch_state_file).unwrap())
+                .unwrap();
+        let provider_launch_session = &provider_launch_state["sessions"][0];
+        let provider_launch = &provider_launch_state["session_runtime_launches"][0];
+        assert_ne!(
+            provider_launch_session["session_credential_sha256"],
+            old_credential_sha256
+        );
+        assert_eq!(
+            provider_launch_session["session_credential_sha256"],
+            provider_launch["credential_sha256"]
+        );
+
+        let state = store.load_raw_json_value().unwrap();
+        let session = &state["sessions"][0];
+        let launch = &state["session_runtime_launches"][0];
+        assert_eq!(session["status"], "stopped");
+        assert_eq!(session["provider_resume_id"], "durable-root");
+        assert_ne!(session["session_credential_sha256"], old_credential_sha256);
+        assert_eq!(
+            session["session_credential_sha256"],
+            launch["credential_sha256"]
+        );
+        assert_eq!(launch["status"], "failed");
+        let tmux_log = fs::read_to_string(&tmux_log).unwrap();
+        assert!(tmux_log.starts_with("kill-session -t =codex-fork-restore-absent\n"));
+        assert!(tmux_log.contains("new-session -d -s codex-fork-restore-absent"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
     struct CodexForkRestoreRootFixture {
         state_file: PathBuf,
         fixture_dir: PathBuf,
