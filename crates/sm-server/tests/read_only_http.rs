@@ -15567,12 +15567,8 @@ async fn runtime_core_claude_spawn_brief_never_retries_an_unobserved_submission(
             .as_nanos()
     );
     let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let app = runtime_app_with_command(
-        &state_file,
-        &log_dir,
-        &tmux_socket,
-        r#"/bin/sh -lc 'printf ">"; while IFS= read -r line; do printf "\nreceived:%s\n>" "$line"; done' runtime-sh"#,
-    );
+    let app =
+        runtime_app_with_structured_claude_provider(&state_file, &log_dir, &tmux_socket, false);
 
     let (status, payload) = post_json(
         app,
@@ -15603,7 +15599,7 @@ async fn runtime_core_claude_spawn_brief_never_retries_an_unobserved_submission(
 }
 
 #[tokio::test]
-async fn runtime_core_claude_spawn_brief_accepts_provider_turn_transition() {
+async fn runtime_core_claude_spawn_brief_accepts_matching_transcript_user_turn() {
     if !tmux_available() {
         return;
     }
@@ -15620,12 +15616,8 @@ async fn runtime_core_claude_spawn_brief_accepts_provider_turn_transition() {
             .as_nanos()
     );
     let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let app = runtime_app_with_command(
-        &state_file,
-        &log_dir,
-        &tmux_socket,
-        r#"/bin/sh -lc 'printf "Header\n>"; while IFS= read -r line; do printf "\nreceived:%s\n\033[2J\033[H✽ Thinking through the initial brief\n>" "$line"; done' runtime-sh"#,
-    );
+    let app =
+        runtime_app_with_structured_claude_provider(&state_file, &log_dir, &tmux_socket, true);
 
     let (status, payload) = post_json(
         app,
@@ -15644,6 +15636,17 @@ async fn runtime_core_claude_spawn_brief_accepts_provider_turn_transition() {
     let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
     let launch = &state["session_runtime_launches"][0];
     assert_eq!(launch["status"], "applied");
+    let provider_session_id = launch["provider_resume_id"].as_str().unwrap();
+    assert_eq!(provider_session_id.len(), 36);
+    assert_eq!(provider_session_id.as_bytes()[14], b'4');
+    assert!(matches!(
+        provider_session_id.as_bytes()[19],
+        b'8' | b'9' | b'a' | b'b'
+    ));
+    assert_eq!(
+        state["sessions"][0]["provider_resume_id"],
+        provider_session_id
+    );
     let logs = fs::read_to_string(launch["log_file"].as_str().unwrap()).unwrap_or_default();
     assert_eq!(logs.matches("received:CLAUDE_ACCEPTED_SENTINEL").count(), 1);
 }
@@ -20581,6 +20584,85 @@ fn runtime_app(state_file: &PathBuf, log_dir: &PathBuf, tmux_socket: &str) -> ax
         tmux_socket,
         r#"/bin/sh -lc 'while IFS= read -r line; do printf "argv:%s\nids:%s:%s:%s\nruntime:%s\n" "$*" "$SESSION_MANAGER_ID" "$CLAUDE_SESSION_MANAGER_ID" "$ENABLE_TOOL_SEARCH" "$line"; done' runtime-sh"#,
     )
+}
+
+fn runtime_app_with_structured_claude_provider(
+    state_file: &PathBuf,
+    log_dir: &PathBuf,
+    tmux_socket: &str,
+    acknowledge: bool,
+) -> axum::Router {
+    fs::create_dir_all(log_dir).unwrap();
+    let transcript_root = state_file.with_extension("claude-projects");
+    let provider = log_dir.join("fake-structured-claude");
+    let acknowledgement = acknowledge.then_some(
+        r#"  printf '{"type":"user","sessionId":"%s","message":{"content":"%s"}}\n' "$session_id" "$line" >> "$transcript"
+"#,
+    )
+    .unwrap_or_default();
+    fs::write(
+        &provider,
+        format!(
+            r#"#!/bin/sh
+session_id=''
+previous=''
+for argument in "$@"; do
+  if [ "$previous" = "--session-id" ]; then session_id="$argument"; fi
+  previous="$argument"
+done
+project_dir=$(pwd -P | sed 's#/#-#g')
+transcript='{}'/"$project_dir"/"$session_id".jsonl
+mkdir -p "$(dirname "$transcript")"
+printf '{{"type":"mode","sessionId":"%s"}}\n' "$session_id" > "$transcript"
+printf 'renderer layout deliberately irrelevant\n❯ '
+while IFS= read -r line; do
+  printf 'received:%s\n' "$line"
+{}
+  printf 'renderer changed again\n❯ '
+done
+"#,
+            transcript_root.display(),
+            acknowledgement
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&provider).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&provider, permissions).unwrap();
+    }
+
+    router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db_path_for_state_file(state_file)
+                .display()
+                .to_string(),
+        },
+        claude: ProviderLaunchConfig {
+            command: provider.display().to_string(),
+            args: Vec::new(),
+            default_model: None,
+            session_index_path: None,
+            transcript_root: Some(transcript_root.display().to_string()),
+        },
+        rust_core: RustCoreConfig {
+            runtime_enabled: true,
+            log_dir: Some(log_dir.display().to_string()),
+            tmux_socket_name: Some(tmux_socket.to_owned()),
+            runtime_prompt_mode: Some("stdin".to_owned()),
+            runtime_initial_brief_ready_timeout_ms: Some(2_000),
+            runtime_initial_brief_ack_timeout_ms: Some(300),
+            send_keys_settle_ms: Some(10.0),
+            send_keys_settle_max_ms: Some(50.0),
+            send_keys_max_chunk_chars: Some(128),
+            ..RustCoreConfig::default()
+        },
+        ..AppConfig::default()
+    }))
 }
 
 fn runtime_app_with_codex_fork_initial_brief_provider(
