@@ -5620,7 +5620,21 @@ impl SessionStore {
         store_session_runtime_launch_records(&mut state, &launch_records)?;
         self.write_raw_json_value(&state)?;
 
-        if session_runtime.session_exists(&record.tmux_session)? {
+        if record.provider == "codex-fork" {
+            // For a Codex-fork restore, a tmux command failure is not proof
+            // that the prior runtime is gone. Keep the seat visible and fence
+            // another restore until an operator can resolve the runtime.
+            if let Err(error) = session_runtime.kill_session(&record.tmux_session) {
+                mark_runtime_launch_teardown_failed(
+                    &mut state,
+                    &launch_id,
+                    &record.id,
+                    &format!("failed to tear down prior runtime before restore: {error}"),
+                )?;
+                self.write_raw_json_value(&state)?;
+                return Err(error);
+            }
+        } else if session_runtime.session_exists(&record.tmux_session)? {
             if let Err(error) = session_runtime.kill_session(&record.tmux_session) {
                 mark_runtime_launch_failed(
                     &mut state,
@@ -14353,6 +14367,50 @@ fn mark_runtime_launch_failed(
     Ok(())
 }
 
+/// Record an inconclusive teardown without claiming the runtime is stopped.
+///
+/// A tmux command error is not evidence that the target process is gone. The
+/// session remains operator-visible and fenced from another restore until the
+/// runtime can be inspected or explicitly retired.
+fn mark_runtime_launch_teardown_failed(
+    state: &mut Value,
+    launch_id: &str,
+    session_id: &str,
+    failure_reason: &str,
+) -> Result<()> {
+    let mut records = session_runtime_launch_records(state)?;
+    let record = records
+        .iter_mut()
+        .find(|record| record.id == launch_id)
+        .ok_or_else(|| anyhow::anyhow!("runtime launch {launch_id} disappeared"))?;
+    record.status = "failed".to_owned();
+    record.updated_at = now_rfc3339();
+    record.failure_reason = Some(failure_reason.to_owned());
+    let restore_authorized = record.is_authorized_restore_intent();
+    store_session_runtime_launch_records(state, &records)?;
+
+    let sessions = ensure_sessions_array_mut(state)?;
+    if let Some(session) = session_object_mut(sessions, session_id) {
+        // The caller admitted this restore before it cleared a terminal
+        // marker. Do not let that marker hide an unconfirmed runtime.
+        if restore_authorized {
+            session.insert("completion_status".to_owned(), Value::Null);
+            session.insert("completion_message".to_owned(), Value::Null);
+            session.insert("completed_at".to_owned(), Value::Null);
+            session.insert("terminal_provenance".to_owned(), Value::Null);
+            session.insert("retirement_intent".to_owned(), Value::Null);
+            session.insert("agent_task_completed_at".to_owned(), Value::Null);
+        }
+        session.insert("status".to_owned(), Value::String("error".to_owned()));
+        session.insert("stopped_at".to_owned(), Value::Null);
+        session.insert(
+            "error_message".to_owned(),
+            Value::String(format!("runtime teardown failed: {failure_reason}")),
+        );
+    }
+    Ok(())
+}
+
 fn reparent_topology_fingerprint(
     kind: &str,
     subject_session_id: &str,
@@ -16710,6 +16768,56 @@ mod tests {
         assert_eq!(state["session_runtime_launches"][0]["status"], "failed");
     }
 
+    #[test]
+    fn runtime_teardown_failure_keeps_an_authorized_restore_operator_visible() {
+        let mut state = json!({
+            "sessions": [{
+                "id": "restore01",
+                "name": "restore-codex-fork",
+                "provider": "codex-fork",
+                "working_dir": "/tmp",
+                "tmux_session": "codex-fork-restore01",
+                "status": "stopped",
+                "completion_status": "killed",
+                "created_at": "2026-08-18T00:00:00Z",
+                "last_activity": "2026-08-18T00:00:00Z"
+            }],
+            "session_runtime_launches": [{
+                "id": "launch01",
+                "operation_kind": "restore",
+                "session_id": "restore01",
+                "tmux_session": "codex-fork-restore01",
+                "working_dir": "/tmp",
+                "log_file": "/tmp/codex-fork-restore01.log",
+                "provider": "codex-fork",
+                "provider_resume_id": "durable-root",
+                "restore_authorized": true,
+                "credential_sha256": "test-credential",
+                "status": "launching",
+                "created_at": "2026-08-18T00:00:00Z",
+                "updated_at": "2026-08-18T00:00:00Z"
+            }]
+        });
+
+        mark_runtime_launch_teardown_failed(
+            &mut state,
+            "launch01",
+            "restore01",
+            "tmux transport failed",
+        )
+        .unwrap();
+
+        let session = state["sessions"][0].as_object().unwrap();
+        assert_eq!(session["status"], "error");
+        assert!(session["completion_status"].is_null());
+        assert!(!raw_session_is_stopped(session));
+        assert!(session["error_message"]
+            .as_str()
+            .unwrap()
+            .contains("tmux transport failed"));
+        assert_eq!(state["session_runtime_launches"][0]["status"], "failed");
+    }
+
     static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvVarRestore {
@@ -16736,6 +16844,80 @@ mod tests {
                 env::remove_var(self.key);
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_fork_restore_teardown_transport_failure_is_fenced_and_operator_visible() {
+        let root = unique_temp_path("codex-fork-restore-teardown-failure");
+        fs::create_dir_all(&root).unwrap();
+        let tmux = root.join("tmux");
+        fs::write(
+            &tmux,
+            r#"#!/bin/sh
+case "$1" in
+  kill-session) echo "permission denied while contacting tmux server" >&2; exit 1 ;;
+  *) exit 99 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+
+        let state_file = root.join("sessions.json");
+        fs::write(
+            &state_file,
+            json!({
+                "sessions": [{
+                    "id": "restore01",
+                    "name": "restore-codex-fork",
+                    "provider": "codex-fork",
+                    "provider_resume_id": "durable-root",
+                    "working_dir": root,
+                    "tmux_session": "codex-fork-restore01",
+                    "log_file": root.join("restore.log"),
+                    "status": "stopped",
+                    "completion_status": "killed",
+                    "created_at": "2026-08-18T00:00:00Z",
+                    "last_activity": "2026-08-18T00:00:00Z"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(state_file.clone());
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
+            .with_tmux_binary_for_test(tmux.display().to_string());
+
+        let error = store
+            .restore_core_session_with_runtime("restore01", &runtime)
+            .unwrap_err();
+        assert!(error.to_string().contains("permission denied"));
+
+        let state = store.load_raw_json_value().unwrap();
+        let session = &state["sessions"][0];
+        assert_eq!(session["status"], "error");
+        assert!(session["stopped_at"].is_null());
+        assert!(session["completion_status"].is_null());
+        assert_eq!(session["provider_resume_id"], "durable-root");
+        assert!(session["error_message"]
+            .as_str()
+            .unwrap()
+            .contains("permission denied"));
+        assert_eq!(state["session_runtime_launches"][0]["status"], "failed");
+        assert!(state["session_runtime_launches"][0]["failure_reason"]
+            .as_str()
+            .unwrap()
+            .contains("permission denied"));
+        assert!(matches!(
+            store
+                .restore_core_session_with_runtime("restore01", &runtime)
+                .unwrap(),
+            Some(CoreRestoreOutcome::NotStopped)
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
