@@ -15567,8 +15567,13 @@ async fn runtime_core_claude_spawn_brief_never_retries_an_unobserved_submission(
             .as_nanos()
     );
     let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let app =
-        runtime_app_with_structured_claude_provider(&state_file, &log_dir, &tmux_socket, false);
+    let app = runtime_app_with_structured_claude_provider(
+        &state_file,
+        &log_dir,
+        &tmux_socket,
+        false,
+        false,
+    );
 
     let (status, payload) = post_json(
         app,
@@ -15599,7 +15604,7 @@ async fn runtime_core_claude_spawn_brief_never_retries_an_unobserved_submission(
 }
 
 #[tokio::test]
-async fn runtime_core_claude_spawn_brief_accepts_matching_transcript_user_turn() {
+async fn runtime_core_claude_spawn_brief_accepts_matching_nested_transcript_user_turn() {
     if !tmux_available() {
         return;
     }
@@ -15616,8 +15621,13 @@ async fn runtime_core_claude_spawn_brief_accepts_matching_transcript_user_turn()
             .as_nanos()
     );
     let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let app =
-        runtime_app_with_structured_claude_provider(&state_file, &log_dir, &tmux_socket, true);
+    let app = runtime_app_with_structured_claude_provider(
+        &state_file,
+        &log_dir,
+        &tmux_socket,
+        true,
+        true,
+    );
 
     let (status, payload) = post_json(
         app,
@@ -20591,10 +20601,22 @@ fn runtime_app_with_structured_claude_provider(
     log_dir: &PathBuf,
     tmux_socket: &str,
     acknowledge: bool,
+    nested_transcript: bool,
 ) -> axum::Router {
     fs::create_dir_all(log_dir).unwrap();
     let transcript_root = state_file.with_extension("claude-projects");
     let provider = log_dir.join("fake-structured-claude");
+    let transcript_layout = if nested_transcript {
+        format!(
+            r#"transcript='{}'/"$project_dir"/"$session_id"/chat.jsonl"#,
+            transcript_root.display()
+        )
+    } else {
+        format!(
+            r#"transcript='{}'/"$project_dir"/"$session_id".jsonl"#,
+            transcript_root.display()
+        )
+    };
     let acknowledgement = acknowledge.then_some(
         r#"  printf '{"type":"user","sessionId":"%s","message":{"content":"%s"}}\n' "$session_id" "$line" >> "$transcript"
 "#,
@@ -20611,17 +20633,16 @@ for argument in "$@"; do
   previous="$argument"
 done
 project_dir=$(pwd -P | sed 's#/#-#g')
-transcript='{}'/"$project_dir"/"$session_id".jsonl
+{transcript_layout}
 mkdir -p "$(dirname "$transcript")"
 printf '{{"type":"mode","sessionId":"%s"}}\n' "$session_id" > "$transcript"
-printf 'renderer layout deliberately irrelevant\n❯ '
+printf 'renderer layout deliberately irrelevant\n❯'
 while IFS= read -r line; do
   printf 'received:%s\n' "$line"
 {}
-  printf 'renderer changed again\n❯ '
+  printf 'renderer changed again\n❯'
 done
 "#,
-            transcript_root.display(),
             acknowledgement
         ),
     )

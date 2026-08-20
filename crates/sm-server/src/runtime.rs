@@ -1353,6 +1353,14 @@ impl TmuxRuntime {
                 }
                 let (transcript_path, transcript_offset) =
                     self.wait_for_claude_initial_brief_transcript(spec)?;
+                self.wait_for_claude_initial_brief_composer(&spec.tmux_session)?;
+                // The input lock coordinates session-manager writers, but a
+                // human tmux client can attach while waiting for Claude to
+                // finish startup. Check again at the send boundary so an
+                // immutable brief is never pasted into an observed session.
+                if self.session_has_attached_clients(&spec.tmux_session)? {
+                    bail!("refusing to submit the initial Claude spawn brief while a tmux client is attached");
+                }
                 self.send_text_then_enter(&spec.tmux_session, prompt)?;
                 self.wait_for_claude_initial_brief_acceptance(
                     &spec.tmux_session,
@@ -1371,6 +1379,68 @@ impl TmuxRuntime {
                 .into(),
             ),
         }
+    }
+
+    /// Wait until Claude has both initialized its provider transcript and
+    /// exposed an empty composer at the live cursor. A transcript proves which
+    /// provider session will acknowledge the brief, but it can precede the
+    /// interactive UI while Claude shows startup or onboarding screens.
+    fn wait_for_claude_initial_brief_composer(&self, tmux_session: &str) -> Result<()> {
+        let deadline = Instant::now() + self.initial_brief_ready_timeout;
+        loop {
+            if !self.session_exists(tmux_session)? {
+                return Err(InitialBriefDeliveryError::SessionExited {
+                    provider: "claude".to_owned(),
+                }
+                .into());
+            }
+            if self.claude_initial_brief_composer_ready(tmux_session) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(InitialBriefDeliveryError::ProviderReadinessTimedOut {
+                    provider: "claude".to_owned(),
+                }
+                .into());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Claude's empty composer must be at the active cursor, not merely occur
+    /// in scrollback or resemble a typed prompt in a startup frame.
+    fn claude_initial_brief_composer_ready(&self, tmux_session: &str) -> bool {
+        let Some(pane) = self.capture_pane_text(tmux_session) else {
+            return false;
+        };
+        if !claude_composer_is_ready(&pane) {
+            return false;
+        }
+        let Some((cursor_x, cursor_y)) = self.pane_cursor_position(tmux_session) else {
+            return false;
+        };
+        claude_empty_composer_cursor(&pane, cursor_x, cursor_y)
+    }
+
+    fn pane_cursor_position(&self, tmux_session: &str) -> Option<(usize, usize)> {
+        let output = self
+            .tmux_command([
+                "display-message",
+                "-p",
+                "-t",
+                tmux_session,
+                "#{cursor_x},#{cursor_y}",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let cursor = String::from_utf8_lossy(&output.stdout);
+        let (x, y) = cursor.trim().split_once(',')?;
+        Some((x.parse().ok()?, y.parse().ok()?))
     }
 
     fn wait_for_initial_brief_readiness(&self, tmux_session: &str, provider: &str) -> Result<()> {
@@ -1492,6 +1562,14 @@ impl TmuxRuntime {
             );
         }
         let deadline = Instant::now() + self.initial_brief_ready_timeout;
+        let direct_candidates = claude_transcript_candidates(
+            &self.claude_projects_roots,
+            &spec.working_dir,
+            provider_session_id,
+        );
+        let project_directories =
+            claude_transcript_project_directories(&self.claude_projects_roots, &spec.working_dir);
+        let mut next_nested_scan = Instant::now();
         loop {
             if !self.session_exists(&spec.tmux_session)? {
                 return Err(InitialBriefDeliveryError::SessionExited {
@@ -1499,17 +1577,24 @@ impl TmuxRuntime {
                 }
                 .into());
             }
-            for transcript_path in claude_transcript_candidates(
-                &self.claude_projects_roots,
-                &spec.working_dir,
-                provider_session_id,
-            ) {
+            for transcript_path in &direct_candidates {
                 let Ok(metadata) = fs::metadata(&transcript_path) else {
                     continue;
                 };
                 if claude_transcript_declares_session(&transcript_path, provider_session_id) {
-                    return Ok((transcript_path, metadata.len()));
+                    return Ok((transcript_path.clone(), metadata.len()));
                 }
+            }
+            if Instant::now() >= next_nested_scan {
+                for transcript_path in claude_nested_transcript_candidates(&project_directories) {
+                    let Ok(metadata) = fs::metadata(&transcript_path) else {
+                        continue;
+                    };
+                    if claude_transcript_declares_session(&transcript_path, provider_session_id) {
+                        return Ok((transcript_path, metadata.len()));
+                    }
+                }
+                next_nested_scan = Instant::now() + Duration::from_millis(250);
             }
             if Instant::now() >= deadline {
                 return Err(InitialBriefDeliveryError::ProviderReadinessTimedOut {
@@ -1739,6 +1824,16 @@ fn claude_transcript_candidates(
     working_dir: &str,
     provider_session_id: &str,
 ) -> Vec<PathBuf> {
+    claude_transcript_project_directories(projects_roots, working_dir)
+        .iter()
+        .map(|project_dir| project_dir.join(format!("{provider_session_id}.jsonl")))
+        .collect()
+}
+
+fn claude_transcript_project_directories(
+    projects_roots: &[PathBuf],
+    working_dir: &str,
+) -> Vec<PathBuf> {
     let resolved_working_dir = PathBuf::from(working_dir)
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(working_dir));
@@ -1747,11 +1842,31 @@ fn claude_transcript_candidates(
         .replace(std::path::MAIN_SEPARATOR, "-");
     projects_roots
         .iter()
-        .map(|root| {
-            root.join(&project_dir)
-                .join(format!("{provider_session_id}.jsonl"))
-        })
+        .map(|root| root.join(&project_dir))
         .collect()
+}
+
+/// Claude normally writes `<project>/<session-id>.jsonl`, but older and
+/// nested layouts may place the file below the project directory. The caller
+/// binds every result to the generated session ID before accepting it.
+fn claude_nested_transcript_candidates(project_directories: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = project_directories.to_vec();
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
 }
 
 fn claude_transcript_declares_session(path: &Path, provider_session_id: &str) -> bool {
@@ -1841,6 +1956,27 @@ fn claude_inline_placeholder(line: &str) -> bool {
     placeholder.starts_with(concat!("Try ", "\""))
         && placeholder.ends_with('"')
         && placeholder.len() > concat!("Try ", "\"").len()
+}
+
+/// Confirm that tmux's cursor is immediately after the visible composer
+/// prefix. A user-typed string, including one that resembles Claude's `Try
+/// "..."` placeholder, places the cursor farther right and is rejected.
+fn claude_empty_composer_cursor(pane: &str, cursor_x: usize, cursor_y: usize) -> bool {
+    let Some(line) = pane.lines().nth(cursor_y) else {
+        return false;
+    };
+    let leading = line.len() - line.trim_start().len();
+    let composer = &line[leading..];
+    let prefix_width = if composer.starts_with('>') {
+        1
+    } else if composer.starts_with("❯\u{a0}") {
+        2
+    } else if composer.starts_with('❯') {
+        1
+    } else {
+        return false;
+    };
+    claude_composer_line_is_ready(composer.trim()) && cursor_x == leading + prefix_width
 }
 
 fn claude_composer_footer_divider(line: &str) -> bool {
@@ -2428,6 +2564,15 @@ esac
             "❯ deploy --production",
         );
         assert!(!claude_composer_is_ready(&typed));
+    }
+
+    #[test]
+    fn claude_empty_composer_cursor_rejects_typed_or_stale_prompt_rows() {
+        let pane = "Earlier output\n❯\n────────────────────\nFable 5\n";
+
+        assert!(claude_empty_composer_cursor(pane, 1, 1));
+        assert!(!claude_empty_composer_cursor(pane, 2, 1));
+        assert!(!claude_empty_composer_cursor(pane, 1, 0));
     }
 
     #[test]
