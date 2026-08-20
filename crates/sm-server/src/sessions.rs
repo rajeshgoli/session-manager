@@ -5785,6 +5785,65 @@ impl SessionStore {
             return Err(error);
         }
 
+        if let Some(artifacts) = codex_fork_artifacts.as_ref() {
+            let expected_provider_resume_id = provider_resume_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("codex-fork restore is missing its provider resume id")
+            })?;
+            if let Err(acceptance_error) = wait_for_codex_fork_restore_root_acceptance(
+                &artifacts.event_stream_path,
+                0,
+                expected_provider_resume_id,
+                CODEX_FORK_THREAD_STARTED_TIMEOUT,
+                || session_runtime.session_exists(&record.tmux_session),
+                || session_runtime.accept_codex_directory_trust_prompt(&record.tmux_session),
+            ) {
+                let failure_reason = format!(
+                    "codex-fork restore rejected durable root {expected_provider_resume_id}: {acceptance_error}"
+                );
+                let mut returned_failure = failure_reason.clone();
+                match session_runtime.teardown_session_for_restore(&record.tmux_session) {
+                    RestoreTmuxTeardownOutcome::Killed
+                    | RestoreTmuxTeardownOutcome::AlreadyAbsent => {
+                        mark_runtime_launch_failed(
+                            &mut state,
+                            &launch_id,
+                            &record.id,
+                            false,
+                            &failure_reason,
+                        )?;
+                        let sessions = ensure_sessions_array_mut(&mut state)?;
+                        if let Some(session) = session_object_mut(sessions, &record.id) {
+                            session.insert(
+                                "error_message".to_owned(),
+                                Value::String(format!(
+                                    "codex_fork_restore_rejected: {failure_reason}"
+                                )),
+                            );
+                        }
+                    }
+                    RestoreTmuxTeardownOutcome::Inconclusive { reason } => {
+                        let teardown_failure = format!(
+                            "{failure_reason}; failed to confirm rejected runtime teardown: {reason}"
+                        );
+                        mark_runtime_launch_restore_request_inconclusive(
+                            &mut state,
+                            &launch_id,
+                            &record.id,
+                            &teardown_failure,
+                        )?;
+                        returned_failure = teardown_failure;
+                    }
+                }
+                self.write_raw_json_value(&state)?;
+                return Err(anyhow::anyhow!(returned_failure)).with_context(|| {
+                    format!(
+                        "codex-fork session {} did not accept durable provider resume id {expected_provider_resume_id}",
+                        record.id
+                    )
+                });
+            }
+        }
+
         let sessions = ensure_sessions_array_mut(&mut state)?;
         let Some(session) = session_object_mut(sessions, session_id) else {
             return Ok(None);
@@ -5798,6 +5857,7 @@ impl SessionStore {
         session.insert("terminal_provenance".to_owned(), Value::Null);
         session.insert("retirement_intent".to_owned(), Value::Null);
         session.insert("agent_task_completed_at".to_owned(), Value::Null);
+        session.insert("error_message".to_owned(), Value::Null);
         session.insert("last_activity".to_owned(), Value::String(now));
         if let Some(socket_name) = session_runtime.socket_name() {
             session.insert(
@@ -9042,6 +9102,74 @@ fn wait_for_codex_fork_provider_resume_id_after_offset(
     )
 }
 
+/// Require a restoring Codex-fork runtime to bind the exact durable root.
+///
+/// This is provider acceptance only. The post-acceptance liveness window is a
+/// separate restore slice so a matching root event returns after the complete
+/// currently-available event batch has been checked for terminal events.
+fn wait_for_codex_fork_restore_root_acceptance<F, H>(
+    event_stream_path: &Path,
+    initial_offset: u64,
+    expected_provider_resume_id: &str,
+    timeout: Duration,
+    mut runtime_is_live: F,
+    mut handle_startup_prompt: H,
+) -> Result<()>
+where
+    F: FnMut() -> Result<bool>,
+    H: FnMut() -> Result<bool>,
+{
+    let started = Instant::now();
+    let mut offset = initial_offset;
+    let mut buffer = String::new();
+    let mut directory_trust_accepted = false;
+    loop {
+        if !runtime_is_live()? {
+            anyhow::bail!(
+                "codex-fork tmux runtime disappeared while waiting for restore root acceptance"
+            );
+        }
+        let mut accepted = false;
+        if let Ok(chunk) = read_file_from_offset(event_stream_path, &mut offset) {
+            for line in split_complete_event_lines(&mut buffer, &chunk) {
+                let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
+                    continue;
+                };
+                let Some(event) = event.as_object() else {
+                    continue;
+                };
+                if codex_fork_event_ends_session(event) {
+                    anyhow::bail!(
+                        "codex-fork provider ended during restore root acceptance in {}",
+                        event_stream_path.display()
+                    );
+                }
+                if let Some(provider_resume_id) = extract_codex_fork_thread_started(event) {
+                    if provider_resume_id != expected_provider_resume_id {
+                        anyhow::bail!(
+                            "codex-fork restore bound unexpected root thread {provider_resume_id}; expected {expected_provider_resume_id}"
+                        );
+                    }
+                    accepted = true;
+                }
+            }
+        }
+        if accepted {
+            return Ok(());
+        }
+        if !directory_trust_accepted {
+            directory_trust_accepted = handle_startup_prompt()?;
+        }
+        if started.elapsed() >= timeout {
+            anyhow::bail!(
+                "timed out waiting for codex-fork restore to bind root thread {expected_provider_resume_id} in {}",
+                event_stream_path.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn wait_for_codex_fork_provider_resume_id_after_offset_with_startup<F>(
     event_stream_path: &Path,
     initial_offset: u64,
@@ -9282,6 +9410,20 @@ fn codex_fork_status_for_event(event: &Map<String, Value>) -> Option<&'static st
         other if other.ends_with("_begin") => Some("running"),
         _ => None,
     }
+}
+
+fn codex_fork_event_ends_session(event: &Map<String, Value>) -> bool {
+    matches!(
+        normalize_codex_fork_event_type(
+            &codex_fork_event_type(event)
+                .unwrap_or_default()
+                .replace('/', "_")
+        )
+        .as_str(),
+        // `shutdown_complete` is detached-runtime churn and deliberately does
+        // not terminate an accepted root in either lifecycle reducer.
+        "session_end" | "shutdown"
+    )
 }
 
 fn codex_fork_event_starts_turn(event: &Map<String, Value>) -> bool {
@@ -17182,6 +17324,300 @@ esac
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    struct CodexForkRestoreRootFixture {
+        state_file: PathBuf,
+        fixture_dir: PathBuf,
+        tmux_socket: String,
+        tmux_server_pid: String,
+        runtime: TmuxRuntime,
+    }
+
+    #[cfg(unix)]
+    impl CodexForkRestoreRootFixture {
+        fn new(label: &str, provider_script: &str) -> Option<Self> {
+            if !Command::new("tmux")
+                .arg("-V")
+                .output()
+                .ok()?
+                .status
+                .success()
+            {
+                return None;
+            }
+            let state_file = unique_temp_path(&format!("codex-restore-root-{label}"));
+            let fixture_dir = state_file.with_extension("dir");
+            fs::create_dir_all(&fixture_dir).ok()?;
+            let command_path = fixture_dir.join("fake-codex-fork");
+            fs::write(&command_path, provider_script).ok()?;
+            let mut permissions = fs::metadata(&command_path).ok()?.permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&command_path, permissions).ok()?;
+
+            let tmux_socket = format!(
+                "sm-1363-{}-{}",
+                std::process::id(),
+                OffsetDateTime::now_utc().unix_timestamp_nanos()
+            );
+            let anchor = Command::new("tmux")
+                .args([
+                    "-L",
+                    &tmux_socket,
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "__sm_server_anchor",
+                    "sleep 30",
+                ])
+                .output()
+                .ok()?;
+            if !anchor.status.success() {
+                return None;
+            }
+            let server_pid = Command::new("tmux")
+                .args([
+                    "-L",
+                    &tmux_socket,
+                    "display-message",
+                    "-p",
+                    "-t",
+                    "=__sm_server_anchor",
+                    "#{pid}",
+                ])
+                .output()
+                .ok()?;
+            if !server_pid.status.success() {
+                return None;
+            }
+            let tmux_server_pid = String::from_utf8(server_pid.stdout).ok()?.trim().to_owned();
+
+            let mut config = AppConfig::default();
+            config.rust_core.tmux_socket_name = Some(tmux_socket.clone());
+            config.codex_fork.command = command_path.display().to_string();
+            config.codex_fork.args = Vec::new();
+            let runtime = TmuxRuntime::from_app_config(&config);
+            let log_file = fixture_dir.join("restore01.log");
+            fs::write(
+                &state_file,
+                json!({
+                    "sessions": [{
+                        "id": "restore01",
+                        "name": "restore-codex-fork",
+                        "provider": "codex-fork",
+                        "provider_resume_id": "durable-root",
+                        "session_credential_sha256": sha256_text("old-runtime-secret"),
+                        "working_dir": fixture_dir.display().to_string(),
+                        "tmux_session": "codex-fork-restore01",
+                        "tmux_socket_name": tmux_socket,
+                        "log_file": log_file.display().to_string(),
+                        "status": "stopped",
+                        "stopped_at": "2026-08-18T00:00:00Z",
+                        "completion_status": "killed",
+                        "completion_message": "previous runtime stopped",
+                        "error_message": "stale prior failure",
+                        "created_at": "2026-08-18T00:00:00Z",
+                        "last_activity": "2026-08-18T00:00:00Z"
+                    }]
+                })
+                .to_string(),
+            )
+            .ok()?;
+            Some(Self {
+                state_file,
+                fixture_dir,
+                tmux_socket,
+                tmux_server_pid,
+                runtime,
+            })
+        }
+
+        fn store(&self) -> SessionStore {
+            SessionStore::new_with_legacy_fallback(self.state_file.clone(), self.state_file.clone())
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CodexForkRestoreRootFixture {
+        fn drop(&mut self) {
+            let _ = Command::new("kill")
+                .args(["-USR1", &self.tmux_server_pid])
+                .status();
+            let killed = Command::new("tmux")
+                .args(["-L", &self.tmux_socket, "kill-server"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !killed {
+                let process = Command::new("ps")
+                    .args(["-p", &self.tmux_server_pid, "-o", "command="])
+                    .output()
+                    .ok();
+                let is_fixture_server = process.as_ref().is_some_and(|output| {
+                    let command = String::from_utf8_lossy(&output.stdout);
+                    command.contains("tmux") && command.contains(&self.tmux_socket)
+                });
+                if is_fixture_server {
+                    let _ = Command::new("kill")
+                        .args(["-TERM", &self.tmux_server_pid])
+                        .status();
+                }
+            }
+            let _ = fs::remove_file(&self.state_file);
+            let _ = fs::remove_dir_all(&self.fixture_dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_fork_restore_projects_running_only_after_exact_root_acceptance() {
+        let Some(fixture) = CodexForkRestoreRootFixture::new(
+            "valid",
+            r#"#!/bin/sh
+event_stream=''
+resume_id=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --event-stream) event_stream="$2"; shift 2 ;;
+    resume | --resume) resume_id="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s\n' '{"event_type":"shutdown_complete","payload":{}}' >> "$event_stream"
+printf '{"event_type":"thread_started","payload":{"thread":{"id":"%s"}}}\n' "$resume_id" >> "$event_stream"
+printf '%s\n' '{"event_type":"shutdown_complete","payload":{}}' >> "$event_stream"
+sleep 30
+"#,
+        ) else {
+            return;
+        };
+
+        let restored = fixture
+            .store()
+            .restore_core_session_with_runtime("restore01", &fixture.runtime)
+            .unwrap()
+            .unwrap();
+        let CoreRestoreOutcome::Restored(restored) = restored else {
+            panic!("restore did not report success");
+        };
+        assert_eq!(restored.status, "running");
+        assert_eq!(restored.provider_resume_id.as_deref(), Some("durable-root"));
+        let state = fixture.store().load_raw_json_value().unwrap();
+        assert_eq!(state["sessions"][0]["status"], "running");
+        assert_eq!(state["sessions"][0]["error_message"], Value::Null);
+        assert_eq!(state["session_runtime_launches"][0]["status"], "applied");
+        assert!(fixture
+            .runtime
+            .session_exists("codex-fork-restore01")
+            .unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_fork_restore_rejects_mismatched_root_and_tears_down_runtime() {
+        let Some(fixture) = CodexForkRestoreRootFixture::new(
+            "mismatch",
+            r#"#!/bin/sh
+event_stream=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --event-stream) event_stream="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s\n' '{"event_type":"thread_started","payload":{"thread":{"id":"new-root"}}}' >> "$event_stream"
+sleep 30
+"#,
+        ) else {
+            return;
+        };
+
+        let error = fixture
+            .store()
+            .restore_core_session_with_runtime("restore01", &fixture.runtime)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("unexpected root thread new-root"));
+        let state = fixture.store().load_raw_json_value().unwrap();
+        assert_eq!(state["sessions"][0]["status"], "stopped");
+        assert_eq!(state["sessions"][0]["provider_resume_id"], "durable-root");
+        assert!(state["sessions"][0]["error_message"]
+            .as_str()
+            .unwrap()
+            .contains("unexpected root thread new-root"));
+        assert_eq!(state["session_runtime_launches"][0]["status"], "failed");
+        assert!(!fixture
+            .runtime
+            .session_exists("codex-fork-restore01")
+            .unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_fork_restore_rejection_fences_inconclusive_teardown_with_live_credential() {
+        let Some(fixture) = CodexForkRestoreRootFixture::new(
+            "unlinked-rejection",
+            r#"#!/bin/sh
+event_stream=''
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --event-stream) event_stream="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s\n' '{"event_type":"thread_started","payload":{"thread":{"id":"new-root"}}}' >> "$event_stream"
+socket_path=${TMUX%%,*}
+rm -f "$socket_path"
+sleep 30
+"#,
+        ) else {
+            return;
+        };
+
+        let error = fixture
+            .store()
+            .restore_core_session_with_runtime("restore01", &fixture.runtime)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("failed to confirm rejected runtime teardown"));
+        let state = fixture.store().load_raw_json_value().unwrap();
+        assert_eq!(state["sessions"][0]["status"], "error");
+        assert!(state["sessions"][0]["stopped_at"].is_null());
+        assert_eq!(state["sessions"][0]["provider_resume_id"], "durable-root");
+        assert_eq!(
+            state["sessions"][0]["session_credential_sha256"],
+            state["session_runtime_launches"][0]["credential_sha256"]
+        );
+        assert_eq!(state["session_runtime_launches"][0]["status"], "failed");
+        assert!(state["sessions"][0]["error_message"]
+            .as_str()
+            .unwrap()
+            .contains("failed to confirm rejected runtime teardown"));
+        assert!(Command::new("kill")
+            .args(["-0", &fixture.tmux_server_pid])
+            .status()
+            .unwrap()
+            .success());
+
+        Command::new("kill")
+            .args(["-USR1", &fixture.tmux_server_pid])
+            .status()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if fixture
+                .runtime
+                .session_exists("codex-fork-restore01")
+                .unwrap_or(false)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "unlinked live tmux server did not recover its socket"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvVarRestore {
@@ -20499,6 +20935,124 @@ esac
             .unwrap(),
             "root-thread"
         );
+        let _ = fs::remove_file(event_stream_path);
+    }
+
+    #[test]
+    fn codex_fork_restore_root_acceptance_requires_exact_identity_and_ignores_shutdown_complete() {
+        let event_stream_path = unique_temp_path("codex-restore-root-acceptance-valid");
+        fs::write(
+            &event_stream_path,
+            concat!(
+                "{\"event_type\":\"shutdown_complete\",\"payload\":{}}\n",
+                "{\"event_type\":\"thread/started\",\"payload\":{\"thread\":{\"id\":\"durable-root\"}}}\n",
+                "{\"event_type\":\"shutdown_complete\",\"payload\":{}}\n"
+            ),
+        )
+        .unwrap();
+
+        wait_for_codex_fork_restore_root_acceptance(
+            &event_stream_path,
+            0,
+            "durable-root",
+            Duration::ZERO,
+            || Ok(true),
+            || Ok(false),
+        )
+        .unwrap();
+
+        let _ = fs::remove_file(event_stream_path);
+    }
+
+    #[test]
+    fn codex_fork_restore_root_acceptance_rejects_mismatch_and_terminal_events() {
+        for (label, events, expected) in [
+            (
+                "mismatch",
+                "{\"event_type\":\"thread_started\",\"payload\":{\"thread\":{\"id\":\"new-root\"}}}\n",
+                "unexpected root thread new-root",
+            ),
+            (
+                "session-end",
+                "{\"event_type\":\"session_end\",\"payload\":{}}\n",
+                "provider ended",
+            ),
+            (
+                "shutdown-after-root",
+                concat!(
+                    "{\"event_type\":\"thread_started\",\"payload\":{\"thread\":{\"id\":\"durable-root\"}}}\n",
+                    "{\"event_type\":\"shutdown\",\"payload\":{}}\n"
+                ),
+                "provider ended",
+            ),
+        ] {
+            let event_stream_path = unique_temp_path(&format!("codex-restore-root-{label}"));
+            fs::write(&event_stream_path, events).unwrap();
+            let error = wait_for_codex_fork_restore_root_acceptance(
+                &event_stream_path,
+                0,
+                "durable-root",
+                Duration::ZERO,
+                || Ok(true),
+                || Ok(false),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{label}: {error:#}");
+            let _ = fs::remove_file(event_stream_path);
+        }
+    }
+
+    #[test]
+    fn codex_fork_restore_root_acceptance_handles_trust_timeout_and_tmux_loss() {
+        let event_stream_path = unique_temp_path("codex-restore-root-trust");
+        fs::write(&event_stream_path, "").unwrap();
+        let writer_path = event_stream_path.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(125));
+            fs::write(
+                writer_path,
+                "{\"event_type\":\"thread_started\",\"payload\":{\"thread\":{\"id\":\"durable-root\"}}}\n",
+            )
+            .unwrap();
+        });
+        let mut prompt_checks = 0;
+        wait_for_codex_fork_restore_root_acceptance(
+            &event_stream_path,
+            0,
+            "durable-root",
+            Duration::from_secs(1),
+            || Ok(true),
+            || {
+                prompt_checks += 1;
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(prompt_checks, 1);
+        writer.join().unwrap();
+
+        fs::write(&event_stream_path, "").unwrap();
+        let timeout = wait_for_codex_fork_restore_root_acceptance(
+            &event_stream_path,
+            0,
+            "durable-root",
+            Duration::ZERO,
+            || Ok(true),
+            || Ok(false),
+        )
+        .unwrap_err();
+        assert!(timeout.to_string().contains("timed out waiting"));
+
+        let tmux_loss = wait_for_codex_fork_restore_root_acceptance(
+            &event_stream_path,
+            0,
+            "durable-root",
+            Duration::from_millis(50),
+            || Ok(false),
+            || Ok(false),
+        )
+        .unwrap_err();
+        assert!(tmux_loss.to_string().contains("tmux runtime disappeared"));
         let _ = fs::remove_file(event_stream_path);
     }
 
