@@ -6829,9 +6829,42 @@ impl SessionStore {
         Ok(true)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn current_claude_handoff_clear_was_observed(
+        &self,
+        session_id: &str,
+        file_path: &str,
+        recorded_at: &str,
+        reservation_at: &str,
+        tmux_session: &str,
+        socket_name: &Option<String>,
+        previous_reset_emitted_at: Option<&str>,
+    ) -> Result<bool> {
+        let _guard = self.write_guard()?;
+        let state = self.load_raw_json_value()?;
+        let Some(session) = raw_session_object(&state, session_id) else {
+            return Ok(false);
+        };
+        let reservation_matches = json_text(session.get("provider")).as_deref() == Some("claude")
+            && !raw_session_is_stopped(session)
+            && is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
+            && json_text(session.get("tmux_session")).as_deref() == Some(tmux_session)
+            && json_text(session.get("tmux_socket_name")).as_deref() == socket_name.as_deref()
+            && json_text(session.get("pending_handoff_path")).as_deref() == Some(file_path)
+            && json_text(session.get("pending_handoff_recorded_at")).as_deref()
+                == Some(recorded_at)
+            && json_text(session.get("claude_handoff_in_progress_at")).as_deref()
+                == Some(reservation_at);
+        if !reservation_matches {
+            return Ok(false);
+        }
+        let reset_emitted_at = json_text(session.get("context_cycle_reset_emitted_at"));
+        Ok(reset_emitted_at.is_some() && reset_emitted_at.as_deref() != previous_reset_emitted_at)
+    }
+
     fn execute_pending_claude_handoff(&self, session_id: &str) -> Result<bool> {
         let _clear_guard = self.lock_clear_operation(session_id)?;
-        let (file_path, recorded_at, reservation_at, tmux_session, socket_name) = {
+        let (file_path, recorded_at, reservation_at, tmux_session, socket_name, reset_emitted_at) = {
             let _guard = self.write_guard()?;
             let state = self.load_raw_json_value()?;
             let Some(session) = raw_session_object(&state, session_id) else {
@@ -6859,6 +6892,7 @@ impl SessionStore {
                 json_text(session.get("tmux_session"))
                     .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?,
                 json_text(session.get("tmux_socket_name")),
+                json_text(session.get("context_cycle_reset_emitted_at")),
             )
         };
 
@@ -6888,6 +6922,14 @@ impl SessionStore {
             let commit_tmux_session = tmux_session.clone();
             let commit_socket_name = socket_name.clone();
             let commit_clear_started = clear_started.clone();
+            let confirmation_store = self.clone();
+            let confirmation_session_id = session_id.to_owned();
+            let confirmation_file_path = file_path.clone();
+            let confirmation_recorded_at = recorded_at.clone();
+            let confirmation_reservation_at = reservation_at.clone();
+            let confirmation_tmux_session = tmux_session.clone();
+            let confirmation_socket_name = socket_name.clone();
+            let confirmation_reset_emitted_at = reset_emitted_at.clone();
             let prompt_store = self.clone();
             let prompt_session_id = session_id.to_owned();
             let prompt_file_path = file_path.clone();
@@ -6923,6 +6965,17 @@ impl SessionStore {
                             commit_clear_started.store(true, Ordering::Release);
                             send_clear()
                         },
+                    )
+                },
+                move || {
+                    confirmation_store.current_claude_handoff_clear_was_observed(
+                        &confirmation_session_id,
+                        &confirmation_file_path,
+                        &confirmation_recorded_at,
+                        &confirmation_reservation_at,
+                        &confirmation_tmux_session,
+                        &confirmation_socket_name,
+                        confirmation_reset_emitted_at.as_deref(),
                     )
                 },
                 move |send_prompt| {

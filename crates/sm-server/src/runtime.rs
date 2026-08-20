@@ -658,17 +658,19 @@ impl TmuxRuntime {
         self.clear_session_inner(tmux_session, clear_command, prompt, wake_completed, None)
     }
 
-    pub(crate) fn clear_claude_session_if<P, C, S>(
+    pub(crate) fn clear_claude_session_if<P, C, A, S>(
         &self,
         tmux_session: &str,
         prompt: &str,
         precondition: P,
         commit_clear: C,
+        clear_completed: A,
         commit_prompt: S,
     ) -> Result<ConditionalClearOutcome>
     where
         P: FnOnce() -> Result<bool>,
         C: FnOnce(&mut dyn FnMut() -> Result<()>) -> Result<bool>,
+        A: FnMut() -> Result<bool>,
         S: FnOnce(&mut dyn FnMut() -> Result<()>) -> Result<bool>,
     {
         let _guard = self.lock_session_input(tmux_session)?;
@@ -688,14 +690,12 @@ impl TmuxRuntime {
             return Ok(ConditionalClearOutcome::PreconditionFailed);
         }
 
-        if self
-            .wait_for_claude_empty_composer(
-                tmux_session,
-                Some(&pre_clear_pane),
-                Duration::from_secs_f64(5.0),
-            )
-            .is_none()
-        {
+        if !self.wait_for_confirmed_claude_clear(
+            tmux_session,
+            &pre_clear_pane,
+            clear_completed,
+            Duration::from_secs_f64(5.0),
+        )? {
             bail!("Claude handoff timed out waiting for /clear to finish");
         }
         let mut send_prompt = || self.send_text_then_enter(tmux_session, prompt);
@@ -703,6 +703,36 @@ impl TmuxRuntime {
             return Ok(ConditionalClearOutcome::PostClearPreconditionFailed);
         }
         Ok(ConditionalClearOutcome::Cleared)
+    }
+
+    fn wait_for_confirmed_claude_clear<A>(
+        &self,
+        tmux_session: &str,
+        pre_clear_pane: &str,
+        mut clear_completed: A,
+        timeout: Duration,
+    ) -> Result<bool>
+    where
+        A: FnMut() -> Result<bool>,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if clear_completed()?
+                && self
+                    .wait_for_claude_empty_composer(
+                        tmux_session,
+                        Some(pre_clear_pane),
+                        Duration::ZERO,
+                    )
+                    .is_some()
+            {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
     }
 
     pub fn clear_codex_session_confirming_prompt(
@@ -3005,6 +3035,7 @@ esac
                     checks.set(checks.get() + 1);
                     Ok(false)
                 },
+                || unreachable!("clear completion must not be checked"),
                 |_send_prompt| unreachable!("prompt submission must not be reached"),
             )
             .unwrap();
@@ -3035,6 +3066,7 @@ esac
                     send_clear()?;
                     Ok(true)
                 },
+                || Ok(true),
                 |send_prompt| {
                     send_prompt()?;
                     Ok(true)
@@ -3069,6 +3101,7 @@ esac
                     send_clear()?;
                     Ok(true)
                 },
+                || Ok(true),
                 |_send_prompt| Ok(false),
             )
             .unwrap();
@@ -3101,6 +3134,7 @@ esac
                     send_clear()?;
                     Ok(true)
                 },
+                || Ok(true),
                 |send_prompt| {
                     send_prompt()?;
                     Ok(true)
@@ -3112,6 +3146,41 @@ esac
         let log = fs::read_to_string(log_path).unwrap();
         assert!(log.contains("send-keys -t sm-test -l -- /clear"));
         assert!(log.contains("send-keys -t sm-test -l -- handoff prompt"));
+    }
+
+    #[test]
+    fn conditional_claude_clear_requires_provider_clear_confirmation() {
+        let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary_with_fresh_clear();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            send_keys_settle_ms: Some(0.0),
+            send_keys_settle_max_ms: Some(0.0),
+            ..RustCoreConfig::default()
+        });
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        let error = runtime
+            .clear_claude_session_if(
+                "sm-test",
+                "handoff prompt",
+                || Ok(true),
+                |send_clear| {
+                    send_clear()?;
+                    Ok(true)
+                },
+                || Ok(false),
+                |send_prompt| {
+                    send_prompt()?;
+                    Ok(true)
+                },
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("timed out waiting for /clear to finish"));
+        let log = fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("send-keys -t sm-test -l -- /clear"));
+        assert!(!log.contains("handoff prompt"));
     }
 
     #[test]
@@ -3130,6 +3199,7 @@ esac
                 "handoff prompt",
                 || Ok(true),
                 |_send_clear| unreachable!("typed input must not be cleared"),
+                || unreachable!("clear completion must not be checked"),
                 |_send_prompt| unreachable!("handoff prompt must not be submitted"),
             )
             .unwrap();
@@ -3385,8 +3455,9 @@ esac
             .unwrap()
             .as_nanos();
         let temp_dir = std::env::temp_dir().join(format!(
-            "sm-runtime-fake-tmux-{}-{unique}",
-            std::process::id()
+            "sm-runtime-fake-tmux-{}-{:?}-{unique}",
+            std::process::id(),
+            std::thread::current().id(),
         ));
         fs::create_dir_all(&temp_dir).unwrap();
         let tmux_binary = temp_dir.join("tmux");
