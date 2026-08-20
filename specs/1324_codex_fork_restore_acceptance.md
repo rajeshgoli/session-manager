@@ -18,6 +18,10 @@ window before applying the restore.
 `session_end`, `shutdown`, a mismatched root thread, a missing root-thread
 event, or missing tmux runtime fails the launch. The failure keeps the stored
 resume identity, leaves the session stopped, and records an actionable reason.
+If tmux teardown itself cannot be confirmed, the session instead remains
+operator-visible in an error state and is fenced from another restore; a
+failed tmux command is not proof that the runtime stopped. A normal
+already-gone tmux race is idempotent and still reaches the stopped projection.
 Interrupted Codex-fork restore acceptance is ambiguous after process restart,
 so recovery fails it conservatively rather than replaying the launch.
 
@@ -30,6 +34,8 @@ so recovery fails it conservatively rather than replaying the launch.
 - tmux disappearance;
 - restart recovery; and
 - stopped durable projection with an actionable error reason.
+- teardown failure preserves an operator-visible error projection, while an
+  already-gone tmux race remains a successful teardown.
 
 ## Classification
 

@@ -796,8 +796,14 @@ impl TmuxRuntime {
         if !self.session_exists(tmux_session)? {
             return Ok(false);
         }
-        self.run_tmux(["kill-session", "-t", tmux_session])?;
-        Ok(true)
+        match self.run_tmux(["kill-session", "-t", tmux_session]) {
+            Ok(()) => Ok(true),
+            // `kill_session` is intentionally idempotent. The session may
+            // exit after the existence check above but before tmux handles
+            // the kill request, which is still an already-absent outcome.
+            Err(error) if is_tmux_session_gone_error(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn set_status_bar(&self, tmux_session: &str, friendly_name: &str) -> Result<bool> {
@@ -2576,6 +2582,32 @@ esac
     fn tmux_no_current_target_counts_as_session_gone() {
         let error = anyhow::anyhow!("tmux command failed: no current target");
         assert!(is_tmux_session_gone_error(&error));
+    }
+
+    #[test]
+    fn kill_session_treats_a_gone_race_as_already_absent() {
+        let (tmux_binary, _log_path, _temp_dir) = fake_tmux_binary();
+        fs::write(
+            &tmux_binary,
+            r#"#!/bin/sh
+if [ "$1" = "-L" ]; then
+  shift 2
+fi
+case "$1" in
+  has-session) exit 0 ;;
+  kill-session) echo "can't find session: sm-test" >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux_binary, permissions).unwrap();
+        let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+        runtime.tmux_binary = tmux_binary.display().to_string();
+
+        assert!(!runtime.kill_session("sm-test").unwrap());
     }
 
     #[test]
