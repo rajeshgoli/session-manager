@@ -101,6 +101,14 @@ pub(crate) enum RestoreTmuxTeardownOutcome {
     Inconclusive { reason: String },
 }
 
+/// Restore-only tmux liveness proof with transport ambiguity preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RestoreTmuxLivenessOutcome {
+    Live,
+    Absent,
+    Inconclusive { reason: String },
+}
+
 #[derive(Clone)]
 pub struct TmuxSessionSpec {
     pub session_id: String,
@@ -884,6 +892,38 @@ impl TmuxRuntime {
             Err(error) => RestoreTmuxTeardownOutcome::Inconclusive {
                 reason: error.to_string(),
             },
+        }
+    }
+
+    /// Probe only the exact restore target without collapsing transport errors
+    /// into absence. Generic `session_exists` behavior remains unchanged.
+    pub(crate) fn probe_session_for_restore(
+        &self,
+        tmux_session: &str,
+    ) -> RestoreTmuxLivenessOutcome {
+        let exact_target = format!("={tmux_session}");
+        let output = match self
+            .tmux_command(["has-session", "-t", exact_target.as_str()])
+            .stderr(Stdio::piped())
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return RestoreTmuxLivenessOutcome::Inconclusive {
+                    reason: format!("failed to run tmux has-session: {error}"),
+                };
+            }
+        };
+        if output.status.success() {
+            return RestoreTmuxLivenessOutcome::Live;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("can't find session") {
+            RestoreTmuxLivenessOutcome::Absent
+        } else {
+            RestoreTmuxLivenessOutcome::Inconclusive {
+                reason: format!("tmux has-session failed: {}", stderr.trim()),
+            }
         }
     }
 
@@ -2978,6 +3018,54 @@ esac
 
     #[cfg(unix)]
     #[test]
+    fn restore_liveness_probe_is_exact_and_tri_state() {
+        for (label, status, message, expected) in [
+            ("live", 0, "", RestoreTmuxLivenessOutcome::Live),
+            (
+                "absent",
+                1,
+                "can't find session: sm-test",
+                RestoreTmuxLivenessOutcome::Absent,
+            ),
+            (
+                "transport",
+                1,
+                "error connecting to /tmp/tmux-501/session-manager (No such file or directory)",
+                RestoreTmuxLivenessOutcome::Inconclusive {
+                    reason: "tmux has-session failed: error connecting to /tmp/tmux-501/session-manager (No such file or directory)".to_owned(),
+                },
+            ),
+        ] {
+            let (tmux_binary, log_path, _temp_dir) = fake_tmux_binary();
+            fs::write(
+                &tmux_binary,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s\\n' '{}' >&2\nexit {status}\n",
+                    log_path.display(),
+                    message.replace('\'', "'\\''")
+                ),
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&tmux_binary).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&tmux_binary, permissions).unwrap();
+            let mut runtime = TmuxRuntime::from_config(&RustCoreConfig::default());
+            runtime.tmux_binary = tmux_binary.display().to_string();
+
+            assert_eq!(
+                runtime.probe_session_for_restore("sm-test"),
+                expected,
+                "{label}"
+            );
+            assert_eq!(
+                fs::read_to_string(log_path).unwrap(),
+                "has-session -t =sm-test\n"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn real_tmux_missing_socket_is_inconclusive_both_cold_and_live() {
         if !Command::new("tmux")
             .arg("-V")
@@ -3045,6 +3133,7 @@ esac
         fs::remove_file(&socket_path).unwrap();
 
         let outcome = runtime.teardown_session_for_restore(&session_name);
+        let liveness = runtime.probe_session_for_restore(&session_name);
         let server_still_live = Command::new("kill")
             .args(["-0", server_pid.as_str()])
             .status()
@@ -3052,6 +3141,11 @@ esac
         assert!(matches!(
             outcome,
             RestoreTmuxTeardownOutcome::Inconclusive { reason }
+                if reason.contains("No such file or directory")
+        ));
+        assert!(matches!(
+            liveness,
+            RestoreTmuxLivenessOutcome::Inconclusive { reason }
                 if reason.contains("No such file or directory")
         ));
         assert!(
