@@ -14924,7 +14924,7 @@ async fn runtime_core_claude_handoff_executes_after_stop_without_interrupting_ac
         &state_file,
         &log_dir,
         _tmux_guard.0.as_str(),
-        r#"/bin/sh -lc 'printf ">\n"; while IFS= read -r line; do if [ "$line" = "/clear" ]; then sleep 1; fi; printf "runtime:%s\n>\n" "$line"; done' runtime-sh"#,
+        r#"/bin/sh -lc 'printf ">"; while IFS= read -r line; do if [ "$line" = "/clear" ]; then sleep 1; fi; printf "\nruntime:%s\n>" "$line"; done' runtime-sh"#,
     );
 
     let (status, _payload) = post_json(
@@ -15017,6 +15017,48 @@ async fn runtime_core_claude_handoff_executes_after_stop_without_interrupting_ac
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["delivered"], false);
 
+    let clear_output =
+        wait_for_output_contains(app.clone(), "runtimehandoff", "runtime:/clear").await;
+    assert!(!clear_output["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("continue from where you left off"));
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/context-usage",
+        json!({
+            "session_id": "runtimehandoff",
+            "event": "context_reset",
+            "sm_hook_emitted_at": "2020-01-01T00:00:00.000000Z"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "flags_reset");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (status, output) = get_json(app.clone(), "/sessions/runtimehandoff/output?lines=20").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!output["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("continue from where you left off"));
+
+    let reset_emitted_at = (time::OffsetDateTime::now_utc() + time::Duration::seconds(1))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let (status, payload) = post_json(
+        app.clone(),
+        "/hooks/context-usage",
+        json!({
+            "session_id": "runtimehandoff",
+            "event": "context_reset",
+            "sm_hook_emitted_at": reset_emitted_at
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "flags_reset");
+
     let handoff_output = wait_for_output_contains(
         app.clone(),
         "runtimehandoff",
@@ -15093,7 +15135,7 @@ async fn runtime_core_claude_handoff_failure_retains_pending_and_restart_recover
             .as_nanos()
     );
     let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let runtime_command = r#"/bin/sh -lc 'printf ">\n"; while IFS= read -r line; do printf "runtime:%s\n>\n" "$line"; done' runtime-sh"#;
+    let runtime_command = r#"/bin/sh -lc 'printf ">"; while IFS= read -r line; do printf "\nruntime:%s\n>" "$line"; done' runtime-sh"#;
     let app = runtime_app_with_command(&state_file, &log_dir, &tmux_socket, runtime_command);
 
     let (status, _) = post_json(
@@ -15230,7 +15272,31 @@ async fn runtime_core_claude_handoff_failure_retains_pending_and_restart_recover
     )
     .unwrap();
     let restarted = runtime_app_with_command(&state_file, &log_dir, &tmux_socket, runtime_command);
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    let clear_output = wait_for_output_contains(
+        restarted.clone(),
+        "runtimehandoffrecovery",
+        "runtime:/clear",
+    )
+    .await;
+    assert!(!clear_output["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("continue from where you left off"));
+    let reset_emitted_at = (time::OffsetDateTime::now_utc() + time::Duration::seconds(1))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let (status, payload) = post_json(
+        restarted.clone(),
+        "/hooks/context-usage",
+        json!({
+            "session_id": "runtimehandoffrecovery",
+            "event": "context_reset",
+            "sm_hook_emitted_at": reset_emitted_at
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["status"], "flags_reset");
     wait_for_output_contains(
         restarted.clone(),
         "runtimehandoffrecovery",
