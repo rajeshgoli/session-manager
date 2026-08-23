@@ -13379,7 +13379,7 @@ async fn runtime_core_lifecycle_uses_tmux_backend_when_enabled() {
             log_dir: Some(log_dir.display().to_string()),
             tmux_socket_name: Some(tmux_socket.clone()),
             runtime_command: Some(
-                r#"/bin/sh -lc 'while IFS= read -r line; do printf "argv:%s\nids:%s:%s:%s\nruntime:%s\n>\n" "$*" "$SESSION_MANAGER_ID" "$CLAUDE_SESSION_MANAGER_ID" "$ENABLE_TOOL_SEARCH" "$line"; done' runtime-sh"#
+                r#"/bin/sh -lc 'printf ">"; while IFS= read -r line; do printf "\nargv:%s\nids:%s:%s:%s\nruntime:%s\n>" "$*" "$SESSION_MANAGER_ID" "$CLAUDE_SESSION_MANAGER_ID" "$ENABLE_TOOL_SEARCH" "$line"; done' runtime-sh"#
                     .to_owned(),
             ),
             runtime_prompt_mode: Some("stdin".to_owned()),
