@@ -1244,9 +1244,7 @@ impl TmuxRuntime {
     pub fn session_input_ready(&self, tmux_session: &str, provider: &str) -> bool {
         match provider {
             "codex" | "codex-fork" => self.codex_composer_is_ready(tmux_session, None),
-            _ => self
-                .capture_pane_text(tmux_session)
-                .is_some_and(|pane| claude_composer_is_ready(&pane)),
+            _ => self.claude_empty_composer_pane(tmux_session).is_some(),
         }
     }
 
@@ -1594,7 +1592,7 @@ impl TmuxRuntime {
         let Some(pane) = self.capture_pane_text(tmux_session) else {
             return None;
         };
-        if !claude_composer_is_ready(&pane) {
+        if !claude_composer_layout_is_candidate(&pane) {
             return None;
         }
         let Some((cursor_x, cursor_y)) = self.pane_cursor_position(tmux_session) else {
@@ -2104,15 +2102,18 @@ fn claude_transcript_has_matching_user_turn(
 
 /// Claude renders a status/footer block below its live composer. Looking only
 /// at the final pane line therefore treats every normal idle Claude session as
-/// busy. Claude 2.1.226 also displays a dim inline `Try "..."` suggestion in a
-/// new empty composer. A live composer is either bare or that exact suggestion,
-/// and must be immediately followed by Claude's chrome divider; an older prompt
-/// followed by a spinner or response row is not a safe slash-command target.
-fn claude_composer_is_ready(pane: &str) -> bool {
+/// busy. Claude 2.1.226 also displays dim inline suggestions in a new empty
+/// composer. Plain tmux capture strips that styling, so these suggestions are
+/// indistinguishable from typed text here. A composer candidate must be
+/// immediately followed by Claude's chrome divider; the cursor check in
+/// `claude_empty_composer_cursor` then distinguishes an empty suggested composer
+/// from typed input. An older prompt followed by a spinner or response row is
+/// not a safe slash-command target.
+fn claude_composer_layout_is_candidate(pane: &str) -> bool {
     let lines = pane.lines().map(str::trim).collect::<Vec<_>>();
     let Some(composer_index) = lines
         .iter()
-        .rposition(|line| claude_composer_line_is_ready(line))
+        .rposition(|line| claude_composer_line_is_candidate(line))
     else {
         return false;
     };
@@ -2132,26 +2133,24 @@ fn claude_composer_is_ready(pane: &str) -> bool {
     }
 }
 
-fn claude_composer_line_is_ready(line: &str) -> bool {
-    matches!(line, ">" | "❯") || claude_inline_placeholder(line)
+fn claude_composer_line_is_candidate(line: &str) -> bool {
+    matches!(line, ">" | "❯") || claude_composer_has_inline_text(line)
 }
 
-/// Match the one observed Claude empty-composer rendering, not arbitrary text
-/// beginning with the composer glyph.  `claude_empty_composer_cursor` adds the
-/// second guard required before an initial spawn brief is submitted.
-fn claude_inline_placeholder(line: &str) -> bool {
-    let Some(placeholder) = line.strip_prefix('❯').or_else(|| line.strip_prefix('>')) else {
+/// Match text rendered after Claude's composer glyph. This may be either a dim
+/// contextual suggestion or user-typed input because plain tmux capture removes
+/// the style that distinguishes them. `claude_empty_composer_cursor` supplies
+/// the required discriminator before input is submitted.
+fn claude_composer_has_inline_text(line: &str) -> bool {
+    let Some(inline_text) = line.strip_prefix('❯').or_else(|| line.strip_prefix('>')) else {
         return false;
     };
-    let placeholder = placeholder.trim_start();
-    placeholder.starts_with(concat!("Try ", "\""))
-        && placeholder.ends_with('"')
-        && placeholder.len() > concat!("Try ", "\"").len()
+    !inline_text.trim_start().is_empty()
 }
 
 /// Confirm that tmux's cursor is immediately after the visible composer
-/// prefix. A user-typed string, including one that resembles Claude's `Try
-/// "..."` placeholder, places the cursor farther right and is rejected.
+/// prefix. A user-typed string, including one that resembles a contextual
+/// suggestion, places the cursor farther right and is rejected.
 fn claude_empty_composer_cursor(pane: &str, cursor_x: usize, cursor_y: usize) -> bool {
     let Some(line) = pane.lines().nth(cursor_y) else {
         return false;
@@ -2167,7 +2166,7 @@ fn claude_empty_composer_cursor(pane: &str, cursor_x: usize, cursor_y: usize) ->
     } else {
         return false;
     };
-    claude_composer_line_is_ready(composer.trim()) && cursor_x == leading + prefix_width
+    claude_composer_line_is_candidate(composer.trim()) && cursor_x == leading + prefix_width
 }
 
 fn claude_composer_footer_divider(line: &str) -> bool {
@@ -2721,7 +2720,9 @@ printf '%s' '{"models":[{"slug":"gpt-5.6-luna","visibility":"list"}]}'
     fn claude_input_readiness_requires_the_live_composer_not_scrollback() {
         let (tmux_binary, _log_path, temp_dir) = fake_tmux_binary();
         let pane_path = temp_dir.join("pane");
+        let cursor_path = temp_dir.join("cursor");
         fs::write(&pane_path, "❯ prior prompt\n✽ Thinking through the task…\n").unwrap();
+        fs::write(&cursor_path, "0,1\n").unwrap();
         fs::write(
             &tmux_binary,
             format!(
@@ -2731,10 +2732,12 @@ if [ "$1" = "-L" ]; then
 fi
 case "$1" in
   capture-pane) cat "{}"; exit 0 ;;
+  display-message) cat "{}"; exit 0 ;;
   *) exit 0 ;;
 esac
 "#,
-                pane_path.display()
+                pane_path.display(),
+                cursor_path.display(),
             ),
         )
         .unwrap();
@@ -2748,20 +2751,24 @@ esac
 
         fs::write(
             &pane_path,
-            "✻ Finished\n────────────────────\n❯\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+            "✻ Finished\n────────────────────\n❯\u{a0}fix the horizon.rs comment too\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
         )
         .unwrap();
+        fs::write(&cursor_path, "2,2\n").unwrap();
         assert!(runtime.session_input_ready("sm-test", "claude"));
+
+        fs::write(&cursor_path, "33,2\n").unwrap();
+        assert!(!runtime.session_input_ready("sm-test", "claude"));
     }
 
     #[test]
     fn claude_composer_readiness_rejects_a_stale_prompt_before_running_output() {
         let pane = "❯\n────────────────────\nFable 5\n✽ Thinking through the task…\n";
-        assert!(!claude_composer_is_ready(pane));
+        assert!(!claude_composer_layout_is_candidate(pane));
     }
 
     #[test]
-    fn claude_placeholder_readiness_accepts_only_the_observed_empty_composer() {
+    fn claude_placeholder_layout_accepts_generic_contextual_suggestions() {
         let pane = concat!(
             "○ low · /effort\n",
             "────────────────────\n",
@@ -2771,12 +2778,14 @@ esac
             "⏵⏵ bypass permissions on\n",
         );
 
-        assert!(claude_composer_is_ready(pane));
-        let typed = pane.replace(
+        assert!(claude_composer_layout_is_candidate(pane));
+        let contextual = pane.replace(
             "❯\u{a0}Try \"how does this work?\"",
-            "❯ deploy --production",
+            "❯\u{a0}fix the horizon.rs comment too",
         );
-        assert!(!claude_composer_is_ready(&typed));
+        assert!(claude_composer_layout_is_candidate(&contextual));
+        assert!(claude_empty_composer_cursor(&contextual, 2, 2));
+        assert!(!claude_empty_composer_cursor(&contextual, 32, 2));
     }
 
     #[test]
