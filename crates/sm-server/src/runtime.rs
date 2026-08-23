@@ -1615,7 +1615,7 @@ impl TmuxRuntime {
             return None;
         }
         let composer = pane.lines().nth(cursor_y)?.trim_start();
-        if claude_inline_placeholder(composer) {
+        if claude_composer_has_inline_text(composer) {
             let styled_pane = self.capture_pane_styled_text(tmux_session)?;
             if ansi_visible_text(&styled_pane)? != pane {
                 return None;
@@ -2135,8 +2135,8 @@ fn claude_transcript_has_matching_user_turn(
 
 /// Claude renders a status/footer block below its live composer. Looking only
 /// at the final pane line therefore treats every normal idle Claude session as
-/// busy. Claude 2.1.226 also displays a dim inline `Try "..."` suggestion in a
-/// new empty composer. A composer candidate must be immediately followed by Claude's
+/// busy. Claude 2.1.226 also displays dim inline contextual suggestions in a new
+/// empty composer. A composer candidate must be immediately followed by Claude's
 /// chrome divider. `claude_empty_composer_pane` additionally requires the live
 /// cursor at the prompt prefix and, for inline text, the dim styling retained by
 /// `tmux capture-pane -e`. An older prompt followed by a spinner or response row
@@ -2166,19 +2166,21 @@ fn claude_composer_layout_is_candidate(pane: &str) -> bool {
 }
 
 fn claude_composer_line_is_candidate(line: &str) -> bool {
-    matches!(line, ">" | "❯") || claude_inline_placeholder(line)
+    matches!(line, ">" | "❯") || claude_composer_has_inline_text(line)
 }
 
-/// Match Claude's observed empty-composer placeholder shape. Styled capture and
-/// cursor checks still prove that a matching user draft is not authorized.
-fn claude_inline_placeholder(line: &str) -> bool {
-    let Some(placeholder) = line.strip_prefix('❯').or_else(|| line.strip_prefix('>')) else {
+/// Match inline text after Claude's composer glyph. Styled capture, stable-frame,
+/// and cursor checks prove that a matching user draft is not authorized.
+fn claude_composer_has_inline_text(line: &str) -> bool {
+    let Some(inline_text) = line.strip_prefix('❯').or_else(|| line.strip_prefix('>')) else {
         return false;
     };
-    let placeholder = placeholder.trim_start();
-    placeholder.starts_with(concat!("Try ", "\""))
-        && placeholder.ends_with('"')
-        && placeholder.len() > concat!("Try ", "\"").len()
+    let inline_text = inline_text.trim_start();
+    if inline_text.is_empty() {
+        return false;
+    }
+    let lowered = inline_text.to_ascii_lowercase();
+    !lowered.contains("queued message")
 }
 
 /// Prove that nonempty text after Claude's prompt is a dim UI suggestion, not a
@@ -2901,34 +2903,56 @@ esac
 
         fs::write(
             &pane_path,
-            "✻ Finished\n────────────────────\n❯\u{a0}Try \"how does this work?\"\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+            "✻ Finished\n────────────────────\n❯\u{a0}fix the horizon.rs comment too\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
         )
         .unwrap();
         fs::write(
             &styled_pane_path,
-            "✻ Finished\n────────────────────\n\u{1b}[39m❯\u{a0}\u{1b}[2mTry \"how does this work?\"\u{1b}[0m\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+            "✻ Finished\n────────────────────\n\u{1b}[39m❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}[0m\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
         )
         .unwrap();
         fs::write(&cursor_path, "2,2\n").unwrap();
         assert!(runtime.session_input_ready("sm-test", "claude"));
 
         fs::write(
+            &pane_path,
+            "✻ Finished\n────────────────────\n❯\u{a0}Press up to edit queued messages\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+        )
+        .unwrap();
+        fs::write(
             &styled_pane_path,
-            "✻ Finished\n────────────────────\n\u{1b}[39m❯\u{a0}\u{1b}[2mTry \"how does this work?\"\u{1b}[0m\n✽ Thinking through the task…\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+            "✻ Finished\n────────────────────\n\u{1b}[39m❯\u{a0}\u{1b}[2mPress up to edit queued messages\u{1b}[0m\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+        )
+        .unwrap();
+        assert!(!runtime.session_input_ready("sm-test", "claude"));
+
+        fs::write(
+            &pane_path,
+            "✻ Finished\n────────────────────\n❯\u{a0}fix the horizon.rs comment too\n✽ Thinking through the task…\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+        )
+        .unwrap();
+        fs::write(
+            &styled_pane_path,
+            "✻ Finished\n────────────────────\n\u{1b}[39m❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}[0m\n✽ Thinking through the task…\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+        )
+        .unwrap();
+        assert!(!runtime.session_input_ready("sm-test", "claude"));
+
+        fs::write(
+            &pane_path,
+            "✻ Finished\n────────────────────\n❯\u{a0}fix the horizon.rs comment too\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+        )
+        .unwrap();
+        fs::write(
+            &styled_pane_path,
+            "✻ Finished\n────────────────────\n❯\u{a0}fix the horizon.rs comment too\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
         )
         .unwrap();
         assert!(!runtime.session_input_ready("sm-test", "claude"));
 
         fs::write(
             &styled_pane_path,
-            "✻ Finished\n────────────────────\n❯\u{a0}Try \"how does this work?\"\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
-        )
-        .unwrap();
-        assert!(!runtime.session_input_ready("sm-test", "claude"));
-
-        fs::write(
-            &styled_pane_path,
-            "✻ Finished\n────────────────────\n\u{1b}[39m❯\u{a0}\u{1b}[2mTry \"how does this work?\"\u{1b}[0m\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+            "✻ Finished\n────────────────────\n\u{1b}[39m❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}[0m\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
         )
         .unwrap();
         fs::write(&cursor_path, "32,2\n").unwrap();
@@ -2957,8 +2981,18 @@ esac
             "❯\u{a0}Try \"how does this work?\"",
             "❯\u{a0}fix the horizon.rs comment too",
         );
-        assert!(!claude_composer_layout_is_candidate(&contextual));
-        assert!(!claude_empty_composer_cursor(&contextual, 2, 2));
+        assert!(claude_composer_layout_is_candidate(&contextual));
+        assert!(claude_empty_composer_cursor(&contextual, 2, 2));
+        assert!(claude_styled_composer_has_dim_suggestion(
+            "❯\u{a0}fix the horizon.rs comment too",
+            "\u{1b}[39m❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}[0m"
+        ));
+        let queued = pane.replace(
+            "❯\u{a0}Try \"how does this work?\"",
+            "❯\u{a0}Press up to edit queued messages",
+        );
+        assert!(!claude_composer_layout_is_candidate(&queued));
+        assert!(!claude_empty_composer_cursor(&queued, 2, 2));
         assert!(claude_empty_composer_cursor(pane, 2, 2));
         assert!(!claude_empty_composer_cursor(pane, 32, 2));
         assert!(claude_styled_composer_has_dim_suggestion(
