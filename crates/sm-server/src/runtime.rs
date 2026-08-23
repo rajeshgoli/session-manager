@@ -1226,6 +1226,19 @@ impl TmuxRuntime {
         Some(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    fn capture_pane_styled_text(&self, tmux_session: &str) -> Option<String> {
+        let output = self
+            .tmux_command(["capture-pane", "-p", "-e", "-t", tmux_session])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
     pub fn accept_codex_directory_trust_prompt(&self, tmux_session: &str) -> Result<bool> {
         let _guard = self.lock_session_input(tmux_session)?;
         if !self.session_exists(tmux_session)? {
@@ -1598,7 +1611,19 @@ impl TmuxRuntime {
         let Some((cursor_x, cursor_y)) = self.pane_cursor_position(tmux_session) else {
             return None;
         };
-        claude_empty_composer_cursor(&pane, cursor_x, cursor_y).then_some(pane)
+        if !claude_empty_composer_cursor(&pane, cursor_x, cursor_y) {
+            return None;
+        }
+        let composer = pane.lines().nth(cursor_y)?.trim_start();
+        if claude_composer_has_inline_text(composer) {
+            let styled_pane = self.capture_pane_styled_text(tmux_session)?;
+            let styled_line = styled_pane.lines().nth(cursor_y)?;
+            let plain_line = pane.lines().nth(cursor_y)?;
+            if !claude_styled_composer_has_dim_suggestion(plain_line, styled_line) {
+                return None;
+            }
+        }
+        Some(pane)
     }
 
     fn pane_cursor_position(&self, tmux_session: &str) -> Option<(usize, usize)> {
@@ -2103,12 +2128,11 @@ fn claude_transcript_has_matching_user_turn(
 /// Claude renders a status/footer block below its live composer. Looking only
 /// at the final pane line therefore treats every normal idle Claude session as
 /// busy. Claude 2.1.226 also displays dim inline suggestions in a new empty
-/// composer. Plain tmux capture strips that styling, so these suggestions are
-/// indistinguishable from typed text here. A composer candidate must be
-/// immediately followed by Claude's chrome divider; the cursor check in
-/// `claude_empty_composer_cursor` then distinguishes an empty suggested composer
-/// from typed input. An older prompt followed by a spinner or response row is
-/// not a safe slash-command target.
+/// composer. A composer candidate must be immediately followed by Claude's
+/// chrome divider. `claude_empty_composer_pane` additionally requires the live
+/// cursor at the prompt prefix and, for inline text, the dim styling retained by
+/// `tmux capture-pane -e`. An older prompt followed by a spinner or response row
+/// is not a safe slash-command target.
 fn claude_composer_layout_is_candidate(pane: &str) -> bool {
     let lines = pane.lines().map(str::trim).collect::<Vec<_>>();
     let Some(composer_index) = lines
@@ -2146,6 +2170,78 @@ fn claude_composer_has_inline_text(line: &str) -> bool {
         return false;
     };
     !inline_text.trim_start().is_empty()
+}
+
+/// Prove that nonempty text after Claude's prompt is a dim UI suggestion, not a
+/// user draft whose caret happens to be at the prompt prefix. The styled capture
+/// must render exactly the same text as the plain capture, and every non-space
+/// suggestion character must be under SGR 2 (dim) styling.
+fn claude_styled_composer_has_dim_suggestion(plain_line: &str, styled_line: &str) -> bool {
+    let Some(cells) = ansi_visible_cells(styled_line) else {
+        return false;
+    };
+    if cells.iter().map(|(ch, _)| ch).collect::<String>() != plain_line {
+        return false;
+    }
+    let mut cells = cells.iter().skip_while(|(ch, _)| ch.is_whitespace());
+    if !matches!(cells.next(), Some(('>' | '❯', _))) {
+        return false;
+    }
+    let inline = cells
+        .skip_while(|(ch, _)| ch.is_whitespace())
+        .collect::<Vec<_>>();
+    let content = inline
+        .iter()
+        .filter(|(ch, _)| !ch.is_whitespace())
+        .collect::<Vec<_>>();
+    !content.is_empty() && content.iter().all(|(_, dim)| *dim)
+}
+
+fn ansi_visible_cells(text: &str) -> Option<Vec<(char, bool)>> {
+    let mut cells = Vec::new();
+    let mut chars = text.chars().peekable();
+    let mut dim = false;
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' || chars.peek() != Some(&'[') {
+            cells.push((ch, dim));
+            continue;
+        }
+        chars.next();
+        let mut parameters = String::new();
+        let mut final_byte = None;
+        for next in chars.by_ref() {
+            if ('@'..='~').contains(&next) {
+                final_byte = Some(next);
+                break;
+            }
+            parameters.push(next);
+        }
+        let final_byte = final_byte?;
+        if final_byte == 'm' {
+            let codes = if parameters.is_empty() {
+                vec![0]
+            } else {
+                parameters
+                    .split(';')
+                    .map(|value| {
+                        if value.is_empty() {
+                            Some(0)
+                        } else {
+                            value.parse::<u16>().ok()
+                        }
+                    })
+                    .collect::<Option<Vec<_>>>()?
+            };
+            for code in codes {
+                match code {
+                    0 | 22 => dim = false,
+                    2 => dim = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    Some(cells)
 }
 
 /// Confirm that tmux's cursor is immediately after the visible composer
@@ -2720,8 +2816,14 @@ printf '%s' '{"models":[{"slug":"gpt-5.6-luna","visibility":"list"}]}'
     fn claude_input_readiness_requires_the_live_composer_not_scrollback() {
         let (tmux_binary, _log_path, temp_dir) = fake_tmux_binary();
         let pane_path = temp_dir.join("pane");
+        let styled_pane_path = temp_dir.join("styled-pane");
         let cursor_path = temp_dir.join("cursor");
         fs::write(&pane_path, "❯ prior prompt\n✽ Thinking through the task…\n").unwrap();
+        fs::write(
+            &styled_pane_path,
+            "❯ prior prompt\n✽ Thinking through the task…\n",
+        )
+        .unwrap();
         fs::write(&cursor_path, "0,1\n").unwrap();
         fs::write(
             &tmux_binary,
@@ -2731,11 +2833,18 @@ if [ "$1" = "-L" ]; then
   shift 2
 fi
 case "$1" in
-  capture-pane) cat "{}"; exit 0 ;;
+  capture-pane)
+    case " $* " in
+      *' -e '*) cat "{}" ;;
+      *) cat "{}" ;;
+    esac
+    exit 0
+    ;;
   display-message) cat "{}"; exit 0 ;;
   *) exit 0 ;;
 esac
 "#,
+                styled_pane_path.display(),
                 pane_path.display(),
                 cursor_path.display(),
             ),
@@ -2754,10 +2863,27 @@ esac
             "✻ Finished\n────────────────────\n❯\u{a0}fix the horizon.rs comment too\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
         )
         .unwrap();
+        fs::write(
+            &styled_pane_path,
+            "✻ Finished\n────────────────────\n\u{1b}[39m❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}[0m\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+        )
+        .unwrap();
         fs::write(&cursor_path, "2,2\n").unwrap();
         assert!(runtime.session_input_ready("sm-test", "claude"));
 
-        fs::write(&cursor_path, "33,2\n").unwrap();
+        fs::write(
+            &styled_pane_path,
+            "✻ Finished\n────────────────────\n❯\u{a0}fix the horizon.rs comment too\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+        )
+        .unwrap();
+        assert!(!runtime.session_input_ready("sm-test", "claude"));
+
+        fs::write(
+            &styled_pane_path,
+            "✻ Finished\n────────────────────\n\u{1b}[39m❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}[0m\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+        )
+        .unwrap();
+        fs::write(&cursor_path, "32,2\n").unwrap();
         assert!(!runtime.session_input_ready("sm-test", "claude"));
     }
 
@@ -2786,6 +2912,22 @@ esac
         assert!(claude_composer_layout_is_candidate(&contextual));
         assert!(claude_empty_composer_cursor(&contextual, 2, 2));
         assert!(!claude_empty_composer_cursor(&contextual, 32, 2));
+        assert!(claude_styled_composer_has_dim_suggestion(
+            "❯\u{a0}fix the horizon.rs comment too",
+            "\u{1b}[39m❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}[0m"
+        ));
+        assert!(!claude_styled_composer_has_dim_suggestion(
+            "❯\u{a0}fix the horizon.rs comment too",
+            "❯\u{a0}fix the horizon.rs comment too"
+        ));
+        assert!(!claude_styled_composer_has_dim_suggestion(
+            "❯\u{a0}fix the horizon.rs comment too",
+            "❯\u{a0}\u{1b}[2mfix\u{1b}[22m the horizon.rs comment too"
+        ));
+        assert!(!claude_styled_composer_has_dim_suggestion(
+            "❯\u{a0}fix the horizon.rs comment too",
+            "❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}["
+        ));
     }
 
     #[test]
@@ -4208,7 +4350,10 @@ case "$1" in
     if [ -f "{}" ]; then
       printf 'clearing\n'
     else
-      printf 'ready\n❯\302\240Try "fix typecheck errors"\n'
+      case " $* " in
+        *' -e '*) printf 'ready\n\033[39m❯\302\240\033[2mTry "fix typecheck errors"\033[0m\n' ;;
+        *) printf 'ready\n❯\302\240Try "fix typecheck errors"\n' ;;
+      esac
     fi
     exit 0
     ;;
@@ -4253,9 +4398,15 @@ case "$1" in
     ;;
   capture-pane)
     if [ -f "{}" ]; then
-      printf 'cleared\n❯\302\240Try "write a function"\n'
+      case " $* " in
+        *' -e '*) printf 'cleared\n\033[39m❯\302\240\033[2mTry "write a function"\033[0m\n' ;;
+        *) printf 'cleared\n❯\302\240Try "write a function"\n' ;;
+      esac
     else
-      printf 'ready\n❯\302\240Try "fix typecheck errors"\n'
+      case " $* " in
+        *' -e '*) printf 'ready\n\033[39m❯\302\240\033[2mTry "fix typecheck errors"\033[0m\n' ;;
+        *) printf 'ready\n❯\302\240Try "fix typecheck errors"\n' ;;
+      esac
     fi
     exit 0
     ;;
