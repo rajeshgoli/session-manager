@@ -2218,49 +2218,50 @@ fn ansi_visible_cells(text: &str) -> Option<Vec<(char, bool)>> {
             parameters.push(next);
         }
         let final_byte = final_byte?;
-        if final_byte == 'm' {
-            let codes = if parameters.is_empty() {
-                vec![0]
-            } else {
-                parameters
-                    .split(';')
-                    .map(|value| {
-                        if value.is_empty() {
-                            Some(0)
-                        } else if value.bytes().all(|byte| byte.is_ascii_digit()) {
-                            value.parse::<u16>().ok()
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Option<Vec<_>>>()?
-            };
-            let mut index = 0;
-            while index < codes.len() {
-                match codes[index] {
-                    0 | 22 => {
-                        dim = false;
-                        index += 1;
+        if final_byte != 'm' {
+            return None;
+        }
+        let codes = if parameters.is_empty() {
+            vec![0]
+        } else {
+            parameters
+                .split(';')
+                .map(|value| {
+                    if value.is_empty() {
+                        Some(0)
+                    } else if value.bytes().all(|byte| byte.is_ascii_digit()) {
+                        value.parse::<u16>().ok()
+                    } else {
+                        None
                     }
-                    2 => {
-                        dim = true;
-                        index += 1;
-                    }
-                    38 | 48 | 58 => {
-                        let color_mode = *codes.get(index + 1)?;
-                        let component_count = match color_mode {
-                            5 => 1,
-                            2 => 3,
-                            _ => return None,
-                        };
-                        let components = codes.get(index + 2..index + 2 + component_count)?;
-                        if components.iter().any(|component| *component > 255) {
-                            return None;
-                        }
-                        index += 2 + component_count;
-                    }
-                    _ => index += 1,
+                })
+                .collect::<Option<Vec<_>>>()?
+        };
+        let mut index = 0;
+        while index < codes.len() {
+            match codes[index] {
+                0 | 22 => {
+                    dim = false;
+                    index += 1;
                 }
+                2 => {
+                    dim = true;
+                    index += 1;
+                }
+                38 | 48 | 58 => {
+                    let color_mode = *codes.get(index + 1)?;
+                    let component_count = match color_mode {
+                        5 => 1,
+                        2 => 3,
+                        _ => return None,
+                    };
+                    let components = codes.get(index + 2..index + 2 + component_count)?;
+                    if components.iter().any(|component| *component > 255) {
+                        return None;
+                    }
+                    index += 2 + component_count;
+                }
+                _ => index += 1,
             }
         }
     }
@@ -2971,6 +2972,10 @@ esac
         assert!(!claude_styled_composer_has_dim_suggestion(
             "❯\u{a0}Try \"how does this work?\"",
             "❯\u{a0}\u{1b}[+2mTry \"how does this work?\"\u{1b}[0m"
+        ));
+        assert!(!claude_styled_composer_has_dim_suggestion(
+            "❯\u{a0}Try \"how does this work?\"",
+            "❯\u{a0}\u{1b}[2mTry \u{1b}[ 1q\"how does this work?\"\u{1b}[0m"
         ));
     }
 
