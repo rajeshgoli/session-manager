@@ -1617,13 +1617,21 @@ impl TmuxRuntime {
         let composer = pane.lines().nth(cursor_y)?.trim_start();
         if claude_inline_placeholder(composer) {
             let styled_pane = self.capture_pane_styled_text(tmux_session)?;
+            if ansi_visible_text(&styled_pane)? != pane {
+                return None;
+            }
             let styled_line = styled_pane.lines().nth(cursor_y)?;
             let plain_line = pane.lines().nth(cursor_y)?;
             if !claude_styled_composer_has_dim_suggestion(plain_line, styled_line) {
                 return None;
             }
         }
-        Some(pane)
+        let confirmed_cursor = self.pane_cursor_position(tmux_session)?;
+        let confirmed_pane = self.capture_pane_text(tmux_session)?;
+        if confirmed_cursor != (cursor_x, cursor_y) || confirmed_pane != pane {
+            return None;
+        }
+        Some(confirmed_pane)
     }
 
     fn pane_cursor_position(&self, tmux_session: &str) -> Option<(usize, usize)> {
@@ -2196,6 +2204,15 @@ fn claude_styled_composer_has_dim_suggestion(plain_line: &str, styled_line: &str
         .filter(|(ch, _)| !ch.is_whitespace())
         .collect::<Vec<_>>();
     !content.is_empty() && content.iter().all(|(_, dim)| *dim)
+}
+
+fn ansi_visible_text(text: &str) -> Option<String> {
+    Some(
+        ansi_visible_cells(text)?
+            .into_iter()
+            .map(|(ch, _)| ch)
+            .collect(),
+    )
 }
 
 fn ansi_visible_cells(text: &str) -> Option<Vec<(char, bool)>> {
@@ -2894,6 +2911,13 @@ esac
         .unwrap();
         fs::write(&cursor_path, "2,2\n").unwrap();
         assert!(runtime.session_input_ready("sm-test", "claude"));
+
+        fs::write(
+            &styled_pane_path,
+            "✻ Finished\n────────────────────\n\u{1b}[39m❯\u{a0}\u{1b}[2mTry \"how does this work?\"\u{1b}[0m\n✽ Thinking through the task…\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+        )
+        .unwrap();
+        assert!(!runtime.session_input_ready("sm-test", "claude"));
 
         fs::write(
             &styled_pane_path,
