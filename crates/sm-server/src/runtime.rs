@@ -2232,11 +2232,31 @@ fn ansi_visible_cells(text: &str) -> Option<Vec<(char, bool)>> {
                     })
                     .collect::<Option<Vec<_>>>()?
             };
-            for code in codes {
-                match code {
-                    0 | 22 => dim = false,
-                    2 => dim = true,
-                    _ => {}
+            let mut index = 0;
+            while index < codes.len() {
+                match codes[index] {
+                    0 | 22 => {
+                        dim = false;
+                        index += 1;
+                    }
+                    2 => {
+                        dim = true;
+                        index += 1;
+                    }
+                    38 | 48 | 58 => {
+                        let color_mode = *codes.get(index + 1)?;
+                        let component_count = match color_mode {
+                            5 => 1,
+                            2 => 3,
+                            _ => return None,
+                        };
+                        let components = codes.get(index + 2..index + 2 + component_count)?;
+                        if components.iter().any(|component| *component > 255) {
+                            return None;
+                        }
+                        index += 2 + component_count;
+                    }
+                    _ => index += 1,
                 }
             }
         }
@@ -2927,6 +2947,22 @@ esac
         assert!(!claude_styled_composer_has_dim_suggestion(
             "❯\u{a0}fix the horizon.rs comment too",
             "❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}["
+        ));
+        assert!(!claude_styled_composer_has_dim_suggestion(
+            "❯\u{a0}fix the horizon.rs comment too",
+            "\u{1b}[38;5;2m❯\u{a0}fix the horizon.rs comment too\u{1b}[39m"
+        ));
+        assert!(!claude_styled_composer_has_dim_suggestion(
+            "❯\u{a0}fix the horizon.rs comment too",
+            "\u{1b}[38;2;10;20;30m❯\u{a0}fix the horizon.rs comment too\u{1b}[39m"
+        ));
+        assert!(claude_styled_composer_has_dim_suggestion(
+            "❯\u{a0}fix the horizon.rs comment too",
+            "\u{1b}[38;5;2m❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}[0m"
+        ));
+        assert!(!claude_styled_composer_has_dim_suggestion(
+            "❯\u{a0}fix the horizon.rs comment too",
+            "❯\u{a0}\u{1b}[38;2;10;20mfix the horizon.rs comment too\u{1b}[0m"
         ));
     }
 
