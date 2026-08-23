@@ -19872,7 +19872,7 @@ sleep 30
         let input_path = unique_temp_path("queue-completion-input");
         let pane = if input_ready { ">" } else { ">\n✽ Thinking" };
         let command = format!(
-            "printf '%s\\n' {}; while IFS= read -r line; do printf '%s\\n' \"$line\" >> {}; printf '%s\\n' {}; done",
+            "printf '%s' {}; while IFS= read -r line; do printf '%s\\n' \"$line\" >> {}; printf '%s' {}; done",
             queue_completion_test_shell_quote(pane),
             queue_completion_test_shell_quote(&input_path.display().to_string()),
             queue_completion_test_shell_quote(pane),
