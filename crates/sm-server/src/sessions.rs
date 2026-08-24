@@ -9207,10 +9207,7 @@ fn format_last_codex_fork_startup_event(last_event: Option<&str>) -> String {
 }
 
 fn codex_fork_event_ends_startup(event_type: &str) -> bool {
-    matches!(
-        event_type,
-        "session_end" | "shutdown" | "shutdown_complete" | "stream_error"
-    )
+    matches!(event_type, "session_end" | "shutdown" | "stream_error")
 }
 
 fn usage_ledger_error_is_transient(error: &anyhow::Error) -> bool {
@@ -21474,15 +21471,22 @@ sleep 30
     #[test]
     fn codex_fork_create_acceptance_keeps_live_provider_until_delayed_root() {
         let event_stream_path = unique_temp_path("codex-create-acceptance-delayed-root");
-        fs::write(&event_stream_path, "").unwrap();
+        fs::write(
+            &event_stream_path,
+            "{\"event_type\":\"shutdown_complete\",\"payload\":{}}\n",
+        )
+        .unwrap();
         let writer_path = event_stream_path.clone();
         let writer = thread::spawn(move || {
             thread::sleep(Duration::from_millis(125));
-            fs::write(
-                writer_path,
-                "{\"event_type\":\"thread_started\",\"payload\":{\"thread\":{\"id\":\"delayed-root\"}}}\n",
-            )
-            .unwrap();
+            fs::OpenOptions::new()
+                .append(true)
+                .open(writer_path)
+                .unwrap()
+                .write_all(
+                    b"{\"event_type\":\"thread_started\",\"payload\":{\"thread\":{\"id\":\"delayed-root\"}}}\n",
+                )
+                .unwrap();
         });
         let mut prompt_checks = 0;
 
