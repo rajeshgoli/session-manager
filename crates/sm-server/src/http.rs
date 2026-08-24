@@ -426,7 +426,10 @@ impl AppState {
         let mut session_store = SessionStore::new_with_queue(state_file, queue_db_path)
             .with_codex_session_index_path(config.codex.session_index_path.as_deref())
             .with_claude_transcript_root(config.claude.transcript_root.as_deref())
-            .with_context_monitor_config(config.context_monitor.clone());
+            .with_context_monitor_config(config.context_monitor.clone())
+            .with_codex_fork_create_startup_timeout(std::time::Duration::from_secs(
+                config.codex_fork.create_startup_timeout_seconds,
+            ));
         if config.rust_core.runtime_enabled {
             let runtime = TmuxRuntime::from_app_config(&config)
                 .with_claude_transcript_roots(session_store.claude_transcript_roots());
