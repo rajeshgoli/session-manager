@@ -23,6 +23,7 @@ pub const TEST_ISOLATION_ROOT_ENV: &str = "SM_TEST_ISOLATION_ROOT";
 
 static TEST_ISOLATION_INSTANCE: AtomicU64 = AtomicU64::new(0);
 static DIRECT_TEST_ISOLATION_ROOT: OnceLock<PathBuf> = OnceLock::new();
+const MAX_CODEX_FORK_CREATE_STARTUP_TIMEOUT_SECONDS: u64 = 300;
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -138,6 +139,7 @@ impl AppConfig {
         }
 
         config.validate_queue_runner_capacity()?;
+        config.validate_codex_fork_create_startup_timeout()?;
 
         Ok(config)
     }
@@ -159,6 +161,16 @@ impl AppConfig {
         if (service.max_concurrent as u128) >= (self.queue_runner.max_running_jobs as u128) {
             bail!(
                 "queue_runner.types.service.max_concurrent must be less than queue_runner.max_running_jobs so service jobs cannot consume the entire global queue capacity"
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_codex_fork_create_startup_timeout(&self) -> Result<()> {
+        let timeout = self.codex_fork.create_startup_timeout_seconds;
+        if timeout == 0 || timeout > MAX_CODEX_FORK_CREATE_STARTUP_TIMEOUT_SECONDS {
+            bail!(
+                "codex_fork.create_startup_timeout_seconds must be between 1 and {MAX_CODEX_FORK_CREATE_STARTUP_TIMEOUT_SECONDS}"
             );
         }
         Ok(())
@@ -1076,6 +1088,9 @@ pub struct CodexForkLaunchConfig {
     pub default_model: Option<String>,
     pub event_schema_version: u32,
     pub control_tmux_fallback_enabled: bool,
+    /// Bounded time that a newly-created provider can spend initializing
+    /// before it has published the root thread identity.
+    pub create_startup_timeout_seconds: u64,
 }
 
 impl Default for CodexForkLaunchConfig {
@@ -1086,6 +1101,7 @@ impl Default for CodexForkLaunchConfig {
             default_model: None,
             event_schema_version: 2,
             control_tmux_fallback_enabled: true,
+            create_startup_timeout_seconds: default_codex_fork_create_startup_timeout_seconds(),
         }
     }
 }
@@ -1844,6 +1860,8 @@ struct RawCodexForkLaunchConfig {
     event_schema_version: Option<u32>,
     #[serde(default)]
     control_tmux_fallback_enabled: Option<YamlValue>,
+    #[serde(default)]
+    create_startup_timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1941,7 +1959,14 @@ fn codex_fork_launch_config(
             raw.control_tmux_fallback_enabled.as_ref(),
             true,
         ),
+        create_startup_timeout_seconds: raw
+            .create_startup_timeout_seconds
+            .unwrap_or_else(default_codex_fork_create_startup_timeout_seconds),
     }
+}
+
+fn default_codex_fork_create_startup_timeout_seconds() -> u64 {
+    60
 }
 
 fn codex_observability_config(
@@ -3125,6 +3150,7 @@ codex_fork:
         assert_eq!(config.codex_fork.default_model.as_deref(), Some("gpt-5"));
         assert_eq!(config.codex_fork.event_schema_version, 7);
         assert!(!config.codex_fork.control_tmux_fallback_enabled);
+        assert_eq!(config.codex_fork.create_startup_timeout_seconds, 60);
     }
 
     #[test]
@@ -3133,6 +3159,28 @@ codex_fork:
         let config = AppConfig::from(raw);
 
         assert!(config.codex_fork.control_tmux_fallback_enabled);
+    }
+
+    #[test]
+    fn codex_fork_create_startup_timeout_is_configurable_and_bounded() {
+        let raw: RawConfig =
+            serde_yaml::from_str("codex_fork:\n  create_startup_timeout_seconds: 90\n").unwrap();
+        let config = AppConfig::from(raw);
+        assert_eq!(config.codex_fork.create_startup_timeout_seconds, 90);
+        config.validate_codex_fork_create_startup_timeout().unwrap();
+
+        let raw: RawConfig =
+            serde_yaml::from_str("codex_fork:\n  create_startup_timeout_seconds: 0\n").unwrap();
+        let error = AppConfig::from(raw)
+            .validate_codex_fork_create_startup_timeout()
+            .unwrap_err();
+        assert!(error.to_string().contains("between 1 and 300"));
+
+        let raw: RawConfig =
+            serde_yaml::from_str("codex_fork:\n  create_startup_timeout_seconds: 301\n").unwrap();
+        assert!(AppConfig::from(raw)
+            .validate_codex_fork_create_startup_timeout()
+            .is_err());
     }
 
     #[test]

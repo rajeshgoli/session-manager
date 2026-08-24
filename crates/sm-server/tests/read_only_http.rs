@@ -17168,6 +17168,7 @@ while true; do sleep 1; done
             default_model: Some("gpt-default".to_owned()),
             event_schema_version: 7,
             control_tmux_fallback_enabled: true,
+            create_startup_timeout_seconds: 60,
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,
@@ -17589,6 +17590,7 @@ while true; do sleep 1; done
             default_model: None,
             event_schema_version: 2,
             control_tmux_fallback_enabled: true,
+            create_startup_timeout_seconds: 60,
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,
@@ -17701,6 +17703,7 @@ while true; do sleep 1; done
             default_model: None,
             event_schema_version: 2,
             control_tmux_fallback_enabled: true,
+            create_startup_timeout_seconds: 60,
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,
@@ -20810,6 +20813,7 @@ fn runtime_app_with_codex_fork_initial_brief_provider(
             default_model: None,
             event_schema_version: 2,
             control_tmux_fallback_enabled: true,
+            create_startup_timeout_seconds: 60,
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,

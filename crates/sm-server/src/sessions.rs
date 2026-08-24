@@ -56,6 +56,7 @@ const CODEX_CLI_SESSION_BIND_TIMEOUT: Duration = Duration::from_secs(1);
 const CODEX_CLI_DEFERRED_BIND_TIMEOUT: Duration = Duration::from_secs(30);
 const CODEX_CLI_SESSION_BIND_POLL: Duration = Duration::from_millis(50);
 const CODEX_FORK_THREAD_STARTED_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_CODEX_FORK_CREATE_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const CODEX_FORK_EVENT_MONITOR_POLL: Duration = Duration::from_millis(250);
 // Recovery must inspect a bounded tail before it starts at EOF: a native
 // compaction while the service was down otherwise leaves an obsolete alert
@@ -88,6 +89,10 @@ pub struct SessionStore {
     /// event monitor threads evaluate the same thresholds and have no access to
     /// the HTTP layer's `AppConfig`.
     context_monitor: ContextMonitorConfig,
+    /// Create startup has a distinct timeout from clear, handoff, and restore
+    /// binding. It is carried here because session creation runs below the HTTP
+    /// layer where the parsed application configuration is otherwise absent.
+    codex_fork_create_startup_timeout: Duration,
     /// Same reason: those threads enqueue context alerts, and nothing drains the
     /// message queue on a timer, so a message queued without a runtime waits for
     /// an unrelated request to happen to flush it.
@@ -212,6 +217,7 @@ impl SessionStore {
             reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             context_monitor: ContextMonitorConfig::default(),
+            codex_fork_create_startup_timeout: DEFAULT_CODEX_FORK_CREATE_STARTUP_TIMEOUT,
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
             claude_handoff_workers: Arc::new(Mutex::new(BTreeSet::new())),
@@ -297,6 +303,11 @@ impl SessionStore {
 
     pub fn with_usage_db_path(mut self, db_path: PathBuf) -> Self {
         self.seat_session_store = SeatSessionStore::new(db_path);
+        self
+    }
+
+    pub fn with_codex_fork_create_startup_timeout(mut self, timeout: Duration) -> Self {
+        self.codex_fork_create_startup_timeout = timeout;
         self
     }
 
@@ -1121,7 +1132,7 @@ impl SessionStore {
             if let Some(artifacts) = codex_fork_artifacts.as_ref() {
                 match wait_for_codex_fork_provider_resume_id_for_launch(
                     &artifacts.event_stream_path,
-                    CODEX_FORK_THREAD_STARTED_TIMEOUT,
+                    self.codex_fork_create_startup_timeout,
                     &session_runtime,
                     &launch.tmux_session,
                 ) {
@@ -1129,13 +1140,20 @@ impl SessionStore {
                         recovered_provider_resume_id = Some(provider_resume_id);
                     }
                     Err(error) => {
-                        let _ = session_runtime.kill_session(&launch.tmux_session);
+                        let teardown_error =
+                            session_runtime.kill_session(&launch.tmux_session).err();
+                        let failure_reason = match teardown_error.as_ref() {
+                            Some(teardown_error) => format!(
+                                "{error:#}; failed to tear down runtime after provider startup rejection: {teardown_error}"
+                            ),
+                            None => format!("{error:#}"),
+                        };
                         mark_runtime_launch_failed(
                             &mut state,
                             launch_id,
                             &launch.session_id,
-                            true,
-                            &error.to_string(),
+                            teardown_error.is_none(),
+                            &failure_reason,
                         )?;
                         self.write_raw_json_value(&state)?;
                         return Ok(());
@@ -1613,6 +1631,7 @@ impl SessionStore {
             reparent_apply_lock: Arc::new(Mutex::new(())),
             queue_store: None,
             context_monitor: ContextMonitorConfig::default(),
+            codex_fork_create_startup_timeout: DEFAULT_CODEX_FORK_CREATE_STARTUP_TIMEOUT,
             delivery_runtime: None,
             codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
             claude_handoff_workers: Arc::new(Mutex::new(BTreeSet::new())),
@@ -4456,7 +4475,7 @@ impl SessionStore {
         if let Some(artifacts) = &codex_fork_artifacts {
             match wait_for_codex_fork_provider_resume_id_for_launch(
                 &artifacts.event_stream_path,
-                CODEX_FORK_THREAD_STARTED_TIMEOUT,
+                self.codex_fork_create_startup_timeout,
                 runtime,
                 &record.tmux_session,
             ) {
@@ -4464,25 +4483,35 @@ impl SessionStore {
                     record.provider_resume_id = Some(provider_resume_id);
                 }
                 Err(error) => {
-                    let _ = runtime.kill_session(&record.tmux_session);
+                    let teardown_error = runtime.kill_session(&record.tmux_session).err();
                     let _guard = self.write_guard()?;
                     let mut state = self.load_raw_json_value()?;
-                    let remove_provisional_session =
-                        remove_failed_provisional_runtime_session(&state, &record.id);
+                    let remove_provisional_session = teardown_error.is_none()
+                        && remove_failed_provisional_runtime_session(&state, &record.id);
+                    let failure_reason = match teardown_error.as_ref() {
+                        Some(teardown_error) => format!(
+                            "{error:#}; failed to tear down runtime after provider startup rejection: {teardown_error}"
+                        ),
+                        None => format!("{error:#}"),
+                    };
                     mark_runtime_launch_failed(
                         &mut state,
                         &launch_id,
                         &record.id,
                         remove_provisional_session,
-                        &error.to_string(),
+                        &failure_reason,
                     )?;
                     self.write_raw_json_value(&state)?;
-                    return Err(error).with_context(|| {
-                        format!(
-                            "codex-fork session {} did not publish a provider resume id",
-                            record.id
-                        )
-                    });
+                    if let Some(teardown_error) = teardown_error {
+                        anyhow::bail!(
+                            "codex-fork create startup rejected for session {}: {error:#}; runtime teardown also failed: {teardown_error}",
+                            record.id,
+                        );
+                    }
+                    anyhow::bail!(
+                        "codex-fork create startup rejected for session {}: {error:#}",
+                        record.id,
+                    );
                 }
             }
         }
@@ -9073,11 +9102,114 @@ fn wait_for_codex_fork_provider_resume_id_for_launch(
     runtime: &TmuxRuntime,
     tmux_session: &str,
 ) -> Result<String> {
-    wait_for_codex_fork_provider_resume_id_after_offset_with_startup(
+    wait_for_codex_fork_create_acceptance(
         event_stream_path,
         0,
         timeout,
+        || runtime.session_exists(tmux_session),
         || runtime.accept_codex_directory_trust_prompt(tmux_session),
+    )
+}
+
+/// Accept a newly-created Codex-fork runtime only once its launch-specific
+/// stream publishes a root thread identity. A slow but live provider retains
+/// the entire bounded startup window; a dead runtime or terminal stream event
+/// fails immediately with enough context for the operator to diagnose it.
+fn wait_for_codex_fork_create_acceptance<F, H>(
+    event_stream_path: &Path,
+    initial_offset: u64,
+    timeout: Duration,
+    mut runtime_is_live: F,
+    mut handle_startup_prompt: H,
+) -> Result<String>
+where
+    F: FnMut() -> Result<bool>,
+    H: FnMut() -> Result<bool>,
+{
+    let started = Instant::now();
+    let mut offset = initial_offset;
+    let mut buffer = String::new();
+    let mut directory_trust_accepted = false;
+    let mut last_relevant_event = None;
+    loop {
+        if !runtime_is_live()? {
+            anyhow::bail!(
+                "codex-fork runtime disappeared before root startup acceptance after {}ms in {}{}",
+                started.elapsed().as_millis(),
+                event_stream_path.display(),
+                format_last_codex_fork_startup_event(last_relevant_event.as_deref()),
+            );
+        }
+        if let Ok(chunk) = read_file_from_offset(event_stream_path, &mut offset) {
+            for line in split_complete_event_lines(&mut buffer, &chunk) {
+                let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
+                    continue;
+                };
+                let Some(event) = event.as_object() else {
+                    continue;
+                };
+                let event_type = codex_fork_event_type(event)
+                    .map(|value| normalize_codex_fork_event_type(&value.replace('/', "_")));
+                if event_type
+                    .as_deref()
+                    .is_some_and(codex_fork_event_ends_startup)
+                {
+                    anyhow::bail!(
+                        "codex-fork provider emitted terminal startup event {} before root acceptance after {}ms in {}",
+                        event_type.as_deref().unwrap_or("unknown"),
+                        started.elapsed().as_millis(),
+                        event_stream_path.display(),
+                    );
+                }
+                if let Some(provider_resume_id) = extract_codex_fork_thread_started(event) {
+                    let elapsed = started.elapsed();
+                    if elapsed > CODEX_FORK_THREAD_STARTED_TIMEOUT {
+                        eprintln!(
+                            "codex-fork create root acceptance was slow: {}ms for {}",
+                            elapsed.as_millis(),
+                            event_stream_path.display(),
+                        );
+                    }
+                    return Ok(provider_resume_id);
+                }
+                if let Some(event_type) = event_type {
+                    last_relevant_event = Some(event_type);
+                }
+            }
+        }
+        if !directory_trust_accepted {
+            directory_trust_accepted = handle_startup_prompt()?;
+        }
+        if started.elapsed() >= timeout {
+            if !runtime_is_live()? {
+                anyhow::bail!(
+                    "codex-fork runtime disappeared before root startup acceptance after {}ms in {}{}",
+                    started.elapsed().as_millis(),
+                    event_stream_path.display(),
+                    format_last_codex_fork_startup_event(last_relevant_event.as_deref()),
+                );
+            }
+            anyhow::bail!(
+                "codex-fork create startup timed out after {}ms while runtime remained live without a root thread_started event in {}{}",
+                started.elapsed().as_millis(),
+                event_stream_path.display(),
+                format_last_codex_fork_startup_event(last_relevant_event.as_deref()),
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn format_last_codex_fork_startup_event(last_event: Option<&str>) -> String {
+    last_event
+        .map(|event| format!("; last structured event: {event}"))
+        .unwrap_or_default()
+}
+
+fn codex_fork_event_ends_startup(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "session_end" | "shutdown" | "shutdown_complete" | "stream_error"
     )
 }
 
@@ -21337,6 +21469,125 @@ sleep 30
         .unwrap_err();
         assert!(inconclusive.to_string().contains("inconclusive"));
         assert!(inconclusive.to_string().contains("lost server connection"));
+    }
+
+    #[test]
+    fn codex_fork_create_acceptance_keeps_live_provider_until_delayed_root() {
+        let event_stream_path = unique_temp_path("codex-create-acceptance-delayed-root");
+        fs::write(&event_stream_path, "").unwrap();
+        let writer_path = event_stream_path.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(125));
+            fs::write(
+                writer_path,
+                "{\"event_type\":\"thread_started\",\"payload\":{\"thread\":{\"id\":\"delayed-root\"}}}\n",
+            )
+            .unwrap();
+        });
+        let mut prompt_checks = 0;
+
+        let provider_resume_id = wait_for_codex_fork_create_acceptance(
+            &event_stream_path,
+            0,
+            Duration::from_millis(500),
+            || Ok(true),
+            || {
+                prompt_checks += 1;
+                Ok(true)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(provider_resume_id, "delayed-root");
+        assert_eq!(prompt_checks, 1);
+        writer.join().unwrap();
+        let _ = fs::remove_file(event_stream_path);
+    }
+
+    #[test]
+    fn codex_fork_create_acceptance_rejects_subagents_terminal_events_and_tmux_loss() {
+        let subagent_path = unique_temp_path("codex-create-acceptance-subagent");
+        fs::write(
+            &subagent_path,
+            concat!(
+                "{\"event_type\":\"thread_started\",\"payload\":{\"thread\":{\"id\":\"child\",\"parentThreadId\":\"root\",\"threadSource\":\"subagent\"}}}\n",
+                "{\"event_type\":\"thread_started\",\"payload\":{\"thread\":{\"id\":\"root\",\"parentThreadId\":null,\"threadSource\":\"user\"}}}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            wait_for_codex_fork_create_acceptance(
+                &subagent_path,
+                0,
+                Duration::ZERO,
+                || Ok(true),
+                || Ok(false),
+            )
+            .unwrap(),
+            "root"
+        );
+
+        for (event_type, expected_reason) in [
+            ("session_end", "terminal startup event session_end"),
+            ("stream_error", "terminal startup event stream_error"),
+        ] {
+            let path = unique_temp_path(&format!("codex-create-acceptance-{event_type}"));
+            fs::write(
+                &path,
+                format!("{{\"event_type\":\"{event_type}\",\"payload\":{{}}}}\n"),
+            )
+            .unwrap();
+            let error = wait_for_codex_fork_create_acceptance(
+                &path,
+                0,
+                Duration::from_millis(100),
+                || Ok(true),
+                || Ok(false),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains(expected_reason));
+            let _ = fs::remove_file(path);
+        }
+
+        let lost_path = unique_temp_path("codex-create-acceptance-runtime-lost");
+        fs::write(&lost_path, "").unwrap();
+        let error = wait_for_codex_fork_create_acceptance(
+            &lost_path,
+            0,
+            Duration::from_millis(100),
+            || Ok(false),
+            || Ok(false),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("runtime disappeared"));
+
+        let _ = fs::remove_file(subagent_path);
+        let _ = fs::remove_file(lost_path);
+    }
+
+    #[test]
+    fn codex_fork_create_acceptance_reports_live_timeout_with_last_event() {
+        let event_stream_path = unique_temp_path("codex-create-acceptance-timeout");
+        fs::write(
+            &event_stream_path,
+            "{\"event_type\":\"session_start\",\"payload\":{}}\n",
+        )
+        .unwrap();
+
+        let error = wait_for_codex_fork_create_acceptance(
+            &event_stream_path,
+            0,
+            Duration::ZERO,
+            || Ok(true),
+            || Ok(false),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("timed out"));
+        assert!(message.contains("runtime remained live"));
+        assert!(message.contains("last structured event: session_start"));
+
+        let _ = fs::remove_file(event_stream_path);
     }
 
     #[test]
