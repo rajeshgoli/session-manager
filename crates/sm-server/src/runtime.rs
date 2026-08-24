@@ -1617,7 +1617,7 @@ impl TmuxRuntime {
         let composer = pane.lines().nth(cursor_y)?.trim_start();
         if claude_composer_has_inline_text(composer) {
             let styled_pane = self.capture_pane_styled_text(tmux_session)?;
-            if ansi_visible_text(&styled_pane)? != pane {
+            if !claude_capture_frames_match(&pane, &styled_pane) {
                 return None;
             }
             let styled_line = styled_pane.lines().nth(cursor_y)?;
@@ -2215,6 +2215,21 @@ fn ansi_visible_text(text: &str) -> Option<String> {
             .map(|(ch, _)| ch)
             .collect(),
     )
+}
+
+/// Compare plain and styled tmux captures after removing the line-end spaces
+/// that `capture-pane -e` can retain solely to carry terminal styling. Keep
+/// every other visible character and every line boundary in the proof.
+fn claude_capture_frames_match(plain_pane: &str, styled_pane: &str) -> bool {
+    let Some(styled_visible) = ansi_visible_text(styled_pane) else {
+        return false;
+    };
+    plain_pane
+        .split('\n')
+        .map(|line| line.trim_end_matches(' '))
+        .eq(styled_visible
+            .split('\n')
+            .map(|line| line.trim_end_matches(' ')))
 }
 
 fn ansi_visible_cells(text: &str) -> Option<Vec<(char, bool)>> {
@@ -2914,6 +2929,21 @@ esac
         fs::write(&cursor_path, "2,2\n").unwrap();
         assert!(runtime.session_input_ready("sm-test", "claude"));
 
+        // Real tmux captures can retain a line-end space in styled mode on an
+        // unrelated historical row. That representational difference must not
+        // hide an otherwise verified empty contextual-suggestion composer.
+        fs::write(
+            &pane_path,
+            "Ran 1 shell command\n────────────────────\n❯\u{a0}merge it and file the census ticket\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+        )
+        .unwrap();
+        fs::write(
+            &styled_pane_path,
+            "\u{1b}[38;5;246mRan 1 shell command \u{1b}[39m\n────────────────────\n\u{1b}[39m❯\u{a0}\u{1b}[2mmerge it and file the census ticket\u{1b}[0m\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
+        )
+        .unwrap();
+        assert!(runtime.session_input_ready("sm-test", "claude"));
+
         fs::write(
             &pane_path,
             "✻ Finished\n────────────────────\n❯\u{a0}Press up to edit queued messages\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
@@ -2986,6 +3016,18 @@ esac
         assert!(claude_styled_composer_has_dim_suggestion(
             "❯\u{a0}fix the horizon.rs comment too",
             "\u{1b}[39m❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}[0m"
+        ));
+        assert!(claude_capture_frames_match(
+            "Ran 1 shell command\n❯\u{a0}fix the horizon.rs comment too\n",
+            "\u{1b}[38;5;246mRan 1 shell command \u{1b}[39m\n\u{1b}[39m❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}[0m\n",
+        ));
+        assert!(!claude_capture_frames_match(
+            "Ran 1 shell command\n❯\u{a0}fix the horizon.rs comment too\n",
+            "Ran 2 shell commands\n\u{1b}[39m❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}[0m\n",
+        ));
+        assert!(!claude_capture_frames_match(
+            "Ran 1 shell command\n❯\u{a0}fix the horizon.rs comment too\n",
+            "Ran 1 shell command\n\u{1b}[39m❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}[0m",
         ));
         let queued = pane.replace(
             "❯\u{a0}Try \"how does this work?\"",
