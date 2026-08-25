@@ -105,6 +105,14 @@ async def test_queue_job_runs_and_notifies(mock_sm, tmp_path):
     assert completed.exit_code == 0
     assert "queued hello" in (tmp_path / "queue-runner" / "logs" / f"{job.id}.log").read_text()
     mock_sm.message_queue_manager.queue_message.assert_called()
+    completion = next(
+        call.kwargs["text"]
+        for call in mock_sm.message_queue_manager.queue_message.call_args_list
+        if "completed:" in call.kwargs["text"]
+    )
+    assert f"Log: {completed.log_path}" in completion
+    assert "queued hello" not in completion
+    assert "log tail:" not in completion
 
 
 @pytest.mark.asyncio
