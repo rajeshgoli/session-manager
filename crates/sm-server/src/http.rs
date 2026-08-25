@@ -5595,7 +5595,7 @@ async fn create_queue_job(
         return Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
             detail: format!(
-                "timeout_seconds must be greater than 0 for {job_type} jobs; only background jobs may use 0 for no timeout (CLI: --timeout none). Use a larger positive duration such as 2h for long-running {job_type} jobs"
+                "timeout_seconds must be greater than 0 for {job_type} jobs; only background jobs may use 0 for no timeout (CLI: --timeout none). Use a larger positive value such as 7200 seconds (CLI: --timeout 2h) for long-running {job_type} jobs"
             ),
         });
     }

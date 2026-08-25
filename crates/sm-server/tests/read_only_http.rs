@@ -4414,7 +4414,8 @@ async fn queue_job_background_accepts_explicit_no_timeout() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let detail = rejected["detail"].as_str().unwrap();
     assert!(detail.contains("only background jobs may use 0"));
-    assert!(detail.contains("larger positive duration such as 2h"));
+    assert!(detail.contains("larger positive value such as 7200 seconds"));
+    assert!(detail.contains("CLI: --timeout 2h"));
 }
 
 #[tokio::test]
