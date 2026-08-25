@@ -5594,9 +5594,9 @@ async fn create_queue_job(
     if timeout_seconds < 0 || (timeout_seconds == 0 && job_type != "background") {
         return Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
-            detail:
-                "timeout_seconds must be greater than 0; background jobs may use 0 for no timeout"
-                    .to_owned(),
+            detail: format!(
+                "timeout_seconds must be greater than 0 for {job_type} jobs; only background jobs may use 0 for no timeout (CLI: --timeout none). Use a larger positive duration such as 2h for long-running {job_type} jobs"
+            ),
         });
     }
     let label = payload
