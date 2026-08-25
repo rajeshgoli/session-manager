@@ -461,7 +461,11 @@ struct QueueRunArgs {
     label: Option<String>,
     #[arg(long)]
     cwd: Option<String>,
-    #[arg(long, value_name = "DURATION|none")]
+    #[arg(
+        long,
+        value_name = "DURATION|none",
+        help = "Positive timeout (for example 90s or 2h); 'none' is background-only"
+    )]
     timeout: Option<String>,
     #[arg(long = "env")]
     env_pairs: Vec<String>,
@@ -1425,7 +1429,7 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
     let timeout_seconds = args
         .timeout
         .as_deref()
-        .map(parse_queue_timeout_seconds)
+        .map(|value| parse_queue_timeout_seconds_for_type(&args.job_type, value))
         .transpose()?;
     let mut body = json!({
         "type": args.job_type,
@@ -4951,6 +4955,16 @@ fn parse_queue_timeout_seconds(value: &str) -> Result<i64> {
     parse_duration_seconds(value)
 }
 
+fn parse_queue_timeout_seconds_for_type(job_type: &str, value: &str) -> Result<i64> {
+    let timeout_seconds = parse_queue_timeout_seconds(value)?;
+    if timeout_seconds == 0 && job_type != "background" {
+        bail!(
+            "--timeout none is allowed only for background jobs; {job_type} jobs require a positive timeout such as --timeout 2h"
+        );
+    }
+    Ok(timeout_seconds)
+}
+
 fn parse_queue_log_lines(value: &str) -> std::result::Result<usize, String> {
     let lines = value
         .parse::<usize>()
@@ -6321,6 +6335,19 @@ mod tests {
         assert_eq!(parse_duration_seconds("1d").unwrap(), 86400);
         assert_eq!(parse_queue_timeout_seconds("none").unwrap(), 0);
         assert_eq!(parse_queue_timeout_seconds("2h").unwrap(), 7200);
+        assert_eq!(
+            parse_queue_timeout_seconds_for_type("background", "none").unwrap(),
+            0
+        );
+        assert_eq!(
+            parse_queue_timeout_seconds_for_type("tests", "2h").unwrap(),
+            7200
+        );
+        let error = parse_queue_timeout_seconds_for_type("tests", "none")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("background jobs"));
+        assert!(error.contains("--timeout 2h"));
     }
 
     #[test]
