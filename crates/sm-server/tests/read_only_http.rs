@@ -4202,7 +4202,12 @@ async fn queue_job_create_runs_when_runtime_enabled() {
     assert_eq!(notifications.len(), 1);
     assert!(notifications[0].contains(&format!("[sm queue] {job_id} completed: succeeded")));
     assert!(notifications[0].contains(" exit=0 "));
-    assert!(notifications[0].contains("log tail:\nqueue-runtime-ok"));
+    assert!(notifications[0].contains(&format!(
+        "Log: {}",
+        final_payload["log_path"].as_str().unwrap()
+    )));
+    assert!(!notifications[0].contains("queue-runtime-ok"));
+    assert!(!notifications[0].contains("log tail:"));
 }
 
 #[tokio::test]
@@ -5125,7 +5130,12 @@ async fn queue_runtime_recovery_starts_pending_job() {
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert_eq!(notifications.len(), 1);
     assert!(notifications[0].contains(&format!("[sm queue] {job_id} completed: succeeded")));
-    assert!(notifications[0].contains("log tail:\nrecovered-pending"));
+    assert!(notifications[0].contains(&format!(
+        "Log: {}",
+        final_payload["log_path"].as_str().unwrap()
+    )));
+    assert!(!notifications[0].contains("recovered-pending"));
+    assert!(!notifications[0].contains("log tail:"));
 }
 
 #[test]
@@ -5505,7 +5515,9 @@ async fn queue_runtime_recovery_polls_live_running_job_to_completion() {
     let _ = child.wait();
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert_eq!(notifications.len(), 1);
-    assert!(notifications[0].contains("log tail:\nrecovered-live"));
+    assert!(notifications[0].contains(&format!("Log: {log_path}")));
+    assert!(!notifications[0].contains("recovered-live"));
+    assert!(!notifications[0].contains("log tail:"));
 }
 
 #[cfg(unix)]
@@ -5932,14 +5944,16 @@ async fn queue_job_cancel_terminates_running_job() {
     let (status, detail) = get_json(app, &format!("/queue-jobs/{job_id}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(detail["state"], "cancelled");
-    let log = fs::read_to_string(log_path).unwrap();
+    let log = fs::read_to_string(&log_path).unwrap();
     assert!(log.contains("before-cancel"));
     assert!(!log.contains("after-cancel"));
     assert!(queue_job_completion_notified_at(&queue_state_dir, &job_id).is_some());
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert_eq!(notifications.len(), 1);
     assert!(notifications[0].contains(&format!("[sm queue] {job_id} completed: cancelled")));
-    assert!(notifications[0].contains("log tail:\nbefore-cancel"));
+    assert!(notifications[0].contains(&format!("Log: {}", log_path.display())));
+    assert!(!notifications[0].contains("before-cancel"));
+    assert!(!notifications[0].contains("log tail:"));
 }
 
 #[tokio::test]

@@ -12,7 +12,8 @@ sm queue run --type tests --label <label> --cwd <worktree> -- <command>
 The current managed session is the default notify target. Callers outside a
 managed session pass `--notify <session>`. When the job reaches a terminal
 state, Session Manager queues an `[sm queue]` message containing the state,
-exit code when available, runtime, queue time, log path, and bounded log tail.
+exit code when available, runtime, queue time, and log path. Command output
+stays in that log so the receiving agent can inspect it selectively.
 The caller goes idle after submission; it does not poll or add another watch.
 Terminal jobs retain a notification-pending marker until that message is
 durably queued. A service-owned retry loop reattempts unnotified completions,

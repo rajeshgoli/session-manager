@@ -261,8 +261,6 @@ Completion notification, always:
 
 ```text
 [sm queue] job_abc123 completed: failed exit=1 runtime=3m12s queue=48s. Log: ...
-stderr tail:
-...
 ```
 
 Completion notification includes:
@@ -275,7 +273,10 @@ Completion notification includes:
 6. queue duration
 7. runtime
 8. log path
-9. stderr tail capped at 8 KB
+
+The completion notification never embeds command output. Agents inspect the
+returned log path with the tools and amount of context appropriate to the
+failure.
 
 ## API
 
