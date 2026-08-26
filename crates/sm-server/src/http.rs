@@ -4881,7 +4881,7 @@ async fn run_codex_review_request_watcher(
         }
         let poll_seconds = registration.poll_interval_seconds.max(1) as u64;
         tokio::time::sleep(Duration::from_secs(poll_seconds)).await;
-        let Some(registration) =
+        let Some(mut registration) =
             RetainedQueueStore::get_codex_review_request_from_path(&queue_db_path, &request_id)
                 .map_err(|error| error.to_string())?
         else {
@@ -4908,6 +4908,49 @@ async fn run_codex_review_request_watcher(
         }
 
         let now = now_rfc3339();
+        if registration.requested_head_sha.is_none() {
+            let current_head_sha = match github_current_open_pr_head(
+                state.github_review_poster.clone(),
+                &registration.repo,
+                registration.pr_number,
+            )
+            .await
+            {
+                Ok(head_sha) => head_sha,
+                Err(error) => {
+                    let next_retry_at = registration
+                        .next_retry_at
+                        .as_deref()
+                        .filter(|value| codex_review_datetime_due(value))
+                        .and_then(|_| {
+                            codex_review_next_retry_at(
+                                &now,
+                                registration.retry_interval_seconds.max(1),
+                            )
+                        });
+                    let _ = RetainedQueueStore::mark_codex_review_request_poll_error_in_path(
+                        &queue_db_path,
+                        &request_id,
+                        &now,
+                        &format!("missing requested head backfill failed: {error}"),
+                        next_retry_at.as_deref(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    continue;
+                }
+            };
+            let Some(backfilled) = RetainedQueueStore::backfill_codex_review_request_head_in_path(
+                &queue_db_path,
+                &request_id,
+                &current_head_sha,
+                &now,
+            )
+            .map_err(|error| error.to_string())?
+            else {
+                return Ok(());
+            };
+            registration = backfilled;
+        }
         if let Some(comment_id) = registration.latest_request_comment_id {
             if registration.pickup_detected_at.is_none() {
                 match github_detect_pickup(

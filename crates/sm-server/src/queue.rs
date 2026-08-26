@@ -595,6 +595,34 @@ impl RetainedQueueStore {
         get_codex_review_request_conn(&conn, request_id)
     }
 
+    pub fn backfill_codex_review_request_head_in_path(
+        db_path: &Path,
+        request_id: &str,
+        requested_head_sha: &str,
+        last_polled_at: &str,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(db_path)?;
+        let changed = conn.execute(
+            r#"
+            UPDATE codex_review_request_registrations
+            SET requested_head_sha = ?2,
+                last_polled_at = ?3,
+                last_error = NULL
+            WHERE id = ?1
+                AND is_active = 1
+                AND requested_head_sha IS NULL
+            "#,
+            params![request_id, requested_head_sha, last_polled_at],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        get_codex_review_request_conn(&conn, request_id)
+    }
+
     pub fn retry_codex_review_request_in_path(
         db_path: &Path,
         request_id: &str,

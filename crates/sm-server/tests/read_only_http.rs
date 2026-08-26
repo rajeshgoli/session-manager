@@ -3218,6 +3218,85 @@ async fn codex_review_request_recovery_spawns_active_watchers() {
 }
 
 #[tokio::test]
+async fn codex_review_request_recovery_backfills_missing_head_before_matching_review() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-recover-missing-head.db");
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [{
+                "id": "notify1", "name": "notify1", "working_dir": "/repo/notify",
+                "tmux_session": "notify1", "log_file": "/tmp/notify1.log", "status": "running",
+                "created_at": "2026-06-01T00:00:00Z", "last_activity": "2026-06-01T00:01:00Z"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    create_active_codex_review_request_fixture_db(&queue_db, "missing-head", "notify1", 1);
+    Connection::open(&queue_db)
+        .unwrap()
+        .execute(
+            "UPDATE codex_review_request_registrations SET requested_head_sha = NULL WHERE id = 'missing-head'",
+            [],
+        )
+        .unwrap();
+    let poster = StubGitHubReviewPoster::successful().with_fresh_review(GitHubReviewMatch {
+        source: "pull_review".to_owned(),
+        created_at: "2026-06-14T02:31:00Z".to_owned(),
+        id: Some(json!("PRR_kwBackfilled")),
+        url: Some("https://example.test/review-backfilled".to_owned()),
+        head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
+    });
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.runtime_enabled = true;
+    let _app = router(AppState::new(config).with_github_review_poster(Arc::new(poster)));
+
+    let mut row = None;
+    for _ in 0..30 {
+        let current = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state, is_active, requested_head_sha, review_url FROM codex_review_request_registrations WHERE id = 'missing-head'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        if current.0 == "completed" {
+            row = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let row = row.expect("recovered watcher should backfill the head and complete");
+    assert_eq!(row.1, 0);
+    assert_eq!(
+        row.2.as_deref(),
+        Some("1111111111111111111111111111111111111111")
+    );
+    assert_eq!(
+        row.3.as_deref(),
+        Some("https://example.test/review-backfilled")
+    );
+    assert_eq!(queued_message_texts(&queue_db, "notify1").len(), 1);
+}
+
+#[tokio::test]
 async fn codex_review_request_recovery_keeps_missing_notify_session_active() {
     let state_file = unique_temp_path();
     let queue_db = state_file.with_extension("codex-review-recover-missing-notify.db");
