@@ -447,6 +447,13 @@ queue_runner:
     background:
       max_concurrent: 2
       default_timeout_seconds: 3600  # 0 disables timeout for background jobs
+    service:
+      # Explicit class for API/frontend dev servers. Service jobs still count
+      # toward max_running_jobs and must be stopped during workflow teardown.
+      # Keep the shared example's legacy global cap unchanged; installations
+      # that need two services can raise this below their larger global cap.
+      max_concurrent: 1
+      default_timeout_seconds: 86400
 
 # Session defaults
 sessions:
