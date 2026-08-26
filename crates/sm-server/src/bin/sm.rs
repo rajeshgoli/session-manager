@@ -1990,6 +1990,9 @@ fn run_request_codex_review_create(client: &ApiClient, args: RequestCodexReviewA
             .or_else(|| response["notify_session_id"].as_str())
             .unwrap_or(&effective_notify)
     );
+    if let Some(head_sha) = response["requested_head_sha"].as_str() {
+        println!("  Head: {head_sha}");
+    }
     Ok(())
 }
 

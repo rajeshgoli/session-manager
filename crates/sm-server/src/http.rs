@@ -4495,7 +4495,7 @@ async fn create_codex_review_request(
     let create_result = async {
         let poster = state.github_review_poster.clone();
         let repo_for_head = repo.clone();
-        let requested_head_sha = tokio::task::spawn_blocking(move || {
+        let initial_head_sha = tokio::task::spawn_blocking(move || {
             poster.current_open_pr_head(&repo_for_head, payload.pr_number)
         })
         .await
@@ -4530,7 +4530,7 @@ async fn create_codex_review_request(
                     ),
                 });
             }
-            if existing.requested_head_sha.as_deref() == Some(requested_head_sha.as_str()) {
+            if existing.requested_head_sha.as_deref() == Some(initial_head_sha.as_str()) {
                 let response = codex_review_request_response(&state, existing.clone())?;
                 spawn_codex_review_request_watcher(state.clone(), existing.id);
                 return Ok(Json(response));
@@ -4553,6 +4553,26 @@ async fn create_codex_review_request(
             detail: format!("Failed to request Codex review: {error}"),
         })?
         .map_err(codex_review_poster_error)?;
+
+        // A push and the GitHub PR API can briefly disagree. Bind the durable
+        // request to the head visible after the trigger comment was accepted,
+        // which is the head Codex will actually review.
+        let requested_head_sha = match github_current_open_pr_head(
+            state.github_review_poster.clone(),
+            &repo,
+            payload.pr_number,
+        )
+        .await
+        {
+            Ok(head_sha) => head_sha,
+            Err(error) => {
+                eprintln!(
+                    "Codex review request post-comment head reconciliation failed for {} PR #{}: {}; retaining initial head {}",
+                    repo, payload.pr_number, error, initial_head_sha
+                );
+                initial_head_sha
+            }
+        };
 
         let registration = RetainedQueueStore::create_codex_review_request_in_path(
             &queue_db_path,
@@ -4972,6 +4992,46 @@ async fn run_codex_review_request_watcher(
             .as_deref()
             .is_some_and(codex_review_datetime_due)
         {
+            let requested_head_sha = registration
+                .requested_head_sha
+                .as_deref()
+                .ok_or_else(|| "Codex review request has no requested head SHA".to_owned())?;
+            let current_head_sha = match github_current_open_pr_head(
+                state.github_review_poster.clone(),
+                &registration.repo,
+                registration.pr_number,
+            )
+            .await
+            {
+                Ok(head_sha) => head_sha,
+                Err(error) => {
+                    let next_retry_at = codex_review_next_retry_at(
+                        &now,
+                        registration.retry_interval_seconds.max(1),
+                    );
+                    let _ = RetainedQueueStore::mark_codex_review_request_poll_error_in_path(
+                        &queue_db_path,
+                        &request_id,
+                        &now,
+                        &format!("PR head recheck failed before retry: {error}"),
+                        next_retry_at.as_deref(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                    continue;
+                }
+            };
+            if current_head_sha != requested_head_sha {
+                supersede_codex_review_request_for_head_change(
+                    &state,
+                    &queue_db_path,
+                    &request_id,
+                    &registration,
+                    requested_head_sha,
+                    &current_head_sha,
+                    &now,
+                )?;
+                return Ok(());
+            }
             let comment = github_post_review_request(
                 state.github_review_poster.clone(),
                 &registration.repo,
@@ -5005,6 +5065,17 @@ async fn run_codex_review_request_watcher(
             .map_err(|error| error.to_string())?;
         }
     }
+}
+
+async fn github_current_open_pr_head(
+    poster: Arc<dyn GitHubReviewPoster>,
+    repo: &str,
+    pr_number: i64,
+) -> Result<String, String> {
+    let repo = repo.to_owned();
+    tokio::task::spawn_blocking(move || poster.current_open_pr_head(&repo, pr_number))
+        .await
+        .map_err(|error| format!("PR head lookup task failed: {error}"))?
 }
 
 async fn github_detect_pickup(
@@ -5110,6 +5181,48 @@ fn complete_codex_review_request(
             eprintln!(
                 "failed to immediately deliver Codex review completion message {request_id} to {}: {error:#}",
                 completed.notify_session_id
+            );
+        }
+    }
+    Ok(())
+}
+
+fn supersede_codex_review_request_for_head_change(
+    state: &AppState,
+    queue_db_path: &std::path::Path,
+    request_id: &str,
+    registration: &CodexReviewRequestRegistration,
+    requested_head_sha: &str,
+    current_head_sha: &str,
+    last_polled_at: &str,
+) -> Result<(), String> {
+    let reason = format!(
+        "PR head changed from {requested_head_sha} to {current_head_sha}; no retry was posted"
+    );
+    let text = format!(
+        "[sm review] Codex review request {request_id} for PR #{} stopped because the PR head changed from {requested_head_sha} to {current_head_sha}. Request a new review for the current head.",
+        registration.pr_number
+    );
+    let Some(superseded) = RetainedQueueStore::supersede_codex_review_request_and_enqueue_in_path(
+        queue_db_path,
+        request_id,
+        last_polled_at,
+        &reason,
+        &text,
+    )
+    .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    if state.config.rust_core.runtime_enabled {
+        let runtime = TmuxRuntime::from_app_config(&state.config);
+        if let Err(error) = state
+            .session_store
+            .drain_runtime_pending_messages_for_session(&superseded.notify_session_id, &runtime)
+        {
+            eprintln!(
+                "failed to immediately deliver stale-head Codex review message {request_id} to {}: {error:#}",
+                superseded.notify_session_id
             );
         }
     }

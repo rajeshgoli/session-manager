@@ -231,6 +231,7 @@ struct StubGitHubReviewPoster {
     calls: Arc<Mutex<Vec<(String, i64, Option<String>)>>>,
     fresh_reviews: Arc<Mutex<VecDeque<GitHubReviewMatch>>>,
     current_head_sha: Arc<Mutex<String>>,
+    head_after_post: Arc<Mutex<Option<String>>>,
 }
 
 impl StubGitHubReviewPoster {
@@ -249,6 +250,7 @@ impl StubGitHubReviewPoster {
             current_head_sha: Arc::new(Mutex::new(
                 "1111111111111111111111111111111111111111".to_owned(),
             )),
+            head_after_post: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -260,6 +262,7 @@ impl StubGitHubReviewPoster {
             current_head_sha: Arc::new(Mutex::new(
                 "1111111111111111111111111111111111111111".to_owned(),
             )),
+            head_after_post: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -281,6 +284,10 @@ impl StubGitHubReviewPoster {
         *self.current_head_sha.lock().unwrap() = head_sha.to_owned();
     }
 
+    fn set_head_after_post(&self, head_sha: &str) {
+        *self.head_after_post.lock().unwrap() = Some(head_sha.to_owned());
+    }
+
     fn push_fresh_review(&self, review_match: GitHubReviewMatch) {
         self.fresh_reviews.lock().unwrap().push_back(review_match);
     }
@@ -297,6 +304,9 @@ impl GitHubReviewPoster for StubGitHubReviewPoster {
             .lock()
             .unwrap()
             .push((repo.to_owned(), pr_number, steer.map(ToOwned::to_owned)));
+        if let Some(head_sha) = self.head_after_post.lock().unwrap().take() {
+            *self.current_head_sha.lock().unwrap() = head_sha;
+        }
         self.result.lock().unwrap().clone()
     }
 
@@ -2463,6 +2473,10 @@ async fn codex_review_request_create_posts_and_persists_active_row() {
     assert_eq!(payload["attempt_count"], 1);
     assert_eq!(payload["poll_interval_seconds"], 45);
     assert_eq!(payload["retry_interval_seconds"], 900);
+    assert_eq!(
+        payload["requested_head_sha"],
+        "1111111111111111111111111111111111111111"
+    );
     assert_eq!(payload["state"], "active");
     assert_eq!(payload["is_active"], true);
     assert_eq!(
@@ -2511,6 +2525,54 @@ async fn codex_review_request_create_posts_and_persists_active_row() {
     let (status, payload) = get_json(app, &format!("/codex-review-requests/{request_id}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["id"], request_id);
+}
+
+#[tokio::test]
+async fn codex_review_request_create_reconciles_head_after_post() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("codex-review-create-head-race.db");
+    let poster = StubGitHubReviewPoster::successful();
+    poster.set_head_after_post("2222222222222222222222222222222222222222");
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 967,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "run12345",
+            "poll_interval_seconds": 900,
+            "retry_interval_seconds": 900
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload["requested_head_sha"],
+        "2222222222222222222222222222222222222222"
+    );
+    assert_eq!(poster.calls().len(), 1);
+    let persisted_head: String = Connection::open(queue_db)
+        .unwrap()
+        .query_row(
+            "SELECT requested_head_sha FROM codex_review_request_registrations WHERE id = ?1",
+            [payload["id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(persisted_head, "2222222222222222222222222222222222222222");
 }
 
 #[tokio::test]
@@ -2865,6 +2927,81 @@ async fn codex_review_request_watcher_completes_and_queues_wake() {
         message,
         "[sm review] Codex comment for PR #967 is here. https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701300000"
     );
+}
+
+#[tokio::test]
+async fn codex_review_request_watcher_stops_before_retry_when_head_changes() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("codex-review-stale-before-retry.db");
+    let poster = StubGitHubReviewPoster::successful();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 971,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "run12345",
+            "poll_interval_seconds": 1,
+            "retry_interval_seconds": 1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let request_id = payload["id"].as_str().unwrap().to_owned();
+    poster.set_current_head("2222222222222222222222222222222222222222");
+
+    let mut row = None;
+    for _ in 0..30 {
+        let conn = Connection::open(&queue_db).unwrap();
+        let current = conn
+            .query_row(
+                "SELECT state, is_active, attempt_count, next_retry_at, superseded_at, last_error FROM codex_review_request_registrations WHERE id = ?1",
+                [&request_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        if current.0 == "superseded" {
+            row = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let row = row.expect("changed PR head should supersede the stale review request");
+    assert_eq!(row.1, 0);
+    assert_eq!(row.2, 1, "stale request must not post another comment");
+    assert!(row.3.is_none());
+    assert!(row.4.is_some());
+    let error = row.5.unwrap();
+    assert!(error.contains("1111111111111111111111111111111111111111"));
+    assert!(error.contains("2222222222222222222222222222222222222222"));
+    assert_eq!(poster.calls().len(), 1);
+
+    let messages = queued_message_texts(&queue_db, "run12345");
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].contains(&request_id));
+    assert!(messages[0].contains("PR head changed"));
+    assert!(messages[0].contains("Request a new review"));
 }
 
 #[tokio::test]
