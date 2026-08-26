@@ -428,8 +428,7 @@ sm_send:
 queue_runner:
   enabled: true
   state_dir: "~/.local/share/claude-sessions/queue-runner"
-  # Keep capacity for finite tests/background work while long-lived services run.
-  max_running_jobs: 4
+  max_running_jobs: 2
   perf_cooldown_seconds: 30
   cancel_grace_seconds: 10
   memory:
@@ -451,7 +450,9 @@ queue_runner:
     service:
       # Explicit class for API/frontend dev servers. Service jobs still count
       # toward max_running_jobs and must be stopped during workflow teardown.
-      max_concurrent: 2
+      # Keep the shared example's legacy global cap unchanged; installations
+      # that need two services can raise this below their larger global cap.
+      max_concurrent: 1
       default_timeout_seconds: 86400
 
 # Session defaults

@@ -3292,7 +3292,7 @@ queue_runner:
     }
 
     #[test]
-    fn example_config_admits_two_services_and_reserves_global_capacity() {
+    fn example_config_enables_service_without_raising_the_legacy_global_cap() {
         let raw: RawConfig = serde_yaml::from_str(include_str!("../../../config.yaml.example"))
             .expect("config.yaml.example must remain valid YAML");
         let config = AppConfig::from(raw);
@@ -3303,8 +3303,8 @@ queue_runner:
             .as_ref()
             .expect("the installation example must configure service capacity");
 
-        assert_eq!(config.queue_runner.max_running_jobs, 4);
-        assert_eq!(service.max_concurrent, 2);
+        assert_eq!(config.queue_runner.max_running_jobs, 2);
+        assert_eq!(service.max_concurrent, 1);
         assert_eq!(service.default_timeout_seconds, 86_400);
         assert!(service.max_concurrent < config.queue_runner.max_running_jobs as usize);
         assert!(config.validate_queue_runner_capacity().is_ok());
