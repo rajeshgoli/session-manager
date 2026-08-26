@@ -3290,4 +3290,23 @@ queue_runner:
             .to_string()
             .contains("cannot consume the entire global queue capacity"));
     }
+
+    #[test]
+    fn example_config_admits_two_services_and_reserves_global_capacity() {
+        let raw: RawConfig = serde_yaml::from_str(include_str!("../../../config.yaml.example"))
+            .expect("config.yaml.example must remain valid YAML");
+        let config = AppConfig::from(raw);
+        let service = config
+            .queue_runner
+            .types
+            .service
+            .as_ref()
+            .expect("the installation example must configure service capacity");
+
+        assert_eq!(config.queue_runner.max_running_jobs, 4);
+        assert_eq!(service.max_concurrent, 2);
+        assert_eq!(service.default_timeout_seconds, 86_400);
+        assert!(service.max_concurrent < config.queue_runner.max_running_jobs as usize);
+        assert!(config.validate_queue_runner_capacity().is_ok());
+    }
 }
