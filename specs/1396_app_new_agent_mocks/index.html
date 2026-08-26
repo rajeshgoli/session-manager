@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Session Manager - New agent flow</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="mock-shell">
+      <aside class="scenario-panel" aria-label="Mock scenarios">
+        <div>
+          <p class="eyebrow">Issue 1396</p>
+          <h1>New agent</h1>
+          <p class="scenario-copy">Static product mock for the Android Watch flow.</p>
+        </div>
+        <div class="scenario-list" role="group" aria-label="Choose scenario">
+          <button class="scenario is-active" data-scenario="watch" type="button">Watch</button>
+          <button class="scenario" data-scenario="contextual" type="button">From agent</button>
+          <button class="scenario" data-scenario="global" type="button">Global</button>
+          <button class="scenario" data-scenario="loading" type="button">Repositories loading</button>
+          <button class="scenario" data-scenario="empty" type="button">No repositories</button>
+          <button class="scenario" data-scenario="validation" type="button">Validation</button>
+          <button class="scenario" data-scenario="creating" type="button">Creating</button>
+          <button class="scenario" data-scenario="success" type="button">Confirmation</button>
+        </div>
+        <p class="scenario-foot">No network calls or session creation occur.</p>
+      </aside>
+
+      <section class="device-stage" aria-label="Android app mock">
+        <div class="device">
+          <div class="status-bar" aria-hidden="true">
+            <span>9:41</span>
+            <span>5G&nbsp;&nbsp;92%</span>
+          </div>
+
+          <section id="watch-screen" class="app-screen" aria-label="Watch screen">
+            <header class="app-header">
+              <div>
+                <p class="eyebrow">Session Manager</p>
+                <h2>Watch</h2>
+              </div>
+              <div class="header-actions">
+                <button id="refresh-button" class="icon-button" type="button" aria-label="Refresh sessions" title="Refresh sessions">&#8635;</button>
+                <button id="global-menu-button" class="icon-button" type="button" aria-label="Open Watch menu" title="Open Watch menu">&#8942;</button>
+              </div>
+              <div id="global-menu" class="overflow-menu" hidden>
+                <button id="global-new-agent" type="button"><span aria-hidden="true">+</span> New agent</button>
+                <button type="button">Request status</button>
+              </div>
+            </header>
+
+            <div class="sync-line"><span class="live-dot"></span> Connected <span>Updated now</span></div>
+
+            <section class="repo-band">
+              <div>
+                <strong>session-manager</strong>
+                <span>rajeshgoli/session-manager</span>
+              </div>
+              <span class="count">3 agents</span>
+            </section>
+
+            <article class="agent-row">
+              <button class="agent-summary" type="button" aria-expanded="false">
+                <span class="agent-mark claude">C</span>
+                <span class="agent-main">
+                  <strong>maintainer</strong>
+                  <span>031de889 &middot; Claude Code</span>
+                </span>
+                <span class="state working">working</span>
+              </button>
+            </article>
+
+            <article class="agent-row expanded">
+              <button class="agent-summary" type="button" aria-expanded="true">
+                <span class="agent-mark codex">X</span>
+                <span class="agent-main">
+                  <strong>981-chart-engineer</strong>
+                  <span>ce215685 &middot; Codex</span>
+                </span>
+                <span class="state idle">idle</span>
+              </button>
+              <div class="agent-detail">
+                <dl>
+                  <div><dt>Repository</dt><dd>/Users/rajesh/worktrees/981-355-main</dd></div>
+                  <div><dt>Parent</dt><dd>355-root-34</dd></div>
+                </dl>
+                <div class="agent-actions">
+                  <button id="contextual-new-agent" class="primary-compact" type="button"><span aria-hidden="true">+</span> New agent</button>
+                  <button type="button">Open</button>
+                  <button type="button">More</button>
+                </div>
+              </div>
+            </article>
+
+            <article class="agent-row">
+              <button class="agent-summary" type="button" aria-expanded="false">
+                <span class="agent-mark codex">X</span>
+                <span class="agent-main">
+                  <strong>984-engineer</strong>
+                  <span>ce215685 &middot; Codex</span>
+                </span>
+                <span class="state working">working</span>
+              </button>
+            </article>
+
+            <nav class="bottom-nav" aria-label="App navigation">
+              <button class="selected" type="button">Watch</button>
+              <button type="button">Analytics</button>
+            </nav>
+          </section>
+
+          <section id="create-screen" class="app-screen create-screen" aria-label="New agent form" hidden>
+            <header class="form-header">
+              <button id="close-form" class="icon-button" type="button" aria-label="Close new agent form">&#8592;</button>
+              <div>
+                <h2>New agent</h2>
+                <p id="form-context">From 981-chart-engineer</p>
+              </div>
+            </header>
+
+            <form id="agent-form" novalidate>
+              <div id="form-error" class="form-error" role="alert" hidden>Review the highlighted fields.</div>
+
+              <div class="field" id="repo-field">
+                <div class="field-label-row">
+                  <label for="repo-button">Repository</label>
+                  <span id="repo-inherited" class="inherited">Inherited</span>
+                </div>
+                <button id="repo-button" class="select-button" type="button" aria-haspopup="listbox" aria-expanded="false">
+                  <span><strong id="repo-name">981-355-main</strong><small id="repo-path">/Users/rajesh/worktrees/981-355-main</small></span>
+                  <span aria-hidden="true">&#9662;</span>
+                </button>
+                <p id="repo-error" class="field-error" hidden>Choose a repository.</p>
+                <div id="repo-menu" class="select-menu" role="listbox" hidden>
+                  <button class="repo-option is-selected" type="button" data-name="981-355-main" data-path="/Users/rajesh/worktrees/981-355-main">
+                    <span><strong>981-355-main</strong><small>/Users/rajesh/worktrees/981-355-main</small></span><em>Current</em>
+                  </button>
+                  <button class="repo-option" type="button" data-name="session-manager" data-path="/Users/rajesh/projects/session-manager">
+                    <span><strong>session-manager</strong><small>/Users/rajesh/projects/session-manager</small></span><em>Recent</em>
+                  </button>
+                  <button class="repo-option" type="button" data-name="fractal-algo-rust" data-path="/Users/rajesh/projects/fractal-algo-rust">
+                    <span><strong>fractal-algo-rust</strong><small>/Users/rajesh/projects/fractal-algo-rust</small></span><em>Worktree</em>
+                  </button>
+                </div>
+                <div id="repo-loading" class="repo-loading" hidden>
+                  <span></span><span></span><span></span>
+                </div>
+                <div id="repo-empty" class="repo-empty" hidden>
+                  <strong>No repositories available</strong>
+                  <p>Start an agent from the CLI once, then refresh this list.</p>
+                  <button type="button">Refresh repositories</button>
+                </div>
+              </div>
+
+              <fieldset class="field" id="provider-field">
+                <div class="field-label-row">
+                  <legend>Agent type</legend>
+                  <span id="provider-inherited" class="inherited">Inherited</span>
+                </div>
+                <div class="segmented">
+                  <button class="provider-option" type="button" data-provider="claude">
+                    <span class="agent-mark claude">C</span><span><strong>Claude Code</strong><small>claude</small></span>
+                  </button>
+                  <button class="provider-option is-selected" type="button" data-provider="codex-fork">
+                    <span class="agent-mark codex">X</span><span><strong>Codex</strong><small>codex-fork</small></span>
+                  </button>
+                </div>
+                <p id="provider-error" class="field-error" hidden>Choose an agent type.</p>
+              </fieldset>
+
+              <div class="field" id="task-field">
+                <label for="task-input">Initial task</label>
+                <textarea id="task-input" rows="5" placeholder="Describe what this agent should do.">Validate the chart API and frontend together, then report the exact evidence.</textarea>
+                <p id="task-error" class="field-error" hidden>Describe what this agent should do.</p>
+              </div>
+
+              <div class="field">
+                <label for="name-input">Name <span>Optional</span></label>
+                <input id="name-input" type="text" value="981-chart-validation" maxlength="32">
+                <p class="helper">Use letters, numbers, - or _ (32 max)</p>
+              </div>
+            </form>
+
+            <footer class="form-actions">
+              <div class="launch-summary">
+                <span id="summary-type">Codex</span>
+                <span id="summary-repo">981-355-main</span>
+              </div>
+              <button id="create-agent" class="primary-action" type="submit" form="agent-form">Create agent</button>
+            </footer>
+          </section>
+
+          <section id="success-screen" class="app-screen success-screen" aria-label="Agent creation confirmation" hidden>
+            <div class="success-mark" aria-hidden="true">&#10003;</div>
+            <p class="eyebrow">Session Manager</p>
+            <h2>Agent started</h2>
+            <p class="success-copy">The initial task was accepted with the new session.</p>
+            <dl class="success-details">
+              <div><dt>Name</dt><dd>981-chart-validation</dd></div>
+              <div><dt>Session</dt><dd>new981a</dd></div>
+              <div><dt>Type</dt><dd>Codex &middot; codex-fork</dd></div>
+              <div><dt>Repository</dt><dd>/Users/rajesh/worktrees/981-355-main</dd></div>
+              <div><dt>Relationship</dt><dd id="success-relationship">Child of 981-chart-engineer</dd></div>
+            </dl>
+            <div class="success-actions">
+              <button id="open-agent" class="primary-action" type="button">Open agent</button>
+              <button id="back-watch" class="secondary-action" type="button">Back to Watch</button>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>
