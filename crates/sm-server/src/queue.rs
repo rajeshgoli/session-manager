@@ -595,6 +595,34 @@ impl RetainedQueueStore {
         get_codex_review_request_conn(&conn, request_id)
     }
 
+    pub fn backfill_codex_review_request_head_in_path(
+        db_path: &Path,
+        request_id: &str,
+        requested_head_sha: &str,
+        last_polled_at: &str,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(db_path)?;
+        let changed = conn.execute(
+            r#"
+            UPDATE codex_review_request_registrations
+            SET requested_head_sha = ?2,
+                last_polled_at = ?3,
+                last_error = NULL
+            WHERE id = ?1
+                AND is_active = 1
+                AND requested_head_sha IS NULL
+            "#,
+            params![request_id, requested_head_sha, last_polled_at],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        get_codex_review_request_conn(&conn, request_id)
+    }
+
     pub fn retry_codex_review_request_in_path(
         db_path: &Path,
         request_id: &str,
@@ -715,6 +743,61 @@ impl RetainedQueueStore {
             }
             let registration = get_codex_review_request_conn(&conn, request_id)?
                 .ok_or_else(|| anyhow::anyhow!("completed Codex review request disappeared"))?;
+            enqueue_message_with_metadata_conn(
+                &conn,
+                &registration.notify_session_id,
+                wake_text,
+                "sequential",
+                QueueMessageMetadata::default(),
+            )?;
+            Ok(Some(registration))
+        })();
+        match result {
+            Ok(registration) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(registration)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn supersede_codex_review_request_and_enqueue_in_path(
+        db_path: &Path,
+        request_id: &str,
+        superseded_at: &str,
+        reason: &str,
+        wake_text: &str,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        init_schema(&conn)?;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let changed = conn.execute(
+                r#"
+                UPDATE codex_review_request_registrations
+                SET state = 'superseded',
+                    is_active = 0,
+                    superseded_at = ?2,
+                    next_retry_at = NULL,
+                    last_polled_at = ?2,
+                    last_error = ?3
+                WHERE id = ?1 AND is_active = 1
+                "#,
+                params![request_id, superseded_at, reason],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            let registration = get_codex_review_request_conn(&conn, request_id)?
+                .ok_or_else(|| anyhow::anyhow!("superseded Codex review request disappeared"))?;
             enqueue_message_with_metadata_conn(
                 &conn,
                 &registration.notify_session_id,
