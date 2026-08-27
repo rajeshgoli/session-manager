@@ -82,14 +82,14 @@ impl Default for AppConfig {
             codex_observability: CodexObservabilityConfig::default(),
             claude: ProviderLaunchConfig::new(
                 "claude".to_owned(),
-                Vec::new(),
+                vec!["--permission-mode".to_owned(), "auto".to_owned()],
                 Some("sonnet".to_owned()),
                 None,
                 None,
             ),
             codex: ProviderLaunchConfig::new(
                 "codex".to_owned(),
-                Vec::new(),
+                vec!["--approve-for-me".to_owned()],
                 None,
                 Some("~/.codex/session_index.jsonl".to_owned()),
                 None,
@@ -1097,7 +1097,7 @@ impl Default for CodexForkLaunchConfig {
     fn default() -> Self {
         Self {
             command: "codex".to_owned(),
-            args: codex_fork_managed_args(Vec::new()),
+            args: codex_fork_managed_args(vec!["--approve-for-me".to_owned()]),
             default_model: None,
             event_schema_version: 2,
             control_tmux_fallback_enabled: true,
@@ -1702,13 +1702,19 @@ impl From<RawConfig> for AppConfig {
             codex_observability_config(raw.codex_observability, &paths.state_file);
         let codex_requests = codex_requests_config(raw.codex_requests, &paths.state_file);
         let codex_events = codex_events_config(raw.codex_events, &paths.state_file);
-        let claude = provider_launch_config(raw.claude, "claude", Some("sonnet"), Vec::new(), None);
+        let claude = provider_launch_config(
+            raw.claude,
+            "claude",
+            Some("sonnet"),
+            vec!["--permission-mode".to_owned(), "auto".to_owned()],
+            None,
+        );
         let codex_review = raw.codex.review;
         let codex = provider_launch_config(
             raw.codex.provider,
             "codex",
             None,
-            Vec::new(),
+            vec!["--approve-for-me".to_owned()],
             Some("~/.codex/session_index.jsonl"),
         );
         let codex_fork = codex_fork_launch_config(raw.codex_fork, &codex);
@@ -3128,7 +3134,7 @@ paths:
 codex:
   command: "/opt/bin/codex"
   args:
-    - "--dangerously-bypass-approvals-and-sandbox"
+    - "--approve-for-me"
   default_model: "gpt-5"
 codex_fork:
   event_schema_version: 7
@@ -3142,7 +3148,7 @@ codex_fork:
         assert_eq!(
             config.codex_fork.args,
             vec![
-                "--dangerously-bypass-approvals-and-sandbox",
+                "--approve-for-me",
                 "-c",
                 "check_for_update_on_startup=false"
             ]
@@ -3151,6 +3157,22 @@ codex_fork:
         assert_eq!(config.codex_fork.event_schema_version, 7);
         assert!(!config.codex_fork.control_tmux_fallback_enabled);
         assert_eq!(config.codex_fork.create_startup_timeout_seconds, 60);
+    }
+
+    #[test]
+    fn default_provider_permission_modes_are_safe_for_unconfigured_launches() {
+        let config = AppConfig::from(RawConfig::default());
+
+        assert_eq!(config.claude.args, vec!["--permission-mode", "auto"]);
+        assert_eq!(config.codex.args, vec!["--approve-for-me"]);
+        assert_eq!(
+            config.codex_fork.args,
+            vec![
+                "--approve-for-me",
+                "-c",
+                "check_for_update_on_startup=false"
+            ]
+        );
     }
 
     #[test]
@@ -3206,7 +3228,7 @@ claude:
             r#"
 codex:
   command: "/opt/bin/codex"
-  args: ["--dangerously-bypass-approvals-and-sandbox"]
+  args: ["--approve-for-me"]
   default_model: "gpt-5"
   session_index_path: "/tmp/codex/session_index.jsonl"
   review:
@@ -3220,10 +3242,7 @@ codex:
         let config = AppConfig::from(raw);
 
         assert_eq!(config.codex.command, "/opt/bin/codex");
-        assert_eq!(
-            config.codex.args,
-            vec!["--dangerously-bypass-approvals-and-sandbox"]
-        );
+        assert_eq!(config.codex.args, vec!["--approve-for-me"]);
         assert_eq!(config.codex.default_model.as_deref(), Some("gpt-5"));
         assert_eq!(
             config.codex.session_index_path.as_deref(),

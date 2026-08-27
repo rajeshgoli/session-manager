@@ -3708,6 +3708,16 @@ esac
 
         assert!(runtime.tmux_native_scrollback);
         assert_eq!(runtime.tmux_history_limit, Some(100000));
+        assert_eq!(runtime.claude_args, vec!["--permission-mode", "auto"]);
+        assert_eq!(runtime.codex_args, vec!["--approve-for-me"]);
+        assert_eq!(
+            runtime.codex_fork_args,
+            vec![
+                "--approve-for-me",
+                "-c",
+                "check_for_update_on_startup=false"
+            ]
+        );
     }
 
     #[test]
