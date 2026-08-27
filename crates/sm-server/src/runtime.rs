@@ -2237,9 +2237,40 @@ fn ansi_visible_cells(text: &str) -> Option<Vec<(char, bool)>> {
     let mut chars = text.chars().peekable();
     let mut dim = false;
     while let Some(ch) = chars.next() {
-        if ch != '\u{1b}' || chars.peek() != Some(&'[') {
+        if ch != '\u{1b}' {
             cells.push((ch, dim));
             continue;
+        }
+        if chars.peek() == Some(&']') {
+            chars.next();
+            let mut payload = String::new();
+            let mut terminated = false;
+            while let Some(next) = chars.next() {
+                match next {
+                    '\u{7}' => {
+                        terminated = true;
+                        break;
+                    }
+                    '\u{1b}' => {
+                        if chars.next() != Some('\\') {
+                            return None;
+                        }
+                        terminated = true;
+                        break;
+                    }
+                    _ => payload.push(next),
+                }
+            }
+            let valid_hyperlink = payload.strip_prefix("8;").is_some_and(|hyperlink| {
+                hyperlink.contains(';') && !hyperlink.chars().any(char::is_control)
+            });
+            if !terminated || !valid_hyperlink {
+                return None;
+            }
+            continue;
+        }
+        if chars.peek() != Some(&'[') {
+            return None;
         }
         chars.next();
         let mut parameters = String::new();
@@ -2944,6 +2975,21 @@ esac
         .unwrap();
         assert!(runtime.session_input_ready("sm-test", "claude"));
 
+        // Styled tmux captures also retain OSC 8 hyperlinks that are absent
+        // from plain captures. Ignore the hyperlink wrapper only; the visible
+        // historical row and the dim composer must still match exactly.
+        fs::write(
+            &pane_path,
+            "Commented on PR #1003, ran 2 shell commands\n────────────────────\n❯\u{a0}re-review it, then squash merge and clean up\n────────────────────\nOpus 5\n⏵⏵ bypass permissions on\n",
+        )
+        .unwrap();
+        fs::write(
+            &styled_pane_path,
+            "Commented on PR \u{1b}]8;id=review;https://example.test/pull/1003\u{1b}\\#1003\u{1b}]8;;\u{1b}\\, ran 2 shell commands\n────────────────────\n\u{1b}[39m❯\u{a0}\u{1b}[2mre-review it, then squash merge and clean up\u{1b}[0m\n────────────────────\nOpus 5\n⏵⏵ bypass permissions on\n",
+        )
+        .unwrap();
+        assert!(runtime.session_input_ready("sm-test", "claude"));
+
         fs::write(
             &pane_path,
             "✻ Finished\n────────────────────\n❯\u{a0}Press up to edit queued messages\n────────────────────\nFable 5\n⏵⏵ bypass permissions on\n",
@@ -3020,6 +3066,22 @@ esac
         assert!(claude_capture_frames_match(
             "Ran 1 shell command\n❯\u{a0}fix the horizon.rs comment too\n",
             "\u{1b}[38;5;246mRan 1 shell command \u{1b}[39m\n\u{1b}[39m❯\u{a0}\u{1b}[2mfix the horizon.rs comment too\u{1b}[0m\n",
+        ));
+        assert!(claude_capture_frames_match(
+            "Commented on PR #1003\n❯\u{a0}re-review it\n",
+            "Commented on PR \u{1b}]8;id=review;https://example.test/pull/1003\u{1b}\\#1003\u{1b}]8;;\u{1b}\\\n\u{1b}[39m❯\u{a0}\u{1b}[2mre-review it\u{1b}[0m\n",
+        ));
+        assert!(claude_capture_frames_match(
+            "PR #1003\n",
+            "PR \u{1b}]8;;https://example.test/pull/1003\u{7}#1003\u{1b}]8;;\u{7}\n",
+        ));
+        assert!(!claude_capture_frames_match(
+            "Commented on PR #1003\n❯\u{a0}re-review it\n",
+            "Commented on PR \u{1b}]0;forged title\u{7}#1003\n\u{1b}[39m❯\u{a0}\u{1b}[2mre-review it\u{1b}[0m\n",
+        ));
+        assert!(!claude_capture_frames_match(
+            "Commented on PR #1003\n❯\u{a0}re-review it\n",
+            "Commented on PR \u{1b}]8;id=review;https://example.test/pull/1003#1003\n\u{1b}[39m❯\u{a0}\u{1b}[2mre-review it\u{1b}[0m\n",
         ));
         assert!(!claude_capture_frames_match(
             "Ran 1 shell command\n❯\u{a0}fix the horizon.rs comment too\n",
