@@ -2236,6 +2236,7 @@ fn ansi_visible_cells(text: &str) -> Option<Vec<(char, bool)>> {
     let mut cells = Vec::new();
     let mut chars = text.chars().peekable();
     let mut dim = false;
+    let mut hyperlink_open = false;
     while let Some(ch) = chars.next() {
         if ch != '\u{1b}' {
             cells.push((ch, dim));
@@ -2261,11 +2262,28 @@ fn ansi_visible_cells(text: &str) -> Option<Vec<(char, bool)>> {
                     _ => payload.push(next),
                 }
             }
-            let valid_hyperlink = payload.strip_prefix("8;").is_some_and(|hyperlink| {
-                hyperlink.contains(';') && !hyperlink.chars().any(char::is_control)
-            });
-            if !terminated || !valid_hyperlink {
+            let Some((parameters, uri)) = payload
+                .strip_prefix("8;")
+                .and_then(|hyperlink| hyperlink.split_once(';'))
+            else {
                 return None;
+            };
+            if !terminated
+                || parameters.chars().any(char::is_control)
+                || uri.chars().any(char::is_control)
+            {
+                return None;
+            }
+            if uri.is_empty() {
+                if !hyperlink_open || !parameters.is_empty() {
+                    return None;
+                }
+                hyperlink_open = false;
+            } else {
+                if hyperlink_open {
+                    return None;
+                }
+                hyperlink_open = true;
             }
             continue;
         }
@@ -2330,7 +2348,7 @@ fn ansi_visible_cells(text: &str) -> Option<Vec<(char, bool)>> {
             }
         }
     }
-    Some(cells)
+    (!hyperlink_open).then_some(cells)
 }
 
 /// Confirm that tmux's cursor is immediately after the visible composer
@@ -3074,6 +3092,22 @@ esac
         assert!(claude_capture_frames_match(
             "PR #1003\n",
             "PR \u{1b}]8;;https://example.test/pull/1003\u{7}#1003\u{1b}]8;;\u{7}\n",
+        ));
+        assert!(!claude_capture_frames_match(
+            "PR #1003\n",
+            "PR \u{1b}]8;;https://example.test/pull/1003\u{1b}\\#1003\n",
+        ));
+        assert!(!claude_capture_frames_match(
+            "PR #1003\n",
+            "PR \u{1b}]8;;\u{1b}\\#1003\n",
+        ));
+        assert!(claude_capture_frames_match(
+            "PR #1003 and #1004\n",
+            "PR \u{1b}]8;;https://example.test/pull/1003\u{1b}\\#1003\u{1b}]8;;\u{1b}\\ and \u{1b}]8;;https://example.test/pull/1004\u{1b}\\#1004\u{1b}]8;;\u{1b}\\\n",
+        ));
+        assert!(!claude_capture_frames_match(
+            "PR #1003 and #1004\n",
+            "PR \u{1b}]8;;https://example.test/pull/1003\u{1b}\\#1003 and \u{1b}]8;;https://example.test/pull/1004\u{1b}\\#1004\u{1b}]8;;\u{1b}\\\u{1b}]8;;\u{1b}\\\n",
         ));
         assert!(!claude_capture_frames_match(
             "Commented on PR #1003\n❯\u{a0}re-review it\n",
