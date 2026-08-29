@@ -168,7 +168,7 @@ def test_state_preflight_cli_json_fails_on_blockers(tmp_path, capsys):
     assert report["summary"]["blockers"] == 1
 
 
-def test_state_preflight_repo_owned_defaults_do_not_follow_supplied_config_dir(tmp_path):
+def test_state_preflight_email_default_follows_supplied_config_dir(tmp_path):
     config = tmp_path / "rehearsal" / "config.yaml"
     config.parent.mkdir()
     state_dir = tmp_path / "state"
@@ -189,7 +189,62 @@ paths:
     assert stores["bug_reports_db"]["path"] == str(REPO_ROOT / "data/bug_reports.db")
     assert stores["app_artifacts_dir"]["path"] == str(REPO_ROOT / "data/apps")
     assert stores["email_bridge_config"]["path"] == str(
-        REPO_ROOT / "config/email_send.yaml"
+        config.parent / "config/email_send.yaml"
+    )
+
+
+def test_state_preflight_relative_email_path_follows_supplied_config_dir(tmp_path):
+    config = tmp_path / "other-worktree" / "config.yaml"
+    config.parent.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "sessions.json").write_text("[]\n", encoding="utf-8")
+    config.write_text(
+        f"""
+paths:
+  state_file: "{state_dir / 'sessions.json'}"
+email:
+  bridge_config: "secrets/email.yaml"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    report = build_state_preflight_report(config_path=config)
+    stores = {row["id"]: row for row in report["stores"]}
+
+    assert stores["email_bridge_config"]["path"] == str(
+        config.parent / "secrets/email.yaml"
+    )
+
+
+def test_state_preflight_email_path_follows_relative_symlinked_config_target(
+    tmp_path, monkeypatch
+):
+    config_root = tmp_path / "config-owner"
+    launcher_root = tmp_path / "launcher"
+    state_dir = tmp_path / "state"
+    config_root.mkdir()
+    launcher_root.mkdir()
+    state_dir.mkdir()
+    (state_dir / "sessions.json").write_text("[]\n", encoding="utf-8")
+    target_config = config_root / "config.yaml"
+    target_config.write_text(
+        f"""paths:
+  state_file: "{state_dir / 'sessions.json'}"
+""",
+        encoding="utf-8",
+    )
+    linked_config = launcher_root / "config.yaml"
+    linked_config.symlink_to(target_config)
+    monkeypatch.chdir(launcher_root)
+
+    report = build_state_preflight_report(config_path=linked_config.name)
+    stores = {row["id"]: row for row in report["stores"]}
+
+    assert report["inputs"]["config"] == str(target_config)
+    assert stores["email_bridge_config"]["path"] == str(
+        config_root / "config/email_send.yaml"
     )
 
 

@@ -138,6 +138,13 @@ impl AppConfig {
             apply_local_auth_overrides(&mut config, &env_values);
         }
 
+        let config_path_for_relative_resolution =
+            fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        config.email.bridge_config = resolve_config_relative_path(
+            &config_path_for_relative_resolution,
+            &config.email.bridge_config,
+        );
+
         config.validate_queue_runner_capacity()?;
         config.validate_codex_fork_create_startup_timeout()?;
 
@@ -288,6 +295,19 @@ impl AppConfig {
         }
         Ok(())
     }
+}
+
+fn resolve_config_relative_path(config_path: &Path, configured_path: &str) -> String {
+    let configured = Path::new(configured_path);
+    if configured.is_absolute() || configured_path == "~" || configured_path.starts_with("~/") {
+        return configured_path.to_owned();
+    }
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(configured)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Return the configured test-isolation root, creating it before any durable
@@ -2299,6 +2319,67 @@ fn derive_session_cookie_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn email_bridge_paths_are_resolved_relative_to_main_config() {
+        let root = env::temp_dir().join(format!(
+            "sm-config-email-path-{}-{}",
+            std::process::id(),
+            TEST_ISOLATION_INSTANCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let resolved_root = fs::canonicalize(&root).unwrap();
+        let config_path = root.join("config.yaml");
+        fs::write(&config_path, "{}\n").unwrap();
+
+        let default_config = AppConfig::load_from_path(&config_path).unwrap();
+
+        assert_eq!(
+            Path::new(&default_config.email.bridge_config),
+            resolved_root.join("config/email_send.yaml")
+        );
+
+        fs::write(
+            &config_path,
+            "email:\n  bridge_config: secrets/email.yaml\n",
+        )
+        .unwrap();
+
+        let config = AppConfig::load_from_path(&config_path).unwrap();
+
+        assert_eq!(
+            Path::new(&config.email.bridge_config),
+            resolved_root.join("secrets/email.yaml")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn email_bridge_path_follows_symlinked_main_config_target() {
+        let root = env::temp_dir().join(format!(
+            "sm-config-email-symlink-{}-{}",
+            std::process::id(),
+            TEST_ISOLATION_INSTANCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let launcher_root = root.join("launcher");
+        let config_root = root.join("config-owner");
+        fs::create_dir_all(&launcher_root).unwrap();
+        fs::create_dir_all(&config_root).unwrap();
+        let resolved_config_root = fs::canonicalize(&config_root).unwrap();
+        let target_config = config_root.join("config.yaml");
+        fs::write(&target_config, "{}\n").unwrap();
+        let linked_config = launcher_root.join("config.yaml");
+        std::os::unix::fs::symlink(&target_config, &linked_config).unwrap();
+
+        let config = AppConfig::load_from_path(&linked_config).unwrap();
+
+        assert_eq!(
+            Path::new(&config.email.bridge_config),
+            resolved_config_root.join("config/email_send.yaml")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn test_isolation_rehomes_all_default_durable_paths() {
