@@ -138,8 +138,12 @@ impl AppConfig {
             apply_local_auth_overrides(&mut config, &env_values);
         }
 
-        config.email.bridge_config =
-            resolve_config_relative_path(path, &config.email.bridge_config);
+        let config_path_for_relative_resolution =
+            fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        config.email.bridge_config = resolve_config_relative_path(
+            &config_path_for_relative_resolution,
+            &config.email.bridge_config,
+        );
 
         config.validate_queue_runner_capacity()?;
         config.validate_codex_fork_create_startup_timeout()?;
@@ -2324,6 +2328,7 @@ mod tests {
             TEST_ISOLATION_INSTANCE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&root).unwrap();
+        let resolved_root = fs::canonicalize(&root).unwrap();
         let config_path = root.join("config.yaml");
         fs::write(&config_path, "{}\n").unwrap();
 
@@ -2331,7 +2336,7 @@ mod tests {
 
         assert_eq!(
             Path::new(&default_config.email.bridge_config),
-            root.join("config/email_send.yaml")
+            resolved_root.join("config/email_send.yaml")
         );
 
         fs::write(
@@ -2344,7 +2349,34 @@ mod tests {
 
         assert_eq!(
             Path::new(&config.email.bridge_config),
-            root.join("secrets/email.yaml")
+            resolved_root.join("secrets/email.yaml")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn email_bridge_path_follows_symlinked_main_config_target() {
+        let root = env::temp_dir().join(format!(
+            "sm-config-email-symlink-{}-{}",
+            std::process::id(),
+            TEST_ISOLATION_INSTANCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let launcher_root = root.join("launcher");
+        let config_root = root.join("config-owner");
+        fs::create_dir_all(&launcher_root).unwrap();
+        fs::create_dir_all(&config_root).unwrap();
+        let resolved_config_root = fs::canonicalize(&config_root).unwrap();
+        let target_config = config_root.join("config.yaml");
+        fs::write(&target_config, "{}\n").unwrap();
+        let linked_config = launcher_root.join("config.yaml");
+        std::os::unix::fs::symlink(&target_config, &linked_config).unwrap();
+
+        let config = AppConfig::load_from_path(&linked_config).unwrap();
+
+        assert_eq!(
+            Path::new(&config.email.bridge_config),
+            resolved_config_root.join("config/email_send.yaml")
         );
         fs::remove_dir_all(root).unwrap();
     }

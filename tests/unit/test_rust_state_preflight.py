@@ -218,6 +218,36 @@ email:
     )
 
 
+def test_state_preflight_email_path_follows_relative_symlinked_config_target(
+    tmp_path, monkeypatch
+):
+    config_root = tmp_path / "config-owner"
+    launcher_root = tmp_path / "launcher"
+    state_dir = tmp_path / "state"
+    config_root.mkdir()
+    launcher_root.mkdir()
+    state_dir.mkdir()
+    (state_dir / "sessions.json").write_text("[]\n", encoding="utf-8")
+    target_config = config_root / "config.yaml"
+    target_config.write_text(
+        f"""paths:
+  state_file: "{state_dir / 'sessions.json'}"
+""",
+        encoding="utf-8",
+    )
+    linked_config = launcher_root / "config.yaml"
+    linked_config.symlink_to(target_config)
+    monkeypatch.chdir(launcher_root)
+
+    report = build_state_preflight_report(config_path=linked_config.name)
+    stores = {row["id"]: row for row in report["stores"]}
+
+    assert report["inputs"]["config"] == str(target_config)
+    assert stores["email_bridge_config"]["path"] == str(
+        config_root / "config/email_send.yaml"
+    )
+
+
 def test_state_preflight_reports_client_config_env_override(tmp_path, monkeypatch):
     config = tmp_path / "config.yaml"
     state_dir = tmp_path / "state"
