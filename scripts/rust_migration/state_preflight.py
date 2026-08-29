@@ -274,7 +274,13 @@ def _store_specs(
             "email_bridge_config",
             "Email bridge config",
             "file",
-            _config_path(config, ("email", "bridge_config"), DEFAULT_EMAIL_BRIDGE_CONFIG, config_path=config_path),
+            _config_path(
+                config,
+                ("email", "bridge_config"),
+                DEFAULT_EMAIL_BRIDGE_CONFIG,
+                config_path=config_path,
+                relative_to_config=True,
+            ),
             False,
             "email",
             "email.bridge_config",
@@ -426,9 +432,11 @@ def _config_path(
     default: Any,
     *,
     config_path: Path,
+    relative_to_config: bool = False,
 ) -> Path:
     raw = _get(config, keys, default)
-    return _resolve_runtime_path(Path(str(raw)))
+    base = config_path.parent if relative_to_config else REPO_ROOT
+    return _resolve_runtime_path(Path(str(raw)), base=base)
 
 
 def _get(config: dict[str, Any], keys: tuple[str, ...], default: Any = None) -> Any:
@@ -450,11 +458,11 @@ def _resolve_path(path: Path, *, base: Path) -> Path:
     return (REPO_ROOT / expanded).resolve()
 
 
-def _resolve_runtime_path(path: Path) -> Path:
+def _resolve_runtime_path(path: Path, *, base: Path = REPO_ROOT) -> Path:
     expanded = Path(str(path)).expanduser()
     if expanded.is_absolute():
         return expanded
-    return (REPO_ROOT / expanded).resolve()
+    return (base / expanded).resolve()
 
 
 def _client_config_path() -> Path:
