@@ -76,17 +76,23 @@ _RESTORE_COLUMN_SPECS = [
 ]
 _RESTORE_COLUMN_FLOORS = {
     "Session": 8,
-    "ID": 4,
+    # IDs and providers are operational identifiers, not decorative metadata.
+    # Keep them readable when one unusually long session name pressures the
+    # table width.
+    "ID": 8,
     "Parent": 8,
     "Role": 4,
     "Node": 4,
-    "Provider": 6,
+    "Provider": 10,
     "Repo": 6,
     "Last Active": 5,
     "Retired": 5,
     "Restore": 5,
 }
 _RESTORE_DYNAMIC_COLUMN_CAPS = {
+    # A single long friendly name must not consume the space needed by the
+    # fixed-width ID and Provider columns.
+    "Session": 32,
     "ID": 8,
     "Parent": 36,
     "Role": 16,
@@ -936,7 +942,22 @@ def build_restore_rows(
         for idx, child in enumerate(children):
             render_session(child, ancestors_last + [is_last], idx == len(children) - 1)
 
-    for repo_key in sorted(groups.keys()):
+    def repo_sort_key(repo_key: str) -> tuple[float, str]:
+        """Sort repository groups by most-recent use, then stable path."""
+        most_recent = max(
+            (
+                _timestamp_sort_value(
+                    session.get("last_activity")
+                    or session.get("stopped_at")
+                    or session.get("completed_at")
+                )
+                for session in groups.get(repo_key, [])
+            ),
+            default=float("-inf"),
+        )
+        return (-most_recent, repo_key)
+
+    for repo_key in sorted(groups.keys(), key=repo_sort_key):
         top_level_roots = roots_by_repo.get(repo_key, [])
         if not top_level_roots:
             continue
@@ -1117,7 +1138,11 @@ def _compute_column_widths(
     used = sum(widths.values()) + sep_total
     if used <= content_width:
         if "Session" in widths:
-            widths["Session"] += content_width - used
+            extra = content_width - used
+            session_cap = caps.get("Session")
+            if session_cap is not None:
+                extra = min(extra, max(0, session_cap - widths["Session"]))
+            widths["Session"] += extra
         return widths
 
     deficit = used - content_width

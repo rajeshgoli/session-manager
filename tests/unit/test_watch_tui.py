@@ -564,6 +564,38 @@ def test_dynamic_column_widths_fit_waiting_permission_activity():
     assert "waiting_per..." not in rendered
 
 
+def test_restore_column_widths_keep_ids_and_providers_readable_with_long_names():
+    rows, _, _ = build_restore_rows(
+        [
+            _session(
+                "88eaba6e",
+                "codex-fork-88eaba6e",
+                "/tmp/repo",
+                friendly_name="an-unusually-long-session-name-that-must-not-starve-identifiers",
+                provider="codex-fork",
+                status="stopped",
+                stopped_at="2026-02-21T23:00:00",
+            )
+        ]
+    )
+    session_row = next(row for row in rows if row.kind == "session")
+
+    widths = _compute_column_widths(
+        120,
+        rows,
+        watch_tui._RESTORE_COLUMN_SPECS,
+        watch_tui._RESTORE_COLUMN_FLOORS,
+        watch_tui._RESTORE_DYNAMIC_COLUMN_CAPS,
+    )
+    rendered = _session_line(session_row, widths, watch_tui._RESTORE_COLUMN_SPECS)
+
+    assert widths["Session"] <= 32
+    assert widths["ID"] == 8
+    assert widths["Provider"] == 10
+    assert "88eaba6e" in rendered
+    assert "codex-fork" in rendered
+
+
 def test_render_columns_uses_full_visible_width_except_reserved_footer_cell():
     assert _render_columns(80, 0) == 80
     assert _render_columns(80, 2) == 78
@@ -1033,6 +1065,32 @@ def test_build_restore_rows_sorts_by_last_active_or_name():
 
     _, selectable, _ = build_restore_rows(sessions, sort_mode="name")
     assert selectable == ["alpha", "beta"]
+
+
+def test_build_restore_rows_orders_repositories_by_most_recent_use():
+    old = _session(
+        "old",
+        "old-agent",
+        "/tmp/aaa-old",
+        status="stopped",
+        stopped_at="2026-02-21T23:55:00",
+    )
+    old["last_activity"] = "2026-02-21T22:00:00"
+    recent = _session(
+        "recent",
+        "recent-agent",
+        "/tmp/zzz-recent",
+        status="stopped",
+        stopped_at="2026-02-21T23:00:00",
+    )
+    recent["last_activity"] = "2026-02-21T23:00:00"
+
+    rows, selectable, _ = build_restore_rows([old, recent])
+
+    repo_rows = [row.text for row in rows if row.kind == "repo"]
+    assert repo_rows[0].startswith("zzz-recent/")
+    assert repo_rows[1].startswith("aaa-old/")
+    assert selectable == ["recent", "old"]
 
 
 def test_build_restore_rows_collapsed_session_hides_children_when_default_expanded():
