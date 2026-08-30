@@ -943,18 +943,25 @@ def build_restore_rows(
             render_session(child, ancestors_last + [is_last], idx == len(children) - 1)
 
     def repo_sort_key(repo_key: str) -> tuple[float, str]:
-        """Sort repository groups by most-recent use, then stable path."""
-        most_recent = max(
-            (
+        """Sort emitted repository trees by most-recent use, then stable path."""
+        most_recent = float("-inf")
+        pending = list(roots_by_repo.get(repo_key, []))
+        visited: set[str] = set()
+        while pending:
+            session = pending.pop()
+            session_id = session.get("id")
+            if not session_id or session_id in visited:
+                continue
+            visited.add(session_id)
+            most_recent = max(
+                most_recent,
                 _timestamp_sort_value(
                     session.get("last_activity")
                     or session.get("stopped_at")
                     or session.get("completed_at")
-                )
-                for session in groups.get(repo_key, [])
-            ),
-            default=float("-inf"),
-        )
+                ),
+            )
+            pending.extend(children_by_parent.get(session_id, []))
         return (-most_recent, repo_key)
 
     for repo_key in sorted(groups.keys(), key=repo_sort_key):

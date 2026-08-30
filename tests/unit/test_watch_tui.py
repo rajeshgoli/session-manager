@@ -1123,6 +1123,44 @@ def test_build_restore_rows_orders_repositories_by_most_recent_use():
     assert selectable == ["recent", "old"]
 
 
+def test_restore_repo_recency_includes_cross_repo_descendants():
+    old_parent = _session(
+        "parent",
+        "old-parent",
+        "/tmp/aaa-parent",
+        status="stopped",
+        stopped_at="2026-02-21T20:00:00",
+    )
+    old_parent["last_activity"] = "2026-02-21T20:00:00"
+    recent_child = _session(
+        "child",
+        "recent-child",
+        "/tmp/ccc-child",
+        parent_session_id="parent",
+        status="stopped",
+        stopped_at="2026-02-21T23:00:00",
+    )
+    recent_child["last_activity"] = "2026-02-21T23:00:00"
+    middle_root = _session(
+        "middle",
+        "middle-root",
+        "/tmp/bbb-middle",
+        status="stopped",
+        stopped_at="2026-02-21T22:00:00",
+    )
+    middle_root["last_activity"] = "2026-02-21T22:00:00"
+
+    rows, selectable, _ = build_restore_rows(
+        [old_parent, recent_child, middle_root]
+    )
+
+    repo_rows = [row.text for row in rows if row.kind == "repo"]
+    assert repo_rows[0].startswith("aaa-parent/")
+    assert repo_rows[1].startswith("bbb-middle/")
+    assert all(not row.startswith("ccc-child/") for row in repo_rows)
+    assert selectable == ["parent", "child", "middle"]
+
+
 def test_build_restore_rows_collapsed_session_hides_children_when_default_expanded():
     sessions = [
         _session("p1", "parent", "/tmp/repo", status="stopped"),
