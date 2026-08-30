@@ -9670,17 +9670,11 @@ fn codex_fork_restore_status_confirms_root(
 
     let payload = codex_fork_payload(event);
     let identities = [
-        payload.and_then(|payload| {
-            payload
-                .get("threadId")
-                .or_else(|| payload.get("thread_id"))
-                .and_then(non_unknown_json_text)
-        }),
+        payload.and_then(|payload| payload.get("threadId").and_then(non_unknown_json_text)),
+        payload.and_then(|payload| payload.get("thread_id").and_then(non_unknown_json_text)),
         payload.and_then(|payload| payload.get("session_id").and_then(non_unknown_json_text)),
-        event
-            .get("threadId")
-            .or_else(|| event.get("thread_id"))
-            .and_then(non_unknown_json_text),
+        event.get("threadId").and_then(non_unknown_json_text),
+        event.get("thread_id").and_then(non_unknown_json_text),
         event.get("session_id").and_then(non_unknown_json_text),
     ];
     let mut observed_identity = false;
@@ -21443,6 +21437,27 @@ sleep 30
                     "session_id": "child-thread",
                     "event_type": "thread/status/changed",
                     "payload": {"threadId": "durable-root", "status": {"type": "idle"}}
+                }),
+            ),
+            (
+                "conflicting-payload-aliases",
+                json!({
+                    "session_id": "durable-root",
+                    "event_type": "thread/status/changed",
+                    "payload": {
+                        "threadId": "durable-root",
+                        "thread_id": "child-thread",
+                        "status": {"type": "idle"}
+                    }
+                }),
+            ),
+            (
+                "conflicting-envelope-aliases",
+                json!({
+                    "threadId": "durable-root",
+                    "thread_id": "child-thread",
+                    "event_type": "thread/status/changed",
+                    "payload": {"status": {"type": "idle"}}
                 }),
             ),
             (
