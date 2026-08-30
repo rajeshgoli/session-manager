@@ -1138,11 +1138,7 @@ def _compute_column_widths(
     used = sum(widths.values()) + sep_total
     if used <= content_width:
         if "Session" in widths:
-            extra = content_width - used
-            session_cap = caps.get("Session")
-            if session_cap is not None:
-                extra = min(extra, max(0, session_cap - widths["Session"]))
-            widths["Session"] += extra
+            widths["Session"] += content_width - used
         return widths
 
     deficit = used - content_width

@@ -581,7 +581,7 @@ def test_restore_column_widths_keep_ids_and_providers_readable_with_long_names()
     session_row = next(row for row in rows if row.kind == "session")
 
     widths = _compute_column_widths(
-        120,
+        105,
         rows,
         watch_tui._RESTORE_COLUMN_SPECS,
         watch_tui._RESTORE_COLUMN_FLOORS,
@@ -594,6 +594,36 @@ def test_restore_column_widths_keep_ids_and_providers_readable_with_long_names()
     assert widths["Provider"] == 10
     assert "88eaba6e" in rendered
     assert "codex-fork" in rendered
+
+
+def test_restore_column_widths_give_spare_width_back_to_session_names():
+    friendly_name = "an-unusually-long-session-name-that-fits-on-a-wide-terminal"
+    rows, _, _ = build_restore_rows(
+        [
+            _session(
+                "88eaba6e",
+                "codex-fork-88eaba6e",
+                "/tmp/repo",
+                friendly_name=friendly_name,
+                provider="codex-fork",
+                status="stopped",
+                stopped_at="2026-02-21T23:00:00",
+            )
+        ]
+    )
+    session_row = next(row for row in rows if row.kind == "session")
+
+    widths = _compute_column_widths(
+        200,
+        rows,
+        watch_tui._RESTORE_COLUMN_SPECS,
+        watch_tui._RESTORE_COLUMN_FLOORS,
+        watch_tui._RESTORE_DYNAMIC_COLUMN_CAPS,
+    )
+    rendered = _session_line(session_row, widths, watch_tui._RESTORE_COLUMN_SPECS)
+
+    assert widths["Session"] >= len(session_row.columns["Session"])
+    assert friendly_name in rendered
 
 
 def test_render_columns_uses_full_visible_width_except_reserved_footer_cell():
