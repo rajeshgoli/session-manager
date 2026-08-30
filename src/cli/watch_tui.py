@@ -75,18 +75,18 @@ _RESTORE_COLUMN_SPECS = [
     ("Restore", 10, 1, "left"),
 ]
 _RESTORE_COLUMN_FLOORS = {
-    "Session": 8,
+    "Session": 5,
     # IDs and providers are operational identifiers, not decorative metadata.
     # Keep them readable when one unusually long session name pressures the
     # table width.
     "ID": 8,
-    "Parent": 8,
-    "Role": 4,
-    "Node": 4,
+    "Parent": 4,
+    "Role": 3,
+    "Node": 3,
     "Provider": 10,
-    "Repo": 6,
-    "Last Active": 5,
-    "Retired": 5,
+    "Repo": 4,
+    "Last Active": 4,
+    "Retired": 4,
     "Restore": 5,
 }
 _RESTORE_DYNAMIC_COLUMN_CAPS = {

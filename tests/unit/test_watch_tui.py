@@ -596,6 +596,44 @@ def test_restore_column_widths_keep_ids_and_providers_readable_with_long_names()
     assert "codex-fork" in rendered
 
 
+def test_restore_column_widths_fit_narrow_terminals_without_right_edge_clipping():
+    rows, _, _ = build_restore_rows(
+        [
+            _session(
+                "88eaba6e",
+                "codex-fork-88eaba6e",
+                "/tmp/a-long-repository-name",
+                friendly_name="an-unusually-long-session-name-that-pressures-the-table",
+                provider="codex-fork",
+                status="stopped",
+                stopped_at="2026-02-21T23:00:00",
+            )
+        ]
+    )
+
+    for content_width in (78, 68):
+        widths = _compute_column_widths(
+            content_width,
+            rows,
+            watch_tui._RESTORE_COLUMN_SPECS,
+            watch_tui._RESTORE_COLUMN_FLOORS,
+            watch_tui._RESTORE_DYNAMIC_COLUMN_CAPS,
+        )
+        rendered = _session_line(
+            next(row for row in rows if row.kind == "session"),
+            widths,
+            watch_tui._RESTORE_COLUMN_SPECS,
+        )
+
+        assert len(rendered) <= content_width
+        assert widths["ID"] == 8
+        assert widths["Provider"] == 10
+        assert widths["Restore"] == 5
+        assert "88eaba6e" in rendered
+        assert "codex-fork" in rendered
+        assert rendered.endswith("ready")
+
+
 def test_restore_column_widths_give_spare_width_back_to_session_names():
     friendly_name = "an-unusually-long-session-name-that-fits-on-a-wide-terminal"
     rows, _, _ = build_restore_rows(
