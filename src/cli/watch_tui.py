@@ -75,18 +75,24 @@ _RESTORE_COLUMN_SPECS = [
     ("Restore", 10, 1, "left"),
 ]
 _RESTORE_COLUMN_FLOORS = {
-    "Session": 8,
-    "ID": 4,
-    "Parent": 8,
-    "Role": 4,
-    "Node": 4,
-    "Provider": 6,
-    "Repo": 6,
-    "Last Active": 5,
-    "Retired": 5,
+    "Session": 5,
+    # IDs and providers are operational identifiers, not decorative metadata.
+    # Keep them readable when one unusually long session name pressures the
+    # table width.
+    "ID": 8,
+    "Parent": 4,
+    "Role": 3,
+    "Node": 3,
+    "Provider": 10,
+    "Repo": 4,
+    "Last Active": 4,
+    "Retired": 4,
     "Restore": 5,
 }
 _RESTORE_DYNAMIC_COLUMN_CAPS = {
+    # A single long friendly name must not consume the space needed by the
+    # fixed-width ID and Provider columns.
+    "Session": 32,
     "ID": 8,
     "Parent": 36,
     "Role": 16,
@@ -936,7 +942,29 @@ def build_restore_rows(
         for idx, child in enumerate(children):
             render_session(child, ancestors_last + [is_last], idx == len(children) - 1)
 
-    for repo_key in sorted(groups.keys()):
+    def repo_sort_key(repo_key: str) -> tuple[float, str]:
+        """Sort emitted repository trees by most-recent use, then stable path."""
+        most_recent = float("-inf")
+        pending = list(roots_by_repo.get(repo_key, []))
+        visited: set[str] = set()
+        while pending:
+            session = pending.pop()
+            session_id = session.get("id")
+            if not session_id or session_id in visited:
+                continue
+            visited.add(session_id)
+            most_recent = max(
+                most_recent,
+                _timestamp_sort_value(
+                    session.get("last_activity")
+                    or session.get("stopped_at")
+                    or session.get("completed_at")
+                ),
+            )
+            pending.extend(children_by_parent.get(session_id, []))
+        return (-most_recent, repo_key)
+
+    for repo_key in sorted(groups.keys(), key=repo_sort_key):
         top_level_roots = roots_by_repo.get(repo_key, [])
         if not top_level_roots:
             continue
