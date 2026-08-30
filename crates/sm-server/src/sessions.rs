@@ -9291,6 +9291,14 @@ where
                     }
                     accepted = true;
                 }
+                // Resuming an existing app-server thread does not necessarily
+                // emit a fresh `thread_started` event. Current Codex builds do
+                // emit an initial status snapshot scoped to the resumed thread,
+                // which is equally strong identity evidence when every identity
+                // field on the event matches the durable root we requested.
+                if codex_fork_restore_status_confirms_root(event, expected_provider_resume_id) {
+                    accepted = true;
+                }
             }
         }
         if accepted {
@@ -9640,6 +9648,49 @@ fn codex_fork_event_thread_id(event: &Map<String, Value>) -> Option<String> {
                 .and_then(non_unknown_json_text)
         })
         .or_else(|| event.get("session_id").and_then(non_unknown_json_text))
+}
+
+/// Return true only for a recognized thread status snapshot whose explicit
+/// identity fields all agree with the durable root requested by restore.
+///
+/// Status events also arrive for subagents, so an unrelated identity is
+/// ignored rather than treated as a replacement root. Conflicting envelope
+/// and payload identities are never accepted.
+fn codex_fork_restore_status_confirms_root(
+    event: &Map<String, Value>,
+    expected_provider_resume_id: &str,
+) -> bool {
+    let event_type = codex_fork_event_type(event)
+        .map(|value| normalize_codex_fork_event_type(&value.replace('/', "_")));
+    if event_type.as_deref() != Some("thread_status_changed")
+        || codex_fork_thread_status(event).is_none()
+    {
+        return false;
+    }
+
+    let payload = codex_fork_payload(event);
+    let identities = [
+        payload.and_then(|payload| {
+            payload
+                .get("threadId")
+                .or_else(|| payload.get("thread_id"))
+                .and_then(non_unknown_json_text)
+        }),
+        payload.and_then(|payload| payload.get("session_id").and_then(non_unknown_json_text)),
+        event
+            .get("threadId")
+            .or_else(|| event.get("thread_id"))
+            .and_then(non_unknown_json_text),
+        event.get("session_id").and_then(non_unknown_json_text),
+    ];
+    let mut observed_identity = false;
+    for identity in identities.into_iter().flatten() {
+        observed_identity = true;
+        if identity != expected_provider_resume_id {
+            return false;
+        }
+    }
+    observed_identity
 }
 
 struct CodexContextUsage {
@@ -21348,6 +21399,77 @@ sleep 30
         .unwrap();
 
         let _ = fs::remove_file(event_stream_path);
+    }
+
+    #[test]
+    fn codex_fork_restore_root_acceptance_accepts_resumed_thread_status_snapshot() {
+        let event_stream_path = unique_temp_path("codex-restore-root-status-snapshot");
+        fs::write(
+            &event_stream_path,
+            concat!(
+                "{\"schema_version\":2,\"session_id\":\"durable-root\",\"event_type\":\"thread/status/changed\",\"payload\":{\"threadId\":\"durable-root\",\"status\":{\"type\":\"idle\"}}}\n",
+                "{\"event_type\":\"shutdown_complete\",\"payload\":{}}\n"
+            ),
+        )
+        .unwrap();
+
+        wait_for_codex_fork_restore_root_acceptance(
+            &event_stream_path,
+            0,
+            "durable-root",
+            Duration::ZERO,
+            || Ok(true),
+            || Ok(false),
+        )
+        .unwrap();
+
+        let _ = fs::remove_file(event_stream_path);
+    }
+
+    #[test]
+    fn codex_fork_restore_status_evidence_requires_known_status_and_consistent_identity() {
+        for (label, event) in [
+            (
+                "subagent",
+                json!({
+                    "session_id": "child-thread",
+                    "event_type": "thread/status/changed",
+                    "payload": {"threadId": "child-thread", "status": {"type": "idle"}}
+                }),
+            ),
+            (
+                "conflicting-envelope",
+                json!({
+                    "session_id": "child-thread",
+                    "event_type": "thread/status/changed",
+                    "payload": {"threadId": "durable-root", "status": {"type": "idle"}}
+                }),
+            ),
+            (
+                "unknown-status",
+                json!({
+                    "session_id": "durable-root",
+                    "event_type": "thread/status/changed",
+                    "payload": {"threadId": "durable-root", "status": {"type": "loading"}}
+                }),
+            ),
+            (
+                "wrong-event",
+                json!({
+                    "session_id": "durable-root",
+                    "event_type": "thread/tokenUsage/updated",
+                    "payload": {"threadId": "durable-root", "status": {"type": "idle"}}
+                }),
+            ),
+        ] {
+            assert!(
+                !codex_fork_restore_status_confirms_root(
+                    event.as_object().unwrap(),
+                    "durable-root"
+                ),
+                "{label} must not prove restore acceptance"
+            );
+        }
     }
 
     #[test]
