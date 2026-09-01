@@ -3622,7 +3622,7 @@ async fn codex_review_request_ttl_bounds_an_oversized_poll_interval() {
         .to_string(),
     )
     .unwrap();
-    create_active_codex_review_request_fixture_db(&queue_db, "bounded-expiry", "notify1", 7200);
+    create_active_codex_review_request_fixture_db(&queue_db, "bounded-expiry", "notify1", i64::MAX);
     Connection::open(&queue_db)
         .unwrap()
         .execute(
@@ -3660,7 +3660,7 @@ async fn codex_review_request_ttl_bounds_an_oversized_poll_interval() {
     }
     assert!(
         expired,
-        "one-hour TTL must preempt a two-hour GitHub poll interval"
+        "one-hour TTL must safely preempt an extreme legacy GitHub poll interval"
     );
 }
 
@@ -3926,6 +3926,24 @@ async fn codex_review_request_create_preserves_validation_errors_and_write_gate(
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(payload["detail"], "poll_interval_seconds must be > 0");
+    assert!(poster.calls().is_empty());
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/codex-review-requests",
+        json!({
+            "pr_number": 967,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "notify1",
+            "poll_interval_seconds": i64::MAX
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        payload["detail"],
+        "poll_interval_seconds must be <= the 3600 second review TTL"
+    );
     assert!(poster.calls().is_empty());
 
     let (status, payload) = post_json(

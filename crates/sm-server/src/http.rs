@@ -4830,6 +4830,15 @@ fn validate_codex_review_create_payload(
             detail: "poll_interval_seconds must be > 0".to_owned(),
         });
     }
+    if payload.poll_interval_seconds > CODEX_REVIEW_REQUEST_TTL_SECONDS {
+        return Err(ApiError::Status {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail: format!(
+                "poll_interval_seconds must be <= the {} second review TTL",
+                CODEX_REVIEW_REQUEST_TTL_SECONDS
+            ),
+        });
+    }
     if payload.retry_interval_seconds <= 0 {
         return Err(ApiError::Status {
             status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -5005,8 +5014,16 @@ async fn wait_for_codex_review_poll_or_terminal(
     request_id: &str,
     registration: &CodexReviewRequestRegistration,
 ) -> Result<Option<CodexReviewRequestRegistration>, String> {
-    let poll_deadline =
-        Instant::now() + Duration::from_secs(registration.poll_interval_seconds.max(1) as u64);
+    // Old rows can contain intervals larger than the current API accepts. Cap
+    // deadline arithmetic by the fixed TTL so recovery cannot overflow and a
+    // legacy interval can never outlive the request.
+    let poll_wait = std::cmp::min(
+        Duration::from_secs(registration.poll_interval_seconds.max(1) as u64),
+        codex_review_request_ttl_remaining(registration),
+    );
+    let poll_deadline = Instant::now()
+        .checked_add(poll_wait)
+        .ok_or_else(|| "Codex review poll deadline overflowed after TTL bounding".to_owned())?;
     loop {
         let until_poll = poll_deadline.saturating_duration_since(Instant::now());
         let sleep_for = std::cmp::min(
