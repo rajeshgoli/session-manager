@@ -26,7 +26,10 @@ use sm_server::{
         ProviderLaunchConfig, QueueRunnerConfig, QueueRunnerTypeConfig, RustCoreConfig,
         SmSendConfig, ToolLoggingConfig, UsageAccountConfig,
     },
-    http::{router, AppState, GitHubReviewComment, GitHubReviewMatch, GitHubReviewPoster},
+    http::{
+        router, AppState, GitHubPullRequestState, GitHubReviewComment, GitHubReviewMatch,
+        GitHubReviewPoster,
+    },
     runtime::TmuxRuntime,
     sessions::{SendCoreInputRequest, SessionStore},
     usage_burn::{BurnWindowSample, UsageBurnStore},
@@ -231,6 +234,7 @@ struct StubGitHubReviewPoster {
     calls: Arc<Mutex<Vec<(String, i64, Option<String>)>>>,
     fresh_reviews: Arc<Mutex<VecDeque<GitHubReviewMatch>>>,
     current_head_sha: Arc<Mutex<String>>,
+    closed_pr_state: Arc<Mutex<Option<String>>>,
     head_after_post: Arc<Mutex<Option<String>>>,
 }
 
@@ -243,13 +247,14 @@ impl StubGitHubReviewPoster {
                     "https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701290334"
                         .to_owned(),
                 ),
-                posted_at: "2026-06-14T02:30:00Z".to_owned(),
+                posted_at: test_now_rfc3339(),
             }))),
             calls: Arc::new(Mutex::new(Vec::new())),
             fresh_reviews: Arc::new(Mutex::new(VecDeque::new())),
             current_head_sha: Arc::new(Mutex::new(
                 "1111111111111111111111111111111111111111".to_owned(),
             )),
+            closed_pr_state: Arc::new(Mutex::new(None)),
             head_after_post: Arc::new(Mutex::new(None)),
         }
     }
@@ -262,6 +267,7 @@ impl StubGitHubReviewPoster {
             current_head_sha: Arc::new(Mutex::new(
                 "1111111111111111111111111111111111111111".to_owned(),
             )),
+            closed_pr_state: Arc::new(Mutex::new(None)),
             head_after_post: Arc::new(Mutex::new(None)),
         }
     }
@@ -282,6 +288,10 @@ impl StubGitHubReviewPoster {
 
     fn set_current_head(&self, head_sha: &str) {
         *self.current_head_sha.lock().unwrap() = head_sha.to_owned();
+    }
+
+    fn set_closed_pr_state(&self, state: &str) {
+        *self.closed_pr_state.lock().unwrap() = Some(state.to_owned());
     }
 
     fn set_head_after_post(&self, head_sha: &str) {
@@ -312,6 +322,19 @@ impl GitHubReviewPoster for StubGitHubReviewPoster {
 
     fn current_open_pr_head(&self, _repo: &str, _pr_number: i64) -> Result<String, String> {
         Ok(self.current_head_sha.lock().unwrap().clone())
+    }
+
+    fn current_pr_state(
+        &self,
+        _repo: &str,
+        _pr_number: i64,
+    ) -> Result<GitHubPullRequestState, String> {
+        if let Some(state) = self.closed_pr_state.lock().unwrap().clone() {
+            return Ok(GitHubPullRequestState::Closed { state });
+        }
+        Ok(GitHubPullRequestState::Open {
+            head_sha: self.current_head_sha.lock().unwrap().clone(),
+        })
     }
 
     fn find_fresh_codex_review_or_comment(
@@ -2473,6 +2496,8 @@ async fn codex_review_request_create_posts_and_persists_active_row() {
     assert_eq!(payload["attempt_count"], 1);
     assert_eq!(payload["poll_interval_seconds"], 45);
     assert_eq!(payload["retry_interval_seconds"], 900);
+    assert_eq!(payload["ttl_seconds"], 3600);
+    assert!(payload["expires_at"].as_str().is_some());
     assert_eq!(
         payload["requested_head_sha"],
         "1111111111111111111111111111111111111111"
@@ -2519,7 +2544,7 @@ async fn codex_review_request_create_posts_and_persists_active_row() {
     );
     assert_eq!(row.3, 1);
     assert_eq!(row.4, "active");
-    assert_eq!(row.5, "2026-06-14T02:45:00Z");
+    assert!(row.5 > test_now_rfc3339());
     assert_eq!(row.6, 1);
 
     let (status, payload) = get_json(app, &format!("/codex-review-requests/{request_id}")).await;
@@ -2630,7 +2655,7 @@ async fn pr_review_route_posts_comment_and_returns_python_shape() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["repo"], "rajeshgoli/session-manager");
     assert_eq!(payload["pr_number"], 967);
-    assert_eq!(payload["posted_at"], "2026-06-14T02:30:00Z");
+    assert!(payload["posted_at"].as_str().is_some());
     assert_eq!(payload["comment_id"], 4701290334_i64);
     assert_eq!(payload["comment_body"], "@codex review for focus create");
     assert_eq!(payload["status"], "posted");
@@ -2930,6 +2955,44 @@ async fn codex_review_request_watcher_completes_and_queues_wake() {
 }
 
 #[tokio::test]
+async fn codex_review_request_create_rejects_stopped_notify_session() {
+    let state_file = write_session_fixture();
+    let mut state_payload: Value = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+    state_payload["sessions"][0]["status"] = json!("stopped");
+    fs::write(&state_file, state_payload.to_string()).unwrap();
+    let queue_db = state_file.with_extension("codex-review-stopped-create.db");
+    let poster = StubGitHubReviewPoster::successful();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 971,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "run12345"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        payload["detail"],
+        "Cannot watch a Codex review for a stopped notify session"
+    );
+    assert!(poster.calls().is_empty());
+}
+
+#[tokio::test]
 async fn codex_review_request_watcher_stops_before_retry_when_head_changes() {
     let state_file = write_session_fixture();
     let queue_db = state_file.with_extension("codex-review-stale-before-retry.db");
@@ -3002,6 +3065,123 @@ async fn codex_review_request_watcher_stops_before_retry_when_head_changes() {
     assert!(messages[0].contains(&request_id));
     assert!(messages[0].contains("PR head changed"));
     assert!(messages[0].contains("Request a new review"));
+}
+
+#[tokio::test]
+async fn codex_review_request_watcher_terminates_when_pr_closes() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("codex-review-pr-closed.db");
+    let poster = StubGitHubReviewPoster::successful();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 971,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "run12345",
+            "poll_interval_seconds": 1,
+            "retry_interval_seconds": 1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let request_id = payload["id"].as_str().unwrap().to_owned();
+    poster.set_closed_pr_state("MERGED");
+
+    let mut row = None;
+    for _ in 0..30 {
+        let current: (String, i64, Option<String>, Option<String>) = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state, is_active, next_retry_at, last_error FROM codex_review_request_registrations WHERE id = ?1",
+                [&request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        if current.0 == "pr_closed" {
+            row = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let row = row.expect("merged PR should terminate its review watcher");
+    assert_eq!(row.1, 0);
+    assert!(row.2.is_none());
+    assert!(row
+        .3
+        .is_some_and(|reason| reason.contains("PR #971 is MERGED, not OPEN")));
+    assert_eq!(poster.calls().len(), 1, "closed PR must not be re-pinged");
+}
+
+#[tokio::test]
+async fn codex_review_request_watcher_terminates_when_notify_session_stops() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("codex-review-notify-stops.db");
+    let poster = StubGitHubReviewPoster::successful();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster)));
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 971,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "run12345",
+            "poll_interval_seconds": 1,
+            "retry_interval_seconds": 900
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let request_id = payload["id"].as_str().unwrap().to_owned();
+
+    let mut state_payload: Value = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+    state_payload["sessions"][0]["status"] = json!("stopped");
+    fs::write(&state_file, state_payload.to_string()).unwrap();
+
+    let mut row = None;
+    for _ in 0..30 {
+        let current: (String, i64, Option<String>) = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state, is_active, last_error FROM codex_review_request_registrations WHERE id = ?1",
+                [&request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        if current.0 == "notify_inactive" {
+            row = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let row = row.expect("stopped notify session should terminate its review watcher");
+    assert_eq!(row.1, 0);
+    assert!(row
+        .2
+        .is_some_and(|reason| reason.contains("no longer exists or is stopped")));
 }
 
 #[tokio::test]
@@ -3297,7 +3477,7 @@ async fn codex_review_request_recovery_backfills_missing_head_before_matching_re
 }
 
 #[tokio::test]
-async fn codex_review_request_recovery_keeps_missing_notify_session_active() {
+async fn codex_review_request_recovery_terminates_missing_notify_session() {
     let state_file = unique_temp_path();
     let queue_db = state_file.with_extension("codex-review-recover-missing-notify.db");
     fs::write(&state_file, json!({ "sessions": [] }).to_string()).unwrap();
@@ -3326,9 +3506,162 @@ async fn codex_review_request_recovery_keeps_missing_notify_session_active() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(row.0, "active");
-    assert_eq!(row.1, 1);
-    assert_eq!(row.2.as_deref(), Some("Notify session no longer exists"));
+    assert_eq!(row.0, "notify_inactive");
+    assert_eq!(row.1, 0);
+    assert!(row
+        .2
+        .as_deref()
+        .is_some_and(|reason| reason.contains("no longer exists or is stopped")));
+}
+
+#[tokio::test]
+async fn codex_review_request_recovery_terminates_stopped_notify_session() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-recover-stopped-notify.db");
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [{
+                "id": "notify-stopped", "name": "notify-stopped", "working_dir": "/repo/notify",
+                "tmux_session": "notify-stopped", "log_file": "/tmp/notify-stopped.log",
+                "status": "stopped", "created_at": "2026-06-01T00:00:00Z",
+                "last_activity": "2026-06-01T00:01:00Z"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    create_active_codex_review_request_fixture_db(&queue_db, "stopped-notify", "notify-stopped", 1);
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.runtime_enabled = true;
+    let _app = router(AppState::new(config));
+
+    let row: (String, i64) = Connection::open(&queue_db)
+        .unwrap()
+        .query_row(
+            "SELECT state, is_active FROM codex_review_request_registrations WHERE id = 'stopped-notify'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(row, ("notify_inactive".to_owned(), 0));
+}
+
+#[tokio::test]
+async fn codex_review_request_recovery_expires_request_after_one_hour() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-recover-expired.db");
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [{
+                "id": "notify1", "name": "notify1", "working_dir": "/repo/notify",
+                "tmux_session": "notify1", "log_file": "/tmp/notify1.log", "status": "running",
+                "created_at": "2026-06-01T00:00:00Z", "last_activity": "2026-06-01T00:01:00Z"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    create_active_codex_review_request_fixture_db(&queue_db, "expired-review", "notify1", 1);
+    Connection::open(&queue_db)
+        .unwrap()
+        .execute(
+            "UPDATE codex_review_request_registrations SET requested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-61 minutes') WHERE id = 'expired-review'",
+            [],
+        )
+        .unwrap();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.runtime_enabled = true;
+    let _app = router(AppState::new(config));
+
+    let row: (String, i64, Option<String>) = Connection::open(&queue_db)
+        .unwrap()
+        .query_row(
+            "SELECT state, is_active, last_error FROM codex_review_request_registrations WHERE id = 'expired-review'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, "expired");
+    assert_eq!(row.1, 0);
+    assert!(row
+        .2
+        .is_some_and(|reason| reason.contains("3600 second TTL")));
+}
+
+#[tokio::test]
+async fn codex_review_request_ttl_bounds_an_oversized_poll_interval() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-bounded-ttl.db");
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [{
+                "id": "notify1", "name": "notify1", "working_dir": "/repo/notify",
+                "tmux_session": "notify1", "log_file": "/tmp/notify1.log", "status": "running",
+                "created_at": "2026-06-01T00:00:00Z", "last_activity": "2026-06-01T00:01:00Z"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    create_active_codex_review_request_fixture_db(&queue_db, "bounded-expiry", "notify1", i64::MAX);
+    Connection::open(&queue_db)
+        .unwrap()
+        .execute(
+            "UPDATE codex_review_request_registrations SET requested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3599 seconds') WHERE id = 'bounded-expiry'",
+            [],
+        )
+        .unwrap();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.runtime_enabled = true;
+    let _app = router(AppState::new(config));
+
+    let mut expired = false;
+    for _ in 0..30 {
+        let row: (String, i64) = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state, is_active FROM codex_review_request_registrations WHERE id = 'bounded-expiry'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        if row == ("expired".to_owned(), 0) {
+            expired = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        expired,
+        "one-hour TTL must safely preempt an extreme legacy GitHub poll interval"
+    );
 }
 
 #[tokio::test]
@@ -3593,6 +3926,24 @@ async fn codex_review_request_create_preserves_validation_errors_and_write_gate(
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(payload["detail"], "poll_interval_seconds must be > 0");
+    assert!(poster.calls().is_empty());
+
+    let (status, payload) = post_json(
+        app.clone(),
+        "/codex-review-requests",
+        json!({
+            "pr_number": 967,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "notify1",
+            "poll_interval_seconds": i64::MAX
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        payload["detail"],
+        "poll_interval_seconds must be <= the 3600 second review TTL"
+    );
     assert!(poster.calls().is_empty());
 
     let (status, payload) = post_json(
@@ -20003,9 +20354,10 @@ fn create_active_codex_review_request_fixture_db(
              review_url, last_polled_at, last_error, state, is_active)
         VALUES
             (?1, 'rajeshgoli/session-manager', 971, 'requester1', ?2, 'recover watchers', '1111111111111111111111111111111111111111',
-             '2026-06-14T02:30:00Z', 4701290334,
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 4701290334,
              'https://github.com/rajeshgoli/session-manager/pull/971#issuecomment-4701290334',
-             '2026-06-14T02:30:00Z', 1, '2026-06-14T02:45:00Z',
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 1,
+             strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+15 minutes'),
              ?3, 600, NULL,
              NULL, NULL, NULL, NULL,
              NULL, NULL, NULL, 'active', 1)
