@@ -455,6 +455,38 @@ impl RetainedQueueStore {
         Ok(Some(registration))
     }
 
+    pub fn terminate_codex_review_request_in_path(
+        db_path: &Path,
+        request_id: &str,
+        state: &str,
+        terminated_at: &str,
+        reason: &str,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        if !matches!(state, "expired" | "notify_inactive" | "pr_closed") {
+            anyhow::bail!("invalid Codex review request terminal state {state:?}");
+        }
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(db_path)?;
+        let changed = conn.execute(
+            r#"
+            UPDATE codex_review_request_registrations
+            SET is_active = 0,
+                state = ?2,
+                next_retry_at = NULL,
+                last_polled_at = ?3,
+                last_error = ?4
+            WHERE id = ?1 AND is_active = 1
+            "#,
+            params![request_id, state, terminated_at, reason],
+        )?;
+        if changed == 0 {
+            return get_codex_review_request_conn(&conn, request_id);
+        }
+        get_codex_review_request_conn(&conn, request_id)
+    }
+
     pub fn create_codex_review_request_in_path(
         db_path: &Path,
         request: CreateCodexReviewRequest,

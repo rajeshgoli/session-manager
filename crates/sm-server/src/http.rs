@@ -156,6 +156,7 @@ const DEFAULT_QUEUE_LOG_LINES: usize = 200;
 const MAX_QUEUE_LOG_LINES: usize = 10_000;
 const EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS: i64 = 8;
 const SCHEDULED_REMINDER_COMPACTION_WAIT_SECONDS: i64 = 300;
+const CODEX_REVIEW_REQUEST_TTL_SECONDS: i64 = 60 * 60;
 const REQUEST_STATUS_PROMPT: &str = "[sm] user requests status, please update now using sm status";
 const BUG_REPORT_MAX_TEXT_CHARS: usize = 4000;
 const BUG_REPORT_MAX_CLIENT_STATE_CHARS: usize = 100_000;
@@ -300,6 +301,12 @@ pub struct GitHubReviewMatch {
     pub head_sha: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitHubPullRequestState {
+    Open { head_sha: String },
+    Closed { state: String },
+}
+
 pub trait GitHubReviewPoster: Send + Sync {
     fn post_initial_review_request(
         &self,
@@ -314,6 +321,15 @@ pub trait GitHubReviewPoster: Send + Sync {
 
     fn current_open_pr_head(&self, _repo: &str, _pr_number: i64) -> Result<String, String> {
         Err("GitHub review poster cannot resolve the current PR head".to_owned())
+    }
+
+    fn current_pr_state(
+        &self,
+        repo: &str,
+        pr_number: i64,
+    ) -> Result<GitHubPullRequestState, String> {
+        self.current_open_pr_head(repo, pr_number)
+            .map(|head_sha| GitHubPullRequestState::Open { head_sha })
     }
 
     fn find_fresh_codex_review_or_comment(
@@ -357,6 +373,14 @@ impl GitHubReviewPoster for GhCliReviewPoster {
 
     fn current_open_pr_head(&self, repo: &str, pr_number: i64) -> Result<String, String> {
         current_open_pr_head_with_gh(repo, pr_number)
+    }
+
+    fn current_pr_state(
+        &self,
+        repo: &str,
+        pr_number: i64,
+    ) -> Result<GitHubPullRequestState, String> {
+        current_pr_state_with_gh(repo, pr_number)
     }
 
     fn find_fresh_codex_review_or_comment(
@@ -648,7 +672,7 @@ fn gh_command_output(args: &[String], timeout_duration: Duration) -> Result<Outp
     )
 }
 
-fn current_open_pr_head_with_gh(repo: &str, pr_number: i64) -> Result<String, String> {
+fn current_pr_state_with_gh(repo: &str, pr_number: i64) -> Result<GitHubPullRequestState, String> {
     let args = vec![
         "pr".to_owned(),
         "view".to_owned(),
@@ -670,17 +694,26 @@ fn current_open_pr_head_with_gh(repo: &str, pr_number: i64) -> Result<String, St
     }
     let payload: GhPrViewPayload = serde_json::from_slice(&output.stdout)
         .map_err(|error| format!("gh pr view returned invalid JSON: {error}"))?;
-    if payload.state.as_deref() != Some("OPEN") {
-        return Err(format!(
-            "PR #{} is {}, not OPEN",
-            pr_number,
-            payload.state.as_deref().unwrap_or("unknown")
-        ));
+    let state = payload.state.as_deref().unwrap_or("unknown");
+    if state != "OPEN" {
+        return Ok(GitHubPullRequestState::Closed {
+            state: state.to_owned(),
+        });
     }
-    payload
+    let head_sha = payload
         .head_ref_oid
         .filter(|head| !head.trim().is_empty())
-        .ok_or_else(|| format!("PR #{} in {} has no head commit", pr_number, repo))
+        .ok_or_else(|| format!("PR #{} in {} has no head commit", pr_number, repo))?;
+    Ok(GitHubPullRequestState::Open { head_sha })
+}
+
+fn current_open_pr_head_with_gh(repo: &str, pr_number: i64) -> Result<String, String> {
+    match current_pr_state_with_gh(repo, pr_number)? {
+        GitHubPullRequestState::Open { head_sha } => Ok(head_sha),
+        GitHubPullRequestState::Closed { state } => {
+            Err(format!("PR #{} is {}, not OPEN", pr_number, state))
+        }
+    }
 }
 
 fn validate_open_pr_with_gh(repo: &str, pr_number: i64) -> Result<(), String> {
@@ -4454,6 +4487,12 @@ async fn create_codex_review_request(
     let Some(notify_session) = resolve_session_or_registry_role(&state, notify_identifier)? else {
         return Err(ApiError::NotFound("Notify target not found"));
     };
+    if notify_session.is_stopped() {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Cannot watch a Codex review for a stopped notify session".to_owned(),
+        });
+    }
     if let Some(requester_session_id) = payload
         .requester_session_id
         .as_deref()
@@ -4799,6 +4838,88 @@ fn validate_codex_review_create_payload(
     Ok(())
 }
 
+fn codex_review_request_requested_at(value: &str) -> Option<OffsetDateTime> {
+    parse_github_datetime(value).or_else(|| parse_python_naive_datetime_local(value))
+}
+
+fn codex_review_request_expired(registration: &CodexReviewRequestRegistration) -> bool {
+    codex_review_request_requested_at(&registration.requested_at).is_none_or(|requested_at| {
+        OffsetDateTime::now_utc() - requested_at
+            >= TimeDuration::seconds(CODEX_REVIEW_REQUEST_TTL_SECONDS)
+    })
+}
+
+fn codex_review_request_local_terminal_reason(
+    state: &AppState,
+    registration: &CodexReviewRequestRegistration,
+) -> anyhow::Result<Option<(&'static str, String)>> {
+    if codex_review_request_expired(registration) {
+        return Ok(Some((
+            "expired",
+            format!(
+                "Codex review request exceeded its {} second TTL",
+                CODEX_REVIEW_REQUEST_TTL_SECONDS
+            ),
+        )));
+    }
+    let notify_session = state
+        .session_store
+        .get_session(&registration.notify_session_id)?;
+    if notify_session
+        .as_ref()
+        .is_none_or(SessionRecord::is_stopped)
+    {
+        return Ok(Some((
+            "notify_inactive",
+            format!(
+                "Notify session {} no longer exists or is stopped",
+                registration.notify_session_id
+            ),
+        )));
+    }
+    Ok(None)
+}
+
+fn terminate_codex_review_request_for_local_condition(
+    state: &AppState,
+    queue_db_path: &StdPath,
+    registration: &CodexReviewRequestRegistration,
+) -> Result<bool, String> {
+    let Some((terminal_state, reason)) =
+        codex_review_request_local_terminal_reason(state, registration)
+            .map_err(|error| error.to_string())?
+    else {
+        return Ok(false);
+    };
+    RetainedQueueStore::terminate_codex_review_request_in_path(
+        queue_db_path,
+        &registration.id,
+        terminal_state,
+        &now_rfc3339(),
+        &reason,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+fn terminate_codex_review_request_for_closed_pr(
+    queue_db_path: &StdPath,
+    request_id: &str,
+    pr_number: i64,
+    pr_state: &str,
+    terminated_at: &str,
+) -> Result<(), String> {
+    RetainedQueueStore::terminate_codex_review_request_in_path(
+        queue_db_path,
+        request_id,
+        "pr_closed",
+        terminated_at,
+        &format!("PR #{pr_number} is {pr_state}, not OPEN"),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn recover_codex_review_request_watchers(state: Arc<AppState>) {
     if !state.config.rust_core.runtime_enabled {
         return;
@@ -4813,28 +4934,32 @@ fn recover_codex_review_request_watchers(state: Arc<AppState>) {
     match RetainedQueueStore::list_active_codex_review_requests_from_path(&queue_db_path) {
         Ok(registrations) => {
             for registration in registrations {
-                if state
-                    .session_store
-                    .get_session(&registration.notify_session_id)
-                    .ok()
-                    .flatten()
-                    .is_none()
-                {
-                    if let Err(error) =
-                        RetainedQueueStore::mark_codex_review_request_poll_error_in_path(
-                            &queue_db_path,
-                            &registration.id,
-                            &now_rfc3339(),
-                            "Notify session no longer exists",
-                            None,
-                        )
-                    {
+                match codex_review_request_local_terminal_reason(&state, &registration) {
+                    Ok(Some((terminal_state, reason))) => {
+                        if let Err(error) =
+                            RetainedQueueStore::terminate_codex_review_request_in_path(
+                                &queue_db_path,
+                                &registration.id,
+                                terminal_state,
+                                &now_rfc3339(),
+                                &reason,
+                            )
+                        {
+                            eprintln!(
+                                "Codex review request recovery failed to terminate {}: {error:#}",
+                                registration.id
+                            );
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
                         eprintln!(
-                            "Codex review request recovery failed to mark {} missing notify session: {error:#}",
+                            "Codex review request recovery failed to inspect {}: {error:#}",
                             registration.id
                         );
+                        continue;
                     }
-                    continue;
                 }
                 spawn_codex_review_request_watcher(state.clone(), registration.id);
             }
@@ -4879,6 +5004,13 @@ async fn run_codex_review_request_watcher(
         if !registration.is_active {
             return Ok(());
         }
+        if terminate_codex_review_request_for_local_condition(
+            &state,
+            &queue_db_path,
+            &registration,
+        )? {
+            return Ok(());
+        }
         let poll_seconds = registration.poll_interval_seconds.max(1) as u64;
         tokio::time::sleep(Duration::from_secs(poll_seconds)).await;
         let Some(mut registration) =
@@ -4890,33 +5022,34 @@ async fn run_codex_review_request_watcher(
         if !registration.is_active {
             return Ok(());
         }
-        if state
-            .session_store
-            .get_session(&registration.notify_session_id)
-            .map_err(|error| error.to_string())?
-            .is_none()
-        {
-            let _ = RetainedQueueStore::mark_codex_review_request_poll_error_in_path(
-                &queue_db_path,
-                &request_id,
-                &now_rfc3339(),
-                "Notify session no longer exists",
-                None,
-            )
-            .map_err(|error| error.to_string())?;
+        if terminate_codex_review_request_for_local_condition(
+            &state,
+            &queue_db_path,
+            &registration,
+        )? {
             return Ok(());
         }
 
         let now = now_rfc3339();
         if registration.requested_head_sha.is_none() {
-            let current_head_sha = match github_current_open_pr_head(
+            let current_head_sha = match github_current_pr_state(
                 state.github_review_poster.clone(),
                 &registration.repo,
                 registration.pr_number,
             )
             .await
             {
-                Ok(head_sha) => head_sha,
+                Ok(GitHubPullRequestState::Open { head_sha }) => head_sha,
+                Ok(GitHubPullRequestState::Closed { state: pr_state }) => {
+                    terminate_codex_review_request_for_closed_pr(
+                        &queue_db_path,
+                        &request_id,
+                        registration.pr_number,
+                        &pr_state,
+                        &now,
+                    )?;
+                    return Ok(());
+                }
                 Err(error) => {
                     let next_retry_at = registration
                         .next_retry_at
@@ -5039,14 +5172,24 @@ async fn run_codex_review_request_watcher(
                 .requested_head_sha
                 .as_deref()
                 .ok_or_else(|| "Codex review request has no requested head SHA".to_owned())?;
-            let current_head_sha = match github_current_open_pr_head(
+            let current_head_sha = match github_current_pr_state(
                 state.github_review_poster.clone(),
                 &registration.repo,
                 registration.pr_number,
             )
             .await
             {
-                Ok(head_sha) => head_sha,
+                Ok(GitHubPullRequestState::Open { head_sha }) => head_sha,
+                Ok(GitHubPullRequestState::Closed { state: pr_state }) => {
+                    terminate_codex_review_request_for_closed_pr(
+                        &queue_db_path,
+                        &request_id,
+                        registration.pr_number,
+                        &pr_state,
+                        &now,
+                    )?;
+                    return Ok(());
+                }
                 Err(error) => {
                     let next_retry_at = codex_review_next_retry_at(
                         &now,
@@ -5119,6 +5262,17 @@ async fn github_current_open_pr_head(
     tokio::task::spawn_blocking(move || poster.current_open_pr_head(&repo, pr_number))
         .await
         .map_err(|error| format!("PR head lookup task failed: {error}"))?
+}
+
+async fn github_current_pr_state(
+    poster: Arc<dyn GitHubReviewPoster>,
+    repo: &str,
+    pr_number: i64,
+) -> Result<GitHubPullRequestState, String> {
+    let repo = repo.to_owned();
+    tokio::task::spawn_blocking(move || poster.current_pr_state(&repo, pr_number))
+        .await
+        .map_err(|error| format!("PR state lookup task failed: {error}"))?
 }
 
 async fn github_detect_pickup(
@@ -13849,6 +14003,12 @@ fn codex_review_request_response(
         .get_session(&registration.notify_session_id)?
         .map(session_display_name)
         .unwrap_or_else(|| registration.notify_session_id.clone());
+    let expires_at =
+        codex_review_request_requested_at(&registration.requested_at).and_then(|requested_at| {
+            (requested_at + TimeDuration::seconds(CODEX_REVIEW_REQUEST_TTL_SECONDS))
+                .format(&Rfc3339)
+                .ok()
+        });
     Ok(json!({
         "id": registration.id,
         "repo": registration.repo,
@@ -13862,6 +14022,8 @@ fn codex_review_request_response(
         "superseded_by_request_id": registration.superseded_by_request_id,
         "superseded_at": registration.superseded_at,
         "requested_at": registration.requested_at,
+        "ttl_seconds": CODEX_REVIEW_REQUEST_TTL_SECONDS,
+        "expires_at": expires_at,
         "latest_request_comment_id": registration.latest_request_comment_id,
         "latest_request_comment_url": registration.latest_request_comment_url,
         "latest_request_posted_at": registration.latest_request_posted_at,
