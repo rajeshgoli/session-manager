@@ -157,6 +157,7 @@ const MAX_QUEUE_LOG_LINES: usize = 10_000;
 const EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS: i64 = 8;
 const SCHEDULED_REMINDER_COMPACTION_WAIT_SECONDS: i64 = 300;
 const CODEX_REVIEW_REQUEST_TTL_SECONDS: i64 = 60 * 60;
+const CODEX_REVIEW_LOCAL_RECONCILE_INTERVAL_SECONDS: u64 = 30;
 const REQUEST_STATUS_PROMPT: &str = "[sm] user requests status, please update now using sm status";
 const BUG_REPORT_MAX_TEXT_CHARS: usize = 4000;
 const BUG_REPORT_MAX_CLIENT_STATE_CHARS: usize = 100_000;
@@ -4849,6 +4850,15 @@ fn codex_review_request_expired(registration: &CodexReviewRequestRegistration) -
     })
 }
 
+fn codex_review_request_ttl_remaining(registration: &CodexReviewRequestRegistration) -> Duration {
+    let Some(requested_at) = codex_review_request_requested_at(&registration.requested_at) else {
+        return Duration::ZERO;
+    };
+    let remaining = requested_at + TimeDuration::seconds(CODEX_REVIEW_REQUEST_TTL_SECONDS)
+        - OffsetDateTime::now_utc();
+    Duration::from_millis(remaining.whole_milliseconds().max(0) as u64)
+}
+
 fn codex_review_request_local_terminal_reason(
     state: &AppState,
     registration: &CodexReviewRequestRegistration,
@@ -4989,6 +4999,43 @@ fn spawn_codex_review_request_watcher(state: Arc<AppState>, request_id: String) 
     });
 }
 
+async fn wait_for_codex_review_poll_or_terminal(
+    state: &AppState,
+    queue_db_path: &StdPath,
+    request_id: &str,
+    registration: &CodexReviewRequestRegistration,
+) -> Result<Option<CodexReviewRequestRegistration>, String> {
+    let poll_deadline =
+        Instant::now() + Duration::from_secs(registration.poll_interval_seconds.max(1) as u64);
+    loop {
+        let until_poll = poll_deadline.saturating_duration_since(Instant::now());
+        let sleep_for = std::cmp::min(
+            until_poll,
+            std::cmp::min(
+                Duration::from_secs(CODEX_REVIEW_LOCAL_RECONCILE_INTERVAL_SECONDS),
+                codex_review_request_ttl_remaining(registration),
+            ),
+        );
+        tokio::time::sleep(sleep_for).await;
+
+        let Some(current) =
+            RetainedQueueStore::get_codex_review_request_from_path(queue_db_path, request_id)
+                .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        if !current.is_active {
+            return Ok(None);
+        }
+        if terminate_codex_review_request_for_local_condition(state, queue_db_path, &current)? {
+            return Ok(None);
+        }
+        if Instant::now() >= poll_deadline {
+            return Ok(Some(current));
+        }
+    }
+}
+
 async fn run_codex_review_request_watcher(
     state: Arc<AppState>,
     request_id: String,
@@ -5011,24 +5058,16 @@ async fn run_codex_review_request_watcher(
         )? {
             return Ok(());
         }
-        let poll_seconds = registration.poll_interval_seconds.max(1) as u64;
-        tokio::time::sleep(Duration::from_secs(poll_seconds)).await;
-        let Some(mut registration) =
-            RetainedQueueStore::get_codex_review_request_from_path(&queue_db_path, &request_id)
-                .map_err(|error| error.to_string())?
+        let Some(mut registration) = wait_for_codex_review_poll_or_terminal(
+            &state,
+            &queue_db_path,
+            &request_id,
+            &registration,
+        )
+        .await?
         else {
             return Ok(());
         };
-        if !registration.is_active {
-            return Ok(());
-        }
-        if terminate_codex_review_request_for_local_condition(
-            &state,
-            &queue_db_path,
-            &registration,
-        )? {
-            return Ok(());
-        }
 
         let now = now_rfc3339();
         if registration.requested_head_sha.is_none() {

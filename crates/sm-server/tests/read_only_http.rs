@@ -3607,6 +3607,64 @@ async fn codex_review_request_recovery_expires_request_after_one_hour() {
 }
 
 #[tokio::test]
+async fn codex_review_request_ttl_bounds_an_oversized_poll_interval() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-bounded-ttl.db");
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [{
+                "id": "notify1", "name": "notify1", "working_dir": "/repo/notify",
+                "tmux_session": "notify1", "log_file": "/tmp/notify1.log", "status": "running",
+                "created_at": "2026-06-01T00:00:00Z", "last_activity": "2026-06-01T00:01:00Z"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    create_active_codex_review_request_fixture_db(&queue_db, "bounded-expiry", "notify1", 7200);
+    Connection::open(&queue_db)
+        .unwrap()
+        .execute(
+            "UPDATE codex_review_request_registrations SET requested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3599 seconds') WHERE id = 'bounded-expiry'",
+            [],
+        )
+        .unwrap();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.runtime_enabled = true;
+    let _app = router(AppState::new(config));
+
+    let mut expired = false;
+    for _ in 0..30 {
+        let row: (String, i64) = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state, is_active FROM codex_review_request_registrations WHERE id = 'bounded-expiry'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        if row == ("expired".to_owned(), 0) {
+            expired = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        expired,
+        "one-hour TTL must preempt a two-hour GitHub poll interval"
+    );
+}
+
+#[tokio::test]
 async fn codex_review_request_create_returns_actionable_conflict_for_other_owner() {
     let state_file = unique_temp_path();
     let queue_db = state_file.with_extension("codex-review-create-duplicate.db");
