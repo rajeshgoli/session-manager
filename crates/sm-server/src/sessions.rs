@@ -852,6 +852,13 @@ impl SessionStore {
 
     /// Preserve resumable records after reboot, but stop advertising lost runtimes as live.
     pub fn reconcile_missing_session_runtimes(&self) -> Result<()> {
+        self.reconcile_missing_session_runtimes_at_boot(system_boot_time())
+    }
+
+    fn reconcile_missing_session_runtimes_at_boot(
+        &self,
+        boot_time: Option<OffsetDateTime>,
+    ) -> Result<()> {
         let Some(runtime) = self.delivery_runtime.as_ref() else {
             return Ok(());
         };
@@ -859,7 +866,6 @@ impl SessionStore {
         let mut state = self.load_raw_json_value()?;
         let snapshot = snapshot_from_raw_value(&state)?;
         let mut changed = false;
-        let boot_time = system_boot_time();
         for record in snapshot.sessions {
             if record.is_stopped()
                 || !is_primary_node(&record.node)
@@ -873,7 +879,10 @@ impl SessionStore {
             // socket is missing. Recreate only the neutral server anchor so
             // subsequent restore can obtain authoritative absence checks.
             if session_predates_boot(&record, boot_time) {
-                session_runtime.ensure_server_anchor()?;
+                if let Err(error) = session_runtime.ensure_recovery_server_anchor() {
+                    eprintln!("preserving session {} after inconclusive reboot probe: {error:#}", record.id);
+                    continue;
+                }
             }
             if !matches!(session_runtime.probe_session_for_restore(&record.tmux_session), RestoreTmuxLivenessOutcome::Absent) {
                 continue;
@@ -5672,7 +5681,12 @@ impl SessionStore {
             return Ok(Some(CoreRestoreOutcome::NotStopped));
         }
         if session_predates_boot(&record, system_boot_time()) {
-            runtime.for_socket_name(record.tmux_socket_name.as_deref()).ensure_server_anchor()?;
+            let session_runtime = runtime.for_socket_name(record.tmux_socket_name.as_deref());
+            if record.is_stopped() {
+                session_runtime.ensure_server_anchor()?;
+            } else {
+                session_runtime.ensure_recovery_server_anchor()?;
+            }
         }
         if !record.is_stopped()
             && !matches!(
@@ -17333,6 +17347,49 @@ mod tests {
         sync::{Arc, Barrier},
         time::Duration,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn reboot_reconciliation_handles_cold_default_socket_and_anchor_failures() {
+        for failed_anchor in [false, true] {
+            let root = unique_temp_path("cold-reboot").with_extension("dir");
+            fs::create_dir_all(&root).unwrap();
+            let tmux = root.join("tmux");
+            let marker = root.join("anchor-created");
+            fs::write(&tmux, format!(r#"#!/bin/sh
+case "$*" in
+  *new-session*)
+    if [ '{failed_anchor}' = true ]; then echo 'permission denied' >&2; exit 1; fi
+    touch '{}'; exit 0 ;;
+  *)
+    if [ -f '{}' ]; then echo "can't find session" >&2
+    else echo 'no server running on default' >&2; fi
+    exit 1 ;;
+esac
+"#, marker.display(), marker.display())).unwrap();
+            fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+            let record = json!({"id": "lost", "name": "lost", "provider": "claude",
+                "working_dir": "/repo", "tmux_session": "lost", "provider_resume_id": "saved",
+                "tmux_socket_name": if failed_anchor { Some("named") } else { None },
+                "status": "running", "created_at": "2000-01-01T00:00:00Z",
+                "last_activity": "2000-01-01T00:00:00Z"});
+            let path = root.join("state.json");
+            fs::write(&path, json!({"sessions": [record.clone()]}).to_string()).unwrap();
+            let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
+                .with_tmux_binary_for_test(tmux.display().to_string());
+            let store = SessionStore::new(path).with_delivery_runtime(Some(runtime));
+            store.reconcile_missing_session_runtimes_at_boot(parse_timestamp("2001-01-01T00:00:00Z")).unwrap();
+            let state = store.load_raw_json_value().unwrap();
+            if failed_anchor {
+                assert_eq!(state["sessions"][0], record);
+            } else {
+                assert!(marker.exists());
+                assert_eq!(state["sessions"][0]["status"], "stopped");
+                assert_eq!(state["sessions"][0]["provider_resume_id"], "saved");
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[cfg(unix)]
     #[test]
