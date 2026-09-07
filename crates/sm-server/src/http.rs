@@ -500,6 +500,9 @@ impl AppState {
         session_store
             .reconcile_reparent_requests()
             .context("reparent authority recovery failed")?;
+        session_store
+            .reconcile_missing_session_runtimes()
+            .context("missing session runtime reconciliation failed")?;
         if let Err(error) = session_store.reconcile_reparent_notifications() {
             eprintln!("reparent notification recovery failed: {error:#}");
         }

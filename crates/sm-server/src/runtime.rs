@@ -933,7 +933,7 @@ impl TmuxRuntime {
     /// that command names an agent session, process cleanup can mistake the
     /// server itself for that agent and kill every session on the socket. The
     /// anchor also keeps the server reachable after the last agent exits.
-    fn ensure_server_anchor(&self) -> Result<()> {
+    pub(crate) fn ensure_server_anchor(&self) -> Result<()> {
         if self.socket_name.is_none() {
             return Ok(());
         }
