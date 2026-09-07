@@ -105,6 +105,18 @@ The service runs from an installed copy at `.local/bin/sm-server`, not from
 `target/release/sm-server`, so an ordinary `cargo build` never disturbs the
 running server. See `specs/1134_rust_restart_procedure.md`.
 
+The `sm` CLI is installed the same way, and for the same reason: `cargo clean`
+deletes everything under `target/`, so a CLI that only lives at
+`target/release/sm` vanishes with it. `restart-rust-server.sh` reinstalls it
+after every successful restart; to refresh it on its own:
+
+```bash
+./scripts/install-sm-cli.sh
+```
+
+Keep `.local/bin` ahead of `venv/bin` on `PATH` - otherwise `sm` resolves to
+the legacy Python CLI rather than the Rust one.
+
 ### Testing
 
 ```bash

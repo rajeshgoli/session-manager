@@ -223,18 +223,32 @@ it once with:
 ./scripts/restart-rust-server.sh --adopt --allow-plist-change
 ```
 
-Use the Rust CLI:
+Install the Rust CLI:
 
 ```bash
-target/release/sm status
-target/release/sm spawn claude "say hello and exit" --name hello-agent
-target/release/sm spawn codex --model gpt-5.6-terra --effort high "review this change"
-target/release/sm spawn codex --prompt-file specs/1264_implementation_brief.md --name implementer
-generate-brief | target/release/sm spawn claude --prompt-stdin --name researcher
-target/release/sm all
+./scripts/install-sm-cli.sh
 ```
 
-If `target/release` is on your `PATH`, `sm` resolves to the Rust CLI.
+This installs `sm` to `.local/bin/sm`, beside the installed `sm-server`, and
+`restart-rust-server.sh` refreshes it on every restart. Install it rather than
+running cargo's output directly: `cargo clean` deletes the whole target
+directory, so a `sm` that only exists at `target/release/sm` disappears with
+it - along with every spawned session's ability to run `sm` at all. Nothing in
+a cargo invocation writes `.local/bin`, so the installed copy survives a clean.
+
+Put `.local/bin` on your `PATH` ahead of `venv/bin`, or `sm` resolves to the
+legacy Python CLI:
+
+```bash
+export PATH="/path/to/session-manager/.local/bin:$PATH"
+
+sm status
+sm spawn claude "say hello and exit" --name hello-agent
+sm spawn codex --model gpt-5.6-terra --effort high "review this change"
+sm spawn codex --prompt-file specs/1264_implementation_brief.md --name implementer
+generate-brief | sm spawn claude --prompt-stdin --name researcher
+sm all
+```
 
 ---
 

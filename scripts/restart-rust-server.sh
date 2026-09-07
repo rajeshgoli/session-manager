@@ -736,5 +736,20 @@ else
   echo "no usable before-count; skipping comparison"
 fi
 
+# Only now, with the service verified healthy, refresh the installed `sm` CLI
+# from the same source tree. It is a separate binary that launchd never execs,
+# so nothing here can affect the running server - which is exactly why it is
+# last, and why a failure warns instead of failing the restart: the server is
+# already up, and reporting the whole restart as failed would be a lie.
+step "Refreshing the installed sm CLI"
+if [[ "$SKIP_BUILD" -eq 1 ]]; then
+  echo "skipped (--skip-build): the installed CLI is whatever was there before"
+elif "$REPO_ROOT/scripts/install-sm-cli.sh"; then
+  :
+else
+  echo "WARNING: the sm CLI was not reinstalled; $SM_LABEL itself is healthy." >&2
+  echo "         Re-run scripts/install-sm-cli.sh once the build is fixed." >&2
+fi
+
 step "Done"
 echo "$SM_LABEL is healthy on a freshly built binary (pid $first_pid)."
