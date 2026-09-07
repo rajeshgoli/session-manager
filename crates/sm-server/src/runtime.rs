@@ -933,10 +933,15 @@ impl TmuxRuntime {
     /// that command names an agent session, process cleanup can mistake the
     /// server itself for that agent and kill every session on the socket. The
     /// anchor also keeps the server reachable after the last agent exits.
-    fn ensure_server_anchor(&self) -> Result<()> {
+    pub(crate) fn ensure_server_anchor(&self) -> Result<()> {
         if self.socket_name.is_none() {
             return Ok(());
         }
+        self.ensure_recovery_server_anchor()
+    }
+
+    /// After a proven reboot, prepare even the default socket for an exact probe.
+    pub(crate) fn ensure_recovery_server_anchor(&self) -> Result<()> {
         let exact_anchor = format!("={SERVER_ANCHOR_SESSION}");
         if self
             .tmux_command(["has-session", "-t", exact_anchor.as_str()])

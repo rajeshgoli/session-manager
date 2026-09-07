@@ -850,6 +850,60 @@ impl SessionStore {
         self
     }
 
+    /// Preserve resumable records after reboot, but stop advertising lost runtimes as live.
+    pub fn reconcile_missing_session_runtimes(&self) -> Result<()> {
+        self.reconcile_missing_session_runtimes_at_boot(system_boot_time())
+    }
+
+    fn reconcile_missing_session_runtimes_at_boot(
+        &self,
+        boot_time: Option<OffsetDateTime>,
+    ) -> Result<()> {
+        let Some(runtime) = self.delivery_runtime.as_ref() else {
+            return Ok(());
+        };
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        let snapshot = snapshot_from_raw_value(&state)?;
+        let mut changed = false;
+        for record in snapshot.sessions {
+            if record.is_stopped()
+                || !is_primary_node(&record.node)
+                || !matches!(record.provider.as_str(), "claude" | "codex" | "codex-fork")
+                || record.tmux_session.trim().is_empty()
+            {
+                continue;
+            }
+            let session_runtime = runtime.for_socket_name(record.tmux_socket_name.as_deref());
+            // A reboot proves that the saved process is gone even when tmux's
+            // socket is missing. Recreate only the neutral server anchor so
+            // subsequent restore can obtain authoritative absence checks.
+            if session_predates_boot(&record, boot_time) {
+                if let Err(error) = session_runtime.ensure_recovery_server_anchor() {
+                    eprintln!("preserving session {} after inconclusive reboot probe: {error:#}", record.id);
+                    continue;
+                }
+            }
+            if !matches!(session_runtime.probe_session_for_restore(&record.tmux_session), RestoreTmuxLivenessOutcome::Absent) {
+                continue;
+            }
+            if ensure_session_not_reparent_fenced(&state, &record.id).is_err() {
+                continue;
+            }
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            if let Some(session) = session_object_mut(sessions, &record.id) {
+                session.insert("status".to_owned(), json!("stopped"));
+                session.insert("stopped_at".to_owned(), json!(now_rfc3339()));
+                session.insert("error_message".to_owned(), json!("Session runtime disappeared; use sm restore to resume the saved conversation"));
+                changed = true;
+            }
+        }
+        if changed {
+            self.write_raw_json_value(&state)?;
+        }
+        Ok(())
+    }
+
     pub fn recover_session_runtime_launches(&self) -> Result<()> {
         loop {
             let launch_id = {
@@ -5615,9 +5669,6 @@ impl SessionStore {
         else {
             return Ok(None);
         };
-        if !record.is_stopped() {
-            return Ok(Some(CoreRestoreOutcome::NotStopped));
-        }
         if !is_primary_node(&record.node) {
             return Ok(Some(CoreRestoreOutcome::UnsupportedNode(record.node)));
         }
@@ -5625,6 +5676,26 @@ impl SessionStore {
             return Ok(Some(CoreRestoreOutcome::UnsupportedProvider(
                 record.provider,
             )));
+        }
+        if !record.is_stopped() && session_restore_is_fenced(&state, &record.id) {
+            return Ok(Some(CoreRestoreOutcome::NotStopped));
+        }
+        if session_predates_boot(&record, system_boot_time()) {
+            let session_runtime = runtime.for_socket_name(record.tmux_socket_name.as_deref());
+            if record.is_stopped() {
+                session_runtime.ensure_server_anchor()?;
+            } else {
+                session_runtime.ensure_recovery_server_anchor()?;
+            }
+        }
+        if !record.is_stopped()
+            && !matches!(
+                runtime.for_socket_name(record.tmux_socket_name.as_deref())
+                    .probe_session_for_restore(&record.tmux_session),
+                RestoreTmuxLivenessOutcome::Absent
+            )
+        {
+            return Ok(Some(CoreRestoreOutcome::NotStopped));
         }
         let stored_provider_resume_id = record.provider_resume_id.clone();
         if record.provider == "codex" && provider_resume_id_for_restore(&record).is_none() {
@@ -9460,7 +9531,10 @@ fn extract_codex_fork_thread_started(event: &Map<String, Value>) -> Option<Strin
         .or_else(|| thread_payload.get("thread_source"))
         .and_then(Value::as_str)
         .map(str::trim);
-    if parent_thread_id.is_some() || thread_source == Some("subagent") {
+    if parent_thread_id.is_some()
+        || matches!(thread_source, Some("subagent" | "system"))
+        || thread_payload.get("ephemeral").and_then(Value::as_bool) == Some(true)
+    {
         return None;
     }
     codex_fork_thread_id(thread_payload)
@@ -13636,6 +13710,41 @@ fn session_lifetime_overlaps(
     artifact_end >= seat_start && artifact_start <= seat_end
 }
 
+fn session_restore_is_fenced(state: &Value, session_id: &str) -> bool {
+    state.get("sessions").and_then(Value::as_array)
+        .and_then(|sessions| sessions.iter().find(|session| session["id"] == session_id))
+        .and_then(|session| session["error_message"].as_str())
+        .is_some_and(|error| error.starts_with("codex_fork_restore_teardown_inconclusive:")
+            || error.starts_with("codex_fork_restore_recovery_inconclusive:"))
+}
+
+/// Read the OS boot timestamp. Unknown platforms conservatively require tmux proof.
+fn system_boot_time() -> Option<OffsetDateTime> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/usr/sbin/sysctl").args(["-n", "kern.boottime"]).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(output.stdout).ok()?;
+        let seconds = text.split("sec = ").nth(1)?.split(',').next()?.trim().parse::<i64>().ok()?;
+        OffsetDateTime::from_unix_timestamp(seconds).ok()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string("/proc/stat").ok()?;
+        let seconds = stat.lines().find_map(|line| line.strip_prefix("btime "))?.trim().parse::<i64>().ok()?;
+        OffsetDateTime::from_unix_timestamp(seconds).ok()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    { None }
+}
+
+fn session_predates_boot(record: &SessionRecord, boot_time: Option<OffsetDateTime>) -> bool {
+    boot_time.zip(parse_timestamp(&record.last_activity))
+        .is_some_and(|(boot, activity)| activity < boot)
+}
+
 fn discover_claude_transcript_path(
     record: &SessionRecord,
     sessions: &[SessionRecord],
@@ -17239,6 +17348,107 @@ mod tests {
         time::Duration,
     };
 
+    #[cfg(unix)]
+    #[test]
+    fn reboot_reconciliation_handles_cold_default_socket_and_anchor_failures() {
+        for failed_anchor in [false, true] {
+            let root = unique_temp_path("cold-reboot").with_extension("dir");
+            fs::create_dir_all(&root).unwrap();
+            let tmux = root.join("tmux");
+            let marker = root.join("anchor-created");
+            fs::write(&tmux, format!(r#"#!/bin/sh
+case "$*" in
+  *new-session*)
+    if [ '{failed_anchor}' = true ]; then echo 'permission denied' >&2; exit 1; fi
+    touch '{}'; exit 0 ;;
+  *)
+    if [ -f '{}' ]; then echo "can't find session" >&2
+    else echo 'no server running on default' >&2; fi
+    exit 1 ;;
+esac
+"#, marker.display(), marker.display())).unwrap();
+            fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+            let record = json!({"id": "lost", "name": "lost", "provider": "claude",
+                "working_dir": "/repo", "tmux_session": "lost", "provider_resume_id": "saved",
+                "tmux_socket_name": if failed_anchor { Some("named") } else { None },
+                "status": "running", "created_at": "2000-01-01T00:00:00Z",
+                "last_activity": "2000-01-01T00:00:00Z"});
+            let path = root.join("state.json");
+            fs::write(&path, json!({"sessions": [record.clone()]}).to_string()).unwrap();
+            let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
+                .with_tmux_binary_for_test(tmux.display().to_string());
+            let store = SessionStore::new(path).with_delivery_runtime(Some(runtime));
+            store.reconcile_missing_session_runtimes_at_boot(parse_timestamp("2001-01-01T00:00:00Z")).unwrap();
+            let state = store.load_raw_json_value().unwrap();
+            if failed_anchor {
+                assert_eq!(state["sessions"][0], record);
+            } else {
+                assert!(marker.exists());
+                assert_eq!(state["sessions"][0]["status"], "stopped");
+                assert_eq!(state["sessions"][0]["provider_resume_id"], "saved");
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_runtime_reconciliation_preserves_live_remote_and_ambiguous_sessions() {
+        let root = unique_temp_path("missing-runtime").with_extension("dir");
+        fs::create_dir_all(&root).unwrap();
+        let tmux = root.join("tmux");
+        fs::write(&tmux, "#!/bin/sh\ncase \"$*\" in\n  *live*) exit 0 ;;\n  *ambiguous*) echo 'permission denied' >&2; exit 1 ;;\n  *) echo \"can't find session\" >&2; exit 1 ;;\nesac\n").unwrap();
+        fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
+        let records = ["missing", "live", "ambiguous", "remote", "stopped"].map(|id| json!({
+            "id": id, "name": id, "provider": "claude", "working_dir": "/repo",
+            "tmux_session": id, "provider_resume_id": "saved-conversation",
+            "node": if id == "remote" { "studio" } else { "primary" },
+            "status": if id == "stopped" { "stopped" } else { "running" },
+            "created_at": now_rfc3339(), "last_activity": now_rfc3339()
+        }));
+        let path = root.join("state.json");
+        fs::write(&path, json!({"sessions": records}).to_string()).unwrap();
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
+            .with_tmux_binary_for_test(tmux.display().to_string());
+        let store = SessionStore::new(path).with_delivery_runtime(Some(runtime.clone()));
+        store.reconcile_missing_session_runtimes().unwrap();
+        let state = store.load_raw_json_value().unwrap();
+        assert_eq!(state["sessions"][0]["status"], "stopped");
+        assert_eq!(state["sessions"][0]["provider_resume_id"], "saved-conversation");
+        for index in 1..4 { assert_eq!(state["sessions"][index]["status"], "running"); }
+        assert_eq!(state["sessions"][4], records[4]);
+        store.reconcile_missing_session_runtimes().unwrap();
+        assert_eq!(store.load_raw_json_value().unwrap(), state);
+        for id in ["live", "ambiguous"] {
+            assert!(matches!(store.restore_core_session_with_runtime(id, &runtime).unwrap(), Some(CoreRestoreOutcome::NotStopped)));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_boot_comparison_requires_a_known_newer_boot() {
+        let record: SessionRecord = serde_json::from_value(json!({
+            "id": "boot", "name": "boot", "working_dir": "/repo", "tmux_session": "boot",
+            "created_at": "2026-09-07T10:00:00Z", "last_activity": "2026-09-07T11:00:00Z"
+        })).unwrap();
+        assert!(session_predates_boot(&record, parse_timestamp("2026-09-07T12:00:00Z")));
+        assert!(!session_predates_boot(&record, parse_timestamp("2026-09-07T09:00:00Z")));
+        assert!(!session_predates_boot(&record, None));
+    }
+
+    #[test]
+    fn codex_fork_resume_identity_ignores_ephemeral_system_threads() {
+        for (source, ephemeral) in [("system", true), ("system", false), ("user", true)] {
+            let event = json!({"event_type": "thread/started", "session_id": "temporary-id",
+                "payload": {"thread": {"id": "temporary-id", "parentThreadId": null,
+                    "threadSource": source, "ephemeral": ephemeral}}});
+            assert_eq!(codex_fork_provider_resume_id(event.as_object().unwrap()), None);
+        }
+        let event = json!({"event_type": "thread/started", "payload": {"thread": {
+            "id": "durable-id", "threadSource": "user", "ephemeral": false}}});
+        assert_eq!(codex_fork_provider_resume_id(event.as_object().unwrap()), Some("durable-id".to_owned()));
+    }
+
     #[test]
     fn accepted_spawn_brief_is_private_immutable_and_records_launch_intent() {
         let state_file = unique_temp_path("spawn-brief");
@@ -17791,6 +18001,32 @@ esac
             let _ = fs::remove_file(&self.state_file);
             let _ = fs::remove_dir_all(&self.fixture_dir);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_accepts_active_record_whose_runtime_disappeared() {
+        let Some(fixture) = CodexForkRestoreRootFixture::new(
+            "stranded",
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --event-stream) event_stream="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s\n' '{"event_type":"thread_started","payload":{"thread":{"id":"durable-root"}}}' >> "$event_stream"
+sleep 30
+"#,
+        ) else { return; };
+        let store = fixture.store();
+        let mut state = store.load_raw_json_value().unwrap();
+        state["sessions"][0]["status"] = json!("running");
+        state["sessions"][0]["completion_status"] = Value::Null;
+        state["sessions"][0]["stopped_at"] = Value::Null;
+        store.write_raw_json_value(&state).unwrap();
+        assert!(matches!(store.restore_core_session_with_runtime("restore01", &fixture.runtime).unwrap(), Some(CoreRestoreOutcome::Restored(_))));
+        assert_eq!(store.load_raw_json_value().unwrap()["sessions"][0]["provider_resume_id"], "durable-root");
     }
 
     #[cfg(unix)]
