@@ -308,7 +308,7 @@ $(while IFS= read -r arg; do printf '        <string>%s</string>\n' "$(xml_text 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>$(xml_text "$REPO_ROOT/target/release:$REPO_ROOT/target/debug:$REPO_ROOT/venv/bin:/Users/rajesh/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")</string>
+        <string>$(xml_text "$REPO_ROOT/.local/bin:$REPO_ROOT/target/release:$REPO_ROOT/target/debug:$REPO_ROOT/venv/bin:/Users/rajesh/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")</string>
     </dict>
 
     <key>ThrottleInterval</key>
