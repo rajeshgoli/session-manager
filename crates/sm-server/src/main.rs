@@ -70,6 +70,21 @@ async fn main() -> Result<()> {
             "configuration ok: {} (listen {address})",
             args.config.display()
         );
+        // Report the overlay too. "configuration ok" on its own is misleading:
+        // the overlay carries the Google auth credentials, is addressed relative
+        // to the config file, and is skipped silently when absent - so a config
+        // that parses cleanly can still have no working sign-in.
+        let overlay =
+            sm_server::config::local_env_overlay_path(&args.config, args.local_env.as_deref());
+        println!(
+            "local env overlay: {} ({})",
+            overlay.display(),
+            if overlay.exists() {
+                "found"
+            } else {
+                "MISSING - auth overrides not applied"
+            }
+        );
         return Ok(());
     }
     let listener = TcpListener::bind(address)

@@ -104,6 +104,19 @@ impl Default for AppConfig {
     }
 }
 
+/// The local env overlay supplying Google auth credentials and external-access
+/// hosts. Addressed relative to the config file when not given explicitly, so
+/// relocating the config relocates this too - callers report it rather than
+/// leave the resolution invisible.
+pub fn local_env_overlay_path(config_path: &Path, explicit: Option<&Path>) -> PathBuf {
+    explicit.map(Path::to_path_buf).unwrap_or_else(|| {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".local/android-parity/values.env")
+    })
+}
+
 impl AppConfig {
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self> {
         Self::load_from_path_with_local_env(path, Option::<&Path>::None)
@@ -124,18 +137,23 @@ impl AppConfig {
             raw.into()
         };
 
-        let env_path = local_env_path
-            .as_ref()
-            .map(|value| value.as_ref().to_path_buf())
-            .unwrap_or_else(|| {
-                path.parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(".local/android-parity/values.env")
-            });
+        let env_path = local_env_overlay_path(path, local_env_path.as_ref().map(AsRef::as_ref));
         if env_path.exists() {
             let env_values = load_env_file(&env_path)
                 .with_context(|| format!("failed to read local env {}", env_path.display()))?;
             apply_local_auth_overrides(&mut config, &env_values);
+        } else {
+            // The overlay is the only source of Google auth credentials, and it
+            // is addressed relative to the config file. Moving config.yaml
+            // therefore moves this path too, and a silent skip here leaves the
+            // server healthy on every check while sign-in returns 503 - which is
+            // exactly how a config relocation broke mobile sign-in on
+            // 2026-09-06. Say so instead of skipping quietly.
+            eprintln!(
+                "local env overlay not found at {}; auth overrides were not applied \
+                 (Google sign-in will report \"Google auth is not configured\")",
+                env_path.display()
+            );
         }
 
         let config_path_for_relative_resolution =
