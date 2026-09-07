@@ -46,7 +46,14 @@ SM_BINARY="${SM_BINARY:-$REPO_ROOT/.local/bin/sm-server}"
 SM_TARGET_DIR="${SM_TARGET_DIR:-$REPO_ROOT/target}"
 SM_CARGO_OUTPUT="${SM_CARGO_OUTPUT:-$SM_TARGET_DIR/release/sm-server}"
 SM_CUTOVER="${SM_CUTOVER:-$REPO_ROOT/scripts/rust-service-cutover.sh}"
-SM_CONFIG="${SM_CONFIG:-$REPO_ROOT/config.yaml}"
+# Production config does not belong inside a checkout. The primary checkout is
+# also the maintainer agent's working directory, so anything kept there shares a
+# directory with an autonomous agent that branches, and cleans, and once took the
+# CLI down with it. Prefer the stable location, and fall back to the in-repo file
+# only when there is no installed config, so a fresh clone still works.
+SM_DEFAULT_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/session-manager/config.yaml"
+[[ -r "$SM_DEFAULT_CONFIG" ]] || SM_DEFAULT_CONFIG="$REPO_ROOT/config.yaml"
+SM_CONFIG="${SM_CONFIG:-$SM_DEFAULT_CONFIG}"
 SM_LOCAL_ENV="${SM_LOCAL_ENV:-}"
 # Empty means "let the cutover use its own default", so an unset value keeps the
 # rendered plist identical to what a bare cutover run would write.

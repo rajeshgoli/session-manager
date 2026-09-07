@@ -117,6 +117,28 @@ after every successful restart; to refresh it on its own:
 Keep `.local/bin` ahead of `venv/bin` on `PATH` - otherwise `sm` resolves to
 the legacy Python CLI rather than the Rust one.
 
+### Where production state lives
+
+Production config and state live outside every checkout, because the primary
+checkout is also the `maintainer` service role's working directory - an
+autonomous agent branches and builds there, and a `cargo clean` in it once
+removed the `sm` CLI.
+
+```
+~/.config/session-manager/config.yaml   # the live service's --config
+~/.config/session-manager/certs/        # mobile device CA cert + key
+~/.local/share/claude-sessions/         # DBs, queue state, app artifacts
+```
+
+`restart-rust-server.sh` defaults `SM_CONFIG` to the installed config and only
+falls back to the in-repo `config.yaml` when none is installed.
+
+Note that `app_artifacts.root_dir`, `bug_reports.db_path` and the two
+`mobile_terminal` CA paths are set explicitly in the installed config. Their
+compiled defaults derive from `CARGO_MANIFEST_DIR` or the process CWD - both of
+which point at whichever tree the binary happened to be built in, not at a
+stable location.
+
 ### Testing
 
 ```bash
