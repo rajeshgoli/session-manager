@@ -3,7 +3,6 @@ use std::os::unix::process::CommandExt;
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
-    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
@@ -3690,7 +3689,7 @@ fn queue_job_completion_text(
         || " exit=unknown (no exit receipt; output is partial/non-evidence)".to_owned(),
         |code| format!(" exit={code}"),
     );
-    let mut text = format!(
+    format!(
         "[sm queue] {} completed: {}{}{} runtime={} queue={}. Log: {}",
         job.id,
         state,
@@ -3699,13 +3698,7 @@ fn queue_job_completion_text(
         runtime,
         queued,
         job.log_path.as_deref().unwrap_or("-")
-    );
-    let stderr_tail = tail_queue_job_log(job.log_path.as_deref(), 8192);
-    if !stderr_tail.is_empty() {
-        text.push_str("\nlog tail:\n");
-        text.push_str(&stderr_tail);
-    }
-    text
+    )
 }
 
 fn queue_duration_text(start: Option<&str>, end: Option<&str>) -> String {
@@ -3726,27 +3719,6 @@ fn parse_queue_datetime(value: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(value, &Rfc3339)
         .ok()
         .or_else(|| parse_python_naive_datetime(value).map(PrimitiveDateTime::assume_utc))
-}
-
-fn tail_queue_job_log(path: Option<&str>, max_bytes: usize) -> String {
-    let Some(path) = path else {
-        return String::new();
-    };
-    let Ok(mut file) = fs::File::open(path) else {
-        return String::new();
-    };
-    let Ok(metadata) = file.metadata() else {
-        return String::new();
-    };
-    let start = metadata.len().saturating_sub(max_bytes as u64);
-    if file.seek(SeekFrom::Start(start)).is_err() {
-        return String::new();
-    }
-    let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
-        return String::new();
-    }
-    String::from_utf8_lossy(&bytes).trim().to_owned()
 }
 
 fn read_queue_job_exit_code_from_state_dir(state_dir: &Path, job_id: &str) -> Option<i64> {
@@ -4564,6 +4536,37 @@ mod tests {
         let displaced = queue_job_completion_text(&job, "displaced", None, "2026-08-16T20:04:24Z");
         assert!(displaced.contains("termination=perf_displacement"));
         assert!(displaced.contains("exit=unknown"));
+    }
+
+    #[test]
+    fn queue_completion_references_log_without_embedding_output() {
+        let log_path = unique_temp_path("completion-log");
+        fs::write(&log_path, "long test output that belongs only in the log\n").unwrap();
+        let job = QueueJobRuntimeRecord {
+            id: "job_completion_log".to_owned(),
+            job_type: "tests".to_owned(),
+            state: "running".to_owned(),
+            notify_session_id: Some("run12345".to_owned()),
+            queued_at: "2026-08-16T20:00:00Z".to_owned(),
+            started_at: Some("2026-08-16T20:00:01Z".to_owned()),
+            finished_at: None,
+            holding_reason: None,
+            wrapper_path: None,
+            log_path: Some(log_path.display().to_string()),
+            exit_code_path: None,
+            timeout_seconds: 900,
+            pid: None,
+            process_group_id: None,
+            exit_code: None,
+            completion_notified_at: None,
+        };
+
+        let completion = queue_job_completion_text(&job, "failed", Some(1), "2026-08-16T20:04:24Z");
+
+        assert!(completion.contains(&format!("Log: {}", log_path.display())));
+        assert!(!completion.contains("long test output that belongs only in the log"));
+        assert!(!completion.contains("log tail:"));
+        let _ = fs::remove_file(log_path);
     }
 
     #[test]

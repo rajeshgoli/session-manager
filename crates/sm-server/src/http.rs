@@ -422,6 +422,9 @@ impl AppState {
             .with_codex_session_index_path(config.codex.session_index_path.as_deref())
             .with_claude_transcript_root(config.claude.transcript_root.as_deref())
             .with_context_monitor_config(config.context_monitor.clone())
+            .with_codex_fork_create_startup_timeout(std::time::Duration::from_secs(
+                config.codex_fork.create_startup_timeout_seconds,
+            ))
             .with_delivery_runtime(
                 config
                     .rust_core
@@ -465,6 +468,9 @@ impl AppState {
         session_store
             .recover_session_runtime_launches()
             .context("session runtime launch recovery failed")?;
+        session_store
+            .reconcile_missing_local_session_runtimes()
+            .context("local session runtime reconciliation failed")?;
         session_store
             .reconcile_reparent_requests()
             .context("reparent authority recovery failed")?;
@@ -7197,6 +7203,9 @@ async fn get_attach_descriptor(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
+    state
+        .session_store
+        .reconcile_missing_local_session_runtimes()?;
     let Some(session) = state.session_store.get_session(&session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };

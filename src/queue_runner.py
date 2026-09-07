@@ -1172,13 +1172,10 @@ class QueueRunner:
         if job.finished_at:
             queued = f"{int(((job.started_at or job.finished_at) - job.queued_at).total_seconds())}s"
         exit_text = f" exit={job.exit_code}" if job.exit_code is not None else ""
-        stderr_tail = self._tail_log(job.log_path, max_bytes=8192)
         text = (
             f"[sm queue] {job.id} completed: {job.state}{exit_text} "
             f"runtime={runtime} queue={queued}. Log: {job.log_path or '-'}"
         )
-        if stderr_tail:
-            text += f"\nlog tail:\n{stderr_tail}"
         mq.queue_message(target_session_id=job.notify_session_id, text=text, delivery_mode="sequential")
 
     def _notify_queued(self, job: QueueJob) -> None:
@@ -1198,18 +1195,6 @@ class QueueRunner:
             return
         text = f"[sm queue] {job.id} started: {job.type}, pid {job.pid or '-'}. Log: {job.log_path or '-'}"
         mq.queue_message(target_session_id=job.notify_session_id, text=text, delivery_mode="sequential")
-
-    def _tail_log(self, log_path: Optional[str], max_bytes: int) -> str:
-        if not log_path:
-            return ""
-        try:
-            path = Path(log_path)
-            size = path.stat().st_size
-            with path.open("rb") as handle:
-                handle.seek(max(0, size - max_bytes))
-                return handle.read().decode(errors="replace").strip()
-        except Exception:
-            return ""
 
     def _ensure_resource_sampler(self) -> None:
         if not self.resource_sampling_enabled or not self._started:

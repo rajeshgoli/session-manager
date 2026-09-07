@@ -130,7 +130,7 @@ def _load_env_file(path: Path) -> dict[str, str]:
 
 
 def _build_local_auth_overrides(env_values: dict[str, str]) -> dict:
-    """Map gitignored Android parity env values into tracked config structure."""
+    """Map gitignored local values into the runtime config structure."""
     if not env_values:
         return {}
 
@@ -142,6 +142,9 @@ def _build_local_auth_overrides(env_values: dict[str, str]) -> dict:
     web_client_id = env_values.get("GOOGLE_WEB_CLIENT_ID", "").strip()
     web_client_secret = env_values.get("GOOGLE_WEB_CLIENT_SECRET", "").strip()
     android_client_id = env_values.get("GOOGLE_ANDROID_CLIENT_ID", "").strip()
+    telegram_bot_token = env_values.get("TELEGRAM_BOT_TOKEN", "").strip()
+    cloudflare_api_token = env_values.get("CLOUDFLARE_API_TOKEN", "").strip()
+    macbook_hook_secret = env_values.get("SM_NODE_MACBOOK_HOOK_SECRET", "").strip()
     allowlist = [
         email.strip()
         for email in env_values.get("ALLOWLIST_EMAIL", "").replace(";", ",").split(",")
@@ -188,6 +191,12 @@ def _build_local_auth_overrides(env_values: dict[str, str]) -> dict:
         overrides["auth"] = {"google": auth_google}
     if external_access:
         overrides["external_access"] = external_access
+    if telegram_bot_token:
+        overrides["telegram"] = {"token": telegram_bot_token}
+    if cloudflare_api_token:
+        overrides["cloudflare_access"] = {"api_token": cloudflare_api_token}
+    if macbook_hook_secret:
+        overrides["nodes"] = {"registry": {"macbook": {"hook_secret": macbook_hook_secret}}}
     return overrides
 
 

@@ -9933,6 +9933,48 @@ async fn sessions_can_include_stopped_sessions() {
 }
 
 #[tokio::test]
+async fn startup_reconciliation_hides_missing_runtimes_and_disables_attach() {
+    let state_file = write_session_fixture();
+    let mut config = config_with_state_file(&state_file);
+    config.rust_core.runtime_enabled = true;
+    config.rust_core.tmux_socket_name = Some(format!(
+        "sm-rust-test-missing-runtime-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let app = router(AppState::new(config));
+
+    let (status, payload) = get_json(app.clone(), "/sessions").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(payload["sessions"].as_array().unwrap().is_empty());
+
+    let (status, payload) = get_json(app, "/sessions/run12345/attach-descriptor").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["attach"]["attach_supported"], false);
+    assert_eq!(payload["attach"]["lifecycle_state"], "stopped");
+    assert_eq!(payload["attach"]["message"], "Session is stopped");
+
+    let state: Value = serde_json::from_str(&fs::read_to_string(state_file).unwrap()).unwrap();
+    let session = state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["id"] == "run12345")
+        .unwrap();
+    assert_eq!(
+        session["terminal_provenance"]["cause"],
+        "tmux_disappearance"
+    );
+    assert_eq!(
+        session["terminal_provenance"]["source"],
+        "runtime_reconciliation_missing"
+    );
+}
+
+#[tokio::test]
 async fn client_sessions_adds_attach_descriptor_without_termux_when_mobile_disabled() {
     let state_file = write_session_fixture();
     let app = router(AppState::new(config_with_state_file(&state_file)));
@@ -17089,6 +17131,7 @@ while true; do sleep 1; done
             default_model: Some("gpt-default".to_owned()),
             event_schema_version: 7,
             control_tmux_fallback_enabled: true,
+            create_startup_timeout_seconds: 60,
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,
@@ -17510,6 +17553,7 @@ while true; do sleep 1; done
             default_model: None,
             event_schema_version: 2,
             control_tmux_fallback_enabled: true,
+            create_startup_timeout_seconds: 60,
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,
@@ -17622,6 +17666,7 @@ while true; do sleep 1; done
             default_model: None,
             event_schema_version: 2,
             control_tmux_fallback_enabled: true,
+            create_startup_timeout_seconds: 60,
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,
@@ -20641,6 +20686,7 @@ fn runtime_app_with_codex_fork_initial_brief_provider(
             default_model: None,
             event_schema_version: 2,
             control_tmux_fallback_enabled: true,
+            create_startup_timeout_seconds: 60,
         },
         rust_core: RustCoreConfig {
             runtime_enabled: true,

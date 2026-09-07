@@ -264,6 +264,9 @@ class TestLoadConfig:
                     "GOOGLE_WEB_CLIENT_ID=web-client-id",
                     "GOOGLE_WEB_CLIENT_SECRET=web-client-secret",
                     "ALLOWLIST_EMAIL=rajeshgoli@gmail.com",
+                    "TELEGRAM_BOT_TOKEN=telegram-token",
+                    "CLOUDFLARE_API_TOKEN=cloudflare-token",
+                    "SM_NODE_MACBOOK_HOOK_SECRET=node-hook-token",
                 ]
             )
         )
@@ -283,6 +286,9 @@ class TestLoadConfig:
         assert google_auth["allowlist_emails"] == ["rajeshgoli@gmail.com"]
         assert google_auth["redirect_uri"] == "https://sm.rajeshgo.li/auth/google/callback"
         assert google_auth["session_cookie_secret"]
+        assert config["telegram"]["token"] == "telegram-token"
+        assert config["cloudflare_access"]["api_token"] == "cloudflare-token"
+        assert config["nodes"]["registry"]["macbook"]["hook_secret"] == "node-hook-token"
 
     def test_partial_local_auth_env_does_not_clear_yaml_values(self, tmp_path: Path):
         config_path = tmp_path / "config.yaml"
