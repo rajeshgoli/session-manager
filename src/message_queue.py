@@ -1115,7 +1115,7 @@ class MessageQueueManager:
         repo: Optional[str] = None,
         steer: Optional[str] = None,
         poll_interval_seconds: int = 30,
-        retry_interval_seconds: int = 600,
+        retry_interval_seconds: int = 1200,
     ) -> CodexReviewRequestRegistration:
         """Create one durable Codex PR review request and start watching it."""
         if poll_interval_seconds <= 0:
@@ -1419,10 +1419,13 @@ class MessageQueueManager:
                         if picked_up:
                             registration.pickup_detected_at = now
                             registration.pickup_source = "reaction"
+                            registration.next_retry_at = None
                             registration.last_error = None
                             updates["pickup_detected_at"] = now
                             updates["pickup_source"] = "reaction"
+                            updates["next_retry_at"] = None
                             updates["last_error"] = None
+                            self._update_codex_review_request_db(request_id, **updates)
 
                 try:
                     review_match = await asyncio.to_thread(
@@ -1448,7 +1451,11 @@ class MessageQueueManager:
                             return
                         return
 
-                    if registration.next_retry_at and now >= registration.next_retry_at:
+                    if (
+                        not registration.pickup_detected_at
+                        and registration.next_retry_at
+                        and now >= registration.next_retry_at
+                    ):
                         comment_result = await asyncio.to_thread(
                             post_pr_review_comment,
                             registration.repo,

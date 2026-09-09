@@ -494,7 +494,7 @@ def main():
     request_codex_review_parser.add_argument("--json", action="store_true", help="Output JSON for list/status")
     request_codex_review_parser.add_argument("--pr", dest="status_pr", type=int, help="Filter status/list by PR number")
     request_codex_review_parser.add_argument("--poll-interval", dest="poll_interval_seconds", type=int, default=30, help="Polling cadence in seconds (default: 30)")
-    request_codex_review_parser.add_argument("--retry-interval", dest="retry_interval_seconds", type=int, default=600, help="Re-ping cadence in seconds (default: 600)")
+    request_codex_review_parser.add_argument("--retry-interval", dest="retry_interval_seconds", type=int, default=1200, help="Unacknowledged re-ping cadence in seconds (default: 1200)")
 
     # sm spawn "<prompt>"
     spawn_parser = subparsers.add_parser("spawn", help="Spawn a child agent session")

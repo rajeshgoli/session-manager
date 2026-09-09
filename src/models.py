@@ -775,7 +775,7 @@ class CodexReviewRequestRegistration:
     attempt_count: int
     next_retry_at: Optional[datetime]
     poll_interval_seconds: int = 30
-    retry_interval_seconds: int = 600
+    retry_interval_seconds: int = 1200
     pickup_detected_at: Optional[datetime] = None
     pickup_source: Optional[str] = None
     review_landed_at: Optional[datetime] = None
@@ -839,7 +839,7 @@ class CodexReviewRequestRegistration:
             attempt_count=int(data.get("attempt_count", 1)),
             next_retry_at=datetime.fromisoformat(data["next_retry_at"]) if data.get("next_retry_at") else None,
             poll_interval_seconds=int(data.get("poll_interval_seconds", 30)),
-            retry_interval_seconds=int(data.get("retry_interval_seconds", 600)),
+            retry_interval_seconds=int(data.get("retry_interval_seconds", 1200)),
             pickup_detected_at=datetime.fromisoformat(data["pickup_detected_at"]) if data.get("pickup_detected_at") else None,
             pickup_source=data.get("pickup_source"),
             review_landed_at=datetime.fromisoformat(data["review_landed_at"]) if data.get("review_landed_at") else None,

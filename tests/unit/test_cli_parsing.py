@@ -131,7 +131,7 @@ class TestCliParsing:
         request_codex_review_parser.add_argument("--json", action="store_true")
         request_codex_review_parser.add_argument("--pr", dest="status_pr", type=int)
         request_codex_review_parser.add_argument("--poll-interval", dest="poll_interval_seconds", type=int, default=30)
-        request_codex_review_parser.add_argument("--retry-interval", dest="retry_interval_seconds", type=int, default=600)
+        request_codex_review_parser.add_argument("--retry-interval", dest="retry_interval_seconds", type=int, default=1200)
 
         # sm children
         children_parser = subparsers.add_parser("children")
@@ -870,7 +870,7 @@ class TestRequestCodexReviewCommand:
         assert args.notify == "maintainer"
         assert args.steer == "focus on races"
         assert args.poll_interval_seconds == 30
-        assert args.retry_interval_seconds == 600
+        assert args.retry_interval_seconds == 1200
 
     def test_main_request_codex_review_dispatches_create(self):
         mock_client = MagicMock()

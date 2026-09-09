@@ -50,7 +50,7 @@ class TestPostPrReviewComment:
 
     @patch("src.github_reviews.subprocess.run")
     def test_posts_steered_review(self, mock_run):
-        """Posts @codex review for <steer> with steer text."""
+        """Posts steer text under a distinct label."""
         mock_run.return_value = MagicMock(
             returncode=0,
             stdout="https://github.com/owner/repo/pull/42#issuecomment-99999\n",
@@ -58,8 +58,18 @@ class TestPostPrReviewComment:
 
         result = post_pr_review_comment("owner/repo", 42, steer="security focus")
 
-        assert result["body"] == "@codex review for security focus"
+        assert result["body"] == "@codex review\n\nSteer: security focus"
         assert result["comment_id"] == 99999
+
+    @patch("src.github_reviews.subprocess.run")
+    def test_normalizes_accidental_review_trigger_from_steer(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="")
+
+        result = post_pr_review_comment(
+            "owner/repo", 42, steer="@codex review . Emphasis is on correctness."
+        )
+
+        assert result["body"] == "@codex review\n\nSteer: Emphasis is on correctness."
 
     @patch("src.github_reviews.subprocess.run")
     def test_raises_on_failure(self, mock_run):

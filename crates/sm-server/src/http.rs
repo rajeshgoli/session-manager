@@ -729,10 +729,7 @@ fn post_pr_review_comment_with_gh(
     pr_number: i64,
     steer: Option<&str>,
 ) -> Result<GitHubReviewComment, String> {
-    let body = match steer.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(steer) => format!("@codex review for {steer}"),
-        None => "@codex review".to_owned(),
-    };
+    let body = codex_review_comment_body(steer);
     let args = vec![
         "pr".to_owned(),
         "comment".to_owned(),
@@ -4765,10 +4762,29 @@ async fn resolve_pr_review_repo(
 }
 
 fn codex_review_comment_body(steer: Option<&str>) -> String {
-    match steer.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(steer) => format!("@codex review for {steer}"),
+    match normalized_codex_review_steer(steer) {
+        Some(steer) => format!("@codex review\n\nSteer: {steer}"),
         None => "@codex review".to_owned(),
     }
+}
+
+fn normalized_codex_review_steer(steer: Option<&str>) -> Option<&str> {
+    let mut normalized = steer?.trim();
+    const TRIGGER: &str = "@codex review";
+    if normalized
+        .get(..TRIGGER.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(TRIGGER))
+        && normalized.get(TRIGGER.len()..).is_some_and(|rest| {
+            rest.chars()
+                .next()
+                .is_none_or(|ch| matches!(ch, ' ' | '\t' | '\n' | '.' | ':' | '-'))
+        })
+    {
+        normalized = normalized[TRIGGER.len()..]
+            .trim_start_matches(|ch| matches!(ch, ' ' | '\t' | '\n' | '.' | ':' | '-'))
+            .trim();
+    }
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn spawn_pr_review_completion_notifier(
@@ -5159,6 +5175,9 @@ async fn run_codex_review_request_watcher(
                             &now,
                         )
                         .map_err(|error| error.to_string())?;
+                        registration.pickup_detected_at = Some(now.clone());
+                        registration.pickup_source = Some("reaction".to_owned());
+                        registration.next_retry_at = None;
                     }
                     Ok(false) => {}
                     Err(error) => {
@@ -5222,11 +5241,12 @@ async fn run_codex_review_request_watcher(
             }
         }
 
-        if registration
-            .next_retry_at
-            .as_deref()
-            .is_some_and(codex_review_datetime_due)
-        {
+        let retry_due = registration.pickup_detected_at.is_none()
+            && registration
+                .next_retry_at
+                .as_deref()
+                .is_some_and(codex_review_datetime_due);
+        if registration.pickup_detected_at.is_some() || retry_due {
             let requested_head_sha = registration
                 .requested_head_sha
                 .as_deref()
@@ -5250,15 +5270,19 @@ async fn run_codex_review_request_watcher(
                     return Ok(());
                 }
                 Err(error) => {
-                    let next_retry_at = codex_review_next_retry_at(
-                        &now,
-                        registration.retry_interval_seconds.max(1),
-                    );
+                    let next_retry_at = retry_due
+                        .then(|| {
+                            codex_review_next_retry_at(
+                                &now,
+                                registration.retry_interval_seconds.max(1),
+                            )
+                        })
+                        .flatten();
                     let _ = RetainedQueueStore::mark_codex_review_request_poll_error_in_path(
                         &queue_db_path,
                         &request_id,
                         &now,
-                        &format!("PR head recheck failed before retry: {error}"),
+                        &format!("PR head recheck failed: {error}"),
                         next_retry_at.as_deref(),
                     )
                     .map_err(|error| error.to_string())?;
@@ -5277,30 +5301,39 @@ async fn run_codex_review_request_watcher(
                 )?;
                 return Ok(());
             }
-            let comment = github_post_review_request(
-                state.github_review_poster.clone(),
-                &registration.repo,
-                registration.pr_number,
-                registration.steer.as_deref(),
-            )
-            .await?;
-            let next_retry_at = codex_review_next_retry_at(
-                &comment.posted_at,
-                registration.retry_interval_seconds.max(1),
-            )
-            .unwrap_or_else(|| now_rfc3339());
-            let _ = RetainedQueueStore::retry_codex_review_request_in_path(
-                &queue_db_path,
-                &request_id,
-                RetryCodexReviewRequest {
-                    latest_request_comment_id: comment.comment_id,
-                    latest_request_comment_url: comment.comment_url,
-                    latest_request_posted_at: comment.posted_at,
-                    next_retry_at,
-                },
-                &now,
-            )
-            .map_err(|error| error.to_string())?;
+            if retry_due {
+                let comment = github_post_review_request(
+                    state.github_review_poster.clone(),
+                    &registration.repo,
+                    registration.pr_number,
+                    registration.steer.as_deref(),
+                )
+                .await?;
+                let next_retry_at = codex_review_next_retry_at(
+                    &comment.posted_at,
+                    registration.retry_interval_seconds.max(1),
+                )
+                .unwrap_or_else(|| now_rfc3339());
+                let _ = RetainedQueueStore::retry_codex_review_request_in_path(
+                    &queue_db_path,
+                    &request_id,
+                    RetryCodexReviewRequest {
+                        latest_request_comment_id: comment.comment_id,
+                        latest_request_comment_url: comment.comment_url,
+                        latest_request_posted_at: comment.posted_at,
+                        next_retry_at,
+                    },
+                    &now,
+                )
+                .map_err(|error| error.to_string())?;
+            } else {
+                let _ = RetainedQueueStore::mark_codex_review_request_polled_in_path(
+                    &queue_db_path,
+                    &request_id,
+                    &now,
+                )
+                .map_err(|error| error.to_string())?;
+            }
         } else {
             let _ = RetainedQueueStore::mark_codex_review_request_polled_in_path(
                 &queue_db_path,
@@ -13503,7 +13536,7 @@ fn default_codex_review_poll_interval_seconds() -> i64 {
 }
 
 fn default_codex_review_retry_interval_seconds() -> i64 {
-    600
+    1200
 }
 
 #[derive(Debug, Deserialize)]
@@ -14330,6 +14363,23 @@ mod tests {
     use tower::ServiceExt;
 
     const DIRECT_HARNESS_PROBE_ENV: &str = "SM_DIRECT_HARNESS_ISOLATION_PROBE";
+
+    #[test]
+    fn codex_review_comment_labels_and_normalizes_steer_text() {
+        assert_eq!(codex_review_comment_body(None), "@codex review");
+        assert_eq!(
+            codex_review_comment_body(Some("focus on correctness")),
+            "@codex review\n\nSteer: focus on correctness"
+        );
+        assert_eq!(
+            codex_review_comment_body(Some("@CODEX review . Emphasis is on the implementation.")),
+            "@codex review\n\nSteer: Emphasis is on the implementation."
+        );
+        assert_eq!(
+            codex_review_comment_body(Some("@codex review")),
+            "@codex review"
+        );
+    }
 
     struct ProbeChild {
         child: Child,
