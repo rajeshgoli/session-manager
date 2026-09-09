@@ -1425,6 +1425,7 @@ class MessageQueueManager:
                             updates["pickup_source"] = "reaction"
                             updates["next_retry_at"] = None
                             updates["last_error"] = None
+                            self._update_codex_review_request_db(request_id, **updates)
 
                 try:
                     review_match = await asyncio.to_thread(

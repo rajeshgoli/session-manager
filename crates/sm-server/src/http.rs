@@ -5241,12 +5241,12 @@ async fn run_codex_review_request_watcher(
             }
         }
 
-        if registration.pickup_detected_at.is_none()
+        let retry_due = registration.pickup_detected_at.is_none()
             && registration
                 .next_retry_at
                 .as_deref()
-                .is_some_and(codex_review_datetime_due)
-        {
+                .is_some_and(codex_review_datetime_due);
+        if registration.pickup_detected_at.is_some() || retry_due {
             let requested_head_sha = registration
                 .requested_head_sha
                 .as_deref()
@@ -5270,15 +5270,19 @@ async fn run_codex_review_request_watcher(
                     return Ok(());
                 }
                 Err(error) => {
-                    let next_retry_at = codex_review_next_retry_at(
-                        &now,
-                        registration.retry_interval_seconds.max(1),
-                    );
+                    let next_retry_at = retry_due
+                        .then(|| {
+                            codex_review_next_retry_at(
+                                &now,
+                                registration.retry_interval_seconds.max(1),
+                            )
+                        })
+                        .flatten();
                     let _ = RetainedQueueStore::mark_codex_review_request_poll_error_in_path(
                         &queue_db_path,
                         &request_id,
                         &now,
-                        &format!("PR head recheck failed before retry: {error}"),
+                        &format!("PR head recheck failed: {error}"),
                         next_retry_at.as_deref(),
                     )
                     .map_err(|error| error.to_string())?;
@@ -5297,30 +5301,39 @@ async fn run_codex_review_request_watcher(
                 )?;
                 return Ok(());
             }
-            let comment = github_post_review_request(
-                state.github_review_poster.clone(),
-                &registration.repo,
-                registration.pr_number,
-                registration.steer.as_deref(),
-            )
-            .await?;
-            let next_retry_at = codex_review_next_retry_at(
-                &comment.posted_at,
-                registration.retry_interval_seconds.max(1),
-            )
-            .unwrap_or_else(|| now_rfc3339());
-            let _ = RetainedQueueStore::retry_codex_review_request_in_path(
-                &queue_db_path,
-                &request_id,
-                RetryCodexReviewRequest {
-                    latest_request_comment_id: comment.comment_id,
-                    latest_request_comment_url: comment.comment_url,
-                    latest_request_posted_at: comment.posted_at,
-                    next_retry_at,
-                },
-                &now,
-            )
-            .map_err(|error| error.to_string())?;
+            if retry_due {
+                let comment = github_post_review_request(
+                    state.github_review_poster.clone(),
+                    &registration.repo,
+                    registration.pr_number,
+                    registration.steer.as_deref(),
+                )
+                .await?;
+                let next_retry_at = codex_review_next_retry_at(
+                    &comment.posted_at,
+                    registration.retry_interval_seconds.max(1),
+                )
+                .unwrap_or_else(|| now_rfc3339());
+                let _ = RetainedQueueStore::retry_codex_review_request_in_path(
+                    &queue_db_path,
+                    &request_id,
+                    RetryCodexReviewRequest {
+                        latest_request_comment_id: comment.comment_id,
+                        latest_request_comment_url: comment.comment_url,
+                        latest_request_posted_at: comment.posted_at,
+                        next_retry_at,
+                    },
+                    &now,
+                )
+                .map_err(|error| error.to_string())?;
+            } else {
+                let _ = RetainedQueueStore::mark_codex_review_request_polled_in_path(
+                    &queue_db_path,
+                    &request_id,
+                    &now,
+                )
+                .map_err(|error| error.to_string())?;
+            }
         } else {
             let _ = RetainedQueueStore::mark_codex_review_request_polled_in_path(
                 &queue_db_path,

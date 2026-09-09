@@ -3143,6 +3143,27 @@ async fn codex_review_request_watcher_clears_retry_after_pickup() {
         1,
         "picked-up request must not be re-pinged"
     );
+
+    poster.set_current_head("2222222222222222222222222222222222222222");
+    let mut state = None;
+    for _ in 0..30 {
+        let current: (String, i64) = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state, is_active FROM codex_review_request_registrations WHERE id = ?1",
+                [&request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        if current.0 == "superseded" {
+            state = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let state = state.expect("head changes after pickup must supersede the stale request");
+    assert_eq!(state.1, 0);
+    assert_eq!(poster.calls().len(), 1);
 }
 
 #[tokio::test]
