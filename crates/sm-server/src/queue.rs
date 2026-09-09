@@ -564,6 +564,7 @@ impl RetainedQueueStore {
             UPDATE codex_review_request_registrations
             SET pickup_detected_at = COALESCE(pickup_detected_at, ?2),
                 pickup_source = COALESCE(pickup_source, 'reaction'),
+                next_retry_at = NULL,
                 last_polled_at = ?2,
                 last_error = NULL
             WHERE id = ?1 AND is_active = 1

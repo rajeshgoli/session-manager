@@ -111,7 +111,7 @@ class TestPRReviewEndpoint:
             "pr_number": 42,
             "posted_at": "2026-02-14T10:00:00",
             "comment_id": 12345,
-            "comment_body": "@codex review for security",
+            "comment_body": "@codex review\n\nSteer: security",
             "status": "posted",
             "server_polling": False,
         })

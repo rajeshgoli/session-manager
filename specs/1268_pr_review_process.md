@@ -14,11 +14,11 @@ Preferred path:
 Fallback path:
 
 1. If `sm request-codex-review` is unavailable in the current Session Manager deployment, post `@codex review` as a PR comment.
-2. Wait about 5 minutes.
+2. Wait about 10 minutes.
 3. Poll the PR for a Codex review.
-4. If no review was posted, wait 5 more minutes.
+4. If no review was posted or acknowledged, wait 10 more minutes.
 5. Poll again.
-6. If there is still no review after 10 minutes total, post another `@codex review` comment.
+6. If there is still no review or acknowledgement after 20 minutes total, post another `@codex review` comment. Once Codex acknowledges a request, do not re-ping it; continue waiting for a review or an explicit failure comment.
 7. Repeat the request-registration cycle until a fresh review is posted. These
    retries obtain one review and do not count as additional review rounds.
 

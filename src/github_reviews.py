@@ -120,8 +120,14 @@ def post_pr_review_comment(
     steer: Optional[str] = None,
 ) -> dict:
     """Post `@codex review` on a PR and return the created issue comment metadata."""
-    if steer:
-        body = f"@codex review for {steer}"
+    normalized_steer = re.sub(
+        r"^@codex\s+review\b[\s.:-]*",
+        "",
+        (steer or "").strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+    if normalized_steer:
+        body = f"@codex review\n\nSteer: {normalized_steer}"
     else:
         body = "@codex review"
 

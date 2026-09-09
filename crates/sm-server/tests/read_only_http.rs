@@ -236,6 +236,7 @@ struct StubGitHubReviewPoster {
     current_head_sha: Arc<Mutex<String>>,
     closed_pr_state: Arc<Mutex<Option<String>>>,
     head_after_post: Arc<Mutex<Option<String>>>,
+    pickup_detected: Arc<Mutex<bool>>,
 }
 
 impl StubGitHubReviewPoster {
@@ -256,6 +257,7 @@ impl StubGitHubReviewPoster {
             )),
             closed_pr_state: Arc::new(Mutex::new(None)),
             head_after_post: Arc::new(Mutex::new(None)),
+            pickup_detected: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -269,6 +271,7 @@ impl StubGitHubReviewPoster {
             )),
             closed_pr_state: Arc::new(Mutex::new(None)),
             head_after_post: Arc::new(Mutex::new(None)),
+            pickup_detected: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -298,6 +301,10 @@ impl StubGitHubReviewPoster {
         *self.head_after_post.lock().unwrap() = Some(head_sha.to_owned());
     }
 
+    fn set_pickup_detected(&self, detected: bool) {
+        *self.pickup_detected.lock().unwrap() = detected;
+    }
+
     fn push_fresh_review(&self, review_match: GitHubReviewMatch) {
         self.fresh_reviews.lock().unwrap().push_back(review_match);
     }
@@ -322,6 +329,10 @@ impl GitHubReviewPoster for StubGitHubReviewPoster {
 
     fn current_open_pr_head(&self, _repo: &str, _pr_number: i64) -> Result<String, String> {
         Ok(self.current_head_sha.lock().unwrap().clone())
+    }
+
+    fn detect_codex_pickup(&self, _repo: &str, _comment_id: i64) -> Result<bool, String> {
+        Ok(*self.pickup_detected.lock().unwrap())
     }
 
     fn current_pr_state(
@@ -2657,7 +2668,10 @@ async fn pr_review_route_posts_comment_and_returns_python_shape() {
     assert_eq!(payload["pr_number"], 967);
     assert!(payload["posted_at"].as_str().is_some());
     assert_eq!(payload["comment_id"], 4701290334_i64);
-    assert_eq!(payload["comment_body"], "@codex review for focus create");
+    assert_eq!(
+        payload["comment_body"],
+        "@codex review\n\nSteer: focus create"
+    );
     assert_eq!(payload["status"], "posted");
     assert_eq!(payload["server_polling"], true);
     assert_eq!(
@@ -3065,6 +3079,70 @@ async fn codex_review_request_watcher_stops_before_retry_when_head_changes() {
     assert!(messages[0].contains(&request_id));
     assert!(messages[0].contains("PR head changed"));
     assert!(messages[0].contains("Request a new review"));
+}
+
+#[tokio::test]
+async fn codex_review_request_watcher_clears_retry_after_pickup() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("codex-review-picked-up.db");
+    let poster = StubGitHubReviewPoster::successful();
+    poster.set_pickup_detected(true);
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 971,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "run12345",
+            "poll_interval_seconds": 1,
+            "retry_interval_seconds": 1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let request_id = payload["id"].as_str().unwrap().to_owned();
+
+    let mut picked_up = None;
+    for _ in 0..30 {
+        let current: (i64, Option<String>, Option<String>) = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT attempt_count, pickup_detected_at, next_retry_at FROM codex_review_request_registrations WHERE id = ?1",
+                [&request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        if current.1.is_some() {
+            picked_up = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let picked_up = picked_up.expect("watcher should persist Codex pickup");
+    assert_eq!(picked_up.0, 1, "pickup must not post another trigger");
+    assert!(
+        picked_up.2.is_none(),
+        "pickup must clear the scheduled retry"
+    );
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(
+        poster.calls().len(),
+        1,
+        "picked-up request must not be re-pinged"
+    );
 }
 
 #[tokio::test]

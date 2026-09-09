@@ -42,10 +42,10 @@ specs/1268_pr_review_process.md
 This feature should automate that actual process doc:
 
 1. post `@codex review`
-2. wait 5 minutes
+2. wait 10 minutes
 3. poll for review
-4. wait 5 more minutes
-5. if still no review, post another `@codex review`
+4. wait 10 more minutes
+5. if still no review or acknowledgement, post another `@codex review`
 6. repeat until a fresh review lands
 
 ## Problem
@@ -62,7 +62,7 @@ That creates repeated failure modes:
 1. the comment posts but Codex never picks it up
 2. the agent polls at the wrong moment and decides nothing happened
 3. the agent sees an older Codex review/comment and mistakes it for the current request
-4. the agent forgets when to re-ping after 10 minutes
+4. the agent forgets when to re-ping an unacknowledged request after 20 minutes
 5. the agent is interrupted or compacted while waiting, so the review loop disappears
 
 This is the wrong layer. Session Manager already owns durable asynchronous wakeups.
@@ -304,24 +304,25 @@ Per active request:
    - save `attempt_count = 1`
    - save `latest_request_comment_id`
    - save `latest_request_posted_at`
-   - set `next_retry_at = requested_at + 10 minutes`
+   - set `next_retry_at = requested_at + 20 minutes`
 2. every poll interval:
    - fetch the latest state of the request comment
    - if Codex eye reaction is present and `pickup_detected_at` is null:
      - set `pickup_detected_at = now`
+     - clear `next_retry_at`
    - fetch PR reviews newer than `latest_request_posted_at`
    - fetch PR issue comments newer than `latest_request_posted_at`
    - if a fresh Codex review/comment is found:
      - mark request `completed`
      - queue a wake message to `notify_session_id`
      - stop polling
-3. if no landing event and `now >= next_retry_at`:
+3. if there is no pickup or landing event and `now >= next_retry_at`:
    - post another `@codex review`
    - increment `attempt_count`
    - replace `latest_request_comment_id`
    - replace `latest_request_posted_at`
    - clear `pickup_detected_at` for the new attempt
-   - set `next_retry_at = now + 10 minutes`
+   - set `next_retry_at = now + 20 minutes`
 4. if the notify target session disappears:
    - cancel the request automatically, same pattern as job watches
 
@@ -476,11 +477,12 @@ So this should reuse the job-watch architecture, not the exact job-watch schema.
 
 1. `sm request-codex-review 616` posts `@codex review`, persists a registration, and returns immediately.
 2. If the request comment gets an eye reaction, status surfaces show pickup.
-3. If no fresh review/comment lands within 10 minutes, SM posts another `@codex review`.
-4. Older Codex comments/reviews from before the current request do not satisfy the watch.
-5. When a fresh Codex review/comment lands, SM sends a wake message to the notify target and marks the request completed.
-6. Active requests survive Session Manager restart.
-7. Agents can list/status/cancel active review requests.
+3. If Codex has not acknowledged the request and no fresh review/comment lands within 20 minutes, SM posts another `@codex review`.
+4. Once Codex acknowledges the current request comment with an eyes reaction, SM clears the scheduled retry and continues polling for a review or failure comment without posting another trigger.
+5. Older Codex comments/reviews from before the current request do not satisfy the watch.
+6. When a fresh Codex review/comment lands, SM sends a wake message to the notify target and marks the request completed.
+7. Active requests survive Session Manager restart.
+8. Agents can list/status/cancel active review requests.
 
 ## Suggested test coverage
 
@@ -489,9 +491,11 @@ So this should reuse the job-watch architecture, not the exact job-watch schema.
 3. old Codex review before `latest_request_posted_at` is ignored
 4. fresh Codex review completes the registration and queues a wake message
 5. fresh Codex issue comment completes the registration and queues a wake message
-6. no landing event by `next_retry_at` posts another `@codex review`
-7. restart recovery resumes polling active requests
-8. notify target missing auto-cancels the registration
+6. no acknowledgement or landing event by `next_retry_at` posts another `@codex review`
+7. acknowledgement clears `next_retry_at` and restart recovery does not re-ping the acknowledged request
+8. steer text uses a distinct `Steer:` label and normalizes an accidental leading `@codex review`
+9. restart recovery resumes polling active requests
+10. notify target missing auto-cancels the registration
 
 ## Classification
 

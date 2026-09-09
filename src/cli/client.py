@@ -1678,7 +1678,7 @@ class SessionManagerClient:
         notify_target: Optional[str] = None,
         requester_session_id: Optional[str] = None,
         poll_interval_seconds: int = 30,
-        retry_interval_seconds: int = 600,
+        retry_interval_seconds: int = 1200,
     ) -> dict:
         """Create one durable Codex PR review request."""
         payload = {

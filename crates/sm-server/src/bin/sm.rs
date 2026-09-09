@@ -603,7 +603,7 @@ struct RequestCodexReviewArgs {
     pr_number: Option<i64>,
     #[arg(long = "poll-interval", global = true, default_value_t = 30)]
     poll_interval_seconds: i64,
-    #[arg(long = "retry-interval", global = true, default_value_t = 600)]
+    #[arg(long = "retry-interval", global = true, default_value_t = 1200)]
     retry_interval_seconds: i64,
     #[command(subcommand)]
     command: Option<RequestCodexReviewCommand>,
@@ -6623,6 +6623,13 @@ mod tests {
         assert_eq!(create_args.poll_interval_seconds, 45);
         assert_eq!(create_args.retry_interval_seconds, 900);
         assert!(create_args.command.is_none());
+
+        let default_create_cli =
+            Cli::try_parse_from(["sm", "request-codex-review", "967"]).unwrap();
+        let Command::RequestCodexReview(default_create_args) = default_create_cli.command else {
+            panic!("expected request-codex-review command");
+        };
+        assert_eq!(default_create_args.retry_interval_seconds, 1200);
 
         let list_cli = Cli::try_parse_from([
             "sm",

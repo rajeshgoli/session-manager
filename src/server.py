@@ -934,7 +934,7 @@ class CodexReviewRequestCreateRequest(BaseModel):
     notify_target: Optional[str] = None
     requester_session_id: Optional[str] = None
     poll_interval_seconds: int = Field(default=30, gt=0)
-    retry_interval_seconds: int = Field(default=600, gt=0)
+    retry_interval_seconds: int = Field(default=1200, gt=0)
 
 
 class CodexReviewRequestResponse(BaseModel):

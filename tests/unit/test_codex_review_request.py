@@ -92,7 +92,7 @@ async def test_register_codex_review_request_persists_and_lists(mq, mock_session
     assert reg.id in mq._codex_review_requests
     assert mq.list_codex_review_requests(notify_session_id="agent618")[0].pr_number == 42
     assert reg.requested_at == datetime(2026, 4, 17, 0, 0, 0)
-    assert reg.next_retry_at == datetime(2026, 4, 17, 0, 10, 0)
+    assert reg.next_retry_at == datetime(2026, 4, 17, 0, 20, 0)
 
     conn = sqlite3.connect(temp_db_path)
     row = conn.execute(
@@ -641,6 +641,45 @@ async def test_codex_review_request_retry_persists_attempt_when_comment_refresh_
     assert persisted_attempts[-1]["latest_request_comment_id"] == 999
 
 
+@pytest.mark.asyncio
+async def test_codex_review_request_pickup_clears_and_suppresses_retry(mq):
+    reg = CodexReviewRequestRegistration(
+        id="req-picked-up",
+        repo="owner/repo",
+        pr_number=42,
+        requester_session_id="agent618",
+        notify_session_id="agent618",
+        steer=None,
+        requested_at=datetime(2026, 4, 17, 0, 0, 0),
+        latest_request_comment_id=321,
+        latest_request_comment_url="https://github.com/owner/repo/pull/42#issuecomment-321",
+        latest_request_posted_at=datetime(2026, 4, 17, 0, 0, 0),
+        attempt_count=1,
+        next_retry_at=datetime(2026, 4, 17, 0, 0, 0),
+    )
+    mq._codex_review_requests[reg.id] = reg
+
+    async def immediate_sleep(_seconds):
+        return None
+
+    def stop_after_persist(_request_id, **_kwargs):
+        reg.is_active = False
+
+    with patch("asyncio.sleep", side_effect=immediate_sleep):
+        with patch("src.message_queue.detect_codex_pickup", return_value=True):
+            with patch("src.message_queue.find_fresh_codex_review_or_comment", return_value=None):
+                with patch("src.message_queue.post_pr_review_comment") as post_comment:
+                    with patch.object(
+                        mq, "_update_codex_review_request_db", side_effect=stop_after_persist
+                    ) as update_db:
+                        await mq._run_codex_review_request_task(reg.id)
+
+    assert reg.pickup_detected_at is not None
+    assert reg.next_retry_at is None
+    post_comment.assert_not_called()
+    assert update_db.call_args.kwargs["next_retry_at"] is None
+
+
 def test_codex_review_request_endpoints_roundtrip(mock_session_manager):
     queue_mgr = MagicMock()
     reg = CodexReviewRequestRegistration(
@@ -811,7 +850,7 @@ class TestClientCodexReviewRequest:
                 {
                     "pr_number": 42,
                     "poll_interval_seconds": 30,
-                    "retry_interval_seconds": 600,
+                    "retry_interval_seconds": 1200,
                     "repo": "owner/repo",
                     "steer": "focus on races",
                     "notify_target": "maintainer",
