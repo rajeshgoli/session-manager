@@ -173,17 +173,18 @@ cargo build -p sm-server --release
 The server, CLI, and `sm watch` terminal dashboard are native Rust. No Python
 environment is needed. Refresh the installed CLI with `./scripts/install-sm-cli.sh`.
 
-In `sm watch`, agents show running/waiting job counts and elapsed time (the
-oldest age when there are multiple jobs), hold reasons, and the agents with
+In `sm watch`, each job has one row showing its state and elapsed time.
+Waiting agents also show hold reasons and the agents with
 running or earlier queued jobs across the global queue. Earlier enqueue time
 is context, not a guaranteed execution order: admission also depends on job
 type, capacity, and cooldowns. Jobs appear under both their requester and their
 notification target when those differ.
 
-Press `Tab` to expand an agent's details and job list, or `J` to open its job
-browser. Running job summaries and job rows are green. Select a job with `j/k`
-and press `Tab` to follow its last five log lines, either in expanded agent
-details or in the job browser. Inside the browser, `t` or `Enter` switches to a
+Jobs are separate selectable rows beneath each agent, visible without expanding
+the agent. Running job rows are green. Select a job with `j/k`
+and press `Tab` to follow only its last five log lines. `Tab` on the agent itself
+expands only agent details and agent output; `J` opens its job browser.
+Inside the browser, `t` or `Enter` switches to a
 200-line live tail (press again to hide it), and `g` switches between that agent
 and all agents. `PgUp/PgDn` scrolls
 the last 200 log lines; `End` returns to the newest output. `q` or `Esc` returns
@@ -191,7 +192,7 @@ to the dashboard. Queue and log reads run in the background; unavailable data
 is marked explicitly. Jobs that finish while the browser is open remain
 available there for inspecting their final logs.
 
-The dashboard retains session trees, filtering, send/rename/create/fork/attach,
+The dashboard retains session trees, filtering, send/rename/create/attach,
 double-press retirement, reparent decisions/repair, and `--restore` browsing.
 Use `PgUp/PgDn` to scroll expanded details and `?` for the keyboard reference.
 
