@@ -72,7 +72,13 @@ fn job_age(job: &Value, now: i64) -> String {
     }
 }
 fn owns(job: &Value, id: &str) -> bool {
-    !id.is_empty() && (s(job, "requester_session_id") == id || s(job, "notify_session_id") == id)
+    let requester = s(job, "requester_session_id");
+    !id.is_empty()
+        && if requester.is_empty() {
+            s(job, "notify_session_id") == id
+        } else {
+            requester == id
+        }
 }
 fn owner(job: &Value) -> &str {
     [
@@ -92,12 +98,6 @@ fn queue_context(jobs: &[Value], id: &str) -> Vec<String> {
         .iter()
         .filter(|j| owns(j, id) && s(j, "state") == "pending")
         .collect();
-    let Some(oldest) = own
-        .iter()
-        .min_by_key(|j| stamp(s(j, "queued_at")).unwrap_or(i64::MAX))
-    else {
-        return lines;
-    };
     let reasons: BTreeSet<_> = own
         .iter()
         .map(|j| s(j, "holding_reason"))
@@ -112,22 +112,6 @@ fn queue_context(jobs: &[Value], id: &str) -> Vec<String> {
                 .join(", ")
                 .replace('_', " ")
         ));
-    }
-    for (running, description) in [
-        (true, "running globally"),
-        (false, "earlier queued globally"),
-    ] {
-        let contenders: Vec<_> = jobs.iter().filter(|j| if running {s(j,"state")=="running"} else {
-                    s(j,"state")=="pending" && matches!((stamp(s(j,"queued_at")),stamp(s(oldest,"queued_at"))), (Some(a),Some(b)) if a<b)
-                }).collect();
-        if !contenders.is_empty() {
-            let owners: BTreeSet<_> = contenders.iter().map(|j| owner(j)).collect();
-            lines.push(format!(
-                "{} {description} by {}",
-                contenders.len(),
-                owners.into_iter().collect::<Vec<_>>().join(", ")
-            ));
-        }
     }
     lines
 }
@@ -420,13 +404,23 @@ fn refresh(
                 shared.lock().unwrap().jobs.push(job);
             }
         }
-        let text = match client.get(&format!(
-            "/queue-jobs/{}/log?lines={}",
-            enc(id),
-            interest.log_lines
-        )) {
-            Ok(v) => clean(s(&v, "text")),
-            Err(e) => format!("Log unavailable: {e}"),
+        let pending = shared
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .any(|j| s(j, "id") == id && s(j, "state") == "pending");
+        let text = if pending {
+            "Waiting to start — no log yet. Following automatically when the job starts.".into()
+        } else {
+            match client.get(&format!(
+                "/queue-jobs/{}/log?lines={}",
+                enc(id),
+                interest.log_lines
+            )) {
+                Ok(v) => clean(s(&v, "text")),
+                Err(e) => format!("Log unavailable: {e}"),
+            }
         };
         let mut state = shared.lock().unwrap();
         state.log_id = id.clone();
@@ -1141,6 +1135,14 @@ fn navigation(rows: &[Row], selection: &mut Option<Target>, delta: isize) {
         .unwrap_or(0);
     *selection = Some(targets[index.saturating_add_signed(delta).min(targets.len() - 1)].clone());
 }
+fn refresh_interest(worker: &Worker, view: &View, interest: &mut Interest) -> Result<()> {
+    let next = view.interest();
+    if next != *interest {
+        worker.tx.send(Work::Refresh(next.clone()))?;
+        *interest = next;
+    }
+    Ok(())
+}
 /// Wrap status/details so queue owner names remain readable on narrow terminals.
 fn wrap_rows(rows: Vec<Row>, width: usize) -> Vec<Row> {
     let mut result = Vec::new();
@@ -1409,6 +1411,14 @@ fn configured_node(config: &serde_yaml::Value) -> Option<String> {
             .map(str::to_owned)
     })
 }
+fn expand_home(path: &str) -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    match (path, home) {
+        ("~", Some(home)) => home,
+        (path, Some(home)) if path.starts_with("~/") => home.join(&path[2..]),
+        _ => path.into(),
+    }
+}
 pub(super) fn run(url: &str, mut args: WatchArgs) -> Result<()> {
     if args.restore && !args.all_nodes && args.node.is_none() {
         if let Ok(text) = std::fs::read_to_string(super::client_config_path()) {
@@ -1417,11 +1427,7 @@ pub(super) fn run(url: &str, mut args: WatchArgs) -> Result<()> {
         }
     }
     if let Some(repo) = &mut args.repo {
-        let path = if let Some(suffix) = repo.strip_prefix("~/") {
-            std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(suffix)
-        } else {
-            std::path::PathBuf::from(&*repo)
-        };
+        let path = expand_home(repo);
         *repo = std::fs::canonicalize(&path)
             .unwrap_or_else(|_| {
                 if path.is_absolute() {
@@ -1470,6 +1476,7 @@ pub(super) fn run(url: &str, mut args: WatchArgs) -> Result<()> {
         {
             navigation(&rows, selection, 0);
         }
+        refresh_interest(&worker, &view, &mut interest)?;
         let output = frame(&mut view, &snap, &args, &rows, h, w);
         if output != last_frame {
             print!("{output}");
@@ -1524,11 +1531,7 @@ pub(super) fn run(url: &str, mut args: WatchArgs) -> Result<()> {
                 view.flash = e.to_string();
             }
         }
-        let next = view.interest();
-        if next != interest {
-            worker.tx.send(Work::Refresh(next.clone()))?;
-            interest = next;
-        }
+        refresh_interest(&worker, &view, &mut interest)?;
     }
     Ok(())
 }
@@ -1721,9 +1724,9 @@ fn handle_key(
                 return Ok(());
             };
             let path = if path.is_empty() {
-                default
+                expand_home(default)
             } else {
-                path.as_str()
+                expand_home(&path)
             };
             let path = std::fs::canonicalize(path).context("Working directory does not exist")?;
             if !path.is_dir() {

@@ -174,11 +174,9 @@ The server, CLI, and `sm watch` terminal dashboard are native Rust. No Python
 environment is needed. Refresh the installed CLI with `./scripts/install-sm-cli.sh`.
 
 In `sm watch`, each job has one row showing its state and elapsed time.
-Waiting agents also show hold reasons and the agents with
-running or earlier queued jobs across the global queue. Earlier enqueue time
-is context, not a guaranteed execution order: admission also depends on job
-type, capacity, and cooldowns. Jobs appear under both their requester and their
-notification target when those differ.
+Waiting agents also show their jobs' hold reasons. Each agent lists only jobs
+it submitted (older records without a requester fall back to the notification
+target). Global jobs are available through `g` in the job browser.
 
 Jobs are separate selectable rows beneath each agent, visible without expanding
 the agent. Running job rows are green. Select a job with `j/k`
@@ -191,6 +189,8 @@ the last 200 log lines; `End` returns to the newest output. `q` or `Esc` returns
 to the dashboard. Queue and log reads run in the background; unavailable data
 is marked explicitly. Jobs that finish while the browser is open remain
 available there for inspecting their final logs.
+Pending jobs show "Waiting to start — no log yet"; the tail starts automatically
+when the job runs.
 
 The dashboard retains session trees, filtering, send/rename/create/attach,
 double-press retirement, reparent decisions/repair, and `--restore` browsing.

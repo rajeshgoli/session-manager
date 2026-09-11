@@ -147,7 +147,7 @@ fn agent_expansion_and_job_tail_are_independent() {
     assert!(!frame(&mut view, &snap, &a, &rows, 40, 100).contains("agent-only-output"));
 }
 #[test]
-fn queue_reports_global_contention_not_false_fifo_dependencies() {
+fn agent_queue_only_shows_its_requesters_jobs_and_hold_reasons() {
     let mut pending = job("p", "a", "pending");
     pending["holding_reason"] = json!("concurrency_cap");
     let running = job("r", "b", "running");
@@ -159,14 +159,15 @@ fn queue_reports_global_contention_not_false_fifo_dependencies() {
     let text = queue_context(&jobs, "a").join("\n");
     assert!(!text.contains("job waiting"));
     assert!(text.contains("held: concurrency cap"));
-    assert!(text.contains("1 running globally by b"));
-    assert!(text.contains("1 earlier queued globally by c"));
+    assert!(!text.contains("globally"));
     assert!(!text.contains("by d"));
     assert!(!text.contains("behind"));
     assert!(queue_context(&jobs, "missing").is_empty());
     let mut delegated = job("d", "a", "running");
     delegated["notify_session_id"] = json!("b");
-    assert!(owns(&delegated, "a") && owns(&delegated, "b"));
+    assert!(owns(&delegated, "a") && !owns(&delegated, "b"));
+    delegated["requester_session_id"] = Value::Null;
+    assert!(owns(&delegated, "b"));
 }
 #[test]
 fn repo_filter_keeps_cross_repo_tree_but_role_and_text_do_not() {
@@ -257,6 +258,55 @@ fn job_browser_keeps_completed_jobs_and_selection_across_refresh() {
     view.global = true;
     assert_eq!(view.rows(&snap, &a, 0).len(), 2);
 }
+
+#[test]
+fn automatic_job_reselection_refreshes_tail_interest() {
+    let a = args();
+    let (worker, rx) = fake_worker();
+    let mut view = View::new(&a);
+    view.jobs_for = Some("a".into());
+    view.global = true;
+    view.tail = true;
+    view.job_selected = Some(Target::Job("other".into()));
+    let snap = Snapshot {
+        jobs: vec![job("local", "a", "running"), job("other", "b", "running")],
+        ..Default::default()
+    };
+    view.rows(&snap, &a, 0);
+    let mut interest = view.interest();
+    assert_eq!(interest.log, "other");
+
+    view.global = false;
+    let rows = view.rows(&snap, &a, 0);
+    let selection = view.active_selection();
+    if !rows
+        .iter()
+        .any(|row| row.target.is_some() && &row.target == selection)
+    {
+        navigation(&rows, selection, 0);
+    }
+    refresh_interest(&worker, &view, &mut interest).unwrap();
+
+    assert_eq!(view.job_selected, Some(Target::Job("local".into())));
+    assert!(matches!(
+        rx.try_recv().unwrap(),
+        Work::Refresh(Interest { log, .. }) if log == "local"
+    ));
+}
+
+#[test]
+fn create_paths_expand_home_before_canonicalization() {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return;
+    };
+    assert_eq!(expand_home("~"), home);
+    assert_eq!(expand_home("~/project"), home.join("project"));
+    assert_eq!(
+        expand_home("/tmp/project"),
+        std::path::PathBuf::from("/tmp/project")
+    );
+}
+
 #[test]
 fn retire_requires_second_press_same_session_and_unexpired_confirmation() {
     let a = args();
@@ -455,5 +505,34 @@ fn refresh_retains_snapshot_on_failure_and_reads_final_remote_tail() {
     update_list(&client, &state, "/queue-jobs", "jobs", "queue");
     assert_eq!(state.lock().unwrap().jobs.len(), 1);
     assert!(state.lock().unwrap().errors["queue"].contains("offline"));
+    peer.join().unwrap();
+}
+
+#[test]
+fn pending_job_skips_missing_log_then_follows_when_it_starts() {
+    let (client, peer) = server(vec![
+        ("/sessions", 200, json!({"sessions":[]})),
+        ("/queue-jobs", 200, json!({"jobs":[job("j","a","pending")]})),
+        ("/reparent-requests", 200, json!({"requests":[]})),
+        ("/sessions", 200, json!({"sessions":[]})),
+        ("/queue-jobs", 200, json!({"jobs":[job("j","a","running")]})),
+        ("/reparent-requests", 200, json!({"requests":[]})),
+        (
+            "/queue-jobs/j/log?lines=5",
+            200,
+            json!({"text":"started output"}),
+        ),
+    ]);
+    let state = Arc::new(Mutex::new(Snapshot::default()));
+    let interest = Interest {
+        log: "j".into(),
+        log_lines: 5,
+        ..Default::default()
+    };
+    refresh(&client, &state, &interest, false, "primary", false);
+    assert!(state.lock().unwrap().log.contains("Waiting to start"));
+    assert!(!state.lock().unwrap().log.contains("404"));
+    refresh(&client, &state, &interest, false, "primary", false);
+    assert_eq!(state.lock().unwrap().log, "started output");
     peer.join().unwrap();
 }
