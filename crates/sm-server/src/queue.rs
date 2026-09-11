@@ -3270,11 +3270,7 @@ fn host_memory_capacity() -> Option<(i64, i64)> {
     #[cfg(target_os = "linux")]
     {
         let text = fs::read_to_string("/proc/meminfo").ok()?;
-        let host = parse_linux_meminfo(&text)?;
-        return Some(
-            linux_cgroup_memory_capacity()
-                .map_or(host, |cgroup| combine_memory_capacities(host, cgroup)),
-        );
+        return parse_linux_meminfo(&text);
     }
     #[allow(unreachable_code)]
     None
@@ -3323,7 +3319,7 @@ fn parse_macos_memory_pressure(text: &str) -> Option<(i64, i64)> {
     Some((total, total.checked_mul(free_percent)?.checked_div(100)?))
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn parse_linux_meminfo(text: &str) -> Option<(i64, i64)> {
     let kib = |name: &str| {
         text.lines()
@@ -3337,101 +3333,6 @@ fn parse_linux_meminfo(text: &str) -> Option<(i64, i64)> {
         kib("MemTotal:")?.checked_mul(1024)?,
         kib("MemAvailable:")?.checked_mul(1024)?,
     ))
-}
-
-#[cfg(any(target_os = "linux", test))]
-#[cfg_attr(test, allow(dead_code))]
-fn linux_cgroup_memory_capacity() -> Option<(i64, i64)> {
-    let membership = fs::read_to_string("/proc/self/cgroup").ok()?;
-    let (version, relative_path) = parse_linux_memory_cgroup(&membership)?;
-    let root = if version == 2 {
-        PathBuf::from("/sys/fs/cgroup")
-    } else {
-        PathBuf::from("/sys/fs/cgroup/memory")
-    };
-    let leaf = safe_cgroup_path(&root, &relative_path)?;
-    let (limit_file, usage_file) = if version == 2 {
-        ("memory.max", "memory.current")
-    } else {
-        ("memory.limit_in_bytes", "memory.usage_in_bytes")
-    };
-
-    let mut capacity = None;
-    let mut directory = leaf.as_path();
-    loop {
-        if let (Ok(limit), Ok(usage)) = (
-            fs::read_to_string(directory.join(limit_file)),
-            fs::read_to_string(directory.join(usage_file)),
-        ) {
-            if let Some(level) = parse_linux_cgroup_memory_capacity(&limit, &usage) {
-                capacity = Some(
-                    capacity.map_or(level, |current| combine_memory_capacities(current, level)),
-                );
-            }
-        }
-        if directory == root {
-            break;
-        }
-        directory = directory.parent()?;
-        if !directory.starts_with(&root) {
-            break;
-        }
-    }
-    capacity
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn parse_linux_memory_cgroup(text: &str) -> Option<(u8, String)> {
-    let mut v1 = None;
-    for line in text.lines() {
-        let mut fields = line.splitn(3, ':');
-        let hierarchy = fields.next()?;
-        let controllers = fields.next()?;
-        let path = fields.next()?;
-        if hierarchy == "0" && controllers.is_empty() {
-            return Some((2, path.to_owned()));
-        }
-        if controllers
-            .split(',')
-            .any(|controller| controller == "memory")
-        {
-            v1 = Some((1, path.to_owned()));
-        }
-    }
-    v1
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn safe_cgroup_path(root: &Path, relative_path: &str) -> Option<PathBuf> {
-    let mut result = root.to_path_buf();
-    for component in Path::new(relative_path.trim_start_matches('/')).components() {
-        match component {
-            std::path::Component::Normal(part) => result.push(part),
-            std::path::Component::CurDir => {}
-            _ => return None,
-        }
-    }
-    Some(result)
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn parse_linux_cgroup_memory_capacity(limit: &str, usage: &str) -> Option<(i64, i64)> {
-    let limit = limit
-        .trim()
-        .parse::<i64>()
-        .ok()
-        .filter(|value| *value > 0)?;
-    let usage = usage
-        .trim()
-        .parse::<i64>()
-        .ok()
-        .filter(|value| *value >= 0)?;
-    Some((limit, limit.saturating_sub(usage)))
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn combine_memory_capacities(left: (i64, i64), right: (i64, i64)) -> (i64, i64) {
-    (left.0.min(right.0), left.1.min(right.1))
 }
 
 fn displace_background_for_perf_conn(
@@ -5302,39 +5203,6 @@ mod tests {
         assert_eq!(
             parse_process_group_rss_bytes(" 42 1024\n 7 9000\n 42 2048\n", 42),
             Some(3 * 1024 * 1024)
-        );
-    }
-
-    #[test]
-    fn linux_memory_capacity_honors_cgroup_v1_v2_and_parent_caps() {
-        let host =
-            parse_linux_meminfo("MemTotal:       33554432 kB\nMemAvailable:   25165824 kB\n")
-                .unwrap();
-        assert_eq!(host, (32 * 1024 * 1024 * 1024, 24 * 1024 * 1024 * 1024));
-        assert_eq!(
-            parse_linux_memory_cgroup("0::/system.slice/session-manager.service\n"),
-            Some((2, "/system.slice/session-manager.service".into()))
-        );
-        assert_eq!(
-            parse_linux_memory_cgroup("7:cpu:/agent\n6:memory:/agent\n"),
-            Some((1, "/agent".into()))
-        );
-        assert_eq!(
-            parse_linux_cgroup_memory_capacity("17179869184\n", "4294967296\n"),
-            Some((16 * 1024 * 1024 * 1024, 12 * 1024 * 1024 * 1024))
-        );
-        assert_eq!(parse_linux_cgroup_memory_capacity("max\n", "0\n"), None);
-        assert_eq!(
-            combine_memory_capacities(host, (16 * 1024 * 1024 * 1024, 12 * 1024 * 1024 * 1024),),
-            (16 * 1024 * 1024 * 1024, 12 * 1024 * 1024 * 1024)
-        );
-        assert_eq!(
-            safe_cgroup_path(Path::new("/sys/fs/cgroup"), "/agent/child"),
-            Some(PathBuf::from("/sys/fs/cgroup/agent/child"))
-        );
-        assert_eq!(
-            safe_cgroup_path(Path::new("/sys/fs/cgroup"), "/../escape"),
-            None
         );
     }
 

@@ -187,7 +187,7 @@ The gates are:
 1. Memory headroom for the declared reservation.
 2. Perf cooldown.
 
-Memory preflight reads macOS memory pressure or Linux `MemAvailable` before starting a perf job. On Linux, any finite memory limit on the process's cgroup v1/v2 hierarchy further caps both total and available memory, preventing node-wide `/proc/meminfo` from admitting a job that cannot fit inside its container or systemd unit. Admission requires the declared memory budget plus a safety reserve. On macOS the reserve is the larger of the configured floor and 8 GiB. This leaves enough operating-system headroom without withholding 10% (25.6 GiB) of the current 256 GB host from useful work.
+Memory preflight reads macOS memory pressure before starting a perf job. Admission requires the declared memory budget plus a safety reserve. On macOS the reserve is the larger of the configured floor and 8 GiB. This leaves enough operating-system headroom without withholding 10% (25.6 GiB) of the current 256 GB host from useful work.
 
 ```yaml
 queue_runner:
