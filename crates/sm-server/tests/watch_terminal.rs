@@ -82,6 +82,10 @@ fn native_watch_handles_key_bursts_live_logs_resize_and_signal_cleanup() {
                 "unexpected mutation: {request}"
             );
             let path = request.split_whitespace().nth(1).unwrap();
+            assert!(
+                !path.contains("/output") && !path.contains("/tool-calls"),
+                "job tail must not fetch agent output: {path}"
+            );
             let body=match path {
             "/sessions"=>json!({"sessions":[{"id":"agent001","friendly_name":"needle","working_dir":"/repo","status":"running","activity_state":"idle","provider":"claude"}]}),
             "/queue-jobs"=>json!({"jobs":[{"id":"job001","requester_session_id":"agent001","notify_session_id":"agent001","state":"running","label":"fixture-job","queued_at":"2026-09-10T10:00:00Z","started_at":"2026-09-10T10:00:01Z"}]}),
@@ -124,8 +128,9 @@ fn native_watch_handles_key_bursts_live_logs_resize_and_signal_cleanup() {
             .spawn()
             .unwrap(),
     );
-    until(&mut master, "1 job running");
-    master.write_all(b"/needle\rJ\t").unwrap();
+    until(&mut master, "job job001 running");
+    // The job is directly selectable without expanding the agent or pressing J.
+    master.write_all(b"/needle\rj\t").unwrap();
     until(&mut master, "five-line-output");
     master.write_all(b"t").unwrap();
     until(&mut master, "fixture-live-output");

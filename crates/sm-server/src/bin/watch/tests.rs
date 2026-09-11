@@ -57,7 +57,7 @@ fn ages_distinguish_wait_start_and_terminal_duration() {
 }
 
 #[test]
-fn running_summaries_and_selectable_jobs_are_green_and_tab_follows_five_lines() {
+fn running_jobs_appear_once_are_green_and_tab_follows_five_lines() {
     let a = args();
     let mut view = View::new(&a);
     let snap = Snapshot {
@@ -65,11 +65,14 @@ fn running_summaries_and_selectable_jobs_are_green_and_tab_follows_five_lines() 
         jobs: vec![job("j", "a", "running")],
         ..Default::default()
     };
-    view.expanded.insert("a".into());
     let rows = view.rows(&snap, &a, 0);
-    assert!(rows
-        .iter()
-        .any(|r| r.text.contains("1 job running") && r.style == "\x1b[32m"));
+    assert!(!rows.iter().any(|r| r.text.contains("1 job running")));
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.text.contains("job j running"))
+            .count(),
+        1
+    );
     let target = Target::SessionJob("a".into(), "j".into());
     assert!(rows
         .iter()
@@ -80,6 +83,7 @@ fn running_summaries_and_selectable_jobs_are_green_and_tab_follows_five_lines() 
     assert_eq!(view.jobs_for.as_deref(), Some("a"));
     assert_eq!(view.interest().log, "j");
     assert_eq!(view.interest().log_lines, 5);
+    assert!(view.interest().details.is_empty());
     let rows = view.rows(&snap, &a, 0);
     assert_eq!(rows[0].style, "\x1b[32m");
     let snap = Snapshot {
@@ -93,9 +97,57 @@ fn running_summaries_and_selectable_jobs_are_green_and_tab_follows_five_lines() 
     assert!(text.contains("unique-line-8"));
     assert!(text.contains("last 5 lines"));
 }
+
+#[test]
+fn agent_expansion_and_job_tail_are_independent() {
+    let a = args();
+    let mut view = View::new(&a);
+    let snap = Snapshot {
+        sessions: vec![session("a", "", "/repo")],
+        jobs: vec![job("j", "a", "running")],
+        details: BTreeMap::from([(
+            "a".into(),
+            vec![
+                "Agent output (last 10 lines):".into(),
+                "agent-only-output".into(),
+            ],
+        )]),
+        ..Default::default()
+    };
+    let rows = view.rows(&snap, &a, 0);
+    assert!(rows
+        .iter()
+        .any(|r| r.target == Some(Target::SessionJob("a".into(), "j".into()))));
+    assert!(!rows.iter().any(|r| r.text.contains("agent-only-output")));
+    view.expanded.insert("a".into());
+    let rows = view.rows(&snap, &a, 0);
+    let agent_output = rows
+        .iter()
+        .position(|r| r.text.contains("agent-only-output"))
+        .unwrap();
+    let job_target = Target::SessionJob("a".into(), "j".into());
+    assert!(
+        agent_output
+            < rows
+                .iter()
+                .position(|r| r.target.as_ref() == Some(&job_target))
+                .unwrap()
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.target.as_ref() == Some(&job_target))
+            .count(),
+        1
+    );
+    let (worker, _) = fake_worker();
+    view.selected = Some(job_target);
+    handle_key(Key::Tab, &mut view, &worker, &snap, &a).unwrap();
+    assert!(view.interest().details.is_empty());
+    let rows = view.rows(&snap, &a, 0);
+    assert!(!frame(&mut view, &snap, &a, &rows, 40, 100).contains("agent-only-output"));
+}
 #[test]
 fn queue_reports_global_contention_not_false_fifo_dependencies() {
-    let now = stamp("2026-09-10T10:10:00Z").unwrap();
     let mut pending = job("p", "a", "pending");
     pending["holding_reason"] = json!("concurrency_cap");
     let running = job("r", "b", "running");
@@ -104,14 +156,14 @@ fn queue_reports_global_contention_not_false_fifo_dependencies() {
     let mut later = job("l", "d", "pending");
     later["queued_at"] = json!("2026-09-10T10:01:00Z");
     let jobs = vec![pending, running, earlier, later];
-    let text = queue_summary(&jobs, "a", now).join("\n");
-    assert!(text.contains("1 job waiting for 10m"));
+    let text = queue_context(&jobs, "a").join("\n");
+    assert!(!text.contains("job waiting"));
     assert!(text.contains("held: concurrency cap"));
     assert!(text.contains("1 running globally by b"));
     assert!(text.contains("1 earlier queued globally by c"));
     assert!(!text.contains("by d"));
     assert!(!text.contains("behind"));
-    assert!(queue_summary(&jobs, "missing", now).is_empty());
+    assert!(queue_context(&jobs, "missing").is_empty());
     let mut delegated = job("d", "a", "running");
     delegated["notify_session_id"] = json!("b");
     assert!(owns(&delegated, "a") && owns(&delegated, "b"));

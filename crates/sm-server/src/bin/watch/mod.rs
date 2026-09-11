@@ -86,63 +86,47 @@ fn owner(job: &Value) -> &str {
     .find(|v| !v.is_empty())
     .unwrap_or("unknown")
 }
-fn queue_summary(jobs: &[Value], id: &str, now: i64) -> Vec<String> {
+fn queue_context(jobs: &[Value], id: &str) -> Vec<String> {
     let mut lines = Vec::new();
-    for (state, label) in [("running", "running"), ("pending", "waiting")] {
-        let own: Vec<_> = jobs
-            .iter()
-            .filter(|j| owns(j, id) && s(j, "state") == state)
-            .collect();
-        let key = if state == "pending" {
-            "queued_at"
-        } else {
-            "started_at"
-        };
-        let Some(oldest) = own
-            .iter()
-            .min_by_key(|j| stamp(s(j, key)).unwrap_or(i64::MAX))
-        else {
-            continue;
-        };
+    let own: Vec<_> = jobs
+        .iter()
+        .filter(|j| owns(j, id) && s(j, "state") == "pending")
+        .collect();
+    let Some(oldest) = own
+        .iter()
+        .min_by_key(|j| stamp(s(j, "queued_at")).unwrap_or(i64::MAX))
+    else {
+        return lines;
+    };
+    let reasons: BTreeSet<_> = own
+        .iter()
+        .map(|j| s(j, "holding_reason"))
+        .filter(|r| !r.is_empty())
+        .collect();
+    if !reasons.is_empty() {
         lines.push(format!(
-            "{} job{} {label} for {}{}",
-            own.len(),
-            if own.len() == 1 { "" } else { "s" },
-            job_age(oldest, now),
-            if own.len() > 1 { " (oldest)" } else { "" }
+            "held: {}",
+            reasons
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ")
+                .replace('_', " ")
         ));
-        if state == "pending" {
-            let reasons: BTreeSet<_> = own
-                .iter()
-                .map(|j| s(j, "holding_reason"))
-                .filter(|r| !r.is_empty())
-                .collect();
-            if !reasons.is_empty() {
-                lines.push(format!(
-                    "held: {}",
-                    reasons
-                        .into_iter()
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                        .replace('_', " ")
-                ));
-            }
-            for (running, description) in [
-                (true, "running globally"),
-                (false, "earlier queued globally"),
-            ] {
-                let contenders: Vec<_> = jobs.iter().filter(|j| if running {s(j,"state")=="running"} else {
+    }
+    for (running, description) in [
+        (true, "running globally"),
+        (false, "earlier queued globally"),
+    ] {
+        let contenders: Vec<_> = jobs.iter().filter(|j| if running {s(j,"state")=="running"} else {
                     s(j,"state")=="pending" && matches!((stamp(s(j,"queued_at")),stamp(s(oldest,"queued_at"))), (Some(a),Some(b)) if a<b)
                 }).collect();
-                if !contenders.is_empty() {
-                    let owners: BTreeSet<_> = contenders.iter().map(|j| owner(j)).collect();
-                    lines.push(format!(
-                        "{} {description} by {}",
-                        contenders.len(),
-                        owners.into_iter().collect::<Vec<_>>().join(", ")
-                    ));
-                }
-            }
+        if !contenders.is_empty() {
+            let owners: BTreeSet<_> = contenders.iter().map(|j| owner(j)).collect();
+            lines.push(format!(
+                "{} {description} by {}",
+                contenders.len(),
+                owners.into_iter().collect::<Vec<_>>().join(", ")
+            ));
         }
     }
     lines
@@ -416,7 +400,7 @@ fn refresh(
             }
             Err(e) => lines.push(format!("Actions unavailable: {e}")),
         }
-        lines.push("Last 10 output lines:".into());
+        lines.push("Agent output (last 10 lines):".into());
         match client.get(&format!("/sessions/{}/output?lines=10", enc(id))) {
             Ok(v) => lines.extend(clean(s(&v, "output")).lines().map(str::to_owned)),
             Err(e) => lines.push(format!("Output unavailable: {e}")),
@@ -604,7 +588,11 @@ impl View {
     }
     fn interest(&self) -> Interest {
         Interest {
-            details: self.expanded.clone(),
+            details: if self.jobs_for.is_some() {
+                BTreeSet::new()
+            } else {
+                self.expanded.clone()
+            },
             log_lines: self.tail_lines,
             log: if self.tail {
                 match &self.job_selected {
@@ -809,7 +797,7 @@ impl View {
             if !last.is_empty() {
                 rows.push(Row::plain(format!("{prefix}   last: {last}")));
             }
-            for line in queue_summary(&snap.jobs, id, now) {
+            for line in queue_context(&snap.jobs, id) {
                 let mut row = Row::plain(format!("{prefix}   {line}"));
                 if line.contains(" running ") {
                     row.style = "\x1b[32m";
@@ -866,22 +854,6 @@ impl View {
                         "-".into()
                     }
                 )));
-                for j in snap.jobs.iter().filter(|j| owns(j, id)) {
-                    let mut row = Row::selectable(
-                        format!(
-                            "{prefix}   job {} {} {} {}",
-                            s(j, "id"),
-                            s(j, "state"),
-                            job_age(j, now),
-                            s(j, "label")
-                        ),
-                        Target::SessionJob(id.into(), s(j, "id").into()),
-                    );
-                    if s(j, "state") == "running" {
-                        row.style = "\x1b[32m";
-                    }
-                    rows.push(row);
-                }
                 match snap.details.get(id) {
                     Some(lines) => {
                         for line in lines {
@@ -890,6 +862,25 @@ impl View {
                     }
                     None => rows.push(Row::plain("   Loading actions/output...")),
                 }
+            }
+            // Jobs are independent navigation targets, even when the agent is
+            // collapsed. Keep agent output above these rows so it cannot look
+            // like output belonging to the job.
+            for j in snap.jobs.iter().filter(|j| owns(j, id)) {
+                let mut row = Row::selectable(
+                    format!(
+                        "{prefix}   +- job {} {} {} {}",
+                        s(j, "id"),
+                        s(j, "state"),
+                        job_age(j, now),
+                        s(j, "label")
+                    ),
+                    Target::SessionJob(id.into(), s(j, "id").into()),
+                );
+                if s(j, "state") == "running" {
+                    row.style = "\x1b[32m";
+                }
+                rows.push(row);
             }
         }
         if args.restore
@@ -1115,9 +1106,9 @@ fn show_help() -> Result<()> {
         "sm watch — keyboard controls",
         "",
         "j/k or arrows: select agent or reparent request",
-        "Tab: expand details; PgUp/PgDn: scroll long details",
+        "Tab on an agent: agent details; Tab on a job: its live tail",
         "J: jobs; j/k: select job; Tab: follow last 5 lines; g: global queue",
-        "Tab also tails a job selected in expanded agent details; t/Enter: 200-line tail",
+        "Jobs are selectable below collapsed agents; t/Enter: 200-line tail",
         "In logs: PgUp/PgDn scroll; End follows newest output; q goes back",
         "Enter: attach (restore in --restore mode)",
         "s: send message; n: rename; +: create",
