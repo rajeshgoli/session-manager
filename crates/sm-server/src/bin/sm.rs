@@ -437,7 +437,24 @@ struct LookupArgs {
     role: Option<String>,
 }
 
+const QUEUE_SCHEDULING_HELP: &str = "Choosing a job type:
+  tests       Required builds/checks (default). Running tests are not displaced.
+  perf        Measurements. Waits for running tests to finish, then a cooldown
+              after the latest tests/perf finish (30s by default; configurable).
+              Pending tests get a turn after a perf run.
+  background  Interruptible work. A perf run can terminate it as 'displaced';
+              it is not paused or automatically retried. Resubmit if needed.
+  service     Persistent services. Not displaced for perf; uses service capacity.
+
+While perf is running, new jobs wait. While perf waits for tests/cooldown,
+new jobs also wait so it can get a quiet window. Existing services keep running.
+All types are subject to configured concurrency limits; pending jobs retry
+admission automatically. Use 'sm queue status <label-or-id>' for the current
+reason and named blockers. Use tests for required gates, background only when
+interruption is acceptable. Set --label to a meaningful, unique name.";
+
 #[derive(Args)]
+#[command(after_help = QUEUE_SCHEDULING_HELP)]
 struct QueueArgs {
     #[command(subcommand)]
     command: QueueCommand,
@@ -445,14 +462,20 @@ struct QueueArgs {
 
 #[derive(Subcommand)]
 enum QueueCommand {
+    /// Submit work and receive a completion notification
     Run(QueueRunArgs),
+    /// List queued and running jobs
     List(QueueListArgs),
+    /// Show a job and explain what it is waiting on
     Status(QueueStatusArgs),
+    /// Read a job log by friendly label or ID
     Log(QueueLogArgs),
+    /// Cancel a job by friendly label or ID
     Cancel(QueueCancelArgs),
 }
 
 #[derive(Args)]
+#[command(after_help = QUEUE_SCHEDULING_HELP)]
 struct QueueRunArgs {
     #[arg(long = "type", value_parser = ["tests", "perf", "background", "service"], default_value = "tests")]
     job_type: String,
@@ -495,6 +518,7 @@ struct QueueListArgs {
 
 #[derive(Args)]
 struct QueueStatusArgs {
+    /// Durable job ID or unique exact friendly label.
     job_id: String,
     #[arg(long)]
     json: bool,
@@ -502,6 +526,7 @@ struct QueueStatusArgs {
 
 #[derive(Args)]
 struct QueueLogArgs {
+    /// Durable job ID or unique exact friendly label.
     job_id: String,
     #[arg(long, default_value_t = 200, value_parser = parse_queue_log_lines)]
     lines: usize,
@@ -509,6 +534,7 @@ struct QueueLogArgs {
 
 #[derive(Args)]
 struct QueueCancelArgs {
+    /// Durable job ID or unique exact friendly label.
     job_id: String,
 }
 
@@ -1344,8 +1370,14 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
     let id = payload["id"].as_str().unwrap_or("unknown");
     let label = payload["label"].as_str().unwrap_or("-");
     let state = payload["state"].as_str().unwrap_or("-");
-    println!("Queued job {id}: {label} [{state}]");
-    if let Some(log_path) = payload["log_path"].as_str() {
+    println!("Queued {label} [{state}] ({id})");
+    if let Some(reason) = queue_waiting_text(&payload) {
+        println!("Waiting: {reason}");
+    }
+    if let Some(log_path) = payload["readable_log_path"]
+        .as_str()
+        .or_else(|| payload["log_path"].as_str())
+    {
         println!("Log: {log_path}");
     }
     Ok(())
@@ -1483,6 +1515,21 @@ fn queue_list_scope_text(
     }
 }
 
+fn queue_waiting_text(job: &Value) -> Option<String> {
+    if job["state"].as_str() != Some("pending") {
+        return None;
+    }
+    if let Some(detail) = job["holding"]["detail"].as_str().filter(|s| !s.is_empty()) {
+        return Some(detail.into());
+    }
+    Some(
+        match job["holding_reason"].as_str().filter(|s| !s.is_empty()) {
+            Some(reason) => format!("Scheduler hold: {}", reason.replace('_', " ")),
+            None => "The scheduler has not reported a hold reason yet.".into(),
+        },
+    )
+}
+
 fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
     let job_id = args.job_id.trim();
     if job_id.is_empty() {
@@ -1493,19 +1540,25 @@ fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
-    println!("Job: {}", payload["id"].as_str().unwrap_or(job_id));
+    println!("Job: {}", payload["label"].as_str().unwrap_or(job_id));
+    println!("ID: {}", payload["id"].as_str().unwrap_or(job_id));
     println!("Type: {}", payload["type"].as_str().unwrap_or("-"));
     println!("State: {}", payload["state"].as_str().unwrap_or("-"));
-    println!(
-        "Holding: {}",
-        payload["holding_reason"].as_str().unwrap_or("-")
-    );
+    if let Some(reason) = queue_waiting_text(&payload) {
+        println!("Waiting: {reason}");
+    }
     println!("Exit: {}", queue_exit_text(&payload));
     println!(
         "Termination: {}",
         payload["termination_reason"].as_str().unwrap_or("-")
     );
-    println!("Log: {}", payload["log_path"].as_str().unwrap_or("-"));
+    println!(
+        "Log: {}",
+        payload["readable_log_path"]
+            .as_str()
+            .or_else(|| payload["log_path"].as_str())
+            .unwrap_or("-")
+    );
     Ok(())
 }
 
@@ -1538,7 +1591,7 @@ fn run_queue_cancel(client: &ApiClient, args: QueueCancelArgs) -> Result<()> {
     )?;
     println!(
         "Cancelled queue job: {} ({})",
-        payload["id"].as_str().unwrap_or(job_id),
+        payload["label"].as_str().unwrap_or(job_id),
         payload["state"].as_str().unwrap_or("-")
     );
     Ok(())
@@ -2161,13 +2214,13 @@ fn print_queue_jobs(jobs: &[Value]) {
         return;
     }
     let headers = [
-        "ID", "Type", "State", "Exit", "Notify", "Label", "Holding", "Log",
+        "Job", "Type", "State", "Exit", "Notify", "ID", "Holding", "Log",
     ];
     let rows = jobs
         .iter()
         .map(|job| {
             vec![
-                json_string(job, "id"),
+                json_string(job, "label"),
                 json_string(job, "type"),
                 json_string(job, "state"),
                 queue_exit_text(job),
@@ -2176,9 +2229,13 @@ fn print_queue_jobs(jobs: &[Value]) {
                     .or_else(|| job["notify_session_id"].as_str())
                     .unwrap_or("")
                     .to_owned(),
-                json_string(job, "label"),
+                json_string(job, "id"),
                 job["holding_reason"].as_str().unwrap_or("-").to_owned(),
-                job["log_path"].as_str().unwrap_or("-").to_owned(),
+                job["readable_log_path"]
+                    .as_str()
+                    .or_else(|| job["log_path"].as_str())
+                    .unwrap_or("-")
+                    .to_owned(),
             ]
         })
         .collect::<Vec<_>>();
@@ -5201,6 +5258,20 @@ mod tests {
             reader.read_exact(&mut body).unwrap();
         }
         (method, path, String::from_utf8(body).unwrap())
+    }
+
+    #[test]
+    fn queue_agent_output_uses_explanation_and_does_not_claim_running_jobs_are_held() {
+        let mut job = json!({"state":"pending","holding_reason":"awaiting_tests", "holding":{"detail":"Waiting for friendly-test so friendly-perf can get a quiet window."}});
+        assert_eq!(
+            queue_waiting_text(&job).unwrap(),
+            "Waiting for friendly-test so friendly-perf can get a quiet window."
+        );
+        job["state"] = json!("running");
+        assert!(queue_waiting_text(&job).is_none());
+        assert!(queue_waiting_text(&json!({"state":"pending"}))
+            .unwrap()
+            .contains("not reported"));
     }
 
     #[test]

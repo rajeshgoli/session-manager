@@ -1309,6 +1309,7 @@ pub fn router(state: AppState) -> Router {
         .route("/events/state", get(events_state))
         .route("/events", get(events_stream))
         .route("/__shadow/http", post(shadow_http))
+        .route("/session-obligations", get(list_session_obligations))
         .route("/queue-jobs", get(list_queue_jobs).post(create_queue_job))
         .route(
             "/queue-jobs/{job_id}",
@@ -5839,6 +5840,128 @@ async fn cancel_codex_review_request(
     Ok(Json(codex_review_request_response(&state, registration)?))
 }
 
+/// Read-only projection for watch and desktop clients. Activity remains a
+/// separate signal: only idle agents with pending obligations are "waiting".
+async fn list_session_obligations(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    let queue_path = expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
+        .join("queue_runner.db");
+    let jobs =
+        RetainedQueueStore::list_queue_jobs_from_path(&queue_path, QueueJobFilters::default())?;
+    let reviews = RetainedQueueStore::list_codex_review_requests_from_path(
+        &expand_home(&state.config.sm_send.db_path),
+        CodexReviewRequestFilters {
+            include_inactive: true,
+            ..Default::default()
+        },
+    )?;
+    Ok(Json(project_session_obligations(&jobs, &reviews)))
+}
+
+fn project_session_obligations(
+    jobs: &[QueueJobRecord],
+    reviews: &[CodexReviewRequestRegistration],
+) -> Value {
+    let mut sessions = BTreeMap::<String, Value>::new();
+    for job in jobs
+        .iter()
+        .filter(|j| matches!(j.state.as_str(), "pending" | "running"))
+    {
+        // A result is owed to the notification recipient, even when another
+        // agent submitted it. Jobs without a recipient carry no obligation.
+        if let Some(id) = job.notify_session_id.as_deref().filter(|id| !id.is_empty()) {
+            let entry = sessions.entry(id.to_owned()).or_insert_with(
+                || json!({"session_id": id, "waiting_on": [], "review_history": []}),
+            );
+            entry["waiting_on"].as_array_mut().unwrap().push(json!({
+                "kind": "queue_job", "id": job.id, "label": job.label,
+                "state": job.state, "since": job.queued_at,
+                "requester_session_id": job.requester_session_id,
+            }));
+        }
+    }
+    #[derive(Default)]
+    struct ReviewCounts<'a> {
+        requests: usize,
+        landed: BTreeSet<&'a str>,
+        by_requester: BTreeMap<&'a str, (usize, BTreeSet<&'a str>)>,
+    }
+    // Index retained records once; each session then visits only its own PRs.
+    let mut per_pr = BTreeMap::<(&str, i64), ReviewCounts<'_>>::new();
+    let mut session_prs = BTreeMap::<&str, BTreeSet<(&str, i64)>>::new();
+    for review in reviews {
+        let key = (review.repo.as_str(), review.pr_number);
+        let counts = per_pr.entry(key).or_default();
+        counts.requests += 1;
+        let landed = review
+            .review_landed_at
+            .as_ref()
+            .map(|_| review.review_url.as_deref().unwrap_or(&review.id));
+        if let Some(url) = landed {
+            counts.landed.insert(url);
+        }
+        session_prs
+            .entry(&review.notify_session_id)
+            .or_default()
+            .insert(key);
+        if let Some(requester) = review.requester_session_id.as_deref() {
+            session_prs.entry(requester).or_default().insert(key);
+            let own = counts.by_requester.entry(requester).or_default();
+            own.0 += 1;
+            if let Some(url) = landed {
+                own.1.insert(url);
+            }
+        }
+        let id = &review.notify_session_id;
+        let entry = sessions
+            .entry(id.clone())
+            .or_insert_with(|| json!({"session_id": id, "waiting_on": [], "review_history": []}));
+        if review.is_active {
+            entry["waiting_on"].as_array_mut().unwrap().push(json!({
+                "kind": "review", "id": review.id,
+                "label": format!("Review · {} #{}", review.repo, review.pr_number),
+                "repo": review.repo, "pr_number": review.pr_number,
+                "state": review.state, "since": review.requested_at,
+                "requester_session_id": review.requester_session_id,
+                "last_polled_at": review.last_polled_at, "last_error": review.last_error,
+            }));
+        }
+        if let Some(requester) = &review.requester_session_id {
+            sessions.entry(requester.clone()).or_insert_with(
+                || json!({"session_id": requester, "waiting_on": [], "review_history": []}),
+            );
+        }
+    }
+    for (id, entry) in &mut sessions {
+        if let Some(prs) = session_prs.get(id.as_str()) {
+            for &(repo, pr) in prs {
+                let counts = &per_pr[&(repo, pr)];
+                let own = counts.by_requester.get(id.as_str());
+                entry["review_history"].as_array_mut().unwrap().push(json!({
+                    "repo": repo, "pr_number": pr,
+                    "scope": "sm_tracked",
+                    "request_count": counts.requests,
+                    "landed_count": counts.landed.len(),
+                    "landed_requested_by_agent": own.map_or(0, |(_, landed)| landed.len()),
+                    "requested_by_agent": own.map_or(0, |(requests, _)| *requests),
+                }));
+            }
+        }
+        let since = entry["waiting_on"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v["since"].as_str())
+            .min()
+            .map(str::to_owned);
+        entry["waiting_since"] = json!(since);
+    }
+    json!({"schema_version": 1, "sessions": sessions.into_values().collect::<Vec<_>>()})
+}
+
 async fn list_queue_jobs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListQueueJobsQuery>,
@@ -5876,11 +5999,26 @@ async fn list_queue_jobs(
             include_terminal: query.include_terminal,
         },
     )?;
+    // Include all active jobs even for a filtered listing: another agent's
+    // test/performance job may be holding this agent's queue.
+    let active =
+        RetainedQueueStore::list_queue_jobs_from_path(&queue_db_path, QueueJobFilters::default())?;
     let mut response_jobs = Vec::with_capacity(jobs.len());
     for job in jobs {
-        response_jobs.push(queue_job_response(&state, job)?);
+        response_jobs.push(queue_job_response_with_context(&state, job, &active)?);
     }
     Ok(Json(json!({ "jobs": response_jobs })))
+}
+
+fn queue_lookup_error(error: anyhow::Error) -> ApiError {
+    if let Some(detail) = error.to_string().strip_prefix("CONFLICT: ") {
+        ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: detail.to_owned(),
+        }
+    } else {
+        ApiError::Internal(error)
+    }
 }
 
 async fn get_queue_job(
@@ -5891,7 +6029,9 @@ async fn get_queue_job(
     ensure_session_read_allowed(&state, &request)?;
     let queue_state_dir = state.config.queue_runner_state_dir();
     let queue_db_path = expand_home(&queue_state_dir.to_string_lossy()).join("queue_runner.db");
-    let Some(job) = RetainedQueueStore::get_queue_job_from_path(&queue_db_path, &job_id)? else {
+    let Some(job) = RetainedQueueStore::resolve_queue_job_from_path(&queue_db_path, &job_id)
+        .map_err(queue_lookup_error)?
+    else {
         return Err(ApiError::NotFound("Queue job not found"));
     };
     Ok(Json(queue_job_response(&state, job)?))
@@ -5913,7 +6053,9 @@ async fn get_queue_job_log(
     }
     let queue_state_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
     let queue_db_path = queue_state_dir.join("queue_runner.db");
-    let Some(job) = RetainedQueueStore::get_queue_job_from_path(&queue_db_path, &job_id)? else {
+    let Some(job) = RetainedQueueStore::resolve_queue_job_from_path(&queue_db_path, &job_id)
+        .map_err(queue_lookup_error)?
+    else {
         return Err(ApiError::NotFound("Queue job not found"));
     };
     if !job
@@ -6069,6 +6211,13 @@ async fn cancel_queue_job(
     let queue_state_dir_config = state.config.queue_runner_state_dir();
     let queue_state_dir = expand_home(&queue_state_dir_config.to_string_lossy());
     let message_queue_db_path = expand_home(&state.config.sm_send.db_path);
+    let job_id = RetainedQueueStore::resolve_queue_job_from_path(
+        &queue_state_dir.join("queue_runner.db"),
+        &job_id,
+    )
+    .map_err(queue_lookup_error)?
+    .ok_or(ApiError::NotFound("Queue job not found"))?
+    .id;
     let Some(job) = RetainedQueueStore::cancel_queue_job_in_state_dir(
         &queue_state_dir,
         &message_queue_db_path,
@@ -9658,7 +9807,7 @@ fn shadow_predict_read(
                 support_status: "implemented_read_status_only",
             }));
         }
-        "/codex-review-requests" => {
+        "/codex-review-requests" | "/session-obligations" => {
             return Ok(Some(ShadowPrediction {
                 status: StatusCode::OK.as_u16(),
                 body_sha256: None,
@@ -12708,6 +12857,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/client/analytics/summary"
         || path == "/codex-review-requests"
         || path.starts_with("/codex-review-requests/")
+        || path == "/session-obligations"
         || path == "/queue-jobs"
         || path.starts_with("/queue-jobs/")
         || path == "/nodes"
@@ -14137,6 +14287,23 @@ fn codex_review_request_response(
 }
 
 fn queue_job_response(state: &AppState, job: QueueJobRecord) -> Result<Value, ApiError> {
+    let active = if job.state == "pending" {
+        RetainedQueueStore::list_queue_jobs_from_path(
+            &expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
+                .join("queue_runner.db"),
+            QueueJobFilters::default(),
+        )?
+    } else {
+        Vec::new()
+    };
+    queue_job_response_with_context(state, job, &active)
+}
+
+fn queue_job_response_with_context(
+    state: &AppState,
+    job: QueueJobRecord,
+    active: &[QueueJobRecord],
+) -> Result<Value, ApiError> {
     let requester_name = match job.requester_session_id.as_deref() {
         Some(session_id) => state
             .session_store
@@ -14181,6 +14348,7 @@ fn queue_job_response(state: &AppState, job: QueueJobRecord) -> Result<Value, Ap
         "script_path": job.script_path,
         "timeout_seconds": job.timeout_seconds,
         "state": job.state,
+        "holding": crate::queue::queue_hold_explanation(&job, active, queue_admission_policy(&state.config)),
         "holding_reason": job.holding_reason,
         "queued_at": job.queued_at,
         "started_at": job.started_at,
@@ -14190,6 +14358,7 @@ fn queue_job_response(state: &AppState, job: QueueJobRecord) -> Result<Value, Ap
         "exit_code": job.exit_code,
         "exit_evidence": exit_evidence,
         "termination_reason": termination_reason,
+        "readable_log_path": job.log_path.as_deref().and_then(|p| std::path::Path::new(p).parent()).map(|p| p.join(crate::queue::queue_log_filename(&job.label, &job.id)).display().to_string()).filter(|p| std::path::Path::new(p).exists()),
         "log_path": job.log_path,
     }))
 }
@@ -14363,6 +14532,117 @@ mod tests {
     use tower::ServiceExt;
 
     const DIRECT_HARNESS_PROBE_ENV: &str = "SM_DIRECT_HARNESS_ISOLATION_PROBE";
+
+    #[test]
+    fn obligations_attribute_waits_to_recipient_and_deduplicate_landed_reviews() {
+        let review = CodexReviewRequestRegistration {
+            id: "r1".into(),
+            repo: "owner/repo".into(),
+            pr_number: 42,
+            requester_session_id: Some("requester".into()),
+            notify_session_id: "recipient".into(),
+            steer: None,
+            requested_head_sha: None,
+            superseded_by_request_id: None,
+            superseded_at: None,
+            requested_at: "2026-09-10T10:00:00Z".into(),
+            latest_request_comment_id: None,
+            latest_request_comment_url: None,
+            latest_request_posted_at: None,
+            attempt_count: 3,
+            next_retry_at: None,
+            poll_interval_seconds: 60,
+            retry_interval_seconds: 300,
+            pickup_detected_at: None,
+            pickup_source: None,
+            review_landed_at: None,
+            review_source: None,
+            review_comment_id: None,
+            review_url: None,
+            last_polled_at: None,
+            last_error: None,
+            state: "pending".into(),
+            is_active: true,
+        };
+        let job = QueueJobRecord {
+            id: "j1".into(),
+            job_type: "tests".into(),
+            label: "unit tests".into(),
+            requester_session_id: Some("requester".into()),
+            notify_session_id: Some("recipient".into()),
+            cwd: "/tmp".into(),
+            argv: None,
+            script_path: None,
+            timeout_seconds: 60,
+            state: "running".into(),
+            holding_reason: None,
+            queued_at: "2026-09-10T09:00:00Z".into(),
+            started_at: None,
+            finished_at: None,
+            pid: None,
+            process_group_id: None,
+            exit_code: None,
+            log_path: None,
+        };
+        let mut completed = review.clone();
+        completed.id = "r2".into();
+        completed.is_active = false;
+        completed.state = "completed".into();
+        completed.review_landed_at = Some("2026-09-10T09:00:00Z".into());
+        completed.review_url = Some("https://example.com/review/1".into());
+        let mut duplicate = completed.clone();
+        duplicate.id = "r3".into();
+        duplicate.requester_session_id = Some("another".into());
+        // Retained history with distinct sessions/PRs must not cross-contaminate counts.
+        let history: Vec<_> = (0..4000)
+            .map(|i| {
+                let mut r = completed.clone();
+                r.id = format!("retained-{i}");
+                r.pr_number = i;
+                r.notify_session_id = format!("recipient-{i}");
+                r.requester_session_id = Some(format!("requester-{i}"));
+                r
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let retained = project_session_obligations(&[], &history);
+        eprintln!("4000 retained reviews projected in {:?}", start.elapsed());
+        let retained_sessions = retained["sessions"].as_array().unwrap();
+        assert_eq!(retained_sessions.len(), 8000);
+        for session in retained_sessions {
+            assert_eq!(session["review_history"].as_array().unwrap().len(), 1);
+            assert_eq!(session["review_history"][0]["request_count"], 1);
+            assert_eq!(session["review_history"][0]["landed_count"], 1);
+            assert!(session["waiting_on"].as_array().unwrap().is_empty());
+        }
+        let projected =
+            project_session_obligations(&[job.clone()], &[review, completed, duplicate]);
+        let sessions = projected["sessions"].as_array().unwrap();
+        let recipient = sessions
+            .iter()
+            .find(|s| s["session_id"] == "recipient")
+            .unwrap();
+        assert_eq!(recipient["waiting_on"].as_array().unwrap().len(), 2);
+        assert_eq!(recipient["waiting_since"], job.queued_at);
+        let requester = sessions
+            .iter()
+            .find(|s| s["session_id"] == "requester")
+            .unwrap();
+        assert!(requester["waiting_on"].as_array().unwrap().is_empty());
+        assert_eq!(requester["review_history"][0]["landed_count"], 1);
+        assert_eq!(requester["review_history"][0]["requested_by_agent"], 2);
+        assert_eq!(
+            requester["review_history"][0]["landed_requested_by_agent"],
+            1
+        );
+        let mut finished = job;
+        finished.state = "succeeded".into();
+        assert!(project_session_obligations(&[finished], &[])["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(is_protected_read_surface("GET", "/session-obligations"));
+    }
 
     #[test]
     fn codex_review_comment_labels_and_normalizes_steer_text() {
