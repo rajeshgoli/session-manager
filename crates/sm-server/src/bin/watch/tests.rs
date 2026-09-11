@@ -55,6 +55,44 @@ fn ages_distinguish_wait_start_and_terminal_duration() {
     assert_eq!(age("invalid", now), "?");
     assert_eq!(age("2026-09-10T11:00:00Z", now), "0s");
 }
+
+#[test]
+fn running_summaries_and_selectable_jobs_are_green_and_tab_follows_five_lines() {
+    let a = args();
+    let mut view = View::new(&a);
+    let snap = Snapshot {
+        sessions: vec![session("a", "", "/repo")],
+        jobs: vec![job("j", "a", "running")],
+        ..Default::default()
+    };
+    view.expanded.insert("a".into());
+    let rows = view.rows(&snap, &a, 0);
+    assert!(rows
+        .iter()
+        .any(|r| r.text.contains("1 job running") && r.style == "\x1b[32m"));
+    let target = Target::SessionJob("a".into(), "j".into());
+    assert!(rows
+        .iter()
+        .any(|r| r.target.as_ref() == Some(&target) && r.style == "\x1b[32m"));
+    view.selected = Some(target);
+    let (worker, _) = fake_worker();
+    handle_key(Key::Tab, &mut view, &worker, &snap, &a).unwrap();
+    assert_eq!(view.jobs_for.as_deref(), Some("a"));
+    assert_eq!(view.interest().log, "j");
+    assert_eq!(view.interest().log_lines, 5);
+    let rows = view.rows(&snap, &a, 0);
+    assert_eq!(rows[0].style, "\x1b[32m");
+    let snap = Snapshot {
+        log_id: "j".into(),
+        log: (1..=8).map(|n| format!("unique-line-{n}\n")).collect(),
+        ..snap
+    };
+    let text = clean(&frame(&mut view, &snap, &a, &rows, 40, 100));
+    assert!(!text.contains("unique-line-3"));
+    assert!(text.contains("unique-line-4"));
+    assert!(text.contains("unique-line-8"));
+    assert!(text.contains("last 5 lines"));
+}
 #[test]
 fn queue_reports_global_contention_not_false_fifo_dependencies() {
     let now = stamp("2026-09-10T10:10:00Z").unwrap();
@@ -186,6 +224,19 @@ fn retire_requires_second_press_same_session_and_unexpired_confirmation() {
         matches!(rx.try_recv().unwrap(),Work::Action{method:"POST",path,..} if path=="/sessions/b/retire")
     );
 }
+
+#[test]
+fn unsupported_fork_key_does_not_enqueue_an_action() {
+    let a = args();
+    let (worker, rx) = fake_worker();
+    let mut view = View::new(&a);
+    view.selected = Some(Target::Session("a".into()));
+
+    handle_key(Key::Char('F'), &mut view, &worker, &Snapshot::default(), &a).unwrap();
+
+    assert!(rx.try_recv().is_err());
+}
+
 #[test]
 fn restore_and_attach_use_correct_endpoints_and_preserve_remote_argv() {
     let mut a = args();

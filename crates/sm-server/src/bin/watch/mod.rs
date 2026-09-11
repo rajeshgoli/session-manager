@@ -254,10 +254,20 @@ struct Snapshot {
     log_id: String,
     log: String,
 }
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct Interest {
     details: BTreeSet<String>,
     log: String,
+    log_lines: usize,
+}
+impl Default for Interest {
+    fn default() -> Self {
+        Self {
+            details: BTreeSet::new(),
+            log: String::new(),
+            log_lines: 200,
+        }
+    }
 }
 enum Work {
     Refresh(Interest),
@@ -426,7 +436,11 @@ fn refresh(
                 shared.lock().unwrap().jobs.push(job);
             }
         }
-        let text = match client.get(&format!("/queue-jobs/{}/log?lines=200", enc(id))) {
+        let text = match client.get(&format!(
+            "/queue-jobs/{}/log?lines={}",
+            enc(id),
+            interest.log_lines
+        )) {
             Ok(v) => clean(s(&v, "text")),
             Err(e) => format!("Log unavailable: {e}"),
         };
@@ -442,6 +456,7 @@ enum Target {
     Repo(String),
     Request(String),
     Job(String),
+    SessionJob(String, String),
 }
 #[derive(Clone)]
 struct Row {
@@ -554,6 +569,7 @@ struct View {
     jobs_for: Option<String>,
     global: bool,
     tail: bool,
+    tail_lines: usize,
     log_scroll: usize,
     job_selected: Option<Target>,
     retained: BTreeMap<String, Value>,
@@ -576,6 +592,7 @@ impl View {
             jobs_for: None,
             global: false,
             tail: false,
+            tail_lines: 200,
             log_scroll: 0,
             job_selected: None,
             retained: BTreeMap::new(),
@@ -588,6 +605,7 @@ impl View {
     fn interest(&self) -> Interest {
         Interest {
             details: self.expanded.clone(),
+            log_lines: self.tail_lines,
             log: if self.tail {
                 match &self.job_selected {
                     Some(Target::Job(id)) => id.clone(),
@@ -628,7 +646,7 @@ impl View {
             return jobs
                 .into_iter()
                 .map(|j| {
-                    Row::selectable(
+                    let mut row = Row::selectable(
                         format!(
                             "{}  {:10} {:8} {:5} {}  {}",
                             s(j, "id"),
@@ -639,7 +657,11 @@ impl View {
                             s(j, "label")
                         ),
                         Target::Job(s(j, "id").into()),
-                    )
+                    );
+                    if s(j, "state") == "running" {
+                        row.style = "\x1b[32m";
+                    }
+                    row
                 })
                 .collect();
         }
@@ -788,7 +810,11 @@ impl View {
                 rows.push(Row::plain(format!("{prefix}   last: {last}")));
             }
             for line in queue_summary(&snap.jobs, id, now) {
-                rows.push(Row::plain(format!("{prefix}   {line}")));
+                let mut row = Row::plain(format!("{prefix}   {line}"));
+                if line.contains(" running ") {
+                    row.style = "\x1b[32m";
+                }
+                rows.push(row);
             }
             if !s(v, "agent_status_text").is_empty() {
                 rows.push(Row::plain(format!(
@@ -841,13 +867,20 @@ impl View {
                     }
                 )));
                 for j in snap.jobs.iter().filter(|j| owns(j, id)) {
-                    rows.push(Row::plain(format!(
-                        "{prefix}   job {} {} {} {}",
-                        s(j, "id"),
-                        s(j, "state"),
-                        job_age(j, now),
-                        s(j, "label")
-                    )));
+                    let mut row = Row::selectable(
+                        format!(
+                            "{prefix}   job {} {} {} {}",
+                            s(j, "id"),
+                            s(j, "state"),
+                            job_age(j, now),
+                            s(j, "label")
+                        ),
+                        Target::SessionJob(id.into(), s(j, "id").into()),
+                    );
+                    if s(j, "state") == "running" {
+                        row.style = "\x1b[32m";
+                    }
+                    rows.push(row);
                 }
                 match snap.details.get(id) {
                     Some(lines) => {
@@ -1083,10 +1116,11 @@ fn show_help() -> Result<()> {
         "",
         "j/k or arrows: select agent or reparent request",
         "Tab: expand details; PgUp/PgDn: scroll long details",
-        "J: jobs; j/k: select job; t/Enter: live log; g: global queue",
+        "J: jobs; j/k: select job; Tab: follow last 5 lines; g: global queue",
+        "Tab also tails a job selected in expanded agent details; t/Enter: 200-line tail",
         "In logs: PgUp/PgDn scroll; End follows newest output; q goes back",
         "Enter: attach (restore in --restore mode)",
-        "s: send message; n: rename; +: create; F: fork",
+        "s: send message; n: rename; +: create",
         "K then K within 5s: retire selected session",
         "A/X: approve/reject a human-gated reparent request",
         "R/B: resume/rollback a failed reparent request",
@@ -1253,13 +1287,19 @@ fn frame(
                     }
                 }
                 if view.tail && y + 3 < h - 2 {
-                    lines[y + 3] = format!("Live tail {id} — last 200 lines");
+                    lines[y + 3] = format!(
+                        "Live tail {id} — last {} lines (following)",
+                        view.tail_lines
+                    );
                     let text = if snap.log_id == *id {
                         snap.log.as_str()
                     } else {
                         "Loading log..."
                     };
-                    let log: Vec<_> = text.lines().collect();
+                    let mut log: Vec<_> = text.lines().collect();
+                    if log.len() > view.tail_lines {
+                        log.drain(..log.len() - view.tail_lines);
+                    }
                     let count = (h - 2).saturating_sub(y + 4);
                     view.log_scroll = view.log_scroll.min(log.len().saturating_sub(count));
                     let end = log.len().saturating_sub(view.log_scroll);
@@ -1284,7 +1324,7 @@ fn frame(
     );
     lines[h - 1] = clipped(
         if jobs {
-            "j/k: job  t/Enter: tail  g: all/agent  PgUp/Dn: log  End: follow  q: back"
+            "Tab: follow 5 lines  t: tail 200  j/k: job  g: all/agent  PgUp/Dn  q: back"
         } else if args.restore {
             "j/k: move Enter: restore Tab: expand E/C: all o: sort R/U: hide/show /: filter q: quit"
         } else {
@@ -1471,7 +1511,16 @@ pub(super) fn run(url: &str, mut args: WatchArgs) -> Result<()> {
             view.log_scroll = 0;
         } else if view.jobs_for.is_some() {
             match key {
-                Key::Enter | Key::Char('t') => view.tail = !view.tail,
+                Key::Tab => {
+                    view.tail = true;
+                    view.tail_lines = 5;
+                    view.log_scroll = 0;
+                }
+                Key::Enter | Key::Char('t') => {
+                    view.tail = !view.tail || view.tail_lines != 200;
+                    view.tail_lines = 200;
+                    view.log_scroll = 0;
+                }
                 Key::Char('g') => view.global = !view.global,
                 Key::PageUp => view.log_scroll += 10,
                 Key::PageDown => view.log_scroll = view.log_scroll.saturating_sub(10),
@@ -1535,6 +1584,17 @@ fn handle_key(
             view.flash.clear();
         }
         Key::Tab => match target {
+            Some(Target::SessionJob(session_id, job_id)) => {
+                view.jobs_for = Some(session_id);
+                view.job_selected = Some(Target::Job(job_id));
+                view.tail = true;
+                view.tail_lines = 5;
+                view.log_scroll = 0;
+                view.offset = 0;
+                view.free_scroll = false;
+                view.global = false;
+                view.flash.clear();
+            }
             Some(Target::Repo(repo)) => {
                 view.hidden.remove(&repo);
             }
@@ -1608,7 +1668,7 @@ fn handle_key(
                 )?;
             }
         }
-        Key::Char('s' | '+' | 'F' | 'K' | 'n' | 'A' | 'X' | 'B') if args.restore => {
+        Key::Char('s' | '+' | 'K' | 'n' | 'A' | 'X' | 'B') if args.restore => {
             view.flash = "Not available in restore mode".into()
         }
         Key::Char('s') if !id.is_empty() => {
@@ -1655,14 +1715,6 @@ fn handle_key(
                 view.flash = format!("Press K again within 5s to retire {id}");
             }
         }
-        Key::Char('F') if !id.is_empty() => send_action(
-            worker,
-            view,
-            "POST",
-            format!("/sessions/{}/fork", enc(id)),
-            json!({"fork_point":"current"}),
-            false,
-        )?,
         Key::Char('+') => {
             let Some(provider) = prompt("provider [codex/claude] (blank=codex, Esc=cancel)> ")?
             else {
