@@ -437,7 +437,24 @@ struct LookupArgs {
     role: Option<String>,
 }
 
+const QUEUE_SCHEDULING_HELP: &str = "Choosing a job type:
+  tests       Required builds/checks (default). Running tests are not displaced.
+  perf        Measurements. Waits for running tests to finish, then a cooldown
+              after the latest tests/perf finish (30s by default; configurable).
+              Pending tests get a turn after a perf run.
+  background  Interruptible work. A perf run can terminate it as 'displaced';
+              it is not paused or automatically retried. Resubmit if needed.
+  service     Persistent services. Not displaced for perf; uses service capacity.
+
+While perf is running, new jobs wait. While perf waits for tests/cooldown,
+new jobs also wait so it can get a quiet window. Existing services keep running.
+All types are subject to configured concurrency limits; pending jobs retry
+admission automatically. Use 'sm queue status <label-or-id>' for the current
+reason and named blockers. Use tests for required gates, background only when
+interruption is acceptable. Set --label to a meaningful, unique name.";
+
 #[derive(Args)]
+#[command(after_help = QUEUE_SCHEDULING_HELP)]
 struct QueueArgs {
     #[command(subcommand)]
     command: QueueCommand,
@@ -445,14 +462,20 @@ struct QueueArgs {
 
 #[derive(Subcommand)]
 enum QueueCommand {
+    /// Submit work and receive a completion notification
     Run(QueueRunArgs),
+    /// List queued and running jobs
     List(QueueListArgs),
+    /// Show a job and explain what it is waiting on
     Status(QueueStatusArgs),
+    /// Read a job log by friendly label or ID
     Log(QueueLogArgs),
+    /// Cancel a job by friendly label or ID
     Cancel(QueueCancelArgs),
 }
 
 #[derive(Args)]
+#[command(after_help = QUEUE_SCHEDULING_HELP)]
 struct QueueRunArgs {
     #[arg(long = "type", value_parser = ["tests", "perf", "background", "service"], default_value = "tests")]
     job_type: String,
