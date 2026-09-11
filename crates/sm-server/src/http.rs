@@ -6134,6 +6134,42 @@ async fn create_queue_job(
             detail: format!("cwd does not exist or is not a directory: {}", payload.cwd),
         });
     }
+    if job_type == "perf"
+        && (payload.timeout_seconds.is_none()
+            || payload.cpu_percent.is_none()
+            || payload.memory_bytes.is_none())
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail:
+                "perf jobs require explicit timeout_seconds, cpu_percent, and memory_bytes budgets"
+                    .to_owned(),
+        });
+    }
+    if job_type != "perf"
+        && (payload.cpu_percent.is_some()
+            || payload.gpu_percent.is_some()
+            || payload.memory_bytes.is_some())
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "cpu_percent, gpu_percent, and memory_bytes are only valid for perf jobs"
+                .to_owned(),
+        });
+    }
+    if payload
+        .cpu_percent
+        .is_some_and(|value| value == 0 || value > 100)
+        || payload.gpu_percent.is_some_and(|value| value > 100)
+        || payload.memory_bytes.is_some_and(|value| value <= 0)
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail:
+                "perf budgets require cpu_percent=1..100, gpu_percent=0..100, and memory_bytes > 0"
+                    .to_owned(),
+        });
+    }
     let timeout_seconds = payload.timeout_seconds.unwrap_or(default_timeout);
     if timeout_seconds < 0 || (timeout_seconds == 0 && job_type != "background") {
         return Err(ApiError::Status {
@@ -6174,6 +6210,9 @@ async fn create_queue_job(
             script,
             env: payload.env,
             timeout_seconds,
+            cpu_percent: payload.cpu_percent,
+            gpu_percent: (job_type == "perf").then_some(payload.gpu_percent.unwrap_or(0)),
+            memory_bytes: payload.memory_bytes,
         },
     )?;
     let job = if state.config.rust_core.runtime_enabled {
@@ -6258,6 +6297,8 @@ fn queue_admission_policy(config: &AppConfig) -> QueueAdmissionPolicy {
             .service
             .as_ref()
             .map_or(0, |service| service.max_concurrent),
+        memory_min_free_bytes: config.queue_runner.memory.min_free_bytes,
+        resource_retry_interval_seconds: config.queue_runner.memory.retry_interval_seconds,
     }
 }
 
@@ -13756,6 +13797,12 @@ struct QueueJobCreateRequest {
     requester_session_id: Option<String>,
     #[serde(default)]
     timeout_seconds: Option<i64>,
+    #[serde(default)]
+    cpu_percent: Option<u8>,
+    #[serde(default)]
+    gpu_percent: Option<u8>,
+    #[serde(default)]
+    memory_bytes: Option<i64>,
 }
 
 fn default_queue_job_type() -> String {
@@ -14323,13 +14370,14 @@ fn queue_job_response_with_context(
         "timed_out" => Some("timeout"),
         "cancelled" => Some("cancelled"),
         "displaced" => Some("perf_displacement"),
+        "memory_exceeded" => Some("memory_budget"),
         _ => None,
     };
     let exit_evidence = if job.exit_code.is_some() {
         "recorded"
     } else if matches!(
         job.state.as_str(),
-        "succeeded" | "failed" | "timed_out" | "cancelled" | "displaced"
+        "succeeded" | "failed" | "timed_out" | "cancelled" | "displaced" | "memory_exceeded"
     ) {
         "missing_partial_output"
     } else {
@@ -14347,6 +14395,9 @@ fn queue_job_response_with_context(
         "argv": job.argv,
         "script_path": job.script_path,
         "timeout_seconds": job.timeout_seconds,
+        "cpu_percent": job.cpu_percent,
+        "gpu_percent": job.gpu_percent,
+        "memory_bytes": job.memory_bytes,
         "state": job.state,
         "holding": crate::queue::queue_hold_explanation(&job, active, queue_admission_policy(&state.config)),
         "holding_reason": job.holding_reason,
@@ -14574,6 +14625,9 @@ mod tests {
             argv: None,
             script_path: None,
             timeout_seconds: 60,
+            cpu_percent: None,
+            gpu_percent: None,
+            memory_bytes: None,
             state: "running".into(),
             holding_reason: None,
             queued_at: "2026-09-10T09:00:00Z".into(),

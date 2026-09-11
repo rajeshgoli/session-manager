@@ -543,20 +543,21 @@ async fn create_pending_queue_job_of_type(
     script: &str,
     timeout_seconds: i64,
 ) -> String {
-    let (status, payload) = post_json(
-        app,
-        "/queue-jobs",
-        json!({
-            "type": job_type,
-            "label": label,
-            "script": script,
-            "cwd": working_dir.display().to_string(),
-            "notify_target": "run12345",
-            "requester_session_id": "run12345",
-            "timeout_seconds": timeout_seconds
-        }),
-    )
-    .await;
+    let mut request = json!({
+        "type": job_type,
+        "label": label,
+        "script": script,
+        "cwd": working_dir.display().to_string(),
+        "notify_target": "run12345",
+        "requester_session_id": "run12345",
+        "timeout_seconds": timeout_seconds
+    });
+    if job_type == "perf" {
+        request["cpu_percent"] = json!(100);
+        request["gpu_percent"] = json!(0);
+        request["memory_bytes"] = json!(4_i64 * 1024 * 1024 * 1024);
+    }
+    let (status, payload) = post_json(app, "/queue-jobs", request).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["state"], "pending");
     payload["id"].as_str().unwrap().to_owned()
@@ -4818,6 +4819,23 @@ async fn queue_job_create_validates_request_shape() {
     );
 
     let (status, payload) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "perf",
+            "argv": ["echo", "missing budgets"],
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        payload["detail"],
+        "perf jobs require explicit timeout_seconds, cpu_percent, and memory_bytes budgets"
+    );
+
+    let (status, payload) = post_json(
         app,
         "/queue-jobs",
         json!({
@@ -5479,11 +5497,17 @@ async fn queue_runtime_admission_displaces_background_for_ready_perf_job() {
             "cwd": working_dir.display().to_string(),
             "notify_target": "run12345",
             "requester_session_id": "run12345",
-            "timeout_seconds": 10
+            "timeout_seconds": 10,
+            "cpu_percent": 100,
+            "gpu_percent": 0,
+            "memory_bytes": 4294967296_i64
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(perf["cpu_percent"], 100);
+    assert_eq!(perf["gpu_percent"], 0);
+    assert_eq!(perf["memory_bytes"], 4_294_967_296_i64);
     let perf_id = perf["id"].as_str().unwrap().to_owned();
 
     let first_final =
@@ -5569,7 +5593,10 @@ async fn queue_runtime_perf_waits_for_tests_and_blocks_new_tests_through_cooldow
             "cwd": working_dir.display().to_string(),
             "notify_target": "run12345",
             "requester_session_id": "run12345",
-            "timeout_seconds": 5
+            "timeout_seconds": 5,
+            "cpu_percent": 100,
+            "gpu_percent": 0,
+            "memory_bytes": 4294967296_i64
         }),
     )
     .await;
@@ -6376,6 +6403,9 @@ async fn queue_runtime_recovery_rejects_live_services_above_reduced_capacity() {
                 script: None,
                 env: Default::default(),
                 timeout_seconds: 60,
+                cpu_percent: None,
+                gpu_percent: None,
+                memory_bytes: None,
             },
         )
         .unwrap()

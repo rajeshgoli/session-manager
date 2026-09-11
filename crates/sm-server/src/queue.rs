@@ -1,11 +1,11 @@
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     thread,
     time::{Duration as StdDuration, Instant},
 };
@@ -152,6 +152,9 @@ pub struct QueueJobRecord {
     pub argv: Option<Vec<String>>,
     pub script_path: Option<String>,
     pub timeout_seconds: i64,
+    pub cpu_percent: Option<u8>,
+    pub gpu_percent: Option<u8>,
+    pub memory_bytes: Option<i64>,
     pub state: String,
     pub holding_reason: Option<String>,
     pub queued_at: String,
@@ -171,6 +174,8 @@ pub struct QueueAdmissionPolicy {
     pub perf_max_concurrent: usize,
     pub background_max_concurrent: usize,
     pub service_max_concurrent: usize,
+    pub memory_min_free_bytes: i64,
+    pub resource_retry_interval_seconds: u64,
 }
 
 impl Default for QueueAdmissionPolicy {
@@ -182,6 +187,8 @@ impl Default for QueueAdmissionPolicy {
             perf_max_concurrent: 1,
             background_max_concurrent: 2,
             service_max_concurrent: 0,
+            memory_min_free_bytes: 8 * 1024 * 1024 * 1024,
+            resource_retry_interval_seconds: 10,
         }
     }
 }
@@ -216,6 +223,9 @@ struct QueueJobRuntimeRecord {
     log_path: Option<String>,
     exit_code_path: Option<String>,
     timeout_seconds: i64,
+    cpu_percent: Option<u8>,
+    gpu_percent: Option<u8>,
+    memory_bytes: Option<i64>,
     pid: Option<i64>,
     process_group_id: Option<i64>,
     exit_code: Option<i64>,
@@ -239,6 +249,9 @@ pub struct CreateQueueJob {
     pub script: Option<String>,
     pub env: BTreeMap<String, String>,
     pub timeout_seconds: i64,
+    pub cpu_percent: Option<u8>,
+    pub gpu_percent: Option<u8>,
+    pub memory_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -999,6 +1012,7 @@ impl RetainedQueueStore {
         let monitor_message_queue_db_path = message_queue_db_path.to_path_buf();
         let monitor_job_id = job_id.to_owned();
         let timeout_seconds = job.timeout_seconds;
+        let memory_bytes = job.memory_bytes;
         thread::spawn(move || {
             monitor_queue_job_completion(
                 monitor_state_dir,
@@ -1006,6 +1020,7 @@ impl RetainedQueueStore {
                 monitor_job_id,
                 child,
                 timeout_seconds,
+                memory_bytes,
                 cancel_grace_seconds,
                 admission_policy,
             );
@@ -2588,6 +2603,9 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
             script_path TEXT,
             env_json TEXT NOT NULL,
             timeout_seconds INTEGER NOT NULL,
+            cpu_percent INTEGER,
+            gpu_percent INTEGER,
+            memory_bytes INTEGER,
             state TEXT NOT NULL,
             holding_reason TEXT,
             queued_at TEXT NOT NULL,
@@ -2631,6 +2649,9 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(conn, "queue_jobs", "completion_notified_at", "TEXT")?;
+    ensure_column(conn, "queue_jobs", "cpu_percent", "INTEGER")?;
+    ensure_column(conn, "queue_jobs", "gpu_percent", "INTEGER")?;
+    ensure_column(conn, "queue_jobs", "memory_bytes", "INTEGER")?;
     Ok(())
 }
 
@@ -2738,13 +2759,14 @@ fn create_queue_job_conn(
         r#"
         INSERT INTO queue_jobs
             (id, type, label, requester_session_id, notify_session_id, cwd,
-             argv_json, script_path, env_json, timeout_seconds, state,
+             argv_json, script_path, env_json, timeout_seconds, cpu_percent,
+             gpu_percent, memory_bytes, state,
              holding_reason, queued_at, started_at, finished_at, pid,
              process_group_id, exit_code, log_path, exit_code_path, wrapper_path,
              queued_notified_at, started_notified_at, completion_notified_at)
         VALUES
-            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending',
-             NULL, ?11, NULL, NULL, NULL, NULL, NULL, ?12, ?13, ?14,
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'pending',
+             NULL, ?14, NULL, NULL, NULL, NULL, NULL, ?15, ?16, ?17,
              NULL, NULL, NULL)
         "#,
         params![
@@ -2758,6 +2780,9 @@ fn create_queue_job_conn(
             script_path,
             env_json,
             request.timeout_seconds,
+            request.cpu_percent,
+            request.gpu_percent,
+            request.memory_bytes,
             queued_at,
             log_path.display().to_string(),
             exit_code_path.display().to_string(),
@@ -2851,7 +2876,8 @@ fn get_queue_job_runtime_conn(
         r#"
         SELECT id, type, state, notify_session_id, queued_at, started_at, finished_at,
                holding_reason, wrapper_path, log_path, exit_code_path, timeout_seconds,
-               pid, process_group_id, exit_code, completion_notified_at, label
+               cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
+               exit_code, completion_notified_at, label
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -2880,11 +2906,14 @@ fn get_queue_job_runtime_conn(
                 log_path: row.get(9)?,
                 exit_code_path: row.get(10)?,
                 timeout_seconds: row.get(11)?,
-                pid: row.get(12)?,
-                process_group_id: row.get(13)?,
-                exit_code: row.get(14)?,
-                completion_notified_at: row.get(15)?,
-                label: row.get(16)?,
+                cpu_percent: row.get(12)?,
+                gpu_percent: row.get(13)?,
+                memory_bytes: row.get(14)?,
+                pid: row.get(15)?,
+                process_group_id: row.get(16)?,
+                exit_code: row.get(17)?,
+                completion_notified_at: row.get(18)?,
+                label: row.get(19)?,
             })
         })
         .optional()
@@ -2896,7 +2925,8 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
         r#"
         SELECT id, type, state, notify_session_id, queued_at, started_at, finished_at,
                holding_reason, wrapper_path, log_path, exit_code_path, timeout_seconds,
-               pid, process_group_id, exit_code, completion_notified_at, label
+               cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
+               exit_code, completion_notified_at, label
         FROM queue_jobs
         ORDER BY queued_at, id
         "#,
@@ -2916,11 +2946,14 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                 log_path: row.get(9)?,
                 exit_code_path: row.get(10)?,
                 timeout_seconds: row.get(11)?,
-                pid: row.get(12)?,
-                process_group_id: row.get(13)?,
-                exit_code: row.get(14)?,
-                completion_notified_at: row.get(15)?,
-                label: row.get(16)?,
+                cpu_percent: row.get(12)?,
+                gpu_percent: row.get(13)?,
+                memory_bytes: row.get(14)?,
+                pid: row.get(15)?,
+                process_group_id: row.get(16)?,
+                exit_code: row.get(17)?,
+                completion_notified_at: row.get(18)?,
+                label: row.get(19)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2970,7 +3003,15 @@ fn admit_pending_queue_jobs_conn(
             summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "perf_running")?;
             break;
         }
-        let perf_waiting_for_quiet_window = oldest_pending_queue_job(&jobs, "perf").is_some()
+        let pending_perf = oldest_pending_queue_job(&jobs, "perf");
+        let perf_resource_hold =
+            pending_perf.and_then(|job| perf_resource_hold_reason(job, admission_policy));
+        if let (Some(job), Some(reason)) = (pending_perf, perf_resource_hold) {
+            summary.held += mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), reason)?;
+            summary.retry_after_seconds = Some(admission_policy.resource_retry_interval_seconds);
+        }
+        let perf_waiting_for_quiet_window = pending_perf.is_some()
+            && perf_resource_hold.is_none()
             && !perf_blocked_by_tests_after_perf(&jobs);
         if perf_waiting_for_quiet_window {
             if running_queue_job_count(&jobs, Some("tests")) > 0 {
@@ -2987,21 +3028,30 @@ fn admit_pending_queue_jobs_conn(
                 break;
             }
         }
-        if displace_background_for_perf_conn(
-            conn,
-            &jobs,
-            message_queue_db_path,
-            cancel_grace_seconds,
-            admission_policy,
-        )? {
+        if perf_resource_hold.is_none()
+            && displace_background_for_perf_conn(
+                conn,
+                &jobs,
+                message_queue_db_path,
+                cancel_grace_seconds,
+                admission_policy,
+            )?
+        {
             continue;
         }
         if running_queue_job_count(&jobs, None) as i64 >= admission_policy.max_running_jobs {
             summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "concurrency_cap")?;
             break;
         }
-        let Some(candidate_id) =
-            next_admissible_queue_job_id_conn(conn, &jobs, admission_policy, &mut summary)?
+        let blocked_perf_id =
+            perf_resource_hold.and_then(|_| pending_perf.map(|job| job.id.as_str()));
+        let Some(candidate_id) = next_admissible_queue_job_id_conn(
+            conn,
+            &jobs,
+            admission_policy,
+            &mut summary,
+            blocked_perf_id,
+        )?
         else {
             break;
         };
@@ -3086,8 +3136,13 @@ fn schedule_queue_admission_retry(
     admission_policy: QueueAdmissionPolicy,
     delay_seconds: u64,
 ) {
+    if !claim_queue_admission_retry(&state_dir) {
+        return;
+    }
+    let retry_key = state_dir.clone();
     thread::spawn(move || {
         thread::sleep(StdDuration::from_secs(delay_seconds.max(1)));
+        release_queue_admission_retry(&retry_key);
         let _ =
             RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
                 &state_dir,
@@ -3098,27 +3153,61 @@ fn schedule_queue_admission_retry(
     });
 }
 
+fn queue_admission_retries() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static RETRIES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+    RETRIES.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn claim_queue_admission_retry(state_dir: &Path) -> bool {
+    queue_admission_retries()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(state_dir.to_path_buf())
+}
+
+fn release_queue_admission_retry(state_dir: &Path) {
+    queue_admission_retries()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(state_dir);
+}
+
 const DEFAULT_MAX_RUNNING_QUEUE_JOBS: i64 = 2;
 const DEFAULT_PERF_COOLDOWN_SECONDS: i64 = 30;
 const QUEUE_JOB_TYPE_ORDER: [&str; 4] = ["perf", "tests", "background", "service"];
 static QUEUE_ADMISSION_LOCK: Mutex<()> = Mutex::new(());
+const PERF_MEMORY_SAMPLE_INTERVAL: StdDuration = StdDuration::from_millis(250);
+#[cfg(target_os = "macos")]
+const MACOS_MEMORY_RESERVE_BYTES: i64 = 8 * 1024 * 1024 * 1024;
 
 fn next_admissible_queue_job_id_conn(
     conn: &Connection,
     jobs: &[QueueJobRuntimeRecord],
     admission_policy: QueueAdmissionPolicy,
     summary: &mut QueueAdmissionSummary,
+    blocked_perf_id: Option<&str>,
 ) -> Result<Option<String>> {
     for job_type in QUEUE_JOB_TYPE_ORDER {
         let Some(job) = oldest_pending_queue_job(jobs, job_type) else {
             continue;
         };
+        if blocked_perf_id == Some(job.id.as_str()) {
+            continue;
+        }
         if running_queue_job_count(jobs, Some(job_type))
             >= admission_policy.max_concurrent_jobs(job_type)
         {
             summary.held +=
                 mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), "concurrency_cap")?;
             continue;
+        }
+        if job_type == "perf" {
+            if let Some(reason) = perf_resource_hold_reason(job, admission_policy) {
+                summary.held += mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), reason)?;
+                summary.retry_after_seconds =
+                    Some(admission_policy.resource_retry_interval_seconds);
+                continue;
+            }
         }
         if job_type == "perf" && perf_cooldown_active(jobs, admission_policy) {
             summary.held +=
@@ -3140,6 +3229,110 @@ fn next_admissible_queue_job_id_conn(
         return Ok(Some(job.id.clone()));
     }
     Ok(None)
+}
+
+fn perf_resource_hold_reason(
+    job: &QueueJobRuntimeRecord,
+    admission_policy: QueueAdmissionPolicy,
+) -> Option<&'static str> {
+    let valid_budget = job.timeout_seconds > 0
+        && job
+            .cpu_percent
+            .is_some_and(|value| (1..=100).contains(&value))
+        && job.gpu_percent.unwrap_or(0) <= 100
+        && job.memory_bytes.is_some_and(|value| value > 0);
+    if !valid_budget {
+        return Some("resource_budget_missing");
+    }
+    let memory_budget = job.memory_bytes.expect("validated perf memory budget");
+    let has_safe_headroom = host_memory_capacity().is_some_and(|capacity| {
+        perf_memory_headroom_is_safe(
+            memory_budget,
+            admission_policy.memory_min_free_bytes,
+            capacity,
+        )
+    });
+    (!has_safe_headroom).then_some("memory_pressure")
+}
+
+fn host_memory_capacity() -> Option<(i64, i64)> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/usr/bin/memory_pressure")
+            .arg("-Q")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        return parse_macos_memory_pressure(&String::from_utf8_lossy(&output.stdout));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = fs::read_to_string("/proc/meminfo").ok()?;
+        return parse_linux_meminfo(&text);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+fn perf_memory_headroom_is_safe(
+    memory_budget: i64,
+    configured_reserve: i64,
+    (_total, available): (i64, i64),
+) -> bool {
+    let reserve = effective_memory_reserve_bytes(configured_reserve);
+    memory_budget
+        .checked_add(reserve)
+        .is_some_and(|required| available >= required)
+}
+
+fn effective_memory_reserve_bytes(configured_reserve: i64) -> i64 {
+    #[cfg(target_os = "macos")]
+    {
+        configured_reserve.max(MACOS_MEMORY_RESERVE_BYTES)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        configured_reserve
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_memory_pressure(text: &str) -> Option<(i64, i64)> {
+    let total = text
+        .lines()
+        .find(|line| line.starts_with("The system has "))?
+        .split_whitespace()
+        .nth(3)?
+        .parse::<i64>()
+        .ok()?;
+    let free_percent = text
+        .lines()
+        .find(|line| line.contains("memory free percentage:"))?
+        .split(':')
+        .nth(1)?
+        .trim()
+        .trim_end_matches('%')
+        .parse::<i64>()
+        .ok()?;
+    Some((total, total.checked_mul(free_percent)?.checked_div(100)?))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_meminfo(text: &str) -> Option<(i64, i64)> {
+    let kib = |name: &str| {
+        text.lines()
+            .find(|line| line.starts_with(name))?
+            .split_whitespace()
+            .nth(1)?
+            .parse::<i64>()
+            .ok()
+    };
+    Some((
+        kib("MemTotal:")?.checked_mul(1024)?,
+        kib("MemAvailable:")?.checked_mul(1024)?,
+    ))
 }
 
 fn displace_background_for_perf_conn(
@@ -3342,12 +3535,15 @@ fn monitor_queue_job_completion(
     job_id: String,
     mut child: Child,
     timeout_seconds: i64,
+    memory_bytes: Option<i64>,
     cancel_grace_seconds: u64,
     admission_policy: QueueAdmissionPolicy,
 ) {
     let started = Instant::now();
     let timeout = (timeout_seconds > 0).then(|| StdDuration::from_secs(timeout_seconds as u64));
     let pgid = i64::from(child.id());
+    let mut next_memory_check = Instant::now();
+    let mut failed_memory_samples = 0u8;
     loop {
         let child_status = match child.try_wait() {
             Ok(status) => status,
@@ -3402,8 +3598,78 @@ fn monitor_queue_job_completion(
             );
             return;
         }
+        if memory_bytes.is_some_and(|limit| {
+            if Instant::now() < next_memory_check {
+                return false;
+            }
+            next_memory_check = Instant::now() + PERF_MEMORY_SAMPLE_INTERVAL;
+            let rss = process_group_rss_bytes(pgid);
+            let host = host_memory_capacity();
+            perf_memory_sample_requires_termination(
+                limit,
+                rss,
+                host,
+                admission_policy.memory_min_free_bytes,
+                &mut failed_memory_samples,
+            )
+        }) {
+            terminate_child_process_group_with_grace(&mut child, pgid, cancel_grace_seconds);
+            let exit_code = read_queue_job_exit_code_from_state_dir(&state_dir, &job_id);
+            let _ = finish_queue_job_in_state_dir_if_running(
+                &state_dir,
+                &message_queue_db_path,
+                &job_id,
+                "memory_exceeded",
+                exit_code,
+                cancel_grace_seconds,
+                admission_policy,
+            );
+            return;
+        }
         thread::sleep(StdDuration::from_millis(100));
     }
+}
+
+fn process_group_rss_bytes(pgid: i64) -> Option<i64> {
+    let output = Command::new("ps")
+        .args(["-axo", "pgid=,rss="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_process_group_rss_bytes(&String::from_utf8_lossy(&output.stdout), pgid)
+}
+
+fn parse_process_group_rss_bytes(text: &str, pgid: i64) -> Option<i64> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let row_pgid = fields.next()?.parse::<i64>().ok()?;
+            let rss_kib = fields.next()?.parse::<i64>().ok()?;
+            (row_pgid == pgid).then_some(rss_kib)
+        })
+        .try_fold(0i64, |total, rss_kib| total.checked_add(rss_kib))?
+        .checked_mul(1024)
+}
+
+fn perf_memory_sample_requires_termination(
+    memory_limit: i64,
+    rss: Option<i64>,
+    host: Option<(i64, i64)>,
+    configured_reserve: i64,
+    failed_host_samples: &mut u8,
+) -> bool {
+    *failed_host_samples = if host.is_none() {
+        failed_host_samples.saturating_add(1)
+    } else {
+        0
+    };
+    let job_exceeded = rss.is_some_and(|rss| rss > memory_limit);
+    let host_unsafe = host.is_some_and(|(_, available)| {
+        available < effective_memory_reserve_bytes(configured_reserve)
+    });
+    job_exceeded || host_unsafe || *failed_host_samples >= 2
 }
 
 fn recover_running_queue_job_conn(
@@ -3454,6 +3720,20 @@ fn recover_running_queue_job_conn(
         )?;
         return Ok(RecoveredQueueJobAction::Finished("timed_out"));
     }
+    if job.job_type == "perf" && job.memory_bytes.is_none() {
+        if let Some(pgid) = job.process_group_id.or(job.pid) {
+            terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+        }
+        let exit_code = read_exit_code(job.exit_code_path.as_deref());
+        finish_queue_job_conn(
+            conn,
+            job,
+            "memory_exceeded",
+            exit_code,
+            Some(message_queue_db_path),
+        )?;
+        return Ok(RecoveredQueueJobAction::Finished("memory_exceeded"));
+    }
     let Some(pid) = job.pid else {
         finish_queue_job_conn(conn, job, "failed", None, Some(message_queue_db_path))?;
         return Ok(RecoveredQueueJobAction::Finished("failed"));
@@ -3487,6 +3767,8 @@ fn poll_recovered_queue_job(
     cancel_grace_seconds: u64,
     admission_policy: QueueAdmissionPolicy,
 ) {
+    let mut next_memory_check = Instant::now();
+    let mut failed_memory_samples = 0u8;
     loop {
         thread::sleep(StdDuration::from_millis(100));
         let db_path = state_dir.join("queue_runner.db");
@@ -3552,6 +3834,45 @@ fn poll_recovered_queue_job(
                 &conn,
                 &job,
                 "timed_out",
+                exit_code,
+                Some(&message_queue_db_path),
+            );
+            let _ = admit_pending_queue_jobs_conn(
+                &conn,
+                &state_dir,
+                &message_queue_db_path,
+                cancel_grace_seconds,
+                admission_policy,
+                true,
+            );
+            return;
+        }
+        if job.memory_bytes.is_some_and(|limit| {
+            if Instant::now() < next_memory_check {
+                return false;
+            }
+            next_memory_check = Instant::now() + PERF_MEMORY_SAMPLE_INTERVAL;
+            let rss = job
+                .process_group_id
+                .or(job.pid)
+                .and_then(process_group_rss_bytes);
+            let host = host_memory_capacity();
+            perf_memory_sample_requires_termination(
+                limit,
+                rss,
+                host,
+                admission_policy.memory_min_free_bytes,
+                &mut failed_memory_samples,
+            )
+        }) {
+            if let Some(pgid) = job.process_group_id.or(job.pid) {
+                terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+            }
+            let exit_code = read_exit_code(job.exit_code_path.as_deref());
+            let _ = finish_queue_job_conn(
+                &conn,
+                &job,
+                "memory_exceeded",
                 exit_code,
                 Some(&message_queue_db_path),
             );
@@ -3707,7 +4028,7 @@ fn finish_queue_job_conn(
             finished_at = ?3,
             exit_code = ?4,
             completion_notification_required = 1
-        WHERE id = ?1 AND state NOT IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'displaced')
+        WHERE id = ?1 AND state NOT IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'displaced', 'memory_exceeded')
         "#,
         params![job.id, state, finished_at, exit_code],
     )?;
@@ -3733,7 +4054,7 @@ fn retry_unnotified_queue_job_completions_conn(
         r#"
         SELECT id
         FROM queue_jobs
-        WHERE state IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'displaced')
+        WHERE state IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'displaced', 'memory_exceeded')
           AND completion_notification_required = 1
           AND completion_notified_at IS NULL
         ORDER BY finished_at, id
@@ -3909,13 +4230,55 @@ pub fn queue_hold_explanation(
             };
             ("waiting for an available job slot".into(), detail)
         }
+        "memory_pressure" => (
+            "waiting for safe memory headroom".into(),
+            format!(
+                "The performance job needs {} bytes plus the host safety reserve. It remains queued and admission retries every {} seconds.",
+                job.memory_bytes.unwrap_or(0),
+                policy.resource_retry_interval_seconds
+            ),
+        ),
+        "resource_budget_missing" => (
+            "waiting for resource budget metadata".into(),
+            "This legacy performance job has no complete recorded resource budget and cannot be started safely; resubmit it with explicit CPU, memory, and time budgets.".into(),
+        ),
         "" => ("reason not yet reported".into(), "The job is queued, but the scheduler has not reported a hold reason yet. Check sm queue status for updated scheduler context.".into()),
         other => (format!("waiting for {}", other.replace('_', " ")), format!("Scheduler hold: {}.", other.replace('_', " "))),
     };
+    let blocker_seconds = blockers
+        .iter()
+        .filter_map(|blocker| queue_job_remaining_seconds(blocker))
+        .max();
+    let estimated_wait_seconds = match reason {
+        "perf_running" => blocker_seconds
+            .map(|seconds| seconds.saturating_add(policy.perf_cooldown_seconds.max(0))),
+        "awaiting_tests" => {
+            let perf_seconds = (job.job_type != "perf")
+                .then(|| perf.map(|queued_perf| queued_perf.timeout_seconds.max(0)))
+                .flatten()
+                .unwrap_or(0);
+            blocker_seconds.map(|seconds| {
+                seconds
+                    .saturating_add(perf_seconds)
+                    .saturating_add(policy.perf_cooldown_seconds.max(0))
+            })
+        }
+        "perf_cooldown" => Some(policy.perf_cooldown_seconds.max(0)),
+        _ => blocker_seconds,
+    };
     Some(serde_json::json!({
         "summary": summary, "detail": detail,
+        "estimated_wait_seconds": estimated_wait_seconds,
         "blocking_jobs": blockers.iter().map(|j| serde_json::json!({"id":j.id,"label":j.label,"type":j.job_type,"state":j.state})).collect::<Vec<_>>()
     }))
+}
+
+fn queue_job_remaining_seconds(job: &QueueJobRecord) -> Option<i64> {
+    if job.timeout_seconds <= 0 {
+        return None;
+    }
+    let elapsed = queue_elapsed_since(job.started_at.as_deref()?, OffsetDateTime::now_utc())?;
+    Some(job.timeout_seconds.saturating_sub(elapsed).max(0))
 }
 
 /// A bounded, path-safe readable alias; the durable ID prevents collisions.
@@ -3948,14 +4311,26 @@ fn queue_job_completion_text(
         "timed_out" => " termination=timeout",
         "cancelled" => " termination=cancelled",
         "displaced" => " termination=perf_displacement",
+        "memory_exceeded" => " termination=memory_budget",
         _ => "",
     };
     let exit_text = exit_code.map_or_else(
         || " exit=unknown (no exit receipt; output is partial/non-evidence)".to_owned(),
         |code| format!(" exit={code}"),
     );
+    let budget_text = if job.job_type == "perf" {
+        format!(
+            " budget=cpu:{}% gpu:{}% memory:{}B time:{}s",
+            job.cpu_percent.unwrap_or(0),
+            job.gpu_percent.unwrap_or(0),
+            job.memory_bytes.unwrap_or(0),
+            job.timeout_seconds
+        )
+    } else {
+        String::new()
+    };
     format!(
-        "[sm queue] {} completed: {}{}{} runtime={} queue={}. Log: {}. ID: {}",
+        "[sm queue] {} completed: {}{}{}{} runtime={} queue={}. Log: {}. ID: {}",
         if job.label.trim().is_empty() {
             &job.id
         } else {
@@ -3964,6 +4339,7 @@ fn queue_job_completion_text(
         state,
         termination_text,
         exit_text,
+        budget_text,
         runtime,
         queued,
         job.log_path.as_deref().unwrap_or("-"),
@@ -4087,7 +4463,7 @@ fn process_exists(pid: i64) -> bool {
 fn is_terminal_queue_state(state: &str) -> bool {
     matches!(
         state,
-        "succeeded" | "failed" | "timed_out" | "cancelled" | "displaced"
+        "succeeded" | "failed" | "timed_out" | "cancelled" | "displaced" | "memory_exceeded"
     )
 }
 
@@ -4400,7 +4776,7 @@ fn list_queue_jobs_conn(
     if let Some(value) = filters.state {
         if value == "done" {
             where_clauses
-                .push("state IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'displaced')");
+                .push("state IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'displaced', 'memory_exceeded')");
         } else {
             where_clauses.push("state = ?");
             values.push(value.into());
@@ -4409,14 +4785,16 @@ fn list_queue_jobs_conn(
         where_clauses.push("state IN ('pending', 'running')");
     }
 
-    let mut query = r#"
+    let budget_columns = queue_job_budget_projection(conn)?;
+    let mut query = format!(
+        r#"
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
-               argv_json, script_path, timeout_seconds, state, holding_reason,
+               argv_json, script_path, timeout_seconds, {budget_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
                exit_code, log_path
         FROM queue_jobs
     "#
-    .to_owned();
+    );
     if !where_clauses.is_empty() {
         query.push_str(" WHERE ");
         query.push_str(&where_clauses.join(" AND "));
@@ -4440,17 +4818,19 @@ fn list_queue_jobs_conn(
 }
 
 fn get_queue_job_conn(conn: &Connection, job_id: &str) -> Result<Option<QueueJobRecord>> {
-    let mut statement = match conn.prepare(
+    let budget_columns = queue_job_budget_projection(conn)?;
+    let query = format!(
         r#"
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
-               argv_json, script_path, timeout_seconds, state, holding_reason,
+               argv_json, script_path, timeout_seconds, {budget_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
                exit_code, log_path
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
-        "#,
-    ) {
+        "#
+    );
+    let mut statement = match conn.prepare(&query) {
         Ok(statement) => statement,
         Err(rusqlite::Error::SqliteFailure(_, Some(message)))
             if message.contains("no such table") =>
@@ -4463,6 +4843,23 @@ fn get_queue_job_conn(conn: &Connection, job_id: &str) -> Result<Option<QueueJob
         .query_row(params![job_id], queue_job_record_from_row)
         .optional()
         .map_err(Into::into)
+}
+
+fn queue_job_budget_projection(conn: &Connection) -> Result<&'static str> {
+    let mut statement = conn.prepare("PRAGMA table_info(queue_jobs)")?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    Ok(
+        if columns.contains("cpu_percent")
+            && columns.contains("gpu_percent")
+            && columns.contains("memory_bytes")
+        {
+            "cpu_percent, gpu_percent, memory_bytes"
+        } else {
+            "NULL AS cpu_percent, NULL AS gpu_percent, NULL AS memory_bytes"
+        },
+    )
 }
 
 fn queue_job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJobRecord> {
@@ -4493,15 +4890,18 @@ fn queue_job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJ
         argv,
         script_path: row.get(7)?,
         timeout_seconds: row.get(8)?,
-        state: row.get(9)?,
-        holding_reason: row.get(10)?,
-        queued_at: row.get(11)?,
-        started_at: row.get(12)?,
-        finished_at: row.get(13)?,
-        pid: row.get(14)?,
-        process_group_id: row.get(15)?,
-        exit_code: row.get(16)?,
-        log_path: row.get(17)?,
+        cpu_percent: row.get(9)?,
+        gpu_percent: row.get(10)?,
+        memory_bytes: row.get(11)?,
+        state: row.get(12)?,
+        holding_reason: row.get(13)?,
+        queued_at: row.get(14)?,
+        started_at: row.get(15)?,
+        finished_at: row.get(16)?,
+        pid: row.get(17)?,
+        process_group_id: row.get(18)?,
+        exit_code: row.get(19)?,
+        log_path: row.get(20)?,
     })
 }
 
@@ -4779,6 +5179,127 @@ mod tests {
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn macos_memory_pressure_reports_reclaimable_capacity() {
+        let sample = "The system has 274877906944 (16777216 pages with a page size of 16384).\nSystem-wide memory free percentage: 66%\n";
+        assert_eq!(
+            parse_macos_memory_pressure(sample),
+            Some((274_877_906_944, 181_419_418_583))
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            effective_memory_reserve_bytes(2 * 1024 * 1024 * 1024),
+            8 * 1024 * 1024 * 1024
+        );
+        assert!(perf_memory_headroom_is_safe(
+            32 * 1024 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024,
+            (256 * 1024 * 1024 * 1024, 80 * 1024 * 1024 * 1024),
+        ));
+        assert!(!perf_memory_headroom_is_safe(
+            73 * 1024 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024,
+            (256 * 1024 * 1024 * 1024, 80 * 1024 * 1024 * 1024),
+        ));
+        assert_eq!(
+            parse_process_group_rss_bytes(" 42 1024\n 7 9000\n 42 2048\n", 42),
+            Some(3 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn perf_memory_pressure_holds_an_accepted_job_instead_of_rejecting_it() {
+        let state_dir = unique_temp_path("perf-memory-hold");
+        let perf_job = RetainedQueueStore::create_queue_job_in_state_dir(
+            &state_dir,
+            CreateQueueJob {
+                job_type: "perf".into(),
+                label: "oversized perf".into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["true".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 60,
+                cpu_percent: Some(100),
+                gpu_percent: Some(0),
+                memory_bytes: Some(i64::MAX),
+            },
+        )
+        .unwrap();
+        let tests_job = RetainedQueueStore::create_queue_job_in_state_dir(
+            &state_dir,
+            CreateQueueJob {
+                job_type: "tests".into(),
+                label: "eligible tests".into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["true".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 60,
+                cpu_percent: None,
+                gpu_percent: None,
+                memory_bytes: None,
+            },
+        )
+        .unwrap();
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        let mut summary = QueueAdmissionSummary::default();
+        assert_eq!(
+            next_admissible_queue_job_id_conn(
+                &conn,
+                &jobs,
+                QueueAdmissionPolicy::default(),
+                &mut summary,
+                None,
+            )
+            .unwrap(),
+            Some(tests_job.id.clone())
+        );
+        let held = get_queue_job_conn(&conn, &perf_job.id).unwrap().unwrap();
+        assert_eq!(held.state, "pending");
+        assert_eq!(held.holding_reason.as_deref(), Some("memory_pressure"));
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn perf_memory_monitor_enforces_rss_host_pressure_and_measurement_health() {
+        let mut failed = 0;
+        assert!(perf_memory_sample_requires_termination(
+            1024,
+            Some(2048),
+            Some((10_000, 8_000)),
+            100,
+            &mut failed,
+        ));
+        assert!(perf_memory_sample_requires_termination(
+            4096,
+            None,
+            Some((10_000, 900)),
+            100,
+            &mut failed,
+        ));
+        assert!(!perf_memory_sample_requires_termination(
+            4096,
+            None,
+            None,
+            100,
+            &mut failed,
+        ));
+        assert!(perf_memory_sample_requires_termination(
+            4096,
+            None,
+            None,
+            100,
+            &mut failed,
+        ));
+    }
+
+    #[test]
     fn queue_hold_context_names_other_jobs_and_explains_global_and_type_gates() {
         let record = |id: &str, kind: &str, state: &str, reason: Option<&str>| QueueJobRecord {
             id: id.into(),
@@ -4792,6 +5313,9 @@ mod tests {
             argv: None,
             script_path: None,
             timeout_seconds: 60,
+            cpu_percent: None,
+            gpu_percent: None,
+            memory_bytes: None,
             queued_at: "2026-09-11T05:00:00Z".into(),
             started_at: None,
             finished_at: None,
@@ -4813,6 +5337,15 @@ mod tests {
         assert_eq!(context["blocking_jobs"][0]["id"], "running-tests");
         assert!(!detail.contains("friendly-new-tests"));
         assert!(queue_hold_explanation(&running, &jobs, policy).is_none());
+        let mut active_perf = record("active-perf", "perf", "running", None);
+        active_perf.started_at = Some(now_rfc3339());
+        active_perf.timeout_seconds = 600;
+        let waiting = record("waiting", "tests", "pending", Some("perf_running"));
+        let estimate = queue_hold_explanation(&waiting, &[waiting.clone(), active_perf], policy)
+            .unwrap()["estimated_wait_seconds"]
+            .as_i64()
+            .unwrap();
+        assert!((629..=630).contains(&estimate));
         let stale = queue_hold_explanation(&pending, &[pending.clone()], policy).unwrap();
         assert!(stale["detail"]
             .as_str()
@@ -4854,6 +5387,9 @@ mod tests {
             script: None,
             env: BTreeMap::new(),
             timeout_seconds: 60,
+            cpu_percent: None,
+            gpu_percent: None,
+            memory_bytes: None,
         };
         let first =
             RetainedQueueStore::create_queue_job_in_state_dir(&root, request.clone()).unwrap();
@@ -4904,6 +5440,9 @@ mod tests {
             log_path: Some("/tmp/job_missing_exit.log".to_owned()),
             exit_code_path: None,
             timeout_seconds: 900,
+            cpu_percent: None,
+            gpu_percent: None,
+            memory_bytes: None,
             pid: None,
             process_group_id: None,
             exit_code: None,
@@ -4938,6 +5477,9 @@ mod tests {
             log_path: Some(log_path.display().to_string()),
             exit_code_path: None,
             timeout_seconds: 900,
+            cpu_percent: None,
+            gpu_percent: None,
+            memory_bytes: None,
             pid: None,
             process_group_id: None,
             exit_code: None,
@@ -4984,6 +5526,9 @@ mod tests {
             log_path: Some(log_path.display().to_string()),
             exit_code_path: Some(exit_code_path.display().to_string()),
             timeout_seconds: 60,
+            cpu_percent: None,
+            gpu_percent: None,
+            memory_bytes: None,
             pid: None,
             process_group_id: None,
             exit_code: None,
@@ -5040,6 +5585,9 @@ mod tests {
             log_path: Some(log_path.display().to_string()),
             exit_code_path: Some(exit_code_path.display().to_string()),
             timeout_seconds: 60,
+            cpu_percent: None,
+            gpu_percent: None,
+            memory_bytes: None,
             pid: None,
             process_group_id: None,
             exit_code: None,
@@ -5072,6 +5620,9 @@ mod tests {
             log_path: None,
             exit_code_path: None,
             timeout_seconds: 0,
+            cpu_percent: None,
+            gpu_percent: None,
+            memory_bytes: None,
             pid: None,
             process_group_id: None,
             exit_code: None,
@@ -5100,6 +5651,9 @@ mod tests {
                     script: None,
                     env: BTreeMap::new(),
                     timeout_seconds: 60,
+                    cpu_percent: None,
+                    gpu_percent: None,
+                    memory_bytes: None,
                 },
             )
             .unwrap()
@@ -5125,7 +5679,7 @@ mod tests {
         let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
         let mut summary = QueueAdmissionSummary::default();
         assert_eq!(
-            next_admissible_queue_job_id_conn(&conn, &jobs, policy, &mut summary).unwrap(),
+            next_admissible_queue_job_id_conn(&conn, &jobs, policy, &mut summary, None).unwrap(),
             Some(background.id.clone())
         );
 
@@ -5137,7 +5691,7 @@ mod tests {
         let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
         let mut summary = QueueAdmissionSummary::default();
         assert_eq!(
-            next_admissible_queue_job_id_conn(&conn, &jobs, policy, &mut summary).unwrap(),
+            next_admissible_queue_job_id_conn(&conn, &jobs, policy, &mut summary, None).unwrap(),
             None
         );
         let holding_reason: Option<String> = conn
@@ -5151,6 +5705,80 @@ mod tests {
 
         drop(conn);
         fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn resource_blocked_perf_does_not_displace_running_background_work() {
+        let state_dir = unique_temp_path("blocked-perf-no-displacement");
+        let create_job = |job_type: &str, label: &str, memory_bytes: Option<i64>| {
+            RetainedQueueStore::create_queue_job_in_state_dir(
+                &state_dir,
+                CreateQueueJob {
+                    job_type: job_type.to_owned(),
+                    label: label.to_owned(),
+                    requester_session_id: Some("requester".to_owned()),
+                    notify_session_id: "notify".to_owned(),
+                    cwd: "/tmp".to_owned(),
+                    argv: Some(vec!["true".to_owned()]),
+                    script: None,
+                    env: BTreeMap::new(),
+                    timeout_seconds: 60,
+                    cpu_percent: (job_type == "perf").then_some(100),
+                    gpu_percent: (job_type == "perf").then_some(0),
+                    memory_bytes,
+                },
+            )
+            .unwrap()
+        };
+        let background = create_job("background", "running background", None);
+        let perf = create_job("perf", "oversized perf", Some(i64::MAX));
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET state = 'running', started_at = ?2 WHERE id = ?1",
+            params![background.id, now_rfc3339()],
+        )
+        .unwrap();
+
+        let summary = admit_pending_queue_jobs_conn(
+            &conn,
+            &state_dir,
+            &state_dir.join("message_queue.db"),
+            0,
+            QueueAdmissionPolicy {
+                resource_retry_interval_seconds: 600,
+                ..QueueAdmissionPolicy::default()
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(summary.started, 0);
+        assert_eq!(
+            get_queue_job_conn(&conn, &background.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "running"
+        );
+        let perf = get_queue_job_conn(&conn, &perf.id).unwrap().unwrap();
+        assert_eq!(perf.state, "pending");
+        assert_eq!(perf.holding_reason.as_deref(), Some("memory_pressure"));
+
+        release_queue_admission_retry(&state_dir);
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn queue_admission_retry_is_deduplicated_per_state_directory() {
+        let first = unique_temp_path("retry-dedup-first");
+        let second = unique_temp_path("retry-dedup-second");
+        assert!(claim_queue_admission_retry(&first));
+        assert!(!claim_queue_admission_retry(&first));
+        assert!(claim_queue_admission_retry(&second));
+        release_queue_admission_retry(&first);
+        assert!(claim_queue_admission_retry(&first));
+        release_queue_admission_retry(&first);
+        release_queue_admission_retry(&second);
     }
 
     #[test]
@@ -5169,6 +5797,9 @@ mod tests {
                     script: None,
                     env: BTreeMap::new(),
                     timeout_seconds: 60,
+                    cpu_percent: None,
+                    gpu_percent: None,
+                    memory_bytes: None,
                 },
             )
             .unwrap()
@@ -5976,6 +6607,9 @@ mod tests {
             log_path: None,
             exit_code_path: None,
             timeout_seconds: 120,
+            cpu_percent: None,
+            gpu_percent: None,
+            memory_bytes: None,
             pid: None,
             process_group_id: None,
             exit_code: None,

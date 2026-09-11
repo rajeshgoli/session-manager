@@ -26,7 +26,7 @@ Terminal wake to the requester:
 
 ## Problem
 
-The host machine is a Mac laptop with 18 GB RAM and 12 cores. Multiple agents routinely run local resource-intensive operations in parallel:
+The host is a shared Mac workstation (currently 256 GB RAM). Multiple agents routinely run local resource-intensive operations in parallel:
 
 1. full Python test suites
 2. performance benchmarks
@@ -63,7 +63,7 @@ The new feature should reuse the durable request and notification patterns from 
 ## Non-goals
 
 1. Do not implement cross-host scheduling.
-2. Do not sandbox CPU/memory with cgroups or macOS job objects.
+2. Do not throttle or terminate jobs for CPU/GPU utilization. Exclusive performance jobs may legitimately reserve and consume 100% of either resource.
 3. Do not infer task type from arbitrary command text.
 4. Do not mutate task environment for determinism. If an agent wants `PYTHONHASHSEED=0`, it should pass it explicitly.
 5. Do not make synchronous waiting the primary workflow. Agents should rely on the completion wakeup or tail the returned log path.
@@ -77,7 +77,7 @@ Add one command group:
 sm queue run [options] -- COMMAND [ARG...]
 sm queue run [options] --script-file PATH
 sm queue run [options] --script-file -
-sm queue list [--type TYPE] [--state pending|running|succeeded|failed|cancelled|timed_out|displaced|done] [--all] [--json]
+sm queue list [--type TYPE] [--state pending|running|succeeded|failed|cancelled|timed_out|displaced|memory_exceeded|done] [--all] [--json]
 sm queue status <job-id> [--json]
 sm queue cancel <job-id>
 ```
@@ -89,6 +89,9 @@ sm queue cancel <job-id>
 --label TEXT                   human-readable label shown in list/watch
 --cwd PATH                     default: caller working directory
 --timeout DURATION             examples: 90s, 10m, 2h
+--cpu PERCENT                 whole-host allocation, 1-100; required for perf
+--gpu PERCENT                 whole-host allocation, 0-100; perf default: 0
+--memory SIZE                 peak RSS budget, such as 8G; required for perf
 --env KEY=VALUE                repeatable explicit environment additions/overrides
 --notify SESSION_OR_ROLE       default: current managed session
 ```
@@ -108,7 +111,7 @@ Everything after `--` is captured as an argv vector and executed without shell i
 For multiline shell or commands that intentionally need shell features, agents use a script file or stdin:
 
 ```bash
-sm queue run --type perf --script-file - <<'EOF'
+sm queue run --type perf --cpu 100 --gpu 0 --memory 32G --timeout 45m --script-file - <<'EOF'
 set -euo pipefail
 python scripts/run_benchmark.py --case baseline
 python scripts/run_benchmark.py --case candidate
@@ -119,7 +122,9 @@ EOF
 
 Submission exits with code `0` when SM accepts the job, even if the command later fails. Submission exits non-zero only for invalid input or SM unavailability. The managed command's exit code is reported by `sm queue status` and the completion notification.
 
-Pass `--timeout none` only for a `background` job that is intentionally long-lived. This stores a zero timeout and disables scheduler timeout enforcement; the job remains explicitly cancellable and may still be displaced by ready performance work. Tests and performance jobs must always have a positive timeout.
+Pass `--timeout none` only for a `background` job that is intentionally long-lived. This stores a zero timeout and disables scheduler timeout enforcement; the job remains explicitly cancellable and may still be displaced by ready performance work. Tests must have a positive timeout. Performance jobs must explicitly declare `--cpu`, `--memory`, and `--timeout`; they cannot rely on type defaults. `--gpu` defaults to zero and should be declared when the measurement uses the GPU.
+
+CPU and GPU values are percentages of total host capacity, not per-core utilization and not kill thresholds. A value of 100 means the exclusive perf job may consume the whole resource. Memory is different: it is both an admission reservation and a runtime safety ceiling because exceeding physical-memory headroom can destabilize or reboot the host.
 
 ## Workload Types
 
@@ -128,7 +133,7 @@ V1 ships three built-in workload types. Their defaults are configurable in `conf
 | Type | Max concurrent | Can displace | Can be displaced | Default timeout | Choose this when |
 | --- | ---: | --- | --- | --- | --- |
 | `tests` | 2 | no | no | 15m | Output is content-deterministic and multiple instances can run safely. |
-| `perf` | 1 | `background` only | no | 45m | Output is wall-time-derived, such as benchmarks or latency measurements, and needs a quiet measurement window. |
+| `perf` | 1 | `background` only | no | explicit | Output is wall-time-derived, such as benchmarks or latency measurements, and needs a quiet measurement window. |
 | `background` | 2 | no | yes | 60m (or explicit `none`) | Work is long-running, content-producing, and safe to cancel/retry, such as corpus prep or fixture generation. |
 
 Unknown types are rejected in v1. If operators need more classes later, add config-defined custom types as a follow-up after the core queue is stable.
@@ -142,7 +147,7 @@ Jobs start when all of these are true:
 1. The job is at the head of its type queue.
 2. The type's max-concurrent cap has a free slot.
 3. The global max-running cap has a free slot.
-4. Global resource gates pass.
+4. For `perf`, the exclusive resource gate passes.
 5. A `perf` job is not blocked by cooldown.
 
 A ready `perf` job drains running tests without signalling them, prevents new tests/background jobs from starting, displaces running background jobs, and then runs alone. This makes `perf` the only globally serialized workload class while ordinary tests use their configured concurrency on capable hosts.
@@ -171,27 +176,33 @@ Displacement behavior:
 
 V1 does not automatically resubmit displaced jobs. Manual resubmission is clearer and avoids surprising repeated resource churn from work that may not be safe to restart.
 
-Completion notifications name scheduler-controlled termination (`timeout`, `cancelled`, or `perf_displacement`). If the wrapper did not persist an exit receipt, the notification reports `exit=unknown` and labels the captured output partial/non-evidence; lines in that log must not be treated as a completed test result.
+Completion notifications name scheduler-controlled termination (`timeout`, `cancelled`, `perf_displacement`, or `memory_budget`). If the wrapper did not persist an exit receipt, the notification reports `exit=unknown` and labels the captured output partial/non-evidence; lines in that log must not be treated as a completed test result.
 
-## Resource Gates
+## Exclusive Perf Resource Gates
 
-V1 has two gates:
+Resource-based admission applies only to exclusive `perf` jobs. Submission is never rejected merely because the host is busy: the accepted job remains pending and is reconsidered automatically.
 
-1. Memory preflight.
+The gates are:
+
+1. Memory headroom for the declared reservation.
 2. Perf cooldown.
 
-Memory preflight reads macOS memory pressure/free memory before starting a job. Default policy:
+Memory preflight reads macOS memory pressure before starting a perf job. Admission requires the declared memory budget plus a safety reserve. On macOS the reserve is the larger of the configured floor and 8 GiB. This leaves enough operating-system headroom without withholding 10% (25.6 GiB) of the current 256 GB host from useful work.
 
 ```yaml
 queue_runner:
   memory:
-    min_free_bytes: 2147483648
+    min_free_bytes: 8589934592
     retry_interval_seconds: 10
 ```
 
-The 2 GB default is a conservative first-pass guardrail, not a measured optimum: it is roughly 11% of the host's 18 GB RAM and leaves room for macOS, active agents, browser/Telegram clients, and filesystem cache before admitting another queued command. The value is configurable and should be tuned after the observability samples below show real workload profiles.
+The 8 GiB value is the macOS safety floor. A larger configured value wins. The fixed floor reflects the observed host requirement and leaves the rest of the current 256 GB machine available for declared perf work.
 
-If the gate fails, the job remains pending with holding reason `memory_pressure`. SM does not fail the job just because memory is low; it waits until memory recovers or the job is cancelled.
+If the gate fails, the job remains pending with holding reason `memory_pressure`. SM does not fail the job just because memory is low; it waits until memory recovers or the job is cancelled. Failure to measure host memory is fail-closed and also keeps the job pending.
+
+A resource-blocked perf job does not reserve the exclusive window or displace running background work. Other eligible jobs may continue while it waits; exclusivity begins only after the perf job has safe memory headroom and is otherwise ready to start.
+
+While a perf job runs, SM samples aggregate RSS for its full process group and current host memory pressure every 250 ms. It terminates the job as `memory_exceeded` if measured aggregate RSS exceeds the declaration, host reclaimable memory enters the safety reserve, or two consecutive host-memory samples are unavailable. The short grace avoids misclassifying a process that exits during sampling while still failing closed within 500 ms on a broken host-safety monitor. If process inspection is restricted, the host-pressure backstop remains active even though the declared per-job RSS ceiling cannot be measured directly. CPU/GPU declarations are reported and reserved for the exclusive window but do not cause termination. The explicit wall-time budget continues to terminate as `timed_out`.
 
 Perf cooldown protects measurement quality:
 
@@ -228,6 +239,7 @@ accepted -> pending -> running -> succeeded
                             \-> failed
                             \-> timed_out
                             \-> cancelled
+                            \-> memory_exceeded
                             \-> displaced
 ```
 
@@ -387,7 +399,7 @@ queue_runner:
   perf_cooldown_seconds: 30
   cancel_grace_seconds: 10
   memory:
-    min_free_bytes: 2147483648
+    min_free_bytes: 8589934592
     retry_interval_seconds: 10
   types:
     tests:
@@ -415,7 +427,7 @@ ID  Type  State  Notify  Label  Queued  Started  Runtime  Holding  Log
 
 ## Resource Observability
 
-While at least one queue job is pending or running, SM should sample host load periodically for later analysis. This is not used for scheduling decisions in v1 except for the memory preflight gate; it is for post hoc reconstruction of contention.
+While at least one queue job is pending or running, SM should sample host load periodically for later analysis. CPU/GPU samples are observational; only exclusive-perf memory headroom participates in admission and runtime safety decisions.
 
 Default sampling:
 

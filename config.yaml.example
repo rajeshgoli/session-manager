@@ -432,7 +432,8 @@ queue_runner:
   perf_cooldown_seconds: 30
   cancel_grace_seconds: 10
   memory:
-    min_free_bytes: 2147483648
+    # Exclusive perf admission/runtime reserve. macOS always keeps at least 8 GiB.
+    min_free_bytes: 8589934592
     retry_interval_seconds: 10
   resource_sampling:
     enabled: true

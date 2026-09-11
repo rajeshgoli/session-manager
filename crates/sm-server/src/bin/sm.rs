@@ -441,7 +441,8 @@ const QUEUE_SCHEDULING_HELP: &str = "Choosing a job type:
   tests       Required builds/checks (default). Running tests are not displaced.
   perf        Measurements. Waits for running tests to finish, then a cooldown
               after the latest tests/perf finish (30s by default; configurable).
-              Pending tests get a turn after a perf run.
+              Pending tests get a turn after a perf run. Requires explicit
+              --cpu, --memory, and --timeout budgets; --gpu defaults to 0.
   background  Interruptible work. A perf run can terminate it as 'displaced';
               it is not paused or automatically retried. Resubmit if needed.
   service     Persistent services. Not displaced for perf; uses service capacity.
@@ -489,6 +490,24 @@ struct QueueRunArgs {
         help = "Positive timeout (for example 90s or 2h); 'none' is background-only"
     )]
     timeout: Option<String>,
+    #[arg(
+        long,
+        value_name = "PERCENT",
+        help = "Whole-host CPU allocation (1-100); required for perf"
+    )]
+    cpu: Option<String>,
+    #[arg(
+        long,
+        value_name = "PERCENT",
+        help = "Whole-host GPU allocation (0-100; default 0 for perf)"
+    )]
+    gpu: Option<String>,
+    #[arg(
+        long,
+        value_name = "BYTES",
+        help = "Peak memory budget, for example 8G or 512M; required for perf"
+    )]
+    memory: Option<String>,
     #[arg(long = "env")]
     env_pairs: Vec<String>,
     #[arg(long)]
@@ -1303,6 +1322,31 @@ fn run_queue(client: &ApiClient, args: QueueArgs) -> Result<()> {
 }
 
 fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
+    let timeout_seconds = args
+        .timeout
+        .as_deref()
+        .map(|value| parse_queue_timeout_seconds_for_type(&args.job_type, value))
+        .transpose()?;
+    let cpu_percent = args.cpu.as_deref().map(parse_queue_percent).transpose()?;
+    let gpu_percent = args
+        .gpu
+        .as_deref()
+        .map(parse_queue_optional_percent)
+        .transpose()?;
+    let memory_bytes = args
+        .memory
+        .as_deref()
+        .map(parse_queue_memory_bytes)
+        .transpose()?;
+    if args.job_type == "perf" {
+        if timeout_seconds.is_none() || cpu_percent.is_none() || memory_bytes.is_none() {
+            bail!(
+                "perf jobs require explicit --cpu PERCENT, --memory SIZE, and --timeout DURATION budgets (for example: --cpu 100 --memory 32G --timeout 45m)"
+            );
+        }
+    } else if cpu_percent.is_some() || gpu_percent.is_some() || memory_bytes.is_some() {
+        bail!("--cpu, --gpu, and --memory resource allocations are only valid for --type perf");
+    }
     let notify_target = args
         .notify
         .as_deref()
@@ -1344,11 +1388,6 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
     // or unrelated server state.
     let env_values =
         apply_queue_environment_overrides(captured_queue_environment(), args.env_pairs)?;
-    let timeout_seconds = args
-        .timeout
-        .as_deref()
-        .map(|value| parse_queue_timeout_seconds_for_type(&args.job_type, value))
-        .transpose()?;
     let mut body = json!({
         "type": args.job_type,
         "label": args.label,
@@ -1365,6 +1404,15 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
     }
     if let Some(timeout_seconds) = timeout_seconds {
         body["timeout_seconds"] = json!(timeout_seconds);
+    }
+    if let Some(cpu_percent) = cpu_percent {
+        body["cpu_percent"] = json!(cpu_percent);
+    }
+    if let Some(gpu_percent) = gpu_percent {
+        body["gpu_percent"] = json!(gpu_percent);
+    }
+    if let Some(memory_bytes) = memory_bytes {
+        body["memory_bytes"] = json!(memory_bytes);
     }
     let payload = client.post_json("/queue-jobs", body)?;
     let id = payload["id"].as_str().unwrap_or("unknown");
@@ -1520,7 +1568,11 @@ fn queue_waiting_text(job: &Value) -> Option<String> {
         return None;
     }
     if let Some(detail) = job["holding"]["detail"].as_str().filter(|s| !s.is_empty()) {
-        return Some(detail.into());
+        let estimate = job["holding"]["estimated_wait_seconds"]
+            .as_i64()
+            .map(|seconds| format!(" Estimated wait: up to {seconds}s."))
+            .unwrap_or_default();
+        return Some(format!("{detail}{estimate}"));
     }
     Some(
         match job["holding_reason"].as_str().filter(|s| !s.is_empty()) {
@@ -1544,6 +1596,15 @@ fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
     println!("ID: {}", payload["id"].as_str().unwrap_or(job_id));
     println!("Type: {}", payload["type"].as_str().unwrap_or("-"));
     println!("State: {}", payload["state"].as_str().unwrap_or("-"));
+    if payload["type"].as_str() == Some("perf") {
+        println!(
+            "Budget: cpu={}% gpu={}% memory={}B time={}s",
+            payload["cpu_percent"].as_u64().unwrap_or(0),
+            payload["gpu_percent"].as_u64().unwrap_or(0),
+            payload["memory_bytes"].as_i64().unwrap_or(0),
+            payload["timeout_seconds"].as_i64().unwrap_or(0),
+        );
+    }
     if let Some(reason) = queue_waiting_text(&payload) {
         println!("Waiting: {reason}");
     }
@@ -4917,6 +4978,53 @@ fn parse_queue_timeout_seconds_for_type(job_type: &str, value: &str) -> Result<i
     Ok(timeout_seconds)
 }
 
+fn parse_queue_percent(value: &str) -> Result<u8> {
+    let value = value.trim().trim_end_matches('%');
+    let percent = value
+        .parse::<u8>()
+        .with_context(|| format!("invalid percentage: {value}"))?;
+    if !(1..=100).contains(&percent) {
+        bail!("percentage must be between 1 and 100: {value}");
+    }
+    Ok(percent)
+}
+
+fn parse_queue_optional_percent(value: &str) -> Result<u8> {
+    let value = value.trim().trim_end_matches('%');
+    let percent = value
+        .parse::<u8>()
+        .with_context(|| format!("invalid percentage: {value}"))?;
+    if percent > 100 {
+        bail!("percentage must be between 0 and 100: {value}");
+    }
+    Ok(percent)
+}
+
+fn parse_queue_memory_bytes(value: &str) -> Result<i64> {
+    let value = value.trim();
+    let split = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let amount = value[..split]
+        .parse::<i64>()
+        .with_context(|| format!("invalid memory size: {value}"))?;
+    if amount <= 0 {
+        bail!("memory size must be greater than zero: {value}");
+    }
+    let suffix = value[split..].trim().to_ascii_lowercase();
+    let multiplier = match suffix.as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        "t" | "tb" | "tib" => 1024_i64.pow(4),
+        _ => bail!("invalid memory size suffix: {value}; use B, K, M, G, or T"),
+    };
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| anyhow!("memory size is too large: {value}"))
+}
+
 fn parse_queue_log_lines(value: &str) -> std::result::Result<usize, String> {
     let lines = value
         .parse::<usize>()
@@ -6286,6 +6394,42 @@ mod tests {
             .to_string();
         assert!(error.contains("background jobs"));
         assert!(error.contains("--timeout 2h"));
+        assert_eq!(parse_queue_percent("100%").unwrap(), 100);
+        assert_eq!(parse_queue_optional_percent("0").unwrap(), 0);
+        assert_eq!(
+            parse_queue_memory_bytes("32G").unwrap(),
+            32 * 1024 * 1024 * 1024
+        );
+        assert!(parse_queue_percent("0").is_err());
+
+        let perf_cli = Cli::try_parse_from([
+            "sm",
+            "queue",
+            "run",
+            "--type",
+            "perf",
+            "--cpu",
+            "100",
+            "--gpu",
+            "100%",
+            "--memory",
+            "32G",
+            "--timeout",
+            "45m",
+            "--",
+            "echo",
+            "benchmark",
+        ])
+        .unwrap();
+        let Command::Queue(queue_args) = perf_cli.command else {
+            panic!("expected queue command");
+        };
+        let QueueCommand::Run(run_args) = queue_args.command else {
+            panic!("expected queue run command");
+        };
+        assert_eq!(run_args.cpu.as_deref(), Some("100"));
+        assert_eq!(run_args.gpu.as_deref(), Some("100%"));
+        assert_eq!(run_args.memory.as_deref(), Some("32G"));
     }
 
     #[test]
