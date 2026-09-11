@@ -176,7 +176,8 @@ environment is needed. Refresh the installed CLI with `./scripts/install-sm-cli.
 In `sm watch`, jobs appear under their requesting agent with their friendly label,
 state, and elapsed time. Pending rows also show their scheduler hold reason
 (performance cooldown, test jobs, or an available slot); an unreported reason is
-marked explicitly. Running jobs are green. Idle agents waiting for a queue
+marked explicitly. Running jobs are green and show their PID on the row and in
+expanded details. Idle agents waiting for a queue
 job or review result appear in cyan as **waiting**, with a clock beside their name.
 A single visible job supplies its own detail row; multiple obligations get a compact
 summary such as “Waiting for 2 jobs and 1 review”. Expand the agent for details of
@@ -199,6 +200,13 @@ while their browser or inline log is open.
 `sm queue status`, `sm queue log`, and `sm queue cancel` accept a durable ID or an
 exact, unique friendly label, for example `sm queue status 1374-demo-api-8974`.
 Duplicate labels return an ambiguity error listing IDs; exact IDs take precedence.
+`sm queue run` explains a pending job immediately, and `sm queue status` refreshes
+that explanation. The response names blocking jobs and explains global performance
+windows, test fairness, capacity limits, and cooldowns. For example, a new test job
+can be paused while existing tests drain to give a performance job a quiet window;
+`awaiting_tests` does not mean that the job depends on itself. JSON responses keep
+`holding_reason` and add `holding.summary`, `holding.detail`, and `holding.blocking_jobs`.
+Blocker lists are current snapshots; they can advance after a scheduler hold was recorded.
 Completion messages lead with the label and retain the ID for diagnostics.
 New jobs have readable `label--job_id.log` hard-link aliases sharing the canonical
 log's contents. Existing ID-based log paths continue to work.

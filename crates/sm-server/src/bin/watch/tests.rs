@@ -675,3 +675,36 @@ fn pending_job_rows_explain_each_hold_and_clear_it_when_running() {
     j["state"] = json!("running");
     assert!(pending_reason(&j).is_empty());
 }
+
+#[test]
+fn running_job_pid_appears_in_tree_browser_and_details_only_while_running() {
+    let a = args();
+    let mut view = View::new(&a);
+    let mut j = job("j", "a", "running");
+    j["pid"] = json!(4321);
+    let snap = Snapshot {
+        sessions: vec![session("a", "", "/repo")],
+        jobs: vec![j.clone()],
+        ..Default::default()
+    };
+    assert!(
+        view.rows(&snap, &a, 0)
+            .iter()
+            .any(|r| matches!(r.target, Some(Target::SessionJob(_, _)))
+                && r.text.contains("PID 4321"))
+    );
+    view.jobs_for = Some("a".into());
+    assert!(view
+        .rows(&snap, &a, 0)
+        .iter()
+        .any(|r| matches!(r.target, Some(Target::Job(_))) && r.text.contains("PID 4321")));
+    assert!(job_metadata(&j, 0).join("\n").contains("PID  4321"));
+    j["state"] = json!("succeeded");
+    assert!(running_job_pid(&j).is_none());
+    assert!(!job_metadata(&j, 0).join("\n").contains("PID"));
+    j["state"] = json!("running");
+    j["pid"] = Value::Null;
+    assert!(!job_row_context(&j).contains("PID"));
+    j["pid"] = json!(0);
+    assert!(running_job_pid(&j).is_none());
+}

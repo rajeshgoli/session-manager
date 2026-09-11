@@ -101,6 +101,9 @@ fn pending_reason(job: &Value) -> String {
     if s(job, "state") != "pending" {
         return String::new();
     }
+    if let Some(summary) = job["holding"]["summary"].as_str().filter(|s| !s.is_empty()) {
+        return format!(" · {summary}");
+    }
     let reason = match s(job, "holding_reason") {
         "awaiting_tests" => "waiting for test jobs".into(),
         "perf_running" => "waiting for the performance run to finish".into(),
@@ -110,6 +113,20 @@ fn pending_reason(job: &Value) -> String {
         other => format!("waiting for {}", other.replace('_', " ")),
     };
     format!(" · {reason}")
+}
+
+fn running_job_pid(job: &Value) -> Option<i64> {
+    if s(job, "state") == "running" {
+        job["pid"].as_i64().filter(|pid| *pid > 0)
+    } else {
+        None
+    }
+}
+fn job_row_context(job: &Value) -> String {
+    match running_job_pid(job) {
+        Some(pid) => format!(" · PID {pid}"),
+        None => pending_reason(job),
+    }
 }
 
 /// Summarize outstanding work without repeating the selectable job rows.
@@ -169,10 +186,15 @@ fn job_metadata(job: &Value, now: i64) -> Vec<String> {
     if !reason.is_empty() {
         lines.push(format!(
             "Pending reason  {}",
-            reason.trim_start_matches(" · ")
+            job["holding"]["detail"]
+                .as_str()
+                .unwrap_or_else(|| reason.trim_start_matches(" · "))
         ));
     }
     let mut context = vec![format!("Owner  {}", owner(job))];
+    if let Some(pid) = running_job_pid(job) {
+        context.push(format!("PID  {pid}"));
+    }
     if let Some(code) = job["exit_code"].as_i64() {
         context.push(format!("Exit  {code}"));
     }
@@ -752,7 +774,7 @@ impl View {
                             s(j, "type"),
                             s(j, "state"),
                             job_age(j, now),
-                            pending_reason(j),
+                            job_row_context(j),
                             owner(j),
                             s(j, "id")
                         ),
@@ -1019,7 +1041,7 @@ impl View {
                         s(j, "label"),
                         s(j, "state"),
                         job_age(j, now),
-                        pending_reason(j),
+                        job_row_context(j),
                         s(j, "id")
                     ),
                     Target::SessionJob(id.into(), s(j, "id").into()),

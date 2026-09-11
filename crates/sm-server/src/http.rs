@@ -5975,9 +5975,13 @@ async fn list_queue_jobs(
             include_terminal: query.include_terminal,
         },
     )?;
+    // Include all active jobs even for a filtered listing: another agent's
+    // test/performance job may be holding this agent's queue.
+    let active =
+        RetainedQueueStore::list_queue_jobs_from_path(&queue_db_path, QueueJobFilters::default())?;
     let mut response_jobs = Vec::with_capacity(jobs.len());
     for job in jobs {
-        response_jobs.push(queue_job_response(&state, job)?);
+        response_jobs.push(queue_job_response_with_context(&state, job, &active)?);
     }
     Ok(Json(json!({ "jobs": response_jobs })))
 }
@@ -14259,6 +14263,23 @@ fn codex_review_request_response(
 }
 
 fn queue_job_response(state: &AppState, job: QueueJobRecord) -> Result<Value, ApiError> {
+    let active = if job.state == "pending" {
+        RetainedQueueStore::list_queue_jobs_from_path(
+            &expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
+                .join("queue_runner.db"),
+            QueueJobFilters::default(),
+        )?
+    } else {
+        Vec::new()
+    };
+    queue_job_response_with_context(state, job, &active)
+}
+
+fn queue_job_response_with_context(
+    state: &AppState,
+    job: QueueJobRecord,
+    active: &[QueueJobRecord],
+) -> Result<Value, ApiError> {
     let requester_name = match job.requester_session_id.as_deref() {
         Some(session_id) => state
             .session_store
@@ -14303,6 +14324,7 @@ fn queue_job_response(state: &AppState, job: QueueJobRecord) -> Result<Value, Ap
         "script_path": job.script_path,
         "timeout_seconds": job.timeout_seconds,
         "state": job.state,
+        "holding": crate::queue::queue_hold_explanation(&job, active, queue_admission_policy(&state.config)),
         "holding_reason": job.holding_reason,
         "queued_at": job.queued_at,
         "started_at": job.started_at,

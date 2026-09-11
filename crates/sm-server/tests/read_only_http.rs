@@ -4380,6 +4380,8 @@ async fn queue_jobs_lists_rows_with_filters_and_session_names() {
     assert_eq!(payload["notify_name"], "reviewer");
     assert_eq!(payload["argv"], json!(["cargo", "test"]));
     assert_eq!(payload["holding_reason"], "memory");
+    assert_eq!(payload["holding"]["summary"], "waiting for memory");
+    assert_eq!(payload["holding"]["detail"], "Scheduler hold: memory.");
 
     let (status, payload) = get_json(app.clone(), "/queue-jobs/missing").await;
     assert_eq!(status, StatusCode::NOT_FOUND);

@@ -1348,6 +1348,9 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
     let label = payload["label"].as_str().unwrap_or("-");
     let state = payload["state"].as_str().unwrap_or("-");
     println!("Queued {label} [{state}] ({id})");
+    if let Some(reason) = queue_waiting_text(&payload) {
+        println!("Waiting: {reason}");
+    }
     if let Some(log_path) = payload["readable_log_path"]
         .as_str()
         .or_else(|| payload["log_path"].as_str())
@@ -1489,6 +1492,21 @@ fn queue_list_scope_text(
     }
 }
 
+fn queue_waiting_text(job: &Value) -> Option<String> {
+    if job["state"].as_str() != Some("pending") {
+        return None;
+    }
+    if let Some(detail) = job["holding"]["detail"].as_str().filter(|s| !s.is_empty()) {
+        return Some(detail.into());
+    }
+    Some(
+        match job["holding_reason"].as_str().filter(|s| !s.is_empty()) {
+            Some(reason) => format!("Scheduler hold: {}", reason.replace('_', " ")),
+            None => "The scheduler has not reported a hold reason yet.".into(),
+        },
+    )
+}
+
 fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
     let job_id = args.job_id.trim();
     if job_id.is_empty() {
@@ -1503,10 +1521,9 @@ fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
     println!("ID: {}", payload["id"].as_str().unwrap_or(job_id));
     println!("Type: {}", payload["type"].as_str().unwrap_or("-"));
     println!("State: {}", payload["state"].as_str().unwrap_or("-"));
-    println!(
-        "Holding: {}",
-        payload["holding_reason"].as_str().unwrap_or("-")
-    );
+    if let Some(reason) = queue_waiting_text(&payload) {
+        println!("Waiting: {reason}");
+    }
     println!("Exit: {}", queue_exit_text(&payload));
     println!(
         "Termination: {}",
@@ -5218,6 +5235,20 @@ mod tests {
             reader.read_exact(&mut body).unwrap();
         }
         (method, path, String::from_utf8(body).unwrap())
+    }
+
+    #[test]
+    fn queue_agent_output_uses_explanation_and_does_not_claim_running_jobs_are_held() {
+        let mut job = json!({"state":"pending","holding_reason":"awaiting_tests", "holding":{"detail":"Waiting for friendly-test so friendly-perf can get a quiet window."}});
+        assert_eq!(
+            queue_waiting_text(&job).unwrap(),
+            "Waiting for friendly-test so friendly-perf can get a quiet window."
+        );
+        job["state"] = json!("running");
+        assert!(queue_waiting_text(&job).is_none());
+        assert!(queue_waiting_text(&json!({"state":"pending"}))
+            .unwrap()
+            .contains("not reported"));
     }
 
     #[test]
