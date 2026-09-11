@@ -181,9 +181,7 @@ fn agent_queue_only_shows_its_requesters_jobs_and_hold_reasons() {
         .collect();
     assert_eq!(job_rows.len(), 1);
     assert!(job_rows[0].text.contains("pending"));
-    assert!(job_rows[0]
-        .text
-        .contains("waiting for an available job slot"));
+    assert!(job_rows[0].text.contains("slots full"));
     let mut delegated = job("d", "a", "running");
     delegated["notify_session_id"] = json!("b");
     assert!(owns(&delegated, "a") && !owns(&delegated, "b"));
@@ -562,14 +560,13 @@ fn pending_job_skips_missing_log_then_follows_when_it_starts() {
 }
 
 #[test]
-fn waiting_is_cyan_only_for_idle_agents_and_history_is_visible_on_expansion() {
+fn waiting_is_cyan_only_for_idle_agents_and_review_history_is_visible() {
     let a = args();
     let mut view = View::new(&a);
-    view.expanded.insert("a".into());
     let mut snap = Snapshot {
         sessions: vec![session("a", "", "/repo")],
         obligations: vec![
-            json!({"session_id":"a", "waiting_on":[{"label":"Review · repo #42", "since":"2026-09-10T10:00:00Z"}], "review_history":[{"repo":"repo","pr_number":42,"landed_count":3,"requested_by_agent":2}]}),
+            json!({"session_id":"a", "waiting_on":[{"kind":"review", "repo":"repo", "pr_number":42, "label":"Review · repo #42", "since":"2026-09-10T10:00:00Z"}], "review_history":[{"repo":"repo","pr_number":42,"landed_count":3,"landed_requested_by_agent":1,"requested_by_agent":2}]}),
         ],
         ..Default::default()
     };
@@ -582,7 +579,7 @@ fn waiting_is_cyan_only_for_idle_agents_and_history_is_visible_on_expansion() {
     assert!(agent.text.contains("◷  a"));
     assert_eq!(agent.style, "\x1b[36m");
     assert!(rows.iter().any(|r| r.text.contains("waiting 5m")));
-    assert!(rows.iter().any(|r| r.text.contains("3 landed via sm")));
+    assert!(rows.iter().any(|r| r.text.contains("3 reviews · 1 yours")));
     snap.sessions[0]["activity_state"] = json!("working");
     let rows = view.rows(&snap, &a, 0);
     assert!(rows
@@ -630,7 +627,7 @@ fn obligations_do_not_repeat_visible_jobs_but_preserve_other_results() {
     let multiple = json!({"waiting_on":[
         {"kind":"queue_job", "id":"j", "label":"unit tests"},
         {"kind":"queue_job", "id":"j2", "label":"integration tests"},
-        {"kind":"review", "id":"r", "label":"Review · repo #42", "since":"2026-09-10T10:00:00Z"}
+        {"kind":"review", "id":"r", "repo":"repo", "pr_number":42, "label":"Review · repo #42", "since":"2026-09-10T10:00:00Z"}
     ]});
     let mut jobs = jobs;
     jobs.push(job("j2", "a", "pending"));
@@ -639,8 +636,7 @@ fn obligations_do_not_repeat_visible_jobs_but_preserve_other_results() {
         vec!["Waiting for 2 jobs and 1 review"]
     );
     let expanded = obligation_context(&multiple, &jobs, "a", true, 0);
-    assert_eq!(expanded.len(), 2);
-    assert!(expanded[1].starts_with("Review · repo #42"));
+    assert_eq!(expanded, vec!["Waiting for 2 jobs and 1 review"]);
 }
 
 #[test]
@@ -649,11 +645,11 @@ fn pending_job_rows_explain_each_hold_and_clear_it_when_running() {
     let mut view = View::new(&a);
     let mut j = job("j", "a", "pending");
     for (reason, expected) in [
-        ("perf_cooldown", "waiting for performance cooldown"),
-        ("perf_running", "waiting for the performance run to finish"),
-        ("awaiting_tests", "waiting for test jobs"),
-        ("", "reason not yet reported"),
-        ("future_hold", "waiting for future hold"),
+        ("perf_cooldown", "perf cooldown"),
+        ("perf_running", "perf in progress"),
+        ("awaiting_tests", "tests ahead"),
+        ("", "reason unknown"),
+        ("future_hold", "future hold"),
     ] {
         j["holding_reason"] = json!(reason);
         let snap = Snapshot {
@@ -707,4 +703,93 @@ fn running_job_pid_appears_in_tree_browser_and_details_only_while_running() {
     assert!(!job_row_context(&j).contains("PID"));
     j["pid"] = json!(0);
     assert!(running_job_pid(&j).is_none());
+}
+
+#[test]
+fn review_rows_show_pr_history_collapsed_and_tab_opens_the_watch_details() {
+    let a = args();
+    let mut view = View::new(&a);
+    let now = stamp("2026-09-10T10:05:00Z").unwrap();
+    let mut j = job("j", "a", "pending");
+    j["type"] = json!("perf");
+    j["holding_reason"] = json!("awaiting_tests");
+    let snap = Snapshot {
+        sessions: vec![session("a", "", "/repo")],
+        jobs: vec![j],
+        obligations: vec![json!({
+            "session_id":"a", "waiting_on":[{"kind":"review", "id":"r", "repo":"owner/repo", "pr_number":42, "state":"requested", "since":"2026-09-10T10:00:00Z", "last_polled_at":"2026-09-10T10:04:00Z"}],
+            "review_history":[{"repo":"owner/repo","pr_number":42,"landed_count":3,"landed_requested_by_agent":1,"requested_by_agent":2}, {"repo":"owner/repo","pr_number":41,"landed_count":2,"landed_requested_by_agent":0,"requested_by_agent":0}]
+        })],
+        ..Default::default()
+    };
+    let rows = view.rows(&snap, &a, now);
+    assert!(rows
+        .iter()
+        .any(|r| r.text.contains("[perf] unit tests") && r.text.contains("tests ahead")));
+    let reviews: Vec<_> = rows
+        .iter()
+        .filter(|r| matches!(r.target, Some(Target::Review(_, _, _))))
+        .collect();
+    assert_eq!(reviews.len(), 2);
+    assert!(reviews[0]
+        .text
+        .contains("owner/repo#42 · waiting 5m · 3 reviews · 1 yours"));
+    assert!(reviews[1].text.contains("owner/repo#41 · history"));
+    assert_eq!(rows.iter().filter(|r| r.text.contains("#42")).count(), 1);
+    view.selected = reviews[0].target.clone();
+    let (worker, _) = fake_worker();
+    handle_key(Key::Tab, &mut view, &worker, &snap, &a).unwrap();
+    assert!(view.interest().details.is_empty());
+    let rows = view.rows(&snap, &a, now);
+    assert!(rows
+        .iter()
+        .any(|r| r.text.contains("2 requests by this agent")));
+    assert!(rows
+        .iter()
+        .any(|r| r.text.contains("Last checked · 1m ago")));
+    assert!(rows
+        .iter()
+        .any(|r| r.text.contains("https://github.com/owner/repo/pull/42")));
+    handle_key(Key::Tab, &mut view, &worker, &snap, &a).unwrap();
+    assert!(view.expanded_review.is_none());
+}
+
+#[test]
+fn recent_output_uses_rendered_screen_instead_of_raw_terminal_recording() {
+    let (client, peer) = server(vec![
+        (
+            "/sessions",
+            200,
+            json!({"sessions":[session("a", "", "/repo")]}),
+        ),
+        ("/queue-jobs", 200, json!({"jobs":[]})),
+        ("/reparent-requests", 200, json!({"requests":[]})),
+        ("/session-obligations", 200, json!({"sessions":[]})),
+        (
+            "/sessions/a/tool-calls?limit=10",
+            200,
+            json!({"tool_calls":[]}),
+        ),
+        (
+            "/sessions/a/output?lines=10&rendered=true",
+            200,
+            json!({"output":"PR #1382 is open.\nIndependent review is pending."}),
+        ),
+    ]);
+    let state = Arc::new(Mutex::new(Snapshot::default()));
+    refresh(
+        &client,
+        &state,
+        &Interest {
+            details: BTreeSet::from(["a".into()]),
+            ..Default::default()
+        },
+        false,
+        "primary",
+        false,
+    );
+    let text = state.lock().unwrap().details["a"].join("\n");
+    assert!(text.contains("PR #1382 is open."));
+    assert!(!text.contains("2026l"));
+    peer.join().unwrap();
 }

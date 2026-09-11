@@ -173,16 +173,18 @@ cargo build -p sm-server --release
 The server, CLI, and `sm watch` terminal dashboard are native Rust. No Python
 environment is needed. Refresh the installed CLI with `./scripts/install-sm-cli.sh`.
 
-In `sm watch`, jobs appear under their requesting agent with their friendly label,
-state, and elapsed time. Pending rows also show their scheduler hold reason
+In `sm watch`, jobs appear under their requesting agent with their type (`[tests]`, `[perf]`, or
+`[background]`), friendly label, state, and elapsed time. Pending rows also show their scheduler hold reason
 (performance cooldown, test jobs, or an available slot); an unreported reason is
 marked explicitly. Running jobs are green and show their PID on the row and in
 expanded details. Idle agents waiting for a queue
 job or review result appear in cyan as **waiting**, with a clock beside their name.
 A single visible job supplies its own detail row; multiple obligations get a compact
-summary such as “Waiting for 2 jobs and 1 review”. Expand the agent for details of
-reviews or delegated jobs; a single result without a visible job row keeps its wait age.
-Expanded agents also show per-PR review counts tracked by sm (not all GitHub reviews).
+summary such as “Waiting for 2 jobs and 1 review”. PR reviews have their own rows
+with the PR number, wait age, and landed review counts tracked by sm (not all GitHub
+reviews), including how many this agent requested. Select a review and press `Tab`
+for watcher details and its PR URL. Agent output previews use the rendered terminal
+screen so spinner redraws do not accumulate into garbled text.
 
 Select a job with `j/k`. The first `Tab` opens a compact inline card with metadata
 and six live output lines; a second `Tab` opens the full-screen live log. The log

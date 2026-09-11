@@ -101,16 +101,16 @@ fn pending_reason(job: &Value) -> String {
     if s(job, "state") != "pending" {
         return String::new();
     }
-    if let Some(summary) = job["holding"]["summary"].as_str().filter(|s| !s.is_empty()) {
-        return format!(" · {summary}");
-    }
     let reason = match s(job, "holding_reason") {
-        "awaiting_tests" => "waiting for test jobs".into(),
-        "perf_running" => "waiting for the performance run to finish".into(),
-        "perf_cooldown" => "waiting for performance cooldown".into(),
-        "concurrency_cap" => "waiting for an available job slot".into(),
-        "" => "reason not yet reported".into(),
-        other => format!("waiting for {}", other.replace('_', " ")),
+        "awaiting_tests" => "tests ahead".into(),
+        "perf_running" => "perf in progress".into(),
+        "perf_cooldown" => "perf cooldown".into(),
+        "concurrency_cap" => "slots full".into(),
+        "" => "reason unknown".into(),
+        other => job["holding"]["summary"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| other.replace('_', " ")),
     };
     format!(" · {reason}")
 }
@@ -158,6 +158,9 @@ fn obligation_context(
     }
     if items.len() == 1 || expanded {
         for item in items {
+            if s(&item, "kind") == "review" && item["pr_number"].as_i64().is_some() {
+                continue; // Reviews have their own visible PR rows.
+            }
             let already_visible = s(&item, "kind") == "queue_job"
                 && jobs
                     .iter()
@@ -174,10 +177,127 @@ fn obligation_context(
     lines
 }
 
+/// One visible row per PR combines the current watch with retained review counts.
+fn review_rows(
+    obligation: &Value,
+    id: &str,
+    prefix: &str,
+    expanded: &Option<(String, String, i64)>,
+    now: i64,
+) -> Vec<Row> {
+    let waiting = array(obligation, "waiting_on");
+    let mut prs = BTreeMap::new();
+    for history in array(obligation, "review_history") {
+        if let Some(pr) = history["pr_number"].as_i64() {
+            prs.insert((s(&history, "repo").to_owned(), pr), history);
+        }
+    }
+    for item in waiting.iter().filter(|item| s(item, "kind") == "review") {
+        if let Some(pr) = item["pr_number"].as_i64() {
+            prs.entry((s(item, "repo").to_owned(), pr))
+                .or_insert(Value::Null);
+        }
+    }
+    let mut rows = Vec::new();
+    let mut prs: Vec<_> = prs.into_iter().collect();
+    prs.sort_by_key(|((repo, pr), _)| {
+        (
+            !waiting.iter().any(|item| {
+                s(item, "kind") == "review"
+                    && s(item, "repo") == repo
+                    && item["pr_number"].as_i64() == Some(*pr)
+            }),
+            repo.clone(),
+            std::cmp::Reverse(*pr),
+        )
+    });
+    for ((repo, pr), history) in prs {
+        let active: Vec<_> = waiting
+            .iter()
+            .filter(|item| {
+                s(item, "kind") == "review"
+                    && s(item, "repo") == repo
+                    && item["pr_number"].as_i64() == Some(pr)
+            })
+            .collect();
+        let state = if active.is_empty() {
+            "history".into()
+        } else {
+            let since = active
+                .iter()
+                .map(|item| s(item, "since"))
+                .min()
+                .unwrap_or("");
+            format!("waiting {}", age(since, now))
+        };
+        let counts = if history.is_null() {
+            "history unavailable".into()
+        } else {
+            format!(
+                "{} reviews · {} yours",
+                history["landed_count"]
+                    .as_u64()
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                history["landed_requested_by_agent"]
+                    .as_u64()
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".into())
+            )
+        };
+        rows.push(Row {
+            text: format!("{prefix}   +- [review] {repo}#{pr} · {state} · {counts}"),
+            target: Some(Target::Review(id.into(), repo.clone(), pr)),
+            style: if active.is_empty() {
+                "\x1b[2m"
+            } else {
+                "\x1b[36m"
+            },
+        });
+        if expanded.as_ref() == Some(&(id.to_owned(), repo.clone(), pr)) {
+            if !history.is_null() {
+                rows.push(Row::plain(format!(
+                    "{prefix}      │ Reviews tracked by sm · {} landed · {} requests by this agent",
+                    history["landed_count"], history["requested_by_agent"]
+                )));
+            }
+            for item in active {
+                rows.push(Row::plain(format!(
+                    "{prefix}      │ Watch · {} · requested {} ago",
+                    s(item, "state").replace('_', " "),
+                    age(s(item, "since"), now)
+                )));
+                if !s(item, "last_polled_at").is_empty() {
+                    rows.push(Row::plain(format!(
+                        "{prefix}      │ Last checked · {} ago",
+                        age(s(item, "last_polled_at"), now)
+                    )));
+                }
+                if !s(item, "last_error").is_empty() {
+                    rows.push(Row::plain(format!(
+                        "{prefix}      │ Last check failed · {}",
+                        s(item, "last_error")
+                    )));
+                }
+            }
+            rows.push(Row::plain(format!(
+                "{prefix}      │ https://github.com/{repo}/pull/{pr}"
+            )));
+            rows.push(Row::plain(format!("{prefix}      ╰─")));
+        }
+    }
+    rows
+}
+
 /// Compact metadata shared by inline cards and the full-screen log.
 fn job_metadata(job: &Value, now: i64) -> Vec<String> {
     let mut lines = vec![format!(
-        "{} · {} · {}",
+        "[{}] {} · {} · {}",
+        if s(job, "type").is_empty() {
+            "job"
+        } else {
+            s(job, "type")
+        },
         s(job, "label"),
         s(job, "state"),
         job_age(job, now)
@@ -522,8 +642,18 @@ fn refresh(
             Err(e) => lines.push(format!("Actions unavailable: {e}")),
         }
         lines.push("── Recent output ──".into());
-        match client.get(&format!("/sessions/{}/output?lines=10", enc(id))) {
-            Ok(v) => lines.extend(clean(s(&v, "output")).lines().map(str::to_owned)),
+        match client.get(&format!(
+            "/sessions/{}/output?lines=10&rendered=true",
+            enc(id)
+        )) {
+            Ok(v) => {
+                let output = clean(s(&v, "output"));
+                if output.trim().is_empty() {
+                    lines.push("No rendered terminal output available.".into());
+                } else {
+                    lines.extend(output.lines().map(str::to_owned));
+                }
+            }
             Err(e) => lines.push(format!("Output unavailable: {e}")),
         }
         shared.lock().unwrap().details.insert(id.clone(), lines);
@@ -572,6 +702,7 @@ enum Target {
     Request(String),
     Job(String),
     SessionJob(String, String),
+    Review(String, String, i64),
 }
 #[derive(Clone)]
 struct Row {
@@ -676,6 +807,7 @@ struct View {
     selected: Option<Target>,
     expanded: BTreeSet<String>,
     inline_job: Option<String>,
+    expanded_review: Option<(String, String, i64)>,
     collapsed: BTreeSet<String>,
     hidden: BTreeSet<String>,
     top_level: bool,
@@ -700,6 +832,7 @@ impl View {
             selected: None,
             expanded: BTreeSet::new(),
             inline_job: None,
+            expanded_review: None,
             collapsed: BTreeSet::new(),
             hidden: BTreeSet::new(),
             top_level: args.top_level,
@@ -981,11 +1114,6 @@ impl View {
                         style: "\x1b[36m",
                     });
                 }
-                if self.expanded.contains(id) {
-                    for review in array(obligation, "review_history") {
-                        rows.push(Row::plain(format!("{prefix}   Reviews · {} #{} · {} landed via sm ({} from this agent) · {} requests by this agent", s(&review, "repo"), review["pr_number"], review["landed_count"], review["landed_requested_by_agent"].as_u64().unwrap_or(0), review["requested_by_agent"])));
-                    }
-                }
             }
             if self.expanded.contains(id) {
                 rows.push(Row::plain(format!(
@@ -1037,7 +1165,12 @@ impl View {
             for j in snap.jobs.iter().filter(|j| owns(j, id)) {
                 let mut row = Row::selectable(
                     format!(
-                        "{prefix}   +- {} · {} · {}{}  ({})",
+                        "{prefix}   +- [{}] {} · {} · {}{}  ({})",
+                        if s(j, "type").is_empty() {
+                            "job"
+                        } else {
+                            s(j, "type")
+                        },
                         s(j, "label"),
                         s(j, "state"),
                         job_age(j, now),
@@ -1053,6 +1186,15 @@ impl View {
                 if self.inline_job.as_deref() == Some(s(j, "id")) {
                     rows.extend(job_card(j, snap, &format!("{prefix}      "), now));
                 }
+            }
+            if let Some(obligation) = obligation {
+                rows.extend(review_rows(
+                    obligation,
+                    id,
+                    &prefix,
+                    &self.expanded_review,
+                    now,
+                ));
             }
         }
         if args.restore
@@ -1658,6 +1800,8 @@ pub(super) fn run(url: &str, mut args: WatchArgs) -> Result<()> {
                 view.tail = false;
                 view.offset = 0;
                 view.retained.clear();
+            } else if view.expanded_review.take().is_some() {
+                // Close the review card before leaving the dashboard.
             } else if view.inline_job.take().is_some() {
                 // Close the inline card before leaving the dashboard.
             } else {
@@ -1760,6 +1904,14 @@ fn handle_key(
                 view.free_scroll = false;
                 view.global = false;
                 view.flash.clear();
+            }
+            Some(Target::Review(id, repo, pr)) => {
+                let key = (id, repo, pr);
+                view.expanded_review = if view.expanded_review.as_ref() == Some(&key) {
+                    None
+                } else {
+                    Some(key)
+                };
             }
             Some(Target::Repo(repo)) => {
                 view.hidden.remove(&repo);
