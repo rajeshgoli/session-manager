@@ -91,7 +91,7 @@ fn native_watch_handles_key_bursts_live_logs_resize_and_signal_cleanup() {
             "/queue-jobs"=>json!({"jobs":[{"id":"job001","requester_session_id":"agent001","notify_session_id":"agent001","state":"running","label":"fixture-job","queued_at":"2026-09-10T10:00:00Z","started_at":"2026-09-10T10:00:01Z"}]}),
             "/reparent-requests"=>json!({"requests":[]}),
             "/queue-jobs/job001/log?lines=200"=>json!({"text":"fixture-live-output\n"}),
-            "/queue-jobs/job001/log?lines=5"=>json!({"text":"five-line-output\n"}),
+            "/queue-jobs/job001/log?lines=6"=>json!({"text":"five-line-output\n"}),
             _=>json!({}),
         }.to_string();
             let _=write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
@@ -128,11 +128,11 @@ fn native_watch_handles_key_bursts_live_logs_resize_and_signal_cleanup() {
             .spawn()
             .unwrap(),
     );
-    until(&mut master, "job job001 running");
+    until(&mut master, "fixture-job · running");
     // The job is directly selectable without expanding the agent or pressing J.
     master.write_all(b"/needle\rj\t").unwrap();
     until(&mut master, "five-line-output");
-    master.write_all(b"t").unwrap();
+    master.write_all(b"\t").unwrap();
     until(&mut master, "fixture-live-output");
     master.write_all(b"g").unwrap();
     until(&mut master, "all agents");

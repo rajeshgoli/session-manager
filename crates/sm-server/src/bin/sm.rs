@@ -495,6 +495,7 @@ struct QueueListArgs {
 
 #[derive(Args)]
 struct QueueStatusArgs {
+    /// Durable job ID or unique exact friendly label.
     job_id: String,
     #[arg(long)]
     json: bool,
@@ -502,6 +503,7 @@ struct QueueStatusArgs {
 
 #[derive(Args)]
 struct QueueLogArgs {
+    /// Durable job ID or unique exact friendly label.
     job_id: String,
     #[arg(long, default_value_t = 200, value_parser = parse_queue_log_lines)]
     lines: usize,
@@ -509,6 +511,7 @@ struct QueueLogArgs {
 
 #[derive(Args)]
 struct QueueCancelArgs {
+    /// Durable job ID or unique exact friendly label.
     job_id: String,
 }
 
@@ -1344,8 +1347,11 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
     let id = payload["id"].as_str().unwrap_or("unknown");
     let label = payload["label"].as_str().unwrap_or("-");
     let state = payload["state"].as_str().unwrap_or("-");
-    println!("Queued job {id}: {label} [{state}]");
-    if let Some(log_path) = payload["log_path"].as_str() {
+    println!("Queued {label} [{state}] ({id})");
+    if let Some(log_path) = payload["readable_log_path"]
+        .as_str()
+        .or_else(|| payload["log_path"].as_str())
+    {
         println!("Log: {log_path}");
     }
     Ok(())
@@ -1493,7 +1499,8 @@ fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
-    println!("Job: {}", payload["id"].as_str().unwrap_or(job_id));
+    println!("Job: {}", payload["label"].as_str().unwrap_or(job_id));
+    println!("ID: {}", payload["id"].as_str().unwrap_or(job_id));
     println!("Type: {}", payload["type"].as_str().unwrap_or("-"));
     println!("State: {}", payload["state"].as_str().unwrap_or("-"));
     println!(
@@ -1505,7 +1512,13 @@ fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
         "Termination: {}",
         payload["termination_reason"].as_str().unwrap_or("-")
     );
-    println!("Log: {}", payload["log_path"].as_str().unwrap_or("-"));
+    println!(
+        "Log: {}",
+        payload["readable_log_path"]
+            .as_str()
+            .or_else(|| payload["log_path"].as_str())
+            .unwrap_or("-")
+    );
     Ok(())
 }
 
@@ -1538,7 +1551,7 @@ fn run_queue_cancel(client: &ApiClient, args: QueueCancelArgs) -> Result<()> {
     )?;
     println!(
         "Cancelled queue job: {} ({})",
-        payload["id"].as_str().unwrap_or(job_id),
+        payload["label"].as_str().unwrap_or(job_id),
         payload["state"].as_str().unwrap_or("-")
     );
     Ok(())
@@ -2161,13 +2174,13 @@ fn print_queue_jobs(jobs: &[Value]) {
         return;
     }
     let headers = [
-        "ID", "Type", "State", "Exit", "Notify", "Label", "Holding", "Log",
+        "Job", "Type", "State", "Exit", "Notify", "ID", "Holding", "Log",
     ];
     let rows = jobs
         .iter()
         .map(|job| {
             vec![
-                json_string(job, "id"),
+                json_string(job, "label"),
                 json_string(job, "type"),
                 json_string(job, "state"),
                 queue_exit_text(job),
@@ -2176,9 +2189,13 @@ fn print_queue_jobs(jobs: &[Value]) {
                     .or_else(|| job["notify_session_id"].as_str())
                     .unwrap_or("")
                     .to_owned(),
-                json_string(job, "label"),
+                json_string(job, "id"),
                 job["holding_reason"].as_str().unwrap_or("-").to_owned(),
-                job["log_path"].as_str().unwrap_or("-").to_owned(),
+                job["readable_log_path"]
+                    .as_str()
+                    .or_else(|| job["log_path"].as_str())
+                    .unwrap_or("-")
+                    .to_owned(),
             ]
         })
         .collect::<Vec<_>>();

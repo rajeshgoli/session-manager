@@ -53,11 +53,13 @@ fn ages_distinguish_wait_start_and_terminal_duration() {
     done["finished_at"] = Value::Null;
     assert_eq!(job_age(&done, now), "?");
     assert_eq!(age("invalid", now), "?");
+    assert_eq!(duration(7260), "2h 1m");
+    assert_eq!(duration(90000), "1d 1h");
     assert_eq!(age("2026-09-10T11:00:00Z", now), "0s");
 }
 
 #[test]
-fn running_jobs_appear_once_are_green_and_tab_follows_five_lines() {
+fn jobs_expand_inline_then_open_full_height_live_output() {
     let a = args();
     let mut view = View::new(&a);
     let snap = Snapshot {
@@ -69,7 +71,7 @@ fn running_jobs_appear_once_are_green_and_tab_follows_five_lines() {
     assert!(!rows.iter().any(|r| r.text.contains("1 job running")));
     assert_eq!(
         rows.iter()
-            .filter(|r| r.text.contains("job j running"))
+            .filter(|r| r.text.contains("unit tests · running"))
             .count(),
         1
     );
@@ -80,9 +82,16 @@ fn running_jobs_appear_once_are_green_and_tab_follows_five_lines() {
     view.selected = Some(target);
     let (worker, _) = fake_worker();
     handle_key(Key::Tab, &mut view, &worker, &snap, &a).unwrap();
+    assert!(view.jobs_for.is_none());
+    assert_eq!(view.interest().log_lines, 6);
+    assert!(view
+        .rows(&snap, &a, 0)
+        .iter()
+        .any(|r| r.text.contains("LIVE OUTPUT")));
+    handle_key(Key::Tab, &mut view, &worker, &snap, &a).unwrap();
     assert_eq!(view.jobs_for.as_deref(), Some("a"));
     assert_eq!(view.interest().log, "j");
-    assert_eq!(view.interest().log_lines, 5);
+    assert_eq!(view.interest().log_lines, 200);
     assert!(view.interest().details.is_empty());
     let rows = view.rows(&snap, &a, 0);
     assert_eq!(rows[0].style, "\x1b[32m");
@@ -92,10 +101,10 @@ fn running_jobs_appear_once_are_green_and_tab_follows_five_lines() {
         ..snap
     };
     let text = clean(&frame(&mut view, &snap, &a, &rows, 40, 100));
-    assert!(!text.contains("unique-line-3"));
+    assert!(text.contains("unique-line-3"));
     assert!(text.contains("unique-line-4"));
     assert!(text.contains("unique-line-8"));
-    assert!(text.contains("last 5 lines"));
+    assert!(text.contains("following"));
 }
 
 #[test]
@@ -142,6 +151,8 @@ fn agent_expansion_and_job_tail_are_independent() {
     let (worker, _) = fake_worker();
     view.selected = Some(job_target);
     handle_key(Key::Tab, &mut view, &worker, &snap, &a).unwrap();
+    assert!(view.interest().details.contains("a"));
+    handle_key(Key::Tab, &mut view, &worker, &snap, &a).unwrap();
     assert!(view.interest().details.is_empty());
     let rows = view.rows(&snap, &a, 0);
     assert!(!frame(&mut view, &snap, &a, &rows, 40, 100).contains("agent-only-output"));
@@ -158,7 +169,7 @@ fn agent_queue_only_shows_its_requesters_jobs_and_hold_reasons() {
     let jobs = vec![pending, running, earlier, later];
     let text = queue_context(&jobs, "a").join("\n");
     assert!(!text.contains("job waiting"));
-    assert!(text.contains("held: concurrency cap"));
+    assert!(text.contains("Waiting for concurrency cap"));
     assert!(!text.contains("globally"));
     assert!(!text.contains("by d"));
     assert!(!text.contains("behind"));
@@ -203,7 +214,7 @@ fn tree_groups_children_preserves_cycles_and_expands_jobs() {
     let names = ids(&rows);
     assert!(names.iter().position(|v| v == "root") < names.iter().position(|v| v == "child"));
     assert!(names.contains(&"cycle".into()));
-    assert!(rows.iter().any(|r| r.text.contains("job j running")));
+    assert!(rows.iter().any(|r| r.text.contains("unit tests · running")));
     assert!(rows.iter().any(|r| r.text.contains("/other")));
 }
 #[test]
@@ -480,6 +491,7 @@ fn refresh_retains_snapshot_on_failure_and_reads_final_remote_tail() {
         ("/sessions", 200, json!({"sessions":[]})),
         ("/queue-jobs", 200, json!({"jobs":[]})),
         ("/reparent-requests", 200, json!({"requests":[]})),
+        ("/session-obligations", 200, json!({"sessions":[]})),
         ("/queue-jobs/j", 200, done.clone()),
         (
             "/queue-jobs/j/log?lines=200",
@@ -514,9 +526,11 @@ fn pending_job_skips_missing_log_then_follows_when_it_starts() {
         ("/sessions", 200, json!({"sessions":[]})),
         ("/queue-jobs", 200, json!({"jobs":[job("j","a","pending")]})),
         ("/reparent-requests", 200, json!({"requests":[]})),
+        ("/session-obligations", 200, json!({"sessions":[]})),
         ("/sessions", 200, json!({"sessions":[]})),
         ("/queue-jobs", 200, json!({"jobs":[job("j","a","running")]})),
         ("/reparent-requests", 200, json!({"requests":[]})),
+        ("/session-obligations", 200, json!({"sessions":[]})),
         (
             "/queue-jobs/j/log?lines=5",
             200,
@@ -535,4 +549,60 @@ fn pending_job_skips_missing_log_then_follows_when_it_starts() {
     refresh(&client, &state, &interest, false, "primary", false);
     assert_eq!(state.lock().unwrap().log, "started output");
     peer.join().unwrap();
+}
+
+#[test]
+fn waiting_is_cyan_only_for_idle_agents_and_history_is_visible_on_expansion() {
+    let a = args();
+    let mut view = View::new(&a);
+    view.expanded.insert("a".into());
+    let mut snap = Snapshot {
+        sessions: vec![session("a", "", "/repo")],
+        obligations: vec![
+            json!({"session_id":"a", "waiting_on":[{"label":"Review · repo #42", "since":"2026-09-10T10:00:00Z"}], "review_history":[{"repo":"repo","pr_number":42,"landed_count":3,"requested_by_agent":2}]}),
+        ],
+        ..Default::default()
+    };
+    let rows = view.rows(&snap, &a, stamp("2026-09-10T10:05:00Z").unwrap());
+    let agent = rows
+        .iter()
+        .find(|r| r.target == Some(Target::Session("a".into())))
+        .unwrap();
+    assert!(agent.text.contains("waiting"));
+    assert_eq!(agent.style, "\x1b[36m");
+    assert!(rows.iter().any(|r| r.text.contains("waiting 5m")));
+    assert!(rows.iter().any(|r| r.text.contains("3 landed via sm")));
+    snap.sessions[0]["activity_state"] = json!("working");
+    let rows = view.rows(&snap, &a, 0);
+    assert!(rows
+        .iter()
+        .any(|r| r.target == Some(Target::Session("a".into()))
+            && r.text.contains("working")
+            && r.style == "\x1b[32m"));
+}
+
+#[test]
+fn full_screen_tail_uses_height_and_scroll_follow_survives_resize() {
+    let a = args();
+    let mut view = View::new(&a);
+    view.jobs_for = Some("a".into());
+    view.job_selected = Some(Target::Job("j".into()));
+    view.tail = true;
+    let snap = Snapshot {
+        jobs: vec![job("j", "a", "running")],
+        log_id: "j".into(),
+        log: (1..=100).map(|n| format!("output-{n:03}\n")).collect(),
+        ..Default::default()
+    };
+    let rows = view.rows(&snap, &a, 0);
+    let large = clean(&frame(&mut view, &snap, &a, &rows, 45, 100));
+    assert!(large.contains("output-070") && large.contains("output-100"));
+    assert!(!large.contains("held:") && !large.contains("null"));
+    view.log_scroll = 20;
+    let scrolled = clean(&frame(&mut view, &snap, &a, &rows, 20, 100));
+    assert!(scrolled.contains("output-080") && !scrolled.contains("output-100"));
+    assert!(scrolled.contains("End to follow"));
+    view.log_scroll = 0;
+    let resized = clean(&frame(&mut view, &snap, &a, &rows, 12, 60));
+    assert!(resized.contains("output-100"));
 }

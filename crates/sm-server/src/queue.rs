@@ -204,6 +204,7 @@ pub struct QueueRecoverySummary {
 #[derive(Debug, Clone)]
 struct QueueJobRuntimeRecord {
     id: String,
+    label: String,
     job_type: String,
     state: String,
     notify_session_id: Option<String>,
@@ -883,6 +884,39 @@ impl RetainedQueueStore {
         let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("failed to open queue runner db {}", db_path.display()))?;
         get_queue_job_conn(&conn, job_id)
+    }
+
+    /// Resolve an exact durable ID first, then a unique exact friendly label.
+    pub fn resolve_queue_job_from_path(
+        db_path: &Path,
+        identifier: &str,
+    ) -> Result<Option<QueueJobRecord>> {
+        if let Some(job) = Self::get_queue_job_strict_from_path(db_path, identifier)? {
+            return Ok(Some(job));
+        }
+        let matches: Vec<_> = Self::list_queue_jobs_from_path(
+            db_path,
+            QueueJobFilters {
+                include_terminal: true,
+                ..Default::default()
+            },
+        )?
+        .into_iter()
+        .filter(|j| j.label == identifier)
+        .collect();
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.into_iter().next()),
+            _ => bail!(
+                "CONFLICT: queue label '{}' is ambiguous; use an ID: {}",
+                identifier,
+                matches
+                    .iter()
+                    .map(|j| j.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
     }
 
     pub fn create_queue_job_in_state_dir(
@@ -2678,6 +2712,13 @@ fn create_queue_job_conn(
     let exit_code_path = job_dir.join("exit.code");
     let wrapper_path = job_dir.join("run.zsh");
     let log_path = logs_dir.join(format!("{id}.log"));
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&log_path)?;
+    let readable_log = logs_dir.join(queue_log_filename(&request.label, &id));
+    std::fs::hard_link(&log_path, &readable_log)
+        .with_context(|| format!("failed to create readable log {}", readable_log.display()))?;
     write_queue_job_wrapper(
         &wrapper_path,
         &request.cwd,
@@ -2810,7 +2851,7 @@ fn get_queue_job_runtime_conn(
         r#"
         SELECT id, type, state, notify_session_id, queued_at, started_at, finished_at,
                holding_reason, wrapper_path, log_path, exit_code_path, timeout_seconds,
-               pid, process_group_id, exit_code, completion_notified_at
+               pid, process_group_id, exit_code, completion_notified_at, label
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -2843,6 +2884,7 @@ fn get_queue_job_runtime_conn(
                 process_group_id: row.get(13)?,
                 exit_code: row.get(14)?,
                 completion_notified_at: row.get(15)?,
+                label: row.get(16)?,
             })
         })
         .optional()
@@ -2854,7 +2896,7 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
         r#"
         SELECT id, type, state, notify_session_id, queued_at, started_at, finished_at,
                holding_reason, wrapper_path, log_path, exit_code_path, timeout_seconds,
-               pid, process_group_id, exit_code, completion_notified_at
+               pid, process_group_id, exit_code, completion_notified_at, label
         FROM queue_jobs
         ORDER BY queued_at, id
         "#,
@@ -2878,6 +2920,7 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                 process_group_id: row.get(13)?,
                 exit_code: row.get(14)?,
                 completion_notified_at: row.get(15)?,
+                label: row.get(16)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3786,6 +3829,23 @@ fn queue_job_completion_notified_at(
     Ok(Some(now_rfc3339()))
 }
 
+/// A bounded, path-safe readable alias; the durable ID prevents collisions.
+pub fn queue_log_filename(label: &str, id: &str) -> String {
+    let slug: String = label
+        .chars()
+        .take(100)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-');
+    format!("{}--{id}.log", if slug.is_empty() { "job" } else { slug })
+}
+
 fn queue_job_completion_text(
     job: &QueueJobRuntimeRecord,
     state: &str,
@@ -3806,14 +3866,19 @@ fn queue_job_completion_text(
         |code| format!(" exit={code}"),
     );
     format!(
-        "[sm queue] {} completed: {}{}{} runtime={} queue={}. Log: {}",
-        job.id,
+        "[sm queue] {} completed: {}{}{} runtime={} queue={}. Log: {}. ID: {}",
+        if job.label.trim().is_empty() {
+            &job.id
+        } else {
+            &job.label
+        },
         state,
         termination_text,
         exit_text,
         runtime,
         queued,
-        job.log_path.as_deref().unwrap_or("-")
+        job.log_path.as_deref().unwrap_or("-"),
+        job.id
     )
 }
 
@@ -4625,8 +4690,56 @@ mod tests {
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn queue_labels_resolve_uniquely_and_readable_logs_share_output() {
+        let root = unique_temp_path("queue-friendly-labels");
+        let request = CreateQueueJob {
+            job_type: "tests".into(),
+            label: "1374-demo-api-8974".into(),
+            requester_session_id: Some("a".into()),
+            notify_session_id: "a".into(),
+            cwd: "/tmp".into(),
+            argv: Some(vec!["true".into()]),
+            script: None,
+            env: BTreeMap::new(),
+            timeout_seconds: 60,
+        };
+        let first =
+            RetainedQueueStore::create_queue_job_in_state_dir(&root, request.clone()).unwrap();
+        let db = root.join("queue_runner.db");
+        assert_eq!(
+            RetainedQueueStore::resolve_queue_job_from_path(&db, &request.label)
+                .unwrap()
+                .unwrap()
+                .id,
+            first.id
+        );
+        let alias = root
+            .join("logs")
+            .join(queue_log_filename(&request.label, &first.id));
+        fs::write(first.log_path.as_ref().unwrap(), "live output").unwrap();
+        assert_eq!(fs::read_to_string(alias).unwrap(), "live output");
+        let second = RetainedQueueStore::create_queue_job_in_state_dir(&root, request).unwrap();
+        let error = RetainedQueueStore::resolve_queue_job_from_path(&db, &first.label)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("ambiguous") && error.contains(&first.id) && error.contains(&second.id)
+        );
+        assert_eq!(
+            RetainedQueueStore::resolve_queue_job_from_path(&db, &first.id)
+                .unwrap()
+                .unwrap()
+                .id,
+            first.id
+        );
+        assert!(!queue_log_filename("../../bad/name", "job_1").contains('/'));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn queue_completion_without_exit_receipt_is_explicitly_non_evidence() {
         let job = QueueJobRuntimeRecord {
+            label: "friendly-job".into(),
             id: "job_missing_exit".to_owned(),
             job_type: "tests".to_owned(),
             state: "running".to_owned(),
@@ -4646,6 +4759,7 @@ mod tests {
         };
 
         let failed = queue_job_completion_text(&job, "failed", None, "2026-08-16T20:04:24Z");
+        assert!(failed.starts_with("[sm queue] friendly-job completed:"));
         assert!(failed.contains("completed: failed exit=unknown"));
         assert!(failed.contains("output is partial/non-evidence"));
 
@@ -4659,6 +4773,7 @@ mod tests {
         let log_path = unique_temp_path("completion-log");
         fs::write(&log_path, "long test output that belongs only in the log\n").unwrap();
         let job = QueueJobRuntimeRecord {
+            label: "friendly-job".into(),
             id: "job_completion_log".to_owned(),
             job_type: "tests".to_owned(),
             state: "running".to_owned(),
@@ -4704,6 +4819,7 @@ mod tests {
         )
         .unwrap();
         let job = QueueJobRuntimeRecord {
+            label: "friendly-job".into(),
             id: "job-missing-executable".to_owned(),
             job_type: "tests".to_owned(),
             state: "pending".to_owned(),
@@ -4759,6 +4875,7 @@ mod tests {
         )));
         assert!(!wrapper.contains("source \"$1\""));
         let job = QueueJobRuntimeRecord {
+            label: "friendly-job".into(),
             id: "job-missing-script-executable".to_owned(),
             job_type: "tests".to_owned(),
             state: "pending".to_owned(),
@@ -4790,6 +4907,7 @@ mod tests {
     #[test]
     fn zero_timeout_never_expires() {
         let mut job = QueueJobRuntimeRecord {
+            label: "friendly-job".into(),
             id: "job_unbounded".to_owned(),
             job_type: "background".to_owned(),
             state: "running".to_owned(),
@@ -5693,6 +5811,7 @@ mod tests {
         let recent_started_at = python_naive_timestamp(now_local - Duration::seconds(30));
         let old_started_at = python_naive_timestamp(now_local - Duration::seconds(300));
         let mut job = QueueJobRuntimeRecord {
+            label: "friendly-job".into(),
             id: "job-naive-timeout".to_owned(),
             job_type: "tests".to_owned(),
             state: "running".to_owned(),

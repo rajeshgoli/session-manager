@@ -173,22 +173,31 @@ cargo build -p sm-server --release
 The server, CLI, and `sm watch` terminal dashboard are native Rust. No Python
 environment is needed. Refresh the installed CLI with `./scripts/install-sm-cli.sh`.
 
-In `sm watch`, each job has one row showing its state and elapsed time.
-Waiting agents also show their jobs' hold reasons. Each agent lists only jobs
-it submitted (older records without a requester fall back to the notification
-target). Global jobs are available through `g` in the job browser.
+In `sm watch`, jobs appear under their requesting agent with their friendly label,
+state, and elapsed time. Running jobs are green. Idle agents waiting for a queue
+job or review result appear in cyan as **waiting**, with the reason and wait age.
+Expanded agents also show per-PR review counts tracked by sm (not all GitHub reviews).
 
-Jobs are separate selectable rows beneath each agent, visible without expanding
-the agent. Running job rows are green. Select a job with `j/k`
-and press `Tab` to follow only its last five log lines. `Tab` on the agent itself
-expands only agent details and agent output; `J` opens its job browser.
-Inside the browser, `t` or `Enter` switches to a
-200-line live tail (press again to hide it), and `g` switches between that agent
-and all agents. `PgUp/PgDn` scrolls
-the last 200 log lines; `End` returns to the newest output. `q` or `Esc` returns
-to the dashboard. Queue and log reads run in the background; unavailable data
-is marked explicitly. Jobs that finish while the browser is open remain
-available there for inspecting their final logs.
+Select a job with `j/k`. The first `Tab` opens a compact inline card with metadata
+and six live output lines; a second `Tab` opens the full-screen live log. The log
+fills the available terminal height and follows new output automatically, including
+after a resize. `PgUp/PgDn` scrolls the fetched history; `End` resumes following.
+The buffer holds at least 200 lines and grows with the terminal. `q` or `Esc`
+returns to the dashboard, and closes an inline card before quitting.
+
+`Tab` on an agent expands its activity and output; `J` opens its job browser.
+The browser supports the same two-step job expansion, `t`/`Enter` for live output,
+and `g` to switch between the agent's jobs and all jobs. Network reads run in the
+background; unavailable data is marked explicitly. Finished jobs remain visible
+while their browser or inline log is open.
+
+`sm queue status`, `sm queue log`, and `sm queue cancel` accept a durable ID or an
+exact, unique friendly label, for example `sm queue status 1374-demo-api-8974`.
+Duplicate labels return an ambiguity error listing IDs; exact IDs take precedence.
+Completion messages lead with the label and retain the ID for diagnostics.
+New jobs have readable `label--job_id.log` hard-link aliases sharing the canonical
+log's contents. Existing ID-based log paths continue to work.
+
 Pending jobs show "Waiting to start — no log yet"; the tail starts automatically
 when the job runs.
 
@@ -432,7 +441,8 @@ backup, restore, freeze/drain, fixture, shadow, and canary evidence.
 | `/apps/{name}/latest.apk` | GET | Latest APK redirect/download |
 | `/deploy/{name}` | POST | Local/authenticated app artifact upload |
 | `/queue-jobs` | GET/POST | Queue job list/create |
-| `/queue-jobs/{id}` | GET | Queue job detail |
+| `/queue-jobs/{id-or-label}` | GET/DELETE | Queue job detail/cancel (unique exact label or ID) |
+| `/session-obligations` | GET | Pending job/review results and sm-tracked PR history, keyed by session ID |
 | `/codex-review-requests` | GET/POST | Codex review watch list/create |
 | `/nodes` | GET | Node registry projection |
 
@@ -555,3 +565,27 @@ MIT
 
 **Built for the age of AI agents.** When one agent is not enough, let the swarm
 work while you stay in control.
+
+### Waiting-state API for desktop clients
+
+`GET /session-obligations` is a protected, read-only snapshot with `schema_version: 1`
+and a `sessions` array. Join each entry's `session_id` to `/sessions`. Each contains:
+
+- `waiting_on`: pending/running queue jobs and active review watches, with `kind`
+  (`queue_job` or `review`), `id`, friendly `label`, `state`, `since`, and
+  `requester_session_id`. Reviews also include `repo`, `pr_number`, `last_polled_at`,
+  and `last_error`.
+- `waiting_since`: oldest outstanding request timestamp, or null.
+- `review_history`: per-PR `repo`, `pr_number`, `scope: "sm_tracked"`,
+  `request_count`, `requested_by_agent`, `landed_count`, and
+  `landed_requested_by_agent`. Landed reviews deduplicate by review URL.
+
+Decorate only an **idle** agent with nonempty `waiting_on` as waiting. Keep the
+underlying `activity_state` unchanged. Obligations belong to the notification
+recipient; history attributes requests to the requesting agent. A successful
+snapshot omitting an agent means no tracked obligations or history. Preserve a
+stale/unknown indication on request failure rather than treating failure as empty.
+An obligation ends when the job finishes or the review watch becomes inactive;
+this API does not represent unread completion messages. It makes no GitHub calls.
+For individual review records and timestamps, use
+`GET /codex-review-requests?include_inactive=true&repo=OWNER/REPO&pr_number=N`.

@@ -50,8 +50,12 @@ fn duration(seconds: i64) -> String {
     let n = seconds.max(0);
     if n < 60 {
         format!("{n}s")
-    } else {
+    } else if n < 3600 {
         format!("{}m", n / 60)
+    } else if n < 86400 {
+        format!("{}h {}m", n / 3600, n % 3600 / 60)
+    } else {
+        format!("{}d {}h", n / 86400, n % 86400 / 3600)
     }
 }
 fn job_age(job: &Value, now: i64) -> String {
@@ -105,7 +109,7 @@ fn queue_context(jobs: &[Value], id: &str) -> Vec<String> {
         .collect();
     if !reasons.is_empty() {
         lines.push(format!(
-            "held: {}",
+            "Waiting for {}",
             reasons
                 .into_iter()
                 .collect::<Vec<_>>()
@@ -114,6 +118,70 @@ fn queue_context(jobs: &[Value], id: &str) -> Vec<String> {
         ));
     }
     lines
+}
+
+/// Compact metadata shared by inline cards and the full-screen log.
+fn job_metadata(job: &Value, now: i64) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{} · {} · {}",
+        s(job, "label"),
+        s(job, "state"),
+        job_age(job, now)
+    )];
+    if !s(job, "holding_reason").is_empty() {
+        lines.push(format!(
+            "Waiting for  {}",
+            s(job, "holding_reason").replace('_', " ")
+        ));
+    }
+    let mut context = vec![format!("Owner  {}", owner(job))];
+    if let Some(code) = job["exit_code"].as_i64() {
+        context.push(format!("Exit  {code}"));
+    }
+    if !s(job, "cwd").is_empty() {
+        context.push(format!("Directory  {}", s(job, "cwd")));
+    }
+    lines.push(context.join(" · "));
+    let command = array(job, "argv")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let command = if command.is_empty() {
+        s(job, "script_path").to_owned()
+    } else {
+        command
+    };
+    if !command.is_empty() {
+        lines.push(format!("Command  {command}"));
+    }
+    lines
+}
+fn job_card(job: &Value, snap: &Snapshot, prefix: &str, now: i64) -> Vec<Row> {
+    let mut rows = Vec::new();
+    for text in job_metadata(job, now) {
+        rows.push(Row {
+            text: format!("{prefix}│ {text}"),
+            target: None,
+            style: "\x1b[2m",
+        });
+    }
+    rows.push(Row {
+        text: format!("{prefix}│ LIVE OUTPUT · Tab to open"),
+        target: None,
+        style: "\x1b[36m",
+    });
+    let text = if snap.log_id == s(job, "id") {
+        &snap.log
+    } else {
+        "Loading output…"
+    };
+    let lines: Vec<_> = text.lines().collect();
+    for line in lines.iter().skip(lines.len().saturating_sub(6)) {
+        rows.push(Row::plain(format!("{prefix}│ {line}")));
+    }
+    rows.push(Row::plain(format!("{prefix}╰─")));
+    rows
 }
 
 /// Strip terminal control sequences, including OSC clipboard/title sequences.
@@ -217,6 +285,7 @@ struct Snapshot {
     sessions: Vec<Value>,
     jobs: Vec<Value>,
     requests: Vec<Value>,
+    obligations: Vec<Value>,
     details: BTreeMap<String, Vec<String>>,
     errors: BTreeMap<String, String>,
     log_id: String,
@@ -307,6 +376,7 @@ fn update_list(client: &Client, shared: &Arc<Mutex<Snapshot>>, path: &str, key: 
             match field {
                 "sessions" => state.sessions = values,
                 "queue" => state.jobs = values,
+                "obligations" => state.obligations = values,
                 _ => state.requests = values,
             }
             state.errors.remove(field);
@@ -344,9 +414,16 @@ fn refresh(
     if !restore {
         update_list(client, shared, "/queue-jobs", "jobs", "queue");
         update_list(client, shared, "/reparent-requests", "requests", "reparent");
+        update_list(
+            client,
+            shared,
+            "/session-obligations",
+            "sessions",
+            "obligations",
+        );
     }
     for id in interest.details.iter().filter(|_| !restore) {
-        let mut lines = Vec::new();
+        let mut lines = vec!["── Recent activity ──".into()];
         let provider = {
             let state = shared.lock().unwrap();
             state
@@ -384,7 +461,7 @@ fn refresh(
             }
             Err(e) => lines.push(format!("Actions unavailable: {e}")),
         }
-        lines.push("Agent output (last 10 lines):".into());
+        lines.push("── Recent output ──".into());
         match client.get(&format!("/sessions/{}/output?lines=10", enc(id))) {
             Ok(v) => lines.extend(clean(s(&v, "output")).lines().map(str::to_owned)),
             Err(e) => lines.push(format!("Output unavailable: {e}")),
@@ -538,6 +615,7 @@ fn filtered(sessions: &[Value], args: &WatchArgs, query: &str) -> Vec<Value> {
 struct View {
     selected: Option<Target>,
     expanded: BTreeSet<String>,
+    inline_job: Option<String>,
     collapsed: BTreeSet<String>,
     hidden: BTreeSet<String>,
     top_level: bool,
@@ -561,6 +639,7 @@ impl View {
         Self {
             selected: None,
             expanded: BTreeSet::new(),
+            inline_job: None,
             collapsed: BTreeSet::new(),
             hidden: BTreeSet::new(),
             top_level: args.top_level,
@@ -587,14 +666,14 @@ impl View {
             } else {
                 self.expanded.clone()
             },
-            log_lines: self.tail_lines,
+            log_lines: if self.tail { self.tail_lines } else { 6 },
             log: if self.tail {
                 match &self.job_selected {
                     Some(Target::Job(id)) => id.clone(),
                     _ => String::new(),
                 }
             } else {
-                String::new()
+                self.inline_job.clone().unwrap_or_default()
             },
         }
     }
@@ -627,23 +706,27 @@ impl View {
             jobs.sort_by_key(|j| (stamp(s(j, "queued_at")).unwrap_or(0), s(j, "id")));
             return jobs
                 .into_iter()
-                .map(|j| {
+                .flat_map(|j| {
                     let mut row = Row::selectable(
                         format!(
                             "{}  {:10} {:8} {:5} {}  {}",
-                            s(j, "id"),
+                            s(j, "label"),
                             s(j, "type"),
                             s(j, "state"),
                             job_age(j, now),
                             owner(j),
-                            s(j, "label")
+                            s(j, "id")
                         ),
                         Target::Job(s(j, "id").into()),
                     );
                     if s(j, "state") == "running" {
                         row.style = "\x1b[32m";
                     }
-                    row
+                    let mut rows = vec![row];
+                    if !self.tail && self.inline_job.as_deref() == Some(s(j, "id")) {
+                        rows.extend(job_card(j, snap, "    ", now));
+                    }
+                    rows
                 })
                 .collect();
         }
@@ -745,7 +828,11 @@ impl View {
             return;
         }
         let prefix = "  ".repeat(depth.min(20));
-        let state = if args.restore {
+        let obligation = snap.obligations.iter().find(|o| s(o, "session_id") == id);
+        let waiting = obligation.is_some_and(|o| !array(o, "waiting_on").is_empty());
+        let state = if !args.restore && s(v, "activity_state") == "idle" && waiting {
+            "waiting"
+        } else if args.restore {
             s(v, "status")
         } else {
             s(v, "activity_state")
@@ -766,6 +853,7 @@ impl View {
             style: match state {
                 "working" | "thinking" => "\x1b[32m",
                 "blocked" => "\x1b[33m",
+                "waiting" => "\x1b[36m",
                 _ => "",
             },
         });
@@ -828,12 +916,35 @@ impl View {
                     ));
                 }
             }
+            if let Some(obligation) = obligation {
+                for item in array(obligation, "waiting_on") {
+                    let mut row = Row::plain(format!(
+                        "{prefix}   ◷ {} · waiting {}",
+                        s(&item, "label"),
+                        age(s(&item, "since"), now)
+                    ));
+                    row.style = "\x1b[36m";
+                    rows.push(row);
+                }
+                if self.expanded.contains(id) {
+                    for review in array(obligation, "review_history") {
+                        rows.push(Row::plain(format!("{prefix}   Reviews · {} #{} · {} landed via sm ({} from this agent) · {} requests by this agent", s(&review, "repo"), review["pr_number"], review["landed_count"], review["landed_requested_by_agent"].as_u64().unwrap_or(0), review["requested_by_agent"])));
+                    }
+                }
+            }
             if self.expanded.contains(id) {
                 rows.push(Row::plain(format!(
-                    "{prefix}   repo: {}  parent: {}  context: {} tokens",
-                    repo(v),
-                    s(v, "parent_session_id"),
+                    "{prefix}   Context · {} tokens   Parent · {}   Repository · {}",
                     v["tokens_used"]
+                        .as_i64()
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "—".into()),
+                    if s(v, "parent_session_id").is_empty() {
+                        "Top level"
+                    } else {
+                        s(v, "parent_session_id")
+                    },
+                    repo(v)
                 )));
                 let since = ["last_action_started_at", "last_tool_call", "last_activity"]
                     .into_iter()
@@ -851,7 +962,15 @@ impl View {
                 match snap.details.get(id) {
                     Some(lines) => {
                         for line in lines {
-                            rows.push(Row::plain(format!("{prefix}   {line}")));
+                            rows.push(Row {
+                                text: format!("{prefix}   │ {line}"),
+                                target: None,
+                                style: if line.starts_with("──") {
+                                    "\x1b[1;36m"
+                                } else {
+                                    ""
+                                },
+                            });
                         }
                     }
                     None => rows.push(Row::plain("   Loading actions/output...")),
@@ -863,11 +982,11 @@ impl View {
             for j in snap.jobs.iter().filter(|j| owns(j, id)) {
                 let mut row = Row::selectable(
                     format!(
-                        "{prefix}   +- job {} {} {} {}",
-                        s(j, "id"),
+                        "{prefix}   +- {} · {} · {}  ({})",
+                        s(j, "label"),
                         s(j, "state"),
                         job_age(j, now),
-                        s(j, "label")
+                        s(j, "id")
                     ),
                     Target::SessionJob(id.into(), s(j, "id").into()),
                 );
@@ -875,6 +994,9 @@ impl View {
                     row.style = "\x1b[32m";
                 }
                 rows.push(row);
+                if self.inline_job.as_deref() == Some(s(j, "id")) {
+                    rows.extend(job_card(j, snap, &format!("{prefix}      "), now));
+                }
             }
         }
         if args.restore
@@ -1072,6 +1194,7 @@ fn prompt(label: &str) -> Result<Option<String>> {
     let mut text = String::new();
     while !STOP.load(Ordering::Relaxed) {
         let (h, w) = size();
+
         print!(
             "\x1b[{h};1H\x1b[2K{}\x1b[?25h",
             clipped(&format!("{label}{text}"), w - 1)
@@ -1100,8 +1223,8 @@ fn show_help() -> Result<()> {
         "sm watch — keyboard controls",
         "",
         "j/k or arrows: select agent or reparent request",
-        "Tab on an agent: agent details; Tab on a job: its live tail",
-        "J: jobs; j/k: select job; Tab: follow last 5 lines; g: global queue",
+        "Tab: expand inline; Tab again on a job: full-screen live output",
+        "J: jobs; j/k: select job; Tab: full-screen live output; g: global queue",
         "Jobs are selectable below collapsed agents; t/Enter: 200-line tail",
         "In logs: PgUp/PgDn scroll; End follows newest output; q goes back",
         "Enter: attach (restore in --restore mode)",
@@ -1196,7 +1319,7 @@ fn frame(
         )
     };
     lines[1] = if jobs {
-        "ID                Type       State    Age   Agent / Label".into()
+        "Job                         Type       State    Age   Agent / ID".into()
     } else {
         "Session                  ID       Activity   Age   Provider   Role     Node     Status"
             .into()
@@ -1204,9 +1327,9 @@ fn frame(
     let available = h.saturating_sub(4);
     let list_height = if jobs {
         if view.tail {
-            available.saturating_sub(5) / 2
+            1
         } else {
-            available.saturating_sub(3)
+            available
         }
     } else {
         available
@@ -1246,43 +1369,25 @@ fn frame(
     if rows.is_empty() {
         lines[2] = "No matching agents/jobs".into();
     }
-    if jobs {
+    if jobs && view.tail {
         if let Some(Target::Job(id)) = &view.job_selected {
             if let Some(job) = view.retained.get(id) {
                 let y = 2 + list_height;
-                let metadata = [
-                    format!(
-                        "{} {} | held: {} | {}",
-                        s(job, "state"),
-                        job_age(job, OffsetDateTime::now_utc().unix_timestamp()),
-                        s(job, "holding_reason").replace('_', " "),
-                        s(job, "label")
-                    ),
-                    format!(
-                        "exit: {}  notify: {}  cwd: {}",
-                        job["exit_code"],
-                        s(job, "notify_name"),
-                        s(job, "cwd")
-                    ),
-                    format!(
-                        "command: {} {}",
-                        array(job, "argv")
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                        s(job, "script_path")
-                    ),
-                ];
+                let metadata = job_metadata(job, OffsetDateTime::now_utc().unix_timestamp());
                 for (i, text) in metadata.iter().enumerate() {
                     if y + i < h - 2 {
                         lines[y + i] = clipped(text, width);
                     }
                 }
-                if view.tail && y + 3 < h - 2 {
-                    lines[y + 3] = format!(
-                        "Live tail {id} — last {} lines (following)",
-                        view.tail_lines
+                if view.tail && y + metadata.len() < h - 2 {
+                    lines[y + metadata.len()] = format!(
+                        "\x1b[1;36mLive output · {} · {}\x1b[0m",
+                        s(job, "label"),
+                        if view.log_scroll == 0 {
+                            "following"
+                        } else {
+                            "scrolled · End to follow"
+                        }
                     );
                     let text = if snap.log_id == *id {
                         snap.log.as_str()
@@ -1293,11 +1398,11 @@ fn frame(
                     if log.len() > view.tail_lines {
                         log.drain(..log.len() - view.tail_lines);
                     }
-                    let count = (h - 2).saturating_sub(y + 4);
+                    let count = (h - 2).saturating_sub(y + metadata.len() + 1);
                     view.log_scroll = view.log_scroll.min(log.len().saturating_sub(count));
                     let end = log.len().saturating_sub(view.log_scroll);
                     for (i, line) in log[end.saturating_sub(count)..end].iter().enumerate() {
-                        lines[y + 4 + i] = clipped(line, width);
+                        lines[y + metadata.len() + 1 + i] = clipped(line, width);
                     }
                 }
             }
@@ -1317,7 +1422,7 @@ fn frame(
     );
     lines[h - 1] = clipped(
         if jobs {
-            "Tab: follow 5 lines  t: tail 200  j/k: job  g: all/agent  PgUp/Dn  q: back"
+            "Tab: live output  t: toggle output  j/k: job  g: all/agent  PgUp/Dn  q: back"
         } else if args.restore {
             "j/k: move Enter: restore Tab: expand E/C: all o: sort R/U: hide/show /: filter q: quit"
         } else {
@@ -1468,6 +1573,7 @@ pub(super) fn run(url: &str, mut args: WatchArgs) -> Result<()> {
         let snap = worker.snapshot();
         let rows = view.rows(&snap, &args, OffsetDateTime::now_utc().unix_timestamp());
         let (h, w) = size();
+        view.tail_lines = h.saturating_mul(4).clamp(200, 10_000);
         let rows = wrap_rows(rows, w.saturating_sub(3));
         let selection = view.active_selection();
         if !rows
@@ -1496,6 +1602,8 @@ pub(super) fn run(url: &str, mut args: WatchArgs) -> Result<()> {
                 view.tail = false;
                 view.offset = 0;
                 view.retained.clear();
+            } else if view.inline_job.take().is_some() {
+                // Close the inline card before leaving the dashboard.
             } else {
                 break;
             }
@@ -1510,13 +1618,17 @@ pub(super) fn run(url: &str, mut args: WatchArgs) -> Result<()> {
         } else if view.jobs_for.is_some() {
             match key {
                 Key::Tab => {
-                    view.tail = true;
-                    view.tail_lines = 5;
-                    view.log_scroll = 0;
+                    if let Some(Target::Job(id)) = &view.job_selected {
+                        if view.inline_job.as_deref() == Some(id) {
+                            view.tail = true;
+                            view.log_scroll = 0;
+                        } else {
+                            view.inline_job = Some(id.clone());
+                        }
+                    }
                 }
                 Key::Enter | Key::Char('t') => {
-                    view.tail = !view.tail || view.tail_lines != 200;
-                    view.tail_lines = 200;
+                    view.tail = !view.tail;
                     view.log_scroll = 0;
                 }
                 Key::Char('g') => view.global = !view.global,
@@ -1579,10 +1691,14 @@ fn handle_key(
         }
         Key::Tab => match target {
             Some(Target::SessionJob(session_id, job_id)) => {
+                if view.inline_job.as_deref() != Some(&job_id) {
+                    view.inline_job = Some(job_id);
+                    return Ok(());
+                }
                 view.jobs_for = Some(session_id);
                 view.job_selected = Some(Target::Job(job_id));
                 view.tail = true;
-                view.tail_lines = 5;
+                view.tail_lines = 200;
                 view.log_scroll = 0;
                 view.offset = 0;
                 view.free_scroll = false;

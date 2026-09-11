@@ -4456,6 +4456,31 @@ async fn queue_job_log_reads_a_bounded_derived_tail() {
         ..AppConfig::default()
     }));
 
+    let (status, payload) = get_json(app.clone(), "/queue-jobs/cargo%20tests").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["id"], "job-pending");
+    let (status, payload) = get_json(app.clone(), "/queue-jobs/cargo%20tests/log?lines=2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["text"], "two\nthree\n");
+    let (status, payload) = get_json(app.clone(), "/session-obligations").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["schema_version"], 1);
+    assert_eq!(payload["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(payload["sessions"][0]["session_id"], "notify1");
+    assert_eq!(
+        payload["sessions"][0]["waiting_on"][0]["label"],
+        "cargo tests"
+    );
+    let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
+    conn.execute(
+        "UPDATE queue_jobs SET label = 'cargo tests' WHERE id = 'job-running'",
+        [],
+    )
+    .unwrap();
+    let (status, payload) = get_json(app.clone(), "/queue-jobs/cargo%20tests").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(payload["detail"].as_str().unwrap().contains("ambiguous"));
+
     let (status, payload) = get_json(app.clone(), "/queue-jobs/job-pending/log?lines=2").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["job_id"], "job-pending");
@@ -4866,7 +4891,11 @@ async fn queue_job_create_runs_when_runtime_enabled() {
     assert!(queue_job_completion_notified_at(&queue_state_dir, &job_id).is_some());
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert_eq!(notifications.len(), 1);
-    assert!(notifications[0].contains(&format!("[sm queue] {job_id} completed: succeeded")));
+    assert!(queue_completion_matches(
+        &notifications[0],
+        &job_id,
+        "succeeded"
+    ));
     assert!(notifications[0].contains(" exit=0 "));
     assert!(notifications[0].contains(&format!(
         "Log: {}",
@@ -5194,9 +5223,17 @@ async fn queue_job_runtime_persists_failure_and_timeout() {
     assert!(queue_job_completion_notified_at(&queue_state_dir, &timeout_id).is_some());
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert_eq!(notifications.len(), 2);
-    assert!(notifications[0].contains(&format!("[sm queue] {failed_id} completed: failed")));
+    assert!(queue_completion_matches(
+        &notifications[0],
+        &failed_id,
+        "failed"
+    ));
     assert!(notifications[0].contains(" exit=7 "));
-    assert!(notifications[1].contains(&format!("[sm queue] {timeout_id} completed: timed_out")));
+    assert!(queue_completion_matches(
+        &notifications[1],
+        &timeout_id,
+        "timed_out"
+    ));
 }
 
 #[tokio::test]
@@ -5299,7 +5336,11 @@ async fn queue_runtime_recovery_requeues_held_pending_job() {
     assert!(final_payload["started_at"].as_str().is_some());
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert_eq!(notifications.len(), 1);
-    assert!(notifications[0].contains(&format!("[sm queue] {job_id} completed: succeeded")));
+    assert!(queue_completion_matches(
+        &notifications[0],
+        &job_id,
+        "succeeded"
+    ));
 }
 
 #[tokio::test]
@@ -5454,15 +5495,21 @@ async fn queue_runtime_admission_displaces_background_for_ready_perf_job() {
     assert_eq!(second_final["state"], "displaced");
     assert_eq!(second_final["termination_reason"], "perf_displacement");
     let notifications = queued_message_texts(&message_queue_db, "run12345");
-    assert!(notifications.iter().any(|text| text.contains(&format!(
-        "[sm queue] {first_background_id} completed: displaced"
-    ))));
-    assert!(notifications
-        .iter()
-        .any(|text| text.contains(&format!("[sm queue] {perf_id} completed: succeeded"))));
-    assert!(notifications.iter().any(|text| text.contains(&format!(
-        "[sm queue] {second_background_id} completed: displaced"
-    ))));
+    assert!(notifications.iter().any(|text| queue_completion_matches(
+        &text,
+        &first_background_id,
+        "displaced"
+    )));
+    assert!(notifications.iter().any(|text| queue_completion_matches(
+        &text,
+        &perf_id,
+        "succeeded"
+    )));
+    assert!(notifications.iter().any(|text| queue_completion_matches(
+        &text,
+        &second_background_id,
+        "displaced"
+    )));
 }
 
 #[tokio::test]
@@ -5795,7 +5842,11 @@ async fn queue_runtime_recovery_starts_pending_job() {
     assert!(queue_job_completion_notified_at(&queue_state_dir, &job_id).is_some());
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert_eq!(notifications.len(), 1);
-    assert!(notifications[0].contains(&format!("[sm queue] {job_id} completed: succeeded")));
+    assert!(queue_completion_matches(
+        &notifications[0],
+        &job_id,
+        "succeeded"
+    ));
     assert!(notifications[0].contains(&format!(
         "Log: {}",
         final_payload["log_path"].as_str().unwrap()
@@ -5907,8 +5958,16 @@ async fn queue_runtime_recovery_continues_after_bad_pending_job() {
     assert_eq!(good_final["exit_code"], 0);
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert_eq!(notifications.len(), 2);
-    assert!(notifications[0].contains(&format!("[sm queue] {bad_job_id} completed: failed")));
-    assert!(notifications[1].contains(&format!("[sm queue] {good_job_id} completed: succeeded")));
+    assert!(queue_completion_matches(
+        &notifications[0],
+        &bad_job_id,
+        "failed"
+    ));
+    assert!(queue_completion_matches(
+        &notifications[1],
+        &good_job_id,
+        "succeeded"
+    ));
 }
 
 #[tokio::test]
@@ -5965,8 +6024,16 @@ async fn queue_job_create_continues_after_bad_existing_pending_job() {
     assert_eq!(created_final["exit_code"], 0);
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert_eq!(notifications.len(), 2);
-    assert!(notifications[0].contains(&format!("[sm queue] {bad_job_id} completed: failed")));
-    assert!(notifications[1].contains(&format!("[sm queue] {created_id} completed: succeeded")));
+    assert!(queue_completion_matches(
+        &notifications[0],
+        &bad_job_id,
+        "failed"
+    ));
+    assert!(queue_completion_matches(
+        &notifications[1],
+        &created_id,
+        "succeeded"
+    ));
 }
 
 #[tokio::test]
@@ -6015,7 +6082,11 @@ async fn queue_runtime_recovery_finishes_running_job_with_exit_code() {
     assert_eq!(detail["exit_code"], 0);
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert_eq!(notifications.len(), 1);
-    assert!(notifications[0].contains(&format!("[sm queue] {job_id} completed: succeeded")));
+    assert!(queue_completion_matches(
+        &notifications[0],
+        &job_id,
+        "succeeded"
+    ));
 }
 
 #[tokio::test]
@@ -6495,7 +6566,11 @@ async fn queue_job_cancel_persists_pending_cancel() {
     assert!(queue_job_completion_notified_at(&queue_state_dir, job_id).is_some());
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert_eq!(notifications.len(), 1);
-    assert!(notifications[0].contains(&format!("[sm queue] {job_id} completed: cancelled")));
+    assert!(queue_completion_matches(
+        &notifications[0],
+        &job_id,
+        "cancelled"
+    ));
 }
 
 #[tokio::test]
@@ -6540,9 +6615,14 @@ async fn queue_job_cancel_does_not_admit_pending_jobs_without_runtime_ownership(
     )
     .await;
 
-    let (status, cancelled) =
-        delete_json(app.clone(), &format!("/queue-jobs/{first_id}"), json!({})).await;
+    let (status, cancelled) = delete_json(
+        app.clone(),
+        "/queue-jobs/cancel%20fixture%20first",
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(cancelled["id"], first_id);
     assert_eq!(cancelled["state"], "cancelled");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -6550,9 +6630,11 @@ async fn queue_job_cancel_does_not_admit_pending_jobs_without_runtime_ownership(
     assert_eq!(status, StatusCode::OK);
     assert_eq!(second_detail["state"], "pending");
     assert_eq!(second_detail["pid"], Value::Null);
-    assert!(!queue_state_dir
-        .join(format!("logs/{second_id}.log"))
-        .exists());
+    // Readable aliases reserve an empty log at enqueue; no runner wrote output.
+    assert_eq!(
+        fs::read(queue_state_dir.join(format!("logs/{second_id}.log"))).unwrap(),
+        b""
+    );
 }
 
 #[tokio::test]
@@ -6616,7 +6698,11 @@ async fn queue_job_cancel_terminates_running_job() {
     assert!(queue_job_completion_notified_at(&queue_state_dir, &job_id).is_some());
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert_eq!(notifications.len(), 1);
-    assert!(notifications[0].contains(&format!("[sm queue] {job_id} completed: cancelled")));
+    assert!(queue_completion_matches(
+        &notifications[0],
+        &job_id,
+        "cancelled"
+    ));
     assert!(notifications[0].contains(&format!("Log: {}", log_path.display())));
     assert!(!notifications[0].contains("before-cancel"));
     assert!(!notifications[0].contains("log tail:"));
@@ -6687,9 +6773,14 @@ async fn queue_job_cancel_admits_next_pending_job() {
     assert_eq!(third_pending["state"], "pending");
     assert_eq!(third_pending["holding_reason"], "concurrency_cap");
 
-    let (status, cancelled) =
-        delete_json(app.clone(), &format!("/queue-jobs/{first_id}"), json!({})).await;
+    let (status, cancelled) = delete_json(
+        app.clone(),
+        "/queue-jobs/cancel%20admits%20first",
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(cancelled["id"], first_id);
     assert_eq!(cancelled["state"], "cancelled");
     let third_final = wait_for_queue_job_state(app.clone(), &third_id, &["succeeded"]).await;
     assert_eq!(third_final["exit_code"], 0);
@@ -6794,7 +6885,11 @@ async fn queue_job_cancel_force_stops_unmonitored_running_process_group() {
     assert!(queue_job_completion_notified_at(&queue_state_dir, &job_id).is_some());
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert_eq!(notifications.len(), 1);
-    assert!(notifications[0].contains(&format!("[sm queue] {job_id} completed: cancelled")));
+    assert!(queue_completion_matches(
+        &notifications[0],
+        &job_id,
+        "cancelled"
+    ));
 }
 
 #[tokio::test]
@@ -21931,4 +22026,8 @@ fn unix_timestamp() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
+}
+
+fn queue_completion_matches(text: &str, id: &str, state: &str) -> bool {
+    text.contains(&format!("completed: {state}")) && text.contains(&format!("ID: {id}"))
 }
