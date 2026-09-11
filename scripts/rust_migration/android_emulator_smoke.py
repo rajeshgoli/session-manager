@@ -437,15 +437,42 @@ def _free_tcp_port() -> int:
 
 
 def _load_runtime_config(config_path: Path) -> dict[str, Any]:
-    # src.main.load_config applies the same default local-env overlay as the
-    # live Python/Rust migration config path. Keep the import lazy so unit tests
-    # can exercise helper functions without importing the server stack.
-    try:
-        from src.main import load_config
-    except Exception:
-        with config_path.open("r", encoding="utf-8") as handle:
-            return yaml.safe_load(handle) or {}
-    return load_config(str(config_path))
+    with config_path.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle) or {}
+
+    env_path = config_path.parent / ".local" / "android-parity" / "values.env"
+    if not env_path.is_file():
+        return config
+    values = _load_env_values(env_path)
+    public_host = values.get("PUBLIC_HTTP_HOST", "").strip()
+    web_client_secret = values.get("GOOGLE_WEB_CLIENT_SECRET", "").strip()
+    session_secret = values.get("SESSION_COOKIE_SECRET", "").strip()
+    if not session_secret and web_client_secret:
+        session_secret = hashlib.sha256(
+            f"sm-google-session:{public_host}:{web_client_secret}".encode("utf-8")
+        ).hexdigest()
+    if not session_secret:
+        return config
+
+    merged = dict(config)
+    auth = dict(merged.get("auth") or {})
+    google = dict(auth.get("google") or {})
+    google["session_cookie_secret"] = session_secret
+    auth["google"] = google
+    merged["auth"] = auth
+    return merged
+
+
+def _load_env_values(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip():
+            values[key.strip()] = value.strip()
+    return values
 
 
 def _host_step(report: dict[str, Any], step_id: str, status: str, detail: str | None = None) -> None:

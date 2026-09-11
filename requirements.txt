@@ -1,14 +1,3 @@
-fastapi>=0.104.0
-uvicorn>=0.24.0
-python-telegram-bot>=20.0
-aiofiles>=23.0
+# Python is used only by retained migration and operational tooling.
 PyYAML>=6.0
-pydantic>=2.0.0
-google-auth>=2.39.0
-cryptography>=42.0.0
-websockets>=12.0
-python-multipart>=0.0.9
 pytest>=7.0
-pytest-asyncio>=0.21
-pytest-cov>=4.0
-httpx>=0.25.0

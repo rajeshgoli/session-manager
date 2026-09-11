@@ -18,8 +18,7 @@ const DEFAULT_API_URL: &str = "http://127.0.0.1:8420";
 const CONTEXT_COMPACT_STALE_SECONDS: i64 = 10 * 60;
 const CLIENT_CONFIG_ENV: &str = "SM_CLIENT_CONFIG";
 const CLIENT_CONFIG_SUBPATH: &str = "session-manager/client.yaml";
-const WATCH_PYTHON_ENV: &str = "SM_WATCH_PYTHON";
-const WATCH_REPO_ROOT_ENV: &str = "SM_WATCH_REPO_ROOT";
+mod watch;
 
 #[derive(Parser)]
 #[command(name = "sm", version, about = "Session Manager Rust CLI")]
@@ -1117,121 +1116,14 @@ fn run_watch(api_url: &str, args: WatchArgs) -> Result<()> {
              (without SESSION_MANAGER_ID)."
         );
     }
-    if !args.interval.is_finite() || args.interval <= 0.0 {
+    if !args.interval.is_finite()
+        || args.interval <= 0.0
+        || Duration::try_from_secs_f64(args.interval).is_err()
+    {
         bail!("Error: --interval must be > 0");
     }
 
-    let repo_root = watch_repo_root()?;
-    let python = env::var_os(WATCH_PYTHON_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let venv_python = repo_root.join("venv/bin/python");
-            if venv_python.is_file() {
-                venv_python
-            } else {
-                PathBuf::from("python3")
-            }
-        });
-    let python_path = watch_python_path(&repo_root)?;
-    let status = process::Command::new(&python)
-        .args(watch_python_args(&args))
-        .env("PYTHONPATH", python_path)
-        .env("SM_API_URL", api_url)
-        .status()
-        .with_context(|| {
-            format!(
-                "failed to launch retained sm watch implementation with {}",
-                python.display()
-            )
-        })?;
-    if !status.success() {
-        bail!(
-            "sm watch exited with status {}",
-            status
-                .code()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "signal".to_owned())
-        );
-    }
-    Ok(())
-}
-
-fn watch_python_args(args: &WatchArgs) -> Vec<String> {
-    let mut command = vec![
-        "-m".to_owned(),
-        "src.cli.main".to_owned(),
-        "watch".to_owned(),
-    ];
-    if let Some(repo) = &args.repo {
-        command.extend(["--repo".to_owned(), repo.clone()]);
-    }
-    if let Some(role) = &args.role {
-        command.extend(["--role".to_owned(), role.clone()]);
-    }
-    command.extend(["--interval".to_owned(), args.interval.to_string()]);
-    if args.restore {
-        command.push("--restore".to_owned());
-    }
-    if args.top_level {
-        command.push("--top-level".to_owned());
-    }
-    command.extend(["--sort".to_owned(), args.sort.clone()]);
-    if let Some(node) = &args.node {
-        command.extend(["--node".to_owned(), node.clone()]);
-    }
-    if args.all_nodes {
-        command.push("--all-nodes".to_owned());
-    }
-    command
-}
-
-fn watch_repo_root() -> Result<PathBuf> {
-    if let Some(explicit) = env::var_os(WATCH_REPO_ROOT_ENV) {
-        let root = PathBuf::from(explicit);
-        if is_watch_repo_root(&root) {
-            return Ok(root);
-        }
-        bail!(
-            "{WATCH_REPO_ROOT_ENV} does not point to a Session Manager checkout: {}",
-            root.display()
-        );
-    }
-
-    if let Ok(executable) = env::current_exe() {
-        if let Some(root) = find_watch_repo_root(&executable) {
-            return Ok(root);
-        }
-    }
-
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if let Some(root) = find_watch_repo_root(&manifest_dir) {
-        return Ok(root);
-    }
-    bail!("cannot locate the retained sm watch implementation; set {WATCH_REPO_ROOT_ENV}")
-}
-
-fn find_watch_repo_root(start: &Path) -> Option<PathBuf> {
-    let start = if start.is_file() {
-        start.parent()?
-    } else {
-        start
-    };
-    start
-        .ancestors()
-        .find(|candidate| is_watch_repo_root(candidate))
-        .map(Path::to_path_buf)
-}
-
-fn is_watch_repo_root(path: &Path) -> bool {
-    path.join("src/cli/main.py").is_file() && path.join("src/cli/watch_tui.py").is_file()
-}
-
-fn watch_python_path(repo_root: &Path) -> Result<std::ffi::OsString> {
-    let mut paths = vec![repo_root.to_path_buf()];
-    if let Some(existing) = env::var_os("PYTHONPATH") {
-        paths.extend(env::split_paths(&existing));
-    }
-    env::join_paths(paths).context("failed to construct PYTHONPATH for sm watch")
+    watch::run(api_url, args)
 }
 
 fn required_positional(value: Option<String>, label: &str) -> Result<String> {
@@ -5582,7 +5474,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_cli_preserves_python_dashboard_flags() {
+    fn watch_cli_preserves_dashboard_flags() {
         let cli = Cli::try_parse_from([
             "sm",
             "watch",
@@ -5613,27 +5505,6 @@ mod tests {
         assert_eq!(args.sort, "last-active");
         assert_eq!(args.node.as_deref(), Some("studio"));
         assert!(args.all_nodes);
-        assert_eq!(
-            watch_python_args(&args),
-            vec![
-                "-m",
-                "src.cli.main",
-                "watch",
-                "--repo",
-                "/tmp/project",
-                "--role",
-                "engineer",
-                "--interval",
-                "3.5",
-                "--restore",
-                "--top-level",
-                "--sort",
-                "last-active",
-                "--node",
-                "studio",
-                "--all-nodes",
-            ]
-        );
     }
 
     #[test]
@@ -5658,23 +5529,11 @@ mod tests {
     }
 
     #[test]
-    fn watch_delegates_through_internal_python_component() {
+    fn watch_requires_a_terminal_without_launching_python() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let _env = EnvRestore::new(&[
-            "SESSION_MANAGER_ID",
-            "CLAUDE_SESSION_MANAGER_ID",
-            WATCH_PYTHON_ENV,
-            WATCH_REPO_ROOT_ENV,
-        ]);
+        let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
         env::remove_var("SESSION_MANAGER_ID");
         env::remove_var("CLAUDE_SESSION_MANAGER_ID");
-        env::set_var(WATCH_PYTHON_ENV, "/usr/bin/true");
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .unwrap()
-            .to_path_buf();
-        env::set_var(WATCH_REPO_ROOT_ENV, repo_root);
         let args = WatchArgs {
             repo: None,
             role: None,
@@ -5686,7 +5545,12 @@ mod tests {
             all_nodes: false,
         };
 
-        run_watch("http://127.0.0.1:8420", args).unwrap();
+        if !io::stdin().is_terminal() {
+            assert!(run_watch("http://127.0.0.1:8420", args)
+                .unwrap_err()
+                .to_string()
+                .contains("interactive terminal"));
+        }
     }
 
     #[test]

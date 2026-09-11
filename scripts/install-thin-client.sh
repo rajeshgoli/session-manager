@@ -31,7 +31,7 @@ install_shim() {          # A
   echo "== A: installing sm SSH shim -> $SHIM_DST"
   mkdir -p "$HOME/bin"
   install -m 0755 "$SHIM_SRC" "$SHIM_DST"
-  echo "   installed. (ensure ~/bin precedes the venv on PATH)"
+  echo "   installed. (ensure ~/bin is on PATH)"
 }
 
 teardown_node_agent() {   # B

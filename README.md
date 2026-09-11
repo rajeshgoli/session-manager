@@ -170,16 +170,27 @@ cd session-manager
 cargo build -p sm-server --release
 ```
 
-Provision the retained local `sm watch` dashboard compatibility environment:
+The server, CLI, and `sm watch` terminal dashboard are native Rust. No Python
+environment is needed. Refresh the installed CLI with `./scripts/install-sm-cli.sh`.
 
-```bash
-python3.11 -m venv venv
-venv/bin/python -m pip install PyYAML
-```
+In `sm watch`, agents show running/waiting job counts and elapsed time (the
+oldest age when there are multiple jobs), hold reasons, and the agents with
+running or earlier queued jobs across the global queue. Earlier enqueue time
+is context, not a guaranteed execution order: admission also depends on job
+type, capacity, and cooldowns. Jobs appear under both their requester and their
+notification target when those differ.
 
-When `sm` is launched through the Python console wrapper, it forwards that
-wrapper's interpreter to Rust. Direct Rust builds use `venv/bin/python` when
-present.
+Press `Tab` to expand an agent's details and job list, or `J` to open its job
+browser. Inside the browser, `j/k` selects a job, `t` or `Enter` toggles its live
+log tail, and `g` switches between that agent and all agents. `PgUp/PgDn` scrolls
+the last 200 log lines; `End` returns to the newest output. `q` or `Esc` returns
+to the dashboard. Queue and log reads run in the background; unavailable data
+is marked explicitly. Jobs that finish while the browser is open remain
+available there for inspecting their final logs.
+
+The dashboard retains session trees, filtering, send/rename/create/fork/attach,
+double-press retirement, reparent decisions/repair, and `--restore` browsing.
+Use `PgUp/PgDn` to scroll expanded details and `?` for the keyboard reference.
 
 Create local config from the example and adjust host/auth/state paths:
 
@@ -236,8 +247,7 @@ directory, so a `sm` that only exists at `target/release/sm` disappears with
 it - along with every spawned session's ability to run `sm` at all. Nothing in
 a cargo invocation writes `.local/bin`, so the installed copy survives a clean.
 
-Put `.local/bin` on your `PATH` ahead of `venv/bin`, or `sm` resolves to the
-legacy Python CLI:
+Put `.local/bin` on your `PATH` so `sm` resolves to the installed Rust CLI:
 
 ```bash
 export PATH="/path/to/session-manager/.local/bin:$PATH"
@@ -273,6 +283,7 @@ sm all
 | `sm task-complete` | Mark task completion and wake parent/maintainer |
 | `sm turn-complete` | Mark a turn boundary |
 | `sm queue list/status/run/cancel` | Manage retained queue jobs |
+| `sm watch` | Agent dashboard with queue ages, hold reasons, and live job logs |
 | `sm review` | Run local synchronous PR review flows |
 | `sm request-codex-review` | Request async Codex review tracking |
 | `sm enroll-device` | Enroll an Android app device certificate |

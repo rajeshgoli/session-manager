@@ -1,13 +1,15 @@
 # Claude Session Manager
 
-Multi-agent orchestration system for Claude Code. Manages sessions, enables parent-child agent hierarchies, and provides Telegram integration.
+Rust multi-agent orchestration system for Claude Code and Codex. Manages
+sessions, parent-child agent hierarchies, durable messaging, queue jobs, and
+Android/email operator access.
 
 ## Architecture
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Claude Code    │────▶│  Session Manager │────▶│  Telegram Bot   │
-│  (in tmux)      │     │  (FastAPI)       │     │  (optional)     │
+│ Claude / Codex  │────▶│  Session Manager │────▶│  Android / Email│
+│  (in tmux)      │     │  (Rust / Axum)   │     │   (optional)    │
 └─────────────────┘     └──────────────────┘     └─────────────────┘
         │                        │
         ▼                        ▼
@@ -19,12 +21,13 @@ Multi-agent orchestration system for Claude Code. Manages sessions, enables pare
 
 ## Key Components
 
-- `src/main.py` - FastAPI server entry point
-- `src/session_manager.py` - Core session lifecycle management
-- `src/tmux_controller.py` - tmux session creation/control
-- `src/cli/commands.py` - sm CLI command implementations
-- `src/tool_logger.py` - Tool usage logging for security audit
-- `src/telegram_bot.py` - Telegram bot integration
+- `crates/sm-server/src/main.rs` - server entry point
+- `crates/sm-server/src/runtime.rs` - provider and tmux lifecycle
+- `crates/sm-server/src/sessions.rs` - session persistence and lifecycle
+- `crates/sm-server/src/http.rs` - HTTP API and hooks
+- `crates/sm-server/src/bin/sm.rs` - `sm` CLI
+- `crates/sm-server/src/bin/watch/` - native terminal dashboard
+- `crates/sm-server/src/queue.rs` - message, reminder, and job queues
 - `hooks/log_tool_use.sh` - Claude Code hook for tool logging
 - `hooks/context_monitor.sh` - statusLine hook feeding `/hooks/context-usage` (delegates rendering to the previously configured status line)
 - `scripts/install_notify_server_hook.sh` - installs and registers every hook in `hooks/`
@@ -76,19 +79,19 @@ codex_rollout:
 
 ## Development
 
-- Python 3.11+
-- FastAPI + uvicorn
+- Rust 1.86+
+- Axum + Tokio
 - SQLite for persistence
 - tmux for session management
 
 ### Running locally
 
 ```bash
-# Start server
-./venv/bin/python -m src.main
+# Build the server and CLI
+cargo build -p sm-server
 
-# Or use the CLI
-./venv/bin/sm status
+# Run the isolated test launcher
+./scripts/test-rust-isolated.sh
 ```
 
 ### Restarting the live Rust server
@@ -114,8 +117,7 @@ after every successful restart; to refresh it on its own:
 ./scripts/install-sm-cli.sh
 ```
 
-Keep `.local/bin` ahead of `venv/bin` on `PATH` - otherwise `sm` resolves to
-the legacy Python CLI rather than the Rust one.
+Keep `.local/bin` on `PATH` so `sm` resolves to the installed Rust CLI.
 
 ### Where production state lives
 
