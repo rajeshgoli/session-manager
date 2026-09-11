@@ -5,7 +5,7 @@ use std::{
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
     thread,
     time::{Duration as StdDuration, Instant},
 };
@@ -3028,13 +3028,15 @@ fn admit_pending_queue_jobs_conn(
                 break;
             }
         }
-        if displace_background_for_perf_conn(
-            conn,
-            &jobs,
-            message_queue_db_path,
-            cancel_grace_seconds,
-            admission_policy,
-        )? {
+        if perf_resource_hold.is_none()
+            && displace_background_for_perf_conn(
+                conn,
+                &jobs,
+                message_queue_db_path,
+                cancel_grace_seconds,
+                admission_policy,
+            )?
+        {
             continue;
         }
         if running_queue_job_count(&jobs, None) as i64 >= admission_policy.max_running_jobs {
@@ -3134,8 +3136,13 @@ fn schedule_queue_admission_retry(
     admission_policy: QueueAdmissionPolicy,
     delay_seconds: u64,
 ) {
+    if !claim_queue_admission_retry(&state_dir) {
+        return;
+    }
+    let retry_key = state_dir.clone();
     thread::spawn(move || {
         thread::sleep(StdDuration::from_secs(delay_seconds.max(1)));
+        release_queue_admission_retry(&retry_key);
         let _ =
             RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
                 &state_dir,
@@ -3144,6 +3151,25 @@ fn schedule_queue_admission_retry(
                 admission_policy,
             );
     });
+}
+
+fn queue_admission_retries() -> &'static Mutex<BTreeSet<PathBuf>> {
+    static RETRIES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+    RETRIES.get_or_init(|| Mutex::new(BTreeSet::new()))
+}
+
+fn claim_queue_admission_retry(state_dir: &Path) -> bool {
+    queue_admission_retries()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(state_dir.to_path_buf())
+}
+
+fn release_queue_admission_retry(state_dir: &Path) {
+    queue_admission_retries()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(state_dir);
 }
 
 const DEFAULT_MAX_RUNNING_QUEUE_JOBS: i64 = 2;
@@ -5679,6 +5705,80 @@ mod tests {
 
         drop(conn);
         fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn resource_blocked_perf_does_not_displace_running_background_work() {
+        let state_dir = unique_temp_path("blocked-perf-no-displacement");
+        let create_job = |job_type: &str, label: &str, memory_bytes: Option<i64>| {
+            RetainedQueueStore::create_queue_job_in_state_dir(
+                &state_dir,
+                CreateQueueJob {
+                    job_type: job_type.to_owned(),
+                    label: label.to_owned(),
+                    requester_session_id: Some("requester".to_owned()),
+                    notify_session_id: "notify".to_owned(),
+                    cwd: "/tmp".to_owned(),
+                    argv: Some(vec!["true".to_owned()]),
+                    script: None,
+                    env: BTreeMap::new(),
+                    timeout_seconds: 60,
+                    cpu_percent: (job_type == "perf").then_some(100),
+                    gpu_percent: (job_type == "perf").then_some(0),
+                    memory_bytes,
+                },
+            )
+            .unwrap()
+        };
+        let background = create_job("background", "running background", None);
+        let perf = create_job("perf", "oversized perf", Some(i64::MAX));
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET state = 'running', started_at = ?2 WHERE id = ?1",
+            params![background.id, now_rfc3339()],
+        )
+        .unwrap();
+
+        let summary = admit_pending_queue_jobs_conn(
+            &conn,
+            &state_dir,
+            &state_dir.join("message_queue.db"),
+            0,
+            QueueAdmissionPolicy {
+                resource_retry_interval_seconds: 600,
+                ..QueueAdmissionPolicy::default()
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(summary.started, 0);
+        assert_eq!(
+            get_queue_job_conn(&conn, &background.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "running"
+        );
+        let perf = get_queue_job_conn(&conn, &perf.id).unwrap().unwrap();
+        assert_eq!(perf.state, "pending");
+        assert_eq!(perf.holding_reason.as_deref(), Some("memory_pressure"));
+
+        release_queue_admission_retry(&state_dir);
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn queue_admission_retry_is_deduplicated_per_state_directory() {
+        let first = unique_temp_path("retry-dedup-first");
+        let second = unique_temp_path("retry-dedup-second");
+        assert!(claim_queue_admission_retry(&first));
+        assert!(!claim_queue_admission_retry(&first));
+        assert!(claim_queue_admission_retry(&second));
+        release_queue_admission_retry(&first);
+        assert!(claim_queue_admission_retry(&first));
+        release_queue_admission_retry(&first);
+        release_queue_admission_retry(&second);
     }
 
     #[test]
