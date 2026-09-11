@@ -5883,7 +5883,38 @@ fn project_session_obligations(
             }));
         }
     }
+    #[derive(Default)]
+    struct ReviewCounts<'a> {
+        requests: usize,
+        landed: BTreeSet<&'a str>,
+        by_requester: BTreeMap<&'a str, (usize, BTreeSet<&'a str>)>,
+    }
+    // Index retained records once; each session then visits only its own PRs.
+    let mut per_pr = BTreeMap::<(&str, i64), ReviewCounts<'_>>::new();
+    let mut session_prs = BTreeMap::<&str, BTreeSet<(&str, i64)>>::new();
     for review in reviews {
+        let key = (review.repo.as_str(), review.pr_number);
+        let counts = per_pr.entry(key).or_default();
+        counts.requests += 1;
+        let landed = review
+            .review_landed_at
+            .as_ref()
+            .map(|_| review.review_url.as_deref().unwrap_or(&review.id));
+        if let Some(url) = landed {
+            counts.landed.insert(url);
+        }
+        session_prs
+            .entry(&review.notify_session_id)
+            .or_default()
+            .insert(key);
+        if let Some(requester) = review.requester_session_id.as_deref() {
+            session_prs.entry(requester).or_default().insert(key);
+            let own = counts.by_requester.entry(requester).or_default();
+            own.0 += 1;
+            if let Some(url) = landed {
+                own.1.insert(url);
+            }
+        }
         let id = &review.notify_session_id;
         let entry = sessions
             .entry(id.clone())
@@ -5905,26 +5936,19 @@ fn project_session_obligations(
         }
     }
     for (id, entry) in &mut sessions {
-        let prs: BTreeSet<_> = reviews
-            .iter()
-            .filter(|r| {
-                r.notify_session_id == *id || r.requester_session_id.as_deref() == Some(id.as_str())
-            })
-            .map(|r| (r.repo.as_str(), r.pr_number))
-            .collect();
-        for (repo, pr) in prs {
-            let matching: Vec<_> = reviews
-                .iter()
-                .filter(|r| r.repo == repo && r.pr_number == pr)
-                .collect();
-            entry["review_history"].as_array_mut().unwrap().push(json!({
-                "repo": repo, "pr_number": pr,
-                "scope": "sm_tracked",
-                "request_count": matching.len(),
-                "landed_count": matching.iter().filter(|r| r.review_landed_at.is_some()).map(|r| r.review_url.as_deref().unwrap_or(&r.id)).collect::<BTreeSet<_>>().len(),
-                "landed_requested_by_agent": matching.iter().filter(|r| r.review_landed_at.is_some() && r.requester_session_id.as_deref() == Some(id.as_str())).map(|r| r.review_url.as_deref().unwrap_or(&r.id)).collect::<BTreeSet<_>>().len(),
-                "requested_by_agent": matching.iter().filter(|r| r.requester_session_id.as_deref() == Some(id.as_str())).count(),
-            }));
+        if let Some(prs) = session_prs.get(id.as_str()) {
+            for &(repo, pr) in prs {
+                let counts = &per_pr[&(repo, pr)];
+                let own = counts.by_requester.get(id.as_str());
+                entry["review_history"].as_array_mut().unwrap().push(json!({
+                    "repo": repo, "pr_number": pr,
+                    "scope": "sm_tracked",
+                    "request_count": counts.requests,
+                    "landed_count": counts.landed.len(),
+                    "landed_requested_by_agent": own.map_or(0, |(_, landed)| landed.len()),
+                    "requested_by_agent": own.map_or(0, |(requests, _)| *requests),
+                }));
+            }
         }
         let since = entry["waiting_on"]
             .as_array()
@@ -14569,6 +14593,28 @@ mod tests {
         let mut duplicate = completed.clone();
         duplicate.id = "r3".into();
         duplicate.requester_session_id = Some("another".into());
+        // Retained history with distinct sessions/PRs must not cross-contaminate counts.
+        let history: Vec<_> = (0..4000)
+            .map(|i| {
+                let mut r = completed.clone();
+                r.id = format!("retained-{i}");
+                r.pr_number = i;
+                r.notify_session_id = format!("recipient-{i}");
+                r.requester_session_id = Some(format!("requester-{i}"));
+                r
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let retained = project_session_obligations(&[], &history);
+        eprintln!("4000 retained reviews projected in {:?}", start.elapsed());
+        let retained_sessions = retained["sessions"].as_array().unwrap();
+        assert_eq!(retained_sessions.len(), 8000);
+        for session in retained_sessions {
+            assert_eq!(session["review_history"].as_array().unwrap().len(), 1);
+            assert_eq!(session["review_history"][0]["request_count"], 1);
+            assert_eq!(session["review_history"][0]["landed_count"], 1);
+            assert!(session["waiting_on"].as_array().unwrap().is_empty());
+        }
         let projected =
             project_session_obligations(&[job.clone()], &[review, completed, duplicate]);
         let sessions = projected["sessions"].as_array().unwrap();
