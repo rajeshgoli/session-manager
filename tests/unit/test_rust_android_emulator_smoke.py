@@ -85,6 +85,20 @@ def test_mobile_smoke_identity_requires_explicit_user_when_ambiguous(monkeypatch
         smoke.load_mobile_smoke_identity(Path("config.yaml"))
 
 
+def test_runtime_config_loads_local_session_secret(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("auth:\n  google:\n    enabled: true\n", encoding="utf-8")
+    env_dir = tmp_path / ".local" / "android-parity"
+    env_dir.mkdir(parents=True)
+    (env_dir / "values.env").write_text(
+        "SESSION_COOKIE_SECRET=local-secret\n", encoding="utf-8"
+    )
+
+    config = smoke._load_runtime_config(config_path)
+
+    assert config["auth"]["google"]["session_cookie_secret"] == "local-secret"
+
+
 def test_smoke_summary_includes_android_report_counts():
     report = {
         "host_steps": [

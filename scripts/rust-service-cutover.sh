@@ -61,7 +61,6 @@ Commands:
   start-rust       Write/load the Rust launchd plist. Refuses if the port is occupied or Python is loaded.
   stop-rust        Unload the Rust launchd label.
   restart-rust     stop-rust then start-rust.
-  rollback-python  Stop Rust and bootstrap the existing Python launchd plist if present.
   status           Show launchd, port, and Rust health status.
 
 Options:
@@ -376,29 +375,6 @@ stop_python() {
   echo "port $PORT is free"
 }
 
-rollback_python() {
-  stop_rust
-  local python_plist=""
-  for candidate in \
-    "$HOME/Library/LaunchAgents/com.rajeshgoli.session-manager.plist" \
-    "$HOME/Library/LaunchAgents/com.claude.session-manager.plist"; do
-    if [[ -f "$candidate" ]]; then
-      python_plist="$candidate"
-      break
-    fi
-  done
-  if [[ -z "$python_plist" ]]; then
-    echo "no Python Session Manager plist found in ~/Library/LaunchAgents" >&2
-    exit 1
-  fi
-  local label
-  label="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$python_plist")"
-  launchctl enable "$DOMAIN/$label" 2>/dev/null || true
-  launchctl bootstrap "$DOMAIN" "$python_plist" 2>/dev/null || true
-  launchctl kickstart -k "$DOMAIN/$label" || true
-  echo "bootstrapped Python service from $python_plist"
-}
-
 status() {
   echo "Rust label: $RUST_LABEL"
   if launchctl_print_label "$RUST_LABEL"; then
@@ -443,9 +419,6 @@ case "$COMMAND" in
   restart-rust)
     stop_rust
     start_rust
-    ;;
-  rollback-python)
-    rollback_python
     ;;
   status)
     status

@@ -13,13 +13,13 @@
 # exponential backoff, re-probing home<->away each attempt. Any non-255 exit is
 # the remote `sm` itself exiting (e.g. you pressed `q`) and is propagated as-is.
 #
-# Installed to ~/bin/sm (first on PATH), overriding any venv `sm`.
+# Installed to ~/bin/sm (first on PATH).
 
 emulate -L zsh
 set -o pipefail
 
 # Full path to studio's sm, invoked directly to sidestep login-shell PATH issues.
-STUDIO_SM='/Users/rajesh/projects/session-manager/venv/bin/sm'
+STUDIO_SM='/Users/rajesh/projects/session-manager-prod/.local/bin/sm'
 
 # --- host selection -------------------------------------------------------
 pick_host() {
