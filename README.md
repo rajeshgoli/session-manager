@@ -181,8 +181,11 @@ type, capacity, and cooldowns. Jobs appear under both their requester and their
 notification target when those differ.
 
 Press `Tab` to expand an agent's details and job list, or `J` to open its job
-browser. Inside the browser, `j/k` selects a job, `t` or `Enter` toggles its live
-log tail, and `g` switches between that agent and all agents. `PgUp/PgDn` scrolls
+browser. Running job summaries and job rows are green. Select a job with `j/k`
+and press `Tab` to follow its last five log lines, either in expanded agent
+details or in the job browser. Inside the browser, `t` or `Enter` switches to a
+200-line live tail (press again to hide it), and `g` switches between that agent
+and all agents. `PgUp/PgDn` scrolls
 the last 200 log lines; `End` returns to the newest output. `q` or `Esc` returns
 to the dashboard. Queue and log reads run in the background; unavailable data
 is marked explicitly. Jobs that finish while the browser is open remain
