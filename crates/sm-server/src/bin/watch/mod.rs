@@ -96,26 +96,63 @@ fn owner(job: &Value) -> &str {
     .find(|v| !v.is_empty())
     .unwrap_or("unknown")
 }
-fn queue_context(jobs: &[Value], id: &str) -> Vec<String> {
+/// Show the scheduler's reason on the job it holds, not on the whole agent.
+fn pending_reason(job: &Value) -> String {
+    if s(job, "state") != "pending" {
+        return String::new();
+    }
+    let reason = match s(job, "holding_reason") {
+        "awaiting_tests" => "waiting for test jobs".into(),
+        "perf_running" => "waiting for the performance run to finish".into(),
+        "perf_cooldown" => "waiting for performance cooldown".into(),
+        "concurrency_cap" => "waiting for an available job slot".into(),
+        "" => "reason not yet reported".into(),
+        other => format!("waiting for {}", other.replace('_', " ")),
+    };
+    format!(" · {reason}")
+}
+
+/// Summarize outstanding work without repeating the selectable job rows.
+fn obligation_context(
+    obligation: &Value,
+    jobs: &[Value],
+    id: &str,
+    expanded: bool,
+    now: i64,
+) -> Vec<String> {
+    let items = array(obligation, "waiting_on");
     let mut lines = Vec::new();
-    let own: Vec<_> = jobs
-        .iter()
-        .filter(|j| owns(j, id) && s(j, "state") == "pending")
-        .collect();
-    let reasons: BTreeSet<_> = own
-        .iter()
-        .map(|j| s(j, "holding_reason"))
-        .filter(|r| !r.is_empty())
-        .collect();
-    if !reasons.is_empty() {
-        lines.push(format!(
-            "Waiting for {}",
-            reasons
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join(", ")
-                .replace('_', " ")
-        ));
+    if items.len() > 1 {
+        let jobs = items
+            .iter()
+            .filter(|item| s(item, "kind") == "queue_job")
+            .count();
+        let reviews = items
+            .iter()
+            .filter(|item| s(item, "kind") == "review")
+            .count();
+        let other = items.len() - jobs - reviews;
+        let counts: Vec<_> = [(jobs, "job"), (reviews, "review"), (other, "result")]
+            .into_iter()
+            .filter(|(n, _)| *n > 0)
+            .map(|(n, kind)| format!("{n} {kind}{}", if n == 1 { "" } else { "s" }))
+            .collect();
+        lines.push(format!("Waiting for {}", counts.join(" and ")));
+    }
+    if items.len() == 1 || expanded {
+        for item in items {
+            let already_visible = s(&item, "kind") == "queue_job"
+                && jobs
+                    .iter()
+                    .any(|job| s(job, "id") == s(&item, "id") && owns(job, id));
+            if !already_visible {
+                lines.push(format!(
+                    "{} · waiting {}",
+                    s(&item, "label"),
+                    age(s(&item, "since"), now)
+                ));
+            }
+        }
     }
     lines
 }
@@ -128,10 +165,11 @@ fn job_metadata(job: &Value, now: i64) -> Vec<String> {
         s(job, "state"),
         job_age(job, now)
     )];
-    if !s(job, "holding_reason").is_empty() {
+    let reason = pending_reason(job);
+    if !reason.is_empty() {
         lines.push(format!(
-            "Waiting for  {}",
-            s(job, "holding_reason").replace('_', " ")
+            "Pending reason  {}",
+            reason.trim_start_matches(" · ")
         ));
     }
     let mut context = vec![format!("Owner  {}", owner(job))];
@@ -709,11 +747,12 @@ impl View {
                 .flat_map(|j| {
                     let mut row = Row::selectable(
                         format!(
-                            "{}  {:10} {:8} {:5} {}  {}",
+                            "{}  {:10} {:8} {:5}{}  {}  {}",
                             s(j, "label"),
                             s(j, "type"),
                             s(j, "state"),
                             job_age(j, now),
+                            pending_reason(j),
                             owner(j),
                             s(j, "id")
                         ),
@@ -839,7 +878,8 @@ impl View {
         };
         rows.push(Row {
             text: format!(
-                "{prefix}+- {:20} {:8} {:10} {:5} {:10} {:8} {:8} {}",
+                "{prefix}{} {:20} {:8} {:10} {:5} {:10} {:8} {:8} {}",
+                if state == "waiting" { "◷ " } else { "+-" },
                 clipped(name(v), 20),
                 id,
                 state,
@@ -879,13 +919,6 @@ impl View {
             if !last.is_empty() {
                 rows.push(Row::plain(format!("{prefix}   last: {last}")));
             }
-            for line in queue_context(&snap.jobs, id) {
-                let mut row = Row::plain(format!("{prefix}   {line}"));
-                if line.contains(" running ") {
-                    row.style = "\x1b[32m";
-                }
-                rows.push(row);
-            }
             if !s(v, "agent_status_text").is_empty() {
                 rows.push(Row::plain(format!(
                     "{prefix}   status: {} ({})",
@@ -917,14 +950,14 @@ impl View {
                 }
             }
             if let Some(obligation) = obligation {
-                for item in array(obligation, "waiting_on") {
-                    let mut row = Row::plain(format!(
-                        "{prefix}   ◷ {} · waiting {}",
-                        s(&item, "label"),
-                        age(s(&item, "since"), now)
-                    ));
-                    row.style = "\x1b[36m";
-                    rows.push(row);
+                for text in
+                    obligation_context(obligation, &snap.jobs, id, self.expanded.contains(id), now)
+                {
+                    rows.push(Row {
+                        text: format!("{prefix}   {text}"),
+                        target: None,
+                        style: "\x1b[36m",
+                    });
                 }
                 if self.expanded.contains(id) {
                     for review in array(obligation, "review_history") {
@@ -982,10 +1015,11 @@ impl View {
             for j in snap.jobs.iter().filter(|j| owns(j, id)) {
                 let mut row = Row::selectable(
                     format!(
-                        "{prefix}   +- {} · {} · {}  ({})",
+                        "{prefix}   +- {} · {} · {}{}  ({})",
                         s(j, "label"),
                         s(j, "state"),
                         job_age(j, now),
+                        pending_reason(j),
                         s(j, "id")
                     ),
                     Target::SessionJob(id.into(), s(j, "id").into()),

@@ -167,13 +167,23 @@ fn agent_queue_only_shows_its_requesters_jobs_and_hold_reasons() {
     let mut later = job("l", "d", "pending");
     later["queued_at"] = json!("2026-09-10T10:01:00Z");
     let jobs = vec![pending, running, earlier, later];
-    let text = queue_context(&jobs, "a").join("\n");
-    assert!(!text.contains("job waiting"));
-    assert!(text.contains("Waiting for concurrency cap"));
-    assert!(!text.contains("globally"));
-    assert!(!text.contains("by d"));
-    assert!(!text.contains("behind"));
-    assert!(queue_context(&jobs, "missing").is_empty());
+    let a = args();
+    let mut view = View::new(&a);
+    let snap = Snapshot {
+        sessions: vec![session("a", "", "/repo")],
+        jobs,
+        ..Default::default()
+    };
+    let rows = view.rows(&snap, &a, 0);
+    let job_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| matches!(row.target, Some(Target::SessionJob(_, _))))
+        .collect();
+    assert_eq!(job_rows.len(), 1);
+    assert!(job_rows[0].text.contains("pending"));
+    assert!(job_rows[0]
+        .text
+        .contains("waiting for an available job slot"));
     let mut delegated = job("d", "a", "running");
     delegated["notify_session_id"] = json!("b");
     assert!(owns(&delegated, "a") && !owns(&delegated, "b"));
@@ -569,6 +579,7 @@ fn waiting_is_cyan_only_for_idle_agents_and_history_is_visible_on_expansion() {
         .find(|r| r.target == Some(Target::Session("a".into())))
         .unwrap();
     assert!(agent.text.contains("waiting"));
+    assert!(agent.text.contains("◷  a"));
     assert_eq!(agent.style, "\x1b[36m");
     assert!(rows.iter().any(|r| r.text.contains("waiting 5m")));
     assert!(rows.iter().any(|r| r.text.contains("3 landed via sm")));
@@ -605,4 +616,62 @@ fn full_screen_tail_uses_height_and_scroll_follow_survives_resize() {
     view.log_scroll = 0;
     let resized = clean(&frame(&mut view, &snap, &a, &rows, 12, 60));
     assert!(resized.contains("output-100"));
+}
+
+#[test]
+fn obligations_do_not_repeat_visible_jobs_but_preserve_other_results() {
+    let jobs = vec![job("j", "a", "running")];
+    let single = json!({"waiting_on":[{"kind":"queue_job", "id":"j", "label":"unit tests", "since":"2026-09-10T10:00:00Z"}]});
+    assert!(obligation_context(&single, &jobs, "a", false, 0).is_empty());
+    assert!(obligation_context(&single, &jobs, "a", true, 0).is_empty());
+    // A delegated result or a missing job snapshot still needs its own line.
+    assert_eq!(obligation_context(&single, &jobs, "b", false, 0).len(), 1);
+    assert_eq!(obligation_context(&single, &[], "a", false, 0).len(), 1);
+    let multiple = json!({"waiting_on":[
+        {"kind":"queue_job", "id":"j", "label":"unit tests"},
+        {"kind":"queue_job", "id":"j2", "label":"integration tests"},
+        {"kind":"review", "id":"r", "label":"Review · repo #42", "since":"2026-09-10T10:00:00Z"}
+    ]});
+    let mut jobs = jobs;
+    jobs.push(job("j2", "a", "pending"));
+    assert_eq!(
+        obligation_context(&multiple, &jobs, "a", false, 0),
+        vec!["Waiting for 2 jobs and 1 review"]
+    );
+    let expanded = obligation_context(&multiple, &jobs, "a", true, 0);
+    assert_eq!(expanded.len(), 2);
+    assert!(expanded[1].starts_with("Review · repo #42"));
+}
+
+#[test]
+fn pending_job_rows_explain_each_hold_and_clear_it_when_running() {
+    let a = args();
+    let mut view = View::new(&a);
+    let mut j = job("j", "a", "pending");
+    for (reason, expected) in [
+        ("perf_cooldown", "waiting for performance cooldown"),
+        ("perf_running", "waiting for the performance run to finish"),
+        ("awaiting_tests", "waiting for test jobs"),
+        ("", "reason not yet reported"),
+        ("future_hold", "waiting for future hold"),
+    ] {
+        j["holding_reason"] = json!(reason);
+        let snap = Snapshot {
+            sessions: vec![session("a", "", "/repo")],
+            jobs: vec![j.clone()],
+            ..Default::default()
+        };
+        let rows = view.rows(&snap, &a, 0);
+        assert!(rows.iter().any(
+            |r| matches!(r.target, Some(Target::SessionJob(_, _))) && r.text.contains(expected)
+        ));
+        view.jobs_for = Some("a".into());
+        let rows = view.rows(&snap, &a, 0);
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r.target, Some(Target::Job(_))) && r.text.contains(expected)));
+        view.jobs_for = None;
+    }
+    j["state"] = json!("running");
+    assert!(pending_reason(&j).is_empty());
 }
