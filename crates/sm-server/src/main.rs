@@ -116,6 +116,8 @@ async fn main() -> Result<()> {
                 .service
                 .as_ref()
                 .map_or(0, |service| service.max_concurrent),
+            memory_min_free_bytes: config.queue_runner.memory.min_free_bytes,
+            resource_retry_interval_seconds: config.queue_runner.memory.retry_interval_seconds,
         };
         thread::spawn(move || {
             match RetainedQueueStore::recover_queue_jobs_in_state_dir_with_policy(

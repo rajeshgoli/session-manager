@@ -170,6 +170,12 @@ impl AppConfig {
     }
 
     fn validate_queue_runner_capacity(&self) -> Result<()> {
+        if self.queue_runner.memory.min_free_bytes <= 0 {
+            bail!("queue_runner.memory.min_free_bytes must be greater than zero");
+        }
+        if self.queue_runner.memory.retry_interval_seconds == 0 {
+            bail!("queue_runner.memory.retry_interval_seconds must be greater than zero");
+        }
         let Some(service) = self.queue_runner.types.service.as_ref() else {
             return Ok(());
         };
@@ -1397,6 +1403,8 @@ pub struct QueueRunnerConfig {
     #[serde(default = "default_queue_runner_perf_cooldown_seconds")]
     pub perf_cooldown_seconds: i64,
     #[serde(default)]
+    pub memory: QueueRunnerMemoryConfig,
+    #[serde(default)]
     pub types: QueueRunnerTypesConfig,
     #[serde(skip)]
     pub configured: bool,
@@ -1438,6 +1446,23 @@ impl Default for QueueRunnerTypesConfig {
 pub struct QueueRunnerTypeConfig {
     pub max_concurrent: usize,
     pub default_timeout_seconds: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueueRunnerMemoryConfig {
+    #[serde(default = "default_queue_runner_memory_min_free_bytes")]
+    pub min_free_bytes: i64,
+    #[serde(default = "default_queue_runner_memory_retry_interval_seconds")]
+    pub retry_interval_seconds: u64,
+}
+
+impl Default for QueueRunnerMemoryConfig {
+    fn default() -> Self {
+        Self {
+            min_free_bytes: default_queue_runner_memory_min_free_bytes(),
+            retry_interval_seconds: default_queue_runner_memory_retry_interval_seconds(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1513,6 +1538,7 @@ impl Default for QueueRunnerConfig {
             cancel_grace_seconds: default_queue_runner_cancel_grace_seconds(),
             max_running_jobs: default_queue_runner_max_running_jobs(),
             perf_cooldown_seconds: default_queue_runner_perf_cooldown_seconds(),
+            memory: QueueRunnerMemoryConfig::default(),
             types: QueueRunnerTypesConfig::default(),
             configured: false,
         }
@@ -1533,6 +1559,14 @@ fn default_queue_runner_max_running_jobs() -> i64 {
 
 fn default_queue_runner_perf_cooldown_seconds() -> i64 {
     30
+}
+
+fn default_queue_runner_memory_min_free_bytes() -> i64 {
+    8 * 1024 * 1024 * 1024
+}
+
+fn default_queue_runner_memory_retry_interval_seconds() -> u64 {
+    10
 }
 
 fn default_queue_runner_tests_config() -> QueueRunnerTypeConfig {
@@ -1574,6 +1608,7 @@ fn queue_runner_config_for_state_file(state_file: &str) -> QueueRunnerConfig {
         cancel_grace_seconds: default_queue_runner_cancel_grace_seconds(),
         max_running_jobs: default_queue_runner_max_running_jobs(),
         perf_cooldown_seconds: default_queue_runner_perf_cooldown_seconds(),
+        memory: QueueRunnerMemoryConfig::default(),
         types: QueueRunnerTypesConfig::default(),
         configured: false,
     }
@@ -3145,6 +3180,9 @@ queue_runner:
   cancel_grace_seconds: 3
   max_running_jobs: 8
   perf_cooldown_seconds: 7
+  memory:
+    min_free_bytes: 8589934592
+    retry_interval_seconds: 4
   types:
     tests:
       max_concurrent: 6
@@ -3164,6 +3202,8 @@ queue_runner:
         assert_eq!(config.queue_runner.cancel_grace_seconds, 3);
         assert_eq!(config.queue_runner.max_running_jobs, 8);
         assert_eq!(config.queue_runner.perf_cooldown_seconds, 7);
+        assert_eq!(config.queue_runner.memory.min_free_bytes, 8_589_934_592);
+        assert_eq!(config.queue_runner.memory.retry_interval_seconds, 4);
         assert_eq!(config.queue_runner.types.tests.max_concurrent, 6);
         assert_eq!(
             config.queue_runner.types.tests.default_timeout_seconds,

@@ -306,6 +306,9 @@ mod tests {
                 script: None,
                 env: BTreeMap::new(),
                 timeout_seconds: 60,
+                cpu_percent: None,
+                gpu_percent: None,
+                memory_bytes: None,
             },
         )
         .unwrap();
