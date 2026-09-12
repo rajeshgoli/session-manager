@@ -703,6 +703,16 @@ class WatchViewModel(application: Application, private val savedState: androidx.
         if (accepted && submitted) updateTerminalInput("")
     }
 
+    fun openTerminalModelMenu() {
+        val terminal = _uiState.value.terminal ?: return
+        val writer = terminalWriter ?: return
+        if (terminal.status != "attached" || !supportsSessionCloning(terminal.provider)) return
+        // Clear only the remote prompt line. Keep the native draft untouched.
+        if (writer.send(JSONObject().put("type", "input").put("data", "\u0015\u001b[200~/model\u001b[201~").toString())) {
+            writer.send(JSONObject().put("type", "key").put("key", "enter").toString())
+        }
+    }
+
     fun sendTerminalData(data: String) {
         if (data.isEmpty()) {
             return

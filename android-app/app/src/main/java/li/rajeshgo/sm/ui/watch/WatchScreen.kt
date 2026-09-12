@@ -74,6 +74,9 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -436,9 +439,7 @@ fun WatchScreen(
                 terminal = terminal,
                 onInputChange = viewModel::updateTerminalInput,
                 onSend = { viewModel.sendTerminalInput(sendEnter = true) },
-                onEsc = { viewModel.sendTerminalKey("esc") },
-                onCtrlC = { viewModel.sendTerminalKey("ctrl-c") },
-                onEnter = { viewModel.sendTerminalKey("enter") },
+                onChangeModel = viewModel::openTerminalModelMenu,
                 onTerminalInput = viewModel::sendTerminalData,
                 onTerminalResize = viewModel::resizeTerminal,
                 onTerminalPageScroll = viewModel::sendTerminalPageScroll,
@@ -464,9 +465,7 @@ private fun MobileTerminalOverlay(
     terminal: TerminalUiState,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
-    onEsc: () -> Unit,
-    onCtrlC: () -> Unit,
-    onEnter: () -> Unit,
+    onChangeModel: () -> Unit,
     onTerminalInput: (String) -> Unit,
     onTerminalResize: (cols: Int, rows: Int) -> Unit,
     onTerminalPageScroll: (up: Boolean) -> Unit,
@@ -479,6 +478,10 @@ private fun MobileTerminalOverlay(
     onCopy: (String) -> Unit,
 ) {
     var copyRequest by remember { mutableStateOf(0L) }
+    val controls = remember(terminal.connectionGeneration) { TerminalControls() }
+    var actionsOpen by remember { mutableStateOf(false) }
+    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    val focus = androidx.compose.ui.platform.LocalFocusManager.current
     BackHandler(onBack = onDetach)
 
     Surface(
@@ -549,6 +552,7 @@ private fun MobileTerminalOverlay(
                 TerminalWebView(
                     terminal = terminal,
                     copyRequest = copyRequest,
+                    controls = controls,
                     onInput = onTerminalInput,
                     onResize = onTerminalResize,
                     onPageScroll = onTerminalPageScroll,
@@ -561,27 +565,34 @@ private fun MobileTerminalOverlay(
                 }
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                OutlinedButton(
-                    onClick = onEsc,
-                    modifier = Modifier.height(44.dp),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                ) { Text("Esc") }
-                OutlinedButton(
-                    onClick = onCtrlC,
-                    modifier = Modifier.height(44.dp),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                ) { Text("Ctrl-C") }
-                OutlinedButton(
-                    onClick = onEnter,
-                    modifier = Modifier.height(44.dp),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                ) { Text("Enter") }
-                OutlinedButton(
-                    onClick = { copyRequest += 1 },
-                    modifier = Modifier.height(44.dp),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                ) { Text("Copy") }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                val connected = terminal.status == "attached"
+                listOf("up" to "↑", "down" to "↓", "left" to "←", "right" to "→", "enter" to "↵").forEach { (key, label) ->
+                    OutlinedButton(
+                        onClick = { controls.sendKey?.invoke(key) },
+                        enabled = connected,
+                        modifier = Modifier.weight(1f).height(48.dp).semantics { contentDescription = if (key == "enter") "Enter" else "${key.replaceFirstChar(Char::uppercaseChar)} arrow" },
+                        contentPadding = PaddingValues(0.dp),
+                    ) { Text(label, style = MaterialTheme.typography.titleLarge) }
+                }
+                Box(Modifier.weight(1f)) {
+                    OutlinedButton(onClick = { actionsOpen = true }, modifier = Modifier.fillMaxWidth().height(48.dp), contentPadding = PaddingValues(0.dp)) {
+                        Icon(Icons.Rounded.MoreHoriz, "Terminal actions")
+                    }
+                    DropdownMenu(expanded = actionsOpen, onDismissRequest = { actionsOpen = false }) {
+                        if (supportsSessionCloning(terminal.provider)) {
+                            DropdownMenuItem(text = { Text("Change model") }, enabled = connected, onClick = {
+                                actionsOpen = false; focus.clearFocus(); keyboard?.hide(); onChangeModel()
+                            })
+                            HorizontalDivider()
+                        }
+                        listOf("esc" to "Escape", "tab" to "Tab", "shift-tab" to "Shift + Tab", "backspace" to "Backspace", "ctrl-c" to "Interrupt (Ctrl-C)").forEach { (key, label) ->
+                            DropdownMenuItem(text = { Text(label) }, enabled = connected, onClick = { actionsOpen = false; controls.sendKey?.invoke(key) })
+                        }
+                        HorizontalDivider()
+                        DropdownMenuItem(text = { Text("Copy terminal") }, onClick = { actionsOpen = false; copyRequest += 1 })
+                    }
+                }
             }
 
             Row(
@@ -617,6 +628,7 @@ private fun MobileTerminalOverlay(
 private fun TerminalWebView(
     terminal: TerminalUiState,
     copyRequest: Long,
+    controls: TerminalControls,
     onInput: (String) -> Unit,
     onResize: (cols: Int, rows: Int) -> Unit,
     onPageScroll: (up: Boolean) -> Unit,
@@ -636,6 +648,7 @@ private fun TerminalWebView(
 
     androidx.compose.runtime.DisposableEffect(Unit) {
         onDispose {
+            controls.sendKey = null
             webViewRef?.destroy()
             webViewRef = null
         }
@@ -674,6 +687,7 @@ private fun TerminalWebView(
             },
         factory = { context ->
             WebView(context).apply {
+                controls.sendKey = { key -> evaluateJavascript("window.smSendKey(${jsString(key)});", null) }
                 setBackgroundColor(android.graphics.Color.rgb(5, 8, 13))
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = false
@@ -767,6 +781,7 @@ private fun terminalAssetResponse(context: android.content.Context, uri: Uri?): 
     }
     val assetPath = when (uri.path) {
         "/terminal.html" -> "sm_terminal/terminal.html"
+        "/terminal_keys.js" -> "sm_terminal/terminal_keys.js"
         "/vendor/xterm.css" -> "sm_terminal/vendor/xterm.css"
         "/vendor/xterm.js" -> "sm_terminal/vendor/xterm.js"
         "/vendor/addon-fit.js" -> "sm_terminal/vendor/addon-fit.js"
@@ -1696,4 +1711,8 @@ private fun relativeSummaryAge(timestamp: String?): String {
         while (true) { now = java.time.OffsetDateTime.now(); kotlinx.coroutines.delay(60_000) }
     }
     return summaryAgeLabel(timestamp, now)
+}
+
+private class TerminalControls {
+    var sendKey: ((String) -> Unit)? = null
 }
