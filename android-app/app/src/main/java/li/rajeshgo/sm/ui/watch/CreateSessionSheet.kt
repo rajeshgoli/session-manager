@@ -23,6 +23,7 @@ fun sessionTemplate(source: ClientSession?): CreateSessionRequest = CreateSessio
 fun CreateSessionSheet(
     source: ClientSession?,
     sessions: List<ClientSession>,
+    loadModels: suspend (String) -> List<String>,
     busy: Boolean,
     error: String?,
     onDismiss: () -> Unit,
@@ -38,8 +39,19 @@ fun CreateSessionSheet(
     var prompt by rememberSaveable(source?.id) { mutableStateOf("") }
     var customDirectory by rememberSaveable { mutableStateOf(false) }
     val directories = (listOf("/Users/rajesh/projects/fractal-algo-rust", "/Users/rajesh/projects/session-manager", "/Users/rajesh/projects/codex-fork") + sessions.map { it.workingDir } + directory).distinct()
-    val models = (listOf("") + sessions.filter { it.provider == provider }.mapNotNull { it.model } +
-        (if (provider == "claude") listOf("sonnet", "opus", "haiku") else emptyList<String>()) + listOf(model)).distinct()
+    var catalog by remember(provider) { mutableStateOf(emptyList<String>()) }
+    var modelsLoading by remember(provider) { mutableStateOf(true) }
+    var modelsError by remember(provider) { mutableStateOf(false) }
+    var catalogAttempt by remember { mutableStateOf(0) }
+    LaunchedEffect(provider, catalogAttempt) {
+        modelsLoading = true
+        modelsError = false
+        try { catalog = loadModels(provider) }
+        catch (error: kotlinx.coroutines.CancellationException) { throw error }
+        catch (_: Exception) { modelsError = true }
+        finally { modelsLoading = false }
+    }
+    val models = (listOf("") + catalog + sessions.filter { it.provider == provider }.mapNotNull { it.model } + listOf(model)).distinct()
     ModalBottomSheet(sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), onDismissRequest = { if (!busy) onDismiss() }) {
         Column(Modifier.fillMaxWidth().imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             Text(if (source == null) "New session" else "Clone ${sessionDisplayName(source)}", style = MaterialTheme.typography.headlineSmall)
@@ -50,6 +62,8 @@ fun CreateSessionSheet(
             SessionChoice("Model", model, models + "Other model…", !busy, emptyLabel = "Provider default") {
                 if (it == "Other model…") customModel = true else { model = it; customModel = false }
             }
+            if (modelsLoading) Text("Loading available models…", style = MaterialTheme.typography.bodySmall)
+            if (modelsError) TextButton(onClick = { catalogAttempt++ }) { Text("Couldn't load models · Retry") }
             if (customModel) OutlinedTextField(model, { model = it }, label = { Text("Model identifier") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), singleLine = true)
             SessionChoice("Effort", effort, (listOf("medium", "high") + effort).distinct(), !busy) { effort = it }
             SessionChoice("Workspace", directory, directories + "Other directory…", !busy, shortPaths = true) {

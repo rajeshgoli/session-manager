@@ -31,6 +31,9 @@ import retrofit2.http.Path
 import retrofit2.http.Query
 
 interface ApiService {
+    @GET("client/session-models")
+    suspend fun getSessionModels(@Query("provider") provider: String): li.rajeshgo.sm.data.model.SessionModelsResponse
+
     @POST("sessions")
     suspend fun createSession(@Body request: li.rajeshgo.sm.data.model.CreateSessionRequest): li.rajeshgo.sm.data.model.CreatedSession
 

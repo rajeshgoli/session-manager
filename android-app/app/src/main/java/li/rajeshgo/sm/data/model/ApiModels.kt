@@ -618,3 +618,6 @@ data class SessionJob(
     @SerialName("finished_at") val finishedAt: String? = null,
     @SerialName("exit_code") val exitCode: Int? = null,
 )
+
+@Serializable
+data class SessionModelsResponse(val models: List<String> = emptyList())

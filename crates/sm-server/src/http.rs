@@ -1278,6 +1278,7 @@ pub fn router(state: AppState) -> Router {
         .route("/hooks/tmux-client", post(tmux_client_hook))
         .route("/hooks/context-usage", post(context_usage_hook))
         .route("/client/bootstrap", get(client_bootstrap))
+        .route("/client/session-models", get(client_session_models))
         .route("/client/analytics/summary", get(client_analytics_summary))
         .route("/client/request-status", post(client_request_status))
         .route("/client/bug-reports", post(submit_client_bug_report))
@@ -2253,6 +2254,39 @@ async fn client_bootstrap(
         mobile_terminal_runtime_disabled(&state),
         state.studio_ssh_enabled.load(Ordering::SeqCst),
     )))
+}
+
+#[derive(Deserialize)]
+struct SessionModelsQuery {
+    provider: String,
+}
+
+async fn client_session_models(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SessionModelsQuery>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
+    ensure_public_edge_assertion_for_request(&state, &request)?;
+    ensure_session_read_allowed(&state, &request)?;
+    ensure_mobile_cloudflare_access_context_matches_optional_actor(
+        &state,
+        access_context.as_ref(),
+        request_actor_email(&state.config, &request).as_deref(),
+    )?;
+    if !matches!(query.provider.as_str(), "claude" | "codex" | "codex-fork") {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "Unsupported provider".into(),
+        });
+    }
+    let runtime = TmuxRuntime::from_app_config(&state.config);
+    let models = tokio::task::spawn_blocking(move || {
+        runtime.session_models(&query.provider, &std::env::current_dir()?)
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
+    Ok(Json(json!({ "models": models })))
 }
 
 async fn client_analytics_summary(
@@ -12898,6 +12932,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/events/state"
         || path == "/apk"
         || path == "/client/analytics/summary"
+        || path == "/client/session-models"
         || path == "/codex-review-requests"
         || path.starts_with("/codex-review-requests/")
         || path == "/session-obligations"
@@ -17539,6 +17574,12 @@ mod tests {
                 true,
             ),
             (Method::GET, "/client/analytics/summary", "", false),
+            (
+                Method::GET,
+                "/client/session-models?provider=claude",
+                "",
+                false,
+            ),
             (Method::POST, "/client/request-status", "", false),
             (
                 Method::POST,
@@ -18510,13 +18551,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mobile_session_models_exposes_claude_choices_and_rejects_unknown_provider() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let app = router(AppState::new(mobile_ticket_config(&signing_key)));
+        let response = app
+            .clone()
+            .oneshot(local_request(
+                Method::GET,
+                "/client/session-models?provider=claude",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["models"], json!(["fable", "sonnet", "opus", "haiku"]));
+        let response = app
+            .oneshot(local_request(
+                Method::GET,
+                "/client/session-models?provider=invalid",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(is_protected_read_surface("GET", "/client/session-models"));
+    }
+
+    #[tokio::test]
     async fn mobile_terminal_routes_advertise_supported_bridge() {
         let signing_key = SigningKey::random(&mut OsRng);
         let config = mobile_ticket_config(&signing_key);
-        let mut fixture: Value = serde_json::from_slice(&fs::read(&config.paths.state_file).unwrap()).unwrap();
+        let mut fixture: Value =
+            serde_json::from_slice(&fs::read(&config.paths.state_file).unwrap()).unwrap();
         fixture["sessions"][0]["model"] = json!("gpt-test");
         fixture["sessions"][0]["reasoning_effort"] = json!("medium");
-        fs::write(&config.paths.state_file, serde_json::to_vec(&fixture).unwrap()).unwrap();
+        fs::write(
+            &config.paths.state_file,
+            serde_json::to_vec(&fixture).unwrap(),
+        )
+        .unwrap();
         let app = router(AppState::new(config));
 
         let response = app

@@ -340,11 +340,46 @@ impl TmuxRuntime {
         working_dir: &Path,
         timeout: Duration,
     ) -> Result<()> {
-        let executable = resolve_launch_command(&self.codex_fork_command, working_dir)
+        let supported = self.session_models_with_timeout("codex-fork", working_dir, timeout)?;
+        if supported.iter().any(|model| model == requested) {
+            return Ok(());
+        }
+        Err(CodexModelValidationError::Unsupported {
+            requested: requested.to_owned(),
+            supported,
+        }
+        .into())
+    }
+
+    /// Uses the same provider catalog as spawn validation; hidden models stay hidden.
+    pub fn session_models(&self, provider: &str, working_dir: &Path) -> Result<Vec<String>> {
+        self.session_models_with_timeout(provider, working_dir, CODEX_MODEL_DISCOVERY_TIMEOUT)
+    }
+
+    fn session_models_with_timeout(
+        &self,
+        provider: &str,
+        working_dir: &Path,
+        timeout: Duration,
+    ) -> Result<Vec<String>> {
+        if provider == "claude" {
+            return Ok(vec![
+                "fable".into(),
+                "sonnet".into(),
+                "opus".into(),
+                "haiku".into(),
+            ]);
+        }
+        let (executable_name, arguments) = match provider {
+            "codex" => (&self.codex_command, &self.codex_args),
+            "codex-fork" => (&self.codex_fork_command, &self.codex_fork_args),
+            _ => anyhow::bail!("Unsupported provider"),
+        };
+        let executable = resolve_launch_command(executable_name, working_dir)
             .map_err(|error| CodexModelValidationError::DiscoveryUnavailable(error.to_string()))?;
         let mut command = Command::new(executable);
         command
-            .args(&self.codex_fork_args)
+            .args(arguments)
             .args(["debug", "models"])
             .current_dir(working_dir);
         let output = command_output_with_timeout(command, timeout)
@@ -391,14 +426,7 @@ impl TmuxRuntime {
             )
             .into());
         }
-        if supported.iter().any(|model| model == requested) {
-            return Ok(());
-        }
-        Err(CodexModelValidationError::Unsupported {
-            requested: requested.to_owned(),
-            supported,
-        }
-        .into())
+        Ok(supported)
     }
 
     pub fn allows_restore_without_resume_id(&self, provider: &str) -> bool {
@@ -2785,6 +2813,15 @@ mod tests {
         runtime.codex_fork_command = command.display().to_string();
         runtime.codex_fork_args = vec!["--configured-arg".to_owned()];
 
+        runtime.codex_command = command.display().to_string();
+        assert_eq!(
+            runtime.session_models("codex", &working_dir).unwrap(),
+            vec!["gpt-5.6-luna", "gpt-5.6-sol"]
+        );
+        assert_eq!(
+            runtime.session_models("codex-fork", &working_dir).unwrap(),
+            vec!["gpt-5.6-luna", "gpt-5.6-sol"]
+        );
         runtime
             .validate_codex_fork_model("gpt-5.6-luna", &working_dir)
             .unwrap();

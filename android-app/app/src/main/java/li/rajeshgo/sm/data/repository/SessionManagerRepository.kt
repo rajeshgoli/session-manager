@@ -249,6 +249,10 @@ class SessionManagerRepository(
         executeReadRequest(baseUrl, token) { it.getAuthSession() }
     }
 
+    suspend fun fetchSessionModels(baseUrl: String, token: String, provider: String): List<String> = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getSessionModels(provider).models }
+    }
+
     suspend fun fetchSessions(baseUrl: String, token: String): List<ClientSession> = withContext(Dispatchers.IO) {
         coroutineScope {
             val sessions = async { executeReadRequest(baseUrl, token) { it.getClientSessions().sessions } }

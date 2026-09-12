@@ -84,6 +84,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
     // latest toggle can be discarded instead of applying stale pre-toggle data.
     private var studioSshStatusGeneration = 0
     private var terminalSocket: WebSocket? = null
+    private var terminalWriter: TerminalFrameWriter? = null
     private var terminalReconnect: (() -> Unit)? = null
     private var terminalReconnectJob: Job? = null
     private var terminalForeground = true
@@ -121,6 +122,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
         pendingTerminalResize = null
         terminalSocket?.close(1000, "viewmodel cleared")
         terminalSocket = null
+        terminalWriter = null
         super.onCleared()
     }
 
@@ -410,6 +412,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
             terminalReconnectJob?.cancel()
             terminalSocket?.cancel()
             terminalSocket = null
+            terminalWriter = null
             val attachToken = UUID.randomUUID().toString()
             terminalAttachToken = attachToken
             pendingTerminalResize = null
@@ -495,6 +498,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                     failInitialAttach(error)
                     return
                 }
+                terminalWriter = null
                 terminalSocket?.close(1000, if (attempt == 0) "new attach" else "retry attach")
                 updateTerminalIfCurrent(attachToken) { it.copy(outputFrames = emptyList(), copyBuffer = "", connectionGeneration = connectionGeneration) }
                 terminalSocket = sessionRepository.openMobileTerminalSocket(ticket, freshAccessToken, object : WebSocketListener() {
@@ -506,14 +510,20 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                             .put("device_key_id", ticket.deviceKeyId)
                             .put("nonce", wsNonce)
                             .put("signature", wsSignature)
-                        webSocket.send(frame.toString())
-                        pendingTerminalResize?.let { (cols, rows) ->
-                            webSocket.send(terminalResizeFrame(cols, rows).toString())
-                        }
                         viewModelScope.launch {
-                            if (terminalSocket == webSocket) {
-                                updateTerminalIfCurrent(attachToken) { it.copy(status = "authenticating", error = null) }
+                            if (terminalSocket != webSocket || terminalAttachToken != attachToken ||
+                                connectionGeneration != terminalConnectionGeneration || !terminalForeground) {
+                                webSocket.cancel()
+                                return@launch
                             }
+                            val writer = TerminalFrameWriter()
+                            if (!writer.authenticate(frame.toString(), webSocket::send)) {
+                                webSocket.cancel()
+                                return@launch
+                            }
+                            terminalWriter = writer
+                            sendPendingTerminalResize()
+                            updateTerminalIfCurrent(attachToken) { it.copy(status = "authenticating", error = null) }
                         }
                     }
 
@@ -557,7 +567,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                                     it.copy(status = terminalStatusAfterServerEvent(it.status, status))
                                 }
                                 "error" -> updateTerminalIfCurrent(attachToken) {
-                                    it.copy(error = payload.optString("message", "Terminal error"))
+                                    it.copy(error = "Connection interrupted. Reconnecting with your draft saved.")
                                 }
                                 "exit" -> updateTerminalIfCurrent(attachToken) { it.copy(status = if (payload.optString("reason") == "max_attach_seconds") "reconnecting" else "detached") }
                             }
@@ -572,6 +582,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                             val message = mobileTerminalSocketFailureMessage(t, response)
                             val retryable = response?.code == null || response.code in setOf(404, 408, 426, 429, 500, 502, 503, 504)
                             terminalSocket = null
+                            terminalWriter = null
                             if (retryable && terminalForeground) {
                                 updateTerminalIfCurrent(attachToken) { it.copy(status = "reconnecting", error = "Connection interrupted. Your draft is saved.") }
                                 delay((1000L * (attempt + 1)).coerceAtMost(15_000L))
@@ -588,11 +599,12 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                         viewModelScope.launch {
                             if (terminalSocket != webSocket || terminalAttachToken != attachToken) return@launch
                             terminalSocket = null
-                            if (terminalForeground && code != 1008 && reason != "tmux_session_closed") {
-                                updateTerminalIfCurrent(attachToken) { it.copy(status = "reconnecting") }
-                                delay(1000L)
-                                if (connectionGeneration == terminalConnectionGeneration) connectSocket(0)
-                            } else updateTerminalIfCurrent(attachToken) { it.copy(status = "detached", error = reason) }
+                            terminalWriter = null
+                            if (terminalForeground && retryTerminalClose(code, reason)) {
+                                updateTerminalIfCurrent(attachToken) { it.copy(status = "reconnecting", error = null) }
+                                delay((1000L * (attempt + 1)).coerceAtMost(15_000L))
+                                if (connectionGeneration == terminalConnectionGeneration) connectSocket(attempt + 1)
+                            } else updateTerminalIfCurrent(attachToken) { it.copy(status = "detached", error = terminalCloseMessage(reason)) }
                         }
                     }
                 })
@@ -607,6 +619,10 @@ class WatchViewModel(application: Application, private val savedState: androidx.
         }
     }
 
+    suspend fun sessionModels(provider: String): List<String> = sessionRepository.fetchSessionModels(
+        settingsRepository.serverUrl.first(), settingsRepository.accessToken.first(), provider,
+    )
+
     fun setTerminalForeground(foreground: Boolean) {
         terminalForeground = foreground
         if (!foreground) {
@@ -614,6 +630,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
             terminalReconnectJob?.cancel()
             terminalSocket?.cancel()
             terminalSocket = null
+            terminalWriter = null
             _uiState.value = _uiState.value.copy(terminal = _uiState.value.terminal?.copy(status = "paused", error = null))
         } else if (terminalSocket == null && _uiState.value.terminal != null) {
             terminalReconnect?.invoke()
@@ -624,6 +641,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
         terminalConnectionGeneration++
         terminalSocket?.cancel()
         terminalSocket = null
+        terminalWriter = null
         terminalReconnect?.invoke()
     }
 
@@ -676,12 +694,12 @@ class WatchViewModel(application: Application, private val savedState: androidx.
 
     fun sendTerminalInput(sendEnter: Boolean = false) {
         val terminal = _uiState.value.terminal ?: return
-        val socket = terminalSocket ?: return
+        val writer = terminalWriter ?: return
         if (terminal.status != "attached" || terminal.inputDraft.isBlank()) return
         // Bracketed paste keeps multiline prompts intact; Enter submits separately.
         val data = "\u001b[200~" + terminal.inputDraft + "\u001b[201~"
-        val accepted = socket.send(JSONObject().put("type", "input").put("data", data).toString())
-        val submitted = !sendEnter || (accepted && socket.send(JSONObject().put("type", "key").put("key", "enter").toString()))
+        val accepted = writer.send(JSONObject().put("type", "input").put("data", data).toString())
+        val submitted = !sendEnter || (accepted && writer.send(JSONObject().put("type", "key").put("key", "enter").toString()))
         if (accepted && submitted) updateTerminalInput("")
     }
 
@@ -689,11 +707,11 @@ class WatchViewModel(application: Application, private val savedState: androidx.
         if (data.isEmpty()) {
             return
         }
-        terminalSocket?.send(JSONObject().put("type", "input").put("data", data).toString())
+        terminalWriter?.send(JSONObject().put("type", "input").put("data", data).toString())
     }
 
     fun sendTerminalKey(key: String) {
-        terminalSocket?.send(JSONObject().put("type", "key").put("key", key).toString())
+        terminalWriter?.send(JSONObject().put("type", "key").put("key", key).toString())
     }
 
     fun sendTerminalPageScroll(up: Boolean) {
@@ -714,9 +732,10 @@ class WatchViewModel(application: Application, private val savedState: androidx.
         terminalReconnectJob?.cancel()
         terminalAttachToken = null
         pendingTerminalResize = null
-        terminalSocket?.send(JSONObject().put("type", "detach").toString())
+        terminalWriter?.send(JSONObject().put("type", "detach").toString())
         terminalSocket?.close(1000, "detach")
         terminalSocket = null
+        terminalWriter = null
         _uiState.value = _uiState.value.copy(terminal = null)
         refresh()
     }
@@ -741,9 +760,9 @@ class WatchViewModel(application: Application, private val savedState: androidx.
     }
 
     private fun sendPendingTerminalResize() {
-        val socket = terminalSocket ?: return
+        val writer = terminalWriter ?: return
         val (cols, rows) = pendingTerminalResize ?: return
-        socket.send(terminalResizeFrame(cols, rows).toString())
+        writer.send(terminalResizeFrame(cols, rows).toString())
     }
 
     private fun terminalResizeFrame(cols: Int, rows: Int): JSONObject {
@@ -763,10 +782,11 @@ class WatchViewModel(application: Application, private val savedState: androidx.
     }
 
     private fun mobileTerminalSocketFailureMessage(error: Throwable, response: Response?): String {
-        val base = error.message ?: "Terminal socket failed"
-        val code = response?.code ?: return base
-        val reason = response.message.takeIf { it.isNotBlank() } ?: "HTTP error"
-        return "$reason ($code): $base"
+        return when (response?.code) {
+            401 -> "Sign in again in Settings to reconnect. Your draft is saved."
+            403 -> "Device access was refused. Check device enrollment in Settings. Your draft is saved."
+            else -> "Couldn't connect. Retry when your connection is available. Your draft is saved."
+        }
     }
 
     fun requestStatus(onComplete: (Result<String>) -> Unit) {

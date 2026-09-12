@@ -248,12 +248,10 @@ fun WatchScreen(
                         }
                     },
                     onOpenSettings = onNavigateToSettings,
+                    onNewSession = { cloneSource = null; createError = null; creating = true },
                 )
             }
 
-            item {
-                Button(onClick = { cloneSource = null; createError = null; creating = true }, modifier = Modifier.fillMaxWidth(), enabled = state.userEmail.isNotBlank()) { Text("New session") }
-            }
             item {
                 SessionFilters(
                     sessions = state.sessions,
@@ -445,7 +443,7 @@ fun WatchScreen(
         }
 
         if (creating) {
-            CreateSessionSheet(cloneSource, state.sessions, createBusy, createError, onDismiss = { creating = false }) { request ->
+            CreateSessionSheet(cloneSource, state.sessions, viewModel::sessionModels, createBusy, createError, onDismiss = { creating = false }) { request ->
                 createBusy = true
                 createError = null
                 viewModel.createSession(request) { result ->
@@ -972,6 +970,7 @@ private fun HeaderBar(
     onRequestStatus: () -> Unit,
     onEnsureMaintainer: () -> Unit,
     onOpenSettings: () -> Unit,
+    onNewSession: () -> Unit,
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
 
@@ -985,7 +984,7 @@ private fun HeaderBar(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Column {
+            Column(Modifier.weight(1f)) {
                 Text("sm watch", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onSurface)
                 val statusLine = buildString {
                     append("Last sync ")
@@ -1017,6 +1016,11 @@ private fun HeaderBar(
                         expanded = menuExpanded,
                         onDismissRequest = { menuExpanded = false },
                     ) {
+                        DropdownMenuItem(
+                            text = { Text("New session") },
+                            onClick = { menuExpanded = false; onNewSession() },
+                            enabled = userEmail.isNotBlank(),
+                        )
                         DropdownMenuItem(
                             text = { Text(if (ensuringMaintainer) "Wake maintainer (starting...)" else "Wake maintainer") },
                             onClick = {
@@ -1293,16 +1297,12 @@ private fun SessionRow(
                             Text(waiting, style = MaterialTheme.typography.bodySmall, color = Cyan, maxLines = 3, overflow = TextOverflow.Ellipsis)
                             Spacer(Modifier.height(6.dp))
                         }
-                        session.jobs.filter { it.state == "pending" || it.state == "running" }.take(2).forEach { job ->
-                            Text(jobSummary(job), style = MaterialTheme.typography.bodySmall, color = TextSecondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                            Spacer(Modifier.height(6.dp))
-                        }
                         statusSummary(session)?.let { status ->
                             Text(
                                 text = status,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = Cyan,
-                                maxLines = 3,
+                                maxLines = 2,
                                 overflow = TextOverflow.Ellipsis,
                             )
                             Spacer(Modifier.height(6.dp))
@@ -1346,7 +1346,6 @@ private fun SessionRow(
             if (expanded) {
                 HorizontalDivider(color = Border)
                 Column(modifier = Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("${session.id} · ${session.workingDir}", style = MaterialTheme.typography.bodySmall, color = TextMuted)
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         StatusChip(label = projectedStatusLabel(session), tint = statusTint(session))
                         StatusChip(label = session.provider ?: "claude", tint = providerTint(session.provider))
@@ -1362,40 +1361,41 @@ private fun SessionRow(
                             )
                         }
                     }
-                    Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
+                    var actionsExpanded by remember { mutableStateOf(false) }
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (attachSupported) ActionPill(label = "Open terminal", icon = Icons.Rounded.Terminal, onClick = onOpenAttach, tint = Emerald)
                         ActionPill(label = "Clone", icon = Icons.Rounded.ContentCopy, onClick = onClone)
-                        if (attachSupported) {
-                            ActionPill(label = "Attach", icon = Icons.Rounded.Terminal, onClick = onOpenAttach)
-                            ActionPill(label = "Copy", icon = Icons.Rounded.ContentCopy, onClick = onCopyAttach)
+                        Box {
+                            IconButton(onClick = { actionsExpanded = true }) { Icon(Icons.Rounded.MoreVert, "Agent actions", tint = TextSecondary) }
+                            DropdownMenu(actionsExpanded, { actionsExpanded = false }) {
+                                if (attachSupported) DropdownMenuItem(text = { Text("Copy attach command") }, onClick = { actionsExpanded = false; onCopyAttach() })
+                                if (telegramLink(session) != null) DropdownMenuItem(text = { Text("Open in Telegram") }, onClick = { actionsExpanded = false; onOpenTelegram() })
+                                DropdownMenuItem(text = { Text("Retire session", color = Rose) }, onClick = { actionsExpanded = false; onKill() })
+                            }
                         }
-                        if (telegramLink(session) != null) {
-                            ActionPill(label = "TG", icon = Icons.AutoMirrored.Rounded.OpenInNew, onClick = onOpenTelegram, tint = Cyan)
+                    }
+                    AgentWorkSections(session)
+                    if (hasSummary || whatState?.status?.let { it != "idle" } == true) {
+                        AgentDisclosure("Summary", "Read the agent’s progress") {
+                            whatState?.let { WhatSummarySection(it, onUpdateWhat, onRegenerateWhat) }
                         }
-                        if (!hasSummary) {
-                            ActionPill(label = "What?", icon = Icons.Rounded.QuestionAnswer, onClick = onWhat, tint = Violet)
+                    } else {
+                        TextButton(onClick = onWhat) { Text("Summarize progress") }
+                    }
+                    val activity = detail?.actionLines.orEmpty().filterNot { it == "-" || it.startsWith("n/a") }
+                    if (activity.isNotEmpty()) AgentDisclosure("Recent activity", "${activity.size} recent actions") {
+                        activity.forEach { ActivityDetail(it, null, TextSecondary) }
+                    }
+                    AgentDisclosure("Session details", listOfNotNull(session.model, session.reasoningEffort?.let { "$it effort" }).joinToString(" · ").ifBlank { session.provider ?: "Claude" }) {
+                        ActivityDetail("Workspace", session.workingDir, TextSecondary)
+                        ActivityDetail("Session ID", session.id, TextMuted)
+                        session.pendingAdoptionProposals.filter { (it.status ?: "pending") == "pending" }.forEach {
+                            ActivityDetail("Adoption request", "From ${it.proposerName ?: it.proposerSessionId ?: "another agent"}", Violet)
                         }
-                        ActionPill(label = RETIRE_SESSION_ACTION_LABEL, icon = Icons.Rounded.UnfoldLess, onClick = onKill, tint = Rose)
+                        detail?.lastError?.let { ActivityDetail("Attention needed", it, Rose) }
                     }
-                    obligationDetails(session).forEach { line ->
-                        Text(line, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
-                    }
-                    whatState?.takeIf { it.entries.isNotEmpty() || it.status != "idle" }?.let { summary ->
-                        WhatSummarySection(
-                            state = summary,
-                            onUpdate = onUpdateWhat,
-                            onRegenerate = onRegenerateWhat,
-                        )
-                    }
-                    detailLines(session, detail, hasSummary).forEach { line ->
-                        Text(
-                            text = line,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                            fontFamily = FontFamily.Monospace,
-                        )
+                    AgentDisclosure("Terminal preview", "View recent output") {
+                        Text(detail?.tailLines?.joinToString("\n") ?: "Loading output…", style = MaterialTheme.typography.bodySmall, color = TextSecondary, fontFamily = FontFamily.Monospace)
                     }
                     if (session.mobileTerminal?.supported == false && session.termuxAttach?.supported != true) {
                         StatusChip(label = session.mobileTerminal.reason ?: "mobile attach unavailable", tint = TextMuted)
@@ -1405,6 +1405,71 @@ private fun SessionRow(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun AgentDisclosure(title: String, subtitle: String, content: @Composable () -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Surface(color = Panel, shape = RoundedCornerShape(12.dp)) {
+        Column {
+            Row(Modifier.fillMaxWidth().clickable { open = !open }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(title, style = MaterialTheme.typography.titleSmall, color = TextSecondary)
+                    Text(subtitle, style = MaterialTheme.typography.bodySmall, color = TextMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                Icon(if (open) Icons.Rounded.UnfoldLess else Icons.Rounded.UnfoldMore, if (open) "Hide $title" else "Show $title", tint = TextMuted)
+            }
+            if (open) Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) { content() }
+        }
+    }
+}
+
+@Composable
+private fun ActivityDetail(title: String, detail: String?, tint: Color) {
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Box(Modifier.padding(top = 6.dp).size(6.dp).background(tint, CircleShape))
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(title, style = MaterialTheme.typography.bodyMedium, color = tint)
+            detail?.takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextMuted) }
+        }
+    }
+}
+
+@Composable
+private fun AgentWorkSections(session: ClientSession) {
+    val waiting = session.obligations?.waitingOn.orEmpty()
+    val activeJobs = session.jobs.filter { it.state in listOf("pending", "running") }
+    if (waiting.isNotEmpty() || activeJobs.isNotEmpty()) {
+        Surface(color = Cyan.copy(alpha = 0.06f), shape = RoundedCornerShape(12.dp)) {
+            Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(if (isWaitingForResult(session)) "Waiting for results" else "In progress", style = MaterialTheme.typography.titleSmall, color = Cyan)
+                activeJobs.take(2).forEach { job ->
+                    ActivityDetail(job.label, jobSummary(job).removePrefix("${job.label} · "), if (job.state == "running") Emerald else Amber)
+                }
+                if (activeJobs.size > 2 || activeJobs.any { it.holding?.detail != null }) {
+                    AgentDisclosure(if (activeJobs.size > 2) "All ${activeJobs.size} jobs" else "Queue details", "${activeJobs.count { it.state == "running" }} running · ${activeJobs.count { it.state == "pending" }} queued") {
+                        activeJobs.forEach { job ->
+                            ActivityDetail(job.label, listOfNotNull(jobSummary(job).removePrefix("${job.label} · "), job.holding?.detail).distinct().joinToString("\n"), if (job.state == "running") Emerald else Amber)
+                        }
+                    }
+                }
+                waiting.filter { it.kind != "queue_job" || activeJobs.isEmpty() }.forEach { wait ->
+                    ActivityDetail(wait.label, "${wait.state.replace('_', ' ')} · ${ageFromIso(wait.since)}", Cyan)
+                    if (wait.lastError != null || wait.lastPolledAt != null) AgentDisclosure("Check details", wait.lastPolledAt?.let { "Last checked ${ageFromIso(it)} ago" } ?: "Check needs attention") {
+                        Text(wait.lastError ?: "Waiting for the next result.", style = MaterialTheme.typography.bodySmall, color = if (wait.lastError != null) Amber else TextSecondary)
+                    }
+                }
+            }
+        }
+    }
+    val history = session.obligations?.reviewHistory.orEmpty()
+    val finished = session.jobs.filter { it.state !in listOf("pending", "running") }
+    if (history.isNotEmpty() || finished.isNotEmpty()) AgentDisclosure("History", "${history.size} pull requests · ${finished.size} finished jobs") {
+        history.forEach { review ->
+            ActivityDetail("${review.repo.substringAfterLast('/')} #${review.prNumber}", "${review.landedCount} reviews received · ${review.landedRequestedByAgent} of ${review.requestedByAgent} requested by this agent received", Violet)
+        }
+        finished.forEach { job -> ActivityDetail(job.label, jobSummary(job).removePrefix("${job.label} · "), if (job.exitCode == null || job.exitCode == 0) TextSecondary else Rose) }
     }
 }
 
