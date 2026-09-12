@@ -9687,8 +9687,9 @@ fn codex_fork_event_starts_work(event: &Map<String, Value>, root_thread_id: Opti
         // A fresh item is new work, unlike a late completion or output delta.
         // It also repairs persisted idle state when the turn-start event was
         // outside the bounded event tail or an older reducer ended the turn early.
-        "item_started" => root_thread_id
-            .is_none_or(|root| codex_fork_event_thread_id(event).as_deref() == Some(root)),
+        "item_started" => {
+            root_thread_id.is_none_or(|root| codex_fork_event_confirms_root_identity(event, root))
+        }
         "turn_started" => true,
         "thread_status_changed" => codex_fork_thread_status(event) == Some("running"),
         _ => false,
@@ -9749,8 +9750,22 @@ fn codex_fork_restore_status_confirms_root(
         return false;
     }
 
+    codex_fork_event_confirms_root_identity(event, expected_provider_resume_id)
+}
+
+/// Require at least one root identity and reject every explicit conflicting alias.
+fn codex_fork_event_confirms_root_identity(
+    event: &Map<String, Value>,
+    expected_provider_resume_id: &str,
+) -> bool {
     let payload = codex_fork_payload(event);
+    let thread = payload
+        .and_then(|payload| payload.get("thread"))
+        .and_then(Value::as_object);
     let identities = [
+        thread.and_then(|thread| thread.get("id").and_then(non_unknown_json_text)),
+        thread.and_then(|thread| thread.get("thread_id").and_then(non_unknown_json_text)),
+        thread.and_then(|thread| thread.get("session_id").and_then(non_unknown_json_text)),
         payload.and_then(|payload| payload.get("threadId").and_then(non_unknown_json_text)),
         payload.and_then(|payload| payload.get("thread_id").and_then(non_unknown_json_text)),
         payload.and_then(|payload| payload.get("session_id").and_then(non_unknown_json_text)),
@@ -22721,6 +22736,20 @@ sleep 30
             store.get_session("codex001").unwrap().unwrap().status,
             "idle"
         );
+        for event in [
+            r#"{"event_type":"item/started","session_id":"child-thread","payload":{"threadId":"root-thread","item":{"type":"reasoning"}}}"#,
+            r#"{"event_type":"item/started","payload":{"threadId":"root-thread","thread_id":"child-thread","item":{"type":"reasoning"}}}"#,
+            r#"{"event_type":"item/started","payload":{"threadId":"root-thread","thread":{"id":"child-thread"},"item":{"type":"reasoning"}}}"#,
+        ] {
+            store
+                .apply_codex_fork_event_line("codex001", event)
+                .unwrap();
+            assert_eq!(
+                store.get_session("codex001").unwrap().unwrap().status,
+                "idle",
+                "{event}"
+            );
+        }
         store
             .apply_codex_fork_event_line(
                 "codex001",

@@ -16067,6 +16067,25 @@ mod tests {
             ),
             Some("idle")
         );
+        // Conflicting envelope, alias, and nested identities cannot revive the root.
+        for event in [
+            r#"{"event_type":"item/started","session_id":"child-thread","payload":{"threadId":"root-thread","item":{"type":"reasoning"}}}"#,
+            r#"{"event_type":"item/started","payload":{"threadId":"root-thread","thread_id":"child-thread","item":{"type":"reasoning"}}}"#,
+            r#"{"event_type":"item/started","payload":{"threadId":"root-thread","thread":{"id":"child-thread"},"item":{"type":"reasoning"}}}"#,
+        ] {
+            events.extend_from_slice(event.as_bytes());
+            events.push(b'\n');
+            fs::write(&event_stream, &events).unwrap();
+            assert_eq!(
+                codex_fork_event_stream_activity_from_path_with_seed(
+                    event_stream.clone(),
+                    "root-thread",
+                    "idle"
+                ),
+                Some("idle"),
+                "{event}"
+            );
+        }
         // Fresh root work heals stale persisted idle state without a turn-start event.
         events.extend_from_slice(b"{\"event_type\":\"item/started\",\"payload\":{\"threadId\":\"root-thread\",\"item\":{\"type\":\"reasoning\"}}}\n");
         fs::write(&event_stream, &events).unwrap();
