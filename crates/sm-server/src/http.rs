@@ -119,7 +119,7 @@ use crate::runtime::{CodexModelValidationError, InitialBriefDeliveryError, TmuxR
 #[cfg(test)]
 use crate::sessions::codex_fork_legacy_event_stream_path_from_log_file;
 use crate::sessions::{
-    claude_hook_gate, codex_fork_event_line_matches_root_thread, codex_fork_event_line_starts_turn,
+    claude_hook_gate, codex_fork_event_line_matches_root_thread, codex_fork_event_line_starts_work,
     codex_fork_newest_event_stream_path, codex_fork_status_for_event_line, expand_home,
     is_primary_node, submit_codex_fork_btw, AcceptSpawnBriefRequest, AgentRegistrationResponse,
     AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest, ChildSessionResponse,
@@ -11006,7 +11006,7 @@ fn codex_fork_event_stream_signal_from_path(
                 && latest_activity
                     .as_ref()
                     .is_some_and(|signal| matches!(signal.activity, "idle" | "stopped"))
-                && !codex_fork_event_line_starts_turn(line)
+                && !codex_fork_event_line_starts_work(line)
             {
                 continue;
             }
@@ -15863,6 +15863,23 @@ mod tests {
     }
 
     #[test]
+    fn codex_fork_event_stream_commentary_does_not_end_active_turn() {
+        let dir = env::temp_dir().join(format!("sm-commentary-{}", random_urlsafe_token(8)));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.jsonl");
+        fs::write(&path, concat!(
+                "{\"event_type\":\"turn_started\",\"payload\":{}}\n",
+                "{\"event_type\":\"item/completed\",\"payload\":{\"item\":{\"type\":\"agentMessage\",\"phase\":\"commentary\"}}}\n",
+                "{\"event_type\":\"item/started\",\"payload\":{\"item\":{\"type\":\"commandExecution\"}}}\n"
+            )).unwrap();
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path(path),
+            Some("working")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn codex_fork_event_stream_activity_treats_completed_agent_message_as_idle() {
         let dir = env::temp_dir().join(format!(
             "sm-rust-codex-agent-message-idle-{}-{}",
@@ -16007,26 +16024,44 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let event_stream = dir.join("events.jsonl");
         let mut events = concat!(
-            "{\"event_type\":\"thread/status/changed\",\"session_id\":\"root-thread\",\"payload\":{\"threadId\":\"root-thread\",\"status\":{\"type\":\"idle\"}}}\n"
-        )
-        .as_bytes()
-        .to_vec();
+                "{\"event_type\":\"thread/status/changed\",\"session_id\":\"root-thread\",\"payload\":{\"threadId\":\"root-thread\",\"status\":{\"type\":\"idle\"}}}\n"
+            )
+            .as_bytes()
+            .to_vec();
         events.extend(std::iter::repeat_n(
             b'x',
             CODEX_FORK_ACTIVITY_EVENT_TAIL_BYTES as usize + 1024,
         ));
         events.extend_from_slice(
-            b"\n{\"event_type\":\"item/completed\",\"session_id\":\"root-thread\",\"payload\":{\"threadId\":\"root-thread\",\"item\":{\"type\":\"commandExecution\",\"status\":\"completed\"}}}\n",
-        );
-        fs::write(&event_stream, events).unwrap();
+                b"\n{\"event_type\":\"item/completed\",\"session_id\":\"root-thread\",\"payload\":{\"threadId\":\"root-thread\",\"item\":{\"type\":\"commandExecution\",\"status\":\"completed\"}}}\n",
+            );
+        fs::write(&event_stream, &events).unwrap();
 
         assert_eq!(
             codex_fork_event_stream_activity_from_path_with_seed(
-                event_stream,
+                event_stream.clone(),
                 "root-thread",
                 "idle"
             ),
             Some("idle")
+        );
+        // A child starting work must not revive an idle root.
+        events.extend_from_slice(b"\n{\"event_type\":\"item/started\",\"payload\":{\"threadId\":\"child-thread\",\"item\":{\"type\":\"reasoning\"}}}\n");
+        fs::write(&event_stream, &events).unwrap();
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path_with_seed(
+                event_stream.clone(),
+                "root-thread",
+                "idle"
+            ),
+            Some("idle")
+        );
+        // Fresh root work heals stale persisted idle state without a turn-start event.
+        events.extend_from_slice(b"{\"event_type\":\"item/started\",\"payload\":{\"threadId\":\"root-thread\",\"item\":{\"type\":\"reasoning\"}}}\n");
+        fs::write(&event_stream, &events).unwrap();
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path_with_seed(event_stream, "root-thread", "idle"),
+            Some("working")
         );
     }
 

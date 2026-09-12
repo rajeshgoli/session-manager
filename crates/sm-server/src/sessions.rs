@@ -8900,7 +8900,7 @@ impl SessionStore {
             codex_fork_event_matches_root_thread(event, root_provider_resume_id.as_deref())
                 && (status != "idle"
                     || *next_status != "running"
-                    || codex_fork_event_starts_turn(event))
+                    || codex_fork_event_starts_work(event))
         }) {
             if status != next_status {
                 session.insert("status".to_owned(), Value::String(next_status.to_owned()));
@@ -9588,11 +9588,11 @@ pub(crate) fn codex_fork_status_for_event_line(line: &str) -> Option<&'static st
     codex_fork_status_for_event(event)
 }
 
-pub(crate) fn codex_fork_event_line_starts_turn(line: &str) -> bool {
+pub(crate) fn codex_fork_event_line_starts_work(line: &str) -> bool {
     let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
         return false;
     };
-    event.as_object().is_some_and(codex_fork_event_starts_turn)
+    event.as_object().is_some_and(codex_fork_event_starts_work)
 }
 
 pub(crate) fn codex_fork_event_line_matches_root_thread(
@@ -9675,14 +9675,17 @@ fn codex_fork_event_ends_session(event: &Map<String, Value>) -> bool {
     )
 }
 
-fn codex_fork_event_starts_turn(event: &Map<String, Value>) -> bool {
+fn codex_fork_event_starts_work(event: &Map<String, Value>) -> bool {
     let Some(event_type) = codex_fork_event_type(event)
         .map(|value| normalize_codex_fork_event_type(&value.replace('/', "_")))
     else {
         return false;
     };
     match event_type.as_str() {
-        "turn_started" => true,
+        // A fresh item is new work, unlike a late completion or output delta.
+        // It also repairs persisted idle state when the turn-start event was
+        // outside the bounded event tail or an older reducer ended the turn early.
+        "turn_started" | "item_started" => true,
         "thread_status_changed" => codex_fork_thread_status(event) == Some("running"),
         _ => false,
     }
@@ -9841,7 +9844,14 @@ fn codex_fork_item_completed_status(event: &Map<String, Value>) -> Option<&'stat
         .map(str::to_ascii_lowercase);
 
     match item_type.as_deref() {
-        Some("agentmessage" | "agent_message" | "message") => Some("idle"),
+        Some("agentmessage" | "agent_message" | "message") => {
+            // Commentary is a progress update inside a turn, not its final answer.
+            if item.get("phase").and_then(Value::as_str) == Some("commentary") {
+                Some("running")
+            } else {
+                Some("idle")
+            }
+        }
         Some(_) => Some("running"),
         None => Some("running"),
     }
@@ -22659,8 +22669,8 @@ sleep 30
         assert_eq!(codex_fork_status_for_event_line(active), Some("running"));
         assert_eq!(codex_fork_status_for_event_line(idle), Some("idle"));
         assert_eq!(codex_fork_status_for_event_line(unknown), None);
-        assert!(codex_fork_event_line_starts_turn(active));
-        assert!(!codex_fork_event_line_starts_turn(idle));
+        assert!(codex_fork_event_line_starts_work(active));
+        assert!(!codex_fork_event_line_starts_work(idle));
     }
 
     #[test]
@@ -22699,7 +22709,7 @@ sleep 30
         store
             .apply_codex_fork_event_line(
                 "codex001",
-                r#"{"event_type":"turn_started","payload":{}}"#,
+                r#"{"event_type":"item/started","payload":{"item":{"type":"reasoning"}}}"#,
             )
             .unwrap();
         assert_eq!(
@@ -22709,7 +22719,7 @@ sleep 30
     }
 
     #[test]
-    fn codex_fork_descendant_idle_does_not_stop_active_root_turn() {
+    fn codex_fork_commentary_and_descendant_idle_do_not_stop_active_root_turn() {
         let state_file = unique_temp_path("codex-descendant-idle");
         fs::write(
             &state_file,
@@ -22734,6 +22744,17 @@ sleep 30
         store
             .apply_codex_fork_event_line(
                 "codex001",
+                r#"{"event_type":"item/completed","payload":{"threadId":"root-thread","item":{"type":"agentMessage","phase":"commentary"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().status,
+            "running"
+        );
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
                 r#"{"event_type":"thread/status/changed","session_id":"child-thread","payload":{"threadId":"child-thread","status":{"type":"idle"}}}"#,
             )
             .unwrap();
@@ -22752,6 +22773,14 @@ sleep 30
             store.get_session("codex001").unwrap().unwrap().status,
             "idle"
         );
+    }
+
+    #[test]
+    fn codex_fork_completed_commentary_keeps_turn_running() {
+        let event = r#"{"event_type":"item/completed","payload":{"item":{"type":"agentMessage","phase":"commentary"}}}"#;
+        assert_eq!(codex_fork_status_for_event_line(event), Some("running"));
+        let final_event = r#"{"event_type":"item/completed","payload":{"item":{"type":"agentMessage","phase":"final_answer"}}}"#;
+        assert_eq!(codex_fork_status_for_event_line(final_event), Some("idle"));
     }
 
     #[test]

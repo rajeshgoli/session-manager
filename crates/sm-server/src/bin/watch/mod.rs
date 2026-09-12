@@ -1033,7 +1033,7 @@ impl View {
         };
         rows.push(Row {
             text: format!(
-                "{prefix}{} {:20} {:8} {:10} {:5} {:10} {:8} {:8} {}",
+                "{prefix}{} {:20} {:8} {:10} {:5} {:10} {:8} {:8}",
                 if state == "waiting" { "◷ " } else { "+-" },
                 clipped(name(v), 20),
                 id,
@@ -1041,8 +1041,7 @@ impl View {
                 age(s(v, "last_activity"), now),
                 s(v, "provider"),
                 s(v, "role"),
-                s(v, "node"),
-                s(v, "status")
+                s(v, "node")
             ),
             target: Some(Target::Session(id.into())),
             style: match state {
@@ -1315,7 +1314,7 @@ fn key() -> Result<Key> {
     if !readable(100) {
         return Ok(Key::None);
     }
-    let Some(mut byte) = read_byte()? else {
+    let Some(byte) = read_byte()? else {
         return Ok(Key::Esc);
     };
     Ok(match byte {
@@ -1326,27 +1325,7 @@ fn key() -> Result<Key> {
         9 => Key::Tab,
         10 | 13 => Key::Enter,
         127 | 8 => Key::Backspace,
-        27 => {
-            let mut seq = Vec::new();
-            while seq.len() < 8 && readable(20) {
-                let Some(next) = read_byte()? else {
-                    break;
-                };
-                byte = next;
-                seq.push(byte);
-                if byte.is_ascii_alphabetic() || byte == b'~' {
-                    break;
-                }
-            }
-            match seq.as_slice() {
-                b"[A" => Key::Up,
-                b"[B" => Key::Down,
-                b"[5~" => Key::PageUp,
-                b"[6~" => Key::PageDown,
-                b"[F" | b"OF" | b"[4~" => Key::End,
-                _ => Key::Esc,
-            }
-        }
+        27 => escape_key(|| if readable(20) { read_byte() } else { Ok(None) })?,
         b if b < 128 => Key::Char(b as char),
         b => {
             let n = if b < 224 {
@@ -1375,6 +1354,35 @@ fn key() -> Result<Key> {
         }
     })
 }
+/// Decode CSI and application-cursor (SS3) keys without treating unknown keys as quit.
+fn escape_key(mut next: impl FnMut() -> Result<Option<u8>>) -> Result<Key> {
+    let Some(prefix) = next()? else {
+        return Ok(Key::Esc);
+    };
+    if !matches!(prefix, b'[' | b'O') {
+        return Ok(Key::None);
+    }
+    let mut seq = vec![prefix];
+    // The introducer O is not a final byte; SS3 arrows still have a byte after it.
+    while seq.len() < 32 {
+        let Some(byte) = next()? else {
+            return Ok(Key::None);
+        };
+        seq.push(byte);
+        if (0x40..=0x7e).contains(&byte) {
+            break;
+        }
+    }
+    Ok(match seq.as_slice() {
+        b"[A" | b"OA" => Key::Up,
+        b"[B" | b"OB" => Key::Down,
+        b"[5~" => Key::PageUp,
+        b"[6~" => Key::PageDown,
+        b"[F" | b"OF" | b"[4~" => Key::End,
+        _ => Key::None,
+    })
+}
+
 /// Do not use buffered Stdin with poll: it can swallow the rest of a key burst.
 fn read_byte() -> Result<Option<u8>> {
     let mut byte = 0u8;
@@ -1519,8 +1527,7 @@ fn frame(
     lines[1] = if jobs {
         "Job                         Type       State    Age   Agent / ID".into()
     } else {
-        "Session                  ID       Activity   Age   Provider   Role     Node     Status"
-            .into()
+        "Session                  ID       Activity   Age   Provider   Role     Node".into()
     };
     let available = h.saturating_sub(4);
     let list_height = if jobs {

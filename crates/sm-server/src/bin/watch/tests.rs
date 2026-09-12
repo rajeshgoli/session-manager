@@ -793,3 +793,56 @@ fn recent_output_uses_rendered_screen_instead_of_raw_terminal_recording() {
     assert!(!text.contains("2026l"));
     peer.join().unwrap();
 }
+
+#[test]
+fn escape_keys_support_normal_and_application_cursor_modes() {
+    for (sequence, expected) in [
+        (b"[A".as_slice(), Key::Up),
+        (b"OA".as_slice(), Key::Up),
+        (b"[B".as_slice(), Key::Down),
+        (b"OB".as_slice(), Key::Down),
+        (b"[5~".as_slice(), Key::PageUp),
+        (b"[6~".as_slice(), Key::PageDown),
+        (b"[F".as_slice(), Key::End),
+        (b"OF".as_slice(), Key::End),
+        (b"[4~".as_slice(), Key::End),
+        (b"".as_slice(), Key::Esc),
+        (b"[C".as_slice(), Key::None),
+        (b"OD".as_slice(), Key::None),
+        (b"[1;2B".as_slice(), Key::None),
+        (b"[".as_slice(), Key::None),
+        (b"O".as_slice(), Key::None),
+    ] {
+        let mut bytes = sequence.iter().copied();
+        assert_eq!(escape_key(|| Ok(bytes.next())).unwrap(), expected);
+        assert_eq!(bytes.next(), None, "must consume the entire sequence");
+    }
+}
+
+#[test]
+fn escape_key_stops_before_the_next_key_in_a_burst() {
+    let mut bytes = b"OBj".iter().copied();
+    assert_eq!(escape_key(|| Ok(bytes.next())).unwrap(), Key::Down);
+    assert_eq!(bytes.next(), Some(b'j'));
+}
+
+#[test]
+fn active_row_does_not_display_stale_idle_lifecycle_status() {
+    let a = args();
+    let mut view = View::new(&a);
+    let mut agent = session("agent", "", "/repo");
+    agent["status"] = json!("idle");
+    agent["activity_state"] = json!("working");
+    let snap = Snapshot {
+        sessions: vec![agent],
+        ..Snapshot::default()
+    };
+    let rows = view.rows(&snap, &a, 0);
+    let row = rows
+        .iter()
+        .find(|row| row.target == Some(Target::Session("agent".into())))
+        .unwrap();
+    assert!(row.text.contains("working"));
+    assert!(!row.text.contains("idle"));
+    assert_eq!(row.style, "\x1b[32m");
+}
