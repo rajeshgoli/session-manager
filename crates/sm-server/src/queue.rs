@@ -3055,11 +3055,16 @@ fn admit_pending_queue_jobs_conn(
     };
     loop {
         let jobs = list_queue_job_runtime_records_conn(conn)?;
+        if expire_pending_queue_jobs_conn(conn, &jobs, message_queue_db_path, admission_policy)? > 0
+        {
+            continue;
+        }
         if !jobs.iter().any(|job| job.state == "pending") {
             break;
         }
         if running_queue_job_count(&jobs, Some("perf")) > 0 {
-            summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "perf_running")?;
+            summary.held +=
+                mark_pending_queue_jobs_behind_running_perf_conn(conn, &jobs, admission_policy)?;
             break;
         }
         let ready_perf = jobs.iter().find(|job| {
@@ -3201,9 +3206,16 @@ fn expire_pending_queue_jobs_conn(
     let mut expired = 0;
     for job in jobs.iter().filter(|job| job.state == "pending") {
         if queue_job_wait_remaining_seconds(job).is_some_and(|seconds| seconds <= 0) {
+            let mut job = job.clone();
+            if job.job_type == "perf" {
+                if let Some(reason) = perf_resource_hold_reason(&job, admission_policy) {
+                    mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), reason)?;
+                    job.holding_reason = Some(reason.to_owned());
+                }
+            }
             let result = finish_queue_job_conn_with_policy(
                 conn,
-                job,
+                &job,
                 "wait_expired",
                 None,
                 Some(message_queue_db_path),
@@ -3614,6 +3626,23 @@ fn mark_pending_queue_jobs_holding_conn(
             params![reason],
         )?
     };
+    Ok(updated)
+}
+
+fn mark_pending_queue_jobs_behind_running_perf_conn(
+    conn: &Connection,
+    jobs: &[QueueJobRuntimeRecord],
+    admission_policy: QueueAdmissionPolicy,
+) -> Result<usize> {
+    let mut updated = 0;
+    for job in jobs.iter().filter(|job| job.state == "pending") {
+        let reason = if job.job_type == "perf" {
+            perf_resource_hold_reason(job, admission_policy).unwrap_or("perf_running")
+        } else {
+            "perf_running"
+        };
+        updated += mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), reason)?;
+    }
     Ok(updated)
 }
 
@@ -5553,14 +5582,14 @@ mod tests {
                 timeout_seconds: 60,
                 cpu_percent: Some(100),
                 gpu_percent: Some(0),
-                memory_bytes: Some(20 * 1024 * 1024 * 1024),
+                memory_bytes: Some(i64::MAX),
             },
             1,
         )
         .unwrap();
         let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
         conn.execute(
-            "UPDATE queue_jobs SET queued_at = '2020-01-01T00:00:00Z', holding_reason = 'memory_pressure' WHERE id = ?1",
+            "UPDATE queue_jobs SET queued_at = '2020-01-01T00:00:00Z', holding_reason = 'perf_running' WHERE id = ?1",
             params![job.id],
         )
         .unwrap();
@@ -5581,6 +5610,7 @@ mod tests {
         );
         let expired = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
         assert_eq!(expired.state, "wait_expired");
+        assert_eq!(expired.holding_reason.as_deref(), Some("memory_pressure"));
         assert!(expired.started_at.is_none());
         let notifications = RetainedQueueStore::new(message_queue_db)
             .pending_messages_for_target_by_category("notify", "queue-completion", 10)
@@ -5592,7 +5622,6 @@ mod tests {
         assert!(notifications[0]
             .text
             .contains("wait_reason=memory_pressure"));
-        assert!(notifications[0].text.contains("required=32.0 GiB"));
         assert!(notifications[0].text.contains("safety_reserve=12.0 GiB"));
         drop(conn);
         fs::remove_dir_all(state_dir).unwrap();
