@@ -205,6 +205,7 @@ fun projectedStatusLabel(session: ClientSession): String {
     val activity = activityLabel(rawActivity)
     return when {
         session.status == "stopped" -> "stopped"
+        isWaitingForResult(session) -> "waiting for result"
         isOperationallyActive(session) -> activity
         !rawActivity.isNullOrEmpty() -> activity
         session.status == "running" -> "running"
@@ -470,3 +471,59 @@ fun formatContextPercentage(value: Double?): String? {
         "$rounded%"
     }
 }
+
+fun isWaitingForResult(session: ClientSession): Boolean =
+    session.status != "stopped" && session.activityState == "idle" && !session.obligations?.waitingOn.isNullOrEmpty()
+
+fun waitingSummary(session: ClientSession): String? {
+    val waits = session.obligations?.waitingOn.orEmpty()
+    if (waits.isEmpty()) return null
+    val prefix = if (isWaitingForResult(session)) "Waiting for " else "Pending: "
+    return if (waits.size == 1) prefix + waits.first().label + " · " + ageFromIso(waits.first().since)
+    else prefix + listOf("queue_job" to "job", "review" to "review").mapNotNull { (kind, label) ->
+        val count = waits.count { it.kind == kind }
+        if (count == 0) null else "$count $label${if (count == 1) "" else "s"}"
+    }.joinToString(" and ")
+}
+
+fun jobSummary(job: li.rajeshgo.sm.data.model.SessionJob): String {
+    val context = when (job.state) {
+        "pending" -> job.holding?.summary ?: when (job.holdingReason) {
+            "awaiting_tests" -> "Tests ahead"
+            "perf_running" -> "Performance run in progress"
+            "perf_cooldown" -> "Performance cooldown"
+            "concurrency_cap" -> "Waiting for a free slot"
+            else -> job.holdingReason?.replace('_', ' ') ?: "Waiting for scheduler"
+        }
+        "running" -> job.pid?.takeIf { it > 0 }?.let { "PID $it" } ?: "Running"
+        else -> job.exitCode?.let { "Exit $it" } ?: job.state
+    }
+    return "${job.label} · ${job.state} · $context"
+}
+
+fun obligationDetails(session: ClientSession): List<String> = buildList {
+    session.jobs.forEach { job ->
+        add(jobSummary(job))
+        job.holding?.detail?.let { add(it) }
+    }
+    session.obligations?.waitingOn.orEmpty().forEach {
+        add("${it.label} · ${it.state.replace('_', ' ')} · ${ageFromIso(it.since)}")
+        it.lastPolledAt?.let { at -> add("Last checked ${ageFromIso(at)} ago") }
+        it.lastError?.let { error -> add("Review check: $error") }
+    }
+    session.obligations?.reviewHistory.orEmpty().forEach {
+        add("${it.repo} #${it.prNumber} · ${it.landedCount} reviews landed · ${it.landedRequestedByAgent}/${it.requestedByAgent} requested by this agent landed")
+    }
+}
+
+fun terminalConnectionLabel(status: String): String = when (status) {
+    "attached" -> "Connected"
+    "requesting ticket", "authenticating", "connecting" -> "Connecting…"
+    "retrying attach", "reconnecting" -> "Reconnecting…"
+    "paused" -> "Connection paused"
+    "failed", "detached" -> "Connection unavailable"
+    else -> status.replaceFirstChar { it.titlecase() }
+}
+
+fun terminalStatusAfterServerEvent(current: String, event: String): String =
+    if (event in setOf("pong", "resized")) current else event

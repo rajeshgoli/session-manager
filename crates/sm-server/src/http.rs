@@ -10437,6 +10437,8 @@ fn client_session_value(
     ))
     .unwrap_or_else(|_| json!({}));
     let attach_descriptor = attach_descriptor_payload(session.clone());
+    value["model"] = json!(session.model);
+    value["reasoning_effort"] = json!(session.reasoning_effort);
     value["attach_descriptor"] = attach_descriptor.clone();
     value["termux_attach"] = Value::Null;
     let mobile_terminal = mobile_terminal_metadata(
@@ -18510,7 +18512,12 @@ mod tests {
     #[tokio::test]
     async fn mobile_terminal_routes_advertise_supported_bridge() {
         let signing_key = SigningKey::random(&mut OsRng);
-        let app = router(AppState::new(mobile_ticket_config(&signing_key)));
+        let config = mobile_ticket_config(&signing_key);
+        let mut fixture: Value = serde_json::from_slice(&fs::read(&config.paths.state_file).unwrap()).unwrap();
+        fixture["sessions"][0]["model"] = json!("gpt-test");
+        fixture["sessions"][0]["reasoning_effort"] = json!("medium");
+        fs::write(&config.paths.state_file, serde_json::to_vec(&fixture).unwrap()).unwrap();
+        let app = router(AppState::new(config));
 
         let response = app
             .oneshot(local_request(
@@ -18523,6 +18530,8 @@ mod tests {
         let (status, body) = response_json(response).await;
         assert_eq!(status, StatusCode::OK);
         let session = &body["sessions"][0];
+        assert_eq!(session["model"], "gpt-test");
+        assert_eq!(session["reasoning_effort"], "medium");
         assert_eq!(session["mobile_terminal"]["supported"], true);
         assert_eq!(session["mobile_terminal"]["transport"], "sm-https-tmux");
         assert_eq!(

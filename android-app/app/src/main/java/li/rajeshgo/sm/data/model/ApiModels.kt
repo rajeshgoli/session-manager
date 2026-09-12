@@ -197,6 +197,10 @@ data class ClientSession(
     @SerialName("tmux_session")
     val tmuxSession: String,
     val provider: String? = null,
+    val model: String? = null,
+    @SerialName("reasoning_effort") val reasoningEffort: String? = null,
+    val obligations: SessionObligations? = null,
+    val jobs: List<SessionJob> = emptyList(),
     @SerialName("friendly_name")
     val friendlyName: String? = null,
     @SerialName("telegram_chat_id")
@@ -549,4 +553,68 @@ data class AnalyticsTotals(
     val tokensLive: Int = 0,
     @SerialName("track_reminders_24h")
     val trackReminders24h: Int = 0,
+)
+
+@Serializable
+data class CreateSessionRequest(
+    val provider: String,
+    @SerialName("working_dir") val workingDir: String,
+    val model: String? = null,
+    @SerialName("reasoning_effort") val reasoningEffort: String?,
+    val name: String? = null,
+    @SerialName("initial_message") val initialMessage: String? = null,
+)
+
+@Serializable
+data class CreatedSession(val id: String)
+
+@Serializable
+data class SessionObligationsResponse(val sessions: List<SessionObligations> = emptyList())
+
+@Serializable
+data class SessionObligations(
+    @SerialName("session_id") val sessionId: String,
+    @SerialName("waiting_on") val waitingOn: List<WaitingObligation> = emptyList(),
+    @SerialName("review_history") val reviewHistory: List<ReviewHistory> = emptyList(),
+)
+
+@Serializable
+data class WaitingObligation(
+    val kind: String = "",
+    val label: String = "",
+    val state: String = "",
+    val since: String? = null,
+    @SerialName("last_polled_at") val lastPolledAt: String? = null,
+    @SerialName("last_error") val lastError: String? = null,
+)
+
+@Serializable
+data class ReviewHistory(
+    val repo: String = "",
+    @SerialName("pr_number") val prNumber: Long = 0,
+    @SerialName("landed_count") val landedCount: Int = 0,
+    @SerialName("requested_by_agent") val requestedByAgent: Int = 0,
+    @SerialName("landed_requested_by_agent") val landedRequestedByAgent: Int = 0,
+)
+
+@Serializable
+data class SessionJobsResponse(val jobs: List<SessionJob> = emptyList())
+
+@Serializable
+data class JobHolding(val summary: String? = null, val detail: String? = null)
+
+@Serializable
+data class SessionJob(
+    val id: String,
+    val label: String = "",
+    val state: String = "",
+    val pid: Long? = null,
+    @SerialName("requester_session_id") val requesterSessionId: String? = null,
+    @SerialName("notify_session_id") val notifySessionId: String? = null,
+    @SerialName("holding_reason") val holdingReason: String? = null,
+    val holding: JobHolding? = null,
+    @SerialName("queued_at") val queuedAt: String? = null,
+    @SerialName("started_at") val startedAt: String? = null,
+    @SerialName("finished_at") val finishedAt: String? = null,
+    @SerialName("exit_code") val exitCode: Int? = null,
 )

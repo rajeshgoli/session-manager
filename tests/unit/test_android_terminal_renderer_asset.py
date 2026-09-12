@@ -100,3 +100,10 @@ def test_terminal_webview_converts_compose_drag_coordinates_to_css_pixels():
     assert "val cssX = change.position.x / density" in source
     assert "val cssY = change.position.y / density" in source
     assert "\"window.smScrollPixels($cssDelta, $cssX, $cssY);\"" in source
+
+
+def test_terminal_updates_do_not_steal_composer_focus():
+    source = TERMINAL_ASSET.read_text()
+    fit = source.split("function fitAndReport()", 1)[1].split("function terminalViewport", 1)[0]
+    assert "term.focus()" not in fit
+    assert "window.smFocus();" not in WATCH_SCREEN.read_text()

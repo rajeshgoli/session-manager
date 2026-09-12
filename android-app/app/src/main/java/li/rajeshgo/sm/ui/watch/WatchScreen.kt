@@ -1,5 +1,13 @@
 package li.rajeshgo.sm.ui.watch
 
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.runtime.key
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
 import android.annotation.SuppressLint
 import android.os.Handler
 import android.os.Looper
@@ -130,6 +138,11 @@ fun WatchScreen(
 ) {
     val state by viewModel.uiState.collectAsState()
     val updateState by updateViewModel.uiState.collectAsState()
+    var showConnectionTools by remember { mutableStateOf(false) }
+    var creating by remember { mutableStateOf(false) }
+    var cloneSource by remember { mutableStateOf<ClientSession?>(null) }
+    var createBusy by remember { mutableStateOf(false) }
+    var createError by remember { mutableStateOf<String?>(null) }
     var query by remember { mutableStateOf("") }
     var filter by remember { mutableStateOf("all") }
     var toast by remember { mutableStateOf<String?>(null) }
@@ -163,7 +176,9 @@ fun WatchScreen(
     }
 
     androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, _ ->
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) viewModel.setTerminalForeground(false)
+            if (event == Lifecycle.Event.ON_START) viewModel.setTerminalForeground(true)
             isResumed = lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -197,7 +212,9 @@ fun WatchScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background),
+            .background(MaterialTheme.colorScheme.background)
+            .statusBarsPadding()
+            .navigationBarsPadding(),
     ) {
         if (state.loading) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -235,6 +252,23 @@ fun WatchScreen(
             }
 
             item {
+                Button(onClick = { cloneSource = null; createError = null; creating = true }, modifier = Modifier.fillMaxWidth(), enabled = state.userEmail.isNotBlank()) { Text("New session") }
+            }
+            item {
+                SessionFilters(
+                    sessions = state.sessions,
+                    query = query,
+                    filter = filter,
+                    onQueryChange = { query = it },
+                    onFilterChange = { filter = it },
+                )
+            }
+            item {
+                TextButton(onClick = { showConnectionTools = !showConnectionTools }) {
+                    Text("Studio SSH · ${if (state.studioSshEnabled) "On" else "Off"}")
+                }
+            }
+            if (showConnectionTools) item {
                 StudioSshToggleCard(
                     enabled = state.studioSshEnabled,
                     status = state.studioSshStatus,
@@ -275,7 +309,7 @@ fun WatchScreen(
             } else {
                 activeSections.forEach { section ->
                     item(key = "repo-${section.repoKey}") {
-                        RepoHeader(title = "${section.repoLabel} (${section.repoKey})")
+                        RepoHeader(title = "${section.repoLabel.removeSuffix("/")} · Active")
                     }
                     items(section.roots, key = { "active-${it.session.id}" }) { root ->
                         WatchTree(
@@ -288,6 +322,7 @@ fun WatchScreen(
                             whatById = state.whatBySessionId,
                             onToggleExpanded = { viewModel.toggleExpanded(it) },
                             onOpenAttach = openAttach,
+                            onClone = { cloneSource = it; createError = null; creating = true },
                             onCopyAttach = { session ->
                                 val command = session.termuxAttach?.let(::termuxAttachCommand)
                                 if (command == null) {
@@ -325,7 +360,7 @@ fun WatchScreen(
                 }
                 idleSections.forEach { section ->
                     item(key = "idle-repo-${section.repoKey}") {
-                        RepoHeader(title = "${section.repoLabel} (${section.repoKey})")
+                        RepoHeader(title = "${section.repoLabel.removeSuffix("/")} · Idle")
                     }
                     items(section.roots, key = { "idle-${it.session.id}" }) { root ->
                         WatchTree(
@@ -338,6 +373,7 @@ fun WatchScreen(
                             whatById = state.whatBySessionId,
                             onToggleExpanded = { viewModel.toggleExpanded(it) },
                             onOpenAttach = openAttach,
+                            onClone = { cloneSource = it; createError = null; creating = true },
                             onCopyAttach = { session ->
                                 val command = session.termuxAttach?.let(::termuxAttachCommand)
                                 if (command == null) {
@@ -375,15 +411,7 @@ fun WatchScreen(
                 }
             }
 
-            item {
-                FooterControls(
-                    sessions = state.sessions,
-                    query = query,
-                    filter = filter,
-                    onQueryChange = { query = it },
-                    onFilterChange = { filter = it },
-                )
-            }
+
         }
 
         Box(
@@ -416,6 +444,17 @@ fun WatchScreen(
             }
         }
 
+        if (creating) {
+            CreateSessionSheet(cloneSource, state.sessions, createBusy, createError, onDismiss = { creating = false }) { request ->
+                createBusy = true
+                createError = null
+                viewModel.createSession(request) { result ->
+                    createBusy = false
+                    result.onSuccess { creating = false; toast = it }
+                    result.onFailure { createError = it.message ?: "Could not create session" }
+                }
+            }
+        }
         state.terminal?.let { terminal ->
             MobileTerminalOverlay(
                 terminal = terminal,
@@ -432,6 +471,7 @@ fun WatchScreen(
                 onRendererError = viewModel::markTerminalRendererError,
                 onRendererWritten = viewModel::markTerminalRendererWritten,
                 onDetach = viewModel::detachTerminal,
+                onReconnect = viewModel::reconnectTerminal,
                 onCopy = { selectedText ->
                     val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
                     val copiedText = selectedText.ifBlank { terminal.copyBuffer }
@@ -459,9 +499,11 @@ private fun MobileTerminalOverlay(
     onRendererError: (String) -> Unit,
     onRendererWritten: (sequence: Long, bytes: Int) -> Unit,
     onDetach: () -> Unit,
+    onReconnect: () -> Unit,
     onCopy: (String) -> Unit,
 ) {
     var copyRequest by remember { mutableStateOf(0L) }
+    BackHandler(onBack = onDetach)
 
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -470,7 +512,8 @@ private fun MobileTerminalOverlay(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(6.dp),
+                .imePadding()
+                .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Surface(
@@ -492,30 +535,26 @@ private fun MobileTerminalOverlay(
                             overflow = TextOverflow.Ellipsis,
                         )
                         Text(
-                            text = terminal.status,
+                            text = terminalConnectionLabel(terminal.status),
                             style = MaterialTheme.typography.labelSmall,
                             color = if (terminal.error == null) Cyan else Rose,
                             fontFamily = FontFamily.Monospace,
                         )
-                        Text(
-                            text = terminalDiagnostics(terminal),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (terminal.rendererError == null) TextMuted else Rose,
-                            fontFamily = FontFamily.Monospace,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+
                     }
                     OutlinedButton(
                         onClick = onDetach,
-                        modifier = Modifier.height(32.dp),
+                        modifier = Modifier.height(44.dp),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
                     ) {
-                        Text("Detach")
+                        Text("Close")
                     }
                 }
             }
 
+            if (terminal.status in setOf("failed", "detached")) {
+                TextButton(onClick = onReconnect) { Text("Reconnect") }
+            }
             terminal.error?.let { error ->
                 Text(
                     text = error,
@@ -530,6 +569,7 @@ private fun MobileTerminalOverlay(
                 color = Color.Black,
                 border = androidx.compose.foundation.BorderStroke(1.dp, BorderStrong),
             ) {
+                key(terminal.connectionGeneration) {
                 TerminalWebView(
                     terminal = terminal,
                     copyRequest = copyRequest,
@@ -542,27 +582,28 @@ private fun MobileTerminalOverlay(
                     onRendererWritten = onRendererWritten,
                     onCopyText = onCopy,
                 )
+                }
             }
 
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 OutlinedButton(
                     onClick = onEsc,
-                    modifier = Modifier.height(32.dp),
+                    modifier = Modifier.height(44.dp),
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
                 ) { Text("Esc") }
                 OutlinedButton(
                     onClick = onCtrlC,
-                    modifier = Modifier.height(32.dp),
+                    modifier = Modifier.height(44.dp),
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
                 ) { Text("Ctrl-C") }
                 OutlinedButton(
                     onClick = onEnter,
-                    modifier = Modifier.height(32.dp),
+                    modifier = Modifier.height(44.dp),
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
                 ) { Text("Enter") }
                 OutlinedButton(
                     onClick = { copyRequest += 1 },
-                    modifier = Modifier.height(32.dp),
+                    modifier = Modifier.height(44.dp),
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
                 ) { Text("Copy") }
             }
@@ -576,12 +617,14 @@ private fun MobileTerminalOverlay(
                     value = terminal.inputDraft,
                     onValueChange = onInputChange,
                     modifier = Modifier.weight(1f),
-                    label = { Text("Input") },
+                    label = { Text("Message agent") },
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, keyboardType = KeyboardType.Text),
                     singleLine = false,
-                    maxLines = 2,
+                    maxLines = 6,
                 )
                 Button(
                     onClick = onSend,
+                    enabled = terminal.status == "attached" && terminal.inputDraft.isNotBlank(),
                     modifier = Modifier.height(42.dp),
                     contentPadding = ButtonDefaults.ContentPadding,
                 ) {
@@ -709,9 +752,6 @@ private fun TerminalWebView(
                         }
                         deliveredSequence = frame.sequence
                     }
-                if (terminal.outputFrames.isNotEmpty()) {
-                    webView.evaluateJavascript("window.smFocus();", null)
-                }
             }
             if (copyRequest != deliveredCopyRequest) {
                 deliveredCopyRequest = copyRequest
@@ -1046,7 +1086,7 @@ private fun HeaderBar(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun FooterControls(
+private fun SessionFilters(
     sessions: List<ClientSession>,
     query: String,
     filter: String,
@@ -1054,9 +1094,7 @@ private fun FooterControls(
     onFilterChange: (String) -> Unit,
 ) {
     val active = sessions.count(::isOperationallyActive)
-    val working = sessions.count { it.activityState == "working" }
-    val thinking = sessions.count { it.activityState == "thinking" }
-    val maintainers = sessions.count { it.isMaintainer }
+    val waiting = sessions.count(::isWaitingForResult)
 
     Surface(
         shape = RoundedCornerShape(20.dp),
@@ -1087,15 +1125,7 @@ private fun FooterControls(
                     )
                 }
             }
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                SummaryBadge(label = "${sessions.size} sessions", tint = MaterialTheme.colorScheme.onSurface)
-                SummaryBadge(label = "$active active", tint = Emerald)
-                SummaryBadge(label = "$working working", tint = Emerald)
-                SummaryBadge(label = "$thinking thinking", tint = Cyan)
-                if (maintainers > 0) {
-                    SummaryBadge(label = "$maintainers maintainer", tint = Violet)
-                }
-            }
+            Text("${sessions.size} agents · $active active · $waiting waiting for results", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
         }
     }
 }
@@ -1138,6 +1168,7 @@ private fun WatchTree(
     whatById: Map<String, WhatUiState>,
     onToggleExpanded: (ClientSession) -> Unit,
     onOpenAttach: (ClientSession) -> Unit,
+    onClone: (ClientSession) -> Unit,
     onCopyAttach: (ClientSession) -> Unit,
     onOpenTelegram: (ClientSession) -> Unit,
     onWhat: (ClientSession) -> Unit,
@@ -1160,6 +1191,7 @@ private fun WatchTree(
             whatState = whatById[node.session.id],
             onToggleExpanded = { onToggleExpanded(node.session) },
             onOpenAttach = { onOpenAttach(node.session) },
+            onClone = { onClone(node.session) },
             onCopyAttach = { onCopyAttach(node.session) },
             onOpenTelegram = { onOpenTelegram(node.session) },
             onWhat = { onWhat(node.session) },
@@ -1174,7 +1206,7 @@ private fun WatchTree(
     node.sameRepoChildren
         .filter { nodeMatchesSlice(it, slice) }
         .forEach { child ->
-            WatchTree(child, childDepth, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill)
+            WatchTree(child, childDepth, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill)
     }
 
     node.crossRepoGroups.forEach { group ->
@@ -1191,7 +1223,7 @@ private fun WatchTree(
             fontFamily = FontFamily.Monospace,
         )
         visibleChildren.forEach { child ->
-            WatchTree(child, groupDepth + 1, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill)
+            WatchTree(child, groupDepth + 1, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill)
         }
     }
 }
@@ -1207,6 +1239,7 @@ private fun SessionRow(
     whatState: WhatUiState?,
     onToggleExpanded: () -> Unit,
     onOpenAttach: () -> Unit,
+    onClone: () -> Unit,
     onCopyAttach: () -> Unit,
     onOpenTelegram: () -> Unit,
     onWhat: () -> Unit,
@@ -1250,12 +1283,20 @@ private fun SessionRow(
                         }
                         Spacer(Modifier.height(3.dp))
                         Text(
-                            text = "${session.id} • ${session.role ?: if (session.isEm) "em" else session.provider ?: "-"}",
+                            text = "${session.provider ?: "claude"} · ${projectedStatusLabel(session)}",
                             style = MaterialTheme.typography.bodySmall,
                             color = TextSecondary,
                             fontFamily = FontFamily.Monospace,
                         )
                         Spacer(Modifier.height(6.dp))
+                        waitingSummary(session)?.let { waiting ->
+                            Text(waiting, style = MaterialTheme.typography.bodySmall, color = Cyan, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                            Spacer(Modifier.height(6.dp))
+                        }
+                        session.jobs.filter { it.state == "pending" || it.state == "running" }.take(2).forEach { job ->
+                            Text(jobSummary(job), style = MaterialTheme.typography.bodySmall, color = TextSecondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            Spacer(Modifier.height(6.dp))
+                        }
                         statusSummary(session)?.let { status ->
                             Text(
                                 text = status,
@@ -1305,8 +1346,8 @@ private fun SessionRow(
             if (expanded) {
                 HorizontalDivider(color = Border)
                 Column(modifier = Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("${session.id} · ${session.workingDir}", style = MaterialTheme.typography.bodySmall, color = TextMuted)
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        StatusChip(label = activityLabel(session.activityState), tint = activityTint(session.activityState))
                         StatusChip(label = projectedStatusLabel(session), tint = statusTint(session))
                         StatusChip(label = session.provider ?: "claude", tint = providerTint(session.provider))
                         if (session.role != null) StatusChip(label = session.role, tint = Violet)
@@ -1325,6 +1366,7 @@ private fun SessionRow(
                         modifier = Modifier.horizontalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
+                        ActionPill(label = "Clone", icon = Icons.Rounded.ContentCopy, onClick = onClone)
                         if (attachSupported) {
                             ActionPill(label = "Attach", icon = Icons.Rounded.Terminal, onClick = onOpenAttach)
                             ActionPill(label = "Copy", icon = Icons.Rounded.ContentCopy, onClick = onCopyAttach)
@@ -1336,6 +1378,9 @@ private fun SessionRow(
                             ActionPill(label = "What?", icon = Icons.Rounded.QuestionAnswer, onClick = onWhat, tint = Violet)
                         }
                         ActionPill(label = RETIRE_SESSION_ACTION_LABEL, icon = Icons.Rounded.UnfoldLess, onClick = onKill, tint = Rose)
+                    }
+                    obligationDetails(session).forEach { line ->
+                        Text(line, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
                     }
                     whatState?.takeIf { it.entries.isNotEmpty() || it.status != "idle" }?.let { summary ->
                         WhatSummarySection(
@@ -1589,7 +1634,7 @@ private fun sessionLastActivityEpoch(session: ClientSession): Long {
     return parseIso(session.lastActivity)?.toEpochSecond() ?: Long.MIN_VALUE
 }
 
-private fun statusDot(session: ClientSession): Color = when (sessionVisualState(session)) {
+private fun statusDot(session: ClientSession): Color = if (isWaitingForResult(session)) Cyan else when (sessionVisualState(session)) {
     SessionVisualState.Active -> Emerald
     SessionVisualState.Stopped -> Rose
     SessionVisualState.Inactive -> TextMuted

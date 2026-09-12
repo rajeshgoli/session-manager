@@ -9,6 +9,13 @@ import org.junit.Test
 
 class SessionManagerRepositoryTest {
     @Test
+    fun forbiddenAccessDoesNotDiscardAnAuthenticatedDeviceLogin() {
+        val failure: Throwable = forbiddenRequestFailure(IllegalStateException("gateway refused"))
+        assertFalse(failure is SessionManagerAuthException)
+        assertTrue(failure.message!!.contains("sign-in is saved"))
+    }
+
+    @Test
     fun retireFallbackErrorCopyUsesRetireLanguage() {
         assertEquals("Retire request failed", RETIRE_REQUEST_FAILED_MESSAGE)
         assertFalse(RETIRE_REQUEST_FAILED_MESSAGE.contains("kill", ignoreCase = true))

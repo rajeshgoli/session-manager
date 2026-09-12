@@ -31,6 +31,15 @@ import retrofit2.http.Path
 import retrofit2.http.Query
 
 interface ApiService {
+    @POST("sessions")
+    suspend fun createSession(@Body request: li.rajeshgo.sm.data.model.CreateSessionRequest): li.rajeshgo.sm.data.model.CreatedSession
+
+    @GET("queue-jobs")
+    suspend fun getSessionJobs(): li.rajeshgo.sm.data.model.SessionJobsResponse
+
+    @GET("session-obligations")
+    suspend fun getSessionObligations(): li.rajeshgo.sm.data.model.SessionObligationsResponse
+
     @GET("client/bootstrap")
     suspend fun getBootstrap(): ClientBootstrapResponse
 

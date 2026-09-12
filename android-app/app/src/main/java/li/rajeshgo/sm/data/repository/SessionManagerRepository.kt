@@ -116,12 +116,12 @@ class SessionManagerRepository(
 
     private suspend fun httpClient(token: String = ""): OkHttpClient = httpClientFactory.create(token = token)
 
-    private suspend fun api(baseUrl: String, token: String = ""): ApiService {
+    private suspend fun api(baseUrl: String, token: String = "", readTimeoutSeconds: Long = 30): ApiService {
         require(baseUrl.isNotBlank()) { "Server URL is required" }
         val normalizedBaseUrl = baseUrl.trim().trimEnd('/') + "/"
         return Retrofit.Builder()
             .baseUrl(normalizedBaseUrl)
-            .client(httpClient(token))
+            .client(httpClientFactory.create(token = token, readTimeoutSeconds = readTimeoutSeconds))
             .addConverterFactory(json.asConverterFactory("application/json".toMediaType()))
             .build()
             .create(ApiService::class.java)
@@ -169,7 +169,8 @@ class SessionManagerRepository(
                 return block(service)
             } catch (error: HttpException) {
                 when (error.code()) {
-                    401, 403 -> throw SessionManagerAuthException("Session expired. Sign in again.", error)
+                    401 -> throw SessionManagerAuthException("Session expired. Sign in again.", error)
+                    403 -> throw forbiddenRequestFailure(error)
                     502, 503, 504 -> {
                         val serverError = extractServerError(error)
                         if (serverError?.code == BACKEND_UNREACHABLE_ERROR) {
@@ -208,7 +209,8 @@ class SessionManagerRepository(
     private fun classifyWriteFailure(error: Throwable): Throwable {
         if (error is HttpException) {
             return when (error.code()) {
-                401, 403 -> SessionManagerAuthException("Session expired. Sign in again.", error)
+                401 -> SessionManagerAuthException("Session expired. Sign in again.", error)
+                403 -> forbiddenRequestFailure(error)
                 502, 503, 504 -> {
                     val serverError = extractServerError(error)
                     if (serverError?.code == BACKEND_UNREACHABLE_ERROR) {
@@ -248,7 +250,24 @@ class SessionManagerRepository(
     }
 
     suspend fun fetchSessions(baseUrl: String, token: String): List<ClientSession> = withContext(Dispatchers.IO) {
-        executeReadRequest(baseUrl, token) { it.getClientSessions().sessions }
+        coroutineScope {
+            val sessions = async { executeReadRequest(baseUrl, token) { it.getClientSessions().sessions } }
+            val obligations = async { executeReadRequest(baseUrl, token) { it.getSessionObligations().sessions }.associateBy { it.sessionId } }
+            val jobs = async { executeReadRequest(baseUrl, token) { it.getSessionJobs().jobs } }
+            val obligationsById = obligations.await()
+            val allJobs = jobs.await()
+            sessions.await().map { session -> session.copy(
+                obligations = obligationsById[session.id],
+                jobs = allJobs.filter { (it.requesterSessionId?.takeIf(String::isNotBlank) ?: it.notifySessionId) == session.id },
+            ) }
+        }
+    }
+
+    suspend fun createSession(baseUrl: String, token: String, request: li.rajeshgo.sm.data.model.CreateSessionRequest): Result<li.rajeshgo.sm.data.model.CreatedSession> = withContext(Dispatchers.IO) {
+        runCatching {
+            val service = api(baseUrl, token, readTimeoutSeconds = 180)
+            service.createSession(request)
+        }.mapFailure(::classifyWriteFailure)
     }
 
     suspend fun fetchAnalytics(baseUrl: String, token: String): AnalyticsSummary = withContext(Dispatchers.IO) {
@@ -351,7 +370,7 @@ class SessionManagerRepository(
         accessToken: String,
         listener: WebSocketListener,
     ): WebSocket {
-        return httpClient().newWebSocket(mobileTerminalSocketRequest(ticket, accessToken), listener)
+        return httpClient().newBuilder().pingInterval(20, java.util.concurrent.TimeUnit.SECONDS).build().newWebSocket(mobileTerminalSocketRequest(ticket, accessToken), listener)
     }
 
     fun mobileTerminalSocketRequest(ticket: MobileAttachTicketResponse, accessToken: String): Request {
@@ -469,3 +488,7 @@ class SessionManagerRepository(
         }
     }
 }
+
+// A forbidden action or gateway refusal does not prove the device login expired.
+internal fun forbiddenRequestFailure(error: Throwable): SessionManagerRequestException =
+    SessionManagerRequestException("Access was refused. Your sign-in is saved. Retry or check device enrollment in Settings.", error)
