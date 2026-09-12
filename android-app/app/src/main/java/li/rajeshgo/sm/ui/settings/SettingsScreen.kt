@@ -17,6 +17,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import li.rajeshgo.sm.BuildConfig
 import li.rajeshgo.sm.auth.GoogleSignInManager
 import li.rajeshgo.sm.ui.theme.*
@@ -31,7 +34,12 @@ fun SettingsScreen(
     viewModel: SettingsViewModel = viewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
-    LaunchedEffect(Unit) { while (true) { viewModel.refreshStudioSshStatus(); kotlinx.coroutines.delay(10_000) } }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) { viewModel.refreshStudioSshStatus(); kotlinx.coroutines.delay(10_000) }
+        }
+    }
     val context = LocalContext.current
     val signIn = remember(context) { GoogleSignInManager(context) }
     val scope = rememberCoroutineScope()
@@ -133,7 +141,7 @@ private fun AdvancedSettings(state: SettingsUiState, viewModel: SettingsViewMode
     var confirmRemoveDevice by remember { mutableStateOf(false) }
     SettingsGroup("Server") {
         OutlinedTextField(state.serverUrl, viewModel::updateServerUrl, label = { Text("Server address") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-        TextButton(onClick = { viewModel.refreshBootstrap(); viewModel.refreshStudioSshStatus() }) { Text("Save connection") }
+        TextButton(onClick = viewModel::refreshBootstrap) { Text("Save connection") }
     }
     SettingsGroup("Device registration") {
         TextButton(onClick = { deviceTools = !deviceTools }) { Text(if (deviceTools) "Hide registration details" else "Show registration details") }

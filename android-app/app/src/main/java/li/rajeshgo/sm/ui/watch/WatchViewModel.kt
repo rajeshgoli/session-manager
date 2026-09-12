@@ -619,8 +619,8 @@ class WatchViewModel(application: Application, private val savedState: androidx.
         }
     }
 
-    suspend fun sessionModels(provider: String): List<String> = sessionRepository.fetchSessionModels(
-        settingsRepository.serverUrl.first(), settingsRepository.accessToken.first(), provider,
+    suspend fun sessionModels(provider: String, workingDir: String): List<String> = sessionRepository.fetchSessionModels(
+        settingsRepository.serverUrl.first(), settingsRepository.accessToken.first(), provider, workingDir,
     )
 
     fun setTerminalForeground(foreground: Boolean) {

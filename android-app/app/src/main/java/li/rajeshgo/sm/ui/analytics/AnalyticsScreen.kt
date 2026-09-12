@@ -1354,7 +1354,7 @@ private fun WorkloadOverview(metrics: li.rajeshgo.sm.data.model.WorkloadMetrics?
                 WorkloadLine("Reviews", "${metrics.reviewsWaiting} pending", "Waiting for review results")
                 androidx.compose.material3.HorizontalDivider(color = PanelMuted)
                 Text("Last 24 hours", style = MaterialTheme.typography.labelLarge, color = Cyan)
-                WorkloadLine("Jobs", "${metrics.jobsCompleted24H} completed", "${metrics.jobsSubmitted24H} submitted · ${metrics.jobsFailed24H} failed or timed out")
+                WorkloadLine("Jobs", "${metrics.jobsCompleted24H} completed", "${metrics.jobsSubmitted24H} submitted · ${metrics.jobsFailed24H} failed")
                 WorkloadLine("Reviews", "${metrics.reviewsReceived24H} received", "${metrics.reviewsRequested24H} requested")
                 WorkloadLine("Agents", "${metrics.agentsCreated24H} created", null)
             }

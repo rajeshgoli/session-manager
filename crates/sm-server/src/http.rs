@@ -2260,6 +2260,7 @@ async fn client_bootstrap(
 #[derive(Deserialize)]
 struct SessionModelsQuery {
     provider: String,
+    working_dir: Option<String>,
 }
 
 async fn client_session_models(
@@ -2283,7 +2284,11 @@ async fn client_session_models(
     }
     let runtime = TmuxRuntime::from_app_config(&state.config);
     let models = tokio::task::spawn_blocking(move || {
-        runtime.session_models(&query.provider, &std::env::current_dir()?)
+        let working_dir = match query.working_dir {
+            Some(path) if !path.trim().is_empty() => expand_home(path.trim()),
+            _ => std::env::current_dir()?,
+        };
+        runtime.session_models(&query.provider, &working_dir)
     })
     .await
     .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
@@ -18641,6 +18646,28 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(is_protected_read_surface("GET", "/client/session-models"));
+    }
+
+    #[tokio::test]
+    async fn mobile_session_models_uses_selected_workspace_for_relative_provider() {
+        use std::os::unix::fs::PermissionsExt;
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        let root = std::path::Path::new(&config.paths.state_file).parent().unwrap().join("model-workspace");
+        fs::create_dir_all(&root).unwrap();
+        let command = root.join("codex");
+        fs::write(&command, r#"#!/bin/sh
+printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
+"#).unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+        config.codex.command = "./codex".into();
+        let app = router(AppState::new(config));
+        let uri = format!("/client/session-models?provider=codex&working_dir={}", root.display());
+        let response = app.oneshot(local_request(Method::GET, &uri, Body::empty())).await.unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["models"], json!(["workspace-model"]));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

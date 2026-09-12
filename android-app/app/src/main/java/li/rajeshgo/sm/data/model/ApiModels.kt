@@ -618,7 +618,10 @@ data class SessionJob(
     @SerialName("started_at") val startedAt: String? = null,
     @SerialName("finished_at") val finishedAt: String? = null,
     @SerialName("exit_code") val exitCode: Int? = null,
-)
+) {
+    fun isAwaitedBy(sessionId: String): Boolean =
+        (notifySessionId?.takeIf(String::isNotBlank) ?: requesterSessionId) == sessionId
+}
 
 @Serializable
 data class SessionModelsResponse(val models: List<String> = emptyList())

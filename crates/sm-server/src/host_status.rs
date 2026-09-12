@@ -1,7 +1,8 @@
 //! On-demand host measurements. No task or timer runs between requests.
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
 async fn read_command(program: &str, args: &[&str]) -> Option<String> {
     let output = tokio::time::timeout(
@@ -21,7 +22,40 @@ async fn read_command(program: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+// Serialize sampling and share bursts of requests. Nothing runs between requests.
+struct SnapshotCache {
+    sample: Mutex<Option<(Instant, Value)>>,
+    ttl: Duration,
+}
+
+impl SnapshotCache {
+    async fn get<F, Fut>(&self, sample: F) -> Value
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Value>,
+    {
+        let mut cached = self.sample.lock().await;
+        if let Some((sampled_at, value)) = cached.as_ref() {
+            if sampled_at.elapsed() < self.ttl {
+                return value.clone();
+            }
+        }
+        let value = sample().await;
+        *cached = Some((Instant::now(), value.clone()));
+        value
+    }
+}
+
+static SNAPSHOT_CACHE: SnapshotCache = SnapshotCache {
+    sample: Mutex::const_new(None),
+    ttl: Duration::from_secs(5),
+};
+
 pub async fn snapshot() -> Value {
+    SNAPSHOT_CACHE.get(collect_snapshot).await
+}
+
+async fn collect_snapshot() -> Value {
     if !cfg!(target_os = "macos") {
         return json!({"available": false, "error": "Host statistics are not available on this system."});
     }
@@ -112,6 +146,42 @@ fn gpu_percent(ioreg: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn concurrent_requests_share_a_sample_and_refresh_only_after_expiry() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let cache = Arc::new(SnapshotCache {
+            sample: Mutex::new(None),
+            ttl: Duration::from_secs(5),
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..32 {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            tasks.spawn(async move {
+                cache
+                    .get(|| async {
+                        let index = calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::task::yield_now().await;
+                        json!({"sample": index})
+                    })
+                    .await
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            assert_eq!(result.unwrap(), json!({"sample": 0}));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        cache.sample.lock().await.as_mut().unwrap().0 = Instant::now() - Duration::from_secs(6);
+        assert_eq!(
+            cache.get(|| async { json!({"sample": 1}) }).await,
+            json!({"sample": 1})
+        );
+    }
+
     #[test]
     fn uses_recent_cpu_sample_and_preserves_missing_measurements() {
         let sample = "CPU usage: 10% user, 20% sys, 70% idle\nPhysMem: 12G used (1G wired), 4G unused.\nCPU usage: 1% user, 2% sys, 97% idle\nPhysMem: 12500M used (1G wired), 4G unused.";

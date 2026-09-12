@@ -35,7 +35,7 @@ interface ApiService {
     suspend fun getHostStatus(): li.rajeshgo.sm.data.model.HostStatus
 
     @GET("client/session-models")
-    suspend fun getSessionModels(@Query("provider") provider: String): li.rajeshgo.sm.data.model.SessionModelsResponse
+    suspend fun getSessionModels(@Query("provider") provider: String, @Query("working_dir") workingDir: String): li.rajeshgo.sm.data.model.SessionModelsResponse
 
     @POST("sessions")
     suspend fun createSession(@Body request: li.rajeshgo.sm.data.model.CreateSessionRequest): li.rajeshgo.sm.data.model.CreatedSession

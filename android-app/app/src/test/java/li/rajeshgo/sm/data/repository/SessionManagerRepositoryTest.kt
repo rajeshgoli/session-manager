@@ -6,8 +6,30 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import okhttp3.ResponseBody.Companion.toResponseBody
 
 class SessionManagerRepositoryTest {
+    @Test
+    fun attachTicketLimitIsRetryableButAuthenticationIsNot() {
+        val repository = SessionManagerRepository()
+        fun failure(code: Int): Throwable = repository.classifyWriteFailure(
+            retrofit2.HttpException(retrofit2.Response.error<Any>(code, "{}".toResponseBody())),
+        )
+        assertTrue(failure(429) is SessionManagerTransientException)
+        assertTrue(failure(401) is SessionManagerAuthException)
+        assertFalse(failure(403) is SessionManagerTransientException)
+        assertFalse(failure(404) is SessionManagerTransientException)
+    }
+
+    @Test
+    fun queueWorkBelongsToRecipientWhenRequesterDelegatesNotification() {
+        val job = li.rajeshgo.sm.data.model.SessionJob("job", requesterSessionId = "sender", notifySessionId = "recipient")
+        assertTrue(job.isAwaitedBy("recipient"))
+        assertFalse(job.isAwaitedBy("sender"))
+        assertTrue(job.copy(notifySessionId = null).isAwaitedBy("sender"))
+        assertTrue(job.copy(notifySessionId = "").isAwaitedBy("sender"))
+    }
+
     @Test
     fun forbiddenAccessDoesNotDiscardAnAuthenticatedDeviceLogin() {
         val failure: Throwable = forbiddenRequestFailure(IllegalStateException("gateway refused"))

@@ -206,11 +206,12 @@ class SessionManagerRepository(
         throw SessionManagerTransientException("Server temporarily unavailable. Retrying soon.", lastTransient)
     }
 
-    private fun classifyWriteFailure(error: Throwable): Throwable {
+    internal fun classifyWriteFailure(error: Throwable): Throwable {
         if (error is HttpException) {
             return when (error.code()) {
                 401 -> SessionManagerAuthException("Session expired. Sign in again.", error)
                 403 -> forbiddenRequestFailure(error)
+                429 -> SessionManagerTransientException("Connection busy. Retrying soon.", error)
                 502, 503, 504 -> {
                     val serverError = extractServerError(error)
                     if (serverError?.code == BACKEND_UNREACHABLE_ERROR) {
@@ -253,8 +254,8 @@ class SessionManagerRepository(
         executeReadRequest(baseUrl, token) { it.getHostStatus() }
     }
 
-    suspend fun fetchSessionModels(baseUrl: String, token: String, provider: String): List<String> = withContext(Dispatchers.IO) {
-        executeReadRequest(baseUrl, token) { it.getSessionModels(provider).models }
+    suspend fun fetchSessionModels(baseUrl: String, token: String, provider: String, workingDir: String): List<String> = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getSessionModels(provider, workingDir).models }
     }
 
     suspend fun fetchSessions(baseUrl: String, token: String): List<ClientSession> = withContext(Dispatchers.IO) {
@@ -266,7 +267,7 @@ class SessionManagerRepository(
             val allJobs = jobs.await()
             sessions.await().map { session -> session.copy(
                 obligations = obligationsById[session.id],
-                jobs = allJobs.filter { (it.requesterSessionId?.takeIf(String::isNotBlank) ?: it.notifySessionId) == session.id },
+                jobs = allJobs.filter { it.isAwaitedBy(session.id) },
             ) }
         }
     }

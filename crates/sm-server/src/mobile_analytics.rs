@@ -548,7 +548,7 @@ fn workload_metrics(
         "jobs_queued": jobs.iter().filter(|job| job.state == "pending").count(),
         "jobs_submitted_24h": jobs.iter().filter(|job| in_last_day(Some(&job.queued_at), now)).count(),
         "jobs_completed_24h": jobs.iter().filter(|job| job.state == "succeeded" && in_last_day(job.finished_at.as_deref(), now)).count(),
-        "jobs_failed_24h": jobs.iter().filter(|job| matches!(job.state.as_str(), "failed" | "timed_out") && in_last_day(job.finished_at.as_deref(), now)).count(),
+        "jobs_failed_24h": jobs.iter().filter(|job| matches!(job.state.as_str(), "failed" | "timed_out" | "memory_exceeded") && in_last_day(job.finished_at.as_deref(), now)).count(),
         "reviews_waiting": waiting.len(),
         "reviews_requested_24h": reviews.iter().filter(|review| in_last_day(Some(&review.requested_at), now)).count(),
         "reviews_received_24h": reviews.iter().filter(|review| in_last_day(review.review_landed_at.as_deref(), now)).count(),
@@ -602,6 +602,12 @@ mod workload_tests {
         let metrics = workload_metrics(&config, &store, now).unwrap();
         assert_eq!(metrics["jobs_queued"], 0);
         assert_eq!(metrics["jobs_completed_24h"], 1);
+        for state in ["failed", "timed_out", "memory_exceeded", "cancelled"] {
+            conn.execute("UPDATE queue_jobs SET state = ?1 WHERE id = ?2", [state, &job.id]).unwrap();
+            let metrics = workload_metrics(&config, &store, now).unwrap();
+            assert_eq!(metrics["jobs_failed_24h"], u64::from(state != "cancelled"), "{state}");
+            assert_eq!(metrics["jobs_completed_24h"], 0);
+        }
         drop(conn);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -23,7 +23,7 @@ fun sessionTemplate(source: ClientSession?): CreateSessionRequest = CreateSessio
 fun CreateSessionSheet(
     source: ClientSession?,
     sessions: List<ClientSession>,
-    loadModels: suspend (String) -> List<String>,
+    loadModels: suspend (String, String) -> List<String>,
     busy: Boolean,
     error: String?,
     onDismiss: () -> Unit,
@@ -39,14 +39,17 @@ fun CreateSessionSheet(
     var prompt by rememberSaveable(source?.id) { mutableStateOf("") }
     var customDirectory by rememberSaveable { mutableStateOf(false) }
     val directories = (listOf("/Users/rajesh/projects/fractal-algo-rust", "/Users/rajesh/projects/session-manager", "/Users/rajesh/projects/codex-fork") + sessions.map { it.workingDir } + directory).distinct()
-    var catalog by remember(provider) { mutableStateOf(emptyList<String>()) }
-    var modelsLoading by remember(provider) { mutableStateOf(true) }
-    var modelsError by remember(provider) { mutableStateOf(false) }
+    var catalog by remember(provider, directory) { mutableStateOf(emptyList<String>()) }
+    var modelsLoading by remember(provider, directory) { mutableStateOf(true) }
+    var modelsError by remember(provider, directory) { mutableStateOf(false) }
     var catalogAttempt by remember { mutableStateOf(0) }
-    LaunchedEffect(provider, catalogAttempt) {
+    LaunchedEffect(provider, directory, catalogAttempt) {
         modelsLoading = true
         modelsError = false
-        try { catalog = loadModels(provider) }
+        try {
+            kotlinx.coroutines.delay(300)
+            catalog = loadModels(provider, directory.trim())
+        }
         catch (error: kotlinx.coroutines.CancellationException) { throw error }
         catch (_: Exception) { modelsError = true }
         finally { modelsLoading = false }
