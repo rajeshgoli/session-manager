@@ -1279,6 +1279,7 @@ pub fn router(state: AppState) -> Router {
         .route("/hooks/context-usage", post(context_usage_hook))
         .route("/client/bootstrap", get(client_bootstrap))
         .route("/client/session-models", get(client_session_models))
+        .route("/client/host-status", get(client_host_status))
         .route("/client/analytics/summary", get(client_analytics_summary))
         .route("/client/request-status", post(client_request_status))
         .route("/client/bug-reports", post(submit_client_bug_report))
@@ -2289,6 +2290,21 @@ async fn client_session_models(
     Ok(Json(json!({ "models": models })))
 }
 
+async fn client_host_status(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
+    ensure_public_edge_assertion_for_request(&state, &request)?;
+    ensure_session_read_allowed(&state, &request)?;
+    ensure_mobile_cloudflare_access_context_matches_optional_actor(
+        &state,
+        access_context.as_ref(),
+        request_actor_email(&state.config, &request).as_deref(),
+    )?;
+    Ok(Json(crate::host_status::snapshot().await))
+}
+
 async fn client_analytics_summary(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -2301,10 +2317,22 @@ async fn client_analytics_summary(
         access_context.as_ref(),
         request_actor_email(&state.config, &request).as_deref(),
     )?;
-    Ok(Json(build_mobile_analytics_summary(
-        &state.config,
-        &state.session_store,
-    )?))
+    let mut summary = build_mobile_analytics_summary(&state.config, &state.session_store)?;
+    let sessions = state.session_store.list_sessions(false)?;
+    let working = sessions
+        .into_iter()
+        .filter(|session| {
+            let response =
+                serde_json::to_value(session_response_with_live_activity(&state, session.clone()))
+                    .unwrap_or(Value::Null);
+            matches!(
+                response["activity_state"].as_str(),
+                Some("working" | "thinking")
+            )
+        })
+        .count();
+    summary["workload"]["agents_working"] = json!(working);
+    Ok(Json(summary))
 }
 
 async fn client_request_status(
@@ -12933,6 +12961,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/apk"
         || path == "/client/analytics/summary"
         || path == "/client/session-models"
+        || path == "/client/host-status"
         || path == "/codex-review-requests"
         || path.starts_with("/codex-review-requests/")
         || path == "/session-obligations"
@@ -17567,6 +17596,7 @@ mod tests {
         let app = router(AppState::new(cloudflare_access_config()));
         let routes = [
             (Method::GET, "/client/bootstrap", "", false),
+            (Method::GET, "/client/host-status", "", false),
             (
                 Method::POST,
                 "/auth/device/google",

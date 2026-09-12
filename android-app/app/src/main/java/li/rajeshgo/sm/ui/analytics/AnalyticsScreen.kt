@@ -4,6 +4,8 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -124,7 +126,7 @@ fun AnalyticsScreen(
 
     Box(
         modifier = Modifier
-            .fillMaxSize()
+            .fillMaxSize().statusBarsPadding().navigationBarsPadding()
             .background(MaterialTheme.colorScheme.background),
     ) {
         if (state.loading && state.summary == null) {
@@ -171,12 +173,7 @@ fun AnalyticsScreen(
                     EmptyAnalyticsState()
                 }
             } else {
-                item {
-                    KpiGrid(
-                        summary = summary,
-                        onOpenDetail = onOpenDetail,
-                    )
-                }
+                item { WorkloadOverview(summary.workload) }
                 item {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -194,25 +191,13 @@ fun AnalyticsScreen(
                     }
                 }
                 item {
-                    ThroughputCard(
-                        summary = summary,
-                        onOpenDetail = { onOpenDetail("throughput") },
-                    )
-                }
-                item {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        CoordinationCard(
-                            summary = summary,
-                            modifier = Modifier.weight(1f),
-                        )
-                        LoadCard(
-                            summary = summary,
-                            modifier = Modifier.weight(1f),
-                            onOpenDetail = { onOpenDetail("load") },
-                        )
+                    var showMessaging by remember { mutableStateOf(false) }
+                    Column {
+                        androidx.compose.material3.TextButton(onClick = { showMessaging = !showMessaging }) { Text(if (showMessaging) "Hide messaging activity" else "Messaging & dispatches") }
+                        if (showMessaging) {
+                            KpiGrid(summary, onOpenDetail)
+                            ThroughputCard(summary, onOpenDetail = { onOpenDetail("throughput") })
+                        }
                     }
                 }
                 item {
@@ -1354,3 +1339,36 @@ private fun detailTitle(section: String): String = when (section) {
 
 private fun countUnhealthyChecks(checks: List<AnalyticsHealthCheck>): Int =
     checks.count { (it.status ?: "").lowercase() !in setOf("ok", "warning") }
+
+@Composable
+private fun WorkloadOverview(metrics: li.rajeshgo.sm.data.model.WorkloadMetrics?) {
+    Surface(color = Panel, shape = RoundedCornerShape(16.dp)) {
+        Column(Modifier.fillMaxWidth().padding(18.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Text("Work overview", style = MaterialTheme.typography.titleLarge)
+            if (metrics == null) {
+                Text("Workload statistics are unavailable. Refresh to try again.", color = TextSecondary)
+            } else {
+                Text("Right now", style = MaterialTheme.typography.labelLarge, color = Cyan)
+                WorkloadLine("Agents", "${metrics.agentsLive} live", "${metrics.agentsWorking} working · ${metrics.agentsWaitingReview} awaiting review")
+                WorkloadLine("Queue", "${metrics.jobsRunning} running", "${metrics.jobsQueued} queued")
+                WorkloadLine("Reviews", "${metrics.reviewsWaiting} pending", "Waiting for review results")
+                androidx.compose.material3.HorizontalDivider(color = PanelMuted)
+                Text("Last 24 hours", style = MaterialTheme.typography.labelLarge, color = Cyan)
+                WorkloadLine("Jobs", "${metrics.jobsCompleted24H} completed", "${metrics.jobsSubmitted24H} submitted · ${metrics.jobsFailed24H} failed or timed out")
+                WorkloadLine("Reviews", "${metrics.reviewsReceived24H} received", "${metrics.reviewsRequested24H} requested")
+                WorkloadLine("Agents", "${metrics.agentsCreated24H} created", null)
+            }
+        }
+    }
+}
+
+@Composable
+private fun WorkloadLine(title: String, value: String, detail: String?) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(title, style = MaterialTheme.typography.titleSmall, color = TextSecondary)
+            Text(value, style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurface)
+        }
+        detail?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextMuted) }
+    }
+}

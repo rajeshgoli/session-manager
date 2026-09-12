@@ -14,6 +14,7 @@ use time::{
 
 use crate::{
     config::AppConfig,
+    queue::{CodexReviewRequestFilters, QueueJobFilters, RetainedQueueStore},
     sessions::{expand_home, SessionRecord, SessionStore},
 };
 
@@ -59,6 +60,7 @@ fn build_mobile_analytics_summary_at(
     Ok(json!({
         "generated_at": format_rfc3339(now),
         "window_hours": WINDOW_HOURS,
+        "workload": workload_metrics(config, session_store, now)?,
         "kpis": {
             "active_sessions": {
                 "label": "Active sessions",
@@ -497,5 +499,71 @@ fn non_empty_or(value: &str, fallback: &str) -> String {
         fallback.to_owned()
     } else {
         value.to_owned()
+    }
+}
+
+fn in_last_day(timestamp: Option<&str>, now: OffsetDateTime) -> bool {
+    timestamp
+        .and_then(parse_any_datetime)
+        .is_some_and(|time| time >= now - Duration::hours(24) && time <= now)
+}
+
+fn workload_metrics(
+    config: &AppConfig,
+    store: &SessionStore,
+    now: OffsetDateTime,
+) -> Result<Value> {
+    let path = expand_home(&config.sm_send.db_path);
+    let jobs = RetainedQueueStore::list_queue_jobs_from_path(
+        &path,
+        QueueJobFilters {
+            include_terminal: true,
+            ..Default::default()
+        },
+    )?;
+    let reviews = RetainedQueueStore::list_codex_review_requests_from_path(
+        &path,
+        CodexReviewRequestFilters {
+            include_inactive: true,
+            ..Default::default()
+        },
+    )?;
+    let sessions = store.list_sessions(true)?;
+    let live = sessions
+        .iter()
+        .filter(|session| !session.is_stopped())
+        .collect::<Vec<_>>();
+    let waiting = reviews
+        .iter()
+        .filter(|review| review.is_active && review.review_landed_at.is_none())
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "agents_live": live.len(),
+        "agents_working": live.iter().filter(|session| matches!(activity_state(session), "working" | "thinking")).count(),
+        "agents_waiting_review": live.iter().filter(|session| waiting.iter().any(|review| review.notify_session_id == session.id)).count(),
+        "agents_created_24h": sessions.iter().filter(|session| in_last_day(Some(&session.created_at), now)).count(),
+        "jobs_running": jobs.iter().filter(|job| job.state == "running").count(),
+        "jobs_queued": jobs.iter().filter(|job| job.state == "pending").count(),
+        "jobs_submitted_24h": jobs.iter().filter(|job| in_last_day(Some(&job.queued_at), now)).count(),
+        "jobs_completed_24h": jobs.iter().filter(|job| job.state == "succeeded" && in_last_day(job.finished_at.as_deref(), now)).count(),
+        "jobs_failed_24h": jobs.iter().filter(|job| matches!(job.state.as_str(), "failed" | "timed_out") && in_last_day(job.finished_at.as_deref(), now)).count(),
+        "reviews_waiting": waiting.len(),
+        "reviews_requested_24h": reviews.iter().filter(|review| in_last_day(Some(&review.requested_at), now)).count(),
+        "reviews_received_24h": reviews.iter().filter(|review| in_last_day(review.review_landed_at.as_deref(), now)).count(),
+    }))
+}
+
+#[cfg(test)]
+mod workload_tests {
+    use super::*;
+    #[test]
+    fn rolling_window_excludes_old_future_and_unknown_timestamps() {
+        let now = OffsetDateTime::parse("2026-09-12T12:00:00Z", &Rfc3339).unwrap();
+        assert!(in_last_day(Some("2026-09-11T12:00:00Z"), now));
+        assert!(in_last_day(Some("2026-09-12 11:00:00"), now));
+        assert!(in_last_day(Some("2026-09-12T05:00:00-07:00"), now));
+        assert!(!in_last_day(Some("2026-09-11T11:59:59Z"), now));
+        assert!(!in_last_day(Some("2026-09-12T12:00:01Z"), now));
+        assert!(!in_last_day(None, now));
     }
 }

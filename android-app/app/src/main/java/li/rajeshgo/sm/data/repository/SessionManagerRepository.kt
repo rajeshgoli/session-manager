@@ -249,6 +249,10 @@ class SessionManagerRepository(
         executeReadRequest(baseUrl, token) { it.getAuthSession() }
     }
 
+    suspend fun fetchHostStatus(baseUrl: String, token: String): li.rajeshgo.sm.data.model.HostStatus = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getHostStatus() }
+    }
+
     suspend fun fetchSessionModels(baseUrl: String, token: String, provider: String): List<String> = withContext(Dispatchers.IO) {
         executeReadRequest(baseUrl, token) { it.getSessionModels(provider).models }
     }

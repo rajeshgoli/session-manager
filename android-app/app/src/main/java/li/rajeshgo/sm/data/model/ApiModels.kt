@@ -442,6 +442,7 @@ data class PersistedWhatSummary(
 
 @Serializable
 data class AnalyticsSummary(
+    val workload: WorkloadMetrics? = null,
     @SerialName("generated_at")
     val generatedAt: String,
     @SerialName("window_hours")
@@ -621,3 +622,31 @@ data class SessionJob(
 
 @Serializable
 data class SessionModelsResponse(val models: List<String> = emptyList())
+
+@Serializable
+data class WorkloadMetrics(
+    @SerialName("agents_live") val agentsLive: Int = 0,
+    @SerialName("agents_working") val agentsWorking: Int = 0,
+    @SerialName("agents_waiting_review") val agentsWaitingReview: Int = 0,
+    @SerialName("agents_created_24h") val agentsCreated24H: Int = 0,
+    @SerialName("jobs_running") val jobsRunning: Int = 0,
+    @SerialName("jobs_queued") val jobsQueued: Int = 0,
+    @SerialName("jobs_submitted_24h") val jobsSubmitted24H: Int = 0,
+    @SerialName("jobs_completed_24h") val jobsCompleted24H: Int = 0,
+    @SerialName("jobs_failed_24h") val jobsFailed24H: Int = 0,
+    @SerialName("reviews_waiting") val reviewsWaiting: Int = 0,
+    @SerialName("reviews_requested_24h") val reviewsRequested24H: Int = 0,
+    @SerialName("reviews_received_24h") val reviewsReceived24H: Int = 0,
+)
+
+@Serializable
+data class HostStatus(
+    val available: Boolean = false,
+    val host: String? = null,
+    @SerialName("sampled_at") val sampledAt: String? = null,
+    @SerialName("memory_total_bytes") val memoryTotalBytes: Long? = null,
+    @SerialName("memory_used_bytes") val memoryUsedBytes: Long? = null,
+    @SerialName("memory_pressure") val memoryPressure: String? = null,
+    @SerialName("cpu_percent") val cpuPercent: Double? = null,
+    @SerialName("gpu_percent") val gpuPercent: Double? = null,
+)

@@ -9,6 +9,15 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class WatchModelsTest {
+    @Test fun summaryAgeSeparatesMinutesHoursAndDays() {
+        val now = java.time.OffsetDateTime.parse("2026-09-12T12:00:00Z")
+        assertEquals("Just now", summaryAgeLabel(now.minusSeconds(15).toString(), now))
+        assertEquals("5 mins ago", summaryAgeLabel(now.minusMinutes(5).toString(), now))
+        assertEquals("2 hours ago", summaryAgeLabel(now.minusHours(2).toString(), now))
+        assertEquals("3 days ago", summaryAgeLabel(now.minusDays(3).toString(), now))
+        assertEquals("Time unavailable", summaryAgeLabel(null, now))
+    }
+
     @Test
     fun resizeAndHeartbeatAcknowledgementsKeepTheComposerConnected() {
         assertEquals("attached", terminalStatusAfterServerEvent("attached", "resized"))

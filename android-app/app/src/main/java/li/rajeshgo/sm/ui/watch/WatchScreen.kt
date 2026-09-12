@@ -50,7 +50,7 @@ import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.QuestionAnswer
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.RestartAlt
-import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.SupportAgent
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.UnfoldLess
@@ -138,7 +138,6 @@ fun WatchScreen(
 ) {
     val state by viewModel.uiState.collectAsState()
     val updateState by updateViewModel.uiState.collectAsState()
-    var showConnectionTools by remember { mutableStateOf(false) }
     var creating by remember { mutableStateOf(false) }
     var cloneSource by remember { mutableStateOf<ClientSession?>(null) }
     var createBusy by remember { mutableStateOf(false) }
@@ -192,12 +191,10 @@ fun WatchScreen(
             return@LaunchedEffect
         }
         viewModel.refresh()
-        viewModel.refreshStudioSshStatus()
         updateViewModel.refresh()
         while (coroutineContext.isActive) {
             delay(WATCH_AUTO_REFRESH_MS)
             viewModel.refresh()
-            viewModel.refreshStudioSshStatus()
         }
     }
 
@@ -259,25 +256,6 @@ fun WatchScreen(
                     filter = filter,
                     onQueryChange = { query = it },
                     onFilterChange = { filter = it },
-                )
-            }
-            item {
-                TextButton(onClick = { showConnectionTools = !showConnectionTools }) {
-                    Text("Studio SSH · ${if (state.studioSshEnabled) "On" else "Off"}")
-                }
-            }
-            if (showConnectionTools) item {
-                StudioSshToggleCard(
-                    enabled = state.studioSshEnabled,
-                    status = state.studioSshStatus,
-                    host = state.studioSshHost,
-                    busy = state.studioSshBusy,
-                    error = state.studioSshError,
-                    onToggle = { desired ->
-                        viewModel.toggleStudioSsh(desired) { result ->
-                            toast = result.exceptionOrNull()?.message ?: result.getOrNull()
-                        }
-                    },
                 )
             }
 
@@ -1018,6 +996,7 @@ private fun HeaderBar(
                     ) {
                         DropdownMenuItem(
                             text = { Text("New session") },
+                            leadingIcon = { Icon(Icons.Rounded.Add, contentDescription = null) },
                             onClick = { menuExpanded = false; onNewSession() },
                             enabled = userEmail.isNotBlank(),
                         )
@@ -1066,20 +1045,7 @@ private fun HeaderBar(
                                 )
                             },
                         )
-                        DropdownMenuItem(
-                            text = { Text("Settings") },
-                            onClick = {
-                                menuExpanded = false
-                                onOpenSettings()
-                            },
-                            leadingIcon = {
-                                Icon(
-                                    Icons.Rounded.Settings,
-                                    contentDescription = null,
-                                    tint = TextSecondary,
-                                )
-                            },
-                        )
+
                     }
                 }
                 SettingsIconButtonWithUpdate(hasUpdate = hasUpdate, onClick = onOpenSettings)
@@ -1097,39 +1063,21 @@ private fun SessionFilters(
     onQueryChange: (String) -> Unit,
     onFilterChange: (String) -> Unit,
 ) {
-    val active = sessions.count(::isOperationallyActive)
-    val waiting = sessions.count(::isWaitingForResult)
-
-    Surface(
-        shape = RoundedCornerShape(20.dp),
-        color = Panel,
-        tonalElevation = 0.dp,
-        shadowElevation = 0.dp,
-        border = androidx.compose.foundation.BorderStroke(1.dp, Border),
-    ) {
-        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            OutlinedTextField(
-                value = query,
-                onValueChange = onQueryChange,
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Search") },
-                placeholder = { Text("name, id, role, alias, worktree") },
-                singleLine = true,
-            )
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+    var filtersOpen by remember { mutableStateOf(false) }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedTextField(
+            value = query, onValueChange = onQueryChange, modifier = Modifier.weight(1f),
+            placeholder = { Text("Search agents") }, singleLine = true, shape = RoundedCornerShape(14.dp),
+        )
+        Box {
+            TextButton(onClick = { filtersOpen = true }) {
+                Text(if (filter == "all") "All agents" else filter.replaceFirstChar { it.titlecase() })
+            }
+            DropdownMenu(filtersOpen, { filtersOpen = false }) {
                 listOf("all", "running", "idle", "stopped").forEach { candidate ->
-                    val selected = candidate == filter
-                    AssistChip(
-                        onClick = { onFilterChange(candidate) },
-                        label = { Text(candidate.uppercase()) },
-                        colors = AssistChipDefaults.assistChipColors(
-                            containerColor = if (selected) Cyan.copy(alpha = 0.18f) else PanelMuted,
-                            labelColor = if (selected) Color.White else TextSecondary,
-                        ),
-                    )
+                    DropdownMenuItem(text = { Text(if (candidate == "all") "All agents" else candidate.replaceFirstChar { it.titlecase() }) }, onClick = { onFilterChange(candidate); filtersOpen = false })
                 }
             }
-            Text("${sessions.size} agents · $active active · $waiting waiting for results", style = MaterialTheme.typography.labelSmall, color = TextSecondary)
         }
     }
 }
@@ -1376,7 +1324,7 @@ private fun SessionRow(
                     }
                     AgentWorkSections(session)
                     if (hasSummary || whatState?.status?.let { it != "idle" } == true) {
-                        AgentDisclosure("Summary", "Read the agent’s progress") {
+                        AgentDisclosure("Summary", relativeSummaryAge(whatState?.entries?.lastOrNull()?.createdAt)) {
                             whatState?.let { WhatSummarySection(it, onUpdateWhat, onRegenerateWhat) }
                         }
                     } else {
@@ -1439,8 +1387,29 @@ private fun ActivityDetail(title: String, detail: String?, tint: Color) {
 @Composable
 private fun AgentWorkSections(session: ClientSession) {
     val waiting = session.obligations?.waitingOn.orEmpty()
+    val reviews = waiting.filter { it.kind == "review" }
+    val reviewHistory = session.obligations?.reviewHistory.orEmpty()
+    if (reviews.isNotEmpty() || reviewHistory.isNotEmpty()) {
+        Surface(color = Violet.copy(alpha = 0.07f), shape = RoundedCornerShape(12.dp)) {
+            Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("Reviews", style = MaterialTheme.typography.titleSmall, color = Violet)
+                if (reviews.isEmpty()) Text("No reviews pending", style = MaterialTheme.typography.bodySmall, color = TextMuted)
+                reviews.forEach { review ->
+                    ActivityDetail("Waiting for ${review.label}", "${review.state.replace('_', ' ')} · ${relativeSummaryAge(review.since)}", Violet)
+                    if (review.lastError != null) AgentDisclosure("Review check needs attention", "View details") {
+                        Text(review.lastError, style = MaterialTheme.typography.bodySmall, color = Amber)
+                    }
+                }
+                if (reviewHistory.isNotEmpty()) AgentDisclosure("Review history", "${reviewHistory.sumOf { it.landedCount }} reviews received · ${reviewHistory.size} pull requests") {
+                    reviewHistory.forEach { review ->
+                        ActivityDetail("${review.repo.substringAfterLast('/')} #${review.prNumber}", "${review.landedCount} received · ${review.landedRequestedByAgent} of ${review.requestedByAgent} requested by this agent received", Violet)
+                    }
+                }
+            }
+        }
+    }
     val activeJobs = session.jobs.filter { it.state in listOf("pending", "running") }
-    if (waiting.isNotEmpty() || activeJobs.isNotEmpty()) {
+    if (waiting.any { it.kind != "review" } || activeJobs.isNotEmpty()) {
         Surface(color = Cyan.copy(alpha = 0.06f), shape = RoundedCornerShape(12.dp)) {
             Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(if (isWaitingForResult(session)) "Waiting for results" else "In progress", style = MaterialTheme.typography.titleSmall, color = Cyan)
@@ -1454,7 +1423,7 @@ private fun AgentWorkSections(session: ClientSession) {
                         }
                     }
                 }
-                waiting.filter { it.kind != "queue_job" || activeJobs.isEmpty() }.forEach { wait ->
+                waiting.filter { it.kind != "review" && (it.kind != "queue_job" || activeJobs.isEmpty()) }.forEach { wait ->
                     ActivityDetail(wait.label, "${wait.state.replace('_', ' ')} · ${ageFromIso(wait.since)}", Cyan)
                     if (wait.lastError != null || wait.lastPolledAt != null) AgentDisclosure("Check details", wait.lastPolledAt?.let { "Last checked ${ageFromIso(it)} ago" } ?: "Check needs attention") {
                         Text(wait.lastError ?: "Waiting for the next result.", style = MaterialTheme.typography.bodySmall, color = if (wait.lastError != null) Amber else TextSecondary)
@@ -1463,12 +1432,8 @@ private fun AgentWorkSections(session: ClientSession) {
             }
         }
     }
-    val history = session.obligations?.reviewHistory.orEmpty()
     val finished = session.jobs.filter { it.state !in listOf("pending", "running") }
-    if (history.isNotEmpty() || finished.isNotEmpty()) AgentDisclosure("History", "${history.size} pull requests · ${finished.size} finished jobs") {
-        history.forEach { review ->
-            ActivityDetail("${review.repo.substringAfterLast('/')} #${review.prNumber}", "${review.landedCount} reviews received · ${review.landedRequestedByAgent} of ${review.requestedByAgent} requested by this agent received", Violet)
-        }
+    if (finished.isNotEmpty()) AgentDisclosure("Job history", "${finished.size} finished jobs") {
         finished.forEach { job -> ActivityDetail(job.label, jobSummary(job).removePrefix("${job.label} · "), if (job.exitCode == null || job.exitCode == 0) TextSecondary else Rose) }
     }
 }
@@ -1507,13 +1472,10 @@ private fun WhatSummarySection(
             if (index > 0) {
                 HorizontalDivider(color = Border)
             }
-            if (entry.isUpdate) {
-                Text(
-                    text = "Update · ${ageFromIso(entry.createdAt)}",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = Cyan,
-                )
-            }
+            Text(
+                text = "${if (entry.isUpdate) "Update" else "Summary"} · ${relativeSummaryAge(entry.createdAt)}",
+                style = MaterialTheme.typography.labelMedium, color = TextMuted,
+            )
             MarkdownText(entry.markdown)
         }
 
@@ -1725,4 +1687,13 @@ private fun providerTint(provider: String?): Color = when (provider) {
     "claude" -> Fuchsia
     "codex-app" -> Violet
     else -> TextSecondary
+}
+
+@Composable
+private fun relativeSummaryAge(timestamp: String?): String {
+    var now by remember { mutableStateOf(java.time.OffsetDateTime.now()) }
+    LaunchedEffect(timestamp) {
+        while (true) { now = java.time.OffsetDateTime.now(); kotlinx.coroutines.delay(60_000) }
+    }
+    return summaryAgeLabel(timestamp, now)
 }

@@ -31,6 +31,9 @@ import retrofit2.http.Path
 import retrofit2.http.Query
 
 interface ApiService {
+    @GET("client/host-status")
+    suspend fun getHostStatus(): li.rajeshgo.sm.data.model.HostStatus
+
     @GET("client/session-models")
     suspend fun getSessionModels(@Query("provider") provider: String): li.rajeshgo.sm.data.model.SessionModelsResponse
 

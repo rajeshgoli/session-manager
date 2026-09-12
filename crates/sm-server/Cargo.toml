@@ -24,7 +24,7 @@ serde_yaml = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
 time = { workspace = true, features = ["formatting", "local-offset", "macros", "parsing"] }
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 ureq = { workspace = true }
 
 [dev-dependencies]

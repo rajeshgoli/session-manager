@@ -527,3 +527,14 @@ fun terminalConnectionLabel(status: String): String = when (status) {
 
 fun terminalStatusAfterServerEvent(current: String, event: String): String =
     if (event in setOf("pong", "resized")) current else event
+
+fun summaryAgeLabel(timestamp: String?, now: OffsetDateTime = OffsetDateTime.now()): String {
+    val parsed = parseIso(timestamp) ?: return "Time unavailable"
+    val minutes = Duration.between(parsed, now).toMinutes().coerceAtLeast(0)
+    return when {
+        minutes < 1 -> "Just now"
+        minutes < 60 -> "$minutes min${if (minutes == 1L) "" else "s"} ago"
+        minutes < 1440 -> "${minutes / 60} hour${if (minutes / 60 == 1L) "" else "s"} ago"
+        else -> "${minutes / 1440} day${if (minutes / 1440 == 1L) "" else "s"} ago"
+    }
+}

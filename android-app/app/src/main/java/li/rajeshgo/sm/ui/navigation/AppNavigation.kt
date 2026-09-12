@@ -49,7 +49,7 @@ fun AppNavigation(
         composable(Routes.SETTINGS) {
             SettingsScreen(
                 onNavigateToWatch = {
-                    navController.navigate(Routes.WATCH) {
+                    if (!navController.popBackStack()) navController.navigate(Routes.WATCH) {
                         popUpTo(Routes.SETTINGS) { inclusive = true }
                     }
                 },

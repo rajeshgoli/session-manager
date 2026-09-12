@@ -18,6 +18,15 @@ import li.rajeshgo.sm.data.security.CloudflareDeviceCredentialManager
 import li.rajeshgo.sm.data.security.DeviceKeyManager
 
 data class SettingsUiState(
+    val hostStatus: li.rajeshgo.sm.data.model.HostStatus? = null,
+    val hostLoading: Boolean = false,
+    val hostError: String? = null,
+    val studioSshEnabled: Boolean = false,
+    val studioSshLoaded: Boolean = false,
+    val studioSshBusy: Boolean = false,
+    val studioSshHost: String = "",
+    val studioSshStatus: String = "off",
+    val studioSshError: String? = null,
     val serverUrl: String = "",
     val userEmail: String = "",
     val userName: String = "",
@@ -45,6 +54,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private val cloudflareCredentialManager = CloudflareDeviceCredentialManager()
     private val deviceEnrollmentRepository = DeviceEnrollmentRepository(settingsRepository, deviceKeyManager)
 
+    private var sshGeneration = 0
     private val _uiState = MutableStateFlow(SettingsUiState())
     val uiState: StateFlow<SettingsUiState> = _uiState
 
@@ -66,6 +76,47 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    fun refreshHostStatus() {
+        if (_uiState.value.hostLoading) return
+        _uiState.value = _uiState.value.copy(hostLoading = true, hostError = null)
+        viewModelScope.launch {
+            runCatching { sessionRepository.fetchHostStatus(settingsRepository.serverUrl.first(), settingsRepository.accessToken.first()) }
+                .onSuccess { _uiState.value = _uiState.value.copy(hostStatus = it, hostLoading = false) }
+                .onFailure { _uiState.value = _uiState.value.copy(hostError = "Couldn't load host status. Try again.", hostLoading = false) }
+        }
+    }
+
+    fun refreshStudioSshStatus() {
+        if (_uiState.value.studioSshBusy) return
+        val generation = sshGeneration
+        viewModelScope.launch {
+            val url = settingsRepository.serverUrl.first()
+            val token = settingsRepository.accessToken.first()
+            if (url.isBlank() || token.isBlank()) return@launch
+            runCatching { sessionRepository.fetchStudioSshStatus(url, token) }
+                .onSuccess { status ->
+                    if (generation == sshGeneration && !_uiState.value.studioSshBusy) _uiState.value = _uiState.value.copy(
+                        studioSshEnabled = status.enabled, studioSshHost = status.host, studioSshStatus = status.status,
+                        studioSshLoaded = true, studioSshError = status.error,
+                    )
+                }.onFailure {
+                    if (generation == sshGeneration) _uiState.value = _uiState.value.copy(studioSshError = "Couldn't check Studio SSH.")
+                }
+        }
+    }
+
+    fun toggleStudioSsh(enabled: Boolean) {
+        if (_uiState.value.studioSshBusy) return
+        sshGeneration++
+        _uiState.value = _uiState.value.copy(studioSshBusy = true, studioSshError = null)
+        viewModelScope.launch {
+            sessionRepository.setStudioSsh(settingsRepository.serverUrl.first(), settingsRepository.accessToken.first(), enabled)
+                .onSuccess { status -> _uiState.value = _uiState.value.copy(studioSshEnabled = status.enabled, studioSshHost = status.host, studioSshStatus = status.status, studioSshLoaded = true, studioSshError = status.error) }
+                .onFailure { _uiState.value = _uiState.value.copy(studioSshError = "Couldn't change Studio SSH. Try again.") }
+            _uiState.value = _uiState.value.copy(studioSshBusy = false)
+        }
+    }
+
     fun updateServerUrl(value: String) {
         _uiState.value = _uiState.value.copy(serverUrl = value, error = null)
     }
@@ -83,6 +134,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             }.onSuccess { bootstrap ->
                 _uiState.value = _uiState.value.copy(bootstrap = bootstrap, error = null, serverUrl = serverUrl)
                 refreshUpdate()
+                refreshStudioSshStatus()
             }.onFailure { error ->
                 _uiState.value = _uiState.value.copy(error = error.message ?: "Failed to load bootstrap")
             }
