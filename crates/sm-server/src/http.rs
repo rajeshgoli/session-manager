@@ -2319,19 +2319,22 @@ async fn client_analytics_summary(
     )?;
     let mut summary = build_mobile_analytics_summary(&state.config, &state.session_store)?;
     let sessions = state.session_store.list_sessions(false)?;
-    let working = sessions
-        .into_iter()
-        .filter(|session| {
-            let response =
-                serde_json::to_value(session_response_with_live_activity(&state, session.clone()))
-                    .unwrap_or(Value::Null);
-            matches!(
-                response["activity_state"].as_str(),
-                Some("working" | "thinking")
-            )
-        })
-        .count();
-    summary["workload"]["agents_working"] = json!(working);
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for session in sessions {
+        let response = serde_json::to_value(session_response_with_live_activity(&state, session))
+            .unwrap_or(Value::Null);
+        let activity = match response["activity_state"].as_str() {
+            Some("working") => "working",
+            Some("thinking") => "thinking",
+            Some("waiting" | "waiting_permission" | "waiting_input") => "waiting",
+            _ => "idle",
+        };
+        *counts.entry(activity.into()).or_default() += 1;
+    }
+    summary["workload"]["agents_working"] =
+        json!(counts.get("working").unwrap_or(&0) + counts.get("thinking").unwrap_or(&0));
+    summary["state_distribution"] = json!(["working", "thinking", "waiting", "idle"]
+        .map(|key| json!({"key": key, "label": key, "count": counts.get(key).unwrap_or(&0)})));
     Ok(Json(summary))
 }
 
@@ -18578,6 +18581,38 @@ mod tests {
         let (status, body) = response_json(response).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["ticket_id"].as_str().unwrap().starts_with("att_"));
+    }
+
+    #[tokio::test]
+    async fn mobile_analytics_activity_distribution_matches_workload_totals() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let app = router(AppState::new(mobile_ticket_config(&signing_key)));
+        let response = app
+            .oneshot(local_request(
+                Method::GET,
+                "/client/analytics/summary",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body["state_distribution"].as_array().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["count"].as_u64().unwrap())
+                .sum::<u64>(),
+            body["workload"]["agents_live"].as_u64().unwrap()
+        );
+        let working = rows
+            .iter()
+            .filter(|row| row["key"] == "working" || row["key"] == "thinking")
+            .map(|row| row["count"].as_u64().unwrap())
+            .sum::<u64>();
+        assert_eq!(
+            working,
+            body["workload"]["agents_working"].as_u64().unwrap()
+        );
     }
 
     #[tokio::test]
