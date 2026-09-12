@@ -6076,6 +6076,7 @@ async fn list_queue_jobs(
     let jobs = limit_terminal_jobs_per_session(jobs, query.terminal_limit_per_session);
     // Resolve names from one registry snapshot, not two full reads per job.
     let sessions = state.session_store.list_sessions(!query.current_sessions_only)?;
+    let current_session_ids: BTreeSet<_> = sessions.iter().map(|session| session.id.clone()).collect();
     let mut names = BTreeMap::new();
     for session in &sessions {
         names.insert(session.id.clone(), session_display_name(session.clone()));
@@ -6095,7 +6096,7 @@ async fn list_queue_jobs(
         if query.current_sessions_only {
             let recipient = job.notify_session_id.as_deref().filter(|id| !id.trim().is_empty())
                 .or(job.requester_session_id.as_deref());
-            if !recipient.is_some_and(|id| names.contains_key(id.trim())) { continue; }
+            if !recipient.is_some_and(|id| current_session_ids.contains(id.trim())) { continue; }
         }
         let requester_name = job.requester_session_id.as_ref().and_then(|id| names.get(id.trim())).cloned();
         let notify_name = job.notify_session_id.as_ref().map(|id| names.get(id.trim()).unwrap_or(id).clone());
@@ -18683,6 +18684,7 @@ mod tests {
         stopped["status"] = json!("stopped");
         stopped["completion_status"] = json!("retired");
         fixture["sessions"].as_array_mut().unwrap().push(stopped);
+        fixture["sessions"][0]["friendly_name"] = json!("other-agent");
         fs::write(&config.paths.state_file, serde_json::to_vec(&fixture).unwrap()).unwrap();
         let queue_dir = config.queue_runner_state_dir();
         for (index, (recipient, status)) in [
