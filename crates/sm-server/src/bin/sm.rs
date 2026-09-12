@@ -450,9 +450,11 @@ const QUEUE_SCHEDULING_HELP: &str = "Choosing a job type:
 While perf is running, new jobs wait. While perf waits for tests/cooldown,
 new jobs also wait so it can get a quiet window. Existing services keep running.
 All types are subject to configured concurrency limits; pending jobs retry
-admission automatically. Use 'sm queue status <label-or-id>' for the current
-reason and named blockers. Use tests for required gates, background only when
-interruption is acceptable. Set --label to a meaningful, unique name.";
+admission automatically for up to 5 minutes by default, then notify the agent
+without starting. Use --max-wait for an explicit longer admission window. Use
+'sm queue status <label-or-id>' for the current reason and named blockers. Use
+tests for required gates, background only when interruption is acceptable. Set
+--label to a meaningful, unique name.";
 
 #[derive(Args)]
 #[command(after_help = QUEUE_SCHEDULING_HELP)]
@@ -490,6 +492,12 @@ struct QueueRunArgs {
         help = "Positive timeout (for example 90s or 2h); 'none' is background-only"
     )]
     timeout: Option<String>,
+    #[arg(
+        long,
+        value_name = "DURATION",
+        help = "Maximum time to wait for admission (default: 5m)"
+    )]
+    max_wait: Option<String>,
     #[arg(
         long,
         value_name = "PERCENT",
@@ -1327,6 +1335,14 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
         .as_deref()
         .map(|value| parse_queue_timeout_seconds_for_type(&args.job_type, value))
         .transpose()?;
+    let max_wait_seconds = args
+        .max_wait
+        .as_deref()
+        .map(parse_duration_seconds)
+        .transpose()?;
+    if max_wait_seconds.is_some_and(|seconds| seconds <= 0) {
+        bail!("--max-wait must be greater than 0");
+    }
     let cpu_percent = args.cpu.as_deref().map(parse_queue_percent).transpose()?;
     let gpu_percent = args
         .gpu
@@ -1404,6 +1420,9 @@ fn run_queue_run(client: &ApiClient, args: QueueRunArgs) -> Result<()> {
     }
     if let Some(timeout_seconds) = timeout_seconds {
         body["timeout_seconds"] = json!(timeout_seconds);
+    }
+    if let Some(max_wait_seconds) = max_wait_seconds {
+        body["max_wait_seconds"] = json!(max_wait_seconds);
     }
     if let Some(cpu_percent) = cpu_percent {
         body["cpu_percent"] = json!(cpu_percent);
@@ -1572,7 +1591,11 @@ fn queue_waiting_text(job: &Value) -> Option<String> {
             .as_i64()
             .map(|seconds| format!(" Estimated wait: up to {seconds}s."))
             .unwrap_or_default();
-        return Some(format!("{detail}{estimate}"));
+        let deadline = job["holding"]["wait_remaining_seconds"]
+            .as_i64()
+            .map(|seconds| format!(" Queue deadline in {seconds}s."))
+            .unwrap_or_default();
+        return Some(format!("{detail}{estimate}{deadline}"));
     }
     Some(
         match job["holding_reason"].as_str().filter(|s| !s.is_empty()) {
@@ -1596,6 +1619,10 @@ fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
     println!("ID: {}", payload["id"].as_str().unwrap_or(job_id));
     println!("Type: {}", payload["type"].as_str().unwrap_or("-"));
     println!("State: {}", payload["state"].as_str().unwrap_or("-"));
+    println!(
+        "Max wait: {}s",
+        payload["max_wait_seconds"].as_i64().unwrap_or(300)
+    );
     if payload["type"].as_str() == Some("perf") {
         println!(
             "Budget: cpu={}% gpu={}% memory={}B time={}s",
@@ -6352,6 +6379,8 @@ mod tests {
             "/tmp",
             "--timeout",
             "10m",
+            "--max-wait",
+            "15m",
             "--env",
             "EXTRA=1",
             "--notify",
@@ -6372,6 +6401,7 @@ mod tests {
         assert_eq!(run_args.label.as_deref(), Some("unit queue"));
         assert_eq!(run_args.cwd.as_deref(), Some("/tmp"));
         assert_eq!(run_args.timeout.as_deref(), Some("10m"));
+        assert_eq!(run_args.max_wait.as_deref(), Some("15m"));
         assert_eq!(run_args.env_pairs, vec!["EXTRA=1"]);
         assert_eq!(run_args.notify.as_deref(), Some("run12345"));
         assert_eq!(run_args.command, vec!["echo", "hello"]);

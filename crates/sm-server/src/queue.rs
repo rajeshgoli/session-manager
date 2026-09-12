@@ -152,6 +152,7 @@ pub struct QueueJobRecord {
     pub argv: Option<Vec<String>>,
     pub script_path: Option<String>,
     pub timeout_seconds: i64,
+    pub max_wait_seconds: i64,
     pub cpu_percent: Option<u8>,
     pub gpu_percent: Option<u8>,
     pub memory_bytes: Option<i64>,
@@ -223,6 +224,7 @@ struct QueueJobRuntimeRecord {
     log_path: Option<String>,
     exit_code_path: Option<String>,
     timeout_seconds: i64,
+    max_wait_seconds: i64,
     cpu_percent: Option<u8>,
     gpu_percent: Option<u8>,
     memory_bytes: Option<i64>,
@@ -936,6 +938,18 @@ impl RetainedQueueStore {
         state_dir: &Path,
         request: CreateQueueJob,
     ) -> Result<QueueJobRecord> {
+        Self::create_queue_job_in_state_dir_with_max_wait(
+            state_dir,
+            request,
+            DEFAULT_QUEUE_MAX_WAIT_SECONDS,
+        )
+    }
+
+    pub fn create_queue_job_in_state_dir_with_max_wait(
+        state_dir: &Path,
+        request: CreateQueueJob,
+        max_wait_seconds: i64,
+    ) -> Result<QueueJobRecord> {
         std::fs::create_dir_all(state_dir).with_context(|| {
             format!(
                 "failed to create queue runner state dir {}",
@@ -954,7 +968,7 @@ impl RetainedQueueStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         init_queue_jobs_schema(&conn)?;
-        create_queue_job_conn(&conn, state_dir, request)
+        create_queue_job_conn(&conn, state_dir, request, max_wait_seconds)
     }
 
     pub fn start_queue_job_in_state_dir(
@@ -2603,6 +2617,7 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
             script_path TEXT,
             env_json TEXT NOT NULL,
             timeout_seconds INTEGER NOT NULL,
+            max_wait_seconds INTEGER NOT NULL DEFAULT 300,
             cpu_percent INTEGER,
             gpu_percent INTEGER,
             memory_bytes INTEGER,
@@ -2652,6 +2667,12 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
     ensure_column(conn, "queue_jobs", "cpu_percent", "INTEGER")?;
     ensure_column(conn, "queue_jobs", "gpu_percent", "INTEGER")?;
     ensure_column(conn, "queue_jobs", "memory_bytes", "INTEGER")?;
+    ensure_column(
+        conn,
+        "queue_jobs",
+        "max_wait_seconds",
+        "INTEGER NOT NULL DEFAULT 300",
+    )?;
     Ok(())
 }
 
@@ -2714,6 +2735,7 @@ fn create_queue_job_conn(
     conn: &Connection,
     state_dir: &Path,
     request: CreateQueueJob,
+    max_wait_seconds: i64,
 ) -> Result<QueueJobRecord> {
     let id = generate_queue_job_id();
     let job_dir = state_dir.join(&id);
@@ -2759,14 +2781,14 @@ fn create_queue_job_conn(
         r#"
         INSERT INTO queue_jobs
             (id, type, label, requester_session_id, notify_session_id, cwd,
-             argv_json, script_path, env_json, timeout_seconds, cpu_percent,
+             argv_json, script_path, env_json, timeout_seconds, max_wait_seconds, cpu_percent,
              gpu_percent, memory_bytes, state,
              holding_reason, queued_at, started_at, finished_at, pid,
              process_group_id, exit_code, log_path, exit_code_path, wrapper_path,
              queued_notified_at, started_notified_at, completion_notified_at)
         VALUES
-            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'pending',
-             NULL, ?14, NULL, NULL, NULL, NULL, NULL, ?15, ?16, ?17,
+            (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'pending',
+             NULL, ?15, NULL, NULL, NULL, NULL, NULL, ?16, ?17, ?18,
              NULL, NULL, NULL)
         "#,
         params![
@@ -2780,6 +2802,7 @@ fn create_queue_job_conn(
             script_path,
             env_json,
             request.timeout_seconds,
+            max_wait_seconds,
             request.cpu_percent,
             request.gpu_percent,
             request.memory_bytes,
@@ -2876,6 +2899,7 @@ fn get_queue_job_runtime_conn(
         r#"
         SELECT id, type, state, notify_session_id, queued_at, started_at, finished_at,
                holding_reason, wrapper_path, log_path, exit_code_path, timeout_seconds,
+               max_wait_seconds,
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
                exit_code, completion_notified_at, label
         FROM queue_jobs
@@ -2906,14 +2930,15 @@ fn get_queue_job_runtime_conn(
                 log_path: row.get(9)?,
                 exit_code_path: row.get(10)?,
                 timeout_seconds: row.get(11)?,
-                cpu_percent: row.get(12)?,
-                gpu_percent: row.get(13)?,
-                memory_bytes: row.get(14)?,
-                pid: row.get(15)?,
-                process_group_id: row.get(16)?,
-                exit_code: row.get(17)?,
-                completion_notified_at: row.get(18)?,
-                label: row.get(19)?,
+                max_wait_seconds: row.get(12)?,
+                cpu_percent: row.get(13)?,
+                gpu_percent: row.get(14)?,
+                memory_bytes: row.get(15)?,
+                pid: row.get(16)?,
+                process_group_id: row.get(17)?,
+                exit_code: row.get(18)?,
+                completion_notified_at: row.get(19)?,
+                label: row.get(20)?,
             })
         })
         .optional()
@@ -2925,6 +2950,7 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
         r#"
         SELECT id, type, state, notify_session_id, queued_at, started_at, finished_at,
                holding_reason, wrapper_path, log_path, exit_code_path, timeout_seconds,
+               max_wait_seconds,
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
                exit_code, completion_notified_at, label
         FROM queue_jobs
@@ -2946,14 +2972,15 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                 log_path: row.get(9)?,
                 exit_code_path: row.get(10)?,
                 timeout_seconds: row.get(11)?,
-                cpu_percent: row.get(12)?,
-                gpu_percent: row.get(13)?,
-                memory_bytes: row.get(14)?,
-                pid: row.get(15)?,
-                process_group_id: row.get(16)?,
-                exit_code: row.get(17)?,
-                completion_notified_at: row.get(18)?,
-                label: row.get(19)?,
+                max_wait_seconds: row.get(12)?,
+                cpu_percent: row.get(13)?,
+                gpu_percent: row.get(14)?,
+                memory_bytes: row.get(15)?,
+                pid: row.get(16)?,
+                process_group_id: row.get(17)?,
+                exit_code: row.get(18)?,
+                completion_notified_at: row.get(19)?,
+                label: row.get(20)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -2980,6 +3007,8 @@ fn admit_pending_queue_jobs_conn(
     let _admission_guard = QUEUE_ADMISSION_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let pending_jobs = list_queue_job_runtime_records_conn(conn)?;
+    expire_pending_queue_jobs_conn(conn, &pending_jobs, message_queue_db_path)?;
     // Validate before clearing any existing holds: after a restart, preserved
     // service processes may outnumber a newly lowered configuration.  In that
     // state, admitting even one finite job would violate the configured global
@@ -3003,16 +3032,13 @@ fn admit_pending_queue_jobs_conn(
             summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "perf_running")?;
             break;
         }
-        let pending_perf = oldest_pending_queue_job(&jobs, "perf");
-        let perf_resource_hold =
-            pending_perf.and_then(|job| perf_resource_hold_reason(job, admission_policy));
-        if let (Some(job), Some(reason)) = (pending_perf, perf_resource_hold) {
-            summary.held += mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), reason)?;
-            summary.retry_after_seconds = Some(admission_policy.resource_retry_interval_seconds);
-        }
-        let perf_waiting_for_quiet_window = pending_perf.is_some()
-            && perf_resource_hold.is_none()
-            && !perf_blocked_by_tests_after_perf(&jobs);
+        let ready_perf = jobs.iter().find(|job| {
+            job.state == "pending"
+                && job.job_type == "perf"
+                && perf_resource_hold_reason(job, admission_policy).is_none()
+        });
+        let perf_waiting_for_quiet_window =
+            ready_perf.is_some() && !perf_blocked_by_tests_after_perf(&jobs);
         if perf_waiting_for_quiet_window {
             if running_queue_job_count(&jobs, Some("tests")) > 0 {
                 summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "awaiting_tests")?;
@@ -3028,7 +3054,7 @@ fn admit_pending_queue_jobs_conn(
                 break;
             }
         }
-        if perf_resource_hold.is_none()
+        if ready_perf.is_some()
             && displace_background_for_perf_conn(
                 conn,
                 &jobs,
@@ -3043,15 +3069,8 @@ fn admit_pending_queue_jobs_conn(
             summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "concurrency_cap")?;
             break;
         }
-        let blocked_perf_id =
-            perf_resource_hold.and_then(|_| pending_perf.map(|job| job.id.as_str()));
-        let Some(candidate_id) = next_admissible_queue_job_id_conn(
-            conn,
-            &jobs,
-            admission_policy,
-            &mut summary,
-            blocked_perf_id,
-        )?
+        let Some(candidate_id) =
+            next_admissible_queue_job_id_conn(conn, &jobs, admission_policy, &mut summary)?
         else {
             break;
         };
@@ -3076,6 +3095,19 @@ fn admit_pending_queue_jobs_conn(
             }
         }
     }
+    let deadline_retry = list_queue_job_runtime_records_conn(conn)?
+        .iter()
+        .filter(|job| job.state == "pending")
+        .filter_map(queue_job_wait_remaining_seconds)
+        .min()
+        .map(|seconds| seconds.max(1) as u64);
+    if let Some(seconds) = deadline_retry {
+        summary.retry_after_seconds = Some(
+            summary
+                .retry_after_seconds
+                .map_or(seconds, |current| current.min(seconds)),
+        );
+    }
     if let Some(seconds) = summary.retry_after_seconds {
         schedule_queue_admission_retry(
             state_dir.to_path_buf(),
@@ -3086,6 +3118,26 @@ fn admit_pending_queue_jobs_conn(
         );
     }
     Ok(summary)
+}
+
+fn queue_job_wait_remaining_seconds(job: &QueueJobRuntimeRecord) -> Option<i64> {
+    let elapsed = queue_elapsed_since(&job.queued_at, OffsetDateTime::now_utc())?;
+    Some(job.max_wait_seconds.saturating_sub(elapsed))
+}
+
+fn expire_pending_queue_jobs_conn(
+    conn: &Connection,
+    jobs: &[QueueJobRuntimeRecord],
+    message_queue_db_path: &Path,
+) -> Result<usize> {
+    let mut expired = 0;
+    for job in jobs.iter().filter(|job| job.state == "pending") {
+        if queue_job_wait_remaining_seconds(job).is_some_and(|seconds| seconds <= 0) {
+            finish_queue_job_conn(conn, job, "wait_expired", None, Some(message_queue_db_path))?;
+            expired += 1;
+        }
+    }
+    Ok(expired)
 }
 
 fn ensure_service_capacity_reserve_before_admission(
@@ -3136,13 +3188,17 @@ fn schedule_queue_admission_retry(
     admission_policy: QueueAdmissionPolicy,
     delay_seconds: u64,
 ) {
-    if !claim_queue_admission_retry(&state_dir) {
+    let delay = StdDuration::from_secs(delay_seconds.max(1));
+    let deadline = Instant::now() + delay;
+    if !claim_queue_admission_retry(&state_dir, deadline) {
         return;
     }
     let retry_key = state_dir.clone();
     thread::spawn(move || {
-        thread::sleep(StdDuration::from_secs(delay_seconds.max(1)));
-        release_queue_admission_retry(&retry_key);
+        thread::sleep(delay);
+        if !release_queue_admission_retry_if_current(&retry_key, deadline) {
+            return;
+        }
         let _ =
             RetainedQueueStore::admit_queue_jobs_in_state_dir_continuing_after_failed_start_with_policy(
                 &state_dir,
@@ -3153,18 +3209,37 @@ fn schedule_queue_admission_retry(
     });
 }
 
-fn queue_admission_retries() -> &'static Mutex<BTreeSet<PathBuf>> {
-    static RETRIES: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
-    RETRIES.get_or_init(|| Mutex::new(BTreeSet::new()))
+fn queue_admission_retries() -> &'static Mutex<BTreeMap<PathBuf, Instant>> {
+    static RETRIES: OnceLock<Mutex<BTreeMap<PathBuf, Instant>>> = OnceLock::new();
+    RETRIES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn claim_queue_admission_retry(state_dir: &Path) -> bool {
-    queue_admission_retries()
+fn claim_queue_admission_retry(state_dir: &Path, deadline: Instant) -> bool {
+    let mut retries = queue_admission_retries()
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(state_dir.to_path_buf())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if retries
+        .get(state_dir)
+        .is_some_and(|current| *current <= deadline)
+    {
+        return false;
+    }
+    retries.insert(state_dir.to_path_buf(), deadline);
+    true
 }
 
+fn release_queue_admission_retry_if_current(state_dir: &Path, deadline: Instant) -> bool {
+    let mut retries = queue_admission_retries()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if retries.get(state_dir) != Some(&deadline) {
+        return false;
+    }
+    retries.remove(state_dir);
+    true
+}
+
+#[cfg(test)]
 fn release_queue_admission_retry(state_dir: &Path) {
     queue_admission_retries()
         .lock()
@@ -3174,6 +3249,7 @@ fn release_queue_admission_retry(state_dir: &Path) {
 
 const DEFAULT_MAX_RUNNING_QUEUE_JOBS: i64 = 2;
 const DEFAULT_PERF_COOLDOWN_SECONDS: i64 = 30;
+pub const DEFAULT_QUEUE_MAX_WAIT_SECONDS: i64 = 5 * 60;
 const QUEUE_JOB_TYPE_ORDER: [&str; 4] = ["perf", "tests", "background", "service"];
 static QUEUE_ADMISSION_LOCK: Mutex<()> = Mutex::new(());
 const PERF_MEMORY_SAMPLE_INTERVAL: StdDuration = StdDuration::from_millis(250);
@@ -3185,30 +3261,39 @@ fn next_admissible_queue_job_id_conn(
     jobs: &[QueueJobRuntimeRecord],
     admission_policy: QueueAdmissionPolicy,
     summary: &mut QueueAdmissionSummary,
-    blocked_perf_id: Option<&str>,
 ) -> Result<Option<String>> {
     for job_type in QUEUE_JOB_TYPE_ORDER {
-        let Some(job) = oldest_pending_queue_job(jobs, job_type) else {
+        let Some(oldest) = oldest_pending_queue_job(jobs, job_type) else {
             continue;
         };
-        if blocked_perf_id == Some(job.id.as_str()) {
-            continue;
-        }
         if running_queue_job_count(jobs, Some(job_type))
             >= admission_policy.max_concurrent_jobs(job_type)
         {
             summary.held +=
-                mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), "concurrency_cap")?;
+                mark_pending_queue_jobs_holding_conn(conn, Some(&oldest.id), "concurrency_cap")?;
             continue;
         }
-        if job_type == "perf" {
-            if let Some(reason) = perf_resource_hold_reason(job, admission_policy) {
-                summary.held += mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), reason)?;
-                summary.retry_after_seconds =
-                    Some(admission_policy.resource_retry_interval_seconds);
-                continue;
+        let job = if job_type == "perf" {
+            let mut ready = None;
+            for pending in jobs
+                .iter()
+                .filter(|job| job.state == "pending" && job.job_type == "perf")
+            {
+                if let Some(reason) = perf_resource_hold_reason(pending, admission_policy) {
+                    summary.held +=
+                        mark_pending_queue_jobs_holding_conn(conn, Some(&pending.id), reason)?;
+                    summary.retry_after_seconds =
+                        Some(admission_policy.resource_retry_interval_seconds);
+                } else {
+                    ready = Some(pending);
+                    break;
+                }
             }
-        }
+            let Some(job) = ready else { continue };
+            job
+        } else {
+            oldest
+        };
         if job_type == "perf" && perf_cooldown_active(jobs, admission_policy) {
             summary.held +=
                 mark_pending_queue_jobs_holding_conn(conn, Some(&job.id), "perf_cooldown")?;
@@ -4024,11 +4109,11 @@ fn finish_queue_job_conn(
         r#"
         UPDATE queue_jobs
         SET state = ?2,
-            holding_reason = NULL,
+            holding_reason = CASE WHEN ?2 = 'wait_expired' THEN holding_reason ELSE NULL END,
             finished_at = ?3,
             exit_code = ?4,
             completion_notification_required = 1
-        WHERE id = ?1 AND state NOT IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'displaced', 'memory_exceeded')
+        WHERE id = ?1 AND state NOT IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded')
         "#,
         params![job.id, state, finished_at, exit_code],
     )?;
@@ -4054,7 +4139,7 @@ fn retry_unnotified_queue_job_completions_conn(
         r#"
         SELECT id
         FROM queue_jobs
-        WHERE state IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'displaced', 'memory_exceeded')
+        WHERE state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded')
           AND completion_notification_required = 1
           AND completion_notified_at IS NULL
         ORDER BY finished_at, id
@@ -4232,11 +4317,20 @@ pub fn queue_hold_explanation(
         }
         "memory_pressure" => (
             "waiting for safe memory headroom".into(),
-            format!(
-                "The performance job needs {} bytes plus the host safety reserve. It remains queued and admission retries every {} seconds.",
-                job.memory_bytes.unwrap_or(0),
-                policy.resource_retry_interval_seconds
-            ),
+            {
+                let reserve = effective_memory_reserve_bytes(policy.memory_min_free_bytes);
+                let required = job.memory_bytes.unwrap_or(0).saturating_add(reserve);
+                let available = host_memory_capacity().map(|(_, available)| available);
+                format!(
+                    "Available memory: {}. Required: {} ({} job budget + {} safety reserve). Admission retries every {} seconds and gives up after {} seconds.",
+                    available.map_or_else(|| "unknown".to_owned(), memory_amount_text),
+                    memory_amount_text(required),
+                    memory_amount_text(job.memory_bytes.unwrap_or(0)),
+                    memory_amount_text(reserve),
+                    policy.resource_retry_interval_seconds,
+                    job.max_wait_seconds
+                )
+            },
         ),
         "resource_budget_missing" => (
             "waiting for resource budget metadata".into(),
@@ -4266,9 +4360,13 @@ pub fn queue_hold_explanation(
         "perf_cooldown" => Some(policy.perf_cooldown_seconds.max(0)),
         _ => blocker_seconds,
     };
+    let wait_remaining_seconds = queue_elapsed_since(&job.queued_at, OffsetDateTime::now_utc())
+        .map(|elapsed| job.max_wait_seconds.saturating_sub(elapsed).max(0));
     Some(serde_json::json!({
         "summary": summary, "detail": detail,
         "estimated_wait_seconds": estimated_wait_seconds,
+        "max_wait_seconds": job.max_wait_seconds,
+        "wait_remaining_seconds": wait_remaining_seconds,
         "blocking_jobs": blockers.iter().map(|j| serde_json::json!({"id":j.id,"label":j.label,"type":j.job_type,"state":j.state})).collect::<Vec<_>>()
     }))
 }
@@ -4279,6 +4377,11 @@ fn queue_job_remaining_seconds(job: &QueueJobRecord) -> Option<i64> {
     }
     let elapsed = queue_elapsed_since(job.started_at.as_deref()?, OffsetDateTime::now_utc())?;
     Some(job.timeout_seconds.saturating_sub(elapsed).max(0))
+}
+
+fn memory_amount_text(bytes: i64) -> String {
+    const GIB: f64 = (1024_u64 * 1024 * 1024) as f64;
+    format!("{:.1} GiB", bytes as f64 / GIB)
 }
 
 /// A bounded, path-safe readable alias; the durable ID prevents collisions.
@@ -4309,6 +4412,7 @@ fn queue_job_completion_text(
     let queued = queue_duration_text(Some(&job.queued_at), Some(queue_end));
     let termination_text = match state {
         "timed_out" => " termination=timeout",
+        "wait_expired" => " termination=queue_wait_timeout",
         "cancelled" => " termination=cancelled",
         "displaced" => " termination=perf_displacement",
         "memory_exceeded" => " termination=memory_budget",
@@ -4329,8 +4433,28 @@ fn queue_job_completion_text(
     } else {
         String::new()
     };
+    let wait_text = if state == "wait_expired" {
+        let reason = job.holding_reason.as_deref().unwrap_or("not_admitted");
+        if reason == "memory_pressure" {
+            let reserve = effective_memory_reserve_bytes(8 * 1024 * 1024 * 1024);
+            let required = job.memory_bytes.unwrap_or(0).saturating_add(reserve);
+            let available = host_memory_capacity().map(|(_, available)| available);
+            format!(
+                " wait_reason=memory_pressure available={} required={} memory_budget={} safety_reserve={} max_wait={}s",
+                available.map_or_else(|| "unknown".to_owned(), memory_amount_text),
+                memory_amount_text(required),
+                memory_amount_text(job.memory_bytes.unwrap_or(0)),
+                memory_amount_text(reserve),
+                job.max_wait_seconds
+            )
+        } else {
+            format!(" wait_reason={reason} max_wait={}s", job.max_wait_seconds)
+        }
+    } else {
+        String::new()
+    };
     format!(
-        "[sm queue] {} completed: {}{}{}{} runtime={} queue={}. Log: {}. ID: {}",
+        "[sm queue] {} completed: {}{}{}{}{} runtime={} queue={}. Log: {}. ID: {}",
         if job.label.trim().is_empty() {
             &job.id
         } else {
@@ -4340,6 +4464,7 @@ fn queue_job_completion_text(
         termination_text,
         exit_text,
         budget_text,
+        wait_text,
         runtime,
         queued,
         job.log_path.as_deref().unwrap_or("-"),
@@ -4463,7 +4588,13 @@ fn process_exists(pid: i64) -> bool {
 fn is_terminal_queue_state(state: &str) -> bool {
     matches!(
         state,
-        "succeeded" | "failed" | "timed_out" | "cancelled" | "displaced" | "memory_exceeded"
+        "succeeded"
+            | "failed"
+            | "timed_out"
+            | "wait_expired"
+            | "cancelled"
+            | "displaced"
+            | "memory_exceeded"
     )
 }
 
@@ -4776,7 +4907,7 @@ fn list_queue_jobs_conn(
     if let Some(value) = filters.state {
         if value == "done" {
             where_clauses
-                .push("state IN ('succeeded', 'failed', 'timed_out', 'cancelled', 'displaced', 'memory_exceeded')");
+                .push("state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded')");
         } else {
             where_clauses.push("state = ?");
             values.push(value.into());
@@ -4785,11 +4916,11 @@ fn list_queue_jobs_conn(
         where_clauses.push("state IN ('pending', 'running')");
     }
 
-    let budget_columns = queue_job_budget_projection(conn)?;
+    let resource_columns = queue_job_resource_projection(conn)?;
     let mut query = format!(
         r#"
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
-               argv_json, script_path, timeout_seconds, {budget_columns}, state, holding_reason,
+               argv_json, script_path, timeout_seconds, {resource_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
                exit_code, log_path
         FROM queue_jobs
@@ -4818,11 +4949,11 @@ fn list_queue_jobs_conn(
 }
 
 fn get_queue_job_conn(conn: &Connection, job_id: &str) -> Result<Option<QueueJobRecord>> {
-    let budget_columns = queue_job_budget_projection(conn)?;
+    let resource_columns = queue_job_resource_projection(conn)?;
     let query = format!(
         r#"
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
-               argv_json, script_path, timeout_seconds, {budget_columns}, state, holding_reason,
+               argv_json, script_path, timeout_seconds, {resource_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
                exit_code, log_path
         FROM queue_jobs
@@ -4845,21 +4976,27 @@ fn get_queue_job_conn(conn: &Connection, job_id: &str) -> Result<Option<QueueJob
         .map_err(Into::into)
 }
 
-fn queue_job_budget_projection(conn: &Connection) -> Result<&'static str> {
+fn queue_job_resource_projection(conn: &Connection) -> Result<&'static str> {
     let mut statement = conn.prepare("PRAGMA table_info(queue_jobs)")?;
     let columns = statement
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<std::result::Result<BTreeSet<_>, _>>()?;
-    Ok(
-        if columns.contains("cpu_percent")
-            && columns.contains("gpu_percent")
-            && columns.contains("memory_bytes")
-        {
-            "cpu_percent, gpu_percent, memory_bytes"
-        } else {
-            "NULL AS cpu_percent, NULL AS gpu_percent, NULL AS memory_bytes"
-        },
-    )
+    let has_budgets = columns.contains("cpu_percent")
+        && columns.contains("gpu_percent")
+        && columns.contains("memory_bytes");
+    let has_max_wait = columns.contains("max_wait_seconds");
+    Ok(match (has_max_wait, has_budgets) {
+        (true, true) => "max_wait_seconds, cpu_percent, gpu_percent, memory_bytes",
+        (true, false) => {
+            "max_wait_seconds, NULL AS cpu_percent, NULL AS gpu_percent, NULL AS memory_bytes"
+        }
+        (false, true) => {
+            "300 AS max_wait_seconds, cpu_percent, gpu_percent, memory_bytes"
+        }
+        (false, false) => {
+            "300 AS max_wait_seconds, NULL AS cpu_percent, NULL AS gpu_percent, NULL AS memory_bytes"
+        }
+    })
 }
 
 fn queue_job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJobRecord> {
@@ -4890,18 +5027,19 @@ fn queue_job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJ
         argv,
         script_path: row.get(7)?,
         timeout_seconds: row.get(8)?,
-        cpu_percent: row.get(9)?,
-        gpu_percent: row.get(10)?,
-        memory_bytes: row.get(11)?,
-        state: row.get(12)?,
-        holding_reason: row.get(13)?,
-        queued_at: row.get(14)?,
-        started_at: row.get(15)?,
-        finished_at: row.get(16)?,
-        pid: row.get(17)?,
-        process_group_id: row.get(18)?,
-        exit_code: row.get(19)?,
-        log_path: row.get(20)?,
+        max_wait_seconds: row.get(9)?,
+        cpu_percent: row.get(10)?,
+        gpu_percent: row.get(11)?,
+        memory_bytes: row.get(12)?,
+        state: row.get(13)?,
+        holding_reason: row.get(14)?,
+        queued_at: row.get(15)?,
+        started_at: row.get(16)?,
+        finished_at: row.get(17)?,
+        pid: row.get(18)?,
+        process_group_id: row.get(19)?,
+        exit_code: row.get(20)?,
+        log_path: row.get(21)?,
     })
 }
 
@@ -5207,7 +5345,7 @@ mod tests {
     }
 
     #[test]
-    fn perf_memory_pressure_holds_an_accepted_job_instead_of_rejecting_it() {
+    fn oversized_perf_does_not_block_smaller_perf_or_other_work() {
         let state_dir = unique_temp_path("perf-memory-hold");
         let perf_job = RetainedQueueStore::create_queue_job_in_state_dir(
             &state_dir,
@@ -5227,7 +5365,25 @@ mod tests {
             },
         )
         .unwrap();
-        let tests_job = RetainedQueueStore::create_queue_job_in_state_dir(
+        let smaller_perf = RetainedQueueStore::create_queue_job_in_state_dir(
+            &state_dir,
+            CreateQueueJob {
+                job_type: "perf".into(),
+                label: "smaller perf".into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["true".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 60,
+                cpu_percent: Some(100),
+                gpu_percent: Some(0),
+                memory_bytes: Some(1),
+            },
+        )
+        .unwrap();
+        let _tests_job = RetainedQueueStore::create_queue_job_in_state_dir(
             &state_dir,
             CreateQueueJob {
                 job_type: "tests".into(),
@@ -5254,14 +5410,65 @@ mod tests {
                 &jobs,
                 QueueAdmissionPolicy::default(),
                 &mut summary,
-                None,
             )
             .unwrap(),
-            Some(tests_job.id.clone())
+            Some(smaller_perf.id.clone())
         );
         let held = get_queue_job_conn(&conn, &perf_job.id).unwrap().unwrap();
         assert_eq!(held.state, "pending");
         assert_eq!(held.holding_reason.as_deref(), Some("memory_pressure"));
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn pending_job_expires_after_max_wait_and_notifies_requester() {
+        let state_dir = unique_temp_path("queue-max-wait");
+        let message_queue_db = state_dir.join("messages.db");
+        let job = RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
+            &state_dir,
+            CreateQueueJob {
+                job_type: "perf".into(),
+                label: "blocked perf".into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["true".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 60,
+                cpu_percent: Some(100),
+                gpu_percent: Some(0),
+                memory_bytes: Some(i64::MAX),
+            },
+            1,
+        )
+        .unwrap();
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET queued_at = '2020-01-01T00:00:00Z', holding_reason = 'memory_pressure' WHERE id = ?1",
+            params![job.id],
+        )
+        .unwrap();
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+
+        assert_eq!(
+            expire_pending_queue_jobs_conn(&conn, &jobs, &message_queue_db).unwrap(),
+            1
+        );
+        let expired = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(expired.state, "wait_expired");
+        assert!(expired.started_at.is_none());
+        let notifications = RetainedQueueStore::new(message_queue_db)
+            .pending_messages_for_target_by_category("notify", "queue-completion", 10)
+            .unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(notifications[0]
+            .text
+            .contains("termination=queue_wait_timeout"));
+        assert!(notifications[0]
+            .text
+            .contains("wait_reason=memory_pressure"));
         drop(conn);
         fs::remove_dir_all(state_dir).unwrap();
     }
@@ -5313,6 +5520,7 @@ mod tests {
             argv: None,
             script_path: None,
             timeout_seconds: 60,
+            max_wait_seconds: DEFAULT_QUEUE_MAX_WAIT_SECONDS,
             cpu_percent: None,
             gpu_percent: None,
             memory_bytes: None,
@@ -5440,6 +5648,7 @@ mod tests {
             log_path: Some("/tmp/job_missing_exit.log".to_owned()),
             exit_code_path: None,
             timeout_seconds: 900,
+            max_wait_seconds: DEFAULT_QUEUE_MAX_WAIT_SECONDS,
             cpu_percent: None,
             gpu_percent: None,
             memory_bytes: None,
@@ -5477,6 +5686,7 @@ mod tests {
             log_path: Some(log_path.display().to_string()),
             exit_code_path: None,
             timeout_seconds: 900,
+            max_wait_seconds: DEFAULT_QUEUE_MAX_WAIT_SECONDS,
             cpu_percent: None,
             gpu_percent: None,
             memory_bytes: None,
@@ -5526,6 +5736,7 @@ mod tests {
             log_path: Some(log_path.display().to_string()),
             exit_code_path: Some(exit_code_path.display().to_string()),
             timeout_seconds: 60,
+            max_wait_seconds: DEFAULT_QUEUE_MAX_WAIT_SECONDS,
             cpu_percent: None,
             gpu_percent: None,
             memory_bytes: None,
@@ -5585,6 +5796,7 @@ mod tests {
             log_path: Some(log_path.display().to_string()),
             exit_code_path: Some(exit_code_path.display().to_string()),
             timeout_seconds: 60,
+            max_wait_seconds: DEFAULT_QUEUE_MAX_WAIT_SECONDS,
             cpu_percent: None,
             gpu_percent: None,
             memory_bytes: None,
@@ -5620,6 +5832,7 @@ mod tests {
             log_path: None,
             exit_code_path: None,
             timeout_seconds: 0,
+            max_wait_seconds: DEFAULT_QUEUE_MAX_WAIT_SECONDS,
             cpu_percent: None,
             gpu_percent: None,
             memory_bytes: None,
@@ -5679,7 +5892,7 @@ mod tests {
         let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
         let mut summary = QueueAdmissionSummary::default();
         assert_eq!(
-            next_admissible_queue_job_id_conn(&conn, &jobs, policy, &mut summary, None).unwrap(),
+            next_admissible_queue_job_id_conn(&conn, &jobs, policy, &mut summary).unwrap(),
             Some(background.id.clone())
         );
 
@@ -5691,7 +5904,7 @@ mod tests {
         let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
         let mut summary = QueueAdmissionSummary::default();
         assert_eq!(
-            next_admissible_queue_job_id_conn(&conn, &jobs, policy, &mut summary, None).unwrap(),
+            next_admissible_queue_job_id_conn(&conn, &jobs, policy, &mut summary).unwrap(),
             None
         );
         let holding_reason: Option<String> = conn
@@ -5772,11 +5985,16 @@ mod tests {
     fn queue_admission_retry_is_deduplicated_per_state_directory() {
         let first = unique_temp_path("retry-dedup-first");
         let second = unique_temp_path("retry-dedup-second");
-        assert!(claim_queue_admission_retry(&first));
-        assert!(!claim_queue_admission_retry(&first));
-        assert!(claim_queue_admission_retry(&second));
+        let now = Instant::now();
+        let later = now + StdDuration::from_secs(60);
+        let earlier = now + StdDuration::from_secs(10);
+        assert!(claim_queue_admission_retry(&first, later));
+        assert!(!claim_queue_admission_retry(&first, later));
+        assert!(claim_queue_admission_retry(&first, earlier));
+        assert!(!release_queue_admission_retry_if_current(&first, later));
+        assert!(claim_queue_admission_retry(&second, later));
         release_queue_admission_retry(&first);
-        assert!(claim_queue_admission_retry(&first));
+        assert!(claim_queue_admission_retry(&first, later));
         release_queue_admission_retry(&first);
         release_queue_admission_retry(&second);
     }
@@ -6607,6 +6825,7 @@ mod tests {
             log_path: None,
             exit_code_path: None,
             timeout_seconds: 120,
+            max_wait_seconds: DEFAULT_QUEUE_MAX_WAIT_SECONDS,
             cpu_percent: None,
             gpu_percent: None,
             memory_bytes: None,

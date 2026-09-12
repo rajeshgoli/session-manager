@@ -6179,6 +6179,15 @@ async fn create_queue_job(
             ),
         });
     }
+    let max_wait_seconds = payload
+        .max_wait_seconds
+        .unwrap_or(crate::queue::DEFAULT_QUEUE_MAX_WAIT_SECONDS);
+    if max_wait_seconds <= 0 {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "max_wait_seconds must be greater than 0".to_owned(),
+        });
+    }
     let label = payload
         .label
         .as_deref()
@@ -6198,7 +6207,7 @@ async fn create_queue_job(
         .unwrap_or_else(|| "script".to_owned());
     let queue_state_dir_config = state.config.queue_runner_state_dir();
     let queue_state_dir = expand_home(&queue_state_dir_config.to_string_lossy());
-    let job = RetainedQueueStore::create_queue_job_in_state_dir(
+    let job = RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
         &queue_state_dir,
         CreateQueueJob {
             job_type: job_type.to_owned(),
@@ -6214,6 +6223,7 @@ async fn create_queue_job(
             gpu_percent: (job_type == "perf").then_some(payload.gpu_percent.unwrap_or(0)),
             memory_bytes: payload.memory_bytes,
         },
+        max_wait_seconds,
     )?;
     let job = if state.config.rust_core.runtime_enabled {
         let message_queue_db_path = expand_home(&state.config.sm_send.db_path);
@@ -13798,6 +13808,8 @@ struct QueueJobCreateRequest {
     #[serde(default)]
     timeout_seconds: Option<i64>,
     #[serde(default)]
+    max_wait_seconds: Option<i64>,
+    #[serde(default)]
     cpu_percent: Option<u8>,
     #[serde(default)]
     gpu_percent: Option<u8>,
@@ -14368,6 +14380,7 @@ fn queue_job_response_with_context(
     };
     let termination_reason = match job.state.as_str() {
         "timed_out" => Some("timeout"),
+        "wait_expired" => Some("queue_wait_timeout"),
         "cancelled" => Some("cancelled"),
         "displaced" => Some("perf_displacement"),
         "memory_exceeded" => Some("memory_budget"),
@@ -14377,7 +14390,13 @@ fn queue_job_response_with_context(
         "recorded"
     } else if matches!(
         job.state.as_str(),
-        "succeeded" | "failed" | "timed_out" | "cancelled" | "displaced" | "memory_exceeded"
+        "succeeded"
+            | "failed"
+            | "timed_out"
+            | "wait_expired"
+            | "cancelled"
+            | "displaced"
+            | "memory_exceeded"
     ) {
         "missing_partial_output"
     } else {
@@ -14395,6 +14414,7 @@ fn queue_job_response_with_context(
         "argv": job.argv,
         "script_path": job.script_path,
         "timeout_seconds": job.timeout_seconds,
+        "max_wait_seconds": job.max_wait_seconds,
         "cpu_percent": job.cpu_percent,
         "gpu_percent": job.gpu_percent,
         "memory_bytes": job.memory_bytes,
@@ -14625,6 +14645,7 @@ mod tests {
             argv: None,
             script_path: None,
             timeout_seconds: 60,
+            max_wait_seconds: crate::queue::DEFAULT_QUEUE_MAX_WAIT_SECONDS,
             cpu_percent: None,
             gpu_percent: None,
             memory_bytes: None,
