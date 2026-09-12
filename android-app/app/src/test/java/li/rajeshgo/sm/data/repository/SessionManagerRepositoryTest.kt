@@ -17,6 +17,7 @@ class SessionManagerRepositoryTest {
             val request = chain.request()
             assertEquals("true", request.url.queryParameter("include_terminal"))
             assertEquals("10", request.url.queryParameter("terminal_limit_per_session"))
+            assertEquals("true", request.url.queryParameter("current_sessions_only"))
             okhttp3.Response.Builder().request(request).protocol(okhttp3.Protocol.HTTP_1_1)
                 .code(200).message("OK").body(
                     """{"jobs":[{"id":"done","state":"failed","notify_session_id":"agent","exit_code":1}]}""".toResponseBody("application/json".toMediaType()),
