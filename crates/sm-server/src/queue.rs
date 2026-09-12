@@ -3028,6 +3028,13 @@ fn admit_pending_queue_jobs_conn(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let pending_jobs = list_queue_job_runtime_records_conn(conn)?;
     expire_pending_queue_jobs_conn(conn, &pending_jobs, message_queue_db_path, admission_policy)?;
+    schedule_pending_queue_deadline_retry(
+        conn,
+        state_dir,
+        message_queue_db_path,
+        cancel_grace_seconds,
+        admission_policy,
+    )?;
     // Validate before clearing any existing holds: after a restart, preserved
     // service processes may outnumber a newly lowered configuration.  In that
     // state, admitting even one finite job would violate the configured global
@@ -3139,6 +3146,31 @@ fn admit_pending_queue_jobs_conn(
     Ok(summary)
 }
 
+fn schedule_pending_queue_deadline_retry(
+    conn: &Connection,
+    state_dir: &Path,
+    message_queue_db_path: &Path,
+    cancel_grace_seconds: u64,
+    admission_policy: QueueAdmissionPolicy,
+) -> Result<()> {
+    let retry_after_seconds = list_queue_job_runtime_records_conn(conn)?
+        .iter()
+        .filter(|job| job.state == "pending")
+        .filter_map(queue_job_wait_remaining_seconds)
+        .min()
+        .map(|seconds| seconds.max(1) as u64);
+    if let Some(seconds) = retry_after_seconds {
+        schedule_queue_admission_retry(
+            state_dir.to_path_buf(),
+            message_queue_db_path.to_path_buf(),
+            cancel_grace_seconds,
+            admission_policy,
+            seconds,
+        );
+    }
+    Ok(())
+}
+
 fn queue_job_wait_remaining_seconds(job: &QueueJobRuntimeRecord) -> Option<i64> {
     let elapsed = queue_elapsed_since(&job.queued_at, OffsetDateTime::now_utc())?;
     Some(job.max_wait_seconds.saturating_sub(elapsed))
@@ -3153,14 +3185,25 @@ fn expire_pending_queue_jobs_conn(
     let mut expired = 0;
     for job in jobs.iter().filter(|job| job.state == "pending") {
         if queue_job_wait_remaining_seconds(job).is_some_and(|seconds| seconds <= 0) {
-            finish_queue_job_conn_with_policy(
+            let result = finish_queue_job_conn_with_policy(
                 conn,
                 job,
                 "wait_expired",
                 None,
                 Some(message_queue_db_path),
                 Some(admission_policy),
-            )?;
+            );
+            if let Err(error) = result {
+                let transition_is_durable = get_queue_job_runtime_conn(conn, &job.id)?
+                    .is_some_and(|current| current.state == "wait_expired");
+                if !transition_is_durable {
+                    return Err(error);
+                }
+                eprintln!(
+                    "queue wait expiry notification deferred for {}: {error:#}",
+                    job.id
+                );
+            }
             expired += 1;
         }
     }
@@ -5540,6 +5583,71 @@ mod tests {
     }
 
     #[test]
+    fn expiry_notification_failure_does_not_block_later_admission() {
+        let state_dir = unique_temp_path("queue-expiry-notification-failure");
+        let message_queue_db = state_dir.join("unopenable-message-db");
+        let create_job = |label: &str, notify_session_id: &str, max_wait_seconds: i64| {
+            RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
+                &state_dir,
+                CreateQueueJob {
+                    job_type: "background".into(),
+                    label: label.into(),
+                    requester_session_id: Some("requester".into()),
+                    notify_session_id: notify_session_id.into(),
+                    cwd: "/tmp".into(),
+                    argv: Some(vec!["true".into()]),
+                    script: None,
+                    env: BTreeMap::new(),
+                    timeout_seconds: 60,
+                    cpu_percent: None,
+                    gpu_percent: None,
+                    memory_bytes: None,
+                },
+                max_wait_seconds,
+            )
+            .unwrap()
+        };
+        let expired = create_job("expired", "notify", 1);
+        let eligible = create_job("eligible", "", 300);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET queued_at = '2020-01-01T00:00:00Z' WHERE id = ?1",
+            params![expired.id],
+        )
+        .unwrap();
+        fs::create_dir_all(&message_queue_db).unwrap();
+
+        let summary = admit_pending_queue_jobs_conn(
+            &conn,
+            &state_dir,
+            &message_queue_db,
+            0,
+            QueueAdmissionPolicy::default(),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_queue_job_conn(&conn, &expired.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "wait_expired"
+        );
+        assert_eq!(summary.started, 1);
+        assert_ne!(
+            get_queue_job_conn(&conn, &eligible.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "pending"
+        );
+        release_queue_admission_retry(&state_dir);
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
     fn perf_memory_monitor_enforces_rss_host_pressure_and_measurement_health() {
         let mut failed = 0;
         assert!(perf_memory_sample_requires_termination(
@@ -6000,6 +6108,65 @@ mod tests {
             .unwrap();
         assert_eq!(holding_reason.as_deref(), Some("concurrency_cap"));
 
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn service_overcapacity_still_schedules_pending_wait_deadline() {
+        let state_dir = unique_temp_path("service-overcapacity-deadline");
+        let create_job = |job_type: &str, label: &str| {
+            RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
+                &state_dir,
+                CreateQueueJob {
+                    job_type: job_type.into(),
+                    label: label.into(),
+                    requester_session_id: Some("requester".into()),
+                    notify_session_id: "".into(),
+                    cwd: "/tmp".into(),
+                    argv: Some(vec!["true".into()]),
+                    script: None,
+                    env: BTreeMap::new(),
+                    timeout_seconds: 60,
+                    cpu_percent: None,
+                    gpu_percent: None,
+                    memory_bytes: None,
+                },
+                300,
+            )
+            .unwrap()
+        };
+        let first_service = create_job("service", "first service");
+        let second_service = create_job("service", "second service");
+        let _pending = create_job("background", "pending finite job");
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        for id in [&first_service.id, &second_service.id] {
+            conn.execute(
+                "UPDATE queue_jobs SET state = 'running', started_at = ?2 WHERE id = ?1",
+                params![id, now_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        let result = admit_pending_queue_jobs_conn(
+            &conn,
+            &state_dir,
+            &state_dir.join("messages.db"),
+            0,
+            QueueAdmissionPolicy {
+                max_running_jobs: 3,
+                service_max_concurrent: 1,
+                ..QueueAdmissionPolicy::default()
+            },
+            true,
+        );
+
+        assert!(result.is_err());
+        assert!(queue_admission_retries()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&state_dir));
+        release_queue_admission_retry(&state_dir);
         drop(conn);
         fs::remove_dir_all(state_dir).unwrap();
     }
