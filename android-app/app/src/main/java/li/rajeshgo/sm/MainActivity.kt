@@ -21,10 +21,12 @@ class MainActivity : ComponentActivity() {
         )
         setContent {
             SessionManagerTheme {
-                AppNavigation(
-                    pendingEnrollmentUrl = pendingEnrollmentUrl.value,
-                    onEnrollmentDeepLinkConsumed = ::clearEnrollmentDeepLink,
-                )
+                androidx.compose.material3.Surface(color = androidx.compose.material3.MaterialTheme.colorScheme.background) {
+                    AppNavigation(
+                        pendingEnrollmentUrl = pendingEnrollmentUrl.value,
+                        onEnrollmentDeepLinkConsumed = ::clearEnrollmentDeepLink,
+                    )
+                }
             }
         }
     }

@@ -61,7 +61,7 @@ fun SettingsScreen(
                     }
                 }, enabled = !state.loading && state.serverUrl.isNotBlank()) { Text(if (state.loading) "Signing in…" else "Sign in with Google") }
             }
-            state.error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = Rose) }
+            state.error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = Rose); TextButton(onClick = viewModel::refreshBootstrap) { Text("Retry connection") } }
         }
         ConnectionSettings(state, viewModel, pendingEnrollmentUrl, onEnrollmentDeepLinkConsumed)
         SettingsGroup("App updates") {

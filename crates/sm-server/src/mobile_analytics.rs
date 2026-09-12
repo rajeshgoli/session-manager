@@ -514,8 +514,10 @@ fn workload_metrics(
     now: OffsetDateTime,
 ) -> Result<Value> {
     let path = expand_home(&config.sm_send.db_path);
+    let job_path =
+        expand_home(&config.queue_runner_state_dir().to_string_lossy()).join("queue_runner.db");
     let jobs = RetainedQueueStore::list_queue_jobs_from_path(
-        &path,
+        &job_path,
         QueueJobFilters {
             include_terminal: true,
             ..Default::default()
@@ -556,6 +558,54 @@ fn workload_metrics(
 #[cfg(test)]
 mod workload_tests {
     use super::*;
+    #[test]
+    fn workload_reads_durable_jobs_separately_from_message_storage() {
+        let root = std::env::temp_dir().join(format!(
+            "sm-workload-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut config = AppConfig::default();
+        config.paths.state_file = root.join("state.json").display().to_string();
+        config.sm_send.db_path = root.join("messages.db").display().to_string();
+        let store = SessionStore::new(root.join("state.json"));
+        let queue_dir = config.queue_runner_state_dir();
+        let job = RetainedQueueStore::create_queue_job_in_state_dir(
+            &queue_dir,
+            crate::queue::CreateQueueJob {
+                job_type: "test".into(),
+                label: "test job".into(),
+                requester_session_id: None,
+                notify_session_id: "fixture".into(),
+                cwd: root.display().to_string(),
+                argv: Some(vec!["true".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 30,
+                cpu_percent: None,
+                gpu_percent: None,
+                memory_bytes: None,
+            },
+        )
+        .unwrap();
+        let now = OffsetDateTime::now_utc();
+        let metrics = workload_metrics(&config, &store, now).unwrap();
+        assert_eq!(metrics["jobs_queued"], 1);
+        assert_eq!(metrics["jobs_submitted_24h"], 1);
+        let conn = Connection::open(queue_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET state = 'succeeded', finished_at = ?1 WHERE id = ?2",
+            [&format_rfc3339(now), &job.id],
+        )
+        .unwrap();
+        let metrics = workload_metrics(&config, &store, now).unwrap();
+        assert_eq!(metrics["jobs_queued"], 0);
+        assert_eq!(metrics["jobs_completed_24h"], 1);
+        drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn rolling_window_excludes_old_future_and_unknown_timestamps() {
         let now = OffsetDateTime::parse("2026-09-12T12:00:00Z", &Rfc3339).unwrap();

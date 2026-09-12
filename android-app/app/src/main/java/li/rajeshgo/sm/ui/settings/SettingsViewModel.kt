@@ -136,7 +136,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 refreshUpdate()
                 refreshStudioSshStatus()
             }.onFailure { error ->
-                _uiState.value = _uiState.value.copy(error = error.message ?: "Failed to load bootstrap")
+                _uiState.value = _uiState.value.copy(error = "Couldn’t connect to Session Manager. Try again.")
             }
         }
     }
@@ -213,7 +213,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                     _uiState.value = _uiState.value.copy(availableUpdate = update, updateError = null)
                 }
                 .onFailure { error ->
-                    _uiState.value = _uiState.value.copy(updateError = error.message ?: "Failed to check app update")
+                    _uiState.value = _uiState.value.copy(updateError = "Couldn’t check for updates. Try again.")
                 }
         }
     }
@@ -288,7 +288,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             }.onFailure { error ->
                 _uiState.value = _uiState.value.copy(
                     updateInstalling = false,
-                    updateError = error.message ?: "Update failed",
+                    updateError = "Couldn’t download the update. Try again.",
                 )
                 return@launch
             }
