@@ -8,11 +8,11 @@ KEYS = Path(__file__).resolve().parents[2] / "android-app/app/src/main/assets/sm
 
 def test_terminal_navigation_matches_normal_and_application_cursor_protocols():
     source = KEYS.read_text()
-    script = source + "\nconsole.log(JSON.stringify([false, true].map(mode => ['up','down','left','right','enter','esc','tab','shift-tab','backspace','ctrl-c','unknown','constructor'].map(key => terminalKeySequence(key, mode)))));"
+    script = source + "\nconsole.log(JSON.stringify([false, true].map(mode => ['up','down','left','right','unknown','constructor'].map(key => terminalKeySequence(key, mode)))));"
     normal, application = json.loads(subprocess.check_output(["node", "-e", script], text=True))
     assert normal[:4] == ["\x1b[A", "\x1b[B", "\x1b[D", "\x1b[C"]
     assert application[:4] == ["\x1bOA", "\x1bOB", "\x1bOD", "\x1bOC"]
-    assert normal[4:] == application[4:] == ["\r", "\x1b", "\t", "\x1b[Z", "\x7f", "\x03", "", ""]
+    assert normal[4:] == application[4:] == ["", ""]
 
 
 def test_every_terminal_script_is_served_by_the_local_asset_allowlist():

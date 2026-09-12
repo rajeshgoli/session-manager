@@ -4,6 +4,5 @@ function terminalKeySequence(key, applicationCursorKeys) {
   if (Object.prototype.hasOwnProperty.call(arrows, key)) {
     return "\x1b" + (applicationCursorKeys ? "O" : "[") + arrows[key];
   }
-  const keys = { enter: "\r", esc: "\x1b", tab: "\t", "shift-tab": "\x1b[Z", backspace: "\x7f", "ctrl-c": "\x03" };
-  return Object.prototype.hasOwnProperty.call(keys, key) ? keys[key] : "";
+  return "";
 }

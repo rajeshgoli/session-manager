@@ -569,8 +569,8 @@ private fun MobileTerminalOverlay(
                 val connected = terminal.status == "attached"
                 listOf("up" to "↑", "down" to "↓", "left" to "←", "right" to "→", "enter" to "↵").forEach { (key, label) ->
                     OutlinedButton(
-                        onClick = { controls.sendKey?.invoke(key) },
-                        enabled = connected,
+                        onClick = { controls.sendKey(key, onTerminalInput) },
+                        enabled = connected && controls.canSend(key),
                         modifier = Modifier.weight(1f).height(48.dp).semantics { contentDescription = if (key == "enter") "Enter" else "${key.replaceFirstChar(Char::uppercaseChar)} arrow" },
                         contentPadding = PaddingValues(0.dp),
                     ) { Text(label, style = MaterialTheme.typography.titleLarge) }
@@ -587,7 +587,7 @@ private fun MobileTerminalOverlay(
                             HorizontalDivider()
                         }
                         listOf("esc" to "Escape", "tab" to "Tab", "shift-tab" to "Shift + Tab", "backspace" to "Backspace", "ctrl-c" to "Interrupt (Ctrl-C)").forEach { (key, label) ->
-                            DropdownMenuItem(text = { Text(label) }, enabled = connected, onClick = { actionsOpen = false; controls.sendKey?.invoke(key) })
+                            DropdownMenuItem(text = { Text(label) }, enabled = connected, onClick = { actionsOpen = false; controls.sendKey(key, onTerminalInput) })
                         }
                         HorizontalDivider()
                         DropdownMenuItem(text = { Text("Copy terminal") }, onClick = { actionsOpen = false; copyRequest += 1 })
@@ -648,7 +648,8 @@ private fun TerminalWebView(
 
     androidx.compose.runtime.DisposableEffect(Unit) {
         onDispose {
-            controls.sendKey = null
+            controls.rendererReady = false
+            controls.sendArrow = null
             webViewRef?.destroy()
             webViewRef = null
         }
@@ -687,7 +688,7 @@ private fun TerminalWebView(
             },
         factory = { context ->
             WebView(context).apply {
-                controls.sendKey = { key -> evaluateJavascript("window.smSendKey(${jsString(key)});", null) }
+                controls.sendArrow = { key -> evaluateJavascript("window.smSendKey(${jsString(key)});", null) }
                 setBackgroundColor(android.graphics.Color.rgb(5, 8, 13))
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = false
@@ -718,9 +719,13 @@ private fun TerminalWebView(
                         onStatus = onRendererStatus,
                         onReady = { cols, rows ->
                             terminalReady = true
+                            controls.rendererReady = true
                             onRendererReady(cols, rows)
                         },
-                        onError = onRendererError,
+                        onError = { message ->
+                            controls.rendererReady = false
+                            onRendererError(message)
+                        },
                         onWritten = onRendererWritten,
                     ),
                     "TerminalBridge",
@@ -1711,8 +1716,4 @@ private fun relativeSummaryAge(timestamp: String?): String {
         while (true) { now = java.time.OffsetDateTime.now(); kotlinx.coroutines.delay(60_000) }
     }
     return summaryAgeLabel(timestamp, now)
-}
-
-private class TerminalControls {
-    var sendKey: ((String) -> Unit)? = null
 }
