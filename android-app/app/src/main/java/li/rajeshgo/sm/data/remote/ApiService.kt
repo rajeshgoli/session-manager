@@ -40,7 +40,7 @@ interface ApiService {
     @POST("sessions")
     suspend fun createSession(@Body request: li.rajeshgo.sm.data.model.CreateSessionRequest): li.rajeshgo.sm.data.model.CreatedSession
 
-    @GET("queue-jobs?include_terminal=true&terminal_limit_per_session=10")
+    @GET("queue-jobs?include_terminal=true&terminal_limit_per_session=10&current_sessions_only=true")
     suspend fun getSessionJobs(): li.rajeshgo.sm.data.model.SessionJobsResponse
 
     @GET("session-obligations")

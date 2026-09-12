@@ -6075,7 +6075,7 @@ async fn list_queue_jobs(
         RetainedQueueStore::list_queue_jobs_from_path(&queue_db_path, QueueJobFilters::default())?;
     let jobs = limit_terminal_jobs_per_session(jobs, query.terminal_limit_per_session);
     // Resolve names from one registry snapshot, not two full reads per job.
-    let sessions = state.session_store.list_sessions(true)?;
+    let sessions = state.session_store.list_sessions(!query.current_sessions_only)?;
     let mut names = BTreeMap::new();
     for session in &sessions {
         names.insert(session.id.clone(), session_display_name(session.clone()));
@@ -6092,6 +6092,11 @@ async fn list_queue_jobs(
     }
     let mut response_jobs = Vec::with_capacity(jobs.len());
     for job in jobs {
+        if query.current_sessions_only {
+            let recipient = job.notify_session_id.as_deref().filter(|id| !id.trim().is_empty())
+                .or(job.requester_session_id.as_deref());
+            if !recipient.is_some_and(|id| names.contains_key(id.trim())) { continue; }
+        }
         let requester_name = job.requester_session_id.as_ref().and_then(|id| names.get(id.trim())).cloned();
         let notify_name = job.notify_session_id.as_ref().map(|id| names.get(id.trim()).unwrap_or(id).clone());
         response_jobs.push(queue_job_response_with_names(&state, job, &active, requester_name, notify_name)?);
@@ -13872,6 +13877,8 @@ struct ListQueueJobsQuery {
     include_terminal: bool,
     #[serde(default)]
     terminal_limit_per_session: Option<usize>,
+    #[serde(default)]
+    current_sessions_only: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -18670,6 +18677,13 @@ mod tests {
     async fn mobile_job_history_keeps_recent_results_per_recipient_and_all_active_jobs() {
         let signing_key = SigningKey::random(&mut OsRng);
         let config = mobile_ticket_config(&signing_key);
+        let mut fixture: Value = serde_json::from_slice(&fs::read(&config.paths.state_file).unwrap()).unwrap();
+        let mut stopped = fixture["sessions"][0].clone();
+        stopped["id"] = json!("other-agent");
+        stopped["status"] = json!("stopped");
+        stopped["completion_status"] = json!("retired");
+        fixture["sessions"].as_array_mut().unwrap().push(stopped);
+        fs::write(&config.paths.state_file, serde_json::to_vec(&fixture).unwrap()).unwrap();
         let queue_dir = config.queue_runner_state_dir();
         for (index, (recipient, status)) in [
             ("fork1001", "failed"), ("fork1001", "succeeded"),
@@ -18691,6 +18705,7 @@ mod tests {
             ("/queue-jobs", vec!["history-3", "history-4"]),
             ("/queue-jobs?include_terminal=true", vec!["history-0", "history-1", "history-2", "history-3", "history-4"]),
             ("/queue-jobs?include_terminal=true&terminal_limit_per_session=1", vec!["history-1", "history-2", "history-3", "history-4"]),
+            ("/queue-jobs?include_terminal=true&terminal_limit_per_session=1&current_sessions_only=true", vec!["history-1", "history-3", "history-4"]),
         ] {
             let response = app.clone().oneshot(local_request(Method::GET, uri, Body::empty())).await.unwrap();
             let (status, body) = response_json(response).await;
