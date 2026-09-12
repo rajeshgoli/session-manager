@@ -3028,19 +3028,23 @@ fn admit_pending_queue_jobs_conn(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let pending_jobs = list_queue_job_runtime_records_conn(conn)?;
     expire_pending_queue_jobs_conn(conn, &pending_jobs, message_queue_db_path, admission_policy)?;
-    schedule_pending_queue_deadline_retry(
-        conn,
-        state_dir,
-        message_queue_db_path,
-        cancel_grace_seconds,
-        admission_policy,
-    )?;
     // Validate before clearing any existing holds: after a restart, preserved
     // service processes may outnumber a newly lowered configuration.  In that
     // state, admitting even one finite job would violate the configured global
     // reserve for non-service work.
     let running_jobs = list_queue_job_runtime_records_conn(conn)?;
-    ensure_service_capacity_reserve_before_admission(&running_jobs, admission_policy)?;
+    if let Err(error) =
+        ensure_service_capacity_reserve_before_admission(&running_jobs, admission_policy)
+    {
+        schedule_pending_queue_deadline_retry(
+            conn,
+            state_dir,
+            message_queue_db_path,
+            cancel_grace_seconds,
+            admission_policy,
+        )?;
+        return Err(error);
+    }
     let requeued = conn.execute(
         "UPDATE queue_jobs SET holding_reason = NULL WHERE state = 'pending' AND holding_reason IS NOT NULL",
         [],
@@ -3100,6 +3104,18 @@ fn admit_pending_queue_jobs_conn(
         else {
             break;
         };
+        let Some(candidate) = get_queue_job_runtime_conn(conn, &candidate_id)? else {
+            continue;
+        };
+        if queue_job_wait_remaining_seconds(&candidate).is_some_and(|seconds| seconds <= 0) {
+            expire_pending_queue_jobs_conn(
+                conn,
+                std::slice::from_ref(&candidate),
+                message_queue_db_path,
+                admission_policy,
+            )?;
+            continue;
+        }
         match RetainedQueueStore::start_queue_job_in_state_dir_with_policy(
             state_dir,
             message_queue_db_path,
