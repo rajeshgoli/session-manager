@@ -73,6 +73,7 @@
   </div>
   <script src="vendor/xterm.js"></script>
   <script src="vendor/addon-fit.js"></script>
+  <script src="terminal_keys.js"></script>
   <script>
     const terminalElement = document.getElementById("terminal");
     const statusElement = document.getElementById("terminal-status");
@@ -458,6 +459,12 @@
       applyViewportSize();
       fitAndReport();
     });
+
+    window.smSendKey = function(key) {
+      if (!ready || lastBackendStatus !== "attached") return;
+      const data = terminalKeySequence(key, term.modes.applicationCursorKeysMode);
+      if (data) bridgeCall("input", data);
+    };
 
     window.smFocus = function() {
       if (ready) {
