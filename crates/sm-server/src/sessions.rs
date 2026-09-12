@@ -8900,7 +8900,7 @@ impl SessionStore {
             codex_fork_event_matches_root_thread(event, root_provider_resume_id.as_deref())
                 && (status != "idle"
                     || *next_status != "running"
-                    || codex_fork_event_starts_work(event, root_provider_resume_id.as_deref()))
+                    || codex_fork_event_starts_turn(event))
         }) {
             if status != next_status {
                 session.insert("status".to_owned(), Value::String(next_status.to_owned()));
@@ -9588,13 +9588,11 @@ pub(crate) fn codex_fork_status_for_event_line(line: &str) -> Option<&'static st
     codex_fork_status_for_event(event)
 }
 
-pub(crate) fn codex_fork_event_line_starts_work(line: &str, root_thread_id: Option<&str>) -> bool {
+pub(crate) fn codex_fork_event_line_starts_turn(line: &str) -> bool {
     let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
         return false;
     };
-    event
-        .as_object()
-        .is_some_and(|event| codex_fork_event_starts_work(event, root_thread_id))
+    event.as_object().is_some_and(codex_fork_event_starts_turn)
 }
 
 pub(crate) fn codex_fork_event_line_matches_root_thread(
@@ -9677,19 +9675,13 @@ fn codex_fork_event_ends_session(event: &Map<String, Value>) -> bool {
     )
 }
 
-fn codex_fork_event_starts_work(event: &Map<String, Value>, root_thread_id: Option<&str>) -> bool {
+fn codex_fork_event_starts_turn(event: &Map<String, Value>) -> bool {
     let Some(event_type) = codex_fork_event_type(event)
         .map(|value| normalize_codex_fork_event_type(&value.replace('/', "_")))
     else {
         return false;
     };
     match event_type.as_str() {
-        // A fresh item is new work, unlike a late completion or output delta.
-        // It also repairs persisted idle state when the turn-start event was
-        // outside the bounded event tail or an older reducer ended the turn early.
-        "item_started" => {
-            root_thread_id.is_none_or(|root| codex_fork_event_confirms_root_identity(event, root))
-        }
         "turn_started" => true,
         "thread_status_changed" => codex_fork_thread_status(event) == Some("running"),
         _ => false,
@@ -9750,22 +9742,8 @@ fn codex_fork_restore_status_confirms_root(
         return false;
     }
 
-    codex_fork_event_confirms_root_identity(event, expected_provider_resume_id)
-}
-
-/// Require at least one root identity and reject every explicit conflicting alias.
-fn codex_fork_event_confirms_root_identity(
-    event: &Map<String, Value>,
-    expected_provider_resume_id: &str,
-) -> bool {
     let payload = codex_fork_payload(event);
-    let thread = payload
-        .and_then(|payload| payload.get("thread"))
-        .and_then(Value::as_object);
     let identities = [
-        thread.and_then(|thread| thread.get("id").and_then(non_unknown_json_text)),
-        thread.and_then(|thread| thread.get("thread_id").and_then(non_unknown_json_text)),
-        thread.and_then(|thread| thread.get("session_id").and_then(non_unknown_json_text)),
         payload.and_then(|payload| payload.get("threadId").and_then(non_unknown_json_text)),
         payload.and_then(|payload| payload.get("thread_id").and_then(non_unknown_json_text)),
         payload.and_then(|payload| payload.get("session_id").and_then(non_unknown_json_text)),
@@ -22688,8 +22666,8 @@ sleep 30
         assert_eq!(codex_fork_status_for_event_line(active), Some("running"));
         assert_eq!(codex_fork_status_for_event_line(idle), Some("idle"));
         assert_eq!(codex_fork_status_for_event_line(unknown), None);
-        assert!(codex_fork_event_line_starts_work(active, None));
-        assert!(!codex_fork_event_line_starts_work(idle, None));
+        assert!(codex_fork_event_line_starts_turn(active));
+        assert!(!codex_fork_event_line_starts_turn(idle));
     }
 
     #[test]
@@ -22754,6 +22732,16 @@ sleep 30
             .apply_codex_fork_event_line(
                 "codex001",
                 r#"{"event_type":"item/started","payload":{"threadId":"root-thread","item":{"type":"reasoning"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().status,
+            "idle"
+        );
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"turn_started","payload":{"threadId":"root-thread"}}"#,
             )
             .unwrap();
         assert_eq!(

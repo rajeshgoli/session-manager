@@ -119,7 +119,7 @@ use crate::runtime::{CodexModelValidationError, InitialBriefDeliveryError, TmuxR
 #[cfg(test)]
 use crate::sessions::codex_fork_legacy_event_stream_path_from_log_file;
 use crate::sessions::{
-    claude_hook_gate, codex_fork_event_line_matches_root_thread, codex_fork_event_line_starts_work,
+    claude_hook_gate, codex_fork_event_line_matches_root_thread, codex_fork_event_line_starts_turn,
     codex_fork_newest_event_stream_path, codex_fork_status_for_event_line, expand_home,
     is_primary_node, submit_codex_fork_btw, AcceptSpawnBriefRequest, AgentRegistrationResponse,
     AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest, ChildSessionResponse,
@@ -11006,7 +11006,7 @@ fn codex_fork_event_stream_signal_from_path(
                 && latest_activity
                     .as_ref()
                     .is_some_and(|signal| matches!(signal.activity, "idle" | "stopped"))
-                && !codex_fork_event_line_starts_work(line, root_thread_id)
+                && !codex_fork_event_line_starts_turn(line)
             {
                 continue;
             }
@@ -16086,8 +16086,20 @@ mod tests {
                 "{event}"
             );
         }
-        // Fresh root work heals stale persisted idle state without a turn-start event.
+        // Even a root item cannot reopen a conclusively idle turn.
         events.extend_from_slice(b"{\"event_type\":\"item/started\",\"payload\":{\"threadId\":\"root-thread\",\"item\":{\"type\":\"reasoning\"}}}\n");
+        fs::write(&event_stream, &events).unwrap();
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path_with_seed(
+                event_stream.clone(),
+                "root-thread",
+                "idle"
+            ),
+            Some("idle")
+        );
+        events.extend_from_slice(
+            b"{\"event_type\":\"turn_started\",\"payload\":{\"threadId\":\"root-thread\"}}\n",
+        );
         fs::write(&event_stream, &events).unwrap();
         assert_eq!(
             codex_fork_event_stream_activity_from_path_with_seed(
