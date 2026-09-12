@@ -11,6 +11,8 @@ import androidx.compose.ui.unit.dp
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.CreateSessionRequest
 
+fun supportsSessionCloning(provider: String?): Boolean = provider in listOf("claude", "codex", "codex-fork")
+
 fun sessionTemplate(source: ClientSession?): CreateSessionRequest = CreateSessionRequest(
     provider = source?.provider ?: "claude",
     workingDir = source?.workingDir ?: "/Users/rajesh/projects/fractal-algo-rust",

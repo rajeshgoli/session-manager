@@ -1312,7 +1312,7 @@ private fun SessionRow(
                     var actionsExpanded by remember { mutableStateOf(false) }
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         if (attachSupported) ActionPill(label = "Open terminal", icon = Icons.Rounded.Terminal, onClick = onOpenAttach, tint = Emerald)
-                        ActionPill(label = "Clone", icon = Icons.Rounded.ContentCopy, onClick = onClone)
+                        if (supportsSessionCloning(session.provider)) ActionPill(label = "Clone", icon = Icons.Rounded.ContentCopy, onClick = onClone)
                         Box {
                             IconButton(onClick = { actionsExpanded = true }) { Icon(Icons.Rounded.MoreVert, "Agent actions", tint = TextSecondary) }
                             DropdownMenu(actionsExpanded, { actionsExpanded = false }) {

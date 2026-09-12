@@ -9,6 +9,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class WatchModelsTest {
+    @Test
+    fun cloningIsAvailableOnlyForProvidersTheServerCanLaunch() {
+        for (provider in listOf("claude", "codex", "codex-fork")) assertTrue(supportsSessionCloning(provider))
+        for (provider in listOf("codex-app", "shell", "unknown", "", null)) assertFalse(supportsSessionCloning(provider))
+    }
+
     @Test fun summaryAgeSeparatesMinutesHoursAndDays() {
         val now = java.time.OffsetDateTime.parse("2026-09-12T12:00:00Z")
         assertEquals("Just now", summaryAgeLabel(now.minusSeconds(15).toString(), now))
