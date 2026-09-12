@@ -11006,7 +11006,7 @@ fn codex_fork_event_stream_signal_from_path(
                 && latest_activity
                     .as_ref()
                     .is_some_and(|signal| matches!(signal.activity, "idle" | "stopped"))
-                && !codex_fork_event_line_starts_work(line)
+                && !codex_fork_event_line_starts_work(line, root_thread_id)
             {
                 continue;
             }
@@ -16045,6 +16045,17 @@ mod tests {
             ),
             Some("idle")
         );
+        // Unscoped items in a multiplexed stream cannot revive a known root.
+        events.extend_from_slice(b"\n{\"event_type\":\"item/started\",\"payload\":{\"item\":{\"type\":\"reasoning\"}}}\n");
+        fs::write(&event_stream, &events).unwrap();
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path_with_seed(
+                event_stream.clone(),
+                "root-thread",
+                "idle"
+            ),
+            Some("idle")
+        );
         // A child starting work must not revive an idle root.
         events.extend_from_slice(b"\n{\"event_type\":\"item/started\",\"payload\":{\"threadId\":\"child-thread\",\"item\":{\"type\":\"reasoning\"}}}\n");
         fs::write(&event_stream, &events).unwrap();
@@ -16060,7 +16071,11 @@ mod tests {
         events.extend_from_slice(b"{\"event_type\":\"item/started\",\"payload\":{\"threadId\":\"root-thread\",\"item\":{\"type\":\"reasoning\"}}}\n");
         fs::write(&event_stream, &events).unwrap();
         assert_eq!(
-            codex_fork_event_stream_activity_from_path_with_seed(event_stream, "root-thread", "idle"),
+            codex_fork_event_stream_activity_from_path_with_seed(
+                event_stream,
+                "root-thread",
+                "idle"
+            ),
             Some("working")
         );
     }
