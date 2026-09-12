@@ -1232,8 +1232,11 @@ impl RetainedQueueStore {
         summary.requeued_pending += admission.requeued;
         summary.held_pending += admission.held;
         summary.finished_failed += admission.failed_start;
-        summary.retried_completion_notifications +=
-            retry_unnotified_queue_job_completions_conn(&conn, message_queue_db_path)?;
+        summary.retried_completion_notifications += retry_unnotified_queue_job_completions_conn(
+            &conn,
+            message_queue_db_path,
+            Some(admission_policy),
+        )?;
         Ok(summary)
     }
 
@@ -1241,13 +1244,29 @@ impl RetainedQueueStore {
         state_dir: &Path,
         message_queue_db_path: &Path,
     ) -> Result<usize> {
+        Self::retry_unnotified_queue_job_completions_in_state_dir_with_policy(
+            state_dir,
+            message_queue_db_path,
+            QueueAdmissionPolicy::default(),
+        )
+    }
+
+    pub fn retry_unnotified_queue_job_completions_in_state_dir_with_policy(
+        state_dir: &Path,
+        message_queue_db_path: &Path,
+        admission_policy: QueueAdmissionPolicy,
+    ) -> Result<usize> {
         let db_path = state_dir.join("queue_runner.db");
         if !db_path.exists() {
             return Ok(0);
         }
         let conn = open_queue_jobs_connection(&db_path)?;
         init_queue_jobs_schema(&conn)?;
-        retry_unnotified_queue_job_completions_conn(&conn, message_queue_db_path)
+        retry_unnotified_queue_job_completions_conn(
+            &conn,
+            message_queue_db_path,
+            Some(admission_policy),
+        )
     }
 
     pub fn ensure_schema(&self) -> Result<()> {
@@ -3008,7 +3027,7 @@ fn admit_pending_queue_jobs_conn(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let pending_jobs = list_queue_job_runtime_records_conn(conn)?;
-    expire_pending_queue_jobs_conn(conn, &pending_jobs, message_queue_db_path)?;
+    expire_pending_queue_jobs_conn(conn, &pending_jobs, message_queue_db_path, admission_policy)?;
     // Validate before clearing any existing holds: after a restart, preserved
     // service processes may outnumber a newly lowered configuration.  In that
     // state, admitting even one finite job would violate the configured global
@@ -3129,11 +3148,19 @@ fn expire_pending_queue_jobs_conn(
     conn: &Connection,
     jobs: &[QueueJobRuntimeRecord],
     message_queue_db_path: &Path,
+    admission_policy: QueueAdmissionPolicy,
 ) -> Result<usize> {
     let mut expired = 0;
     for job in jobs.iter().filter(|job| job.state == "pending") {
         if queue_job_wait_remaining_seconds(job).is_some_and(|seconds| seconds <= 0) {
-            finish_queue_job_conn(conn, job, "wait_expired", None, Some(message_queue_db_path))?;
+            finish_queue_job_conn_with_policy(
+                conn,
+                job,
+                "wait_expired",
+                None,
+                Some(message_queue_db_path),
+                Some(admission_policy),
+            )?;
             expired += 1;
         }
     }
@@ -3188,7 +3215,7 @@ fn schedule_queue_admission_retry(
     admission_policy: QueueAdmissionPolicy,
     delay_seconds: u64,
 ) {
-    let delay = StdDuration::from_secs(delay_seconds.max(1));
+    let delay = queue_admission_retry_delay(delay_seconds);
     let deadline = Instant::now() + delay;
     if !claim_queue_admission_retry(&state_dir, deadline) {
         return;
@@ -3207,6 +3234,13 @@ fn schedule_queue_admission_retry(
                 admission_policy,
             );
     });
+}
+
+fn queue_admission_retry_delay(delay_seconds: u64) -> StdDuration {
+    // Long explicit admission windows still need periodic, representable wakeups.
+    // Bounding each sleep also prevents `Instant` overflow for values such as
+    // i64::MAX while preserving the configured durable deadline.
+    StdDuration::from_secs(delay_seconds.clamp(1, 24 * 60 * 60))
 }
 
 fn queue_admission_retries() -> &'static Mutex<BTreeMap<PathBuf, Instant>> {
@@ -4104,6 +4138,17 @@ fn finish_queue_job_conn(
     exit_code: Option<i64>,
     message_queue_db_path: Option<&Path>,
 ) -> Result<()> {
+    finish_queue_job_conn_with_policy(conn, job, state, exit_code, message_queue_db_path, None)
+}
+
+fn finish_queue_job_conn_with_policy(
+    conn: &Connection,
+    job: &QueueJobRuntimeRecord,
+    state: &str,
+    exit_code: Option<i64>,
+    message_queue_db_path: Option<&Path>,
+    admission_policy: Option<QueueAdmissionPolicy>,
+) -> Result<()> {
     let finished_at = now_rfc3339();
     let changed = conn.execute(
         r#"
@@ -4127,6 +4172,7 @@ fn finish_queue_job_conn(
         exit_code,
         &finished_at,
         message_queue_db_path,
+        admission_policy,
     )?;
     Ok(())
 }
@@ -4134,6 +4180,7 @@ fn finish_queue_job_conn(
 fn retry_unnotified_queue_job_completions_conn(
     conn: &Connection,
     message_queue_db_path: &Path,
+    admission_policy: Option<QueueAdmissionPolicy>,
 ) -> Result<usize> {
     let mut statement = conn.prepare(
         r#"
@@ -4163,6 +4210,7 @@ fn retry_unnotified_queue_job_completions_conn(
             job.exit_code,
             finished_at,
             Some(message_queue_db_path),
+            admission_policy,
         )? {
             notified += 1;
         }
@@ -4177,6 +4225,7 @@ fn record_queue_job_completion_notification_conn(
     exit_code: Option<i64>,
     finished_at: &str,
     message_queue_db_path: Option<&Path>,
+    admission_policy: Option<QueueAdmissionPolicy>,
 ) -> Result<bool> {
     let Some(completion_notified_at) = queue_job_completion_notified_at(
         job,
@@ -4184,6 +4233,7 @@ fn record_queue_job_completion_notification_conn(
         exit_code,
         finished_at,
         message_queue_db_path,
+        admission_policy,
     )?
     else {
         return Ok(false);
@@ -4205,6 +4255,7 @@ fn queue_job_completion_notified_at(
     exit_code: Option<i64>,
     finished_at: &str,
     message_queue_db_path: Option<&Path>,
+    admission_policy: Option<QueueAdmissionPolicy>,
 ) -> Result<Option<String>> {
     if job.completion_notified_at.is_some() {
         return Ok(None);
@@ -4220,7 +4271,8 @@ fn queue_job_completion_notified_at(
     let Some(message_queue_db_path) = message_queue_db_path else {
         return Ok(None);
     };
-    let text = queue_job_completion_text(job, state, exit_code, finished_at);
+    let text =
+        queue_job_completion_text_with_policy(job, state, exit_code, finished_at, admission_policy);
     let queue = RetainedQueueStore::new(message_queue_db_path.to_path_buf());
     queue.enqueue_message_once_with_metadata(
         &format!("queue-completion-{}", job.id),
@@ -4401,11 +4453,12 @@ pub fn queue_log_filename(label: &str, id: &str) -> String {
     format!("{}--{id}.log", if slug.is_empty() { "job" } else { slug })
 }
 
-fn queue_job_completion_text(
+fn queue_job_completion_text_with_policy(
     job: &QueueJobRuntimeRecord,
     state: &str,
     exit_code: Option<i64>,
     finished_at: &str,
+    admission_policy: Option<QueueAdmissionPolicy>,
 ) -> String {
     let runtime = queue_duration_text(job.started_at.as_deref(), Some(finished_at));
     let queue_end = job.started_at.as_deref().unwrap_or(finished_at);
@@ -4436,7 +4489,9 @@ fn queue_job_completion_text(
     let wait_text = if state == "wait_expired" {
         let reason = job.holding_reason.as_deref().unwrap_or("not_admitted");
         if reason == "memory_pressure" {
-            let reserve = effective_memory_reserve_bytes(8 * 1024 * 1024 * 1024);
+            let reserve = effective_memory_reserve_bytes(
+                admission_policy.unwrap_or_default().memory_min_free_bytes,
+            );
             let required = job.memory_bytes.unwrap_or(0).saturating_add(reserve);
             let available = host_memory_capacity().map(|(_, available)| available);
             format!(
@@ -5439,7 +5494,7 @@ mod tests {
                 timeout_seconds: 60,
                 cpu_percent: Some(100),
                 gpu_percent: Some(0),
-                memory_bytes: Some(i64::MAX),
+                memory_bytes: Some(20 * 1024 * 1024 * 1024),
             },
             1,
         )
@@ -5453,7 +5508,16 @@ mod tests {
         let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
 
         assert_eq!(
-            expire_pending_queue_jobs_conn(&conn, &jobs, &message_queue_db).unwrap(),
+            expire_pending_queue_jobs_conn(
+                &conn,
+                &jobs,
+                &message_queue_db,
+                QueueAdmissionPolicy {
+                    memory_min_free_bytes: 12 * 1024 * 1024 * 1024,
+                    ..QueueAdmissionPolicy::default()
+                },
+            )
+            .unwrap(),
             1
         );
         let expired = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
@@ -5469,6 +5533,8 @@ mod tests {
         assert!(notifications[0]
             .text
             .contains("wait_reason=memory_pressure"));
+        assert!(notifications[0].text.contains("required=32.0 GiB"));
+        assert!(notifications[0].text.contains("safety_reserve=12.0 GiB"));
         drop(conn);
         fs::remove_dir_all(state_dir).unwrap();
     }
@@ -5658,12 +5724,24 @@ mod tests {
             completion_notified_at: None,
         };
 
-        let failed = queue_job_completion_text(&job, "failed", None, "2026-08-16T20:04:24Z");
+        let failed = queue_job_completion_text_with_policy(
+            &job,
+            "failed",
+            None,
+            "2026-08-16T20:04:24Z",
+            None,
+        );
         assert!(failed.starts_with("[sm queue] friendly-job completed:"));
         assert!(failed.contains("completed: failed exit=unknown"));
         assert!(failed.contains("output is partial/non-evidence"));
 
-        let displaced = queue_job_completion_text(&job, "displaced", None, "2026-08-16T20:04:24Z");
+        let displaced = queue_job_completion_text_with_policy(
+            &job,
+            "displaced",
+            None,
+            "2026-08-16T20:04:24Z",
+            None,
+        );
         assert!(displaced.contains("termination=perf_displacement"));
         assert!(displaced.contains("exit=unknown"));
     }
@@ -5696,7 +5774,13 @@ mod tests {
             completion_notified_at: None,
         };
 
-        let completion = queue_job_completion_text(&job, "failed", Some(1), "2026-08-16T20:04:24Z");
+        let completion = queue_job_completion_text_with_policy(
+            &job,
+            "failed",
+            Some(1),
+            "2026-08-16T20:04:24Z",
+            None,
+        );
 
         assert!(completion.contains(&format!("Log: {}", log_path.display())));
         assert!(!completion.contains("long test output that belongs only in the log"));
@@ -5997,6 +6081,16 @@ mod tests {
         assert!(claim_queue_admission_retry(&first, later));
         release_queue_admission_retry(&first);
         release_queue_admission_retry(&second);
+    }
+
+    #[test]
+    fn queue_admission_retry_delay_bounds_extreme_explicit_waits() {
+        assert_eq!(queue_admission_retry_delay(0).as_secs(), 1);
+        assert_eq!(queue_admission_retry_delay(300).as_secs(), 300);
+        assert_eq!(
+            queue_admission_retry_delay(i64::MAX as u64).as_secs(),
+            24 * 60 * 60
+        );
     }
 
     #[test]
