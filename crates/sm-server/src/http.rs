@@ -6073,11 +6073,45 @@ async fn list_queue_jobs(
     // test/performance job may be holding this agent's queue.
     let active =
         RetainedQueueStore::list_queue_jobs_from_path(&queue_db_path, QueueJobFilters::default())?;
+    let jobs = limit_terminal_jobs_per_session(jobs, query.terminal_limit_per_session);
+    // Resolve names from one registry snapshot, not two full reads per job.
+    let sessions = state.session_store.list_sessions(true)?;
+    let mut names = BTreeMap::new();
+    for session in &sessions {
+        names.insert(session.id.clone(), session_display_name(session.clone()));
+    }
+    for session in &sessions {
+        for alias in &session.aliases {
+            names.entry(alias.clone()).or_insert_with(|| session_display_name(session.clone()));
+        }
+    }
+    for session in sessions {
+        for name in [session.cached_display_name(), session.friendly_name.clone(), session.native_title.clone(), Some(session.name.clone())].into_iter().flatten() {
+            names.entry(name).or_insert_with(|| session_display_name(session.clone()));
+        }
+    }
     let mut response_jobs = Vec::with_capacity(jobs.len());
     for job in jobs {
-        response_jobs.push(queue_job_response_with_context(&state, job, &active)?);
+        let requester_name = job.requester_session_id.as_ref().and_then(|id| names.get(id.trim())).cloned();
+        let notify_name = job.notify_session_id.as_ref().map(|id| names.get(id.trim()).unwrap_or(id).clone());
+        response_jobs.push(queue_job_response_with_names(&state, job, &active, requester_name, notify_name)?);
     }
     Ok(Json(json!({ "jobs": response_jobs })))
+}
+
+fn limit_terminal_jobs_per_session(mut jobs: Vec<QueueJobRecord>, limit: Option<usize>) -> Vec<QueueJobRecord> {
+    let Some(limit) = limit else { return jobs; };
+    // The durable listing is oldest first; retain recent terminal work per recipient.
+    jobs.reverse();
+    let mut counts = BTreeMap::<String, usize>::new();
+    jobs.retain(|job| {
+        if matches!(job.state.as_str(), "pending" | "running") { return true; }
+        let recipient = job.notify_session_id.as_ref().filter(|id| !id.is_empty()).or(job.requester_session_id.as_ref()).cloned().unwrap_or_default();
+        let count = counts.entry(recipient).or_default();
+        *count += 1;
+        *count <= limit
+    });
+    jobs
 }
 
 fn queue_lookup_error(error: anyhow::Error) -> ApiError {
@@ -13836,6 +13870,8 @@ struct ListQueueJobsQuery {
     state: Option<String>,
     #[serde(default)]
     include_terminal: bool,
+    #[serde(default)]
+    terminal_limit_per_session: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -14440,6 +14476,16 @@ fn queue_job_response_with_context(
             .or_else(|| Some(session_id.to_owned())),
         None => None,
     };
+    queue_job_response_with_names(state, job, active, requester_name, notify_name)
+}
+
+fn queue_job_response_with_names(
+    state: &AppState,
+    job: QueueJobRecord,
+    active: &[QueueJobRecord],
+    requester_name: Option<String>,
+    notify_name: Option<String>,
+) -> Result<Value, ApiError> {
     let termination_reason = match job.state.as_str() {
         "timed_out" => Some("timeout"),
         "cancelled" => Some("cancelled"),
@@ -18618,6 +18664,45 @@ mod tests {
             working,
             body["workload"]["agents_working"].as_u64().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn mobile_job_history_keeps_recent_results_per_recipient_and_all_active_jobs() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let config = mobile_ticket_config(&signing_key);
+        let queue_dir = config.queue_runner_state_dir();
+        for (index, (recipient, status)) in [
+            ("fork1001", "failed"), ("fork1001", "succeeded"),
+            ("other-agent", "memory_exceeded"), ("fork1001", "pending"),
+            ("fork1001", "running"),
+        ].into_iter().enumerate() {
+            let job = RetainedQueueStore::create_queue_job_in_state_dir(&queue_dir, crate::queue::CreateQueueJob {
+                job_type: "test".into(), label: format!("history-{index}"),
+                requester_session_id: Some("requester".into()), notify_session_id: recipient.into(),
+                cwd: queue_dir.display().to_string(), argv: Some(vec!["true".into()]), script: None,
+                env: BTreeMap::new(), timeout_seconds: 30, cpu_percent: None, gpu_percent: None, memory_bytes: None,
+            }).unwrap();
+            let conn = rusqlite::Connection::open(queue_dir.join("queue_runner.db")).unwrap();
+            conn.execute("UPDATE queue_jobs SET state = ?1, queued_at = ?2 WHERE id = ?3",
+                [status, &format!("2026-09-12T12:00:0{index}Z"), &job.id]).unwrap();
+        }
+        let app = router(AppState::new(config));
+        for (uri, expected) in [
+            ("/queue-jobs", vec!["history-3", "history-4"]),
+            ("/queue-jobs?include_terminal=true", vec!["history-0", "history-1", "history-2", "history-3", "history-4"]),
+            ("/queue-jobs?include_terminal=true&terminal_limit_per_session=1", vec!["history-1", "history-2", "history-3", "history-4"]),
+        ] {
+            let response = app.clone().oneshot(local_request(Method::GET, uri, Body::empty())).await.unwrap();
+            let (status, body) = response_json(response).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let mut labels = body["jobs"].as_array().unwrap().iter().map(|job| job["label"].as_str().unwrap()).collect::<Vec<_>>();
+            labels.sort();
+            assert_eq!(labels, expected, "{uri}");
+            for job in body["jobs"].as_array().unwrap() {
+                assert_eq!(job["requester_name"], Value::Null);
+                assert!(job["notify_name"].is_string());
+            }
+        }
     }
 
     #[tokio::test]

@@ -1433,7 +1433,7 @@ private fun AgentWorkSections(session: ClientSession) {
         }
     }
     val finished = session.jobs.filter { it.state !in listOf("pending", "running") }
-    if (finished.isNotEmpty()) AgentDisclosure("Job history", "${finished.size} finished jobs") {
+    if (finished.isNotEmpty()) AgentDisclosure("Recent job history", "${finished.size} finished jobs") {
         finished.forEach { job -> ActivityDetail(job.label, jobSummary(job).removePrefix("${job.label} · "), if (job.exitCode == null || job.exitCode == 0) TextSecondary else Rose) }
     }
 }
