@@ -4568,8 +4568,9 @@ esac
             .unwrap()
             .as_nanos();
         let temp_dir = std::env::temp_dir().join(format!(
-            "sm-runtime-fake-codex-models-{}-{unique}",
-            std::process::id()
+            "sm-runtime-fake-codex-models-{}-{:?}-{unique}",
+            std::process::id(),
+            std::thread::current().id(),
         ));
         fs::create_dir_all(&temp_dir).unwrap();
         let command = temp_dir.join("codex");
