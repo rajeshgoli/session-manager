@@ -9841,7 +9841,14 @@ fn codex_fork_item_completed_status(event: &Map<String, Value>) -> Option<&'stat
         .map(str::to_ascii_lowercase);
 
     match item_type.as_deref() {
-        Some("agentmessage" | "agent_message" | "message") => Some("idle"),
+        Some("agentmessage" | "agent_message" | "message") => {
+            // Commentary is a progress update inside a turn, not its final answer.
+            if item.get("phase").and_then(Value::as_str) == Some("commentary") {
+                Some("running")
+            } else {
+                Some("idle")
+            }
+        }
         Some(_) => Some("running"),
         None => Some("running"),
     }
@@ -22673,6 +22680,7 @@ sleep 30
                     "id": "codex001",
                     "name": "codex-codex001",
                     "provider": "codex-fork",
+                    "provider_resume_id": "root-thread",
                     "working_dir": "/repo",
                     "tmux_session": "codex-codex001",
                     "status": "idle",
@@ -22699,7 +22707,41 @@ sleep 30
         store
             .apply_codex_fork_event_line(
                 "codex001",
-                r#"{"event_type":"turn_started","payload":{}}"#,
+                r#"{"event_type":"item/started","payload":{"item":{"type":"reasoning"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().status,
+            "idle"
+        );
+        for event in [
+            r#"{"event_type":"item/started","session_id":"child-thread","payload":{"threadId":"root-thread","item":{"type":"reasoning"}}}"#,
+            r#"{"event_type":"item/started","payload":{"threadId":"root-thread","thread_id":"child-thread","item":{"type":"reasoning"}}}"#,
+            r#"{"event_type":"item/started","payload":{"threadId":"root-thread","thread":{"id":"child-thread"},"item":{"type":"reasoning"}}}"#,
+        ] {
+            store
+                .apply_codex_fork_event_line("codex001", event)
+                .unwrap();
+            assert_eq!(
+                store.get_session("codex001").unwrap().unwrap().status,
+                "idle",
+                "{event}"
+            );
+        }
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"item/started","payload":{"threadId":"root-thread","item":{"type":"reasoning"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().status,
+            "idle"
+        );
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
+                r#"{"event_type":"turn_started","payload":{"threadId":"root-thread"}}"#,
             )
             .unwrap();
         assert_eq!(
@@ -22709,7 +22751,7 @@ sleep 30
     }
 
     #[test]
-    fn codex_fork_descendant_idle_does_not_stop_active_root_turn() {
+    fn codex_fork_commentary_and_descendant_idle_do_not_stop_active_root_turn() {
         let state_file = unique_temp_path("codex-descendant-idle");
         fs::write(
             &state_file,
@@ -22734,6 +22776,17 @@ sleep 30
         store
             .apply_codex_fork_event_line(
                 "codex001",
+                r#"{"event_type":"item/completed","payload":{"threadId":"root-thread","item":{"type":"agentMessage","phase":"commentary"}}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get_session("codex001").unwrap().unwrap().status,
+            "running"
+        );
+
+        store
+            .apply_codex_fork_event_line(
+                "codex001",
                 r#"{"event_type":"thread/status/changed","session_id":"child-thread","payload":{"threadId":"child-thread","status":{"type":"idle"}}}"#,
             )
             .unwrap();
@@ -22752,6 +22805,14 @@ sleep 30
             store.get_session("codex001").unwrap().unwrap().status,
             "idle"
         );
+    }
+
+    #[test]
+    fn codex_fork_completed_commentary_keeps_turn_running() {
+        let event = r#"{"event_type":"item/completed","payload":{"item":{"type":"agentMessage","phase":"commentary"}}}"#;
+        assert_eq!(codex_fork_status_for_event_line(event), Some("running"));
+        let final_event = r#"{"event_type":"item/completed","payload":{"item":{"type":"agentMessage","phase":"final_answer"}}}"#;
+        assert_eq!(codex_fork_status_for_event_line(final_event), Some("idle"));
     }
 
     #[test]
