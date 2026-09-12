@@ -135,9 +135,10 @@ async fn main() -> Result<()> {
             loop {
                 thread::sleep(QUEUE_COMPLETION_RETRY_INTERVAL);
                 if let Err(error) =
-                    RetainedQueueStore::retry_unnotified_queue_job_completions_in_state_dir(
+                    RetainedQueueStore::retry_unnotified_queue_job_completions_in_state_dir_with_policy(
                         &queue_state_dir,
                         &message_queue_db_path,
+                        admission_policy,
                     )
                 {
                     eprintln!("queue completion wake retry failed: {error:#}");

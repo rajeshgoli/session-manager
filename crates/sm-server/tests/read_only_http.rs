@@ -5321,6 +5321,50 @@ async fn queue_timeout_waits_for_process_group_cleanup_after_wrapper_exits() {
 }
 
 #[tokio::test]
+async fn queue_create_uses_default_max_wait_and_accepts_explicit_override() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-max-wait");
+    let message_queue_db = state_file.with_extension("queue-max-wait-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let request = |max_wait_seconds: Option<i64>| {
+        let mut body = json!({
+            "type": "tests",
+            "label": "max wait",
+            "script": "true",
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345",
+            "timeout_seconds": 30
+        });
+        if let Some(seconds) = max_wait_seconds {
+            body["max_wait_seconds"] = json!(seconds);
+        }
+        body
+    };
+
+    let (status, default_job) = post_json(app.clone(), "/queue-jobs", request(None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(default_job["max_wait_seconds"], 300);
+    let (status, explicit_job) = post_json(app.clone(), "/queue-jobs", request(Some(900))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(explicit_job["max_wait_seconds"], 900);
+    let (status, rejected) = post_json(app, "/queue-jobs", request(Some(0))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        rejected["detail"],
+        "max_wait_seconds must be greater than 0"
+    );
+}
+
+#[tokio::test]
 async fn queue_runtime_recovery_requeues_held_pending_job() {
     let state_file = write_session_fixture();
     let queue_state_dir = state_file.with_extension("queue-runner-recover-held-pending");
