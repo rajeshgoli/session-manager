@@ -1278,6 +1278,8 @@ pub fn router(state: AppState) -> Router {
         .route("/hooks/tmux-client", post(tmux_client_hook))
         .route("/hooks/context-usage", post(context_usage_hook))
         .route("/client/bootstrap", get(client_bootstrap))
+        .route("/client/session-models", get(client_session_models))
+        .route("/client/host-status", get(client_host_status))
         .route("/client/analytics/summary", get(client_analytics_summary))
         .route("/client/request-status", post(client_request_status))
         .route("/client/bug-reports", post(submit_client_bug_report))
@@ -2255,6 +2257,59 @@ async fn client_bootstrap(
     )))
 }
 
+#[derive(Deserialize)]
+struct SessionModelsQuery {
+    provider: String,
+    working_dir: Option<String>,
+}
+
+async fn client_session_models(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SessionModelsQuery>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
+    ensure_public_edge_assertion_for_request(&state, &request)?;
+    ensure_session_read_allowed(&state, &request)?;
+    ensure_mobile_cloudflare_access_context_matches_optional_actor(
+        &state,
+        access_context.as_ref(),
+        request_actor_email(&state.config, &request).as_deref(),
+    )?;
+    if !matches!(query.provider.as_str(), "claude" | "codex" | "codex-fork") {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "Unsupported provider".into(),
+        });
+    }
+    let runtime = TmuxRuntime::from_app_config(&state.config);
+    let models = tokio::task::spawn_blocking(move || {
+        let working_dir = match query.working_dir {
+            Some(path) if !path.trim().is_empty() => expand_home(path.trim()),
+            _ => std::env::current_dir()?,
+        };
+        runtime.session_models(&query.provider, &working_dir)
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
+    Ok(Json(json!({ "models": models })))
+}
+
+async fn client_host_status(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
+    ensure_public_edge_assertion_for_request(&state, &request)?;
+    ensure_session_read_allowed(&state, &request)?;
+    ensure_mobile_cloudflare_access_context_matches_optional_actor(
+        &state,
+        access_context.as_ref(),
+        request_actor_email(&state.config, &request).as_deref(),
+    )?;
+    Ok(Json(crate::host_status::snapshot().await))
+}
+
 async fn client_analytics_summary(
     State(state): State<Arc<AppState>>,
     request: Request,
@@ -2267,10 +2322,25 @@ async fn client_analytics_summary(
         access_context.as_ref(),
         request_actor_email(&state.config, &request).as_deref(),
     )?;
-    Ok(Json(build_mobile_analytics_summary(
-        &state.config,
-        &state.session_store,
-    )?))
+    let mut summary = build_mobile_analytics_summary(&state.config, &state.session_store)?;
+    let sessions = state.session_store.list_sessions(false)?;
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for session in sessions {
+        let response = serde_json::to_value(session_response_with_live_activity(&state, session))
+            .unwrap_or(Value::Null);
+        let activity = match response["activity_state"].as_str() {
+            Some("working") => "working",
+            Some("thinking") => "thinking",
+            Some("waiting" | "waiting_permission" | "waiting_input") => "waiting",
+            _ => "idle",
+        };
+        *counts.entry(activity.into()).or_default() += 1;
+    }
+    summary["workload"]["agents_working"] =
+        json!(counts.get("working").unwrap_or(&0) + counts.get("thinking").unwrap_or(&0));
+    summary["state_distribution"] = json!(["working", "thinking", "waiting", "idle"]
+        .map(|key| json!({"key": key, "label": key, "count": counts.get(key).unwrap_or(&0)})));
+    Ok(Json(summary))
 }
 
 async fn client_request_status(
@@ -6003,11 +6073,45 @@ async fn list_queue_jobs(
     // test/performance job may be holding this agent's queue.
     let active =
         RetainedQueueStore::list_queue_jobs_from_path(&queue_db_path, QueueJobFilters::default())?;
+    let jobs = limit_terminal_jobs_per_session(jobs, query.terminal_limit_per_session);
+    // Resolve names from one registry snapshot, not two full reads per job.
+    let sessions = state.session_store.list_sessions(true)?;
+    let mut names = BTreeMap::new();
+    for session in &sessions {
+        names.insert(session.id.clone(), session_display_name(session.clone()));
+    }
+    for session in &sessions {
+        for alias in &session.aliases {
+            names.entry(alias.clone()).or_insert_with(|| session_display_name(session.clone()));
+        }
+    }
+    for session in sessions {
+        for name in [session.cached_display_name(), session.friendly_name.clone(), session.native_title.clone(), Some(session.name.clone())].into_iter().flatten() {
+            names.entry(name).or_insert_with(|| session_display_name(session.clone()));
+        }
+    }
     let mut response_jobs = Vec::with_capacity(jobs.len());
     for job in jobs {
-        response_jobs.push(queue_job_response_with_context(&state, job, &active)?);
+        let requester_name = job.requester_session_id.as_ref().and_then(|id| names.get(id.trim())).cloned();
+        let notify_name = job.notify_session_id.as_ref().map(|id| names.get(id.trim()).unwrap_or(id).clone());
+        response_jobs.push(queue_job_response_with_names(&state, job, &active, requester_name, notify_name)?);
     }
     Ok(Json(json!({ "jobs": response_jobs })))
+}
+
+fn limit_terminal_jobs_per_session(mut jobs: Vec<QueueJobRecord>, limit: Option<usize>) -> Vec<QueueJobRecord> {
+    let Some(limit) = limit else { return jobs; };
+    // The durable listing is oldest first; retain recent terminal work per recipient.
+    jobs.reverse();
+    let mut counts = BTreeMap::<String, usize>::new();
+    jobs.retain(|job| {
+        if matches!(job.state.as_str(), "pending" | "running") { return true; }
+        let recipient = job.notify_session_id.as_ref().filter(|id| !id.is_empty()).or(job.requester_session_id.as_ref()).cloned().unwrap_or_default();
+        let count = counts.entry(recipient).or_default();
+        *count += 1;
+        *count <= limit
+    });
+    jobs
 }
 
 fn queue_lookup_error(error: anyhow::Error) -> ApiError {
@@ -10437,6 +10541,8 @@ fn client_session_value(
     ))
     .unwrap_or_else(|_| json!({}));
     let attach_descriptor = attach_descriptor_payload(session.clone());
+    value["model"] = json!(session.model);
+    value["reasoning_effort"] = json!(session.reasoning_effort);
     value["attach_descriptor"] = attach_descriptor.clone();
     value["termux_attach"] = Value::Null;
     let mobile_terminal = mobile_terminal_metadata(
@@ -12896,6 +13002,8 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/events/state"
         || path == "/apk"
         || path == "/client/analytics/summary"
+        || path == "/client/session-models"
+        || path == "/client/host-status"
         || path == "/codex-review-requests"
         || path.starts_with("/codex-review-requests/")
         || path == "/session-obligations"
@@ -13762,6 +13870,8 @@ struct ListQueueJobsQuery {
     state: Option<String>,
     #[serde(default)]
     include_terminal: bool,
+    #[serde(default)]
+    terminal_limit_per_session: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -14366,6 +14476,16 @@ fn queue_job_response_with_context(
             .or_else(|| Some(session_id.to_owned())),
         None => None,
     };
+    queue_job_response_with_names(state, job, active, requester_name, notify_name)
+}
+
+fn queue_job_response_with_names(
+    state: &AppState,
+    job: QueueJobRecord,
+    active: &[QueueJobRecord],
+    requester_name: Option<String>,
+    notify_name: Option<String>,
+) -> Result<Value, ApiError> {
     let termination_reason = match job.state.as_str() {
         "timed_out" => Some("timeout"),
         "cancelled" => Some("cancelled"),
@@ -17530,6 +17650,7 @@ mod tests {
         let app = router(AppState::new(cloudflare_access_config()));
         let routes = [
             (Method::GET, "/client/bootstrap", "", false),
+            (Method::GET, "/client/host-status", "", false),
             (
                 Method::POST,
                 "/auth/device/google",
@@ -17537,6 +17658,12 @@ mod tests {
                 true,
             ),
             (Method::GET, "/client/analytics/summary", "", false),
+            (
+                Method::GET,
+                "/client/session-models?provider=claude",
+                "",
+                false,
+            ),
             (Method::POST, "/client/request-status", "", false),
             (
                 Method::POST,
@@ -18508,9 +18635,140 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mobile_terminal_routes_advertise_supported_bridge() {
+    async fn mobile_analytics_activity_distribution_matches_workload_totals() {
         let signing_key = SigningKey::random(&mut OsRng);
         let app = router(AppState::new(mobile_ticket_config(&signing_key)));
+        let response = app
+            .oneshot(local_request(
+                Method::GET,
+                "/client/analytics/summary",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body["state_distribution"].as_array().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["count"].as_u64().unwrap())
+                .sum::<u64>(),
+            body["workload"]["agents_live"].as_u64().unwrap()
+        );
+        let working = rows
+            .iter()
+            .filter(|row| row["key"] == "working" || row["key"] == "thinking")
+            .map(|row| row["count"].as_u64().unwrap())
+            .sum::<u64>();
+        assert_eq!(
+            working,
+            body["workload"]["agents_working"].as_u64().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn mobile_job_history_keeps_recent_results_per_recipient_and_all_active_jobs() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let config = mobile_ticket_config(&signing_key);
+        let queue_dir = config.queue_runner_state_dir();
+        for (index, (recipient, status)) in [
+            ("fork1001", "failed"), ("fork1001", "succeeded"),
+            ("other-agent", "memory_exceeded"), ("fork1001", "pending"),
+            ("fork1001", "running"),
+        ].into_iter().enumerate() {
+            let job = RetainedQueueStore::create_queue_job_in_state_dir(&queue_dir, crate::queue::CreateQueueJob {
+                job_type: "test".into(), label: format!("history-{index}"),
+                requester_session_id: Some("requester".into()), notify_session_id: recipient.into(),
+                cwd: queue_dir.display().to_string(), argv: Some(vec!["true".into()]), script: None,
+                env: BTreeMap::new(), timeout_seconds: 30, cpu_percent: None, gpu_percent: None, memory_bytes: None,
+            }).unwrap();
+            let conn = rusqlite::Connection::open(queue_dir.join("queue_runner.db")).unwrap();
+            conn.execute("UPDATE queue_jobs SET state = ?1, queued_at = ?2 WHERE id = ?3",
+                [status, &format!("2026-09-12T12:00:0{index}Z"), &job.id]).unwrap();
+        }
+        let app = router(AppState::new(config));
+        for (uri, expected) in [
+            ("/queue-jobs", vec!["history-3", "history-4"]),
+            ("/queue-jobs?include_terminal=true", vec!["history-0", "history-1", "history-2", "history-3", "history-4"]),
+            ("/queue-jobs?include_terminal=true&terminal_limit_per_session=1", vec!["history-1", "history-2", "history-3", "history-4"]),
+        ] {
+            let response = app.clone().oneshot(local_request(Method::GET, uri, Body::empty())).await.unwrap();
+            let (status, body) = response_json(response).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let mut labels = body["jobs"].as_array().unwrap().iter().map(|job| job["label"].as_str().unwrap()).collect::<Vec<_>>();
+            labels.sort();
+            assert_eq!(labels, expected, "{uri}");
+            for job in body["jobs"].as_array().unwrap() {
+                assert_eq!(job["requester_name"], Value::Null);
+                assert!(job["notify_name"].is_string());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mobile_session_models_exposes_claude_choices_and_rejects_unknown_provider() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let app = router(AppState::new(mobile_ticket_config(&signing_key)));
+        let response = app
+            .clone()
+            .oneshot(local_request(
+                Method::GET,
+                "/client/session-models?provider=claude",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["models"], json!(["fable", "sonnet", "opus", "haiku"]));
+        let response = app
+            .oneshot(local_request(
+                Method::GET,
+                "/client/session-models?provider=invalid",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(is_protected_read_surface("GET", "/client/session-models"));
+    }
+
+    #[tokio::test]
+    async fn mobile_session_models_uses_selected_workspace_for_relative_provider() {
+        use std::os::unix::fs::PermissionsExt;
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        let root = std::path::Path::new(&config.paths.state_file).parent().unwrap().join("model-workspace");
+        fs::create_dir_all(&root).unwrap();
+        let command = root.join("codex");
+        fs::write(&command, r#"#!/bin/sh
+printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
+"#).unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+        config.codex.command = "./codex".into();
+        let app = router(AppState::new(config));
+        let uri = format!("/client/session-models?provider=codex&working_dir={}", root.display());
+        let response = app.oneshot(local_request(Method::GET, &uri, Body::empty())).await.unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["models"], json!(["workspace-model"]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn mobile_terminal_routes_advertise_supported_bridge() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let config = mobile_ticket_config(&signing_key);
+        let mut fixture: Value =
+            serde_json::from_slice(&fs::read(&config.paths.state_file).unwrap()).unwrap();
+        fixture["sessions"][0]["model"] = json!("gpt-test");
+        fixture["sessions"][0]["reasoning_effort"] = json!("medium");
+        fs::write(
+            &config.paths.state_file,
+            serde_json::to_vec(&fixture).unwrap(),
+        )
+        .unwrap();
+        let app = router(AppState::new(config));
 
         let response = app
             .oneshot(local_request(
@@ -18523,6 +18781,8 @@ mod tests {
         let (status, body) = response_json(response).await;
         assert_eq!(status, StatusCode::OK);
         let session = &body["sessions"][0];
+        assert_eq!(session["model"], "gpt-test");
+        assert_eq!(session["reasoning_effort"], "medium");
         assert_eq!(session["mobile_terminal"]["supported"], true);
         assert_eq!(session["mobile_terminal"]["transport"], "sm-https-tmux");
         assert_eq!(

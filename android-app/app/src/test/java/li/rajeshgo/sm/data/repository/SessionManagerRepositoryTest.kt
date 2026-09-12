@@ -6,8 +6,59 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import okhttp3.ResponseBody.Companion.toResponseBody
+import okhttp3.MediaType.Companion.toMediaType
+import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 
 class SessionManagerRepositoryTest {
+    @Test
+    fun jobRequestIncludesBoundedHistoryAndDecodesFinishedWork() = kotlinx.coroutines.runBlocking {
+        val client = okhttp3.OkHttpClient.Builder().addInterceptor { chain ->
+            val request = chain.request()
+            assertEquals("true", request.url.queryParameter("include_terminal"))
+            assertEquals("10", request.url.queryParameter("terminal_limit_per_session"))
+            okhttp3.Response.Builder().request(request).protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(200).message("OK").body(
+                    """{"jobs":[{"id":"done","state":"failed","notify_session_id":"agent","exit_code":1}]}""".toResponseBody("application/json".toMediaType()),
+                ).build()
+        }.build()
+        val service = retrofit2.Retrofit.Builder().baseUrl("https://example.com/").client(client)
+            .addConverterFactory(kotlinx.serialization.json.Json.asConverterFactory("application/json".toMediaType()))
+            .build().create(li.rajeshgo.sm.data.remote.ApiService::class.java)
+        val jobs = service.getSessionJobs().jobs
+        assertEquals("failed", jobs.single().state)
+        assertTrue(jobs.single().isAwaitedBy("agent"))
+        assertEquals(1, jobs.single().exitCode)
+    }
+
+    @Test
+    fun attachTicketLimitIsRetryableButAuthenticationIsNot() {
+        val repository = SessionManagerRepository()
+        fun failure(code: Int): Throwable = repository.classifyWriteFailure(
+            retrofit2.HttpException(retrofit2.Response.error<Any>(code, "{}".toResponseBody())),
+        )
+        assertTrue(failure(429) is SessionManagerTransientException)
+        assertTrue(failure(401) is SessionManagerAuthException)
+        assertFalse(failure(403) is SessionManagerTransientException)
+        assertFalse(failure(404) is SessionManagerTransientException)
+    }
+
+    @Test
+    fun queueWorkBelongsToRecipientWhenRequesterDelegatesNotification() {
+        val job = li.rajeshgo.sm.data.model.SessionJob("job", requesterSessionId = "sender", notifySessionId = "recipient")
+        assertTrue(job.isAwaitedBy("recipient"))
+        assertFalse(job.isAwaitedBy("sender"))
+        assertTrue(job.copy(notifySessionId = null).isAwaitedBy("sender"))
+        assertTrue(job.copy(notifySessionId = "").isAwaitedBy("sender"))
+    }
+
+    @Test
+    fun forbiddenAccessDoesNotDiscardAnAuthenticatedDeviceLogin() {
+        val failure: Throwable = forbiddenRequestFailure(IllegalStateException("gateway refused"))
+        assertFalse(failure is SessionManagerAuthException)
+        assertTrue(failure.message!!.contains("sign-in is saved"))
+    }
+
     @Test
     fun retireFallbackErrorCopyUsesRetireLanguage() {
         assertEquals("Retire request failed", RETIRE_REQUEST_FAILED_MESSAGE)

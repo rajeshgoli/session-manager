@@ -1,39 +1,28 @@
 package li.rajeshgo.sm.ui.settings
 
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.ExpandMore
+import androidx.compose.material.icons.rounded.ExpandLess
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import li.rajeshgo.sm.BuildConfig
 import li.rajeshgo.sm.auth.GoogleSignInManager
-import li.rajeshgo.sm.ui.theme.BorderStrong
-import li.rajeshgo.sm.ui.theme.Cyan
-import li.rajeshgo.sm.ui.theme.Emerald
-import li.rajeshgo.sm.ui.theme.PanelElevated
-import li.rajeshgo.sm.ui.theme.Rose
+import li.rajeshgo.sm.ui.theme.*
 import li.rajeshgo.sm.util.LocalDefaults
 import kotlinx.coroutines.launch
 
@@ -45,363 +34,133 @@ fun SettingsScreen(
     viewModel: SettingsViewModel = viewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
-    val context = LocalContext.current
-    val googleSignInManager = GoogleSignInManager(context)
-    val coroutineScope = rememberCoroutineScope()
-    val deepLinkEnrollmentUrl = pendingEnrollmentUrl?.trim()?.takeIf { it.isNotBlank() }
-    val effectiveGoogleClientId = state.bootstrap?.auth?.googleServerClientId?.takeIf { it.isNotBlank() }
-        ?: LocalDefaults.googleServerClientId.takeIf { it.isNotBlank() }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(24.dp),
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Text(
-            text = "Session Manager",
-            style = MaterialTheme.typography.headlineMedium,
-            color = MaterialTheme.colorScheme.onBackground,
-        )
-        Spacer(Modifier.height(8.dp))
-        Text(
-            text = "Native Android watch client for sm.rajeshgo.li with in-app HTTPS terminal attach.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.height(8.dp))
-        Text(
-            text = "App version ${BuildConfig.VERSION_NAME}",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            fontFamily = FontFamily.Monospace,
-        )
-
-        Spacer(Modifier.height(24.dp))
-
-        OutlinedTextField(
-            value = state.serverUrl,
-            onValueChange = viewModel::updateServerUrl,
-            label = { Text("Server URL") },
-            placeholder = { Text(LocalDefaults.defaultServerUrl.ifBlank { "https://your-sm-host" }) },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-
-        Spacer(Modifier.height(16.dp))
-
-        Text(
-            text = "Google server client ID",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.height(4.dp))
-        Text(
-            text = when {
-                !state.bootstrap?.auth?.googleServerClientId.isNullOrBlank() -> "Loaded from server bootstrap"
-                !LocalDefaults.googleServerClientId.isBlank() -> "Configured in local.defaults.properties"
-                else -> "Not configured"
-            },
-            style = MaterialTheme.typography.bodySmall,
-            color = if (effectiveGoogleClientId.isNullOrBlank()) Rose else Emerald,
-            fontFamily = FontFamily.Monospace,
-        )
-
-        state.bootstrap?.externalAccess?.publicSshHost?.let { host ->
-            Spacer(Modifier.height(16.dp))
-            Text(
-                text = "Remote attach host",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(4.dp))
-            Text(
-                text = host,
-                style = MaterialTheme.typography.bodySmall,
-                color = Cyan,
-                fontFamily = FontFamily.Monospace,
-            )
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            while (true) { viewModel.refreshStudioSshStatus(); kotlinx.coroutines.delay(10_000) }
         }
-
-        Spacer(Modifier.height(24.dp))
-
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = PanelElevated),
-            border = androidx.compose.foundation.BorderStroke(1.dp, BorderStrong),
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Text(
-                    text = "Mobile HTTPS attach",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    text = "Register this public key under mobile_terminal.allowed_users in Session Manager config to enable in-app terminal attach.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.height(10.dp))
-                Text(
-                    text = "Device key id",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text(
-                    text = state.mobileDeviceKeyId.ifBlank { "unavailable" },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (state.mobileDeviceKeyId.isBlank()) Rose else Cyan,
-                    fontFamily = FontFamily.Monospace,
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    text = state.mobileDevicePublicKey.ifBlank { state.mobileDeviceKeyError ?: "No key generated yet" },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (state.mobileDeviceKeyError == null) MaterialTheme.colorScheme.onSurfaceVariant else Rose,
-                    fontFamily = FontFamily.Monospace,
-                )
-                Spacer(Modifier.height(10.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(onClick = viewModel::loadMobileDeviceKey) {
-                        Text("Refresh key")
-                    }
-                    Button(
-                        onClick = {
-                            val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
-                            val text = "id: ${state.mobileDeviceKeyId}\npublic_key: |\n" +
-                                state.mobileDevicePublicKey.lines().joinToString("\n") { "  $it" }
-                            clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm mobile attach key", text))
-                        },
-                        enabled = state.mobileDeviceKeyId.isNotBlank() && state.mobileDevicePublicKey.isNotBlank(),
-                    ) {
-                        Text("Copy config")
-                    }
-                }
-                Spacer(Modifier.height(18.dp))
-                Text(
-                    text = "Cloudflare Access client certificate",
-                    style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    text = "Run sm enroll-device on the Session Manager host, scan the QR with the phone Camera app, then open the link in Session Manager.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    text = "Client auth",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                Text(
-                    text = if (state.cloudflareDeviceCertificateConfigured) "Configured" else "Not configured",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (state.cloudflareDeviceCertificateConfigured) Emerald else Rose,
-                    fontFamily = FontFamily.Monospace,
-                )
-                deepLinkEnrollmentUrl?.let { enrollmentUrl ->
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        text = "Enrollment link opened from camera",
-                        style = MaterialTheme.typography.titleSmall,
-                        color = MaterialTheme.colorScheme.onSurface,
-                    )
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        text = enrollmentUrl,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Cyan,
-                        fontFamily = FontFamily.Monospace,
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick = {
-                                viewModel.enrollCloudflareDeviceFromQr(enrollmentUrl)
-                                onEnrollmentDeepLinkConsumed()
-                            },
-                            enabled = !state.cloudflareEnrollmentInProgress,
-                        ) {
-                            Text("Enroll device")
-                        }
-                        OutlinedButton(
-                            onClick = {
-                                onEnrollmentDeepLinkConsumed()
-                            },
-                            enabled = !state.cloudflareEnrollmentInProgress,
-                        ) {
-                            Text("Dismiss")
-                        }
-                    }
-                }
-                Spacer(Modifier.height(10.dp))
-                if (state.cloudflareEnrollmentInProgress) {
-                    CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.height(18.dp))
-                    Spacer(Modifier.height(10.dp))
-                }
-                OutlinedButton(
-                    onClick = viewModel::clearCloudflareDeviceCertificateChain,
-                    enabled = state.cloudflareDeviceCertificateConfigured && !state.cloudflareEnrollmentInProgress,
-                ) {
-                    Text("Clear cert")
-                }
-                state.cloudflareEnrollmentStatus?.let { status ->
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        text = status,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Emerald,
-                    )
-                }
-                state.cloudflareEnrollmentError?.let { error ->
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        text = error,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Rose,
-                    )
-                }
-            }
-        }
-
-        Spacer(Modifier.height(24.dp))
-
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            colors = CardDefaults.cardColors(containerColor = PanelElevated),
-            border = androidx.compose.foundation.BorderStroke(1.dp, BorderStrong),
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Text(
-                    text = "App updates",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
-                Spacer(Modifier.height(8.dp))
-                val availableUpdate = state.availableUpdate
-                if (availableUpdate == null) {
-                    Text(
-                        text = "This build matches the latest published artifact.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(Modifier.height(12.dp))
-                    OutlinedButton(onClick = viewModel::refreshUpdate, modifier = Modifier.fillMaxWidth()) {
-                        Text("Check for update")
-                    }
-                } else {
-                    Text(
-                        text = "Update available: ${availableUpdate.versionName}",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Emerald,
-                    )
-                    availableUpdate.uploadedAt?.let { uploadedAt ->
-                        Spacer(Modifier.height(4.dp))
-                        Text(
-                            text = "Published $uploadedAt",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    Spacer(Modifier.height(12.dp))
-                    Button(
-                        onClick = viewModel::installUpdate,
-                        enabled = !state.updateInstalling,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        if (state.updateInstalling) {
-                            CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.height(18.dp))
-                        } else {
-                            Text("Install update")
-                        }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    OutlinedButton(
-                        onClick = viewModel::dismissUpdate,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text("Dismiss this version")
-                    }
-                }
-
-                state.updateError?.let { updateError ->
-                    Spacer(Modifier.height(12.dp))
-                    Text(
-                        text = updateError,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Rose,
-                    )
-                }
-            }
-        }
-
-        Spacer(Modifier.height(24.dp))
-
-        if (state.isLoggedIn) {
-            Text(
-                text = "Signed in as ${state.userName.ifBlank { state.userEmail }}",
-                style = MaterialTheme.typography.bodyMedium,
-                color = Emerald,
-            )
-            Spacer(Modifier.height(16.dp))
-            Button(onClick = onNavigateToWatch, modifier = Modifier.fillMaxWidth()) {
-                Text("Open Watch")
-            }
-            Spacer(Modifier.height(12.dp))
-            OutlinedButton(
-                onClick = {
-                    coroutineScope.launch {
-                        googleSignInManager.clearCredentialState()
-                        viewModel.finishLogout()
-                    }
-                },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Sign Out")
-            }
-        } else {
-            Button(
-                onClick = {
-                    viewModel.refreshBootstrap()
-                    coroutineScope.launch {
-                        googleSignInManager.getIdToken(effectiveGoogleClientId.orEmpty())
-                            .onSuccess { credential ->
-                                viewModel.exchangeGoogleIdToken(credential.idToken, onNavigateToWatch)
-                            }
-                            .onFailure { error ->
-                                viewModel.reportError(error.message ?: "Google sign-in failed")
-                            }
-                    }
-                },
-                enabled = !state.loading && state.serverUrl.isNotBlank(),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                if (state.loading) {
-                    CircularProgressIndicator(strokeWidth = 2.dp, modifier = Modifier.height(18.dp))
-                } else {
-                    Text("Sign in with Google")
-                }
-            }
-        }
-
-        state.error?.let { error ->
-            Spacer(Modifier.height(16.dp))
-            Text(
-                text = error,
-                style = MaterialTheme.typography.bodySmall,
-                color = Rose,
-            )
-        }
-
-        Spacer(Modifier.height(24.dp))
-        Text(
-            text = "Attach note: HTTPS in-app attach is available when mobile_terminal is enabled server-side and this device key is registered.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
     }
+    val context = LocalContext.current
+    val signIn = remember(context) { GoogleSignInManager(context) }
+    val scope = rememberCoroutineScope()
+    var advanced by rememberSaveable { mutableStateOf(false) }
+    val clientId = state.bootstrap?.auth?.googleServerClientId?.takeIf { it.isNotBlank() } ?: LocalDefaults.googleServerClientId
+    Column(
+        Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().imePadding()
+            .verticalScroll(rememberScrollState()).padding(horizontal = 20.dp).padding(bottom = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(20.dp),
+    ) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onNavigateToWatch) { Icon(Icons.AutoMirrored.Rounded.ArrowBack, "Back") }
+            Text("Settings", style = MaterialTheme.typography.headlineSmall)
+        }
+        SettingsGroup("Account") {
+            if (state.isLoggedIn) {
+                Text(state.userName.ifBlank { state.userEmail }, style = MaterialTheme.typography.titleMedium)
+                if (state.userName.isNotBlank() && state.userName != state.userEmail) Text(state.userEmail, style = MaterialTheme.typography.bodyMedium, color = TextMuted)
+                TextButton(onClick = { scope.launch { signIn.clearCredentialState(); viewModel.finishLogout() } }) { Text("Sign out") }
+            } else {
+                Text("Sign in to manage your agents.", color = TextSecondary)
+                Button(onClick = {
+                    viewModel.refreshBootstrap()
+                    scope.launch {
+                        signIn.getIdToken(clientId).onSuccess { viewModel.exchangeGoogleIdToken(it.idToken, onNavigateToWatch) }
+                            .onFailure { viewModel.reportError(it.message ?: "Couldn't sign in. Try again.") }
+                    }
+                }, enabled = !state.loading && state.serverUrl.isNotBlank()) { Text(if (state.loading) "Signing in…" else "Sign in with Google") }
+            }
+            state.error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = Rose); TextButton(onClick = viewModel::refreshBootstrap) { Text("Retry connection") } }
+        }
+        ConnectionSettings(state, viewModel, pendingEnrollmentUrl, onEnrollmentDeepLinkConsumed)
+        SettingsGroup("App updates") {
+            Text("Version ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})", style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
+            val update = state.availableUpdate
+            if (update == null) {
+                TextButton(onClick = viewModel::refreshUpdate) { Text("Check for updates") }
+            } else {
+                Text("${update.versionName} is available", color = Emerald)
+                Button(onClick = viewModel::installUpdate, enabled = !state.updateInstalling) { Text(if (state.updateInstalling) "Downloading…" else "Install update") }
+            }
+            state.updateError?.let { Text(it, color = Rose, style = MaterialTheme.typography.bodySmall) }
+        }
+        Row(Modifier.fillMaxWidth().clickable { advanced = !advanced }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("Advanced", Modifier.weight(1f), color = TextMuted, style = MaterialTheme.typography.titleSmall)
+            Icon(if (advanced) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, "Advanced settings", tint = TextMuted)
+        }
+        if (advanced) AdvancedSettings(state, viewModel)
+    }
+}
+
+@Composable
+private fun SettingsGroup(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(title, style = MaterialTheme.typography.labelLarge, color = TextMuted, modifier = Modifier.padding(start = 4.dp))
+        Surface(shape = RoundedCornerShape(18.dp), color = PanelElevated) {
+            Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp), content = content)
+        }
+    }
+}
+
+@Composable
+private fun ConnectionSettings(state: SettingsUiState, viewModel: SettingsViewModel, pendingUrl: String?, onConsumed: () -> Unit) {
+    SettingsGroup("Connections") {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("Studio SSH", style = MaterialTheme.typography.titleMedium)
+                Text(if (state.studioSshBusy) "Updating…" else if (!state.studioSshLoaded) "Checking…" else if (state.studioSshStatus == "starting") "Starting…" else if (state.studioSshEnabled) "On" else "Off", color = TextMuted)
+            }
+            Switch(checked = state.studioSshEnabled, onCheckedChange = viewModel::toggleStudioSsh, enabled = state.isLoggedIn && !state.studioSshBusy && state.studioSshLoaded)
+        }
+        if (state.studioSshEnabled && state.studioSshHost.isNotBlank()) Text(state.studioSshHost, style = MaterialTheme.typography.bodySmall, color = TextMuted)
+        state.studioSshError?.let { Text(it, color = Rose, style = MaterialTheme.typography.bodySmall); TextButton(onClick = viewModel::refreshStudioSshStatus) { Text("Try again") } }
+        HorizontalDivider(color = Border)
+        Text("This device", style = MaterialTheme.typography.titleMedium)
+        Text(if (state.cloudflareDeviceCertificateConfigured) "Registered" else "Not registered", color = if (state.cloudflareDeviceCertificateConfigured) Emerald else TextMuted)
+        var hostOpen by remember { mutableStateOf(false) }
+    if (hostOpen) HostStatusSheet(state, viewModel::refreshHostStatus) { hostOpen = false }
+    TextButton(onClick = { hostOpen = true }) { Text("Host status") }
+    val enrollmentUrl = pendingUrl?.trim()?.takeIf { it.isNotBlank() }
+        if (enrollmentUrl != null) {
+            Text("A device registration link is ready.")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { viewModel.enrollCloudflareDeviceFromQr(enrollmentUrl); onConsumed() }, enabled = !state.cloudflareEnrollmentInProgress) { Text("Register device") }
+                TextButton(onClick = onConsumed) { Text("Dismiss") }
+            }
+        } else if (!state.cloudflareDeviceCertificateConfigured) {
+            Text("Scan the registration QR code from your Session Manager host.", style = MaterialTheme.typography.bodySmall, color = TextMuted)
+        }
+        if (state.cloudflareEnrollmentInProgress) LinearProgressIndicator(Modifier.fillMaxWidth())
+        state.cloudflareEnrollmentError?.let { Text(it, color = Rose, style = MaterialTheme.typography.bodySmall) }
+    }
+}
+
+@Composable
+private fun AdvancedSettings(state: SettingsUiState, viewModel: SettingsViewModel) {
+    val context = LocalContext.current
+    var deviceTools by rememberSaveable { mutableStateOf(false) }
+    var confirmRemoveDevice by remember { mutableStateOf(false) }
+    SettingsGroup("Server") {
+        OutlinedTextField(state.serverUrl, viewModel::updateServerUrl, label = { Text("Server address") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+        TextButton(onClick = viewModel::refreshBootstrap) { Text("Save connection") }
+    }
+    SettingsGroup("Device registration") {
+        TextButton(onClick = { deviceTools = !deviceTools }) { Text(if (deviceTools) "Hide registration details" else "Show registration details") }
+        if (deviceTools) {
+            Text(state.mobileDeviceKeyId, style = MaterialTheme.typography.bodySmall, color = TextMuted)
+            Text("For manual setup on your Session Manager host.", style = MaterialTheme.typography.bodySmall, color = TextMuted)
+            TextButton(onClick = {
+                val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                val config = "id: ${state.mobileDeviceKeyId}\npublic_key: |\n" + state.mobileDevicePublicKey.lines().joinToString("\n") { "  $it" }
+                clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("Device registration", config))
+            }, enabled = state.mobileDevicePublicKey.isNotBlank()) { Text("Copy registration details") }
+            state.mobileDeviceKeyError?.let { Text(it, color = Rose); TextButton(onClick = viewModel::loadMobileDeviceKey) { Text("Retry loading device key") } }
+        }
+        TextButton(onClick = { confirmRemoveDevice = true }, enabled = state.cloudflareDeviceCertificateConfigured && !state.cloudflareEnrollmentInProgress) { Text("Remove device registration", color = Rose) }
+    }
+    if (confirmRemoveDevice) AlertDialog(
+        onDismissRequest = { confirmRemoveDevice = false }, title = { Text("Remove registration?") },
+        text = { Text("You’ll need to register this device again to connect remotely.") },
+        confirmButton = { TextButton(onClick = { confirmRemoveDevice = false; viewModel.clearCloudflareDeviceCertificateChain() }) { Text("Remove") } },
+        dismissButton = { TextButton(onClick = { confirmRemoveDevice = false }) { Text("Cancel") } },
+    )
 }

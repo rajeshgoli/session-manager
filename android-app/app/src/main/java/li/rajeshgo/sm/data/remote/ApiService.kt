@@ -31,6 +31,21 @@ import retrofit2.http.Path
 import retrofit2.http.Query
 
 interface ApiService {
+    @GET("client/host-status")
+    suspend fun getHostStatus(): li.rajeshgo.sm.data.model.HostStatus
+
+    @GET("client/session-models")
+    suspend fun getSessionModels(@Query("provider") provider: String, @Query("working_dir") workingDir: String): li.rajeshgo.sm.data.model.SessionModelsResponse
+
+    @POST("sessions")
+    suspend fun createSession(@Body request: li.rajeshgo.sm.data.model.CreateSessionRequest): li.rajeshgo.sm.data.model.CreatedSession
+
+    @GET("queue-jobs?include_terminal=true&terminal_limit_per_session=10")
+    suspend fun getSessionJobs(): li.rajeshgo.sm.data.model.SessionJobsResponse
+
+    @GET("session-obligations")
+    suspend fun getSessionObligations(): li.rajeshgo.sm.data.model.SessionObligationsResponse
+
     @GET("client/bootstrap")
     suspend fun getBootstrap(): ClientBootstrapResponse
 

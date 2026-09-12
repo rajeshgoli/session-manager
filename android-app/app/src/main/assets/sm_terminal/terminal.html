@@ -176,7 +176,7 @@
         if (term.cols > 0 && term.rows > 0) {
           reportReady();
           flushPendingWrites();
-          term.focus();
+
         }
       } catch (error) {
         reportError(`Terminal fit failed: ${error && error.message ? error.message : error}`);
@@ -395,6 +395,11 @@
         }
         if (!opened) {
           term.open(terminalElement);
+          // The native composer owns IME input. Output taps must not open a second keyboard.
+          if (term.textarea) {
+            term.textarea.readOnly = true;
+            term.textarea.setAttribute("inputmode", "none");
+          }
           opened = true;
         }
         fitAndReport();

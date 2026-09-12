@@ -1,5 +1,13 @@
 package li.rajeshgo.sm.ui.watch
 
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.runtime.key
+import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
 import android.annotation.SuppressLint
 import android.os.Handler
 import android.os.Looper
@@ -42,7 +50,7 @@ import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.QuestionAnswer
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.RestartAlt
-import androidx.compose.material.icons.rounded.Settings
+import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.SupportAgent
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.UnfoldLess
@@ -130,6 +138,10 @@ fun WatchScreen(
 ) {
     val state by viewModel.uiState.collectAsState()
     val updateState by updateViewModel.uiState.collectAsState()
+    var creating by remember { mutableStateOf(false) }
+    var cloneSource by remember { mutableStateOf<ClientSession?>(null) }
+    var createBusy by remember { mutableStateOf(false) }
+    var createError by remember { mutableStateOf<String?>(null) }
     var query by remember { mutableStateOf("") }
     var filter by remember { mutableStateOf("all") }
     var toast by remember { mutableStateOf<String?>(null) }
@@ -163,7 +175,9 @@ fun WatchScreen(
     }
 
     androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, _ ->
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) viewModel.setTerminalForeground(false)
+            if (event == Lifecycle.Event.ON_START) viewModel.setTerminalForeground(true)
             isResumed = lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -177,12 +191,10 @@ fun WatchScreen(
             return@LaunchedEffect
         }
         viewModel.refresh()
-        viewModel.refreshStudioSshStatus()
         updateViewModel.refresh()
         while (coroutineContext.isActive) {
             delay(WATCH_AUTO_REFRESH_MS)
             viewModel.refresh()
-            viewModel.refreshStudioSshStatus()
         }
     }
 
@@ -197,7 +209,9 @@ fun WatchScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background),
+            .background(MaterialTheme.colorScheme.background)
+            .statusBarsPadding()
+            .navigationBarsPadding(),
     ) {
         if (state.loading) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -231,21 +245,17 @@ fun WatchScreen(
                         }
                     },
                     onOpenSettings = onNavigateToSettings,
+                    onNewSession = { cloneSource = null; createError = null; creating = true },
                 )
             }
 
             item {
-                StudioSshToggleCard(
-                    enabled = state.studioSshEnabled,
-                    status = state.studioSshStatus,
-                    host = state.studioSshHost,
-                    busy = state.studioSshBusy,
-                    error = state.studioSshError,
-                    onToggle = { desired ->
-                        viewModel.toggleStudioSsh(desired) { result ->
-                            toast = result.exceptionOrNull()?.message ?: result.getOrNull()
-                        }
-                    },
+                SessionFilters(
+                    sessions = state.sessions,
+                    query = query,
+                    filter = filter,
+                    onQueryChange = { query = it },
+                    onFilterChange = { filter = it },
                 )
             }
 
@@ -275,7 +285,7 @@ fun WatchScreen(
             } else {
                 activeSections.forEach { section ->
                     item(key = "repo-${section.repoKey}") {
-                        RepoHeader(title = "${section.repoLabel} (${section.repoKey})")
+                        RepoHeader(title = "${section.repoLabel.removeSuffix("/")} · Active")
                     }
                     items(section.roots, key = { "active-${it.session.id}" }) { root ->
                         WatchTree(
@@ -288,6 +298,7 @@ fun WatchScreen(
                             whatById = state.whatBySessionId,
                             onToggleExpanded = { viewModel.toggleExpanded(it) },
                             onOpenAttach = openAttach,
+                            onClone = { cloneSource = it; createError = null; creating = true },
                             onCopyAttach = { session ->
                                 val command = session.termuxAttach?.let(::termuxAttachCommand)
                                 if (command == null) {
@@ -325,7 +336,7 @@ fun WatchScreen(
                 }
                 idleSections.forEach { section ->
                     item(key = "idle-repo-${section.repoKey}") {
-                        RepoHeader(title = "${section.repoLabel} (${section.repoKey})")
+                        RepoHeader(title = "${section.repoLabel.removeSuffix("/")} · Idle")
                     }
                     items(section.roots, key = { "idle-${it.session.id}" }) { root ->
                         WatchTree(
@@ -338,6 +349,7 @@ fun WatchScreen(
                             whatById = state.whatBySessionId,
                             onToggleExpanded = { viewModel.toggleExpanded(it) },
                             onOpenAttach = openAttach,
+                            onClone = { cloneSource = it; createError = null; creating = true },
                             onCopyAttach = { session ->
                                 val command = session.termuxAttach?.let(::termuxAttachCommand)
                                 if (command == null) {
@@ -375,15 +387,7 @@ fun WatchScreen(
                 }
             }
 
-            item {
-                FooterControls(
-                    sessions = state.sessions,
-                    query = query,
-                    filter = filter,
-                    onQueryChange = { query = it },
-                    onFilterChange = { filter = it },
-                )
-            }
+
         }
 
         Box(
@@ -416,6 +420,17 @@ fun WatchScreen(
             }
         }
 
+        if (creating) {
+            CreateSessionSheet(cloneSource, state.sessions, viewModel::sessionModels, createBusy, createError, onDismiss = { creating = false }) { request ->
+                createBusy = true
+                createError = null
+                viewModel.createSession(request) { result ->
+                    createBusy = false
+                    result.onSuccess { creating = false; toast = it }
+                    result.onFailure { createError = it.message ?: "Could not create session" }
+                }
+            }
+        }
         state.terminal?.let { terminal ->
             MobileTerminalOverlay(
                 terminal = terminal,
@@ -432,6 +447,7 @@ fun WatchScreen(
                 onRendererError = viewModel::markTerminalRendererError,
                 onRendererWritten = viewModel::markTerminalRendererWritten,
                 onDetach = viewModel::detachTerminal,
+                onReconnect = viewModel::reconnectTerminal,
                 onCopy = { selectedText ->
                     val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
                     val copiedText = selectedText.ifBlank { terminal.copyBuffer }
@@ -459,9 +475,11 @@ private fun MobileTerminalOverlay(
     onRendererError: (String) -> Unit,
     onRendererWritten: (sequence: Long, bytes: Int) -> Unit,
     onDetach: () -> Unit,
+    onReconnect: () -> Unit,
     onCopy: (String) -> Unit,
 ) {
     var copyRequest by remember { mutableStateOf(0L) }
+    BackHandler(onBack = onDetach)
 
     Surface(
         modifier = Modifier.fillMaxSize(),
@@ -470,7 +488,8 @@ private fun MobileTerminalOverlay(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(6.dp),
+                .imePadding()
+                .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Surface(
@@ -492,30 +511,26 @@ private fun MobileTerminalOverlay(
                             overflow = TextOverflow.Ellipsis,
                         )
                         Text(
-                            text = terminal.status,
+                            text = terminalConnectionLabel(terminal.status),
                             style = MaterialTheme.typography.labelSmall,
                             color = if (terminal.error == null) Cyan else Rose,
                             fontFamily = FontFamily.Monospace,
                         )
-                        Text(
-                            text = terminalDiagnostics(terminal),
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (terminal.rendererError == null) TextMuted else Rose,
-                            fontFamily = FontFamily.Monospace,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
+
                     }
                     OutlinedButton(
                         onClick = onDetach,
-                        modifier = Modifier.height(32.dp),
+                        modifier = Modifier.height(44.dp),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
                     ) {
-                        Text("Detach")
+                        Text("Close")
                     }
                 }
             }
 
+            if (terminal.status in setOf("failed", "detached")) {
+                TextButton(onClick = onReconnect) { Text("Reconnect") }
+            }
             terminal.error?.let { error ->
                 Text(
                     text = error,
@@ -530,6 +545,7 @@ private fun MobileTerminalOverlay(
                 color = Color.Black,
                 border = androidx.compose.foundation.BorderStroke(1.dp, BorderStrong),
             ) {
+                key(terminal.connectionGeneration) {
                 TerminalWebView(
                     terminal = terminal,
                     copyRequest = copyRequest,
@@ -542,27 +558,28 @@ private fun MobileTerminalOverlay(
                     onRendererWritten = onRendererWritten,
                     onCopyText = onCopy,
                 )
+                }
             }
 
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 OutlinedButton(
                     onClick = onEsc,
-                    modifier = Modifier.height(32.dp),
+                    modifier = Modifier.height(44.dp),
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
                 ) { Text("Esc") }
                 OutlinedButton(
                     onClick = onCtrlC,
-                    modifier = Modifier.height(32.dp),
+                    modifier = Modifier.height(44.dp),
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
                 ) { Text("Ctrl-C") }
                 OutlinedButton(
                     onClick = onEnter,
-                    modifier = Modifier.height(32.dp),
+                    modifier = Modifier.height(44.dp),
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
                 ) { Text("Enter") }
                 OutlinedButton(
                     onClick = { copyRequest += 1 },
-                    modifier = Modifier.height(32.dp),
+                    modifier = Modifier.height(44.dp),
                     contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
                 ) { Text("Copy") }
             }
@@ -576,12 +593,14 @@ private fun MobileTerminalOverlay(
                     value = terminal.inputDraft,
                     onValueChange = onInputChange,
                     modifier = Modifier.weight(1f),
-                    label = { Text("Input") },
+                    label = { Text("Message agent") },
+                    keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, keyboardType = KeyboardType.Text),
                     singleLine = false,
-                    maxLines = 2,
+                    maxLines = 6,
                 )
                 Button(
                     onClick = onSend,
+                    enabled = terminal.status == "attached" && terminal.inputDraft.isNotBlank(),
                     modifier = Modifier.height(42.dp),
                     contentPadding = ButtonDefaults.ContentPadding,
                 ) {
@@ -709,9 +728,6 @@ private fun TerminalWebView(
                         }
                         deliveredSequence = frame.sequence
                     }
-                if (terminal.outputFrames.isNotEmpty()) {
-                    webView.evaluateJavascript("window.smFocus();", null)
-                }
             }
             if (copyRequest != deliveredCopyRequest) {
                 deliveredCopyRequest = copyRequest
@@ -932,6 +948,7 @@ private fun HeaderBar(
     onRequestStatus: () -> Unit,
     onEnsureMaintainer: () -> Unit,
     onOpenSettings: () -> Unit,
+    onNewSession: () -> Unit,
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
 
@@ -945,7 +962,7 @@ private fun HeaderBar(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Column {
+            Column(Modifier.weight(1f)) {
                 Text("sm watch", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onSurface)
                 val statusLine = buildString {
                     append("Last sync ")
@@ -977,6 +994,12 @@ private fun HeaderBar(
                         expanded = menuExpanded,
                         onDismissRequest = { menuExpanded = false },
                     ) {
+                        DropdownMenuItem(
+                            text = { Text("New session") },
+                            leadingIcon = { Icon(Icons.Rounded.Add, contentDescription = null) },
+                            onClick = { menuExpanded = false; onNewSession() },
+                            enabled = userEmail.isNotBlank(),
+                        )
                         DropdownMenuItem(
                             text = { Text(if (ensuringMaintainer) "Wake maintainer (starting...)" else "Wake maintainer") },
                             onClick = {
@@ -1022,20 +1045,7 @@ private fun HeaderBar(
                                 )
                             },
                         )
-                        DropdownMenuItem(
-                            text = { Text("Settings") },
-                            onClick = {
-                                menuExpanded = false
-                                onOpenSettings()
-                            },
-                            leadingIcon = {
-                                Icon(
-                                    Icons.Rounded.Settings,
-                                    contentDescription = null,
-                                    tint = TextSecondary,
-                                )
-                            },
-                        )
+
                     }
                 }
                 SettingsIconButtonWithUpdate(hasUpdate = hasUpdate, onClick = onOpenSettings)
@@ -1046,54 +1056,26 @@ private fun HeaderBar(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun FooterControls(
+private fun SessionFilters(
     sessions: List<ClientSession>,
     query: String,
     filter: String,
     onQueryChange: (String) -> Unit,
     onFilterChange: (String) -> Unit,
 ) {
-    val active = sessions.count(::isOperationallyActive)
-    val working = sessions.count { it.activityState == "working" }
-    val thinking = sessions.count { it.activityState == "thinking" }
-    val maintainers = sessions.count { it.isMaintainer }
-
-    Surface(
-        shape = RoundedCornerShape(20.dp),
-        color = Panel,
-        tonalElevation = 0.dp,
-        shadowElevation = 0.dp,
-        border = androidx.compose.foundation.BorderStroke(1.dp, Border),
-    ) {
-        Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            OutlinedTextField(
-                value = query,
-                onValueChange = onQueryChange,
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Search") },
-                placeholder = { Text("name, id, role, alias, worktree") },
-                singleLine = true,
-            )
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf("all", "running", "idle", "stopped").forEach { candidate ->
-                    val selected = candidate == filter
-                    AssistChip(
-                        onClick = { onFilterChange(candidate) },
-                        label = { Text(candidate.uppercase()) },
-                        colors = AssistChipDefaults.assistChipColors(
-                            containerColor = if (selected) Cyan.copy(alpha = 0.18f) else PanelMuted,
-                            labelColor = if (selected) Color.White else TextSecondary,
-                        ),
-                    )
-                }
+    var filtersOpen by remember { mutableStateOf(false) }
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedTextField(
+            value = query, onValueChange = onQueryChange, modifier = Modifier.weight(1f),
+            placeholder = { Text("Search agents") }, singleLine = true, shape = RoundedCornerShape(14.dp),
+        )
+        Box {
+            TextButton(onClick = { filtersOpen = true }) {
+                Text(if (filter == "all") "All agents" else filter.replaceFirstChar { it.titlecase() })
             }
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                SummaryBadge(label = "${sessions.size} sessions", tint = MaterialTheme.colorScheme.onSurface)
-                SummaryBadge(label = "$active active", tint = Emerald)
-                SummaryBadge(label = "$working working", tint = Emerald)
-                SummaryBadge(label = "$thinking thinking", tint = Cyan)
-                if (maintainers > 0) {
-                    SummaryBadge(label = "$maintainers maintainer", tint = Violet)
+            DropdownMenu(filtersOpen, { filtersOpen = false }) {
+                listOf("all", "running", "idle", "stopped").forEach { candidate ->
+                    DropdownMenuItem(text = { Text(if (candidate == "all") "All agents" else candidate.replaceFirstChar { it.titlecase() }) }, onClick = { onFilterChange(candidate); filtersOpen = false })
                 }
             }
         }
@@ -1138,6 +1120,7 @@ private fun WatchTree(
     whatById: Map<String, WhatUiState>,
     onToggleExpanded: (ClientSession) -> Unit,
     onOpenAttach: (ClientSession) -> Unit,
+    onClone: (ClientSession) -> Unit,
     onCopyAttach: (ClientSession) -> Unit,
     onOpenTelegram: (ClientSession) -> Unit,
     onWhat: (ClientSession) -> Unit,
@@ -1160,6 +1143,7 @@ private fun WatchTree(
             whatState = whatById[node.session.id],
             onToggleExpanded = { onToggleExpanded(node.session) },
             onOpenAttach = { onOpenAttach(node.session) },
+            onClone = { onClone(node.session) },
             onCopyAttach = { onCopyAttach(node.session) },
             onOpenTelegram = { onOpenTelegram(node.session) },
             onWhat = { onWhat(node.session) },
@@ -1174,7 +1158,7 @@ private fun WatchTree(
     node.sameRepoChildren
         .filter { nodeMatchesSlice(it, slice) }
         .forEach { child ->
-            WatchTree(child, childDepth, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill)
+            WatchTree(child, childDepth, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill)
     }
 
     node.crossRepoGroups.forEach { group ->
@@ -1191,7 +1175,7 @@ private fun WatchTree(
             fontFamily = FontFamily.Monospace,
         )
         visibleChildren.forEach { child ->
-            WatchTree(child, groupDepth + 1, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill)
+            WatchTree(child, groupDepth + 1, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill)
         }
     }
 }
@@ -1207,6 +1191,7 @@ private fun SessionRow(
     whatState: WhatUiState?,
     onToggleExpanded: () -> Unit,
     onOpenAttach: () -> Unit,
+    onClone: () -> Unit,
     onCopyAttach: () -> Unit,
     onOpenTelegram: () -> Unit,
     onWhat: () -> Unit,
@@ -1250,18 +1235,22 @@ private fun SessionRow(
                         }
                         Spacer(Modifier.height(3.dp))
                         Text(
-                            text = "${session.id} • ${session.role ?: if (session.isEm) "em" else session.provider ?: "-"}",
+                            text = "${session.provider ?: "claude"} · ${projectedStatusLabel(session)}",
                             style = MaterialTheme.typography.bodySmall,
                             color = TextSecondary,
                             fontFamily = FontFamily.Monospace,
                         )
                         Spacer(Modifier.height(6.dp))
+                        waitingSummary(session)?.let { waiting ->
+                            Text(waiting, style = MaterialTheme.typography.bodySmall, color = Cyan, maxLines = 3, overflow = TextOverflow.Ellipsis)
+                            Spacer(Modifier.height(6.dp))
+                        }
                         statusSummary(session)?.let { status ->
                             Text(
                                 text = status,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = Cyan,
-                                maxLines = 3,
+                                maxLines = 2,
                                 overflow = TextOverflow.Ellipsis,
                             )
                             Spacer(Modifier.height(6.dp))
@@ -1306,7 +1295,6 @@ private fun SessionRow(
                 HorizontalDivider(color = Border)
                 Column(modifier = Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        StatusChip(label = activityLabel(session.activityState), tint = activityTint(session.activityState))
                         StatusChip(label = projectedStatusLabel(session), tint = statusTint(session))
                         StatusChip(label = session.provider ?: "claude", tint = providerTint(session.provider))
                         if (session.role != null) StatusChip(label = session.role, tint = Violet)
@@ -1321,36 +1309,41 @@ private fun SessionRow(
                             )
                         }
                     }
-                    Row(
-                        modifier = Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        if (attachSupported) {
-                            ActionPill(label = "Attach", icon = Icons.Rounded.Terminal, onClick = onOpenAttach)
-                            ActionPill(label = "Copy", icon = Icons.Rounded.ContentCopy, onClick = onCopyAttach)
+                    var actionsExpanded by remember { mutableStateOf(false) }
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (attachSupported) ActionPill(label = "Open terminal", icon = Icons.Rounded.Terminal, onClick = onOpenAttach, tint = Emerald)
+                        if (supportsSessionCloning(session.provider)) ActionPill(label = "Clone", icon = Icons.Rounded.ContentCopy, onClick = onClone)
+                        Box {
+                            IconButton(onClick = { actionsExpanded = true }) { Icon(Icons.Rounded.MoreVert, "Agent actions", tint = TextSecondary) }
+                            DropdownMenu(actionsExpanded, { actionsExpanded = false }) {
+                                if (attachSupported) DropdownMenuItem(text = { Text("Copy attach command") }, onClick = { actionsExpanded = false; onCopyAttach() })
+                                if (telegramLink(session) != null) DropdownMenuItem(text = { Text("Open in Telegram") }, onClick = { actionsExpanded = false; onOpenTelegram() })
+                                DropdownMenuItem(text = { Text("Retire session", color = Rose) }, onClick = { actionsExpanded = false; onKill() })
+                            }
                         }
-                        if (telegramLink(session) != null) {
-                            ActionPill(label = "TG", icon = Icons.AutoMirrored.Rounded.OpenInNew, onClick = onOpenTelegram, tint = Cyan)
-                        }
-                        if (!hasSummary) {
-                            ActionPill(label = "What?", icon = Icons.Rounded.QuestionAnswer, onClick = onWhat, tint = Violet)
-                        }
-                        ActionPill(label = RETIRE_SESSION_ACTION_LABEL, icon = Icons.Rounded.UnfoldLess, onClick = onKill, tint = Rose)
                     }
-                    whatState?.takeIf { it.entries.isNotEmpty() || it.status != "idle" }?.let { summary ->
-                        WhatSummarySection(
-                            state = summary,
-                            onUpdate = onUpdateWhat,
-                            onRegenerate = onRegenerateWhat,
-                        )
+                    AgentWorkSections(session)
+                    if (hasSummary || whatState?.status?.let { it != "idle" } == true) {
+                        AgentDisclosure("Summary", relativeSummaryAge(whatState?.entries?.lastOrNull()?.createdAt)) {
+                            whatState?.let { WhatSummarySection(it, onUpdateWhat, onRegenerateWhat) }
+                        }
+                    } else {
+                        TextButton(onClick = onWhat) { Text("Summarize progress") }
                     }
-                    detailLines(session, detail, hasSummary).forEach { line ->
-                        Text(
-                            text = line,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                            fontFamily = FontFamily.Monospace,
-                        )
+                    val activity = detail?.actionLines.orEmpty().filterNot { it == "-" || it.startsWith("n/a") }
+                    if (activity.isNotEmpty()) AgentDisclosure("Recent activity", "${activity.size} recent actions") {
+                        activity.forEach { ActivityDetail(it, null, TextSecondary) }
+                    }
+                    AgentDisclosure("Session details", listOfNotNull(session.model, session.reasoningEffort?.let { "$it effort" }).joinToString(" · ").ifBlank { session.provider ?: "Claude" }) {
+                        ActivityDetail("Workspace", session.workingDir, TextSecondary)
+                        ActivityDetail("Session ID", session.id, TextMuted)
+                        session.pendingAdoptionProposals.filter { (it.status ?: "pending") == "pending" }.forEach {
+                            ActivityDetail("Adoption request", "From ${it.proposerName ?: it.proposerSessionId ?: "another agent"}", Violet)
+                        }
+                        detail?.lastError?.let { ActivityDetail("Attention needed", it, Rose) }
+                    }
+                    AgentDisclosure("Terminal preview", "View recent output") {
+                        Text(detail?.tailLines?.joinToString("\n") ?: "Loading output…", style = MaterialTheme.typography.bodySmall, color = TextSecondary, fontFamily = FontFamily.Monospace)
                     }
                     if (session.mobileTerminal?.supported == false && session.termuxAttach?.supported != true) {
                         StatusChip(label = session.mobileTerminal.reason ?: "mobile attach unavailable", tint = TextMuted)
@@ -1360,6 +1353,88 @@ private fun SessionRow(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun AgentDisclosure(title: String, subtitle: String, content: @Composable () -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Surface(color = Panel, shape = RoundedCornerShape(12.dp)) {
+        Column {
+            Row(Modifier.fillMaxWidth().clickable { open = !open }.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text(title, style = MaterialTheme.typography.titleSmall, color = TextSecondary)
+                    Text(subtitle, style = MaterialTheme.typography.bodySmall, color = TextMuted, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+                Icon(if (open) Icons.Rounded.UnfoldLess else Icons.Rounded.UnfoldMore, if (open) "Hide $title" else "Show $title", tint = TextMuted)
+            }
+            if (open) Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) { content() }
+        }
+    }
+}
+
+@Composable
+private fun ActivityDetail(title: String, detail: String?, tint: Color) {
+    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Box(Modifier.padding(top = 6.dp).size(6.dp).background(tint, CircleShape))
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(title, style = MaterialTheme.typography.bodyMedium, color = tint)
+            detail?.takeIf { it.isNotBlank() }?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextMuted) }
+        }
+    }
+}
+
+@Composable
+private fun AgentWorkSections(session: ClientSession) {
+    val waiting = session.obligations?.waitingOn.orEmpty()
+    val reviews = waiting.filter { it.kind == "review" }
+    val reviewHistory = session.obligations?.reviewHistory.orEmpty()
+    if (reviews.isNotEmpty() || reviewHistory.isNotEmpty()) {
+        Surface(color = Violet.copy(alpha = 0.07f), shape = RoundedCornerShape(12.dp)) {
+            Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text("Reviews", style = MaterialTheme.typography.titleSmall, color = Violet)
+                if (reviews.isEmpty()) Text("No reviews pending", style = MaterialTheme.typography.bodySmall, color = TextMuted)
+                reviews.forEach { review ->
+                    ActivityDetail("Waiting for ${review.label}", "${review.state.replace('_', ' ')} · ${relativeSummaryAge(review.since)}", Violet)
+                    if (review.lastError != null) AgentDisclosure("Review check needs attention", "View details") {
+                        Text(review.lastError, style = MaterialTheme.typography.bodySmall, color = Amber)
+                    }
+                }
+                if (reviewHistory.isNotEmpty()) AgentDisclosure("Review history", "${reviewHistory.sumOf { it.landedCount }} reviews received · ${reviewHistory.size} pull requests") {
+                    reviewHistory.forEach { review ->
+                        ActivityDetail("${review.repo.substringAfterLast('/')} #${review.prNumber}", "${review.landedCount} received · ${review.landedRequestedByAgent} of ${review.requestedByAgent} requested by this agent received", Violet)
+                    }
+                }
+            }
+        }
+    }
+    val activeJobs = session.jobs.filter { it.state in listOf("pending", "running") }
+    if (waiting.any { it.kind != "review" } || activeJobs.isNotEmpty()) {
+        Surface(color = Cyan.copy(alpha = 0.06f), shape = RoundedCornerShape(12.dp)) {
+            Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(if (isWaitingForResult(session)) "Waiting for results" else "In progress", style = MaterialTheme.typography.titleSmall, color = Cyan)
+                activeJobs.take(2).forEach { job ->
+                    ActivityDetail(job.label, jobSummary(job).removePrefix("${job.label} · "), if (job.state == "running") Emerald else Amber)
+                }
+                if (activeJobs.size > 2 || activeJobs.any { it.holding?.detail != null }) {
+                    AgentDisclosure(if (activeJobs.size > 2) "All ${activeJobs.size} jobs" else "Queue details", "${activeJobs.count { it.state == "running" }} running · ${activeJobs.count { it.state == "pending" }} queued") {
+                        activeJobs.forEach { job ->
+                            ActivityDetail(job.label, listOfNotNull(jobSummary(job).removePrefix("${job.label} · "), job.holding?.detail).distinct().joinToString("\n"), if (job.state == "running") Emerald else Amber)
+                        }
+                    }
+                }
+                waiting.filter { it.kind != "review" && (it.kind != "queue_job" || activeJobs.isEmpty()) }.forEach { wait ->
+                    ActivityDetail(wait.label, "${wait.state.replace('_', ' ')} · ${ageFromIso(wait.since)}", Cyan)
+                    if (wait.lastError != null || wait.lastPolledAt != null) AgentDisclosure("Check details", wait.lastPolledAt?.let { "Last checked ${ageFromIso(it)} ago" } ?: "Check needs attention") {
+                        Text(wait.lastError ?: "Waiting for the next result.", style = MaterialTheme.typography.bodySmall, color = if (wait.lastError != null) Amber else TextSecondary)
+                    }
+                }
+            }
+        }
+    }
+    val finished = session.jobs.filter { it.state !in listOf("pending", "running") }
+    if (finished.isNotEmpty()) AgentDisclosure("Recent job history", "${finished.size} finished jobs") {
+        finished.forEach { job -> ActivityDetail(job.label, jobSummary(job).removePrefix("${job.label} · "), if (job.exitCode == null || job.exitCode == 0) TextSecondary else Rose) }
     }
 }
 
@@ -1397,13 +1472,10 @@ private fun WhatSummarySection(
             if (index > 0) {
                 HorizontalDivider(color = Border)
             }
-            if (entry.isUpdate) {
-                Text(
-                    text = "Update · ${ageFromIso(entry.createdAt)}",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = Cyan,
-                )
-            }
+            Text(
+                text = "${if (entry.isUpdate) "Update" else "Summary"} · ${relativeSummaryAge(entry.createdAt)}",
+                style = MaterialTheme.typography.labelMedium, color = TextMuted,
+            )
             MarkdownText(entry.markdown)
         }
 
@@ -1589,7 +1661,7 @@ private fun sessionLastActivityEpoch(session: ClientSession): Long {
     return parseIso(session.lastActivity)?.toEpochSecond() ?: Long.MIN_VALUE
 }
 
-private fun statusDot(session: ClientSession): Color = when (sessionVisualState(session)) {
+private fun statusDot(session: ClientSession): Color = if (isWaitingForResult(session)) Cyan else when (sessionVisualState(session)) {
     SessionVisualState.Active -> Emerald
     SessionVisualState.Stopped -> Rose
     SessionVisualState.Inactive -> TextMuted
@@ -1615,4 +1687,13 @@ private fun providerTint(provider: String?): Color = when (provider) {
     "claude" -> Fuchsia
     "codex-app" -> Violet
     else -> TextSecondary
+}
+
+@Composable
+private fun relativeSummaryAge(timestamp: String?): String {
+    var now by remember { mutableStateOf(java.time.OffsetDateTime.now()) }
+    LaunchedEffect(timestamp) {
+        while (true) { now = java.time.OffsetDateTime.now(); kotlinx.coroutines.delay(60_000) }
+    }
+    return summaryAgeLabel(timestamp, now)
 }

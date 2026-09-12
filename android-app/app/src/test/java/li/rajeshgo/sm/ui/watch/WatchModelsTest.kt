@@ -10,6 +10,69 @@ import org.junit.Test
 
 class WatchModelsTest {
     @Test
+    fun cloningIsAvailableOnlyForProvidersTheServerCanLaunch() {
+        for (provider in listOf("claude", "codex", "codex-fork")) assertTrue(supportsSessionCloning(provider))
+        for (provider in listOf("codex-app", "shell", "unknown", "", null)) assertFalse(supportsSessionCloning(provider))
+    }
+
+    @Test fun summaryAgeSeparatesMinutesHoursAndDays() {
+        val now = java.time.OffsetDateTime.parse("2026-09-12T12:00:00Z")
+        assertEquals("Just now", summaryAgeLabel(now.minusSeconds(15).toString(), now))
+        assertEquals("5 mins ago", summaryAgeLabel(now.minusMinutes(5).toString(), now))
+        assertEquals("2 hours ago", summaryAgeLabel(now.minusHours(2).toString(), now))
+        assertEquals("3 days ago", summaryAgeLabel(now.minusDays(3).toString(), now))
+        assertEquals("Time unavailable", summaryAgeLabel(null, now))
+    }
+
+    @Test
+    fun resizeAndHeartbeatAcknowledgementsKeepTheComposerConnected() {
+        assertEquals("attached", terminalStatusAfterServerEvent("attached", "resized"))
+        assertEquals("attached", terminalStatusAfterServerEvent("attached", "pong"))
+        assertEquals("attached", terminalStatusAfterServerEvent("authenticating", "attached"))
+    }
+
+    @Test
+    fun creationSerializesTheChosenDefaultEffort() {
+        val request = sessionTemplate(null)
+        val encoded = kotlinx.serialization.json.Json.encodeToString(li.rajeshgo.sm.data.model.CreateSessionRequest.serializer(), request)
+        assertTrue(encoded.contains("\"reasoning_effort\":\"high\""))
+    }
+
+    @Test
+    fun clonePreservesLaunchSettingsWithoutCopyingIdentityOrPrompt() {
+        val source = session(status = "idle", activityState = "idle").copy(provider = "codex-fork", model = "gpt-6", reasoningEffort = "medium", workingDir = "/work/repo")
+        val template = sessionTemplate(source)
+        assertEquals("codex-fork", template.provider)
+        assertEquals("gpt-6", template.model)
+        assertEquals("medium", template.reasoningEffort)
+        assertEquals("/work/repo", template.workingDir)
+        assertEquals(null, template.name)
+        assertEquals(null, template.initialMessage)
+        assertEquals("high", sessionTemplate(null).reasoningEffort)
+        assertTrue(sessionTemplate(null).workingDir.endsWith("/fractal-algo-rust"))
+    }
+
+    @Test
+    fun outstandingResultDoesNotMislabelWorkingOrStoppedAgents() {
+        val obligation = li.rajeshgo.sm.data.model.SessionObligations("a", waitingOn = listOf(li.rajeshgo.sm.data.model.WaitingObligation(kind = "review", label = "Review #42")))
+        val waiting = session(status = "idle", activityState = "idle").copy(obligations = obligation)
+        assertTrue(isWaitingForResult(waiting))
+        assertEquals("waiting for result", projectedStatusLabel(waiting))
+        assertFalse(isWaitingForResult(waiting.copy(activityState = "working")))
+        assertFalse(isWaitingForResult(waiting.copy(status = "stopped")))
+        assertTrue(waitingSummary(waiting)!!.startsWith("Waiting for Review #42"))
+        assertTrue(waitingSummary(waiting.copy(activityState = "working"))!!.startsWith("Pending:"))
+    }
+
+    @Test
+    fun schedulerReasonAndRunningPidAreKeptOnTheirJobs() {
+        val pending = li.rajeshgo.sm.data.model.SessionJob("j", label = "Tests", state = "pending", holdingReason = "concurrency_cap", pid = 42)
+        assertTrue(jobSummary(pending).contains("free slot"))
+        assertFalse(jobSummary(pending).contains("PID"))
+        assertTrue(jobSummary(pending.copy(state = "running")).contains("PID 42"))
+    }
+
+    @Test
     fun retireSessionCopyUsesRetireLanguage() {
         assertEquals("Retire", RETIRE_SESSION_ACTION_LABEL)
         assertEquals("Sign in to retire sessions", SIGN_IN_TO_RETIRE_SESSIONS_MESSAGE)
