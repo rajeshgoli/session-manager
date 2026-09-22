@@ -74,7 +74,11 @@ test('shrinking the terminal keeps the history viewport instead of following the
     r.api.smWriteText(1, Array.from({length: 100}, (_, i) => `line ${i}\r\n`).join(''));
     await drain(r.term);
     r.term.scrollToLine(15);
+    const animationFrames = [];
+    r.api.requestAnimationFrame = callback => animationFrames.push(callback);
     vm.runInContext('fitAddon.proposeDimensions = () => ({cols: 60, rows: 3}); installScrollHandlers = () => {}; fitAndReport();', r.context);
+    r.term.scrollToLine(20); // WebView's delayed viewport scroll after the resize
+    while (animationFrames.length) animationFrames.shift()();
     assert.equal(r.term.rows, 3);
     assert.equal(r.term.buffer.active.viewportY, 15);
     assert.equal(r.term.buffer.active.getLine(15).translateToString(true), 'line 15');

@@ -189,6 +189,13 @@
         // reader's history position instead of moving it with the live screen.
         if (readingHistory) {
           term.scrollToLine(viewportY);
+          // The WebView's delayed scroll event can undo the synchronous
+          // restoration. Restore again once xterm's viewport layout settles.
+          window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+            if (term.buffer.active === buffer) {
+              term.scrollToLine(viewportY);
+            }
+          }));
         }
         installScrollHandlers();
         reportResize();
