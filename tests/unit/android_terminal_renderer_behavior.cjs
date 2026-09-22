@@ -12,6 +12,7 @@ const source = fs.readFileSync(path.join(asset, 'terminal.html'), 'utf8').match(
 
 function renderer() {
   const acks = [];
+  const scrollbarVisibility = [];
   const element = { style: {}, hidden: false, attributes: {}, listeners: {},
     classList: { toggle() {}, add() {}, remove() {}, contains() { return false; } },
     getBoundingClientRect: () => ({top: 4, height: 600}),
@@ -21,13 +22,13 @@ function renderer() {
   const context = vm.createContext({
     Terminal, FitAddon: { FitAddon }, Uint8Array, atob,
     document: { getElementById: () => element },
-    window: { TerminalBridge: { written: seq => acks.push(Number(seq)) }, addEventListener() {}, requestAnimationFrame() {}, setTimeout() {}, clearTimeout() {} },
+    window: { TerminalBridge: { written: seq => acks.push(Number(seq)), scrollbarVisibility: visible => scrollbarVisibility.push(visible) }, addEventListener() {}, requestAnimationFrame() {}, setTimeout() {}, clearTimeout() {} },
   });
   vm.runInContext(source, context);
   vm.runInContext('ready = true; opened = true;', context);
   const term = vm.runInContext('term', context);
   term.resize(40, 8);
-  return { context, term, acks, element, api: context.window };
+  return { context, term, acks, element, scrollbarVisibility, api: context.window };
 }
 
 const drain = term => new Promise(resolve => term.write('', resolve));
@@ -143,12 +144,14 @@ test('history scrollbar hides in alternate buffers and does not send terminal in
     r.api.smWriteText(2, '\x1b[?1049h');
     await drain(r.term);
     assert.equal(r.element.hidden, true);
+    assert.equal(r.scrollbarVisibility.at(-1), false);
     r.api.smBeginScrollbarDrag(300);
     r.api.smDragScrollbar(0);
     assert.equal(r.term.buffer.active.viewportY, 0);
     r.api.smWriteText(3, '\x1b[?1049l');
     await drain(r.term);
     assert.equal(r.element.hidden, false);
+    assert.deepEqual(r.scrollbarVisibility, [false, true, false, true]);
   } finally { r.term.dispose(); }
 });
 

@@ -117,6 +117,7 @@
     const scrollThumb = document.getElementById("terminal-scroll-thumb");
     let scrollbarDragOffset = null;
     let scrollbarNativeDrag = false;
+    let lastScrollbarVisible = null;
     let resizeAnchor = null;
     let resizeAnchorTimer = null;
     const fitAddon = new FitAddon.FitAddon();
@@ -444,7 +445,12 @@
 
     function updateScrollbar() {
       const buffer = term.buffer.active;
-      scrollbar.hidden = buffer.type !== "normal" || buffer.baseY === 0;
+      const visible = buffer.type === "normal" && buffer.baseY > 0;
+      scrollbar.hidden = !visible;
+      if (visible !== lastScrollbarVisible) {
+        lastScrollbarVisible = visible;
+        bridgeCall("scrollbarVisibility", visible);
+      }
       const { height, top } = scrollbarGeometry();
       scrollThumb.style.height = `${height}px`;
       scrollThumb.style.transform = `translateY(${top}px)`;

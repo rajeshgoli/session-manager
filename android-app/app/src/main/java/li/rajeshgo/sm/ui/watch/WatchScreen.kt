@@ -648,6 +648,7 @@ private fun TerminalWebView(
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var claudePageScrollRemainder by remember { mutableStateOf(0f) }
     var draggingScrollbar by remember { mutableStateOf(false) }
+    val historyScrollbarVisible = remember { mutableStateOf(false) }
     val density = LocalDensity.current.density
     val claudeDirectPageScroll = terminal.provider == "claude"
 
@@ -668,7 +669,8 @@ private fun TerminalWebView(
                     onDragStart = { position ->
                         claudePageScrollRemainder = 0f
                         // Match the 28 CSS-pixel history rail in terminal.html.
-                        draggingScrollbar = position.x >= size.width - 28f * density
+                        draggingScrollbar = historyScrollbarVisible.value &&
+                            position.x >= size.width - 28f * density
                         if (draggingScrollbar) webViewRef?.evaluateJavascript(
                             "window.smBeginScrollbarDrag(${position.y / density}, true);", null,
                         )
@@ -685,6 +687,10 @@ private fun TerminalWebView(
                     },
                 ) { change, dragAmount ->
                         change.consume()
+                        if (draggingScrollbar && !historyScrollbarVisible.value) {
+                            draggingScrollbar = false
+                            webViewRef?.evaluateJavascript("window.smEndScrollbarDrag();", null)
+                        }
                         if (draggingScrollbar) {
                             webViewRef?.evaluateJavascript(
                                 "window.smDragScrollbar(${change.position.y / density});", null,
@@ -753,6 +759,7 @@ private fun TerminalWebView(
                             onRendererError(message)
                         },
                         onWritten = onRendererWritten,
+                        onScrollbarVisibility = { historyScrollbarVisible.value = it },
                     ),
                     "TerminalBridge",
                 )
@@ -859,8 +866,14 @@ private class TerminalJavascriptBridge(
     private val onReady: (cols: Int, rows: Int) -> Unit,
     private val onError: (String) -> Unit,
     private val onWritten: (sequence: Long, bytes: Int) -> Unit,
+    private val onScrollbarVisibility: (Boolean) -> Unit,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    @JavascriptInterface
+    fun scrollbarVisibility(visible: Boolean) {
+        mainHandler.post { onScrollbarVisibility(visible) }
+    }
 
     @JavascriptInterface
     fun input(data: String) {
