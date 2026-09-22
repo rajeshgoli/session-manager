@@ -67,3 +67,16 @@ test('long redraws and split UTF-8 survive a burst of ordered frames', async () 
     assert.equal(r.acks.length, bytes.length);
   } finally { r.term.dispose(); }
 });
+
+test('shrinking the terminal keeps the history viewport instead of following the live screen', async () => {
+  const r = renderer();
+  try {
+    r.api.smWriteText(1, Array.from({length: 100}, (_, i) => `line ${i}\r\n`).join(''));
+    await drain(r.term);
+    r.term.scrollToLine(15);
+    vm.runInContext('fitAddon.proposeDimensions = () => ({cols: 60, rows: 3}); installScrollHandlers = () => {}; fitAndReport();', r.context);
+    assert.equal(r.term.rows, 3);
+    assert.equal(r.term.buffer.active.viewportY, 15);
+    assert.equal(r.term.buffer.active.getLine(15).translateToString(true), 'line 15');
+  } finally { r.term.dispose(); }
+});

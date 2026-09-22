@@ -178,10 +178,18 @@
           scheduleOpenRetry();
           return;
         }
+        const buffer = term.buffer.active;
+        const readingHistory = buffer.type === "normal" && buffer.viewportY < buffer.baseY;
+        const viewportY = buffer.viewportY;
         term.resize(
           Math.max(10, Math.min(300, dimensions.cols)),
           Math.max(2, Math.min(120, dimensions.rows))
         );
+        // xterm offsets the viewport when the row count changes. Keep the
+        // reader's history position instead of moving it with the live screen.
+        if (readingHistory) {
+          term.scrollToLine(viewportY);
+        }
         installScrollHandlers();
         reportResize();
         if (term.cols > 0 && term.rows > 0) {
