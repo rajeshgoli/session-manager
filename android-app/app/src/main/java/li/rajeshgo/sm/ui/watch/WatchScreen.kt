@@ -610,7 +610,11 @@ private fun MobileTerminalOverlay(
                     maxLines = 6,
                 )
                 Button(
-                    onClick = onSend,
+                    onClick = {
+                        onSend()
+                        focus.clearFocus(force = true)
+                        keyboard?.hide()
+                    },
                     enabled = terminal.status == "attached" && terminal.inputDraft.isNotBlank(),
                     modifier = Modifier.height(42.dp),
                     contentPadding = ButtonDefaults.ContentPadding,
@@ -643,6 +647,8 @@ private fun TerminalWebView(
     var terminalReady by remember { mutableStateOf(false) }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var claudePageScrollRemainder by remember { mutableStateOf(0f) }
+    var draggingScrollbar by remember { mutableStateOf(false) }
+    val historyScrollbarVisible = remember { mutableStateOf(false) }
     val density = LocalDensity.current.density
     val claudeDirectPageScroll = terminal.provider == "claude"
 
@@ -660,11 +666,37 @@ private fun TerminalWebView(
             .fillMaxSize()
             .pointerInput(density, claudeDirectPageScroll) {
                 detectVerticalDragGestures(
-                    onDragStart = { claudePageScrollRemainder = 0f },
-                    onDragEnd = { claudePageScrollRemainder = 0f },
-                    onDragCancel = { claudePageScrollRemainder = 0f },
+                    onDragStart = { position ->
+                        claudePageScrollRemainder = 0f
+                        // Match the 28 CSS-pixel history rail in terminal.html.
+                        draggingScrollbar = historyScrollbarVisible.value &&
+                            position.x >= size.width - 28f * density
+                        if (draggingScrollbar) webViewRef?.evaluateJavascript(
+                            "window.smBeginScrollbarDrag(${position.y / density}, true);", null,
+                        )
+                    },
+                    onDragEnd = {
+                        claudePageScrollRemainder = 0f
+                        draggingScrollbar = false
+                        webViewRef?.evaluateJavascript("window.smEndScrollbarDrag();", null)
+                    },
+                    onDragCancel = {
+                        claudePageScrollRemainder = 0f
+                        draggingScrollbar = false
+                        webViewRef?.evaluateJavascript("window.smEndScrollbarDrag();", null)
+                    },
                 ) { change, dragAmount ->
                         change.consume()
+                        if (draggingScrollbar && !historyScrollbarVisible.value) {
+                            draggingScrollbar = false
+                            webViewRef?.evaluateJavascript("window.smEndScrollbarDrag();", null)
+                        }
+                        if (draggingScrollbar) {
+                            webViewRef?.evaluateJavascript(
+                                "window.smDragScrollbar(${change.position.y / density});", null,
+                            )
+                            return@detectVerticalDragGestures
+                        }
                         val cssDelta = -dragAmount / density
                         if (claudeDirectPageScroll) {
                             claudePageScrollRemainder += cssDelta
@@ -727,6 +759,7 @@ private fun TerminalWebView(
                             onRendererError(message)
                         },
                         onWritten = onRendererWritten,
+                        onScrollbarVisibility = { historyScrollbarVisible.value = it },
                     ),
                     "TerminalBridge",
                 )
@@ -833,8 +866,14 @@ private class TerminalJavascriptBridge(
     private val onReady: (cols: Int, rows: Int) -> Unit,
     private val onError: (String) -> Unit,
     private val onWritten: (sequence: Long, bytes: Int) -> Unit,
+    private val onScrollbarVisibility: (Boolean) -> Unit,
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    @JavascriptInterface
+    fun scrollbarVisibility(visible: Boolean) {
+        mainHandler.post { onScrollbarVisibility(visible) }
+    }
 
     @JavascriptInterface
     fun input(data: String) {

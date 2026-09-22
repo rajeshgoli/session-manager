@@ -7948,7 +7948,9 @@ fn mobile_terminal_tmux_command(ticket: &MobileTerminalTicket, args: &[&str]) ->
 }
 
 fn mobile_terminal_tmux_argv(ticket: &MobileTerminalTicket, args: &[&str]) -> Vec<String> {
-    let mut argv = vec!["tmux".to_owned()];
+    // The mobile renderer is UTF-8 even when launchd has no locale. Without
+    // -u, tmux replaces smart punctuation and other Unicode with underscores.
+    let mut argv = vec!["tmux".to_owned(), "-u".to_owned()];
     if let Some(socket_name) = ticket.tmux_socket_name.as_deref() {
         argv.extend(["-L".to_owned(), socket_name.to_owned()]);
     }
@@ -17585,6 +17587,7 @@ mod tests {
             mobile_terminal_tmux_argv(&ticket, &["attach-session", "-t", &ticket.tmux_session]),
             vec![
                 "tmux",
+                "-u",
                 "-L",
                 "sm-test",
                 "attach-session",
@@ -17748,6 +17751,7 @@ mod tests {
             let mut saw_pong = false;
             let mut sent_input = false;
             let mut last_sequence = 0;
+            let mut received_output = Vec::new();
             loop {
                 match client.next().await.unwrap().unwrap() {
                     ClientMessage::Ping(_) => {
@@ -17773,7 +17777,7 @@ mod tests {
                             }
                             client
                                 .send(ClientMessage::Text(
-                                    json!({"type":"input", "data":"still-connected-after-idle\r"})
+                                    json!({"type":"input", "data":"I’ll — • café → ✓\rstill-connected-after-idle\r"})
                                         .to_string()
                                         .into(),
                                 ))
@@ -17802,9 +17806,14 @@ mod tests {
                                 }
                             }
                             let bytes = STANDARD.decode(frame["data"].as_str().unwrap()).unwrap();
-                            if String::from_utf8_lossy(&bytes)
+                            received_output.extend_from_slice(&bytes);
+                            if String::from_utf8_lossy(&received_output)
                                 .contains("still-connected-after-idle")
                             {
+                                let output = String::from_utf8_lossy(&received_output);
+                                for character in ["’", "—", "•", "é", "→", "✓"] {
+                                    assert!(output.contains(character), "missing Unicode {character}");
+                                }
                                 assert!(sent_input && saw_pong && pings >= 4);
                                 break;
                             }

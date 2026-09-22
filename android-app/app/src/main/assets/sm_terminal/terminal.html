@@ -41,6 +41,37 @@
       overscroll-behavior: contain;
       touch-action: none;
     }
+    .xterm .xterm-viewport::-webkit-scrollbar { display: none; }
+    #terminal-scrollbar {
+      position: absolute;
+      top: 4px;
+      bottom: 4px;
+      right: 0;
+      width: 28px;
+      touch-action: none;
+      user-select: none;
+      cursor: pointer;
+    }
+    #terminal-scrollbar[hidden] { display: none; }
+    #terminal-scrollbar::before {
+      content: "";
+      position: absolute;
+      left: 12px;
+      width: 4px;
+      height: 100%;
+      border-radius: 4px;
+      background: #1e293b;
+    }
+    #terminal-scroll-thumb {
+      position: absolute;
+      left: 8px;
+      width: 12px;
+      border-radius: 6px;
+      background: #64748b;
+      cursor: grab;
+    }
+    #terminal-scrollbar.dragging #terminal-scroll-thumb,
+    #terminal-scrollbar:focus-visible #terminal-scroll-thumb { background: #2dd4bf; }
     #terminal-status {
       align-items: center;
       background: #05080d;
@@ -69,6 +100,11 @@
 <body>
   <div id="terminal-root">
     <div id="terminal"></div>
+    <div id="terminal-scrollbar" role="scrollbar" aria-label="Terminal history"
+      aria-controls="terminal" aria-orientation="vertical" aria-valuemin="0"
+      aria-valuemax="0" aria-valuenow="0" tabindex="0" hidden>
+      <div id="terminal-scroll-thumb"></div>
+    </div>
     <div id="terminal-status">Loading terminal renderer...</div>
   </div>
   <script src="vendor/xterm.js"></script>
@@ -77,6 +113,13 @@
   <script>
     const terminalElement = document.getElementById("terminal");
     const statusElement = document.getElementById("terminal-status");
+    const scrollbar = document.getElementById("terminal-scrollbar");
+    const scrollThumb = document.getElementById("terminal-scroll-thumb");
+    let scrollbarDragOffset = null;
+    let scrollbarNativeDrag = false;
+    let lastScrollbarVisible = null;
+    let resizeAnchor = null;
+    let resizeAnchorTimer = null;
     const fitAddon = new FitAddon.FitAddon();
     const term = new Terminal({
       allowProposedApi: false,
@@ -180,16 +223,22 @@
         }
         const buffer = term.buffer.active;
         const readingHistory = buffer.type === "normal" && buffer.viewportY < buffer.baseY;
-        let anchorLine = buffer.viewportY;
-        while (anchorLine > 0 && buffer.getLine(anchorLine)?.isWrapped) anchorLine--;
-        const anchorOffset = (buffer.viewportY - anchorLine) * term.cols;
-        // Markers move with xterm's reflow and scrollback trimming. Anchor at
-        // the logical line start, since merged continuation rows are deleted.
-        const anchor = readingHistory
-          ? term.registerMarker(anchorLine - buffer.baseY - buffer.cursorY) : null;
+        if (!resizeAnchor && readingHistory) {
+          let anchorLine = buffer.viewportY;
+          while (anchorLine > 0 && buffer.getLine(anchorLine)?.isWrapped) anchorLine--;
+          resizeAnchor = {
+            marker: term.registerMarker(anchorLine - buffer.baseY - buffer.cursorY),
+            buffer,
+            offset: (buffer.viewportY - anchorLine) * term.cols,
+          };
+        }
+        // Keep one content anchor for the whole IME/rotation animation, rather
+        // than capturing partially adjusted viewport positions on each frame.
+        const anchor = resizeAnchor;
         const restoreAnchor = () => {
-          if (anchor && !anchor.isDisposed && term.buffer.active === buffer) {
-            term.scrollToLine(anchor.line + Math.floor(anchorOffset / term.cols));
+          if (anchor && resizeAnchor === anchor && anchor.marker &&
+              !anchor.marker.isDisposed && term.buffer.active === anchor.buffer) {
+            term.scrollToLine(anchor.marker.line + Math.floor(anchor.offset / term.cols));
           }
         };
         term.resize(
@@ -198,14 +247,18 @@
         );
         // xterm offsets the viewport when the row count changes. Keep the
         // reader's history position instead of moving it with the live screen.
-        if (readingHistory) {
+        if (anchor) {
           restoreAnchor();
           // The WebView's delayed scroll event can undo the synchronous
           // restoration. Restore again once xterm's viewport layout settles.
           window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
             restoreAnchor();
-            anchor?.dispose();
           }));
+          if (resizeAnchorTimer !== null) window.clearTimeout(resizeAnchorTimer);
+          resizeAnchorTimer = window.setTimeout(() => {
+            restoreAnchor();
+            cancelResizeAnchor();
+          }, 250);
         }
         installScrollHandlers();
         reportResize();
@@ -216,6 +269,13 @@
       } catch (error) {
         reportError(`Terminal fit failed: ${error && error.message ? error.message : error}`);
       }
+    }
+
+    function cancelResizeAnchor() {
+      if (resizeAnchorTimer !== null) window.clearTimeout(resizeAnchorTimer);
+      resizeAnchorTimer = null;
+      resizeAnchor?.marker?.dispose();
+      resizeAnchor = null;
     }
 
     function terminalViewport() {
@@ -291,6 +351,7 @@
     }
 
     function scrollTerminalByLines(lines, clientX, clientY) {
+      cancelResizeAnchor();
       if (!ready || !Number.isFinite(lines) || lines === 0) {
         return false;
       }
@@ -373,6 +434,96 @@
       scrollHandlersInstalled = true;
     }
 
+    function scrollbarGeometry() {
+      const buffer = term.buffer.active;
+      const rect = scrollbar.getBoundingClientRect();
+      const height = Math.min(rect.height, Math.max(48, rect.height * term.rows / (buffer.baseY + term.rows)));
+      const travel = Math.max(0, rect.height - height);
+      return { buffer, rect, height, travel,
+        top: buffer.baseY > 0 ? travel * buffer.viewportY / buffer.baseY : 0 };
+    }
+
+    function updateScrollbar() {
+      const buffer = term.buffer.active;
+      const visible = buffer.type === "normal" && buffer.baseY > 0;
+      scrollbar.hidden = !visible;
+      if (visible !== lastScrollbarVisible) {
+        lastScrollbarVisible = visible;
+        bridgeCall("scrollbarVisibility", visible);
+      }
+      const { height, top } = scrollbarGeometry();
+      scrollThumb.style.height = `${height}px`;
+      scrollThumb.style.transform = `translateY(${top}px)`;
+      scrollbar.setAttribute("aria-valuemax", String(buffer.baseY));
+      scrollbar.setAttribute("aria-valuenow", String(buffer.viewportY));
+    }
+
+    window.smBeginScrollbarDrag = function(clientY, fromNative = false) {
+      cancelResizeAnchor();
+      scrollbarNativeDrag = fromNative;
+      if (fromNative && scrollbarDragOffset !== null) {
+        window.smDragScrollbar(clientY);
+        return;
+      }
+      const { buffer, rect, height, top } = scrollbarGeometry();
+      if (!ready || buffer.type !== "normal" || buffer.baseY === 0) return;
+      const y = Number(clientY) - rect.top;
+      scrollbarDragOffset = y >= top && y <= top + height ? y - top : height / 2;
+      scrollbar.classList.add("dragging");
+      window.smDragScrollbar(clientY);
+    };
+
+    window.smDragScrollbar = function(clientY) {
+      if (scrollbarDragOffset === null || !Number.isFinite(Number(clientY))) return;
+      const { buffer, rect, travel } = scrollbarGeometry();
+      if (buffer.type !== "normal" || travel <= 0) return;
+      const fraction = Math.max(0, Math.min(1, (Number(clientY) - rect.top - scrollbarDragOffset) / travel));
+      term.scrollToLine(Math.round(fraction * buffer.baseY));
+      updateScrollbar();
+    };
+
+    window.smEndScrollbarDrag = function() {
+      scrollbarDragOffset = null;
+      scrollbarNativeDrag = false;
+      scrollbar.classList.remove("dragging");
+    };
+
+    scrollbar.addEventListener("pointerdown", event => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      scrollbar.setPointerCapture(event.pointerId);
+      window.smBeginScrollbarDrag(event.clientY);
+    });
+    scrollbar.addEventListener("pointermove", event => {
+      if (!scrollbarNativeDrag && scrollbarDragOffset !== null) {
+        event.preventDefault();
+        window.smDragScrollbar(event.clientY);
+      }
+    });
+    const endPointerDrag = () => {
+      // Compose cancels WebView touch handling when it takes ownership. Its
+      // drag continues through the native bridge until native end/cancel.
+      if (!scrollbarNativeDrag) window.smEndScrollbarDrag();
+    };
+    scrollbar.addEventListener("pointerup", endPointerDrag);
+    scrollbar.addEventListener("pointercancel", endPointerDrag);
+    scrollbar.addEventListener("keydown", event => {
+      const buffer = term.buffer.active;
+      if (buffer.type !== "normal") return;
+      const targets = { Home: 0, End: buffer.baseY, ArrowUp: buffer.viewportY - 1,
+        ArrowDown: buffer.viewportY + 1, PageUp: buffer.viewportY - term.rows,
+        PageDown: buffer.viewportY + term.rows };
+      if (Object.hasOwn(targets, event.key)) {
+        event.preventDefault();
+        event.stopPropagation();
+        cancelResizeAnchor();
+        term.scrollToLine(targets[event.key]);
+      }
+    });
+    term.onScroll(updateScrollbar);
+    term.onWriteParsed(updateScrollbar);
+    term.onResize(updateScrollbar);
+
     function viewportDimensions() {
       const width = window.innerWidth
         || document.documentElement.clientWidth
@@ -388,7 +539,7 @@
     function applyViewportSize() {
       const dimensions = viewportDimensions();
       if (dimensions.width > 0) {
-        terminalElement.style.width = `${dimensions.width}px`;
+        terminalElement.style.width = `${Math.max(0, dimensions.width - 28)}px`;
       }
       if (dimensions.height > 0) {
         terminalElement.style.height = `${dimensions.height}px`;
