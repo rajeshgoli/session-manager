@@ -271,6 +271,8 @@ struct MobileTerminalAuthFrame {
     device_key_id: Option<String>,
     nonce: Option<String>,
     signature: Option<String>,
+    #[serde(default)]
+    output_ack: bool,
 }
 
 #[derive(Clone)]
@@ -7128,7 +7130,10 @@ async fn mobile_terminal_websocket(mut socket: WebSocket, state: Arc<AppState>) 
 
     match consume_mobile_terminal_ticket(&state, &auth_frame) {
         Ok((ticket, attach_id, stop)) => {
-            run_mobile_terminal_bridge(socket, state, ticket, attach_id, stop).await;
+            run_mobile_terminal_bridge(
+                socket, state, ticket, attach_id, stop, auth_frame.output_ack,
+            )
+            .await;
         }
         Err(error) => {
             let detail = api_error_detail(&error);
@@ -7214,8 +7219,11 @@ async fn run_mobile_terminal_bridge(
     ticket: MobileTerminalTicket,
     attach_id: String,
     stop: Arc<AtomicBool>,
+    output_ack: bool,
 ) {
-    if let Err(error) = run_mobile_terminal_bridge_inner(socket, &state, &ticket, stop).await {
+    if let Err(error) =
+        run_mobile_terminal_bridge_inner(socket, &state, &ticket, stop, output_ack).await
+    {
         eprintln!(
             "mobile terminal bridge failed for session {}: {error}",
             ticket.session_id
@@ -7229,6 +7237,7 @@ async fn run_mobile_terminal_bridge_inner(
     state: &AppState,
     ticket: &MobileTerminalTicket,
     stop: Arc<AtomicBool>,
+    output_ack: bool,
 ) -> Result<(), String> {
     if !mobile_terminal_active_attach_exists(state, ticket) || !mobile_terminal_enabled(state) {
         let _ = send_mobile_terminal_json(
@@ -7250,7 +7259,14 @@ async fn run_mobile_terminal_bridge_inner(
         return Ok(());
     }
 
-    preload_mobile_terminal_scrollback(&mut socket, &state.config, ticket).await;
+    let history = load_mobile_terminal_scrollback(&state.config, ticket)
+        .await
+        .unwrap_or_default();
+    let mut history_chunks = history.chunks(8192);
+    // Opt-in acknowledgements bound bytes queued in Android and xterm. Keep
+    // polling control/input frames when the renderer's window is exhausted.
+    let mut output_sequence = 0u64;
+    let mut output_acknowledged = 0u64;
 
     let pty = match start_mobile_terminal_attach_client(ticket, initial.rows, initial.cols, stop) {
         Ok(pty) => pty,
@@ -7265,7 +7281,7 @@ async fn run_mobile_terminal_bridge_inner(
         mut child,
         stop,
     } = pty;
-    let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+    let (output_tx, mut output_rx) = mpsc::channel(32);
     let output_master = master.clone();
     let output_stop = stop.clone();
     let output_handle = tokio::task::spawn_blocking(move || {
@@ -7356,12 +7372,19 @@ async fn run_mobile_terminal_bridge_inner(
                 close_reason = "max_attach_seconds".to_owned();
                 break;
             }
-            output = output_rx.recv() => {
+            output = async {
+                match history_chunks.next() {
+                    Some(chunk) => Some(MobileTerminalPtyEvent::Output(chunk.to_vec())),
+                    None => output_rx.recv().await,
+                }
+            }, if !output_ack || output_sequence - output_acknowledged < 32 => {
                 match output {
                     Some(MobileTerminalPtyEvent::Output(chunk)) => {
+                        output_sequence += 1;
                         let payload = json!({
                             "type": "output",
                             "mode": "stream",
+                            "sequence": output_sequence,
                             "encoding": "base64",
                             "data": STANDARD.encode(chunk),
                         });
@@ -7420,6 +7443,15 @@ async fn run_mobile_terminal_bridge_inner(
                         break;
                     }
                 };
+                if output_ack && mobile_terminal_frame_type(&frame).as_deref() == Some("output_ack") {
+                    if let Some(sequence) = frame.get("sequence").and_then(Value::as_u64) {
+                        // Ignore stale and impossible acknowledgements.
+                        if sequence <= output_sequence {
+                            output_acknowledged = output_acknowledged.max(sequence);
+                        }
+                    }
+                    continue;
+                }
                 if process_mobile_terminal_client_frame(
                     &mut sender,
                     &master,
@@ -7438,6 +7470,7 @@ async fn run_mobile_terminal_bridge_inner(
     stop.store(true, Ordering::SeqCst);
     let _ = child.kill();
     let _ = child.wait();
+    drop(output_rx); // Release a reader blocked on the bounded output channel.
     let _ = output_handle.await;
     eprintln!(
         "mobile terminal closed for session {}: code={close_code} reason={close_reason}",
@@ -7516,34 +7549,19 @@ async fn wait_for_mobile_terminal_initial_resize(
     }
 }
 
-async fn preload_mobile_terminal_scrollback(
-    socket: &mut WebSocket,
+async fn load_mobile_terminal_scrollback(
     config: &AppConfig,
     ticket: &MobileTerminalTicket,
-) {
+) -> Option<Vec<u8>> {
     let lines = config.mobile_terminal.history_preload_lines.min(20_000);
     if lines == 0 {
-        return;
+        return None;
     }
     let ticket = ticket.clone();
-    let chunk =
-        tokio::task::spawn_blocking(move || capture_mobile_terminal_scrollback(&ticket, lines))
-            .await
-            .ok()
-            .flatten();
-    let Some(chunk) = chunk else {
-        return;
-    };
-    let _ = send_mobile_terminal_json(
-        socket,
-        json!({
-            "type": "output",
-            "mode": "history",
-            "encoding": "base64",
-            "data": STANDARD.encode(chunk),
-        }),
-    )
-    .await;
+    tokio::task::spawn_blocking(move || capture_mobile_terminal_scrollback(&ticket, lines))
+        .await
+        .ok()
+        .flatten()
 }
 
 async fn process_mobile_terminal_client_frame<S>(
@@ -7794,18 +7812,18 @@ fn set_mobile_terminal_fd_nonblocking(fd: &OwnedFd) -> anyhow::Result<()> {
 fn mobile_terminal_output_reader(
     master: Arc<OwnedFd>,
     stop: Arc<AtomicBool>,
-    output_tx: mpsc::UnboundedSender<MobileTerminalPtyEvent>,
+    output_tx: mpsc::Sender<MobileTerminalPtyEvent>,
 ) {
     let mut buffer = vec![0u8; 8192];
     while !stop.load(Ordering::SeqCst) {
         match nix_read(master.as_raw_fd(), &mut buffer) {
             Ok(0) => {
-                let _ = output_tx.send(MobileTerminalPtyEvent::Closed);
+                let _ = output_tx.blocking_send(MobileTerminalPtyEvent::Closed);
                 return;
             }
             Ok(n) => {
                 if output_tx
-                    .send(MobileTerminalPtyEvent::Output(buffer[..n].to_vec()))
+                    .blocking_send(MobileTerminalPtyEvent::Output(buffer[..n].to_vec()))
                     .is_err()
                 {
                     return;
@@ -7814,7 +7832,7 @@ fn mobile_terminal_output_reader(
             Err(Errno::EAGAIN) => std::thread::sleep(Duration::from_millis(25)),
             Err(Errno::EINTR) => {}
             Err(_) => {
-                let _ = output_tx.send(MobileTerminalPtyEvent::Closed);
+                let _ = output_tx.blocking_send(MobileTerminalPtyEvent::Closed);
                 return;
             }
         }
@@ -7825,7 +7843,7 @@ fn mobile_terminal_output_reader(
 fn mobile_terminal_output_reader(
     _master: Arc<OwnedFd>,
     _stop: Arc<AtomicBool>,
-    _output_tx: mpsc::UnboundedSender<MobileTerminalPtyEvent>,
+    _output_tx: mpsc::Sender<MobileTerminalPtyEvent>,
 ) {
 }
 
@@ -17233,6 +17251,7 @@ mod tests {
             device_key_id: Some("test-device".to_owned()),
             nonce: Some(nonce.to_owned()),
             signature: Some(STANDARD.encode(signature.to_der().as_bytes())),
+            output_ack: false,
         }
     }
 
@@ -17609,6 +17628,18 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires tmux and loopback sockets; exercises 30 seconds of real idle keepalives"]
     async fn mobile_terminal_live_bridge_survives_keepalives_and_cleans_up() {
+        check_mobile_terminal_live_bridge(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires tmux and loopback sockets; stalls the renderer for 30 seconds"]
+    async fn mobile_terminal_live_bridge_backpressures_slow_renderer() {
+        check_mobile_terminal_live_bridge(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn check_mobile_terminal_live_bridge(output_ack: bool) {
         use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
 
         // Own an isolated tmux server. Never attach to or kill a user's session.
@@ -17635,7 +17666,7 @@ mod tests {
                 "-d",
                 "-s",
                 "terminal",
-                "cat",
+                if output_ack { r#"sleep 1; i=0; while [ "$i" -lt 200 ]; do printf 'flow-control %s\n' "$i"; i=$((i+1)); sleep 0.05; done; cat"# } else { "cat" },
             ])
             .output()
             .unwrap();
@@ -17685,6 +17716,7 @@ mod tests {
                                 ticket,
                                 "test-attach".to_owned(),
                                 stop,
+                                output_ack,
                             )
                             .await;
                             done.notify_one();
@@ -17715,6 +17747,7 @@ mod tests {
             let mut pings = 0;
             let mut saw_pong = false;
             let mut sent_input = false;
+            let mut last_sequence = 0;
             loop {
                 match client.next().await.unwrap().unwrap() {
                     ClientMessage::Ping(_) => {
@@ -17726,6 +17759,18 @@ mod tests {
                             .await
                             .unwrap();
                         if pings >= 4 && !sent_input {
+                            if output_ack {
+                                assert_eq!(
+                                    last_sequence, 32,
+                                    "stalled renderer must receive exactly one window"
+                                );
+                                client
+                                    .send(ClientMessage::Text(
+                                        json!({"type":"output_ack", "sequence":last_sequence})
+                                            .to_string().into(),
+                                    ))
+                                    .await.unwrap();
+                            }
                             client
                                 .send(ClientMessage::Text(
                                     json!({"type":"input", "data":"still-connected-after-idle\r"})
@@ -17741,6 +17786,21 @@ mod tests {
                     ClientMessage::Text(text) => {
                         let frame: Value = serde_json::from_str(&text).unwrap();
                         if frame["type"] == "output" {
+                            let sequence = frame["sequence"].as_u64().unwrap();
+                            assert_eq!(sequence, last_sequence + 1);
+                            last_sequence = sequence;
+                            if output_ack {
+                                if sent_input {
+                                    client
+                                        .send(ClientMessage::Text(
+                                            json!({"type":"output_ack", "sequence":sequence})
+                                                .to_string().into(),
+                                        ))
+                                        .await.unwrap();
+                                } else {
+                                    assert!(sequence <= 32, "server exceeded unacknowledged window");
+                                }
+                            }
                             let bytes = STANDARD.decode(frame["data"].as_str().unwrap()).unwrap();
                             if String::from_utf8_lossy(&bytes)
                                 .contains("still-connected-after-idle")

@@ -180,7 +180,18 @@
         }
         const buffer = term.buffer.active;
         const readingHistory = buffer.type === "normal" && buffer.viewportY < buffer.baseY;
-        const viewportY = buffer.viewportY;
+        let anchorLine = buffer.viewportY;
+        while (anchorLine > 0 && buffer.getLine(anchorLine)?.isWrapped) anchorLine--;
+        const anchorOffset = (buffer.viewportY - anchorLine) * term.cols;
+        // Markers move with xterm's reflow and scrollback trimming. Anchor at
+        // the logical line start, since merged continuation rows are deleted.
+        const anchor = readingHistory
+          ? term.registerMarker(anchorLine - buffer.baseY - buffer.cursorY) : null;
+        const restoreAnchor = () => {
+          if (anchor && !anchor.isDisposed && term.buffer.active === buffer) {
+            term.scrollToLine(anchor.line + Math.floor(anchorOffset / term.cols));
+          }
+        };
         term.resize(
           Math.max(10, Math.min(300, dimensions.cols)),
           Math.max(2, Math.min(120, dimensions.rows))
@@ -188,13 +199,12 @@
         // xterm offsets the viewport when the row count changes. Keep the
         // reader's history position instead of moving it with the live screen.
         if (readingHistory) {
-          term.scrollToLine(viewportY);
+          restoreAnchor();
           // The WebView's delayed scroll event can undo the synchronous
           // restoration. Restore again once xterm's viewport layout settles.
           window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
-            if (term.buffer.active === buffer) {
-              term.scrollToLine(viewportY);
-            }
+            restoreAnchor();
+            anchor?.dispose();
           }));
         }
         installScrollHandlers();

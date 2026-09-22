@@ -84,3 +84,24 @@ test('shrinking the terminal keeps the history viewport instead of following the
     assert.equal(r.term.buffer.active.getLine(15).translateToString(true), 'line 15');
   } finally { r.term.dispose(); }
 });
+
+test('column reflow follows the same logical text, including a wrapped continuation', async () => {
+  const r = renderer();
+  try {
+    r.term.resize(20, 8);
+    r.api.smWriteText(1, Array.from({length: 100}, (_, i) => `${String(i).padStart(3, '0')}${'x'.repeat(27)}\r\n`).join(''));
+    await drain(r.term);
+    for (const start of [80, 81]) {
+      r.term.scrollToLine(start);
+      const animationFrames = [];
+      r.api.requestAnimationFrame = cb => animationFrames.push(cb);
+      vm.runInContext('fitAddon.proposeDimensions = () => ({cols: 40, rows: 8}); installScrollHandlers = () => {}; fitAndReport();', r.context);
+      r.term.scrollToLine(70);
+      while (animationFrames.length) animationFrames.shift()();
+      const b = r.term.buffer.active;
+      assert.equal(b.viewportY, 40);
+      assert.equal(b.getLine(b.viewportY).translateToString(true), `040${'x'.repeat(27)}`);
+      r.term.resize(20, 8);
+    }
+  } finally { r.term.dispose(); }
+});

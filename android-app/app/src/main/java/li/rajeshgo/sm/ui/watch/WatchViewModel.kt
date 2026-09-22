@@ -63,6 +63,8 @@ data class TerminalOutputFrame(
     val sequence: Long,
     val data: String,
     val encoding: String = "text",
+    val serverSequence: Long? = null,
+    val retainedChars: Int = 0,
 )
 
 data class WatchUiState(
@@ -515,10 +517,14 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                 terminalWriter = null
                 terminalSocket?.close(1000, if (attempt == 0) "new attach" else "retry attach")
                 updateTerminalIfCurrent(attachToken) { it.copy(outputFrames = emptyList(), copyBuffer = "", connectionGeneration = connectionGeneration) }
+                val outputBudget = TerminalOutputBudget()
+                val overflowReported = java.util.concurrent.atomic.AtomicBoolean(false)
+                terminalOutputBudget = outputBudget
                 terminalSocket = sessionRepository.openMobileTerminalSocket(ticket, freshAccessToken, object : WebSocketListener() {
                     override fun onOpen(webSocket: WebSocket, response: Response) {
                         val frame = JSONObject()
                             .put("type", "auth")
+                            .put("output_ack", true)
                             .put("ticket_id", ticket.ticketId)
                             .put("ticket_secret", ticket.ticketSecret)
                             .put("device_key_id", ticket.deviceKeyId)
@@ -542,7 +548,30 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                     }
 
                     override fun onMessage(webSocket: WebSocket, text: String) {
-                        val payload = runCatching { JSONObject(text) }.getOrNull() ?: return
+                        // Reserve before posting to Main: even queued callbacks must be bounded.
+                        // Older servers lack flow control; fail visibly instead of losing ANSI bytes.
+                        if (!outputBudget.reserve(text.length)) {
+                            if (!overflowReported.compareAndSet(false, true)) return
+                            viewModelScope.launch {
+                                if (terminalSocket == webSocket) {
+                                    terminalSocket = null
+                                    terminalWriter = null
+                                    webSocket.cancel()
+                                    updateTerminalIfCurrent(attachToken) { it.copy(
+                                        status = "failed",
+                                        error = "Terminal output exceeded the renderer buffer. Reconnect to reload the session.",
+                                    ) }
+                                }
+                            }
+                            return
+                        }
+                        val payload = runCatching { JSONObject(text) }.getOrNull()
+                        if (payload == null) {
+                            outputBudget.release(text.length)
+                            return
+                        }
+                        val isOutput = payload.optString("type") == "output"
+                        if (!isOutput) outputBudget.release(text.length)
                         viewModelScope.launch {
                             if (terminalSocket != webSocket) {
                                 return@launch
@@ -554,7 +583,11 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                                     val mode = payload.optString("mode")
                                     val sequence = current.outputSequence + 1
                                     val byteCount = terminalOutputByteCount(data, encoding)
-                                    current.enqueueOutput(TerminalOutputFrame(sequence, data, encoding)).copy(
+                                    current.enqueueOutput(TerminalOutputFrame(
+                                        sequence, data, encoding,
+                                        if (payload.has("sequence")) payload.getLong("sequence") else null,
+                                        text.length,
+                                    )).copy(
                                         status = "attached",
                                         outputFrameCount = current.outputFrameCount + 1,
                                         outputByteCount = current.outputByteCount + byteCount,
@@ -687,7 +720,16 @@ class WatchViewModel(application: Application, private val savedState: androidx.
         )
     }
 
+    private var terminalOutputBudget: TerminalOutputBudget? = null
+
     fun markTerminalRendererWritten(sequence: Long, bytes: Int) {
+        val acknowledged = _uiState.value.terminal?.outputFrames
+            ?.filter { it.sequence <= sequence }.orEmpty()
+        acknowledged.forEach { terminalOutputBudget?.release(it.retainedChars) }
+        acknowledged.lastOrNull()?.serverSequence?.let { serverSequence ->
+            terminalWriter?.send(JSONObject().put("type", "output_ack")
+                .put("sequence", serverSequence).toString())
+        }
         _uiState.value = _uiState.value.copy(
             terminal = _uiState.value.terminal?.let { terminal ->
                 terminal.acknowledgeOutput(sequence).copy(
