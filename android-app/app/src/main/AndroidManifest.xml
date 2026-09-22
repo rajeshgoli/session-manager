@@ -17,9 +17,13 @@
         android:roundIcon="@mipmap/ic_launcher"
         android:supportsRtl="true"
         android:theme="@style/Theme.SessionManager">
+        <!-- Keep the live terminal emulator and scrollback across display changes.
+             Compose and the WebView resize in place; acknowledged ANSI output
+             must not be replayed into a fresh emulator. -->
         <activity
             android:name=".MainActivity"
             android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|smallestScreenSize|keyboard|keyboardHidden|uiMode"
             android:exported="true"
             android:launchMode="singleTop"
             android:theme="@style/Theme.SessionManager">

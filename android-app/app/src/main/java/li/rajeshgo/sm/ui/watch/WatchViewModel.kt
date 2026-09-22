@@ -43,7 +43,21 @@ data class TerminalUiState(
     val inputDraft: String = "",
     val connectionGeneration: Int = 0,
     val error: String? = null,
-)
+) {
+    /** Keep every byte until xterm has parsed it; ANSI frames are not snapshots. */
+    fun enqueueOutput(frame: TerminalOutputFrame): TerminalUiState = copy(
+        outputFrames = outputFrames + frame,
+        outputSequence = frame.sequence,
+    )
+
+    fun acknowledgeOutput(sequence: Long): TerminalUiState {
+        val acknowledged = sequence.coerceAtMost(outputSequence)
+        return copy(
+            outputFrames = outputFrames.filter { it.sequence > acknowledged },
+            rendererLastAckSequence = maxOf(rendererLastAckSequence, acknowledged),
+        )
+    }
+}
 
 data class TerminalOutputFrame(
     val sequence: Long,
@@ -540,16 +554,8 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                                     val mode = payload.optString("mode")
                                     val sequence = current.outputSequence + 1
                                     val byteCount = terminalOutputByteCount(data, encoding)
-                                    current.copy(
+                                    current.enqueueOutput(TerminalOutputFrame(sequence, data, encoding)).copy(
                                         status = "attached",
-                                        outputFrames = (
-                                            current.outputFrames + TerminalOutputFrame(
-                                                sequence = sequence,
-                                                data = data,
-                                                encoding = encoding,
-                                            )
-                                        ).takeLast(500),
-                                        outputSequence = sequence,
                                         outputFrameCount = current.outputFrameCount + 1,
                                         outputByteCount = current.outputByteCount + byteCount,
                                         copyBuffer = if (encoding == "base64") {
@@ -607,6 +613,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                             } else updateTerminalIfCurrent(attachToken) { it.copy(status = "detached", error = terminalCloseMessage(reason)) }
                         }
                     }
+
                 })
                 completeOnce(Result.success("Opening terminal for ${sessionDisplayName(session)}"))
             }
@@ -683,9 +690,8 @@ class WatchViewModel(application: Application, private val savedState: androidx.
     fun markTerminalRendererWritten(sequence: Long, bytes: Int) {
         _uiState.value = _uiState.value.copy(
             terminal = _uiState.value.terminal?.let { terminal ->
-                terminal.copy(
+                terminal.acknowledgeOutput(sequence).copy(
                     rendererStatus = "renderer wrote frame $sequence (${bytes}B)",
-                    rendererLastAckSequence = maxOf(terminal.rendererLastAckSequence, sequence),
                     rendererError = null,
                 )
             }

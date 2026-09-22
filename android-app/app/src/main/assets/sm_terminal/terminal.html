@@ -117,6 +117,7 @@
     let opened = false;
     let lastResize = "";
     let pendingWrites = [];
+    let lastQueuedSequence = 0;
     let openAttempts = 0;
     let openTimer = null;
     let lastBackendStatus = "connecting";
@@ -171,13 +172,21 @@
 
     function fitAndReport() {
       try {
-        fitAddon.fit();
+        // Match the server's accepted PTY range, including on large displays.
+        const dimensions = fitAddon.proposeDimensions();
+        if (!dimensions || !Number.isFinite(dimensions.cols) || !Number.isFinite(dimensions.rows)) {
+          scheduleOpenRetry();
+          return;
+        }
+        term.resize(
+          Math.max(10, Math.min(300, dimensions.cols)),
+          Math.max(2, Math.min(120, dimensions.rows))
+        );
         installScrollHandlers();
         reportResize();
         if (term.cols > 0 && term.rows > 0) {
           reportReady();
           flushPendingWrites();
-
         }
       } catch (error) {
         reportError(`Terminal fit failed: ${error && error.message ? error.message : error}`);
@@ -440,6 +449,11 @@
     }
 
     function queueOrWrite(frame) {
+      // A bridge retry must never apply cursor motion or text twice.
+      if (frame.sequence <= lastQueuedSequence) {
+        return;
+      }
+      lastQueuedSequence = frame.sequence;
       if (!ready) {
         pendingWrites.push(frame);
         setRendererStatus(`Queued ${pendingWrites.length} terminal frames while renderer initializes`, false);
@@ -485,7 +499,9 @@
       if (!ready && !statusElement.classList.contains("error")) {
         setRendererStatus(`Backend ${lastBackendStatus}; waiting for terminal renderer`, false);
       }
-      ensureTerminalOpen();
+      if (!ready) {
+        ensureTerminalOpen();
+      }
     };
 
     window.smScrollPixels = function(deltaPixels, clientX, clientY) {
