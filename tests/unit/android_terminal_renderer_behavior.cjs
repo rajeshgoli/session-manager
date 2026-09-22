@@ -12,17 +12,22 @@ const source = fs.readFileSync(path.join(asset, 'terminal.html'), 'utf8').match(
 
 function renderer() {
   const acks = [];
-  const element = { style: {}, classList: { toggle() {}, contains() { return false; } } };
+  const element = { style: {}, hidden: false, attributes: {}, listeners: {},
+    classList: { toggle() {}, add() {}, remove() {}, contains() { return false; } },
+    getBoundingClientRect: () => ({top: 4, height: 600}),
+    setAttribute(name, value) { this.attributes[name] = value; },
+    addEventListener(name, handler) { this.listeners[name] = handler; },
+  };
   const context = vm.createContext({
     Terminal, FitAddon: { FitAddon }, Uint8Array, atob,
     document: { getElementById: () => element },
-    window: { TerminalBridge: { written: seq => acks.push(Number(seq)) }, addEventListener() {}, requestAnimationFrame() {} },
+    window: { TerminalBridge: { written: seq => acks.push(Number(seq)) }, addEventListener() {}, requestAnimationFrame() {}, setTimeout() {}, clearTimeout() {} },
   });
   vm.runInContext(source, context);
   vm.runInContext('ready = true; opened = true;', context);
   const term = vm.runInContext('term', context);
   term.resize(40, 8);
-  return { context, term, acks, api: context.window };
+  return { context, term, acks, element, api: context.window };
 }
 
 const drain = term => new Promise(resolve => term.write('', resolve));
@@ -92,6 +97,7 @@ test('column reflow follows the same logical text, including a wrapped continuat
     r.api.smWriteText(1, Array.from({length: 100}, (_, i) => `${String(i).padStart(3, '0')}${'x'.repeat(27)}\r\n`).join(''));
     await drain(r.term);
     for (const start of [80, 81]) {
+      vm.runInContext('cancelResizeAnchor();', r.context);
       r.term.scrollToLine(start);
       const animationFrames = [];
       r.api.requestAnimationFrame = cb => animationFrames.push(cb);
@@ -103,5 +109,78 @@ test('column reflow follows the same logical text, including a wrapped continuat
       assert.equal(b.getLine(b.viewportY).translateToString(true), `040${'x'.repeat(27)}`);
       r.term.resize(20, 8);
     }
+  } finally { r.term.dispose(); }
+});
+
+test('dragging the history thumb traverses thousands of lines and clamps at both ends', async () => {
+  const r = renderer();
+  try {
+    r.api.smWriteText(1, 'I’ll — “quoted” • café → ✓\r\n' + 'history\r\n'.repeat(3900));
+    await drain(r.term);
+    const base = r.term.buffer.active.baseY;
+    assert(base > 3800);
+    assert.equal(r.element.hidden, false);
+    r.api.smBeginScrollbarDrag(580);
+    r.api.smDragScrollbar(20);
+    assert.equal(r.term.buffer.active.viewportY, 0);
+    r.api.smDragScrollbar(300);
+    assert(Math.abs(r.term.buffer.active.viewportY - base / 2) < 100);
+    r.api.smDragScrollbar(10000);
+    assert.equal(r.term.buffer.active.viewportY, base);
+    r.api.smEndScrollbarDrag();
+    r.api.smDragScrollbar(0);
+    assert.equal(r.term.buffer.active.viewportY, base);
+    assert.equal(r.element.attributes['aria-valuenow'], String(base));
+    assert.equal(r.term.buffer.active.getLine(0).translateToString(true), 'I’ll — “quoted” • café → ✓');
+  } finally { r.term.dispose(); }
+});
+
+test('history scrollbar hides in alternate buffers and does not send terminal input', async () => {
+  const r = renderer();
+  try {
+    r.api.smWriteText(1, 'history\r\n'.repeat(100));
+    await drain(r.term);
+    r.api.smWriteText(2, '\x1b[?1049h');
+    await drain(r.term);
+    assert.equal(r.element.hidden, true);
+    r.api.smBeginScrollbarDrag(300);
+    r.api.smDragScrollbar(0);
+    assert.equal(r.term.buffer.active.viewportY, 0);
+    r.api.smWriteText(3, '\x1b[?1049l');
+    await drain(r.term);
+    assert.equal(r.element.hidden, false);
+  } finally { r.term.dispose(); }
+});
+
+test('native scrollbar handoff survives the WebView pointer cancellation', async () => {
+  const r = renderer();
+  try {
+    r.api.smWriteText(1, 'history\r\n'.repeat(3900));
+    await drain(r.term);
+    r.api.smBeginScrollbarDrag(580);
+    r.api.smBeginScrollbarDrag(570, true);
+    r.element.listeners.pointercancel();
+    r.api.smDragScrollbar(0);
+    assert.equal(r.term.buffer.active.viewportY, 0);
+    r.api.smEndScrollbarDrag();
+    r.api.smDragScrollbar(600);
+    assert.equal(r.term.buffer.active.viewportY, 0);
+  } finally { r.term.dispose(); }
+});
+
+test('animated resizes retain the first content anchor and release it for user scrolling', async () => {
+  const r = renderer();
+  try {
+    r.api.smWriteText(1, 'history\r\n'.repeat(100));
+    await drain(r.term);
+    r.term.scrollToLine(30);
+    vm.runInContext('fitAddon.proposeDimensions = () => ({cols: 40, rows: 6}); installScrollHandlers = () => {}; fitAndReport();', r.context);
+    r.term.scrollToLine(33); // delayed intermediate WebView layout
+    vm.runInContext('fitAddon.proposeDimensions = () => ({cols: 40, rows: 3}); fitAndReport();', r.context);
+    assert.equal(r.term.buffer.active.viewportY, 30);
+    r.api.smBeginScrollbarDrag(580);
+    r.api.smDragScrollbar(0);
+    assert.equal(r.term.buffer.active.viewportY, 0);
+    assert.equal(vm.runInContext('resizeAnchor', r.context), null);
   } finally { r.term.dispose(); }
 });
