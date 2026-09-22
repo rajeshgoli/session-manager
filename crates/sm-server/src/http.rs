@@ -171,6 +171,7 @@ const MOBILE_TERMINAL_MAX_COLS: u16 = 300;
 const MOBILE_TERMINAL_INPUT_MAX_CHARS: usize = 8192;
 const MOBILE_TERMINAL_INITIAL_RESIZE_WAIT_SECONDS: f64 = 2.0;
 const MOBILE_TERMINAL_MAX_ATTACH_SECONDS: u64 = 3600;
+const MOBILE_TERMINAL_KEEPALIVE_SECONDS: u64 = 10;
 const CLOUDFLARE_ACCESS_JWKS_TTL: Duration = Duration::from_secs(60 * 60);
 const CLOUDFLARE_ACCESS_UNKNOWN_KID_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const GOOGLE_ID_TOKEN_JWKS_TTL: Duration = Duration::from_secs(60 * 60);
@@ -270,6 +271,8 @@ struct MobileTerminalAuthFrame {
     device_key_id: Option<String>,
     nonce: Option<String>,
     signature: Option<String>,
+    #[serde(default)]
+    output_ack: bool,
 }
 
 #[derive(Clone)]
@@ -7127,7 +7130,10 @@ async fn mobile_terminal_websocket(mut socket: WebSocket, state: Arc<AppState>) 
 
     match consume_mobile_terminal_ticket(&state, &auth_frame) {
         Ok((ticket, attach_id, stop)) => {
-            run_mobile_terminal_bridge(socket, state, ticket, attach_id, stop).await;
+            run_mobile_terminal_bridge(
+                socket, state, ticket, attach_id, stop, auth_frame.output_ack,
+            )
+            .await;
         }
         Err(error) => {
             let detail = api_error_detail(&error);
@@ -7213,8 +7219,16 @@ async fn run_mobile_terminal_bridge(
     ticket: MobileTerminalTicket,
     attach_id: String,
     stop: Arc<AtomicBool>,
+    output_ack: bool,
 ) {
-    let _ = run_mobile_terminal_bridge_inner(socket, &state, &ticket, stop).await;
+    if let Err(error) =
+        run_mobile_terminal_bridge_inner(socket, &state, &ticket, stop, output_ack).await
+    {
+        eprintln!(
+            "mobile terminal bridge failed for session {}: {error}",
+            ticket.session_id
+        );
+    }
     remove_mobile_terminal_active_attach(&state, &attach_id);
 }
 
@@ -7223,6 +7237,7 @@ async fn run_mobile_terminal_bridge_inner(
     state: &AppState,
     ticket: &MobileTerminalTicket,
     stop: Arc<AtomicBool>,
+    output_ack: bool,
 ) -> Result<(), String> {
     if !mobile_terminal_active_attach_exists(state, ticket) || !mobile_terminal_enabled(state) {
         let _ = send_mobile_terminal_json(
@@ -7244,7 +7259,14 @@ async fn run_mobile_terminal_bridge_inner(
         return Ok(());
     }
 
-    preload_mobile_terminal_scrollback(&mut socket, &state.config, ticket).await;
+    let history = load_mobile_terminal_scrollback(&state.config, ticket)
+        .await
+        .unwrap_or_default();
+    let mut history_chunks = history.chunks(8192);
+    // Opt-in acknowledgements bound bytes queued in Android and xterm. Keep
+    // polling control/input frames when the renderer's window is exhausted.
+    let mut output_sequence = 0u64;
+    let mut output_acknowledged = 0u64;
 
     let pty = match start_mobile_terminal_attach_client(ticket, initial.rows, initial.cols, stop) {
         Ok(pty) => pty,
@@ -7259,7 +7281,7 @@ async fn run_mobile_terminal_bridge_inner(
         mut child,
         stop,
     } = pty;
-    let (output_tx, mut output_rx) = mpsc::unbounded_channel();
+    let (output_tx, mut output_rx) = mpsc::channel(32);
     let output_master = master.clone();
     let output_stop = stop.clone();
     let output_handle = tokio::task::spawn_blocking(move || {
@@ -7290,8 +7312,11 @@ async fn run_mobile_terminal_bridge_inner(
     tokio::pin!(max_timer);
 
     let (mut sender, mut receiver) = socket.split();
+    let mut keepalive =
+        tokio::time::interval(Duration::from_secs(MOBILE_TERMINAL_KEEPALIVE_SECONDS));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut close_code = 1000u16;
-    let mut close_reason = "mobile_terminal_detached".to_owned();
+    let mut close_reason = "transport_closed".to_owned();
 
     loop {
         if stop.load(Ordering::SeqCst) || !mobile_terminal_enabled(state) {
@@ -7326,6 +7351,11 @@ async fn run_mobile_terminal_bridge_inner(
         }
 
         tokio::select! {
+            _ = keepalive.tick() => {
+                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
             _ = &mut max_timer => {
                 let _ = sender
                     .send(Message::Text(
@@ -7342,12 +7372,19 @@ async fn run_mobile_terminal_bridge_inner(
                 close_reason = "max_attach_seconds".to_owned();
                 break;
             }
-            output = output_rx.recv() => {
+            output = async {
+                match history_chunks.next() {
+                    Some(chunk) => Some(MobileTerminalPtyEvent::Output(chunk.to_vec())),
+                    None => output_rx.recv().await,
+                }
+            }, if !output_ack || output_sequence - output_acknowledged < 32 => {
                 match output {
                     Some(MobileTerminalPtyEvent::Output(chunk)) => {
+                        output_sequence += 1;
                         let payload = json!({
                             "type": "output",
                             "mode": "stream",
+                            "sequence": output_sequence,
                             "encoding": "base64",
                             "data": STANDARD.encode(chunk),
                         });
@@ -7396,9 +7433,25 @@ async fn run_mobile_terminal_bridge_inner(
                     Ok(message) => message,
                     Err(_) => break,
                 };
-                let Some(frame) = mobile_terminal_client_frame(message)? else {
-                    break;
+                let frame = match mobile_terminal_client_frame(message) {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(_) => {
+                        // Always run PTY cleanup, including on malformed input.
+                        close_code = 1008;
+                        close_reason = "unsupported_terminal_frame".to_owned();
+                        break;
+                    }
                 };
+                if output_ack && mobile_terminal_frame_type(&frame).as_deref() == Some("output_ack") {
+                    if let Some(sequence) = frame.get("sequence").and_then(Value::as_u64) {
+                        // Ignore stale and impossible acknowledgements.
+                        if sequence <= output_sequence {
+                            output_acknowledged = output_acknowledged.max(sequence);
+                        }
+                    }
+                    continue;
+                }
                 if process_mobile_terminal_client_frame(
                     &mut sender,
                     &master,
@@ -7417,7 +7470,12 @@ async fn run_mobile_terminal_bridge_inner(
     stop.store(true, Ordering::SeqCst);
     let _ = child.kill();
     let _ = child.wait();
+    drop(output_rx); // Release a reader blocked on the bounded output channel.
     let _ = output_handle.await;
+    eprintln!(
+        "mobile terminal closed for session {}: code={close_code} reason={close_reason}",
+        ticket.session_id
+    );
     let _ = sender
         .send(Message::Close(Some(CloseFrame {
             code: close_code,
@@ -7475,6 +7533,10 @@ async fn wait_for_mobile_terminal_initial_resize(
                     send_mobile_terminal_json(socket, json!({"type": "status", "state": "pong"}))
                         .await;
             }
+            Some("transport_keepalive") => {
+                // Axum queues the pong; flush it even before the first resize.
+                let _ = socket.flush().await;
+            }
             Some("detach") => {
                 initial.detached = true;
                 return initial;
@@ -7487,34 +7549,19 @@ async fn wait_for_mobile_terminal_initial_resize(
     }
 }
 
-async fn preload_mobile_terminal_scrollback(
-    socket: &mut WebSocket,
+async fn load_mobile_terminal_scrollback(
     config: &AppConfig,
     ticket: &MobileTerminalTicket,
-) {
+) -> Option<Vec<u8>> {
     let lines = config.mobile_terminal.history_preload_lines.min(20_000);
     if lines == 0 {
-        return;
+        return None;
     }
     let ticket = ticket.clone();
-    let chunk =
-        tokio::task::spawn_blocking(move || capture_mobile_terminal_scrollback(&ticket, lines))
-            .await
-            .ok()
-            .flatten();
-    let Some(chunk) = chunk else {
-        return;
-    };
-    let _ = send_mobile_terminal_json(
-        socket,
-        json!({
-            "type": "output",
-            "mode": "history",
-            "encoding": "base64",
-            "data": STANDARD.encode(chunk),
-        }),
-    )
-    .await;
+    tokio::task::spawn_blocking(move || capture_mobile_terminal_scrollback(&ticket, lines))
+        .await
+        .ok()
+        .flatten()
 }
 
 async fn process_mobile_terminal_client_frame<S>(
@@ -7528,6 +7575,11 @@ where
     S: futures_util::Sink<Message> + Unpin,
 {
     match mobile_terminal_frame_type(frame).as_deref() {
+        Some("transport_keepalive") => {
+            // Ping/Pong are transport frames, not terminal input or disconnects.
+            // Flush Axum's automatically queued pong on an otherwise idle PTY.
+            let _ = sender.flush().await;
+        }
         Some("input") => {
             let data = frame.get("data").and_then(Value::as_str).unwrap_or("");
             if data.chars().count() > MOBILE_TERMINAL_INPUT_MAX_CHARS {
@@ -7648,7 +7700,9 @@ fn mobile_terminal_client_frame(message: Message) -> Result<Option<Value>, Strin
         Message::Binary(bytes) => String::from_utf8(bytes.to_vec())
             .map_err(|_| "unsupported terminal frame".to_owned())?,
         Message::Close(_) => return Ok(None),
-        _ => return Err("unsupported terminal frame".to_owned()),
+        Message::Ping(_) | Message::Pong(_) => {
+            return Ok(Some(json!({"type": "transport_keepalive"})));
+        }
     };
     serde_json::from_str(&text).map_err(|_| "unsupported terminal frame".to_owned())
 }
@@ -7758,18 +7812,18 @@ fn set_mobile_terminal_fd_nonblocking(fd: &OwnedFd) -> anyhow::Result<()> {
 fn mobile_terminal_output_reader(
     master: Arc<OwnedFd>,
     stop: Arc<AtomicBool>,
-    output_tx: mpsc::UnboundedSender<MobileTerminalPtyEvent>,
+    output_tx: mpsc::Sender<MobileTerminalPtyEvent>,
 ) {
     let mut buffer = vec![0u8; 8192];
     while !stop.load(Ordering::SeqCst) {
         match nix_read(master.as_raw_fd(), &mut buffer) {
             Ok(0) => {
-                let _ = output_tx.send(MobileTerminalPtyEvent::Closed);
+                let _ = output_tx.blocking_send(MobileTerminalPtyEvent::Closed);
                 return;
             }
             Ok(n) => {
                 if output_tx
-                    .send(MobileTerminalPtyEvent::Output(buffer[..n].to_vec()))
+                    .blocking_send(MobileTerminalPtyEvent::Output(buffer[..n].to_vec()))
                     .is_err()
                 {
                     return;
@@ -7778,7 +7832,7 @@ fn mobile_terminal_output_reader(
             Err(Errno::EAGAIN) => std::thread::sleep(Duration::from_millis(25)),
             Err(Errno::EINTR) => {}
             Err(_) => {
-                let _ = output_tx.send(MobileTerminalPtyEvent::Closed);
+                let _ = output_tx.blocking_send(MobileTerminalPtyEvent::Closed);
                 return;
             }
         }
@@ -7789,7 +7843,7 @@ fn mobile_terminal_output_reader(
 fn mobile_terminal_output_reader(
     _master: Arc<OwnedFd>,
     _stop: Arc<AtomicBool>,
-    _output_tx: mpsc::UnboundedSender<MobileTerminalPtyEvent>,
+    _output_tx: mpsc::Sender<MobileTerminalPtyEvent>,
 ) {
 }
 
@@ -17197,6 +17251,7 @@ mod tests {
             device_key_id: Some("test-device".to_owned()),
             nonce: Some(nonce.to_owned()),
             signature: Some(STANDARD.encode(signature.to_der().as_bytes())),
+            output_ack: false,
         }
     }
 
@@ -17549,6 +17604,238 @@ mod tests {
             normalize_mobile_terminal_scrollback(b"already\r\nnormalized"),
             b"already\r\nnormalized\r\n"
         );
+    }
+
+    #[test]
+    fn mobile_terminal_control_frames_do_not_close_or_corrupt_the_stream() {
+        for message in [
+            Message::Ping(vec![1, 2].into()),
+            Message::Pong(vec![1, 2].into()),
+        ] {
+            let frame = mobile_terminal_client_frame(message).unwrap().unwrap();
+            assert_eq!(
+                mobile_terminal_frame_type(&frame).as_deref(),
+                Some("transport_keepalive")
+            );
+        }
+        assert!(mobile_terminal_client_frame(Message::Close(None))
+            .unwrap()
+            .is_none());
+        assert!(mobile_terminal_client_frame(Message::Text("invalid json".into())).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires tmux and loopback sockets; exercises 30 seconds of real idle keepalives"]
+    async fn mobile_terminal_live_bridge_survives_keepalives_and_cleans_up() {
+        check_mobile_terminal_live_bridge(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires tmux and loopback sockets; stalls the renderer for 30 seconds"]
+    async fn mobile_terminal_live_bridge_backpressures_slow_renderer() {
+        check_mobile_terminal_live_bridge(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn check_mobile_terminal_live_bridge(output_ack: bool) {
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+        // Own an isolated tmux server. Never attach to or kill a user's session.
+        struct TestTmux(String);
+        impl Drop for TestTmux {
+            fn drop(&mut self) {
+                let _ = Command::new("tmux")
+                    .args(["-L", &self.0, "kill-server"])
+                    .output();
+            }
+        }
+        let tmux = TestTmux(format!(
+            "sm-mobile-test-{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let created = Command::new("tmux")
+            .args([
+                "-L",
+                &tmux.0,
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "terminal",
+                if output_ack { r#"sleep 1; i=0; while [ "$i" -lt 200 ]; do printf 'flow-control %s\n' "$i"; i=$((i+1)); sleep 0.05; done; cat"# } else { "cat" },
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let signing_key = SigningKey::random(&mut OsRng);
+        let state = Arc::new(AppState::new(mobile_ticket_config(&signing_key)));
+        let mut ticket = test_mobile_terminal_ticket();
+        ticket.tmux_socket_name = Some(tmux.0.clone());
+        ticket.tmux_session = "terminal".to_owned();
+        let stop = Arc::new(AtomicBool::new(false));
+        state
+            .mobile_terminal_active_attaches
+            .lock()
+            .unwrap()
+            .insert(
+                "test-attach".to_owned(),
+                MobileTerminalActiveAttach {
+                    user_id: ticket.user_id.clone(),
+                    session_id: ticket.session_id.clone(),
+                    provider: ticket.provider.clone(),
+                    device_key_id: ticket.device_key_id.clone(),
+                    started_at_unix: 0,
+                    stop: stop.clone(),
+                },
+            );
+        let done = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new().route(
+            "/",
+            get({
+                let state = state.clone();
+                let stop = stop.clone();
+                let done = done.clone();
+                move |ws: WebSocketUpgrade| {
+                    let state = state.clone();
+                    let ticket = ticket.clone();
+                    let stop = stop.clone();
+                    let done = done.clone();
+                    async move {
+                        ws.on_upgrade(move |socket| async move {
+                            run_mobile_terminal_bridge(
+                                socket,
+                                state,
+                                ticket,
+                                "test-attach".to_owned(),
+                                stop,
+                                output_ack,
+                            )
+                            .await;
+                            done.notify_one();
+                        })
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (mut client, _) = connect_async(format!("ws://{addr}/")).await.unwrap();
+        client
+            .send(ClientMessage::Ping(b"before-resize".to_vec().into()))
+            .await
+            .unwrap();
+        client
+            .send(ClientMessage::Text(
+                json!({"type":"resize", "cols":40, "rows":12})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(40), async {
+            let mut pings = 0;
+            let mut saw_pong = false;
+            let mut sent_input = false;
+            let mut last_sequence = 0;
+            loop {
+                match client.next().await.unwrap().unwrap() {
+                    ClientMessage::Ping(_) => {
+                        pings += 1;
+                        // Flush the automatically queued pong without needing terminal output.
+                        client.flush().await.unwrap();
+                        client
+                            .send(ClientMessage::Ping(b"while-attached".to_vec().into()))
+                            .await
+                            .unwrap();
+                        if pings >= 4 && !sent_input {
+                            if output_ack {
+                                assert_eq!(
+                                    last_sequence, 32,
+                                    "stalled renderer must receive exactly one window"
+                                );
+                                client
+                                    .send(ClientMessage::Text(
+                                        json!({"type":"output_ack", "sequence":last_sequence})
+                                            .to_string().into(),
+                                    ))
+                                    .await.unwrap();
+                            }
+                            client
+                                .send(ClientMessage::Text(
+                                    json!({"type":"input", "data":"still-connected-after-idle\r"})
+                                        .to_string()
+                                        .into(),
+                                ))
+                                .await
+                                .unwrap();
+                            sent_input = true;
+                        }
+                    }
+                    ClientMessage::Pong(_) => saw_pong = true,
+                    ClientMessage::Text(text) => {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        if frame["type"] == "output" {
+                            let sequence = frame["sequence"].as_u64().unwrap();
+                            assert_eq!(sequence, last_sequence + 1);
+                            last_sequence = sequence;
+                            if output_ack {
+                                if sent_input {
+                                    client
+                                        .send(ClientMessage::Text(
+                                            json!({"type":"output_ack", "sequence":sequence})
+                                                .to_string().into(),
+                                        ))
+                                        .await.unwrap();
+                                } else {
+                                    assert!(sequence <= 32, "server exceeded unacknowledged window");
+                                }
+                            }
+                            let bytes = STANDARD.decode(frame["data"].as_str().unwrap()).unwrap();
+                            if String::from_utf8_lossy(&bytes)
+                                .contains("still-connected-after-idle")
+                            {
+                                assert!(sent_input && saw_pong && pings >= 4);
+                                break;
+                            }
+                        }
+                    }
+                    message => panic!("unexpected bridge message: {message:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // Invalid data must terminate the bridge through the same PTY cleanup path.
+        client
+            .send(ClientMessage::Text("invalid json".into()))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(3), done.notified())
+            .await
+            .unwrap();
+        assert!(stop.load(Ordering::SeqCst));
+        assert!(state
+            .mobile_terminal_active_attaches
+            .lock()
+            .unwrap()
+            .is_empty());
+        let clients = Command::new("tmux")
+            .args(["-L", &tmux.0, "list-clients"])
+            .output()
+            .unwrap();
+        assert!(clients.stdout.is_empty());
+        server.abort();
     }
 
     #[tokio::test]
