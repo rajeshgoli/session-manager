@@ -155,6 +155,7 @@
     let lastScrollbarVisible = null;
     let terminalProvider = "";
     let remoteHistoryDragY = null;
+    const HISTORY_PAGE_PIXELS = 72;
     let resizeAnchor = null;
     let resizeAnchorTimer = null;
     const fitAddon = new FitAddon.FitAddon();
@@ -409,6 +410,14 @@
       if (!ready || !Number.isFinite(deltaPixels)) {
         return false;
       }
+      if (providerOwnsHistory()) {
+        // Accumulate physical movement before sending whole-page keys. A
+        // terminal-cell-sized drag delta must not become an entire page.
+        touchScrollRemainder += deltaPixels;
+        const pages = Math.trunc(touchScrollRemainder / HISTORY_PAGE_PIXELS);
+        touchScrollRemainder -= pages * HISTORY_PAGE_PIXELS;
+        return pages === 0 || scrollTerminalByLines(pages * 6, clientX, clientY);
+      }
       const cellHeight = terminalCellHeight();
       const rawLines = (deltaPixels / cellHeight) + touchScrollRemainder;
       const lines = rawLines > 0 ? Math.floor(rawLines) : Math.ceil(rawLines);
@@ -491,6 +500,7 @@
       if (terminalProvider === provider) return;
       window.smEndScrollbarDrag();
       terminalProvider = provider;
+      touchScrollRemainder = 0;
       updateScrollbar();
     };
 
@@ -547,7 +557,7 @@
     window.smDragScrollbar = function(clientY) {
       if (providerOwnsHistory()) {
         if (remoteHistoryDragY === null || !Number.isFinite(Number(clientY))) return;
-        const pages = Math.trunc((Number(clientY) - remoteHistoryDragY) / 72);
+        const pages = Math.trunc((Number(clientY) - remoteHistoryDragY) / HISTORY_PAGE_PIXELS);
         if (pages !== 0) {
           sendTerminalPageScroll(pages * 6);
           remoteHistoryDragY = Number(clientY);

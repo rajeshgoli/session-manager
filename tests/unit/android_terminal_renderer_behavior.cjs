@@ -16,6 +16,7 @@ function renderer() {
   const inputs = [];
   const elements = {};
   const makeElement = () => ({ style: {}, hidden: false, attributes: {}, listeners: {},
+    clientHeight: 96, clientWidth: 320, querySelector() { return null; },
     classList: { toggle() {}, add() {}, remove() {}, contains() { return false; } },
     getBoundingClientRect: () => ({top: 4, height: 600}),
     setAttribute(name, value) { this.attributes[name] = value; },
@@ -229,6 +230,27 @@ test('provider history rail survives native handoff, ignores jitter, and stops a
     r.api.smEndScrollbarDrag();
     r.api.smDragScrollbar(0);
     assert.deepEqual(r.inputs, ['\x1b[5~', '\x1b[6~']);
+  } finally { r.term.dispose(); }
+});
+
+test('provider viewport swipes accumulate one page per 72 pixels', () => {
+  const r = renderer();
+  try {
+    r.api.smSetProvider('codex-fork');
+    for (let i = 0; i < 5; i++) r.api.smScrollPixels(-12);
+    assert.deepEqual(r.inputs, []);
+    r.api.smScrollPixels(-12);
+    assert.deepEqual(r.inputs, ['\x1b[5~']);
+    r.api.smScrollPixels(144);
+    assert.deepEqual(r.inputs, ['\x1b[5~', '\x1b[6~', '\x1b[6~']);
+    r.api.smScrollPixels(-60);
+    r.api.smSetProvider('codex');
+    r.api.smSetProvider('codex-fork');
+    r.api.smScrollPixels(-12);
+    assert.equal(r.inputs.length, 3);
+    r.api.smScrollPixels(-60);
+    assert.equal(r.inputs.length, 4);
+    assert.equal(r.inputs.at(-1), '\x1b[5~');
   } finally { r.term.dispose(); }
 });
 
