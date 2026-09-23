@@ -10722,7 +10722,9 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
         return claude_live_activity_state(session, pane_text.as_deref());
     }
     if session.provider.trim() == "codex" {
-        if !is_primary_node(&session.node) {
+        // A title is undated: a lingering spinner cannot establish a new turn
+        // after an explicit task-complete marker. Follow-up activity clears it.
+        if !is_primary_node(&session.node) || session.agent_task_completed_at.is_some() {
             return None;
         }
         // Stock Codex does not post Claude hooks or fork lifecycle events.
@@ -15407,6 +15409,17 @@ mod tests {
         session.completion_status = Some("completed".to_owned());
         assert_eq!(live_activity_state(&state, &session), None);
         session.completion_status = None;
+
+        session.agent_task_completed_at = Some("2020-01-01T00:01:00Z".to_owned());
+        let response = serde_json::to_value(client_session_response_with_live_activity(
+            &state,
+            session.clone(),
+        ))
+        .unwrap();
+        assert_eq!(response["activity_state"], "idle");
+        assert_eq!(live_activity_state(&state, &session), None);
+        session.agent_task_completed_at = None;
+        assert_eq!(live_activity_state(&state, &session), Some("working"));
 
         set_title("Own 1589 | fractal-algo-rust");
         let response = serde_json::to_value(client_session_response_with_live_activity(
