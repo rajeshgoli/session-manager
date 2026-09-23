@@ -10721,6 +10721,18 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
         let pane_text = runtime.capture_pane_text(&session.tmux_session);
         return claude_live_activity_state(session, pane_text.as_deref());
     }
+    if session.provider.trim() == "codex" {
+        if !is_primary_node(&session.node) {
+            return None;
+        }
+        // Stock Codex does not post Claude hooks or fork lifecycle events.
+        // Its live title spinner must override the 30-second last_activity
+        // fallback during long turns, just as it does for codex-fork.
+        let runtime = TmuxRuntime::from_app_config(&state.config)
+            .for_socket_name(session.tmux_socket_name.as_deref());
+        let pane_title = runtime.pane_title(&session.tmux_session);
+        return codex_fork_live_activity_from_signals(None, pane_title.as_deref());
+    }
     if session.provider.trim() != "codex-fork" {
         return None;
     }
@@ -15325,6 +15337,84 @@ mod tests {
         assert!(!codex_fork_pane_title_indicates_working(
             "⠏⠇ fractal-algo-rust"
         ));
+    }
+
+    #[test]
+    #[ignore = "requires an isolated tmux server"]
+    fn stock_codex_live_activity_overrides_stale_timestamp() {
+        struct TestTmux(String);
+        impl Drop for TestTmux {
+            fn drop(&mut self) {
+                let _ = Command::new("tmux")
+                    .args(["-L", &self.0, "kill-server"])
+                    .output();
+            }
+        }
+        let tmux = TestTmux(format!(
+            "sm-codex-activity-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        let created = Command::new("tmux")
+            .args([
+                "-L", &tmux.0, "-f", "/dev/null", "new-session", "-d", "-s", "activity", "cat",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let set_title = |title: &str| {
+            let output = Command::new("tmux")
+                .args(["-L", &tmux.0, "select-pane", "-t", "activity", "-T", title])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        };
+        let state = AppState::new(AppConfig::default());
+        let mut session: SessionRecord = serde_json::from_value(json!({
+            "id": "codexactivity",
+            "name": "codex-activity",
+            "working_dir": "/repo",
+            "tmux_session": "activity",
+            "tmux_socket_name": tmux.0,
+            "node": "primary",
+            "provider": "codex",
+            "status": "running",
+            "created_at": "2020-01-01T00:00:00Z",
+            "last_activity": "2020-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(projected_activity_state_for_test(&session), "idle");
+        set_title("⠸ Own 1589 | fractal-algo-rust");
+        assert_eq!(live_activity_state(&state, &session), Some("working"));
+        let response = serde_json::to_value(client_session_response_with_live_activity(
+            &state,
+            session.clone(),
+        ))
+        .unwrap();
+        assert_eq!(response["activity_state"], "working");
+        assert_eq!(response["last_activity"], "2020-01-01T00:00:00Z");
+
+        session.node = "macbook".to_owned();
+        assert_eq!(live_activity_state(&state, &session), None);
+        session.node = "primary".to_owned();
+        session.status = "stopped".to_owned();
+        assert_eq!(live_activity_state(&state, &session), None);
+        session.status = "running".to_owned();
+        session.completion_status = Some("completed".to_owned());
+        assert_eq!(live_activity_state(&state, &session), None);
+        session.completion_status = None;
+
+        set_title("Own 1589 | fractal-algo-rust");
+        let response = serde_json::to_value(client_session_response_with_live_activity(
+            &state,
+            session.clone(),
+        ))
+        .unwrap();
+        assert_eq!(response["activity_state"], "idle");
     }
 
     #[test]
