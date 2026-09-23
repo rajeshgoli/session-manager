@@ -72,6 +72,39 @@
     }
     #terminal-scrollbar.dragging #terminal-scroll-thumb,
     #terminal-scrollbar:focus-visible #terminal-scroll-thumb { background: #2dd4bf; }
+    .history-page {
+      display: none;
+      position: absolute;
+      left: 0;
+      width: 28px;
+      height: 48px;
+      padding: 0;
+      border: 1px solid #475569;
+      border-radius: 6px;
+      background: #1e293b;
+      color: #e7f6f2;
+      font-size: 18px;
+      touch-action: none;
+    }
+    #history-earlier { top: 0; }
+    #history-later { bottom: 0; }
+    #terminal-scrollbar.remote-history .history-page { display: block; }
+    #terminal-scrollbar.remote-history #terminal-scroll-thumb { display: none; }
+    #terminal-scrollbar.remote-history::after {
+      content: "↕";
+      position: absolute;
+      top: calc(50% - 20px);
+      left: 2px;
+      width: 24px;
+      line-height: 40px;
+      text-align: center;
+      background: #334155;
+      border-radius: 6px;
+      color: #e7f6f2;
+      font-size: 22px;
+      pointer-events: none;
+    }
+    #terminal-scrollbar.remote-history.dragging::after { background: #0f766e; }
     #terminal-status {
       align-items: center;
       background: #05080d;
@@ -104,6 +137,8 @@
       aria-controls="terminal" aria-orientation="vertical" aria-valuemin="0"
       aria-valuemax="0" aria-valuenow="0" tabindex="0" hidden>
       <div id="terminal-scroll-thumb"></div>
+      <button id="history-earlier" class="history-page" aria-label="Earlier history" title="Earlier history">▲</button>
+      <button id="history-later" class="history-page" aria-label="Later history" title="Later history">▼</button>
     </div>
     <div id="terminal-status">Loading terminal renderer...</div>
   </div>
@@ -118,6 +153,9 @@
     let scrollbarDragOffset = null;
     let scrollbarNativeDrag = false;
     let lastScrollbarVisible = null;
+    let terminalProvider = "";
+    let remoteHistoryDragY = null;
+    const HISTORY_PAGE_PIXELS = 72;
     let resizeAnchor = null;
     let resizeAnchorTimer = null;
     const fitAddon = new FitAddon.FitAddon();
@@ -355,6 +393,9 @@
       if (!ready || !Number.isFinite(lines) || lines === 0) {
         return false;
       }
+      // tmux can suppress alternate-screen sequences while the provider still
+      // owns a full-screen transcript. Its history is not in xterm's buffer.
+      if (providerOwnsHistory()) return sendTerminalPageScroll(lines);
       if (terminalUsesAlternateBuffer()) {
         if (terminalMouseTrackingEnabled()) {
           return sendTerminalWheel(lines, clientX, clientY);
@@ -368,6 +409,14 @@
     function scrollTerminalByPixels(deltaPixels, clientX, clientY) {
       if (!ready || !Number.isFinite(deltaPixels)) {
         return false;
+      }
+      if (providerOwnsHistory()) {
+        // Accumulate physical movement before sending whole-page keys. A
+        // terminal-cell-sized drag delta must not become an entire page.
+        touchScrollRemainder += deltaPixels;
+        const pages = Math.trunc(touchScrollRemainder / HISTORY_PAGE_PIXELS);
+        touchScrollRemainder -= pages * HISTORY_PAGE_PIXELS;
+        return pages === 0 || scrollTerminalByLines(pages * 6, clientX, clientY);
       }
       const cellHeight = terminalCellHeight();
       const rawLines = (deltaPixels / cellHeight) + touchScrollRemainder;
@@ -443,24 +492,56 @@
         top: buffer.baseY > 0 ? travel * buffer.viewportY / buffer.baseY : 0 };
     }
 
+    function providerOwnsHistory() {
+      return terminalProvider === "codex-fork";
+    }
+
+    window.smSetProvider = function(provider) {
+      if (terminalProvider === provider) return;
+      window.smEndScrollbarDrag();
+      terminalProvider = provider;
+      touchScrollRemainder = 0;
+      updateScrollbar();
+    };
+
     function updateScrollbar() {
       const buffer = term.buffer.active;
-      const visible = buffer.type === "normal" && buffer.baseY > 0;
+      const remote = providerOwnsHistory();
+      const visible = remote || (buffer.type === "normal" && buffer.baseY > 0);
       scrollbar.hidden = !visible;
+      scrollbar.classList.toggle("remote-history", remote);
+      // Provider history has no exposed absolute offset. Present navigation
+      // controls instead of inventing a proportional scrollbar position.
+      scrollbar.setAttribute("role", remote ? "group" : "scrollbar");
+      scrollbar.setAttribute("aria-label", remote ? "Session history: drag up for earlier, down for later" : "Terminal history");
+      for (const name of ["aria-valuemin", "aria-valuemax", "aria-valuenow", "aria-orientation"]) {
+        if (remote) scrollbar.removeAttribute(name);
+      }
       if (visible !== lastScrollbarVisible) {
         lastScrollbarVisible = visible;
         bridgeCall("scrollbarVisibility", visible);
       }
+      if (remote) return;
       const { height, top } = scrollbarGeometry();
       scrollThumb.style.height = `${height}px`;
       scrollThumb.style.transform = `translateY(${top}px)`;
       scrollbar.setAttribute("aria-valuemax", String(buffer.baseY));
       scrollbar.setAttribute("aria-valuenow", String(buffer.viewportY));
+      scrollbar.setAttribute("aria-valuemin", "0");
+      scrollbar.setAttribute("aria-orientation", "vertical");
     }
 
     window.smBeginScrollbarDrag = function(clientY, fromNative = false) {
       cancelResizeAnchor();
+      if (!ready || !Number.isFinite(Number(clientY))) return;
       scrollbarNativeDrag = fromNative;
+      if (providerOwnsHistory()) {
+        // Preserve the pointer's starting point when Compose takes ownership.
+        if (remoteHistoryDragY === null) remoteHistoryDragY = Number(clientY);
+        scrollbar.classList.add("dragging");
+        window.smDragScrollbar(clientY);
+        return;
+      }
       if (fromNative && scrollbarDragOffset !== null) {
         window.smDragScrollbar(clientY);
         return;
@@ -474,6 +555,15 @@
     };
 
     window.smDragScrollbar = function(clientY) {
+      if (providerOwnsHistory()) {
+        if (remoteHistoryDragY === null || !Number.isFinite(Number(clientY))) return;
+        const pages = Math.trunc((Number(clientY) - remoteHistoryDragY) / HISTORY_PAGE_PIXELS);
+        if (pages !== 0) {
+          sendTerminalPageScroll(pages * 6);
+          remoteHistoryDragY = Number(clientY);
+        }
+        return;
+      }
       if (scrollbarDragOffset === null || !Number.isFinite(Number(clientY))) return;
       const { buffer, rect, travel } = scrollbarGeometry();
       if (buffer.type !== "normal" || travel <= 0) return;
@@ -485,6 +575,7 @@
     window.smEndScrollbarDrag = function() {
       scrollbarDragOffset = null;
       scrollbarNativeDrag = false;
+      remoteHistoryDragY = null;
       scrollbar.classList.remove("dragging");
     };
 
@@ -495,7 +586,7 @@
       window.smBeginScrollbarDrag(event.clientY);
     });
     scrollbar.addEventListener("pointermove", event => {
-      if (!scrollbarNativeDrag && scrollbarDragOffset !== null) {
+      if (!scrollbarNativeDrag && (scrollbarDragOffset !== null || remoteHistoryDragY !== null)) {
         event.preventDefault();
         window.smDragScrollbar(event.clientY);
       }
@@ -508,6 +599,15 @@
     scrollbar.addEventListener("pointerup", endPointerDrag);
     scrollbar.addEventListener("pointercancel", endPointerDrag);
     scrollbar.addEventListener("keydown", event => {
+      if (providerOwnsHistory()) {
+        const direction = { ArrowUp: -6, PageUp: -6, ArrowDown: 6, PageDown: 6 }[event.key];
+        if (direction) {
+          event.preventDefault();
+          event.stopPropagation();
+          sendTerminalPageScroll(direction);
+        }
+        return;
+      }
       const buffer = term.buffer.active;
       if (buffer.type !== "normal") return;
       const targets = { Home: 0, End: buffer.baseY, ArrowUp: buffer.viewportY - 1,
@@ -523,6 +623,15 @@
     term.onScroll(updateScrollbar);
     term.onWriteParsed(updateScrollbar);
     term.onResize(updateScrollbar);
+    for (const [id, direction] of [["history-earlier", -6], ["history-later", 6]]) {
+      const button = document.getElementById(id);
+      button.addEventListener("pointerdown", event => event.stopPropagation());
+      button.addEventListener("click", event => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (providerOwnsHistory()) sendTerminalPageScroll(direction);
+      });
+    }
 
     function viewportDimensions() {
       const width = window.innerWidth
