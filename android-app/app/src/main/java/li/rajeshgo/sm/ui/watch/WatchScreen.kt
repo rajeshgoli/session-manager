@@ -768,6 +768,8 @@ private fun TerminalWebView(
             }
         },
         update = { webView ->
+            // Configure provider-owned history before delivering its output.
+            if (terminalReady) webView.evaluateJavascript("window.smSetProvider(${jsString(terminal.provider.orEmpty())});", null)
             webView.evaluateJavascript("window.smSetStatus(${jsString(terminal.status)});", null)
             if (terminalReady) {
                 terminal.outputFrames

@@ -13,22 +13,25 @@ const source = fs.readFileSync(path.join(asset, 'terminal.html'), 'utf8').match(
 function renderer() {
   const acks = [];
   const scrollbarVisibility = [];
-  const element = { style: {}, hidden: false, attributes: {}, listeners: {},
+  const inputs = [];
+  const elements = {};
+  const makeElement = () => ({ style: {}, hidden: false, attributes: {}, listeners: {},
     classList: { toggle() {}, add() {}, remove() {}, contains() { return false; } },
     getBoundingClientRect: () => ({top: 4, height: 600}),
     setAttribute(name, value) { this.attributes[name] = value; },
+    removeAttribute(name) { delete this.attributes[name]; },
     addEventListener(name, handler) { this.listeners[name] = handler; },
-  };
+  });
   const context = vm.createContext({
     Terminal, FitAddon: { FitAddon }, Uint8Array, atob,
-    document: { getElementById: () => element },
-    window: { TerminalBridge: { written: seq => acks.push(Number(seq)), scrollbarVisibility: visible => scrollbarVisibility.push(visible) }, addEventListener() {}, requestAnimationFrame() {}, setTimeout() {}, clearTimeout() {} },
+    document: { getElementById: id => elements[id] ||= makeElement() },
+    window: { TerminalBridge: { input: data => inputs.push(data), written: seq => acks.push(Number(seq)), scrollbarVisibility: visible => scrollbarVisibility.push(visible) }, addEventListener() {}, requestAnimationFrame() {}, setTimeout() {}, clearTimeout() {} },
   });
   vm.runInContext(source, context);
   vm.runInContext('ready = true; opened = true;', context);
   const term = vm.runInContext('term', context);
   term.resize(40, 8);
-  return { context, term, acks, element, scrollbarVisibility, api: context.window };
+  return { context, term, acks, element: elements['terminal-scrollbar'], elements, inputs, scrollbarVisibility, api: context.window };
 }
 
 const drain = term => new Promise(resolve => term.write('', resolve));
@@ -185,5 +188,72 @@ test('animated resizes retain the first content anchor and release it for user s
     r.api.smDragScrollbar(0);
     assert.equal(r.term.buffer.active.viewportY, 0);
     assert.equal(vm.runInContext('resizeAnchor', r.context), null);
+  } finally { r.term.dispose(); }
+});
+
+test('Codex fork history remains navigable when tmux hides its alternate screen', async () => {
+  const r = renderer();
+  try {
+    r.api.smSetProvider('codex-fork');
+    // The real attach stream paints a normal xterm viewport with no scrollback,
+    // even though the provider behind tmux owns a full-screen transcript.
+    r.api.smWriteText(1, '\x1b[H\x1b[2JFull-screen transcript\x1b[6;1HComposer');
+    await drain(r.term);
+    assert.equal(r.term.buffer.active.type, 'normal');
+    assert.equal(r.term.buffer.active.baseY, 0);
+    assert.equal(r.element.hidden, false);
+    assert.equal(r.element.attributes.role, 'group');
+    assert.equal(r.element.attributes['aria-valuemax'], undefined);
+    r.api.smScrollLines(-6);
+    r.api.smScrollLines(6);
+    const click = { preventDefault() {}, stopPropagation() {} };
+    r.elements['history-earlier'].listeners.click(click);
+    r.elements['history-later'].listeners.click(click);
+    assert.deepEqual(r.inputs, ['\x1b[5~', '\x1b[6~', '\x1b[5~', '\x1b[6~']);
+    assert.equal(r.term.buffer.active.baseY, 0);
+  } finally { r.term.dispose(); }
+});
+
+test('provider history rail survives native handoff, ignores jitter, and stops after release', () => {
+  const r = renderer();
+  try {
+    r.api.smSetProvider('codex-fork');
+    r.api.smBeginScrollbarDrag(300);
+    r.api.smBeginScrollbarDrag(280, true);
+    r.element.listeners.pointercancel();
+    r.api.smSetProvider('codex-fork'); // repeated Compose update must preserve drag
+    r.api.smDragScrollbar(230);
+    assert.deepEqual(r.inputs, []);
+    r.api.smDragScrollbar(220);
+    r.api.smDragScrollbar(300);
+    r.api.smEndScrollbarDrag();
+    r.api.smDragScrollbar(0);
+    assert.deepEqual(r.inputs, ['\x1b[5~', '\x1b[6~']);
+  } finally { r.term.dispose(); }
+});
+
+test('provider-owned history takes precedence over incidental xterm history and restores local mode', async () => {
+  const r = renderer();
+  try {
+    r.api.smWriteText(1, 'history\r\n'.repeat(100));
+    await drain(r.term);
+    const bottom = r.term.buffer.active.viewportY;
+    r.api.smSetProvider('codex-fork');
+    r.api.smScrollLines(-6);
+    assert.equal(r.term.buffer.active.viewportY, bottom);
+    r.api.smWriteText(2, '\x1b[?1049h');
+    await drain(r.term);
+    assert.equal(r.element.hidden, false);
+    r.element.listeners.keydown({key: 'PageDown', preventDefault() {}, stopPropagation() {}});
+    assert.deepEqual(r.inputs, ['\x1b[5~', '\x1b[6~']);
+    r.api.smSetProvider('codex');
+    assert.equal(r.element.hidden, true);
+    r.api.smWriteText(3, '\x1b[?1049l');
+    await drain(r.term);
+    assert.equal(r.element.attributes.role, 'scrollbar');
+    assert.equal(r.element.hidden, false);
+    r.api.smScrollLines(-6);
+    assert.equal(r.term.buffer.active.viewportY, bottom - 6);
+    assert.equal(r.inputs.length, 2);
   } finally { r.term.dispose(); }
 });
