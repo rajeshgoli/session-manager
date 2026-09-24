@@ -117,3 +117,38 @@ and published with `sm doc publish`. Don't just leave it on disk or mention a pa
 - Read only: commit and push the file, then `sm doc publish <path>`. This pins the
   pushed HEAD commit.
 - Prefer self-contained HTML (inline CSS, images as data URIs). Markdown also works.
+
+## Repo reference
+
+Session manager is a Rust server (Axum + Tokio, Rust 1.86+) that runs Claude Code and Codex agents in tmux, tracks parent–child agent trees, and carries durable messages, reminders, and queue jobs between them. State is in SQLite. The `sm` CLI is its client.
+
+| Where | What |
+|---|---|
+| `crates/sm-server/src/main.rs` | Server entry point |
+| `crates/sm-server/src/runtime.rs` | Provider and tmux lifecycle |
+| `crates/sm-server/src/sessions.rs` | Session persistence and lifecycle |
+| `crates/sm-server/src/http.rs` | HTTP API and hooks |
+| `crates/sm-server/src/queue.rs` | Message, reminder, and job queues |
+| `crates/sm-server/src/bin/sm.rs` | `sm` CLI |
+| `crates/sm-server/src/bin/watch/` | Terminal dashboard |
+| `hooks/` | Claude Code hooks: tool-use logging, context-usage status line. `scripts/install_notify_server_hook.sh` installs them all |
+
+**Restart the live server only with `scripts/restart-rust-server.sh`.** Running `cargo build` then `launchctl kickstart -k` by hand has taken the service down: launchd can pin a launch constraint into the job, and only re-registering the job clears it. The script also reinstalls the `sm` CLI. See `specs/1134_rust_restart_procedure.md`.
+
+**The live binaries are installed copies in `.local/bin/`, not `target/`.** An ordinary `cargo build` never touches the running server, and `cargo clean` never deletes `sm`. Keep `.local/bin` on `PATH`. To refresh only the CLI, run `scripts/install-sm-cli.sh`.
+
+**Production config and state live outside every checkout**, because agents branch, build, and `cargo clean` inside checkouts:
+
+```
+~/.config/session-manager/config.yaml   # the live server's config
+~/.config/session-manager/certs/        # mobile device CA cert and key
+~/.local/share/claude-sessions/         # databases, queue state, app artifacts
+```
+
+The restart script uses the installed config and falls back to the in-repo `config.yaml` only when none is installed. The installed config sets `app_artifacts.root_dir`, `bug_reports.db_path`, and the two `mobile_terminal` CA paths explicitly, because their compiled defaults resolve against whichever tree the binary was built in.
+
+**Run tests with `scripts/test-rust-isolated.sh`**, not bare `cargo test`. The launcher isolates and then cleans up test state.
+
+**Conventions.** Session ids are 8-character UUID prefixes (e.g. `a4af4272`). The tmux session is always `claude-<session id>`; the friendly name (`sm name`) is separate. A session can retire or clear only its own children. Tool-use logging is always on, with no sampling. The server sets `CLAUDE_SESSION_MANAGER_ID` in each session so hooks and `sm` know which session they are in.
+
+**Common failures.** Hooks not logging: check the server is up (`curl localhost:8420/health`). `sm` commands failing: check `CLAUDE_SESSION_MANAGER_ID` is set. Session not found: use the full session id or the exact friendly name.
