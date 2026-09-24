@@ -208,7 +208,7 @@ fun DocReaderOverlay(
                     }
                     if (readyAuth != null) {
                         IconButton(onClick = {
-                            val current = history.lastOrNull() ?: docReaderUrl(readyAuth.serverUrl, doc)
+                            val current = webViewRef?.url ?: history.lastOrNull() ?: docReaderUrl(readyAuth.serverUrl, doc)
                             onCopyLink(docShareUrl(current, doc))
                         }) {
                             Icon(Icons.Rounded.Link, contentDescription = "Copy doc link", tint = Cyan)
