@@ -241,6 +241,8 @@ struct StubGitHubReviewPoster {
     // posted `@codex review` comments is at most `failing_through_post`.
     // Reviews are withheld until that many posts have failed.
     review_failure: Arc<Mutex<Option<(GitHubReviewMatch, usize)>>>,
+    // Posts beyond this count fail until it is raised.
+    post_failures_after: Arc<Mutex<Option<usize>>>,
 }
 
 impl StubGitHubReviewPoster {
@@ -263,6 +265,7 @@ impl StubGitHubReviewPoster {
             head_after_post: Arc::new(Mutex::new(None)),
             pickup_detected: Arc::new(Mutex::new(false)),
             review_failure: Arc::new(Mutex::new(None)),
+            post_failures_after: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -278,6 +281,7 @@ impl StubGitHubReviewPoster {
             head_after_post: Arc::new(Mutex::new(None)),
             pickup_detected: Arc::new(Mutex::new(false)),
             review_failure: Arc::new(Mutex::new(None)),
+            post_failures_after: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -319,6 +323,10 @@ impl StubGitHubReviewPoster {
         *self.review_failure.lock().unwrap() = Some((failure, failing_through_post));
     }
 
+    fn fail_posts_after(&self, successful_posts: Option<usize>) {
+        *self.post_failures_after.lock().unwrap() = successful_posts;
+    }
+
     fn active_review_failure(&self) -> Option<GitHubReviewMatch> {
         let posts = self.calls.lock().unwrap().len();
         self.review_failure
@@ -337,6 +345,11 @@ impl GitHubReviewPoster for StubGitHubReviewPoster {
         pr_number: i64,
         steer: Option<&str>,
     ) -> Result<GitHubReviewComment, String> {
+        if let Some(limit) = *self.post_failures_after.lock().unwrap() {
+            if self.calls.lock().unwrap().len() >= limit {
+                return Err("gh pr comment failed: transient".to_owned());
+            }
+        }
         self.calls
             .lock()
             .unwrap()
@@ -3275,6 +3288,88 @@ async fn codex_review_request_watcher_retries_after_codex_failure_comment() {
     let completed = completed.expect("a Codex failure comment must trigger a fresh request");
     assert_eq!(completed.1, 2);
     assert_eq!(poster.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn codex_review_request_watcher_survives_failed_retry_post() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("codex-review-retry-post-fails.db");
+    let poster = StubGitHubReviewPoster::successful();
+    poster.set_pickup_detected(true);
+    poster.set_review_failure(codex_review_failure_comment(), 1);
+    poster.fail_posts_after(Some(1));
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 971,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "run12345",
+            "poll_interval_seconds": 1,
+            "retry_interval_seconds": 1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let request_id = payload["id"].as_str().unwrap().to_owned();
+
+    let mut post_error = None;
+    for _ in 0..40 {
+        let current: (String, Option<String>) = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state, last_error FROM codex_review_request_registrations WHERE id = ?1",
+                [&request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        if current
+            .1
+            .as_deref()
+            .is_some_and(|error| error.contains("review retry post failed"))
+        {
+            post_error = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let post_error = post_error.expect("a failed retry post must be recorded");
+    assert_eq!(post_error.0, "active");
+
+    poster.fail_posts_after(None);
+    let mut attempts = None;
+    for _ in 0..40 {
+        let current: i64 = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT attempt_count FROM codex_review_request_registrations WHERE id = ?1",
+                [&request_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if current == 2 {
+            attempts = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        attempts,
+        Some(2),
+        "the watcher must keep running and retry once posting works again"
+    );
 }
 
 #[tokio::test]

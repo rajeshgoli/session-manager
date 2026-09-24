@@ -5604,13 +5604,34 @@ async fn run_codex_review_request_watcher(
                 return Ok(());
             }
             if retry_due {
-                let comment = github_post_review_request(
+                let comment = match github_post_review_request(
                     state.github_review_poster.clone(),
                     &registration.repo,
                     registration.pr_number,
                     registration.steer.as_deref(),
                 )
-                .await?;
+                .await
+                {
+                    Ok(comment) => comment,
+                    Err(error) => {
+                        // Keep the watcher alive: a still-present failure
+                        // comment re-arms the retry on the next poll, and a
+                        // missing pickup retries at the rescheduled time.
+                        let next_retry_at = codex_review_next_retry_at(
+                            &now,
+                            registration.retry_interval_seconds.max(1),
+                        );
+                        let _ = RetainedQueueStore::mark_codex_review_request_poll_error_in_path(
+                            &queue_db_path,
+                            &request_id,
+                            &now,
+                            &format!("review retry post failed: {error}"),
+                            next_retry_at.as_deref(),
+                        )
+                        .map_err(|error| error.to_string())?;
+                        continue;
+                    }
+                };
                 let next_retry_at = codex_review_next_retry_at(
                     &comment.posted_at,
                     registration.retry_interval_seconds.max(1),
