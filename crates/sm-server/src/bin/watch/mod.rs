@@ -190,18 +190,14 @@ fn doc_rows(obligation: &Value, prefix: &str, base_url: &str) -> Vec<Row> {
     array(obligation, "docs")
         .iter()
         .map(|doc| {
-            let path = s(doc, "reader_path");
-            let path = if path.is_empty() {
-                format!("/docs/{}", s(doc, "id"))
-            } else {
-                path.to_owned()
+            let url = match (s(doc, "browser_url"), s(doc, "reader_path")) {
+                (url, _) if !url.is_empty() => url.to_owned(),
+                (_, "") => format!("{base_url}/docs/{}", s(doc, "id")),
+                (_, path) => format!("{base_url}{path}"),
             };
             let state = s(doc, "state").replace('_', " ");
             Row {
-                text: format!(
-                    "{prefix}   doc · {} · {state} · {base_url}{path}",
-                    s(doc, "title")
-                ),
+                text: format!("{prefix}   doc · {} · {state} · {url}", s(doc, "title")),
                 target: None,
                 style: if matches!(s(doc, "state"), "read" | "reviewed") {
                     ""

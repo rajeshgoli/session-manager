@@ -603,9 +603,17 @@ mod workload_tests {
         assert_eq!(metrics["jobs_queued"], 0);
         assert_eq!(metrics["jobs_completed_24h"], 1);
         for state in ["failed", "timed_out", "memory_exceeded", "cancelled"] {
-            conn.execute("UPDATE queue_jobs SET state = ?1 WHERE id = ?2", [state, &job.id]).unwrap();
+            conn.execute(
+                "UPDATE queue_jobs SET state = ?1 WHERE id = ?2",
+                [state, &job.id],
+            )
+            .unwrap();
             let metrics = workload_metrics(&config, &store, now).unwrap();
-            assert_eq!(metrics["jobs_failed_24h"], u64::from(state != "cancelled"), "{state}");
+            assert_eq!(
+                metrics["jobs_failed_24h"],
+                u64::from(state != "cancelled"),
+                "{state}"
+            );
             assert_eq!(metrics["jobs_completed_24h"], 0);
         }
         drop(conn);

@@ -885,3 +885,28 @@ fn docs_mark_the_session_row_and_list_reader_urls_when_expanded() {
         .text
         .contains("Old notes · read · http://127.0.0.1:8420/docs/d0c00003")));
 }
+
+#[test]
+fn doc_rows_prefer_the_browser_hostname_link_when_the_server_sends_one() {
+    let a = args();
+    let mut view = View::new(&a);
+    view.base_url = "http://127.0.0.1:8420".into();
+    view.expanded.insert("a".into());
+    let snap = Snapshot {
+        sessions: vec![session("a", "", "/repo")],
+        obligations: vec![
+            json!({"session_id":"a", "waiting_on":[], "review_history":[], "docs":[
+            {"id":"d0c00001","title":"Decision memo","state":"new","reader_path":"/docs/d0c00001",
+             "browser_url":"https://sm.example.com/docs/d0c00001"},
+            {"id":"d0c00002","title":"Readout","state":"new","reader_path":"/docs/d0c00002"}]}),
+        ],
+        ..Default::default()
+    };
+    let rows = view.rows(&snap, &a, 0);
+    assert!(rows
+        .iter()
+        .any(|r| r.text == "   doc · Decision memo · new · https://sm.example.com/docs/d0c00001"));
+    assert!(rows
+        .iter()
+        .any(|r| r.text == "   doc · Readout · new · http://127.0.0.1:8420/docs/d0c00002"));
+}

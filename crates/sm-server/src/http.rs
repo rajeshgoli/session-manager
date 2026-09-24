@@ -6235,7 +6235,12 @@ async fn list_session_obligations(
         },
     )?;
     let docs = docs::obligation_doc_summaries(&state)?;
-    Ok(Json(project_session_obligations(&jobs, &reviews, &docs)))
+    Ok(Json(project_session_obligations(
+        &jobs,
+        &reviews,
+        &docs,
+        docs::doc_browser_base_url(&state.config).as_deref(),
+    )))
 }
 
 fn new_obligation_entry(session_id: &str) -> Value {
@@ -6246,6 +6251,7 @@ fn project_session_obligations(
     jobs: &[QueueJobRecord],
     reviews: &[CodexReviewRequestRegistration],
     docs: &[crate::owner_docs::OwnerDocSummary],
+    doc_browser_base: Option<&str>,
 ) -> Value {
     let mut sessions = BTreeMap::<String, Value>::new();
     for job in jobs
@@ -6327,7 +6333,7 @@ fn project_session_obligations(
             .or_insert_with(|| new_obligation_entry(author))["docs"]
             .as_array_mut()
             .unwrap()
-            .push(docs::obligation_doc_entry(doc));
+            .push(docs::obligation_doc_entry(doc, doc_browser_base));
     }
     for (id, entry) in &mut sessions {
         if let Some(prs) = session_prs.get(id.as_str()) {
@@ -13724,6 +13730,35 @@ fn ensure_core_runtime_node_supported(node: &str) -> Result<(), ApiError> {
     })
 }
 
+/// Owner doc reads (`/docs`, `/docs/{id}`, `/view`, `/raw`) also accept the
+/// owner's interactive Cloudflare Access login on the browser hostname. Docs
+/// only: every other route there still needs the SM Google session (spec 945).
+/// A present assertion must verify; a verified non-owner email falls through
+/// to the Google session check like a request without one.
+fn ensure_owner_doc_read_allowed(state: &AppState, request: &Request) -> Result<(), ApiError> {
+    if request_cloudflare_access_application(state, request)
+        == Some(CloudflareAccessApplication::Browser)
+        && !is_request_local_bypass(state, request)
+    {
+        if let Some(assertion) = header_text(request.headers(), "cf-access-jwt-assertion") {
+            let context = classify_cloudflare_access_assertion_cached(
+                state,
+                CloudflareAccessApplication::Browser,
+                &assertion,
+            )
+            .map_err(cloudflare_access_error)?;
+            if context
+                .email
+                .as_deref()
+                .is_some_and(|email| allowlisted_google_email(&state.config, email))
+            {
+                return Ok(());
+            }
+        }
+    }
+    ensure_session_read_allowed(state, request)
+}
+
 fn ensure_session_read_allowed(state: &AppState, request: &Request) -> Result<(), ApiError> {
     let peer_addr = request
         .extensions()
@@ -15252,7 +15287,7 @@ mod tests {
             })
             .collect();
         let start = std::time::Instant::now();
-        let retained = project_session_obligations(&[], &history, &[]);
+        let retained = project_session_obligations(&[], &history, &[], None);
         eprintln!("4000 retained reviews projected in {:?}", start.elapsed());
         let retained_sessions = retained["sessions"].as_array().unwrap();
         assert_eq!(retained_sessions.len(), 8000);
@@ -15263,7 +15298,7 @@ mod tests {
             assert!(session["waiting_on"].as_array().unwrap().is_empty());
         }
         let projected =
-            project_session_obligations(&[job.clone()], &[review, completed, duplicate], &[]);
+            project_session_obligations(&[job.clone()], &[review, completed, duplicate], &[], None);
         let sessions = projected["sessions"].as_array().unwrap();
         let recipient = sessions
             .iter()
@@ -15285,7 +15320,7 @@ mod tests {
         let mut finished = job;
         finished.state = "succeeded".into();
         assert!(
-            project_session_obligations(&[finished], &[], &[])["sessions"]
+            project_session_obligations(&[finished], &[], &[], None)["sessions"]
                 .as_array()
                 .unwrap()
                 .is_empty()
@@ -17574,6 +17609,60 @@ mod tests {
         .expect("access token")
     }
 
+    #[derive(Serialize)]
+    struct TestBrowserAccessClaims<'a> {
+        sub: &'a str,
+        aud: &'a str,
+        iss: &'a str,
+        exp: usize,
+        iat: usize,
+        email: &'a str,
+    }
+
+    fn test_browser_access_assertion(aud: &str, email: &str, exp: usize) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("google-test-key".to_owned());
+        let claims = TestBrowserAccessClaims {
+            sub: "browser-user-subject",
+            aud,
+            iss: "https://team.cloudflareaccess.com",
+            exp,
+            iat: 1_700_000_000,
+            email,
+        };
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(test_private_key_pem()).expect("private key"),
+        )
+        .expect("access token")
+    }
+
+    /// Cloudflare Access browser app on `sm.example.com` plus the SM Google
+    /// session (owner allowlist `rajeshgoli@gmail.com`).
+    fn owner_doc_browser_access_app() -> Router {
+        let mut config = google_auth_config();
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        let state = AppState::new(config);
+        seed_cloudflare_access_jwks(&state);
+        router(state)
+    }
+
+    async fn browser_host_get(
+        app: &Router,
+        uri: &str,
+        assertion: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let mut request =
+            public_request_with_host(Method::GET, uri, Body::empty(), "sm.example.com");
+        if let Some(assertion) = assertion {
+            request
+                .headers_mut()
+                .insert("cf-access-jwt-assertion", assertion.parse().unwrap());
+        }
+        response_json(app.clone().oneshot(request).await.unwrap()).await
+    }
+
     fn seed_cloudflare_access_jwks(state: &AppState) {
         state.cloudflare_access_jwks_cache.lock().unwrap().insert(
             "https://team.cloudflareaccess.com".to_owned(),
@@ -17885,6 +17974,93 @@ mod tests {
         let (status, body) = response_json(response).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert_eq!(body["detail"], "Google account is not allowlisted");
+    }
+
+    #[tokio::test]
+    async fn owner_doc_reads_accept_owner_cloudflare_browser_login() {
+        let app = owner_doc_browser_access_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "RajeshGoli@gmail.com", 4_102_444_800);
+        // `zzzzzzzz` is not a doc id, so a request past auth gets 404.
+        for uri in [
+            "/docs/zzzzzzzz",
+            "/docs/zzzzzzzz/view",
+            "/docs/zzzzzzzz/raw",
+        ] {
+            let (status, body) = browser_host_get(&app, uri, Some(&owner)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+            assert_eq!(body["detail"], "Doc not found", "{uri}");
+        }
+        let (status, body) = browser_host_get(&app, "/docs", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["docs"].is_array(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn owner_doc_reads_refuse_bad_or_non_owner_browser_assertions() {
+        let app = owner_doc_browser_access_app();
+        let wrong_audience =
+            test_browser_access_assertion("sm-mobile-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let expired =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 1_700_000_100);
+        let valid =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let (head, _) = valid.rsplit_once('.').unwrap();
+        let forged = format!("{head}.{}", "A".repeat(342));
+        for (label, assertion) in [
+            ("wrong audience", wrong_audience),
+            ("expired", expired),
+            ("forged signature", forged),
+        ] {
+            for uri in [
+                "/docs",
+                "/docs/zzzzzzzz",
+                "/docs/zzzzzzzz/view",
+                "/docs/zzzzzzzz/raw",
+            ] {
+                let (status, body) = browser_host_get(&app, uri, Some(&assertion)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{label} {uri}: {body}");
+                assert_eq!(body["detail"], "Invalid Cloudflare Access assertion");
+            }
+        }
+
+        // A verified login that is not the owner, or no login at all, falls
+        // back to the Google session, which this request does not carry.
+        let stranger =
+            test_browser_access_assertion("sm-browser-aud", "stranger@example.com", 4_102_444_800);
+        for assertion in [Some(stranger.as_str()), None] {
+            let (status, body) = browser_host_get(&app, "/docs/zzzzzzzz/view", assertion).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_browser_login_does_not_open_non_doc_routes() {
+        let app = owner_doc_browser_access_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        for uri in ["/sessions", "/session-obligations", "/queue-jobs"] {
+            let (status, body) = browser_host_get(&app, uri, Some(&owner)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_browser_login_is_only_honoured_on_the_browser_hostname() {
+        let app = owner_doc_browser_access_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let mut request = public_request_with_host(
+            Method::GET,
+            "/docs/zzzzzzzz/view",
+            Body::empty(),
+            "sm-app.example.com",
+        );
+        request
+            .headers_mut()
+            .insert("cf-access-jwt-assertion", owner.parse().unwrap());
+        let (status, body) = response_json(app.oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     }
 
     #[tokio::test]
