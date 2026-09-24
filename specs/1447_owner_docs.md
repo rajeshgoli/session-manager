@@ -61,9 +61,15 @@ and published with `sm doc publish`. Don't just leave it on disk or mention a pa
 ```bash
 sm doc publish <path> [--pr N | --commit SHA | --no-pr] [--title "..."] [--note "..."] [--review]
 sm doc list [--session <id>] [--json]          # default: the caller's session tree
-sm doc show <doc-id> [--json]                   # metadata, revisions, reviews, URLs
-sm doc retract <doc-id>                         # hide from the session Docs row (does not touch git)
+sm doc show <doc> [--json]                      # metadata, revisions, reviews, URLs
+sm doc retract <doc>                            # hide from the session Docs row (does not touch git)
 ```
+
+`<doc>` is `<repo-name>/<path in repo>` (for example
+`fractal-algo-rust/docs/working/ticket-title.html`) or the doc's URL pasted as
+printed; a pasted URL's `?version=` picks the same doc the link opens. Output names
+docs the same way and never prints the internal doc id, including `--json` (the
+`id` field and each publish's `doc_id` are dropped).
 
 `sm doc publish` behaviour (the resolution happens in the CLI, which runs in the
 agent's cwd):
@@ -87,7 +93,7 @@ agent's cwd):
      remote-tracking branch (`git branch -r --contains HEAD` is empty).
 3. `--review` requires `--pr` and an open PR.
 4. POST to the server with the author session from `CLAUDE_SESSION_MANAGER_ID`.
-5. Print `Published "<title>" (<doc-id>) at <sha7> → <reader URL>`.
+5. Print `Published "<title>" (<repo-name>/<path>) at <sha7> → <reader URL>`.
 
 Identity and republishing: a doc is keyed by `(repo, path, pr_number)`, or by
 `(repo, path)` when there's no PR. Publishing the same key again adds a new
@@ -105,7 +111,8 @@ publish requested a review.
   cross-cutting view of which agent worked on which ticket, opened which PR, and wrote
   which doc is the history page in the separate ticket/PR-claims work (see "Related
   work").
-- **Reader**: a full-screen WebView loading `/docs/{id}/view` with the same auth the
+- **Reader**: a full-screen WebView loading the doc's readable URL (`reader_path`,
+  see "Doc URLs") with the same auth the
   app uses for API calls (pass the device auth headers on `loadUrl`). WebView doesn't
   resend custom headers when the page navigates itself (revision picker, newer-revision
   banner, cross-revision drafts). So override `shouldOverrideUrlLoading`: for any
@@ -117,9 +124,9 @@ publish requested a review.
 
 ### Web (laptop / studio browser)
 
-The reader is a plain server page behind the existing browser-session (Google) auth.
-`GET /docs/{id}` redirects to `/docs/{id}/view?sha=<latest published>`, so any doc link works in
-a laptop browser. The Rust server serves no web session list today (`web/sm-watch` is
+The reader is a plain server page behind the existing browser-session (Google) auth,
+or the owner's Cloudflare Access browser login (#1463), at the readable URL below, so
+any doc link works in a laptop browser. The Rust server serves no web session list today (`web/sm-watch` is
 not mounted), so on a laptop you find docs through the `sm watch` expansion and
 `sm doc list`, which print reader URLs. If a web session view lands later, it gets
 the same Docs row as Android, fed by the same projection.
@@ -242,7 +249,59 @@ match.
 - Never call `gh` from the list projection. Lists use stored data only; `gh` calls
   happen on view, publish and submit.
 
-### Rendering (`GET /docs/{id}/view?sha=<sha>`)
+### Doc URLs
+
+Every doc URL a person or agent sees has one form (#1465):
+
+```
+https://<browser host>/docs/<repo-name>/<path in repo>?version=<commit SHA prefix>
+https://sm.rajeshgo.li/docs/fractal-algo-rust/docs/working/ticket-title.html?version=856f0d6e1a2b
+```
+
+- `<repo-name>` is the GitHub repo name without the owner (all repos belong to the
+  owner); it matches case-insensitively. `<path in repo>` is the stored path, each
+  segment percent-encoded (`notes/my memo#1.md` → `notes/my%20memo%231.md`).
+- `?version=` is a commit SHA prefix, 7 to 40 hex characters, any case, that must
+  match one of the doc's publishes. Printed links carry 12 characters of the latest
+  publish's commit. Without `?version=` the page renders the latest publish.
+- The page renders in place. It never redirects, so the address bar keeps the
+  readable URL.
+- One path can hold two docs, a PR doc and a commit-only doc. Without a version, the
+  newest publish across both renders; with one, the newest publish whose commit
+  matches renders.
+- 404 when no doc has that repo name and path (`Doc not found`), when no publish
+  matches the version or the version is not 7 to 40 hex characters
+  (`Version not found`), or when the prefix matches two different commits
+  (`Version matches more than one commit; use more characters`). Retracted docs
+  still resolve, as they do by id.
+- `?format=json` returns the same metadata as `GET /docs/{id}?format=json`; this is
+  how `sm doc show/retract` resolve a name.
+- Auth is the same as the id read routes: the SM Google session, the owner's
+  Cloudflare Access browser login on the browser host, or the studio's local bypass.
+
+| Example | Result |
+|---|---|
+| `/docs/widgets/specs/memo.md` | latest publish |
+| `/docs/widgets/specs/memo.md?version=aaaaaaaaaaaa` | the publish at `aaaaaaaaaaaa…` |
+| `/docs/Widgets/specs/memo.md?version=AAAAAAA` | same publish (7 characters, any case) |
+| `/docs/widgets/specs/memo.md?version=bbbbbbbbbbbb` | 404 `Version not found` |
+| `/docs/gadgets/specs/memo.md` | 404 `Doc not found` |
+| `/docs/widgets/view` | the doc at path `view`, not an id route |
+
+The id routes (`/docs/{id}`, `/view`, `/raw`, `/head`, `/drafts`, `/review`,
+`/retract`) are internal API and never appear on the web or in the app. Every URL the
+server hands out uses the readable form: `reader_path`, `reader_url` and
+`browser_url` in `GET /docs`, `GET /docs/{id}?format=json` and
+`/session-obligations`; `sm doc` and `sm watch` output; links the Android reader and
+the review client show or share. `GET /docs/{id}` redirects to the readable URL of
+the latest publish. Each doc projection also carries `name`
+(`<repo-name>/<path in repo>`).
+
+A GET under `/docs/<a>/<rest>` is an id route only when `<a>` is a stored doc id and
+`<rest>` is `view` or `raw`; everything else is a readable name. POST under a doc is
+id-only (`/docs/{id}/retract`); a POST to a readable name is a 404.
+
+### Rendering
 
 1. Fetch the file at `sha`.
 2. Choose the renderer by extension:
@@ -403,7 +462,8 @@ existing optional-field pattern.
 |---|---|---|
 | POST | `/docs` | publish (from the CLI; session auth like other CLI writes) |
 | GET | `/docs?session=<id>` | JSON list for the CLI (a session and, optionally, its descendants) |
-| GET | `/docs/{id}` | redirect to the view at the latest SHA (JSON metadata with `?format=json`) |
+| GET | `/docs/<repo-name>/<path>?version=` | readable reader: the rendered doc (JSON metadata with `?format=json`); see "Doc URLs" |
+| GET | `/docs/{id}` | redirect to the readable URL of the latest publish (JSON metadata with `?format=json`) |
 | GET | `/docs/{id}/view?sha=` | rendered doc plus the review client |
 | GET | `/docs/{id}/raw?sha=` | raw file (download, debugging) |
 | GET | `/docs/{id}/head` | `{latest_published_sha, pr_head_sha, pr_head_blob_differs, pr_state}` for the banners |
@@ -504,7 +564,8 @@ tests do (reuse that fixture pattern; don't invent a new one).
   another doc, when expired, or on `/view`.
 - CLI: with no `--pr`, the current branch's open PR is used (and `--no-pr` opts out),
   so republishing lands on the same doc.
-- Reader default: `/docs/{id}` opens the latest published SHA, not the PR head;
+- Reader default: the readable URL without `?version=` renders the latest published
+  SHA, not the PR head, and `/docs/{id}` redirects to the readable URL;
   `/head` reports `pr_head_blob_differs` correctly.
   When Google auth is not enabled, doc routes behave like other routes (no auth
   needed) and the token is ignored.

@@ -192,7 +192,14 @@ fn doc_rows(obligation: &Value, prefix: &str, base_url: &str) -> Vec<Row> {
         .map(|doc| {
             let url = match (s(doc, "browser_url"), s(doc, "reader_path")) {
                 (url, _) if !url.is_empty() => url.to_owned(),
-                (_, "") => format!("{base_url}/docs/{}", s(doc, "id")),
+                (_, "") => format!(
+                    "{base_url}{}",
+                    sm_server::owner_docs::doc_readable_path(
+                        s(doc, "repo"),
+                        s(doc, "path"),
+                        s(doc, "latest_commit_sha"),
+                    )
+                ),
                 (_, path) => format!("{base_url}{path}"),
             };
             let state = s(doc, "state").replace('_', " ");

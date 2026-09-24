@@ -2,9 +2,9 @@
 
 use super::*;
 use crate::owner_docs::{
-    default_doc_title, git_blob_sha, is_full_commit_sha, is_owner_doc_id, render_doc_page,
-    validate_repo_path, validate_repo_slug, DocCache, OwnerDoc, OwnerDocStore, OwnerDocSummary,
-    PublishOwnerDoc, DOC_CACHE_MAX_IDLE,
+    default_doc_title, doc_name, doc_readable_path, git_blob_sha, is_full_commit_sha,
+    is_owner_doc_id, render_doc_page, validate_repo_path, validate_repo_slug, DocCache, OwnerDoc,
+    OwnerDocStore, OwnerDocSummary, PublishOwnerDoc, DOC_CACHE_MAX_IDLE,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,14 +191,19 @@ fn doc_fetch_api_error(error: DocFetchError, doc_path: &str, commit_sha: &str) -
     }
 }
 
-pub(super) fn doc_reader_path(doc_id: &str) -> String {
-    format!("/docs/{doc_id}")
+/// The readable reader path for a doc's latest publish. Every doc URL a
+/// person or agent sees uses this form; `/docs/{id}` is internal API only.
+pub(super) fn doc_reader_path(summary: &OwnerDocSummary) -> String {
+    doc_readable_path(
+        &summary.doc.repo,
+        &summary.doc.path,
+        &summary.latest_commit_sha,
+    )
 }
 
 /// Absolute reader URL as the caller reached this server. Clients that know
 /// their own API base should prefer `reader_path`.
-fn doc_reader_url(headers: &HeaderMap, doc_id: &str) -> String {
-    let path = doc_reader_path(doc_id);
+fn doc_reader_url(headers: &HeaderMap, path: String) -> String {
     let header = |name: &str| {
         headers
             .get(name)
@@ -234,11 +239,13 @@ fn summary_json(
     headers: &HeaderMap,
 ) -> Result<Value, ApiError> {
     let mut value = serde_json::to_value(summary)?;
-    value["reader_path"] = json!(doc_reader_path(&summary.doc.id));
-    value["reader_url"] = json!(doc_reader_url(headers, &summary.doc.id));
+    let reader_path = doc_reader_path(summary);
+    value["name"] = json!(doc_name(&summary.doc.repo, &summary.doc.path));
+    value["reader_url"] = json!(doc_reader_url(headers, reader_path.clone()));
     if let Some(base) = doc_browser_base_url(config) {
-        value["browser_url"] = json!(format!("{base}{}", doc_reader_path(&summary.doc.id)));
+        value["browser_url"] = json!(format!("{base}{reader_path}"));
     }
+    value["reader_path"] = json!(reader_path);
     Ok(value)
 }
 
@@ -427,82 +434,98 @@ pub(super) async fn get_owner_doc(
 ) -> Result<Response, ApiError> {
     ensure_owner_doc_read_allowed(&state, &request)?;
     let doc = find_doc(&state, &doc_id)?;
-    let store = owner_doc_store(&state);
-    let summary = store
-        .summary(&doc.id)?
-        .ok_or(ApiError::NotFound("Doc not found"))?;
     if query.format.as_deref() == Some("json") {
-        let mut value = summary_json(&state.config, &summary, request.headers())?;
-        value["publishes"] = serde_json::to_value(store.publishes(&doc.id)?)?;
-        return Ok(Json(value).into_response());
+        return doc_metadata_response(&state, &doc, request.headers());
     }
     // Default to the latest *published* revision, the one the agent
-    // announced and the one the state chip describes.
+    // announced and the one the state chip describes. The address bar only
+    // ever shows the readable form.
+    let summary = owner_doc_store(&state)
+        .summary(&doc.id)?
+        .ok_or(ApiError::NotFound("Doc not found"))?;
     Ok((
         StatusCode::FOUND,
         [
-            (
-                LOCATION,
-                format!(
-                    "{}/view?sha={}",
-                    doc_reader_path(&doc.id),
-                    summary.latest_commit_sha
-                ),
-            ),
+            (LOCATION, doc_reader_path(&summary)),
             (CACHE_CONTROL, "no-cache".to_owned()),
         ],
     )
         .into_response())
 }
 
-#[derive(Debug, Default, Deserialize)]
-pub(super) struct DocShaQuery {
-    #[serde(default)]
-    sha: Option<String>,
+/// `?format=json`: the summary plus every publish.
+fn doc_metadata_response(
+    state: &AppState,
+    doc: &OwnerDoc,
+    headers: &HeaderMap,
+) -> Result<Response, ApiError> {
+    let store = owner_doc_store(state);
+    let summary = store
+        .summary(&doc.id)?
+        .ok_or(ApiError::NotFound("Doc not found"))?;
+    let mut value = summary_json(&state.config, &summary, headers)?;
+    value["publishes"] = serde_json::to_value(store.publishes(&doc.id)?)?;
+    Ok(Json(value).into_response())
 }
 
-/// The file bytes for `?sha=`, defaulting to the latest publish.
-async fn doc_bytes_for_request(
-    state: &Arc<AppState>,
-    doc_id: &str,
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct DocSubpathQuery {
+    /// Id routes: a full commit SHA.
+    #[serde(default)]
+    sha: Option<String>,
+    /// Readable routes: a commit SHA prefix matching one of the doc's publishes.
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    format: Option<String>,
+}
+
+/// The commit an id route renders: `?sha=`, defaulting to the latest publish.
+fn id_route_commit(
+    state: &AppState,
+    doc: &OwnerDoc,
     sha: Option<&str>,
-) -> Result<(OwnerDoc, String, Vec<u8>), ApiError> {
-    let doc = find_doc(state, doc_id)?;
-    let commit_sha = match sha.map(str::trim).filter(|sha| !sha.is_empty()) {
+) -> Result<String, ApiError> {
+    match sha.map(str::trim).filter(|sha| !sha.is_empty()) {
         Some(sha) => {
             let sha = sha.to_ascii_lowercase();
             if !is_full_commit_sha(&sha) {
                 return Err(bad_request("sha must be a full 40-character commit SHA"));
             }
-            sha
+            Ok(sha)
         }
         None => owner_doc_store(state)
             .publishes(&doc.id)?
             .last()
             .map(|publish| publish.commit_sha.clone())
-            .ok_or(ApiError::NotFound("Doc has no published revision"))?,
-    };
+            .ok_or(ApiError::NotFound("Doc has no published revision")),
+    }
+}
+
+async fn load_doc_bytes_async(
+    state: &Arc<AppState>,
+    doc: &OwnerDoc,
+    commit_sha: &str,
+) -> Result<Vec<u8>, ApiError> {
     let source = state.owner_doc_source.clone();
     let cache = owner_doc_cache(&state.config);
-    let (fetch_doc, fetch_sha) = (doc.clone(), commit_sha.clone());
-    let bytes = tokio::task::spawn_blocking(move || {
+    let (fetch_doc, fetch_sha) = (doc.clone(), commit_sha.to_owned());
+    tokio::task::spawn_blocking(move || {
         load_doc_bytes(source.as_ref(), &cache, &fetch_doc, &fetch_sha)
     })
     .await
     .map_err(|error| anyhow::anyhow!("doc fetch task failed: {error}"))?
-    .map_err(|error| doc_fetch_api_error(error, &doc.path, &commit_sha))?;
-    Ok((doc, commit_sha, bytes))
+    .map_err(|error| doc_fetch_api_error(error, &doc.path, commit_sha))
 }
 
-pub(super) async fn view_owner_doc(
-    State(state): State<Arc<AppState>>,
-    Path(doc_id): Path<String>,
-    Query(query): Query<DocShaQuery>,
-    request: Request,
+/// The rendered page, recording the owner's view of that blob.
+async fn view_doc_response(
+    state: &Arc<AppState>,
+    doc: &OwnerDoc,
+    commit_sha: &str,
 ) -> Result<Response, ApiError> {
-    ensure_owner_doc_read_allowed(&state, &request)?;
-    let (doc, _, bytes) = doc_bytes_for_request(&state, &doc_id, query.sha.as_deref()).await?;
-    if let Err(error) = owner_doc_store(&state).record_view(&doc.id, &git_blob_sha(&bytes)) {
+    let bytes = load_doc_bytes_async(state, doc, commit_sha).await?;
+    if let Err(error) = owner_doc_store(state).record_view(&doc.id, &git_blob_sha(&bytes)) {
         eprintln!("Owner doc view record failed: {error:#}");
     }
     Ok((
@@ -516,14 +539,12 @@ pub(super) async fn view_owner_doc(
         .into_response())
 }
 
-pub(super) async fn raw_owner_doc(
-    State(state): State<Arc<AppState>>,
-    Path(doc_id): Path<String>,
-    Query(query): Query<DocShaQuery>,
-    request: Request,
+async fn raw_doc_response(
+    state: &Arc<AppState>,
+    doc: &OwnerDoc,
+    commit_sha: &str,
 ) -> Result<Response, ApiError> {
-    ensure_owner_doc_read_allowed(&state, &request)?;
-    let (doc, _, bytes) = doc_bytes_for_request(&state, &doc_id, query.sha.as_deref()).await?;
+    let bytes = load_doc_bytes_async(state, doc, commit_sha).await?;
     let file_name = doc
         .path
         .rsplit('/')
@@ -549,9 +570,64 @@ pub(super) async fn raw_owner_doc(
         .into_response())
 }
 
-pub(super) async fn retract_owner_doc(
+/// The id sub-route a GET or POST names, when `first` is a stored doc id and
+/// `rest` is one of that method's actions. Anything else is a readable name.
+fn id_subroute(
+    state: &AppState,
+    first: &str,
+    rest: &str,
+    actions: &[&str],
+) -> Result<Option<OwnerDoc>, ApiError> {
+    if !is_owner_doc_id(first) || !actions.contains(&rest) {
+        return Ok(None);
+    }
+    Ok(owner_doc_store(state).get(first)?)
+}
+
+/// `GET /docs/{a}/{*rest}`: the internal id routes (`/docs/{id}/view`,
+/// `/docs/{id}/raw`) or the readable reader `/docs/<repo-name>/<path>`.
+///
+/// The readable form renders the pinned `?version=` (a commit SHA prefix
+/// matching one of the doc's publishes), or the latest publish without one,
+/// in place: it never redirects, so the address bar keeps the readable URL.
+/// `?format=json` returns the doc's metadata instead, which is how `sm doc`
+/// resolves a readable name.
+pub(super) async fn get_owner_doc_subpath(
     State(state): State<Arc<AppState>>,
-    Path(doc_id): Path<String>,
+    Path((first, rest)): Path<(String, String)>,
+    Query(query): Query<DocSubpathQuery>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    ensure_owner_doc_read_allowed(&state, &request)?;
+    if let Some(doc) = id_subroute(&state, &first, &rest, &["view", "raw"])? {
+        let commit_sha = id_route_commit(&state, &doc, query.sha.as_deref())?;
+        return if rest == "raw" {
+            raw_doc_response(&state, &doc, &commit_sha).await
+        } else {
+            view_doc_response(&state, &doc, &commit_sha).await
+        };
+    }
+    let version = query
+        .version
+        .as_deref()
+        .map(str::trim)
+        .filter(|version| !version.is_empty());
+    let (doc, commit_sha) = owner_doc_store(&state)
+        .resolve_readable(&first, &rest, version)?
+        .map_err(|error| ApiError::Status {
+            status: StatusCode::NOT_FOUND,
+            detail: error.detail().to_owned(),
+        })?;
+    if query.format.as_deref() == Some("json") {
+        return doc_metadata_response(&state, &doc, request.headers());
+    }
+    view_doc_response(&state, &doc, &commit_sha).await
+}
+
+/// `POST /docs/{id}/retract`, the only POST under a doc.
+pub(super) async fn post_owner_doc_subpath(
+    State(state): State<Arc<AppState>>,
+    Path((doc_id, rest)): Path<(String, String)>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
@@ -559,8 +635,11 @@ pub(super) async fn retract_owner_doc(
         &state.config,
         &headers,
         Some(peer_addr),
-        &format!("/docs/{doc_id}/retract"),
+        &format!("/docs/{doc_id}/{rest}"),
     )?;
+    if rest != "retract" {
+        return Err(ApiError::NotFound("Not found"));
+    }
     ensure_core_writes_enabled(&state)?;
     find_doc(&state, &doc_id)?;
     let store = owner_doc_store(&state);
@@ -586,10 +665,11 @@ pub(super) fn obligation_doc_entry(summary: &OwnerDocSummary, browser_base: Opti
         "pr_number": summary.doc.pr_number,
         "latest_commit_sha": summary.latest_commit_sha,
         "published_at": summary.published_at,
-        "reader_path": doc_reader_path(&summary.doc.id),
+        "name": doc_name(&summary.doc.repo, &summary.doc.path),
+        "reader_path": doc_reader_path(summary),
     });
     if let Some(base) = browser_base {
-        entry["browser_url"] = json!(format!("{base}{}", doc_reader_path(&summary.doc.id)));
+        entry["browser_url"] = json!(format!("{base}{}", doc_reader_path(summary)));
     }
     entry
 }
@@ -637,17 +717,18 @@ mod tests {
 
     #[test]
     fn reader_url_uses_the_callers_host() {
+        let path = || "/docs/widgets/memo.md?version=aaaaaaaaaaaa".to_owned();
         let mut headers = HeaderMap::new();
-        assert_eq!(doc_reader_url(&headers, "abcd1234"), "/docs/abcd1234");
+        assert_eq!(doc_reader_url(&headers, path()), path());
         headers.insert(HOST, "127.0.0.1:8420".parse().unwrap());
         assert_eq!(
-            doc_reader_url(&headers, "abcd1234"),
-            "http://127.0.0.1:8420/docs/abcd1234"
+            doc_reader_url(&headers, path()),
+            format!("http://127.0.0.1:8420{}", path())
         );
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         assert_eq!(
-            doc_reader_url(&headers, "abcd1234"),
-            "https://127.0.0.1:8420/docs/abcd1234"
+            doc_reader_url(&headers, path()),
+            format!("https://127.0.0.1:8420{}", path())
         );
     }
 }
