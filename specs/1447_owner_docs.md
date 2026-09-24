@@ -47,8 +47,10 @@ and published with `sm doc publish`. Don't just leave it on disk or mention a pa
 - Needs the owner's review: open a PR containing the file, then
   `sm doc publish <path> --pr <N> --review`. The review arrives as a GitHub PR review,
   and sm wakes you with `[sm review] Rajesh's review of "<title>" ... is here: <url>`.
-  Read the review with `gh`, address the comments, push, and run `sm doc publish`
-  again so the owner sees the new revision.
+  Read the review with `gh`, address the comments, push, and run
+  `sm doc publish <path> --pr <N>` again (add `--review` if you want another review)
+  so the owner sees the new revision. Always republish with the same `--pr`; a
+  publish without it is a different, read-only doc.
 - Prefer self-contained HTML (inline CSS, images as data URIs). Markdown also works.
 ```
 
@@ -57,7 +59,7 @@ and published with `sm doc publish`. Don't just leave it on disk or mention a pa
 ### CLI
 
 ```bash
-sm doc publish <path> [--pr N | --commit SHA] [--title "..."] [--note "..."] [--review]
+sm doc publish <path> [--pr N | --commit SHA | --no-pr] [--title "..."] [--note "..."] [--review]
 sm doc list [--session <id>] [--json]          # default: the caller's session tree
 sm doc show <doc-id> [--json]                   # metadata, revisions, reviews, URLs
 sm doc retract <doc-id>                         # hide from the session Docs row (does not touch git)
@@ -76,9 +78,13 @@ agent's cwd):
      the pushed version at <sha7>; push first if that's not what you want"). Fail if
      the PR doesn't contain the file at its head (a 404 from the contents API).
    - `--commit SHA`: use it as given.
-   - Neither: use `HEAD`. Fail with "commit and push first" if the file has
-     uncommitted changes, or if `HEAD` isn't on any remote-tracking branch
-     (`git branch -r --contains HEAD` is empty).
+   - Neither: if the current branch has an open PR (`gh pr view --json number,state`
+     with no argument), behave as `--pr <that number>` and print
+     `Using PR #N for the current branch (pass --no-pr for a commit-only doc)`.
+     This keeps a republish on the same doc even when the agent forgets `--pr`.
+   - `--no-pr`, or no open PR for the branch: use `HEAD`. Fail with "commit and push
+     first" if the file has uncommitted changes, or if `HEAD` isn't on any
+     remote-tracking branch (`git branch -r --contains HEAD` is empty).
 3. `--review` requires `--pr` and an open PR.
 4. POST to the server with the author session from `CLAUDE_SESSION_MANAGER_ID`.
 5. Print `Published "<title>" (<doc-id>) at <sha7> → <reader URL>`.
@@ -99,15 +105,19 @@ publish carries the current title, note and review request.
   which doc is the history page in the separate ticket/PR-claims work (see "Related
   work").
 - **Reader**: a full-screen WebView loading `/docs/{id}/view` with the same auth the
-  app uses for API calls (pass the device auth headers on `loadUrl`). All review UI
-  lives inside the served page (below), so Android needs no native comment UI; one
-  implementation serves every client. Enable JavaScript and DOM storage, and handle
-  back navigation.
+  app uses for API calls (pass the device auth headers on `loadUrl`). WebView doesn't
+  resend custom headers when the page navigates itself (revision picker, newer-revision
+  banner, cross-revision drafts). So override `shouldOverrideUrlLoading`: for any
+  same-origin URL under `/docs/`, cancel the navigation and call
+  `loadUrl(url, deviceAuthHeaders)`. Other URLs (the PR link, external links in the doc)
+  open in the system browser. All review UI lives inside the served page (below), so
+  Android needs no native comment UI; one implementation serves every client. Enable
+  JavaScript and DOM storage, and handle back navigation.
 
 ### Web (laptop / studio browser)
 
 The reader is a plain server page behind the existing browser-session (Google) auth.
-`GET /docs/{id}` redirects to `/docs/{id}/view?sha=<latest>`, so any doc link works in
+`GET /docs/{id}` redirects to `/docs/{id}/view?sha=<latest published>`, so any doc link works in
 a laptop browser. The Rust server serves no web session list today (`web/sm-watch` is
 not mounted), so on a laptop you find docs through the `sm watch` expansion and
 `sm doc list`, which print reader URLs. If a web session view lands later, it gets
@@ -177,7 +187,8 @@ CREATE TABLE owner_doc_reviews (
   blob_sha TEXT NOT NULL,            -- blob reviewed, for state derivation
   verdict TEXT NOT NULL,             -- approve | changes_requested | comment
   body TEXT,
-  comment_count INTEGER NOT NULL,
+  line_comment_count INTEGER NOT NULL,   -- posted as LINE threads
+  file_comment_count INTEGER NOT NULL,   -- posted as FILE threads (no line, or line fallback)
   github_review_id INTEGER,
   github_review_url TEXT,
   submitted_at TEXT NOT NULL,
@@ -216,9 +227,12 @@ match.
   or branch deletion (GitHub keeps `refs/pull/N/head`). PR state
   (`open`/`closed`/`merged`) comes from the same call and decides whether commenting
   is enabled.
-- For a PR doc, "latest" means the PR head, even when the agent hasn't republished.
-  The owner sees what's actually in the PR. Publish events still mark
-  the revisions the agent explicitly announced.
+- The reader opens the **latest published** SHA by default, the revision the agent
+  announced as ready. That's also the revision the state chip describes, so the chip
+  and what you open always agree. If the PR head's file blob differs (the agent pushed
+  without republishing), the reader shows a banner, "The PR has newer unpublished
+  changes to this doc", with a link to view the head. You can read and review the head
+  too; it's simply not the default.
 - Never call `gh` from the list projection. Lists use stored data only; `gh` calls
   happen on view, publish and submit.
 
@@ -242,10 +256,13 @@ match.
    `{docId, sha, latestSha, prNumber, prState, canComment, token, drafts[]}`.
 5. Record a view of this blob SHA.
 
-`token` is an HMAC over `doc_id|sha|expiry` (24h), signed with the server's existing
-session-cookie secret. The doc endpoints below accept either normal auth or
-`X-SM-Doc-Token` scoped to that doc. That way the page's own `fetch` calls work in the
-Android WebView, where device auth headers only accompany the initial `loadUrl`.
+`token` is an HMAC over `doc_id|expiry` (24h), signed with the server's existing
+session-cookie secret. It covers the whole doc, not one SHA, so it stays valid across
+revisions. The doc's JSON endpoints (`/head`, `/drafts`, `/review`) accept either
+normal auth or an `X-SM-Doc-Token` header for that doc. That way the page's own
+`fetch` calls work in the Android WebView, where device auth headers don't accompany
+script requests. Page navigations (`/view`) always use normal auth; on Android the
+reader's navigation override re-sends it. Tokens never go in URLs.
 
 ### Review client (the injected script)
 
@@ -254,10 +271,14 @@ Plain JS, no dependencies, under ~20 KB. It must not break the doc's own scripts
 and use a shadow DOM for its UI.
 
 - **Header bar** (fixed, collapsible): title, `sha7`, revision picker (the publish
-  events plus the PR head), PR link, state. If `canComment` is false, it reads
+  events, plus the PR head when its blob differs from every published one), PR link,
+  state. If `canComment` is false, it reads
   "Read-only: PR closed / no PR".
-- **Newer-revision banner**: poll `GET /docs/{id}/head` every 60s. If the latest SHA
-  differs from the viewed one, show "A newer revision was pushed. Load it."
+- **Newer-revision banner**: poll `GET /docs/{id}/head` every 60s, which returns
+  `{latest_published_sha, pr_head_sha, pr_head_blob_differs, pr_state}`. If a newer
+  revision has been **published**, show "A newer revision was published. Load it."
+  Otherwise, if the PR head's blob differs from the viewed one, show the
+  unpublished-changes banner.
 - **Selecting what to comment on**:
   - Desktop: select text → a "Comment" chip appears next to the selection.
   - Touch: tap a block with `data-sm-line` → it highlights and the chip appears (text
@@ -310,8 +331,8 @@ behaviour each step relies on was verified on PR #1448; see "GitHub API findings
    with `**Verdict: Approved**`, `**Verdict: Changes requested**` or
    `**Verdict: Comments**`, followed by the owner's overall text. The wake message
    carries the verdict too.
-5. Store the `owner_doc_reviews` row, with counts of line and file-level comments,
-   and delete the drafts.
+5. Store the `owner_doc_reviews` row, with `line_comment_count` and
+   `file_comment_count` as actually posted (after fallbacks), and delete the drafts.
 6. **Wake the author** through the normal durable `sm send` path:
    ```
    [sm review] Rajesh's review of "<title>" (PR #<n> @ <sha7>) is here: <review_url>
@@ -352,7 +373,7 @@ existing optional-field pattern.
 | GET | `/docs/{id}` | redirect to the view at the latest SHA (JSON metadata with `?format=json`) |
 | GET | `/docs/{id}/view?sha=` | rendered doc plus the review client |
 | GET | `/docs/{id}/raw?sha=` | raw file (download, debugging) |
-| GET | `/docs/{id}/head` | `{latest_sha, pr_state}` for the banner poll |
+| GET | `/docs/{id}/head` | `{latest_published_sha, pr_head_sha, pr_head_blob_differs, pr_state}` for the banners |
 | POST/PATCH/DELETE | `/docs/{id}/drafts[/{draft_id}]` | draft CRUD |
 | POST | `/docs/{id}/review` | submit the review |
 | POST | `/docs/{id}/retract` | hide |
@@ -398,7 +419,8 @@ Epic #1447. Each ticket fits within one agent's context.
   "Docs for the owner" section. On its own, this solves "I can't find or read the
   doc" on a laptop.
 - **#1450, Android.** The Docs surface in `AgentWorkSections`, the optional `docs`
-  field in `ApiModels.kt`, and the WebView reader with device auth. Depends on #1449.
+  field in `ApiModels.kt`, and the WebView reader with device auth, including the
+  `shouldOverrideUrlLoading` re-auth for `/docs/` navigations. Depends on #1449.
   This solves it on mobile.
 - **#1451, review.** Line annotation; the injected review client; drafts; the doc
   token; `/head`; submit using the GraphQL flow above; the `[sm review]` wake; the
@@ -440,15 +462,20 @@ tests do (reuse that fixture pattern; don't invent a new one).
   verdict header; every body quotes the selection; the pending review is deleted
   when a later step fails; a closed PR is refused; wake message text and
   recipient routing (live author, retired author → parent, none → undelivered).
-- Doc token: accepted for its own doc, rejected for another doc or when expired.
+- Doc token: accepted by the JSON endpoints for its own doc at any SHA, rejected for
+  another doc, when expired, or on `/view`.
+- CLI: with no `--pr`, the current branch's open PR is used (and `--no-pr` opts out),
+  so republishing lands on the same doc.
+- Reader default: `/docs/{id}` opens the latest published SHA, not the PR head;
+  `/head` reports `pr_head_blob_differs` correctly.
   When Google auth is not enabled, doc routes behave like other routes (no auth
   needed) and the token is ignored.
 - Blob SHA: the locally computed value equals the contents API's `sha` for a real file.
 - Projection: `docs` and the `owner_review` waiting entry; old-schema Android
   parsing still works.
 - Manual: publish a real memo from a worktree, open it on the phone over the
-  Cloudflare hostname, leave two tap comments, submit, confirm the GitHub review and
-  the agent's wake. Repeat on a PR that **modifies** an existing doc, commenting on
+  Cloudflare hostname, switch revisions from the picker (no 401), leave two tap
+  comments, submit, confirm the GitHub review and the agent's wake. Repeat on a PR that **modifies** an existing doc, commenting on
   an untouched paragraph, and confirm it lands as a file comment with the quote.
 
 ## Non-goals
