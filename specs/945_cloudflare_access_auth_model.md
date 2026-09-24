@@ -155,7 +155,7 @@ The Android private key/cert should live in Android secure storage / platform TL
 At origin, Rust should classify incoming requests into one of these contexts:
 
 - `local_loopback`: local operator/dev path; existing local bypass rules may apply only on loopback plus trusted local host checks.
-- `browser_access`: valid Cloudflare Access user/browser session for the browser hostname. Still requires SM Google OAuth/session for operational data. One exception: owner doc reads (`GET /docs`, `/docs/{id}`, `/docs/{id}/view`, `/docs/{id}/raw`) accept a verified browser-app assertion whose email is on the Google owner allowlist in place of the Google session (#1463), because the Rust server has no Google browser login. Doc writes (`POST /docs`, `/docs/{id}/retract`) and every other route are unchanged.
+- `browser_access`: valid Cloudflare Access user/browser session for the browser hostname. Still requires SM Google OAuth/session for operational data. One exception: owner doc reads (`GET /docs`, `/docs/{id}`, `/docs/{id}/view`, `/docs/{id}/raw`, and the readable reader `/docs/<repo-name>/<path>`, #1465) accept a verified browser-app assertion whose email is on the Google owner allowlist in place of the Google session (#1463), because the Rust server has no Google browser login. Doc writes (`POST /docs`, `/docs/{id}/retract`) and every other route are unchanged.
 - `mobile_device_access`: valid Cloudflare mTLS/service assertion with enrolled, non-revoked device Common Name. Still requires SM device bearer token and route capabilities.
 - `node_access`: valid Cloudflare mTLS/service assertion with enrolled, non-revoked node Common Name. Still requires node authorization.
 - `worker_access`: valid worker/service proof for the inbound email route only.
@@ -172,7 +172,7 @@ Origin must not trust raw client-supplied Cloudflare headers unless the request 
 | Native mobile terminal | `/client/sessions/{id}/attach-ticket`, `/client/terminal`, `/client/mobile-terminal/*` | App mTLS enrolled device | Bearer token, mobile capability, attach ticket/WebSocket auth, quotas, revocation. |
 | App artifacts | `/apps/*`, `/apk` | App mTLS enrolled device unless a signed-artifact exception is reviewed | Metadata/hash compatibility, no public unauthenticated artifact serving by default. |
 | Node fallback | `/nodes/*`, node-agent/control routes | Node mTLS enrolled node | Node token/capability and LAN-first fallback logic. |
-| Owner doc reader (#1463) | `GET /docs`, `/docs/{id}`, `/docs/{id}/view`, `/docs/{id}/raw` | Browser Access email allowlist | Browser Access assertion with an owner-allowlisted email, or the SM Google session. |
+| Owner doc reader (#1463) | `GET /docs`, `/docs/{id}`, `/docs/{id}/view`, `/docs/{id}/raw`, `/docs/<repo-name>/<path>` | Browser Access email allowlist | Browser Access assertion with an owner-allowlisted email, or the SM Google session. |
 | Email worker | configured inbound email path | Worker/service identity and route allowlist | Worker secret, authorized sender, session routing checks. |
 | Retired/public-denied | Telegram, retired CLI/API surfaces, non-allowlisted routes | Denied before origin | Origin denies if reached. |
 

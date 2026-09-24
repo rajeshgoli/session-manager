@@ -856,9 +856,9 @@ fn docs_mark_the_session_row_and_list_reader_urls_when_expanded() {
         sessions: vec![session("a", "", "/repo"), session("b", "", "/repo")],
         obligations: vec![
             json!({"session_id":"a", "waiting_on":[], "review_history":[], "docs":[
-                {"id":"d0c00001","title":"Decision memo","state":"new","reader_path":"/docs/d0c00001"},
-                {"id":"d0c00002","title":"Readout","state":"updated","reader_path":"/docs/d0c00002"},
-                {"id":"d0c00003","title":"Old notes","state":"read","reader_path":"/docs/d0c00003"}]}),
+                {"id":"d0c00001","title":"Decision memo","state":"new","reader_path":"/docs/widgets/memo.html?version=aaaaaaaaaaaa"},
+                {"id":"d0c00002","title":"Readout","state":"updated","reader_path":"/docs/widgets/readout.md?version=aaaaaaaaaaaa"},
+                {"id":"d0c00003","title":"Old notes","state":"read","reader_path":"/docs/widgets/notes.txt?version=aaaaaaaaaaaa"}]}),
             // An older server omits `docs`; the row stays unmarked.
             json!({"session_id":"b", "waiting_on":[], "review_history":[]}),
         ],
@@ -880,10 +880,10 @@ fn docs_mark_the_session_row_and_list_reader_urls_when_expanded() {
     let rows = view.rows(&snap, &a, 0);
     assert!(rows
         .iter()
-        .any(|r| r.text == "   doc · Decision memo · new · http://127.0.0.1:8420/docs/d0c00001"));
-    assert!(rows.iter().any(|r| r
-        .text
-        .contains("Old notes · read · http://127.0.0.1:8420/docs/d0c00003")));
+        .any(|r| r.text == "   doc · Decision memo · new · http://127.0.0.1:8420/docs/widgets/memo.html?version=aaaaaaaaaaaa"));
+    assert!(rows.iter().any(|r| r.text.contains(
+        "Old notes · read · http://127.0.0.1:8420/docs/widgets/notes.txt?version=aaaaaaaaaaaa"
+    )));
 }
 
 #[test]
@@ -896,17 +896,19 @@ fn doc_rows_prefer_the_browser_hostname_link_when_the_server_sends_one() {
         sessions: vec![session("a", "", "/repo")],
         obligations: vec![
             json!({"session_id":"a", "waiting_on":[], "review_history":[], "docs":[
-            {"id":"d0c00001","title":"Decision memo","state":"new","reader_path":"/docs/d0c00001",
-             "browser_url":"https://sm.example.com/docs/d0c00001"},
-            {"id":"d0c00002","title":"Readout","state":"new","reader_path":"/docs/d0c00002"}]}),
+            {"id":"d0c00001","title":"Decision memo","state":"new","reader_path":"/docs/widgets/memo.html?version=aaaaaaaaaaaa",
+             "browser_url":"https://sm.example.com/docs/widgets/memo.html?version=aaaaaaaaaaaa"},
+            // No `reader_path` (older server): the row builds the readable form.
+            {"id":"d0c00002","title":"Readout","state":"new","repo":"acme/widgets",
+             "path":"notes/read out.md","latest_commit_sha":"cccccccccccccccccccc"}]}),
         ],
         ..Default::default()
     };
     let rows = view.rows(&snap, &a, 0);
     assert!(rows
         .iter()
-        .any(|r| r.text == "   doc · Decision memo · new · https://sm.example.com/docs/d0c00001"));
+        .any(|r| r.text == "   doc · Decision memo · new · https://sm.example.com/docs/widgets/memo.html?version=aaaaaaaaaaaa"));
     assert!(rows
         .iter()
-        .any(|r| r.text == "   doc · Readout · new · http://127.0.0.1:8420/docs/d0c00002"));
+        .any(|r| r.text == "   doc · Readout · new · http://127.0.0.1:8420/docs/widgets/notes/read%20out.md?version=cccccccccccc"));
 }

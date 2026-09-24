@@ -1435,9 +1435,12 @@ pub fn router(state: AppState) -> Router {
             get(docs::list_owner_docs).post(docs::publish_owner_doc),
         )
         .route("/docs/{doc_id}", get(docs::get_owner_doc))
-        .route("/docs/{doc_id}/view", get(docs::view_owner_doc))
-        .route("/docs/{doc_id}/raw", get(docs::raw_owner_doc))
-        .route("/docs/{doc_id}/retract", post(docs::retract_owner_doc))
+        // `/docs/{id}/view|raw|retract` (internal API) and the readable
+        // reader `/docs/<repo-name>/<path in repo>` share one pattern.
+        .route(
+            "/docs/{doc_id}/{*rest}",
+            get(docs::get_owner_doc_subpath).post(docs::post_owner_doc_subpath),
+        )
         .route("/scheduler/remind", post(schedule_reminder))
         .route(
             "/scheduler/remind/{reminder_id}",
@@ -13730,9 +13733,9 @@ fn ensure_core_runtime_node_supported(node: &str) -> Result<(), ApiError> {
     })
 }
 
-/// Owner doc reads (`/docs`, `/docs/{id}`, `/view`, `/raw`) also accept the
-/// owner's interactive Cloudflare Access login on the browser hostname. Docs
-/// only: every other route there still needs the SM Google session (spec 945).
+/// Owner doc reads (`/docs`, `/docs/{id}`, `/view`, `/raw`, and the readable
+/// `/docs/<repo-name>/<path>`) also accept the owner's interactive Cloudflare
+/// Access login on the browser hostname. Docs only: every other route there still needs the SM Google session (spec 945).
 /// A present assertion must verify; a verified non-owner email falls through
 /// to the Google session check like a request without one.
 fn ensure_owner_doc_read_allowed(state: &AppState, request: &Request) -> Result<(), ApiError> {
@@ -17981,11 +17984,13 @@ mod tests {
         let app = owner_doc_browser_access_app();
         let owner =
             test_browser_access_assertion("sm-browser-aud", "RajeshGoli@gmail.com", 4_102_444_800);
-        // `zzzzzzzz` is not a doc id, so a request past auth gets 404.
+        // `zzzzzzzz` is not a doc id and `widgets/memo.md` is not a doc, so
+        // a request past auth gets 404.
         for uri in [
             "/docs/zzzzzzzz",
             "/docs/zzzzzzzz/view",
             "/docs/zzzzzzzz/raw",
+            "/docs/widgets/memo.md?version=aaaaaaaaaaaa",
         ] {
             let (status, body) = browser_host_get(&app, uri, Some(&owner)).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
@@ -18017,6 +18022,7 @@ mod tests {
                 "/docs/zzzzzzzz",
                 "/docs/zzzzzzzz/view",
                 "/docs/zzzzzzzz/raw",
+                "/docs/widgets/memo.md",
             ] {
                 let (status, body) = browser_host_get(&app, uri, Some(&assertion)).await;
                 assert_eq!(status, StatusCode::FORBIDDEN, "{label} {uri}: {body}");
@@ -18029,8 +18035,10 @@ mod tests {
         let stranger =
             test_browser_access_assertion("sm-browser-aud", "stranger@example.com", 4_102_444_800);
         for assertion in [Some(stranger.as_str()), None] {
-            let (status, body) = browser_host_get(&app, "/docs/zzzzzzzz/view", assertion).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            for uri in ["/docs/zzzzzzzz/view", "/docs/widgets/memo.md"] {
+                let (status, body) = browser_host_get(&app, uri, assertion).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
+            }
         }
     }
 

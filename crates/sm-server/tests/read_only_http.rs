@@ -22589,12 +22589,19 @@ async fn owner_docs_publish_read_and_project_state() {
     assert_eq!(doc["author_session_name"], "author01-writer");
     assert_eq!(doc["latest_blob_sha"], git_blob_sha(memo));
     let id = doc["id"].as_str().unwrap().to_owned();
-    assert_eq!(doc["reader_path"], format!("/docs/{id}"));
+    assert_eq!(doc["name"], "widgets/specs/memo.html");
+    assert_eq!(
+        doc["reader_path"],
+        "/docs/widgets/specs/memo.html?version=aaaaaaaaaaaa"
+    );
 
-    // Reader default: the latest published SHA.
+    // The internal id route sends the address bar to the readable form.
     let (status, headers, _) = get_response(app.clone(), &format!("/docs/{id}")).await;
     assert_eq!(status, StatusCode::FOUND);
-    assert_eq!(headers["location"], format!("/docs/{id}/view?sha={c1}"));
+    assert_eq!(
+        headers["location"],
+        "/docs/widgets/specs/memo.html?version=aaaaaaaaaaaa"
+    );
 
     // HTML is served as-is, from the cache filled at publish.
     let fetches = source.fetches.load(Ordering::SeqCst);
@@ -22609,6 +22616,10 @@ async fn owner_docs_publish_read_and_project_state() {
     assert_eq!(obligations["schema_version"], 2);
     let author = owner_doc_session(&obligations, "author01");
     assert_eq!(author["docs"][0]["id"], id);
+    assert_eq!(
+        author["docs"][0]["reader_path"],
+        "/docs/widgets/specs/memo.html?version=aaaaaaaaaaaa"
+    );
     assert_eq!(author["docs"][0]["state"], "read");
     assert_eq!(author["docs"][0]["pr_number"], 12);
     assert_eq!(author["docs"][0]["latest_commit_sha"], c1);
@@ -22719,6 +22730,152 @@ async fn owner_docs_publish_read_and_project_state() {
 }
 
 #[tokio::test]
+async fn owner_docs_readable_urls_resolve_names_and_versions() {
+    const REPO: &str = "acme/widgets";
+    let (c1, c2) = ("a".repeat(40), "c".repeat(40));
+    let (near1, near2) = (
+        format!("abcdef1{}", "1".repeat(33)),
+        format!("abcdef1{}", "2".repeat(33)),
+    );
+    let source = StubDocSource::default();
+    for (sha, body) in [
+        (&c1, "# v1\n"),
+        (&c2, "# v2\n"),
+        (&near1, "# near1\n"),
+        (&near2, "# near2\n"),
+    ] {
+        source.put(REPO, "specs/memo.md", sha, body.as_bytes());
+    }
+    source.put(REPO, "notes/my memo#1.md", &c1, b"# Spaced\n");
+    source.put(REPO, "view", &c1, b"root file named view");
+    let (app, _dir) = owner_docs_app(source);
+    let publish = |path: &str, sha: &str, pr: Option<i64>| {
+        json!({"repo": REPO, "path": path, "commit_sha": sha, "pr_number": pr,
+               "session_id": "author01"})
+    };
+    let body_of = |body: Vec<u8>| String::from_utf8(body).unwrap();
+
+    let (_, doc) = post_json(app.clone(), "/docs", publish("specs/memo.md", &c1, Some(7))).await;
+    let id = doc["id"].as_str().unwrap().to_owned();
+    let (_, doc) = post_json(app.clone(), "/docs", publish("specs/memo.md", &c2, Some(7))).await;
+    assert_eq!(
+        doc["reader_path"],
+        "/docs/widgets/specs/memo.md?version=cccccccccccc"
+    );
+
+    // Pinned versions render in place: no redirect, so the address bar
+    // keeps the readable URL. Case of the SHA and the repo name is ignored.
+    for (uri, expected) in [
+        ("/docs/widgets/specs/memo.md?version=aaaaaaaaaaaa", "v1"),
+        ("/docs/widgets/specs/memo.md?version=aaaaaaa", "v1"),
+        (&*format!("/docs/widgets/specs/memo.md?version={c1}"), "v1"),
+        ("/docs/widgets/specs/memo.md?version=CCCCCCCCCCCC", "v2"),
+        ("/docs/Widgets/specs/memo.md?version=cccccccccccc", "v2"),
+        // Latest publish without a version.
+        ("/docs/widgets/specs/memo.md", "v2"),
+    ] {
+        let (status, headers, body) = get_response(app.clone(), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(headers.get("location").is_none(), "{uri}");
+        assert!(
+            body_of(body).contains(&format!("<h1>{expected}</h1>")),
+            "{uri}"
+        );
+    }
+
+    // `?format=json` is how `sm doc` resolves a readable name.
+    let (status, meta) = get_json(
+        app.clone(),
+        "/docs/widgets/specs/memo.md?format=json&version=aaaaaaaaaaaa",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(meta["id"], id);
+    assert_eq!(meta["name"], "widgets/specs/memo.md");
+    assert_eq!(meta["publishes"].as_array().unwrap().len(), 2);
+
+    // Unknown repo, path or version, and malformed versions, are 404s.
+    post_json(
+        app.clone(),
+        "/docs",
+        publish("specs/memo.md", &near1, Some(7)),
+    )
+    .await;
+    post_json(
+        app.clone(),
+        "/docs",
+        publish("specs/memo.md", &near2, Some(7)),
+    )
+    .await;
+    for (uri, detail) in [
+        ("/docs/gadgets/specs/memo.md", "Doc not found"),
+        ("/docs/widgets/specs/absent.md", "Doc not found"),
+        (
+            "/docs/widgets/specs/absent.md?version=aaaaaaaaaaaa",
+            "Doc not found",
+        ),
+        (
+            "/docs/widgets/specs/memo.md?version=bbbbbbbbbbbb",
+            "Version not found",
+        ),
+        (
+            "/docs/widgets/specs/memo.md?version=aaaaaa",
+            "Version not found",
+        ),
+        (
+            "/docs/widgets/specs/memo.md?version=HEAD",
+            "Version not found",
+        ),
+        (
+            "/docs/widgets/specs/memo.md?version=abcdef1",
+            "Version matches more than one commit; use more characters",
+        ),
+    ] {
+        let (status, body) = get_json(app.clone(), uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+        assert_eq!(body["detail"], detail, "{uri}");
+    }
+    let (_, _, body) =
+        get_response(app.clone(), "/docs/widgets/specs/memo.md?version=abcdef12").await;
+    assert!(body_of(body).contains("<h1>near2</h1>"));
+
+    // A commit-only doc on the same path is a second doc; without a version
+    // the newest publish across both wins.
+    post_json(app.clone(), "/docs", publish("specs/memo.md", &c1, None)).await;
+    let (_, _, body) = get_response(app.clone(), "/docs/widgets/specs/memo.md").await;
+    assert!(body_of(body).contains("<h1>v1</h1>"));
+    let (_, meta) = get_json(app.clone(), "/docs/widgets/specs/memo.md?format=json").await;
+    assert_ne!(meta["id"], id);
+    assert!(meta["pr_number"].is_null());
+
+    // Paths are percent-encoded segment by segment.
+    let (_, doc) = post_json(
+        app.clone(),
+        "/docs",
+        publish("notes/my memo#1.md", &c1, None),
+    )
+    .await;
+    let reader_path = doc["reader_path"].as_str().unwrap().to_owned();
+    assert_eq!(
+        reader_path,
+        "/docs/widgets/notes/my%20memo%231.md?version=aaaaaaaaaaaa"
+    );
+    let (status, _, body) = get_response(app.clone(), &reader_path).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body_of(body).contains("<h1>Spaced</h1>"));
+
+    // `view` after a repo name is a path, not the id route.
+    post_json(app.clone(), "/docs", publish("view", &c1, None)).await;
+    let (status, _, body) = get_response(app.clone(), "/docs/widgets/view").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body_of(body).contains("root file named view"));
+
+    // A readable name never takes a write.
+    let (status, _) = post_json(app.clone(), "/docs/widgets/specs/memo.md", json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn owner_docs_publish_rejects_bad_input_and_reports_missing_files() {
     let source = StubDocSource::default();
     source.put("acme/widgets", "memo.md", &"a".repeat(40), b"# Memo\n");
@@ -22774,6 +22931,8 @@ async fn owner_doc_routes_require_auth_when_google_auth_is_enabled() {
         "/docs/0123abcd",
         "/docs/0123abcd/view",
         "/docs/0123abcd/raw",
+        "/docs/widgets/specs/memo.html",
+        "/docs/widgets/specs/memo.html?version=aaaaaaaaaaaa",
     ] {
         let (status, _) = get_json_with_host_and_peer(
             app.clone(),

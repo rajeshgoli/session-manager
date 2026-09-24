@@ -55,14 +55,16 @@ struct DocListArgs {
 
 #[derive(Args)]
 struct DocShowArgs {
-    doc_id: String,
+    /// `<repo-name>/<path in repo>`, or the doc's URL as printed
+    doc: String,
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Args)]
 struct DocRetractArgs {
-    doc_id: String,
+    /// `<repo-name>/<path in repo>`, or the doc's URL as printed
+    doc: String,
 }
 
 pub(crate) fn run_doc(client: &ApiClient, args: DocArgs) -> Result<()> {
@@ -71,18 +73,81 @@ pub(crate) fn run_doc(client: &ApiClient, args: DocArgs) -> Result<()> {
         DocCommand::List(args) => run_doc_list(client, args),
         DocCommand::Show(args) => run_doc_show(client, args),
         DocCommand::Retract(args) => {
+            // The id is the internal key: resolve the readable name to it,
+            // and never print it.
+            let found = client.get_json(&doc_metadata_path(&args.doc)?)?;
             let doc = client.post_json(
-                &format!("/docs/{}/retract", url_segment(&args.doc_id)),
+                &format!("/docs/{}/retract", url_segment(&json_string(&found, "id"))),
                 json!({}),
             )?;
             println!(
                 "Retracted \"{}\" ({}). The file in git is untouched; publish again to restore it.",
                 json_string(&doc, "title"),
-                json_string(&doc, "id")
+                json_string(&doc, "name")
             );
             Ok(())
         }
     }
+}
+
+/// The metadata request for a doc named as `<repo-name>/<path in repo>` or
+/// as a reader URL (`https://<host>/docs/<repo-name>/<path>?version=<sha>`,
+/// or its `/docs/...` path). A URL's `?version=` is kept, so `show` describes
+/// the same doc the link opens.
+fn doc_metadata_path(doc: &str) -> Result<String> {
+    let doc = doc.trim();
+    let invalid = || anyhow!("expected <repo-name>/<path in repo> or a doc URL, got {doc:?}");
+    let url_path = match doc.split_once("://") {
+        Some((_, rest)) => Some(rest.find('/').map_or("", |slash| &rest[slash..])),
+        None => doc.starts_with("/docs/").then_some(doc),
+    };
+    let (encoded, version) = match url_path {
+        // Already percent-encoded as printed.
+        Some(url_path) => {
+            let url_path = url_path.split('#').next().unwrap_or_default();
+            let (path, query) = url_path.split_once('?').unwrap_or((url_path, ""));
+            let encoded = path.strip_prefix("/docs/").ok_or_else(invalid)?.to_owned();
+            let version = query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("version="))
+                .filter(|version| !version.is_empty())
+                .map(ToOwned::to_owned);
+            (encoded, version)
+        }
+        None => (
+            doc.split('/')
+                .map(url_segment)
+                .collect::<Vec<_>>()
+                .join("/"),
+            None,
+        ),
+    };
+    let (name, path) = encoded.split_once('/').ok_or_else(invalid)?;
+    if name.is_empty() || path.is_empty() || path.ends_with('/') {
+        return Err(invalid());
+    }
+    let mut request = format!("/docs/{encoded}?format=json");
+    if let Some(version) = version {
+        request.push_str(&format!("&version={}", url_segment(&version)));
+    }
+    Ok(request)
+}
+
+/// `--json` output keeps the internal doc id out, like every other output.
+fn without_doc_ids(mut doc: Value) -> Value {
+    let Some(object) = doc.as_object_mut() else {
+        return doc;
+    };
+    object.remove("id");
+    // `get_mut`, not indexing: a list record has no `publishes` to add.
+    if let Some(publishes) = object.get_mut("publishes").and_then(Value::as_array_mut) {
+        for publish in publishes {
+            if let Some(object) = publish.as_object_mut() {
+                object.remove("doc_id");
+            }
+        }
+    }
+    doc
 }
 
 fn url_segment(value: &str) -> String {
@@ -399,7 +464,7 @@ fn run_doc_publish(client: &ApiClient, args: DocPublishArgs) -> Result<()> {
     println!(
         "Published \"{}\" ({}) at {} → {}",
         json_string(&doc, "title"),
-        json_string(&doc, "id"),
+        json_string(&doc, "name"),
         &resolved.commit_sha[..7],
         reader_url(client, &doc)
     );
@@ -431,6 +496,7 @@ fn run_doc_list(client: &ApiClient, args: DocListArgs) -> Result<()> {
     let payload = client.get_json(&path)?;
     let docs = payload["docs"].as_array().cloned().unwrap_or_default();
     if args.json {
+        let docs: Vec<_> = docs.into_iter().map(without_doc_ids).collect();
         println!("{}", serde_json::to_string_pretty(&docs)?);
         return Ok(());
     }
@@ -441,15 +507,15 @@ fn run_doc_list(client: &ApiClient, args: DocListArgs) -> Result<()> {
     let rows = docs
         .iter()
         .map(|doc| {
+            let mut name = json_string(doc, "name");
+            if let Some(pr) = doc["pr_number"].as_i64() {
+                name.push_str(&format!(" #{pr}"));
+            }
             vec![
-                json_string(doc, "id"),
+                name,
                 json_string(doc, "state"),
                 json_string(doc, "title"),
-                format!(
-                    "{} @{}",
-                    doc_location(doc),
-                    short_sha(doc["latest_commit_sha"].as_str().unwrap_or(""))
-                ),
+                short_sha(doc["latest_commit_sha"].as_str().unwrap_or("")).to_owned(),
                 doc["author_session_name"]
                     .as_str()
                     .unwrap_or_else(|| doc["author_session_id"].as_str().unwrap_or(""))
@@ -458,12 +524,15 @@ fn run_doc_list(client: &ApiClient, args: DocListArgs) -> Result<()> {
             ]
         })
         .collect::<Vec<_>>();
-    print_table(&["ID", "State", "Title", "Where", "Author", "URL"], &rows);
+    print_table(
+        &["Doc", "State", "Title", "Version", "Author", "URL"],
+        &rows,
+    );
     Ok(())
 }
 
 fn run_doc_show(client: &ApiClient, args: DocShowArgs) -> Result<()> {
-    let doc = client.get_json(&format!("/docs/{}?format=json", url_segment(&args.doc_id)))?;
+    let doc = without_doc_ids(client.get_json(&doc_metadata_path(&args.doc)?)?);
     if args.json {
         println!("{}", serde_json::to_string_pretty(&doc)?);
         return Ok(());
@@ -471,7 +540,7 @@ fn run_doc_show(client: &ApiClient, args: DocShowArgs) -> Result<()> {
     println!(
         "Doc: {} ({})",
         json_string(&doc, "title"),
-        json_string(&doc, "id")
+        json_string(&doc, "name")
     );
     println!("State: {}", json_string(&doc, "state"));
     println!("Where: {}", doc_location(&doc));
@@ -508,19 +577,71 @@ mod tests {
     #[test]
     fn reader_url_prefers_the_browser_hostname_link() {
         let client = ApiClient::parse("http://127.0.0.1:8420").unwrap();
-        let doc = json!({"reader_path": "/docs/d0c00001"});
+        let path = "/docs/widgets/memo.md?version=aaaaaaaaaaaa";
+        let doc = json!({"reader_path": path});
         assert_eq!(
             reader_url(&client, &doc),
-            "http://127.0.0.1:8420/docs/d0c00001"
+            format!("http://127.0.0.1:8420{path}")
         );
         let doc = json!({
-            "reader_path": "/docs/d0c00001",
-            "browser_url": "https://sm.example.com/docs/d0c00001",
+            "reader_path": path,
+            "browser_url": format!("https://sm.example.com{path}"),
         });
         assert_eq!(
             reader_url(&client, &doc),
-            "https://sm.example.com/docs/d0c00001"
+            format!("https://sm.example.com{path}")
         );
+    }
+
+    #[test]
+    fn docs_are_named_by_repo_and_path_or_by_url() {
+        for (doc, expected) in [
+            (
+                "fractal-algo-rust/docs/working/ticket-title.html",
+                "/docs/fractal-algo-rust/docs/working/ticket-title.html?format=json",
+            ),
+            (
+                "widgets/notes/my memo#1.md",
+                "/docs/widgets/notes/my%20memo%231.md?format=json",
+            ),
+            (
+                "https://sm.example.com/docs/widgets/notes/my%20memo%231.md?version=aaaaaaaaaaaa",
+                "/docs/widgets/notes/my%20memo%231.md?format=json&version=aaaaaaaaaaaa",
+            ),
+            (
+                "http://127.0.0.1:8420/docs/widgets/memo.md",
+                "/docs/widgets/memo.md?format=json",
+            ),
+            (
+                "/docs/widgets/memo.md?version=cccccccccccc",
+                "/docs/widgets/memo.md?format=json&version=cccccccccccc",
+            ),
+        ] {
+            assert_eq!(doc_metadata_path(doc).unwrap(), expected, "{doc}");
+        }
+        for bad in [
+            "d0c00001",
+            "widgets/",
+            "/widgets",
+            "https://sm.example.com/sessions/abc",
+            "https://sm.example.com/docs/d0c00001",
+        ] {
+            assert!(doc_metadata_path(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn json_output_drops_the_internal_doc_id() {
+        let doc = without_doc_ids(json!({
+            "id": "d0c00001",
+            "name": "widgets/memo.md",
+            "publishes": [{"id": 1, "doc_id": "d0c00001", "commit_sha": "a"}],
+        }));
+        assert!(!doc.to_string().contains("d0c00001"), "{doc}");
+        assert_eq!(doc["name"], "widgets/memo.md");
+        assert_eq!(doc["publishes"][0]["commit_sha"], "a");
+        let listed = without_doc_ids(json!({"id": "d0c00001", "name": "widgets/memo.md"}));
+        assert_eq!(listed, json!({"name": "widgets/memo.md"}));
     }
 
     /// Scripted git/gh: `(program, args)` → output. Unscripted calls fail.

@@ -213,6 +213,67 @@ pub fn validate_repo_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Commit SHA characters in a printed `?version=`.
+pub const DOC_VERSION_LEN: usize = 12;
+
+/// `?version=` accepts a commit SHA prefix at least as long as git's short SHA.
+pub fn is_doc_version(value: &str) -> bool {
+    (7..=40).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The repo name without its owner: `acme/widgets` → `widgets`.
+pub fn repo_name(repo: &str) -> &str {
+    repo.rsplit('/').next().unwrap_or(repo)
+}
+
+/// How people and agents name a doc: `<repo-name>/<path in repo>`.
+pub fn doc_name(repo: &str, path: &str) -> String {
+    format!("{}/{path}", repo_name(repo))
+}
+
+/// The readable reader path, pinned to a publish:
+/// `/docs/<repo-name>/<path in repo>?version=<12-char SHA prefix>`. Each
+/// segment is percent-encoded, so the path survives spaces and `#`.
+pub fn doc_readable_path(repo: &str, path: &str, commit_sha: &str) -> String {
+    let encoded = std::iter::once(repo_name(repo))
+        .chain(path.split('/'))
+        .map(percent_encode_segment)
+        .collect::<Vec<_>>()
+        .join("/");
+    let version = &commit_sha[..commit_sha.len().min(DOC_VERSION_LEN)];
+    format!("/docs/{encoded}?version={version}")
+}
+
+fn percent_encode_segment(segment: &str) -> String {
+    segment
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+/// Why a readable name did not resolve. Every variant is a 404.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadableDocError {
+    NotFound,
+    VersionNotFound,
+    AmbiguousVersion,
+}
+
+impl ReadableDocError {
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::NotFound => "Doc not found",
+            Self::VersionNotFound => "Version not found",
+            Self::AmbiguousVersion => "Version matches more than one commit; use more characters",
+        }
+    }
+}
+
 pub fn init_owner_docs_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
@@ -553,6 +614,63 @@ impl OwnerDocStore {
         Ok(summaries)
     }
 
+    /// Resolve `<repo-name>/<path>` plus an optional `?version=` to one doc
+    /// and the commit to render. The repo name matches case-insensitively and
+    /// the path exactly; retracted docs still resolve, as they do by id.
+    ///
+    /// One path can hold two docs (a PR doc and a commit-only doc). Without a
+    /// version the newest publish across them wins; with one, the newest
+    /// publish whose commit starts with the prefix wins, and a prefix that
+    /// matches two different commits is refused.
+    pub fn resolve_readable(
+        &self,
+        name: &str,
+        path: &str,
+        version: Option<&str>,
+    ) -> Result<std::result::Result<(OwnerDoc, String), ReadableDocError>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Err(ReadableDocError::NotFound));
+        };
+        let docs: BTreeMap<String, OwnerDoc> = {
+            let mut statement = conn.prepare(&format!(
+                "SELECT {DOC_COLUMNS} FROM owner_docs WHERE path = ?1"
+            ))?;
+            let rows = statement
+                .query_map(params![path], doc_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows.into_iter()
+                .filter(|doc| repo_name(&doc.repo).eq_ignore_ascii_case(name))
+                .map(|doc| (doc.id.clone(), doc))
+                .collect()
+        };
+        if docs.is_empty() {
+            return Ok(Err(ReadableDocError::NotFound));
+        }
+        let mut publishes = Vec::new();
+        for doc_id in docs.keys() {
+            publishes.extend(self.publishes(doc_id)?);
+        }
+        if let Some(version) = version {
+            let version = version.to_ascii_lowercase();
+            if !is_doc_version(&version) {
+                return Ok(Err(ReadableDocError::VersionNotFound));
+            }
+            publishes.retain(|publish| publish.commit_sha.starts_with(&version));
+            let commits: BTreeSet<_> = publishes.iter().map(|p| &p.commit_sha).collect();
+            if commits.len() > 1 {
+                return Ok(Err(ReadableDocError::AmbiguousVersion));
+            }
+        }
+        let Some(publish) = publishes.into_iter().max_by_key(|publish| publish.id) else {
+            return Ok(Err(if version.is_some() {
+                ReadableDocError::VersionNotFound
+            } else {
+                ReadableDocError::NotFound
+            }));
+        };
+        Ok(Ok((docs[&publish.doc_id].clone(), publish.commit_sha)))
+    }
+
     pub fn summary(&self, doc_id: &str) -> Result<Option<OwnerDocSummary>> {
         Ok(self
             .summaries(None, true)?
@@ -731,7 +849,7 @@ pub fn doc_kind(path: &str) -> DocKind {
     }
 }
 
-/// The page served by `/docs/{id}/view`. HTML is served byte for byte.
+/// The page served by the doc reader. HTML is served byte for byte.
 pub fn render_doc_page(path: &str, title: &str, bytes: &[u8]) -> Vec<u8> {
     match doc_kind(path) {
         DocKind::Html => bytes.to_vec(),
