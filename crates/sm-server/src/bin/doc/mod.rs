@@ -152,16 +152,21 @@ pub(crate) struct PublishRequest<'a> {
     pub no_pr: bool,
 }
 
-/// `owner/name` from an `origin` URL: SSH, scp-style, or HTTPS.
+/// `owner/name` from an `origin` URL: SSH, scp-style, or HTTPS. The host
+/// must be exactly `github.com`; anything else falls back to `gh repo view`.
 pub(crate) fn parse_github_remote(url: &str) -> Option<String> {
     let url = url.trim();
-    let rest = if let Some((_, rest)) = url.split_once("github.com:") {
-        rest
-    } else if let Some((_, rest)) = url.split_once("github.com/") {
-        rest
+    let (authority, rest) = if let Some((_, after_scheme)) = url.split_once("://") {
+        after_scheme.split_once('/')?
     } else {
-        return None;
+        // scp-style: [user@]host:owner/name
+        url.split_once(':')?
     };
+    let host = authority.rsplit('@').next()?;
+    let host = host.split(':').next()?;
+    if !host.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
     let rest = rest.trim_end_matches('/');
     let rest = rest.strip_suffix(".git").unwrap_or(rest);
     let mut parts = rest.split('/');
@@ -583,6 +588,22 @@ mod tests {
             );
         }
         assert_eq!(parse_github_remote("https://gitlab.com/acme/widgets"), None);
+        assert_eq!(
+            parse_github_remote("https://notgithub.com/acme/widgets.git"),
+            None
+        );
+        assert_eq!(
+            parse_github_remote("git@notgithub.com:acme/widgets.git"),
+            None
+        );
+        assert_eq!(
+            parse_github_remote("https://github.com.evil.io/acme/widgets"),
+            None
+        );
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com:22/acme/widgets.git").as_deref(),
+            Some("acme/widgets")
+        );
         assert_eq!(parse_github_remote("https://github.com/acme"), None);
     }
 
