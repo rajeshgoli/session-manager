@@ -135,10 +135,12 @@ fn doc_metadata_path(doc: &str) -> Result<String> {
 
 /// `--json` output keeps the internal doc id out, like every other output.
 fn without_doc_ids(mut doc: Value) -> Value {
-    if let Some(object) = doc.as_object_mut() {
-        object.remove("id");
-    }
-    if let Some(publishes) = doc["publishes"].as_array_mut() {
+    let Some(object) = doc.as_object_mut() else {
+        return doc;
+    };
+    object.remove("id");
+    // `get_mut`, not indexing: a list record has no `publishes` to add.
+    if let Some(publishes) = object.get_mut("publishes").and_then(Value::as_array_mut) {
         for publish in publishes {
             if let Some(object) = publish.as_object_mut() {
                 object.remove("doc_id");
@@ -638,6 +640,8 @@ mod tests {
         assert!(!doc.to_string().contains("d0c00001"), "{doc}");
         assert_eq!(doc["name"], "widgets/memo.md");
         assert_eq!(doc["publishes"][0]["commit_sha"], "a");
+        let listed = without_doc_ids(json!({"id": "d0c00001", "name": "widgets/memo.md"}));
+        assert_eq!(listed, json!({"name": "widgets/memo.md"}));
     }
 
     /// Scripted git/gh: `(program, args)` → output. Unscripted calls fail.
