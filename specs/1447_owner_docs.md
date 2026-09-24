@@ -60,7 +60,7 @@ and published with `sm doc publish`. Don't just leave it on disk or mention a pa
 sm doc publish <path> [--pr N | --commit SHA] [--title "..."] [--note "..."] [--review]
 sm doc list [--session <id>] [--json]          # default: the caller's session tree
 sm doc show <doc-id> [--json]                   # metadata, revisions, reviews, URLs
-sm doc retract <doc-id>                         # hide from reading lists (does not touch git)
+sm doc retract <doc-id>                         # hide from the session Docs row (does not touch git)
 ```
 
 `sm doc publish` behaviour (the resolution happens in the CLI, which runs in the
@@ -270,35 +270,55 @@ and use a shadow DOM for its UI.
 
 ### Submitting a review (`POST /docs/{id}/review`)
 
-Body: `{sha, verdict, body}`. Uses the stored drafts for `(doc_id, sha)`.
+Body: `{sha, verdict, body}`. Uses the stored drafts for `(doc_id, sha)`. The GitHub
+behaviour each step relies on was verified on PR #1448; see "GitHub API findings".
 
 1. Refuse unless the doc has a PR and the PR is open.
-2. Build one GitHub review: `POST repos/{repo}/pulls/{n}/reviews` with
-   `commit_id = sha` and `event = "COMMENT"`. Each draft with a line becomes
-   `{path, line, side: "RIGHT", body: "> <quote>\n\n<comment>"}`. Quote the selected
-   text in every comment: the line anchor is a block start, which may cover a long
-   paragraph.
-3. **Verdict in the body, not the event.** Agents open PRs through the owner's `gh`
-   account, so the owner is the PR author, and GitHub rejects `APPROVE` and
-   `REQUEST_CHANGES` on your own PR. Always send `event: COMMENT`. The body starts
+2. **Use GraphQL's pending-review flow, not a single REST call.** One bad inline
+   comment makes GitHub reject the whole REST review with a generic
+   `Line could not be resolved` that doesn't say which comment failed (F5). The
+   pending flow lets each comment fall back on its own:
+   1. `addPullRequestReview(input: {pullRequestId, commitOID: <sha>})` with no event
+      creates a pending review pinned to the viewed SHA.
+   2. For each draft that has a line, run
+      `addPullRequestReviewThread(input: {pullRequestReviewId, path, line, side: RIGHT, subjectType: LINE, body})`.
+      **A `null` thread with no error means it failed** (F2). Treat it exactly like
+      an error.
+   3. For each draft that failed, or has `line = NULL`, run
+      `addPullRequestReviewThread(... subjectType: FILE, body)`. This is a file-level
+      comment on the doc, and it works inside a review (F3).
+   4. `submitPullRequestReview(input: {pullRequestReviewId, event: COMMENT, body})`.
+   5. If anything fails after step 1, delete the pending review
+      (`deletePullRequestReview`) so no half-built pending review is left under the
+      owner's account. A leftover pending review blocks creating the next one.
+3. **Every comment body quotes the selected text**, as `> <quote>\n\n<comment>`. A
+   line anchor is the start of a block, which may be a long paragraph, and a
+   file-level comment has no anchor at all. The quote is what tells the agent where
+   the comment applies.
+4. **The verdict goes in the body; the event is always `COMMENT`.** Agents open PRs
+   through the owner's `gh` account, so the owner is the PR author, and GitHub
+   rejects both `APPROVE` and `REQUEST_CHANGES` on your own PR (F4). The body starts
    with `**Verdict: Approved**`, `**Verdict: Changes requested**` or
    `**Verdict: Comments**`, followed by the owner's overall text. The wake message
-   carries the verdict as well.
-4. Drafts with `line = NULL`, or any comment GitHub rejects with 422, go into the
-   review body under "Comments not anchored to a line" as quote + comment. Try the
-   full review first. On a 422 that names specific comments, move those into the
-   body and retry once. On an unspecific 422, move all of them into the body and retry.
-5. Store the `owner_doc_reviews` row and delete the drafts.
+   carries the verdict too.
+5. Store the `owner_doc_reviews` row, with counts of line and file-level comments,
+   and delete the drafts.
 6. **Wake the author** through the normal durable `sm send` path:
    ```
    [sm review] Rajesh's review of "<title>" (PR #<n> @ <sha7>) is here: <review_url>
-   Verdict: changes requested · 5 inline comments · 1 unanchored
+   Verdict: changes requested · 5 line comments · 1 file comment
    ```
    Recipient: the author session if it exists (stopped sessions get the queued
    message on restore, as with other sends). If the author has been retired, send to
    its parent if there is one. Otherwise, leave `delivered_to_session_id` NULL and
-   show "Review not delivered: author retired" in the reading list. Don't fail the
-   submit.
+   show "Review not delivered: author retired" on the doc row and in `sm doc show`.
+   Don't fail the submit.
+
+When does a comment fall back to file level? Only when the file is **modified** by
+the PR (it existed on the base branch) and the selected block is outside the diff
+hunks. A doc **added** by the PR, the normal case for memos, is entirely inside the
+diff at every revision, because the diff is always base...head. Every line can take
+an inline comment.
 
 ### Obligations projection
 
@@ -332,28 +352,62 @@ All doc routes go through `ensure_session_read_allowed` / `ensure_core_writes_en
 as appropriate, plus the doc-token alternative described above. Add the routes to the
 read-only HTTP test inventory (`tests/read_only_http.rs`) where applicable.
 
-## Phases
+## GitHub API findings (verified on PR #1448, 2026-09-24)
 
-**Phase 0 — verify GitHub behaviour (do this before writing the review code).**
-On a scratch PR in this repo, confirm via the API:
-(a) a review comment on a line **outside** the diff hunks of a modified file is
-accepted with `line` + `side: RIGHT` + `commit_id`. The web UI allows this after
-expanding the file; confirm the API does too.
-(b) `APPROVE` on your own PR is rejected.
-(c) a review with `commit_id` older than the head is accepted.
-Record the results in this spec. If (a) turns out false, the 422 fallback in the
-submit step already handles it.
+Probe reviews on #1448 are labelled `[probe ...]`. The PR briefly carried a one-line
+AGENTS.md edit to test a modified file; it was reverted in the next commit.
 
-**Phase 1 — publish and read.** Tables, `sm doc publish/list/show/retract`,
-fetch + cache, view rendering (without the review client), obligations projection,
-Android Docs surface + reading list + reader, web `/docs`, `sm watch` marker,
-AGENTS.md section. This alone solves "I can't find or read the doc".
+| # | Probe | Result |
+|---|---|---|
+| F1 | Inline comment on a line **outside** the diff hunks of a modified file (REST `pulls/{n}/reviews`, REST `pulls/{n}/comments`, GraphQL `addPullRequestReview` with `threads`) | **Rejected** by all three: `Line could not be resolved`. The web UI may allow it after expanding the file, but the public API does not. |
+| F2 | Same, via GraphQL pending review + `addPullRequestReviewThread(subjectType: LINE)` | Returns `thread: null` with **no error**, so the call looks like success |
+| F3 | File-level thread (`subjectType: FILE`) inside a pending review, then submit | **Works**; the comment has `line: null` |
+| F4 | `APPROVE` / `REQUEST_CHANGES` on your own PR | **Rejected**: `Can not approve your own pull request` / `Can not request changes on your own pull request` |
+| F5 | REST review with one valid and one invalid inline comment | **Whole review rejected**, with an error that doesn't identify the bad comment |
+| F6 | Review with `commit_id` older than the PR head | **Accepted**, pinned to that commit |
+| F7 | Inline comment against an older commit on a file whose change was later reverted (it's no longer in the head diff) | **Accepted**, so line resolution uses the diff at `commit_id`, not at head |
+| F8 | Control: inline comment inside a hunk | Accepted |
 
-**Phase 2 — review.** Line annotation, review client, drafts, submit, wake.
+What this means for the design: F6 and F7 confirm that pinning a review to the viewed
+SHA is sound. F1–F3 and F5 lead to the per-comment fallback to a file-level comment
+in the submit steps. F4 leads to the verdict going in the body.
 
-**Later (not in scope).** Highlight what changed between the last reviewed SHA and
-the current one, computed from the two blobs at render time. Show existing GitHub
-review threads inline in the reader.
+Anchoring check: in `1612_decision_memo.html` (536 lines, 31 `<p>`), every block
+starts on its own source line, so the line anchor from `data-sm-line` is exact for
+hand-written memos. Generated or minified HTML can pack many blocks onto one line
+(`walkthrough.html`: 8 lines, 7 `<p>`). The anchor is then coarse, and the quoted
+text in each comment disambiguates.
+
+## Tickets
+
+Epic #1447. Each ticket fits within one agent's context.
+
+- **#1449, server + CLI + web reader.** Storage tables; `sm doc publish/list/show/retract`
+  (no `--review` yet); content fetch and cache; `GET /docs/{id}`, `/view` (rendering
+  without the review client or line annotation), `/raw`; the `docs` field in the
+  obligations projection; the `sm watch` marker; the read-only part of the AGENTS.md
+  "Docs for the owner" section. On its own, this solves "I can't find or read the
+  doc" on a laptop.
+- **#1450, Android.** The Docs surface in `AgentWorkSections`, the optional `docs`
+  field in `ApiModels.kt`, and the WebView reader with device auth. Depends on #1449.
+  This solves it on mobile.
+- **#1451, review.** Line annotation; the injected review client; drafts; the doc
+  token; `/head`; submit using the GraphQL flow above; the `[sm review]` wake; the
+  `owner_review` waiting entry; `--review`; the review part of the AGENTS.md section.
+  Depends on #1449 and #1450.
+
+Out of scope, possible later tickets: highlight what changed between the last
+reviewed SHA and the current one, computed from the two blobs at render time; show
+existing GitHub review threads inline in the reader.
+
+## Related work
+
+- **#1452, `sm ticket` / `sm pr` claims and an agent history page.** Agents claim the
+  tickets and PRs they work on; sm shows which agent worked on which ticket, opened
+  which PR, and wrote which docs, and detects two agents on the same ticket or PR.
+  This replaces a global doc reading list: cross-session doc discovery belongs on
+  that history page, cut by agent, ticket or PR. Owner docs don't depend on it. When
+  #1452 lands, a doc's PR links it to the claim records automatically.
 
 ## Tests
 
@@ -372,15 +426,18 @@ tests do (reuse that fixture pattern; don't invent a new one).
   input apart from the inserted attributes. Snapshot-test against a real memo
   (copy `~/artifacts/1612-context/1612_decision_memo.html` into test fixtures).
 - Markdown line mapping.
-- Submit: payload shape (`event: COMMENT`, verdict header, quotes, `commit_id`); 422
-  fallback moves comments into the body; closed PR is refused; wake message
-  text and recipient routing (live author, retired author → parent, none → undelivered).
+- Submit (stub GraphQL): pending review pinned to `commitOID`; a `null` thread and an
+  error both fall back to a `FILE` thread; the event is always `COMMENT` with the
+  verdict header; every body quotes the selection; the pending review is deleted
+  when a later step fails; a closed PR is refused; wake message text and
+  recipient routing (live author, retired author → parent, none → undelivered).
 - Doc token: accepted for its own doc, rejected for another doc or when expired.
 - Projection: `docs` and the `owner_review` waiting entry; old-schema Android
   parsing still works.
 - Manual: publish a real memo from a worktree, open it on the phone over the
   Cloudflare hostname, leave two tap comments, submit, confirm the GitHub review and
-  the agent's wake.
+  the agent's wake. Repeat on a PR that **modifies** an existing doc, commenting on
+  an untouched paragraph, and confirm it lands as a file comment with the quote.
 
 ## Non-goals
 
@@ -389,3 +446,7 @@ tests do (reuse that fixture pattern; don't invent a new one).
 - Replying to or resolving GitHub threads from sm (the agent does that with `gh`; the
   owner can use GitHub).
 - Docs outside GitHub-hosted repos.
+
+## Classification
+
+Epic (#1447) with three sub-tickets: #1449, #1450 and #1451.
