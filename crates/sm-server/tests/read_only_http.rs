@@ -11789,6 +11789,7 @@ timeouts:
     send_keys_settle_per_ki_chars: 0.07
     send_keys_settle_per_extra_line: 0.02
     send_keys_max_chunk_chars: 2048
+    send_keys_chunk_gap_seconds: 0.03
 rust_core:
   runtime_enabled: true
 "#,
@@ -11810,6 +11811,7 @@ rust_core:
         Some(20.0)
     );
     assert_eq!(config.rust_core.send_keys_max_chunk_chars, Some(2048));
+    assert_eq!(config.rust_core.send_keys_chunk_gap_ms, Some(30.0));
 
     fs::write(
         &config_path,
