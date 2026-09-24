@@ -5106,8 +5106,9 @@ fn terminate_codex_review_request_for_local_condition(
 
 /// Terminates a request for a local condition. An expired request also wakes
 /// its notify session, so the requester is not left waiting on a review that
-/// will never be reported. `deliver_now` drains that wake immediately; startup
-/// recovery passes false and leaves it to normal queue delivery.
+/// will never be reported. `deliver_now` drains that wake inline; startup
+/// recovery passes false and gets back the request whose wake it must deliver
+/// off the startup path.
 fn terminate_codex_review_request_for_reason(
     state: &AppState,
     queue_db_path: &StdPath,
@@ -5115,7 +5116,7 @@ fn terminate_codex_review_request_for_reason(
     terminal_state: &str,
     reason: &str,
     deliver_now: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<CodexReviewRequestRegistration>> {
     if terminal_state != "expired" {
         RetainedQueueStore::terminate_codex_review_request_in_path(
             queue_db_path,
@@ -5124,7 +5125,7 @@ fn terminate_codex_review_request_for_reason(
             &now_rfc3339(),
             reason,
         )?;
-        return Ok(());
+        return Ok(None);
     }
     let text = format!(
         "[sm review] Codex review request {} for PR #{} expired after {} minutes without a Codex review. Run `sm request-codex-review {}` to ask again.",
@@ -5141,12 +5142,13 @@ fn terminate_codex_review_request_for_reason(
         reason,
         &text,
     )?;
-    if deliver_now {
-        if let Some(terminated) = terminated {
+    match terminated {
+        Some(terminated) if deliver_now => {
             deliver_codex_review_wake_now(state, &terminated);
+            Ok(None)
         }
+        terminated => Ok(terminated),
     }
-    Ok(())
 }
 
 fn fail_codex_review_request_after_codex_errors(
@@ -5233,7 +5235,7 @@ fn recover_codex_review_request_watchers(state: Arc<AppState>) {
             for registration in registrations {
                 match codex_review_request_local_terminal_reason(&state, &registration) {
                     Ok(Some((terminal_state, reason))) => {
-                        if let Err(error) = terminate_codex_review_request_for_reason(
+                        match terminate_codex_review_request_for_reason(
                             &state,
                             &queue_db_path,
                             &registration,
@@ -5241,10 +5243,22 @@ fn recover_codex_review_request_watchers(state: Arc<AppState>) {
                             &reason,
                             false,
                         ) {
-                            eprintln!(
-                                "Codex review request recovery failed to terminate {}: {error:#}",
-                                registration.id
-                            );
+                            Ok(Some(terminated)) => {
+                                // Nothing else drains ordinary queued messages
+                                // at startup, so deliver the expiry wake here,
+                                // on a blocking task to keep tmux off startup.
+                                let state = state.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    deliver_codex_review_wake_now(&state, &terminated)
+                                });
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                eprintln!(
+                                    "Codex review request recovery failed to terminate {}: {error:#}",
+                                    registration.id
+                                );
+                            }
                         }
                         continue;
                     }
@@ -5524,13 +5538,18 @@ async fn run_codex_review_request_watcher(
             }
         };
         let give_up = failure.is_some() && registration.attempt_count >= CODEX_REVIEW_MAX_ATTEMPTS;
+        // `next_retry_at` is also set after a failed retry post, so honor it
+        // rather than re-posting on every poll during a GitHub outage.
         let failure_retry_due = failure.as_ref().is_some_and(|failure| {
             let delay = CODEX_REVIEW_FAILURE_RETRY_DELAY_SECONDS
                 .min(registration.retry_interval_seconds.max(1));
             codex_review_next_retry_at(&failure.created_at, delay)
                 .as_deref()
                 .is_some_and(codex_review_datetime_due)
-        });
+        }) && registration
+            .next_retry_at
+            .as_deref()
+            .is_none_or(codex_review_datetime_due);
         let retry_due = give_up
             || failure_retry_due
             || (registration.pickup_detected_at.is_none()
