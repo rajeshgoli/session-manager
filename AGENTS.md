@@ -36,7 +36,7 @@ This file is the whole standing contract. Read all of it.
 
 **Prefer a image or chart to a paragraph.** Please use charts, diagrams, or tables to clarify concepts. This is much easier for me to grok than it is to read dense text. Unlike you, I don't entirely live in the textual dimension :).
 
-A design document ships as a single self-contained HTML file in `docs/working/` that prints cleanly, and **graduates to `docs/specs/` when the work it specifies ships** — `working/` is deleted at arc close, so a converged spec left there disappears from under the implementation and review that depend on it. Until then it is unshipped, which is why `docs/specs/` may not change without the implementation changing with it.
+ A design document ships as a single self-contained HTML file in `docs/working/` that prints cleanly, and **graduates to `specs/` when the work it specifies ships** — `working/` is deleted at arc close, so a converged spec left there disappears from under the implementation and review that depend on it. Until then it is unshipped, which is why `docs/specs/` may not change without the implementation changing with it.
 
 **Give me decisions and options, not questions.** Bring only what I alone can decide, with a recommendation
 and a reason. "Should we delete this?" is not a question for me; "I recommend deleting this because X — confirm?" is. If it's deep in the code that agents wrote, I have no idea why it came about. That is like asking a programmer to reason about assembly. Bring it to my level if my decision is needed. If not make one and tell me.
@@ -84,17 +84,18 @@ If I explicitly asked you to be a maintainer, register as maintainer, sm maintai
 
 **Name yourself.** If you are not maintainer, Before you begin work, check your name with `sm me`. If it is `claude-<slug>`, `codex-fork-<slug>`, or anything similar, replace it with `sm name <newname>`. `<ticket>-engineer`, `<ticket>-scout`, `<spec-section>-engineer`, `<pr>-spec-repair`, `<ticket>-spec-author`, `<ticket>-spec-reviewer` and `<pr>-reviewer-<round>` all beat `claude-<slug>`, because a name that says what you were doing is what lets me restore you.
 
-**Worktrees.** Every agent works in its own worktree under `~/worktrees/<ticket>-<slug>`, build outputs inside. In each fresh worktree run `cd frontend && npm ci` — the lockfile is in `frontend/`, so a root invocation fails and leaves the frontend without dependencies.
+**Worktrees.** Every agent works in its own worktree under `~/worktrees/sm-<ticket>-<slug>`, build outputs inside. If you're maintainer, use a stable `~/worktrees/sm-maintainer` worktree where possible. You may use a ticket specific worktree where needed, but you should ensure it's deleted when it's no longer useful.
 
  Workflow as usual:
- 1. Rebuild and restart session manager as required. If it's pure sm app update, you don't need to restart session manager, otherwise you may need to.
+ 1. Rebuild and restart session manager as required. If it's pure sm app update, you don't need to restart session manager, otherwise you may need to. Restart using `scripts/restart-rust-server.sh`. Follow other maintainer lessons from `docs/product/lessons.md` as needed. 
  2. If I need to test something let me know. For example, if something can be tested with sm cli or sm app, let me know exactly what to try out.  If you can test directly that's preferred. For example, if you can reliable reproduce the issue I reported and you can verify it no longer occurs, you can tell me what you did and ask me to try it optionally.
  3. Once all feature requests above are completed and verified, you may exit to step 4. If I have feedback or if you find live test failures, repeat steps 1 and 2 until exit to 4 criteria is met. 
  4. Once functionality is in place, create a PR for your changes.
  5. Use instructions in Review loop section to get your PR in a clean mergable state.
  6. Once clean, squash merge the PR, delete local and remote branches or worktrees you may have created.
- 7. Rebuild and restart session manager if required.
- 8. Clean up any old builds and binary detritus so it's in clean state. Let me know. Cargo clean is a must and sm binary should still contain your latest code. 
+ 7. Rebuild and restart session manager if required. Be sure to use `scripts/restart-rust-server.sh` if restarting.
+ 8. Clean up any old builds and binary detritus so it's in clean state. Let me know. Cargo clean is a must and sm binary should still contain your latest code.
+ 9. If there are process learnings of things that all future workers on this repo need to know, write them down in `docs/product/lessons.md`. Note the bar to writing here should be high. You're costing tokens on every agent that follows you. Default to not writing if you're in doubt.
     
 ## 4. Review loop
 Request a review with `sm request-codex-review <pr-number>`. Treat the response as registration only, then go idle — do not poll. If Session Manager cannot take the request, post `@codex review` as a PR comment, check back after five minutes, again after five more, and re-post if nothing has landed after ten.
