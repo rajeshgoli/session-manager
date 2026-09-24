@@ -478,7 +478,10 @@ impl RetainedQueueStore {
         terminated_at: &str,
         reason: &str,
     ) -> Result<Option<CodexReviewRequestRegistration>> {
-        if !matches!(state, "expired" | "notify_inactive" | "pr_closed") {
+        if !matches!(
+            state,
+            "expired" | "failed" | "notify_inactive" | "pr_closed"
+        ) {
             anyhow::bail!("invalid Codex review request terminal state {state:?}");
         }
         if !db_path.exists() {
@@ -501,6 +504,67 @@ impl RetainedQueueStore {
             return get_codex_review_request_conn(&conn, request_id);
         }
         get_codex_review_request_conn(&conn, request_id)
+    }
+
+    /// Terminates an active request and queues `wake_text` for its notify
+    /// session in one transaction. Returns `None` when the request was no
+    /// longer active, in which case nothing is queued.
+    pub fn terminate_codex_review_request_and_enqueue_in_path(
+        db_path: &Path,
+        request_id: &str,
+        state: &str,
+        terminated_at: &str,
+        reason: &str,
+        wake_text: &str,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        if !matches!(state, "expired" | "failed") {
+            anyhow::bail!("invalid notifying Codex review request terminal state {state:?}");
+        }
+        if !db_path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open(db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        init_schema(&conn)?;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let changed = conn.execute(
+                r#"
+                UPDATE codex_review_request_registrations
+                SET is_active = 0,
+                    state = ?2,
+                    next_retry_at = NULL,
+                    last_polled_at = ?3,
+                    last_error = ?4
+                WHERE id = ?1 AND is_active = 1
+                "#,
+                params![request_id, state, terminated_at, reason],
+            )?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            let registration = get_codex_review_request_conn(&conn, request_id)?
+                .ok_or_else(|| anyhow::anyhow!("terminated Codex review request disappeared"))?;
+            enqueue_message_with_metadata_conn(
+                &conn,
+                &registration.notify_session_id,
+                wake_text,
+                "sequential",
+                QueueMessageMetadata::default(),
+            )?;
+            Ok(Some(registration))
+        })();
+        match result {
+            Ok(registration) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(registration)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     pub fn create_codex_review_request_in_path(
