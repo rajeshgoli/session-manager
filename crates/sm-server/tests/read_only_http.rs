@@ -237,6 +237,10 @@ struct StubGitHubReviewPoster {
     closed_pr_state: Arc<Mutex<Option<String>>>,
     head_after_post: Arc<Mutex<Option<String>>>,
     pickup_detected: Arc<Mutex<bool>>,
+    // Codex "Something went wrong" comment, reported while the number of
+    // posted `@codex review` comments is at most `failing_through_post`.
+    // Reviews are withheld until that many posts have failed.
+    review_failure: Arc<Mutex<Option<(GitHubReviewMatch, usize)>>>,
 }
 
 impl StubGitHubReviewPoster {
@@ -258,6 +262,7 @@ impl StubGitHubReviewPoster {
             closed_pr_state: Arc::new(Mutex::new(None)),
             head_after_post: Arc::new(Mutex::new(None)),
             pickup_detected: Arc::new(Mutex::new(false)),
+            review_failure: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -272,6 +277,7 @@ impl StubGitHubReviewPoster {
             closed_pr_state: Arc::new(Mutex::new(None)),
             head_after_post: Arc::new(Mutex::new(None)),
             pickup_detected: Arc::new(Mutex::new(false)),
+            review_failure: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -307,6 +313,20 @@ impl StubGitHubReviewPoster {
 
     fn push_fresh_review(&self, review_match: GitHubReviewMatch) {
         self.fresh_reviews.lock().unwrap().push_back(review_match);
+    }
+
+    fn set_review_failure(&self, failure: GitHubReviewMatch, failing_through_post: usize) {
+        *self.review_failure.lock().unwrap() = Some((failure, failing_through_post));
+    }
+
+    fn active_review_failure(&self) -> Option<GitHubReviewMatch> {
+        let posts = self.calls.lock().unwrap().len();
+        self.review_failure
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|(_, failing_through_post)| posts <= *failing_through_post)
+            .map(|(failure, _)| failure)
     }
 }
 
@@ -356,6 +376,9 @@ impl GitHubReviewPoster for StubGitHubReviewPoster {
         requested_head_sha: &str,
         request_comment_id: Option<i64>,
     ) -> Result<Option<GitHubReviewMatch>, String> {
+        if self.active_review_failure().is_some() {
+            return Ok(None);
+        }
         let mut fresh_reviews = self.fresh_reviews.lock().unwrap();
         let position = fresh_reviews.iter().position(|review_match| {
             review_match.head_sha.as_deref() == Some(requested_head_sha)
@@ -389,6 +412,29 @@ impl GitHubReviewPoster for StubGitHubReviewPoster {
         } else {
             Ok(None)
         }
+    }
+
+    fn find_codex_review_failure(
+        &self,
+        _repo: &str,
+        _pr_number: i64,
+        _since: &str,
+        _request_comment_id: Option<i64>,
+    ) -> Result<Option<GitHubReviewMatch>, String> {
+        Ok(self.active_review_failure())
+    }
+}
+
+fn codex_review_failure_comment() -> GitHubReviewMatch {
+    GitHubReviewMatch {
+        source: "failure".to_owned(),
+        created_at: "2026-06-14T02:31:00Z".to_owned(),
+        id: Some(json!(4701300001_i64)),
+        url: Some(
+            "https://github.com/rajeshgoli/session-manager/pull/971#issuecomment-4701300001"
+                .to_owned(),
+        ),
+        head_sha: None,
     }
 }
 
@@ -3168,6 +3214,140 @@ async fn codex_review_request_watcher_clears_retry_after_pickup() {
 }
 
 #[tokio::test]
+async fn codex_review_request_watcher_retries_after_codex_failure_comment() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("codex-review-failure-retry.db");
+    let poster = StubGitHubReviewPoster::successful().with_fresh_review(GitHubReviewMatch {
+        source: "comment".to_owned(),
+        created_at: "2026-06-14T02:40:00Z".to_owned(),
+        id: Some(json!(4701300002_i64)),
+        url: Some(
+            "https://github.com/rajeshgoli/session-manager/pull/971#issuecomment-4701300002"
+                .to_owned(),
+        ),
+        head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
+    });
+    poster.set_pickup_detected(true);
+    poster.set_review_failure(codex_review_failure_comment(), 1);
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 971,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "run12345",
+            "poll_interval_seconds": 1,
+            "retry_interval_seconds": 1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let request_id = payload["id"].as_str().unwrap().to_owned();
+
+    let mut completed = None;
+    for _ in 0..60 {
+        let current: (String, i64) = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state, attempt_count FROM codex_review_request_registrations WHERE id = ?1",
+                [&request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        if current.0 == "completed" {
+            completed = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let completed = completed.expect("a Codex failure comment must trigger a fresh request");
+    assert_eq!(completed.1, 2);
+    assert_eq!(poster.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn codex_review_request_watcher_gives_up_and_notifies_after_repeated_codex_failures() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("codex-review-failure-exhausted.db");
+    let poster = StubGitHubReviewPoster::successful();
+    poster.set_pickup_detected(true);
+    poster.set_review_failure(codex_review_failure_comment(), usize::MAX);
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 971,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "run12345",
+            "poll_interval_seconds": 1,
+            "retry_interval_seconds": 1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let request_id = payload["id"].as_str().unwrap().to_owned();
+
+    let mut failed = None;
+    for _ in 0..80 {
+        let current: (String, i64, i64) = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state, is_active, attempt_count FROM codex_review_request_registrations WHERE id = ?1",
+                [&request_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        if current.0 == "failed" {
+            failed = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let failed = failed.expect("repeated Codex failures must end the request");
+    assert_eq!(failed, ("failed".to_owned(), 0, 3));
+    assert_eq!(poster.calls().len(), 3, "sm must stop after three requests");
+
+    let message: String = Connection::open(&queue_db)
+        .unwrap()
+        .query_row(
+            "SELECT text FROM message_queue WHERE target_session_id = 'run12345'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        message,
+        format!(
+            "[sm review] Codex review request {request_id} for PR #971 failed: Codex reported an error on each of 3 attempts, so sm stopped retrying. Latest error: https://github.com/rajeshgoli/session-manager/pull/971#issuecomment-4701300001"
+        )
+    );
+}
+
+#[tokio::test]
 async fn codex_review_request_watcher_terminates_when_pr_closes() {
     let state_file = write_session_fixture();
     let queue_db = state_file.with_extension("codex-review-pr-closed.db");
@@ -3704,6 +3884,19 @@ async fn codex_review_request_recovery_expires_request_after_one_hour() {
     assert!(row
         .2
         .is_some_and(|reason| reason.contains("3600 second TTL")));
+    let message: String = Connection::open(&queue_db)
+        .unwrap()
+        .query_row(
+            "SELECT text FROM message_queue WHERE target_session_id = 'notify1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        message.starts_with("[sm review] Codex review request expired-review for PR #")
+            && message.contains("expired after 60 minutes without a Codex review"),
+        "{message}"
+    );
 }
 
 #[tokio::test]

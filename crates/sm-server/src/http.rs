@@ -158,6 +158,11 @@ const EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS: i64 = 8;
 const SCHEDULED_REMINDER_COMPACTION_WAIT_SECONDS: i64 = 300;
 const CODEX_REVIEW_REQUEST_TTL_SECONDS: i64 = 60 * 60;
 const CODEX_REVIEW_LOCAL_RECONCILE_INTERVAL_SECONDS: u64 = 30;
+// After Codex reports "Something went wrong" on a picked-up review, wait this
+// long (or the request's retry interval, if shorter) before re-posting, and
+// give up once this many `@codex review` comments have been posted.
+const CODEX_REVIEW_FAILURE_RETRY_DELAY_SECONDS: i64 = 120;
+const CODEX_REVIEW_MAX_ATTEMPTS: i64 = 3;
 const REQUEST_STATUS_PROMPT: &str = "[sm] user requests status, please update now using sm status";
 const BUG_REPORT_MAX_TEXT_CHARS: usize = 4000;
 const BUG_REPORT_MAX_CLIENT_STATE_CHARS: usize = 100_000;
@@ -355,6 +360,18 @@ pub trait GitHubReviewPoster: Send + Sync {
     ) -> Result<Option<GitHubReviewMatch>, String> {
         Ok(None)
     }
+
+    /// Returns the earliest Codex comment posted after `since` that reports
+    /// the review run failed ("Codex Review: Something went wrong").
+    fn find_codex_review_failure(
+        &self,
+        _repo: &str,
+        _pr_number: i64,
+        _since: &str,
+        _request_comment_id: Option<i64>,
+    ) -> Result<Option<GitHubReviewMatch>, String> {
+        Ok(None)
+    }
 }
 
 #[derive(Debug)]
@@ -411,6 +428,16 @@ impl GitHubReviewPoster for GhCliReviewPoster {
         since: &str,
     ) -> Result<Option<GitHubReviewMatch>, String> {
         find_fresh_codex_review_with_gh(repo, pr_number, since)
+    }
+
+    fn find_codex_review_failure(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        since: &str,
+        request_comment_id: Option<i64>,
+    ) -> Result<Option<GitHubReviewMatch>, String> {
+        find_codex_review_failure_with_gh(repo, pr_number, since, request_comment_id)
     }
 }
 
@@ -971,6 +998,68 @@ fn codex_comment_is_bound(
             .to_ascii_lowercase()
             .starts_with("@codex review")
         && reviewed_commit_matches_requested_head(body, requested_head_sha)
+}
+
+fn find_codex_review_failure_with_gh(
+    repo: &str,
+    pr_number: i64,
+    since: &str,
+    request_comment_id: Option<i64>,
+) -> Result<Option<GitHubReviewMatch>, String> {
+    let Some(since_dt) = parse_github_datetime(since) else {
+        return Ok(None);
+    };
+    let comments = gh_api_json(
+        repo,
+        &format!(
+            "issues/{pr_number}/comments?since={}",
+            since_dt
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| since.to_owned())
+        ),
+        true,
+    )?;
+    let mut failures = Vec::<GitHubReviewMatch>::new();
+    for comment in comments.as_array().into_iter().flatten() {
+        let Some(created_at) = comment
+            .get("created_at")
+            .and_then(Value::as_str)
+            .and_then(parse_github_datetime)
+        else {
+            continue;
+        };
+        if created_at > since_dt
+            && codex_comment_reports_review_failure(comment, request_comment_id)
+        {
+            failures.push(GitHubReviewMatch {
+                source: "failure".to_owned(),
+                created_at: created_at
+                    .format(&Rfc3339)
+                    .unwrap_or_else(|_| now_rfc3339()),
+                id: comment.get("id").cloned(),
+                url: comment
+                    .get("html_url")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                head_sha: None,
+            });
+        }
+    }
+    failures.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    Ok(failures.into_iter().next())
+}
+
+fn codex_comment_reports_review_failure(comment: &Value, request_comment_id: Option<i64>) -> bool {
+    let body = comment
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim_start()
+        .to_ascii_lowercase();
+    comment.get("id").and_then(Value::as_i64) != request_comment_id
+        && github_actor_is_codex(comment)
+        && !body.starts_with("@codex review")
+        && body.contains("something went wrong")
 }
 
 fn reviewed_commit_matches_requested_head(body: &str, requested_head_sha: &str) -> bool {
@@ -5003,15 +5092,111 @@ fn terminate_codex_review_request_for_local_condition(
     else {
         return Ok(false);
     };
-    RetainedQueueStore::terminate_codex_review_request_in_path(
+    terminate_codex_review_request_for_reason(
+        state,
+        queue_db_path,
+        registration,
+        terminal_state,
+        &reason,
+        true,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+/// Terminates a request for a local condition. An expired request also wakes
+/// its notify session, so the requester is not left waiting on a review that
+/// will never be reported. `deliver_now` drains that wake immediately; startup
+/// recovery passes false and leaves it to normal queue delivery.
+fn terminate_codex_review_request_for_reason(
+    state: &AppState,
+    queue_db_path: &StdPath,
+    registration: &CodexReviewRequestRegistration,
+    terminal_state: &str,
+    reason: &str,
+    deliver_now: bool,
+) -> anyhow::Result<()> {
+    if terminal_state != "expired" {
+        RetainedQueueStore::terminate_codex_review_request_in_path(
+            queue_db_path,
+            &registration.id,
+            terminal_state,
+            &now_rfc3339(),
+            reason,
+        )?;
+        return Ok(());
+    }
+    let text = format!(
+        "[sm review] Codex review request {} for PR #{} expired after {} minutes without a Codex review. Run `sm request-codex-review {}` to ask again.",
+        registration.id,
+        registration.pr_number,
+        CODEX_REVIEW_REQUEST_TTL_SECONDS / 60,
+        registration.pr_number
+    );
+    let terminated = RetainedQueueStore::terminate_codex_review_request_and_enqueue_in_path(
         queue_db_path,
         &registration.id,
         terminal_state,
         &now_rfc3339(),
+        reason,
+        &text,
+    )?;
+    if deliver_now {
+        if let Some(terminated) = terminated {
+            deliver_codex_review_wake_now(state, &terminated);
+        }
+    }
+    Ok(())
+}
+
+fn fail_codex_review_request_after_codex_errors(
+    state: &AppState,
+    queue_db_path: &StdPath,
+    registration: &CodexReviewRequestRegistration,
+    failure: Option<&GitHubReviewMatch>,
+    terminated_at: &str,
+) -> Result<(), String> {
+    let latest = failure
+        .and_then(|failure| failure.url.as_deref())
+        .map(|url| format!(" Latest error: {url}"))
+        .unwrap_or_default();
+    let reason = format!(
+        "Codex reported a review failure after {} request(s); retries exhausted",
+        registration.attempt_count
+    );
+    let text = format!(
+        "[sm review] Codex review request {} for PR #{} failed: Codex reported an error on each of {} attempts, so sm stopped retrying.{latest}",
+        registration.id, registration.pr_number, registration.attempt_count
+    );
+    let terminated = RetainedQueueStore::terminate_codex_review_request_and_enqueue_in_path(
+        queue_db_path,
+        &registration.id,
+        "failed",
+        terminated_at,
         &reason,
+        &text,
     )
     .map_err(|error| error.to_string())?;
-    Ok(true)
+    if let Some(terminated) = terminated {
+        deliver_codex_review_wake_now(state, &terminated);
+    }
+    Ok(())
+}
+
+fn deliver_codex_review_wake_now(state: &AppState, registration: &CodexReviewRequestRegistration) {
+    if !state.config.rust_core.runtime_enabled {
+        return;
+    }
+    let runtime = TmuxRuntime::from_app_config(&state.config);
+    if let Err(error) = state
+        .session_store
+        .drain_runtime_pending_messages_for_session(&registration.notify_session_id, &runtime)
+    {
+        eprintln!(
+            "failed to immediately deliver Codex review message {} to {}: {error:#}",
+            registration.id, registration.notify_session_id
+        );
+    }
 }
 
 fn terminate_codex_review_request_for_closed_pr(
@@ -5048,15 +5233,14 @@ fn recover_codex_review_request_watchers(state: Arc<AppState>) {
             for registration in registrations {
                 match codex_review_request_local_terminal_reason(&state, &registration) {
                     Ok(Some((terminal_state, reason))) => {
-                        if let Err(error) =
-                            RetainedQueueStore::terminate_codex_review_request_in_path(
-                                &queue_db_path,
-                                &registration.id,
-                                terminal_state,
-                                &now_rfc3339(),
-                                &reason,
-                            )
-                        {
+                        if let Err(error) = terminate_codex_review_request_for_reason(
+                            &state,
+                            &queue_db_path,
+                            &registration,
+                            terminal_state,
+                            &reason,
+                            false,
+                        ) {
                             eprintln!(
                                 "Codex review request recovery failed to terminate {}: {error:#}",
                                 registration.id
@@ -5315,11 +5499,45 @@ async fn run_codex_review_request_watcher(
             }
         }
 
-        let retry_due = registration.pickup_detected_at.is_none()
-            && registration
-                .next_retry_at
+        // A failure comment answers the latest `@codex review` only, because
+        // the search starts at that comment's post time.
+        let failure = match github_find_review_failure(
+            state.github_review_poster.clone(),
+            &registration.repo,
+            registration.pr_number,
+            &since,
+            registration.latest_request_comment_id,
+        )
+        .await
+        {
+            Ok(failure) => failure,
+            Err(error) => {
+                let _ = RetainedQueueStore::mark_codex_review_request_poll_error_in_path(
+                    &queue_db_path,
+                    &request_id,
+                    &now,
+                    &format!("failure detection failed: {error}"),
+                    None,
+                )
+                .map_err(|error| error.to_string())?;
+                None
+            }
+        };
+        let give_up = failure.is_some() && registration.attempt_count >= CODEX_REVIEW_MAX_ATTEMPTS;
+        let failure_retry_due = failure.as_ref().is_some_and(|failure| {
+            let delay = CODEX_REVIEW_FAILURE_RETRY_DELAY_SECONDS
+                .min(registration.retry_interval_seconds.max(1));
+            codex_review_next_retry_at(&failure.created_at, delay)
                 .as_deref()
-                .is_some_and(codex_review_datetime_due);
+                .is_some_and(codex_review_datetime_due)
+        });
+        let retry_due = give_up
+            || failure_retry_due
+            || (registration.pickup_detected_at.is_none()
+                && registration
+                    .next_retry_at
+                    .as_deref()
+                    .is_some_and(codex_review_datetime_due));
         if registration.pickup_detected_at.is_some() || retry_due {
             let requested_head_sha = registration
                 .requested_head_sha
@@ -5371,6 +5589,16 @@ async fn run_codex_review_request_watcher(
                     &registration,
                     requested_head_sha,
                     &current_head_sha,
+                    &now,
+                )?;
+                return Ok(());
+            }
+            if give_up {
+                fail_codex_review_request_after_codex_errors(
+                    &state,
+                    &queue_db_path,
+                    &registration,
+                    failure.as_ref(),
                     &now,
                 )?;
                 return Ok(());
@@ -5490,6 +5718,22 @@ async fn github_find_fresh_pull_review(
     tokio::task::spawn_blocking(move || poster.find_fresh_codex_review(&repo, pr_number, &since))
         .await
         .map_err(|error| format!("review poll task failed: {error}"))?
+}
+
+async fn github_find_review_failure(
+    poster: Arc<dyn GitHubReviewPoster>,
+    repo: &str,
+    pr_number: i64,
+    since: &str,
+    request_comment_id: Option<i64>,
+) -> Result<Option<GitHubReviewMatch>, String> {
+    let repo = repo.to_owned();
+    let since = since.to_owned();
+    tokio::task::spawn_blocking(move || {
+        poster.find_codex_review_failure(&repo, pr_number, &since, request_comment_id)
+    })
+    .await
+    .map_err(|error| format!("failure poll task failed: {error}"))?
 }
 
 async fn github_post_review_request(
