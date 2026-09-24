@@ -1702,6 +1702,8 @@ pub struct RustCoreConfig {
     pub send_keys_settle_per_extra_line_ms: Option<f64>,
     #[serde(default)]
     pub send_keys_max_chunk_chars: Option<usize>,
+    #[serde(default)]
+    pub send_keys_chunk_gap_ms: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1819,6 +1821,10 @@ impl From<RawConfig> for AppConfig {
         }
         if rust_core.send_keys_max_chunk_chars.is_none() {
             rust_core.send_keys_max_chunk_chars = tmux_timeouts.send_keys_max_chunk_chars;
+        }
+        if rust_core.send_keys_chunk_gap_ms.is_none() {
+            rust_core.send_keys_chunk_gap_ms =
+                seconds_to_millis(tmux_timeouts.send_keys_chunk_gap_seconds);
         }
         Self {
             paths: PathsConfig {
@@ -1979,6 +1985,8 @@ struct RawTmuxTimeoutsConfig {
     send_keys_settle_per_extra_line: Option<f64>,
     #[serde(default)]
     send_keys_max_chunk_chars: Option<usize>,
+    #[serde(default)]
+    send_keys_chunk_gap_seconds: Option<f64>,
 }
 
 fn provider_launch_config(
