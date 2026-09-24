@@ -24,8 +24,10 @@ const DEFAULT_SEND_KEYS_SETTLE_PER_EXTRA_LINE_MS: f64 = 15.0;
 // Claude Code treats a large unbracketed input burst as a paste, collapses the
 // first terminal read into a "[Pasted text]" placeholder, and on an idle
 // session drops that placeholder at submit. Typing in small, spaced chunks
-// keeps every read below its paste threshold.
-const DEFAULT_SEND_KEYS_MAX_CHUNK_CHARS: usize = 512;
+// keeps every read below its paste threshold. The threshold is on terminal
+// reads, so the limit counts UTF-8 bytes; `send_keys_max_chunk_chars` keeps
+// its historical name.
+const DEFAULT_SEND_KEYS_MAX_CHUNK_BYTES: usize = 512;
 const DEFAULT_SEND_KEYS_CHUNK_GAP_MS: f64 = 20.0;
 const CODEX_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_INITIAL_BRIEF_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -80,7 +82,7 @@ pub struct TmuxRuntime {
     send_keys_settle_max_ms: f64,
     send_keys_settle_per_ki_ms: f64,
     send_keys_settle_per_extra_line_ms: f64,
-    send_keys_max_chunk_chars: usize,
+    send_keys_max_chunk_bytes: usize,
     send_keys_chunk_gap_ms: f64,
     claude_projects_roots: Vec<PathBuf>,
 }
@@ -274,9 +276,9 @@ impl TmuxRuntime {
                 config.send_keys_settle_per_extra_line_ms,
                 DEFAULT_SEND_KEYS_SETTLE_PER_EXTRA_LINE_MS,
             ),
-            send_keys_max_chunk_chars: config
+            send_keys_max_chunk_bytes: config
                 .send_keys_max_chunk_chars
-                .unwrap_or(DEFAULT_SEND_KEYS_MAX_CHUNK_CHARS)
+                .unwrap_or(DEFAULT_SEND_KEYS_MAX_CHUNK_BYTES)
                 .max(1),
             send_keys_chunk_gap_ms: finite_nonnegative_or_default(
                 config.send_keys_chunk_gap_ms,
@@ -1175,7 +1177,7 @@ impl TmuxRuntime {
 
     fn send_text(&self, tmux_session: &str, text: &str) -> Result<()> {
         self.exit_copy_mode_if_needed(tmux_session);
-        for (index, chunk) in split_send_text_chunks(text, self.send_keys_max_chunk_chars)
+        for (index, chunk) in split_send_text_chunks(text, self.send_keys_max_chunk_bytes)
             .into_iter()
             .enumerate()
         {
@@ -1982,32 +1984,22 @@ fn codex_text_parts(parts: &[Value]) -> Option<String> {
     })
 }
 
-fn split_send_text_chunks(text: &str, max_chunk_chars: usize) -> Vec<&str> {
-    let max_chunk_chars = max_chunk_chars.max(1);
-    if text.chars().count() <= max_chunk_chars {
-        return vec![text];
-    }
-
+fn split_send_text_chunks(text: &str, max_chunk_bytes: usize) -> Vec<&str> {
+    let max_chunk_bytes = max_chunk_bytes.max(1);
     let mut chunks = Vec::new();
     let mut remaining = text;
-    while !remaining.is_empty() {
-        if remaining.chars().count() <= max_chunk_chars {
-            chunks.push(remaining);
-            break;
-        }
-
-        let boundary = byte_index_after_chars(remaining, max_chunk_chars);
-        let half_chars = max_chunk_chars / 2;
-        let newline_split = remaining[..boundary].rfind('\n').and_then(|idx| {
-            if remaining[..idx].chars().count() >= half_chars {
-                Some(idx + '\n'.len_utf8())
-            } else {
-                None
-            }
-        });
+    while remaining.len() > max_chunk_bytes {
+        let boundary = char_boundary_at_or_before(remaining, max_chunk_bytes);
+        let newline_split = remaining[..boundary]
+            .rfind('\n')
+            .filter(|idx| *idx >= max_chunk_bytes / 2)
+            .map(|idx| idx + '\n'.len_utf8());
         let split_at = newline_split.unwrap_or(boundary);
         chunks.push(&remaining[..split_at]);
         remaining = &remaining[split_at..];
+    }
+    if !remaining.is_empty() || chunks.is_empty() {
+        chunks.push(remaining);
     }
     chunks
 }
@@ -2031,12 +2023,17 @@ fn tail_text_lines(text: &str, lines: usize) -> String {
     output
 }
 
-fn byte_index_after_chars(value: &str, char_count: usize) -> usize {
-    value
-        .char_indices()
-        .nth(char_count)
-        .map(|(idx, _)| idx)
-        .unwrap_or(value.len())
+/// The last char boundary at or before `max_bytes`, but always past the first
+/// char so a chunk limit smaller than one char still makes progress.
+fn char_boundary_at_or_before(value: &str, max_bytes: usize) -> usize {
+    let mut boundary = max_bytes.min(value.len());
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    if boundary == 0 {
+        boundary = value.chars().next().map_or(0, char::len_utf8);
+    }
+    boundary
 }
 
 fn finite_nonnegative_or_default(value: Option<f64>, default: f64) -> f64 {
@@ -2939,8 +2936,18 @@ printf '%s' '{"models":[{"slug":"gpt-5.6-luna","visibility":"list"}]}'
 
     #[test]
     fn split_send_text_chunks_preserves_utf8_boundaries() {
-        let chunks = split_send_text_chunks("åßçdé", 2);
+        let chunks = split_send_text_chunks("åßçdé", 4);
         assert_eq!(chunks, vec!["åß", "çd", "é"]);
+        assert_eq!(split_send_text_chunks("åß", 1), vec!["å", "ß"]);
+    }
+
+    #[test]
+    fn split_send_text_chunks_limits_encoded_bytes_not_chars() {
+        let text = "漢".repeat(400);
+        let chunks = split_send_text_chunks(&text, 512);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 512));
+        assert_eq!(chunks.concat(), text);
+        assert_eq!(chunks.len(), 3);
     }
 
     #[cfg(unix)]
