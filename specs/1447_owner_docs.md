@@ -92,7 +92,8 @@ agent's cwd):
 Identity and republishing: a doc is keyed by `(repo, path, pr_number)`, or by
 `(repo, path)` when there's no PR. Publishing the same key again adds a new
 **publish event** to the existing doc; it doesn't create a second doc. The latest
-publish carries the current title, note and review request.
+publish carries the current title and note; each publish row records whether that
+publish requested a review.
 
 ### Android app
 
@@ -146,7 +147,6 @@ CREATE TABLE owner_docs (
   author_session_name TEXT,          -- snapshot so retired sessions still show a name
   title TEXT NOT NULL,
   note TEXT,
-  review_requested INTEGER NOT NULL DEFAULT 0,
   retracted_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -159,6 +159,7 @@ CREATE TABLE owner_doc_publishes (   -- one row per `sm doc publish`
   commit_sha TEXT NOT NULL,
   blob_sha TEXT NOT NULL,            -- from the contents API; detects whether the file really changed
   session_id TEXT NOT NULL,
+  review_requested INTEGER NOT NULL DEFAULT 0,  -- this publish asked for a review (--review)
   published_at TEXT NOT NULL
 );
 
@@ -181,7 +182,9 @@ CREATE TABLE owner_doc_drafts (      -- server-side so a draft started on the ph
 );
 
 CREATE TABLE owner_doc_reviews (
-  id TEXT PRIMARY KEY,
+  id TEXT PRIMARY KEY,               -- the client's submission_id (see "Submitting a review")
+  status TEXT NOT NULL,              -- submitting | posted | failed
+  pending_review_node_id TEXT,       -- GraphQL id of the pending review while submitting
   doc_id TEXT NOT NULL,
   commit_sha TEXT NOT NULL,
   blob_sha TEXT NOT NULL,            -- blob reviewed, for state derivation
@@ -200,8 +203,11 @@ Derived doc state, first match wins. The *latest blob* is the `blob_sha` of the
 latest publish row. The projection uses stored data only (see "Fetching content"), so
 it never looks at the live PR head.
 
-1. A review exists whose `blob_sha` equals the latest blob → **Reviewed**
-2. `review_requested` is set on the latest publish → **Review requested**
+1. The latest publish has `review_requested`, and no **posted** review was submitted
+   after that publish's `published_at` → **Review requested**. A review request
+   belongs to a publish event, so republishing an already-reviewed blob with
+   `--review` asks again.
+2. A posted review exists whose `blob_sha` equals the latest blob → **Reviewed**
 3. A view exists for the latest blob → **Read**
 4. A view exists for some other blob → **Updated**
 5. Otherwise → **New**
@@ -222,8 +228,8 @@ match.
   variant when the blob SHA is also needed (at publish time).
 - Cache on disk at `<state dir>/doc_cache/{repo}/{commit_sha}/{path}`. Content at a
   SHA never changes, so the cache is never invalidated; prune entries unused for 30 days.
-- The latest revision of a PR doc is the PR head (`gh pr view` or
-  `repos/{repo}/pulls/{n}`), cached for 30s. The head SHA stays readable after merge
+- The PR head SHA and state come from `gh pr view` (or `repos/{repo}/pulls/{n}`),
+  cached for 30s. The head SHA stays readable after merge
   or branch deletion (GitHub keeps `refs/pull/N/head`). PR state
   (`open`/`closed`/`merged`) comes from the same call and decides whether commenting
   is enabled.
@@ -247,7 +253,10 @@ match.
 3. **Line annotation**: add `data-sm-line="N"` (1-based line of the start tag in the
    source) to block-level start tags: `p li h1-h6 pre blockquote td th dt dd figcaption
    div section tr`. For HTML, do a single forward scan that tracks line numbers and
-   skips `<script>`, `<style>`, `<!-- -->` and attribute values. It edits the start
+   skips comments (`<!-- -->`), attribute values, and the contents of raw-text and
+   RCDATA elements, up to their matching end tag: `script style textarea title xmp
+   iframe noembed noframes noscript plaintext`. Tag-like text inside those, such as
+   `<textarea><p>example</p></textarea>`, is content, not markup. It edits the start
    tag in place and doesn't reserialize the document, so the owner's HTML is otherwise
    untouched byte for byte. For markdown, add the attribute from the source offsets
    during rendering.
@@ -300,7 +309,25 @@ and use a shadow DOM for its UI.
 
 ### Submitting a review (`POST /docs/{id}/review`)
 
-Body: `{sha, verdict, body}`. Uses the stored drafts for `(doc_id, sha)`. The GitHub
+Body: `{submission_id, sha, verdict, body}`. Uses the stored drafts for
+`(doc_id, sha)`. The review client generates `submission_id` (a UUID) when the submit
+panel opens and reuses it on every retry of that submit.
+
+**Idempotency.** Before any GitHub call, insert the `owner_doc_reviews` row with
+`id = submission_id` and `status = submitting`. If the row already exists:
+`posted` → return the stored result without touching GitHub; `submitting` →
+reconcile (below) instead of starting over. The review body ends with a hidden
+marker, `<!-- sm-review:<submission_id> -->`. To reconcile, list the PR's reviews by
+the viewer (GraphQL `pullRequest.reviews(author: <viewer login>)`, including
+`PENDING`) and look for the marker:
+- a submitted review carries it → finish steps 5–6 from that review;
+- a pending review carries it → submit it (step 2.4), then finish;
+- neither → delete any pending review recorded in `pending_review_node_id`, then
+  run the flow again.
+
+The row changes from `submitting` to `posted` in the same transaction that deletes
+the drafts and enqueues the wake, so the wake fires exactly once. A server restart
+reconciles any rows left in `submitting`. The GitHub
 behaviour each step relies on was verified on PR #1448; see "GitHub API findings".
 
 1. Refuse unless the doc has a PR and the PR is open.
@@ -308,8 +335,9 @@ behaviour each step relies on was verified on PR #1448; see "GitHub API findings
    comment makes GitHub reject the whole REST review with a generic
    `Line could not be resolved` that doesn't say which comment failed (F5). The
    pending flow lets each comment fall back on its own:
-   1. `addPullRequestReview(input: {pullRequestId, commitOID: <sha>})` with no event
-      creates a pending review pinned to the viewed SHA.
+   1. `addPullRequestReview(input: {pullRequestId, commitOID: <sha>, body})` with no
+      event creates a pending review pinned to the viewed SHA. The body includes the
+      marker. Record its id in `pending_review_node_id` right away.
    2. For each draft that has a line, run
       `addPullRequestReviewThread(input: {pullRequestReviewId, path, line, side: RIGHT, subjectType: LINE, body})`.
       **A `null` thread with no error means it failed** (F2). Treat it exactly like
@@ -317,10 +345,14 @@ behaviour each step relies on was verified on PR #1448; see "GitHub API findings
    3. For each draft that failed, or has `line = NULL`, run
       `addPullRequestReviewThread(... subjectType: FILE, body)`. This is a file-level
       comment on the doc, and it works inside a review (F3).
-   4. `submitPullRequestReview(input: {pullRequestReviewId, event: COMMENT, body})`.
-   5. If anything fails after step 1, delete the pending review
+   4. `submitPullRequestReview(input: {pullRequestReviewId, event: COMMENT, body})`,
+      with the same body as step 1, marker included.
+   5. If GitHub returns an error after step 1, delete the pending review
       (`deletePullRequestReview`) so no half-built pending review is left under the
-      owner's account. A leftover pending review blocks creating the next one.
+      owner's account (a leftover pending review blocks creating the next one). Then
+      mark the row `failed` and keep the drafts. The client retries with a new
+      `submission_id`. A crash, as opposed to an error, leaves the row `submitting`,
+      and reconciliation handles it.
 3. **Every comment body quotes the selected text**, as `> <quote>\n\n<comment>`. A
    line anchor is the start of a block, which may be a long paragraph, and a
    file-level comment has no anchor at all. The quote is what tells the agent where
@@ -331,8 +363,9 @@ behaviour each step relies on was verified on PR #1448; see "GitHub API findings
    with `**Verdict: Approved**`, `**Verdict: Changes requested**` or
    `**Verdict: Comments**`, followed by the owner's overall text. The wake message
    carries the verdict too.
-5. Store the `owner_doc_reviews` row, with `line_comment_count` and
-   `file_comment_count` as actually posted (after fallbacks), and delete the drafts.
+5. In one transaction: set the row to `posted` with `line_comment_count`,
+   `file_comment_count` (as actually posted, after fallbacks) and the GitHub review
+   id and URL; delete the drafts; enqueue the wake (step 6).
 6. **Wake the author** through the normal durable `sm send` path:
    ```
    [sm review] Rajesh's review of "<title>" (PR #<n> @ <sha7>) is here: <review_url>
@@ -452,7 +485,8 @@ tests do (reuse that fixture pattern; don't invent a new one).
   the same path is a different doc.
 - State derivation: new → read → updated only when the blob SHA changes, not on
   unrelated pushes; review requested → reviewed.
-- Line annotation: correct line numbers; tags inside `<script>`/`<style>`/comments
+- Line annotation: correct line numbers; tag-like text inside comments and every
+  raw-text/RCDATA element (`<script>`, `<style>`, `<textarea>`, `<title>`, ...)
   untouched; attribute values containing `>` or newlines; output identical to the
   input apart from the inserted attributes. Snapshot-test against a real memo
   (copy `~/artifacts/1612-context/1612_decision_memo.html` into test fixtures).
@@ -460,7 +494,11 @@ tests do (reuse that fixture pattern; don't invent a new one).
 - Submit (stub GraphQL): pending review pinned to `commitOID`; a `null` thread and an
   error both fall back to a `FILE` thread; the event is always `COMMENT` with the
   verdict header; every body quotes the selection; the pending review is deleted
-  when a later step fails; a closed PR is refused; wake message text and
+  when a later step fails; a closed PR is refused. Idempotency: a retry with the
+  same `submission_id` after a crash following `submitPullRequestReview` posts no
+  second review and sends no second wake; a crash after `addPullRequestReview`
+  resumes the pending review; a crash before it starts clean. Re-requesting review
+  on an already-reviewed blob shows **Review requested** again; wake message text and
   recipient routing (live author, retired author → parent, none → undelivered).
 - Doc token: accepted by the JSON endpoints for its own doc at any SHA, rejected for
   another doc, when expired, or on `/view`.
