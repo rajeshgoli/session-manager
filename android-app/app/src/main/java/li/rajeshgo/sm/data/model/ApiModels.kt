@@ -577,6 +577,22 @@ data class SessionObligations(
     @SerialName("session_id") val sessionId: String,
     @SerialName("waiting_on") val waitingOn: List<WaitingObligation> = emptyList(),
     @SerialName("review_history") val reviewHistory: List<ReviewHistory> = emptyList(),
+    val docs: List<SessionDoc> = emptyList(),
+)
+
+/** A doc this session published for the owner (`sm doc publish`). The internal doc id is deliberately not parsed: every link uses the readable form. */
+@Serializable
+data class SessionDoc(
+    val title: String = "",
+    val state: String = "",
+    val repo: String = "",
+    val path: String = "",
+    @SerialName("pr_number") val prNumber: Long? = null,
+    @SerialName("latest_commit_sha") val latestCommitSha: String = "",
+    @SerialName("published_at") val publishedAt: String? = null,
+    val name: String? = null,
+    @SerialName("reader_path") val readerPath: String? = null,
+    @SerialName("browser_url") val browserUrl: String? = null,
 )
 
 @Serializable

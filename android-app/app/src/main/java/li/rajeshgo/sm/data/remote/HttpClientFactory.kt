@@ -24,9 +24,32 @@ import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509ExtendedKeyManager
 import javax.net.ssl.X509TrustManager
 
+/** The enrolled Cloudflare device certificate, for clients (the doc reader WebView) that answer the TLS client-certificate request themselves. */
+class DeviceClientCertificate(
+    val privateKey: PrivateKey,
+    val certificateChain: Array<X509Certificate>,
+)
+
 class HttpClientFactory(
     private val settingsRepository: SettingsRepository? = null,
 ) {
+    suspend fun deviceClientCertificate(): DeviceClientCertificate? {
+        val repository = settingsRepository ?: return null
+        val certificateChainPem = repository.cloudflareDeviceCertificateChainPem.first().trim()
+        val privateKeyPkcs8 = repository.cloudflareDevicePrivateKeyPkcs8().trim()
+        if (certificateChainPem.isBlank() || privateKeyPkcs8.isBlank()) {
+            return null
+        }
+        return runCatching {
+            val certificateChain = decodeCertificates(certificateChainPem)
+            val privateKey = decodePrivateKey(privateKeyPkcs8)
+            if (certificateChain.isEmpty() || privateKey == null) null
+            else DeviceClientCertificate(privateKey, certificateChain.toTypedArray())
+        }
+            .onFailure { error -> Log.w(TAG, "Unable to load SM Cloudflare client certificate", error) }
+            .getOrNull()
+    }
+
     suspend fun create(
         token: String = "",
         includeLogging: Boolean = true,

@@ -107,6 +107,7 @@ import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
+import li.rajeshgo.sm.data.model.SessionDoc
 import li.rajeshgo.sm.ui.navigation.AppBottomNav
 import li.rajeshgo.sm.ui.navigation.Routes
 import li.rajeshgo.sm.ui.theme.Amber
@@ -148,6 +149,7 @@ fun WatchScreen(
     var query by remember { mutableStateOf("") }
     var filter by remember { mutableStateOf("all") }
     var toast by remember { mutableStateOf<String?>(null) }
+    var openDoc by remember { mutableStateOf<SessionDoc?>(null) }
 
     val sections = remember(state.sessions, filter, query) {
         filterSections(buildSections(state.sessions), filter, query)
@@ -334,6 +336,7 @@ fun WatchScreen(
                                     toast = result.exceptionOrNull()?.message ?: "Retired ${session.id}"
                                 }
                             },
+                            onOpenDoc = { openDoc = it },
                         )
                     }
                 }
@@ -385,6 +388,7 @@ fun WatchScreen(
                                     toast = result.exceptionOrNull()?.message ?: "Retired ${session.id}"
                                 }
                             },
+                            onOpenDoc = { openDoc = it },
                         )
                     }
                 }
@@ -454,6 +458,18 @@ fun WatchScreen(
                     val copiedText = selectedText.ifBlank { terminal.copyBuffer }
                     clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm terminal", copiedText))
                     toast = "Terminal output copied"
+                },
+            )
+        }
+        openDoc?.let { doc ->
+            DocReaderOverlay(
+                doc = doc,
+                loadAuth = viewModel::docReaderAuth,
+                onClose = { openDoc = null },
+                onCopyLink = { link ->
+                    val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm doc", link))
+                    toast = "Doc link copied"
                 },
             )
         }
@@ -1188,6 +1204,7 @@ private fun WatchTree(
     onUpdateWhat: (ClientSession) -> Unit,
     onRegenerateWhat: (ClientSession) -> Unit,
     onKill: (ClientSession) -> Unit,
+    onOpenDoc: (SessionDoc) -> Unit,
 ) {
     if (!nodeMatchesSlice(node, slice)) {
         return
@@ -1211,6 +1228,7 @@ private fun WatchTree(
             onUpdateWhat = { onUpdateWhat(node.session) },
             onRegenerateWhat = { onRegenerateWhat(node.session) },
             onKill = { onKill(node.session) },
+            onOpenDoc = onOpenDoc,
         )
     }
 
@@ -1219,7 +1237,7 @@ private fun WatchTree(
     node.sameRepoChildren
         .filter { nodeMatchesSlice(it, slice) }
         .forEach { child ->
-            WatchTree(child, childDepth, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill)
+            WatchTree(child, childDepth, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill, onOpenDoc)
     }
 
     node.crossRepoGroups.forEach { group ->
@@ -1236,7 +1254,7 @@ private fun WatchTree(
             fontFamily = FontFamily.Monospace,
         )
         visibleChildren.forEach { child ->
-            WatchTree(child, groupDepth + 1, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill)
+            WatchTree(child, groupDepth + 1, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill, onOpenDoc)
         }
     }
 }
@@ -1259,6 +1277,7 @@ private fun SessionRow(
     onUpdateWhat: () -> Unit,
     onRegenerateWhat: () -> Unit,
     onKill: () -> Unit,
+    onOpenDoc: (SessionDoc) -> Unit,
 ) {
     val attachSupported = session.mobileTerminal?.supported == true || session.termuxAttach?.supported == true
     val hasSummary = whatState?.entries?.isNotEmpty() == true
@@ -1383,7 +1402,7 @@ private fun SessionRow(
                             }
                         }
                     }
-                    AgentWorkSections(session)
+                    AgentWorkSections(session, onOpenDoc)
                     if (hasSummary || whatState?.status?.let { it != "idle" } == true) {
                         AgentDisclosure("Summary", relativeSummaryAge(whatState?.entries?.lastOrNull()?.createdAt)) {
                             whatState?.let { WhatSummarySection(it, onUpdateWhat, onRegenerateWhat) }
@@ -1446,7 +1465,16 @@ private fun ActivityDetail(title: String, detail: String?, tint: Color) {
 }
 
 @Composable
-private fun AgentWorkSections(session: ClientSession) {
+private fun AgentWorkSections(session: ClientSession, onOpenDoc: (SessionDoc) -> Unit) {
+    val docs = session.obligations?.docs.orEmpty()
+    if (docs.isNotEmpty()) {
+        Surface(color = Emerald.copy(alpha = 0.06f), shape = RoundedCornerShape(12.dp)) {
+            Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                Text("Docs", style = MaterialTheme.typography.titleSmall, color = Emerald, modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp))
+                docs.forEach { doc -> DocRow(doc, onClick = { onOpenDoc(doc) }) }
+            }
+        }
+    }
     val waiting = session.obligations?.waitingOn.orEmpty()
     val reviews = waiting.filter { it.kind == "review" }
     val reviewHistory = session.obligations?.reviewHistory.orEmpty()
@@ -1497,6 +1525,29 @@ private fun AgentWorkSections(session: ClientSession) {
     if (finished.isNotEmpty()) AgentDisclosure("Recent job history", "${finished.size} finished jobs") {
         finished.forEach { job -> ActivityDetail(job.label, jobSummary(job).removePrefix("${job.label} · "), if (job.exitCode == null || job.exitCode == 0) TextSecondary else Rose) }
     }
+}
+
+@Composable
+private fun DocRow(doc: SessionDoc, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(doc.title.ifBlank { docDisplayName(doc) }, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Text("Published ${relativeSummaryAge(doc.publishedAt).replaceFirstChar { it.lowercaseChar() }}", style = MaterialTheme.typography.bodySmall, color = TextMuted, maxLines = 1)
+        }
+        StatusChip(label = docStateLabel(doc.state), tint = docStateTint(doc.state))
+    }
+}
+
+private fun docStateTint(state: String): Color = when (state) {
+    "new" -> Cyan
+    "updated" -> Amber
+    "review_requested" -> Fuchsia
+    "reviewed" -> Emerald
+    else -> TextMuted
 }
 
 @Composable

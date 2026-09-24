@@ -18,6 +18,7 @@ import java.util.UUID
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
+import li.rajeshgo.sm.data.remote.HttpClientFactory
 import li.rajeshgo.sm.data.repository.SessionManagerAuthException
 import li.rajeshgo.sm.data.repository.SessionManagerBackendUnavailableException
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
@@ -110,6 +111,18 @@ class WatchViewModel(application: Application, private val savedState: androidx.
 
     private val _uiState = MutableStateFlow(WatchUiState())
     val uiState: StateFlow<WatchUiState> = _uiState
+
+    /** Server URL, bearer token and device certificate for the doc reader; null when signed out. */
+    suspend fun docReaderAuth(): DocReaderAuth? {
+        val serverUrl = settingsRepository.serverUrl.first().trim()
+        val accessToken = settingsRepository.accessToken.first().trim()
+        if (serverUrl.isBlank() || accessToken.isBlank()) return null
+        return DocReaderAuth(
+            serverUrl = serverUrl,
+            accessToken = accessToken,
+            clientCertificate = HttpClientFactory(settingsRepository).deviceClientCertificate(),
+        )
+    }
 
     init {
         viewModelScope.launch {
