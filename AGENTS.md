@@ -2,7 +2,7 @@ Read .agent-os/agents.md for workflow instructions and persona definitions.
 
 # Session Manager
 
-Rust multi-agent orchestration system for Claude Code and Codex. Manages sessions, parent-child agent hierarchies, durable messaging, queue jobs, and the Android operator app.
+Rust multi-agent orchestration system for Claude Code and Codex. It manages sessions, parent-child agent hierarchies, durable messaging, queue jobs, and the Android operator app.
 
 ## Key Components
 
