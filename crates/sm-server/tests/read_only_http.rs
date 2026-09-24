@@ -27,9 +27,10 @@ use sm_server::{
         SmSendConfig, ToolLoggingConfig, UsageAccountConfig,
     },
     http::{
-        router, AppState, GitHubPullRequestState, GitHubReviewComment, GitHubReviewMatch,
-        GitHubReviewPoster,
+        router, AppState, DocFetchError, GitHubPullRequestState, GitHubReviewComment,
+        GitHubReviewMatch, GitHubReviewPoster, OwnerDocSource,
     },
+    owner_docs::git_blob_sha,
     runtime::TmuxRuntime,
     sessions::{SendCoreInputRequest, SessionStore},
     usage_burn::{BurnWindowSample, UsageBurnStore},
@@ -4467,7 +4468,7 @@ async fn queue_job_log_reads_a_bounded_derived_tail() {
     assert_eq!(payload["text"], "two\nthree\n");
     let (status, payload) = get_json(app.clone(), "/session-obligations").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["schema_version"], 1);
+    assert_eq!(payload["schema_version"], 2);
     assert_eq!(payload["sessions"].as_array().unwrap().len(), 2);
     assert_eq!(payload["sessions"][0]["session_id"], "notify1");
     assert_eq!(
@@ -22108,4 +22109,339 @@ fn unix_timestamp() -> i64 {
 
 fn queue_completion_matches(text: &str, id: &str, state: &str) -> bool {
     text.contains(&format!("completed: {state}")) && text.contains(&format!("ID: {id}"))
+}
+
+#[derive(Clone, Default)]
+struct StubDocSource {
+    files: Arc<Mutex<std::collections::BTreeMap<(String, String, String), Vec<u8>>>>,
+    fetches: Arc<AtomicU64>,
+    wrong_blob_sha: bool,
+}
+
+impl StubDocSource {
+    fn put(&self, repo: &str, path: &str, sha: &str, bytes: &[u8]) {
+        self.files.lock().unwrap().insert(
+            (repo.to_owned(), path.to_owned(), sha.to_owned()),
+            bytes.to_vec(),
+        );
+    }
+}
+
+impl OwnerDocSource for StubDocSource {
+    fn fetch_doc(&self, repo: &str, path: &str, sha: &str) -> Result<Vec<u8>, DocFetchError> {
+        self.fetches.fetch_add(1, Ordering::SeqCst);
+        self.files
+            .lock()
+            .unwrap()
+            .get(&(repo.to_owned(), path.to_owned(), sha.to_owned()))
+            .cloned()
+            .ok_or_else(|| DocFetchError::NotFound("gh: Not Found (HTTP 404)".to_owned()))
+    }
+
+    fn fetch_doc_with_blob_sha(
+        &self,
+        repo: &str,
+        path: &str,
+        sha: &str,
+    ) -> Result<(Vec<u8>, String), DocFetchError> {
+        let bytes = self.fetch_doc(repo, path, sha)?;
+        let blob = if self.wrong_blob_sha {
+            "0".repeat(40)
+        } else {
+            git_blob_sha(&bytes)
+        };
+        Ok((bytes, blob))
+    }
+}
+
+fn owner_docs_app(source: StubDocSource) -> (axum::Router, PathBuf) {
+    let dir = unique_temp_path();
+    fs::create_dir_all(&dir).unwrap();
+    let state_file = dir.join("sessions.json");
+    let session = |id: &str, parent: Option<&str>| {
+        json!({
+            "id": id,
+            "name": format!("claude-{id}"),
+            "friendly_name": format!("{id}-writer"),
+            "working_dir": "/repo",
+            "tmux_session": format!("claude-{id}"),
+            "log_file": "/tmp/doc.log",
+            "status": "running",
+            "created_at": "2026-09-24T00:00:00Z",
+            "last_activity": "2026-09-24T00:01:00Z",
+            "parent_session_id": parent,
+        })
+    };
+    fs::write(
+        &state_file,
+        json!({"sessions": [
+            session("author01", None),
+            session("child001", Some("author01")),
+            session("other001", None),
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: dir.join("message_queue.db").display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    (
+        router(AppState::new(config).with_owner_doc_source(Arc::new(source))),
+        dir,
+    )
+}
+
+fn owner_doc_session<'a>(obligations: &'a Value, session_id: &str) -> &'a Value {
+    obligations["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["session_id"] == session_id)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn owner_docs_publish_read_and_project_state() {
+    const REPO: &str = "acme/widgets";
+    let (c1, c2, c3) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+    let memo = b"<!doctype html><html><head><title>Decision memo</title></head>\n<body><p>Buy</p></body></html>\n";
+    let memo_v2 = b"<!doctype html><html><head><title>Decision memo</title></head>\n<body><p>Sell</p></body></html>\n";
+    let source = StubDocSource::default();
+    source.put(REPO, "specs/memo.html", &c1, memo);
+    source.put(REPO, "specs/memo.html", &c2, memo); // unrelated push
+    source.put(REPO, "specs/memo.html", &c3, memo_v2);
+    source.put(
+        REPO,
+        "notes/readout.md",
+        &c1,
+        b"# Readout\n\n| a |\n|---|\n| 1 |\n",
+    );
+    source.put(REPO, "logs/run.txt", &c1, b"<b>not markup</b>");
+    let (app, _dir) = owner_docs_app(source.clone());
+
+    let publish = |path: &str, sha: &str, pr: Option<i64>, session: &str| {
+        json!({"repo": REPO, "path": path, "commit_sha": sha, "pr_number": pr,
+               "session_id": session})
+    };
+    let (status, doc) = post_json(
+        app.clone(),
+        "/docs",
+        publish("specs/memo.html", &c1, Some(12), "author01"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    assert_eq!(doc["created"], true);
+    assert_eq!(doc["title"], "Decision memo");
+    assert_eq!(doc["state"], "new");
+    assert_eq!(doc["author_session_name"], "author01-writer");
+    assert_eq!(doc["latest_blob_sha"], git_blob_sha(memo));
+    let id = doc["id"].as_str().unwrap().to_owned();
+    assert_eq!(doc["reader_path"], format!("/docs/{id}"));
+
+    // Reader default: the latest published SHA.
+    let (status, headers, _) = get_response(app.clone(), &format!("/docs/{id}")).await;
+    assert_eq!(status, StatusCode::FOUND);
+    assert_eq!(headers["location"], format!("/docs/{id}/view?sha={c1}"));
+
+    // HTML is served as-is, from the cache filled at publish.
+    let fetches = source.fetches.load(Ordering::SeqCst);
+    let (status, headers, body) =
+        get_response(app.clone(), &format!("/docs/{id}/view?sha={c1}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "text/html; charset=utf-8");
+    assert_eq!(body, memo);
+    assert_eq!(source.fetches.load(Ordering::SeqCst), fetches);
+
+    let (_, obligations) = get_json(app.clone(), "/session-obligations").await;
+    assert_eq!(obligations["schema_version"], 2);
+    let author = owner_doc_session(&obligations, "author01");
+    assert_eq!(author["docs"][0]["id"], id);
+    assert_eq!(author["docs"][0]["state"], "read");
+    assert_eq!(author["docs"][0]["pr_number"], 12);
+    assert_eq!(author["docs"][0]["latest_commit_sha"], c1);
+    assert!(author["waiting_on"].as_array().unwrap().is_empty());
+
+    // Republishing the same key is a publish event on the same doc; a push
+    // that leaves the blob alone keeps it read.
+    let (_, again) = post_json(
+        app.clone(),
+        "/docs",
+        publish("specs/memo.html", &c2, Some(12), "author01"),
+    )
+    .await;
+    assert_eq!(again["id"], id);
+    assert_eq!(again["created"], false);
+    assert_eq!(again["publish_count"], 2);
+    assert_eq!(again["state"], "read");
+    let (_, again) = post_json(
+        app.clone(),
+        "/docs",
+        json!({"repo": REPO, "path": "specs/memo.html", "commit_sha": c3, "pr_number": 12,
+               "session_id": "author01", "title": "Memo v2", "note": "addressed review"}),
+    )
+    .await;
+    assert_eq!(again["state"], "updated");
+    assert_eq!(again["title"], "Memo v2");
+    assert_eq!(again["note"], "addressed review");
+    // Commit-only publish of the same path is a different doc.
+    let (_, commit_only) = post_json(
+        app.clone(),
+        "/docs",
+        publish("specs/memo.html", &c1, None, "author01"),
+    )
+    .await;
+    assert_eq!(commit_only["created"], true);
+    assert_ne!(commit_only["id"], id);
+
+    let (_, meta) = get_json(app.clone(), &format!("/docs/{id}?format=json")).await;
+    assert_eq!(meta["publishes"].as_array().unwrap().len(), 3);
+    assert_eq!(meta["latest_commit_sha"], c3);
+
+    // Markdown renders; other files are escaped inside <pre>.
+    let (_, md) = post_json(
+        app.clone(),
+        "/docs",
+        publish("notes/readout.md", &c1, None, "child001"),
+    )
+    .await;
+    assert_eq!(md["title"], "Readout");
+    let (_, _, body) = get_response(
+        app.clone(),
+        &format!("/docs/{}/view", md["id"].as_str().unwrap()),
+    )
+    .await;
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("<h1>Readout</h1>") && body.contains("<table>"));
+    let (_, txt) = post_json(
+        app.clone(),
+        "/docs",
+        publish("logs/run.txt", &c1, None, "other001"),
+    )
+    .await;
+    let txt_id = txt["id"].as_str().unwrap().to_owned();
+    let (_, _, body) = get_response(app.clone(), &format!("/docs/{txt_id}/view")).await;
+    assert!(String::from_utf8(body)
+        .unwrap()
+        .contains("<pre>&lt;b&gt;not markup&lt;/b&gt;</pre>"));
+    let (status, headers, body) = get_response(app.clone(), &format!("/docs/{txt_id}/raw")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "text/plain; charset=utf-8");
+    assert_eq!(body, b"<b>not markup</b>");
+
+    // The session tree list includes descendants and nothing else.
+    let (_, list) = get_json(app.clone(), "/docs?session=author01&tree=true").await;
+    let mut listed: Vec<_> = list["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|doc| doc["path"].as_str().unwrap().to_owned())
+        .collect();
+    listed.sort();
+    assert_eq!(
+        listed,
+        ["notes/readout.md", "specs/memo.html", "specs/memo.html"]
+    );
+    let (_, list) = get_json(app.clone(), "/docs?session=author01").await;
+    assert_eq!(list["docs"].as_array().unwrap().len(), 2);
+
+    // Retract hides the doc from lists and the projection only.
+    let (status, retracted) =
+        post_json(app.clone(), &format!("/docs/{txt_id}/retract"), json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(retracted["retracted_at"].is_string());
+    let (_, list) = get_json(app.clone(), "/docs").await;
+    assert!(!list["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|doc| doc["id"] == txt_id.as_str()));
+    let (_, obligations) = get_json(app.clone(), "/session-obligations").await;
+    assert!(obligations["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["session_id"] != "other001"));
+    let (status, _, _) = get_response(app.clone(), &format!("/docs/{txt_id}/view")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn owner_docs_publish_rejects_bad_input_and_reports_missing_files() {
+    let source = StubDocSource::default();
+    source.put("acme/widgets", "memo.md", &"a".repeat(40), b"# Memo\n");
+    let (app, _dir) = owner_docs_app(source);
+    let body = |overrides: Value| {
+        let mut body = json!({"repo": "acme/widgets", "path": "memo.md",
+                              "commit_sha": "a".repeat(40), "session_id": "author01"});
+        for (key, value) in overrides.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        body
+    };
+    for (overrides, expected) in [
+        (json!({"path": "../etc/passwd"}), StatusCode::BAD_REQUEST),
+        (json!({"repo": "nope"}), StatusCode::BAD_REQUEST),
+        (json!({"commit_sha": "HEAD"}), StatusCode::BAD_REQUEST),
+        (json!({"session_id": "missing1"}), StatusCode::BAD_REQUEST),
+        (json!({"review": true}), StatusCode::BAD_REQUEST),
+        (json!({"path": "absent.md"}), StatusCode::NOT_FOUND),
+    ] {
+        let (status, payload) = post_json(app.clone(), "/docs", body(overrides.clone())).await;
+        assert_eq!(status, expected, "{overrides} -> {payload}");
+    }
+    let (status, _) = get_json(app.clone(), "/docs/zzzzzzzz").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = get_json(app.clone(), "/docs/0123abcd/view?sha=HEAD").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let mut mismatched = StubDocSource::default();
+    mismatched.wrong_blob_sha = true;
+    mismatched.put("acme/widgets", "memo.md", &"a".repeat(40), b"# Memo\n");
+    let (app, _dir) = owner_docs_app(mismatched);
+    let (status, payload) = post_json(app, "/docs", body(json!({}))).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(payload["detail"]
+        .as_str()
+        .unwrap()
+        .contains("Blob SHA mismatch"));
+}
+
+#[tokio::test]
+async fn owner_doc_routes_require_auth_when_google_auth_is_enabled() {
+    let app = router(AppState::new(AppConfig {
+        google_auth: GoogleAuthConfig {
+            enabled: true,
+            public_host: Some("sm.example.com".to_owned()),
+            ..GoogleAuthConfig::default()
+        },
+        ..AppConfig::default()
+    }));
+    for uri in [
+        "/docs",
+        "/docs/0123abcd",
+        "/docs/0123abcd/view",
+        "/docs/0123abcd/raw",
+    ] {
+        let (status, _) = get_json_with_host_and_peer(
+            app.clone(),
+            uri,
+            "sm.example.com",
+            Some(SocketAddr::from(([203, 0, 113, 7], 443))),
+        )
+        .await;
+        assert!(
+            matches!(
+                status,
+                StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE
+            ),
+            "{uri}: {status}"
+        );
+    }
 }

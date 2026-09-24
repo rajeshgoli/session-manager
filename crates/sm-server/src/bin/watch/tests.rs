@@ -846,3 +846,42 @@ fn active_row_does_not_display_stale_idle_lifecycle_status() {
     assert!(!row.text.contains("idle"));
     assert_eq!(row.style, "\x1b[32m");
 }
+
+#[test]
+fn docs_mark_the_session_row_and_list_reader_urls_when_expanded() {
+    let a = args();
+    let mut view = View::new(&a);
+    view.base_url = "http://127.0.0.1:8420".into();
+    let snap = Snapshot {
+        sessions: vec![session("a", "", "/repo"), session("b", "", "/repo")],
+        obligations: vec![
+            json!({"session_id":"a", "waiting_on":[], "review_history":[], "docs":[
+                {"id":"d0c00001","title":"Decision memo","state":"new","reader_path":"/docs/d0c00001"},
+                {"id":"d0c00002","title":"Readout","state":"updated","reader_path":"/docs/d0c00002"},
+                {"id":"d0c00003","title":"Old notes","state":"read","reader_path":"/docs/d0c00003"}]}),
+            // An older server omits `docs`; the row stays unmarked.
+            json!({"session_id":"b", "waiting_on":[], "review_history":[]}),
+        ],
+        ..Default::default()
+    };
+    let row = |rows: &[Row], id: &str| {
+        rows.iter()
+            .find(|r| r.target == Some(Target::Session(id.into())))
+            .unwrap()
+            .text
+            .clone()
+    };
+    let rows = view.rows(&snap, &a, 0);
+    assert!(row(&rows, "a").ends_with(" [docs 2]"));
+    assert!(!row(&rows, "b").contains("[docs"));
+    assert!(!rows.iter().any(|r| r.text.contains("Decision memo")));
+
+    view.expanded.insert("a".into());
+    let rows = view.rows(&snap, &a, 0);
+    assert!(rows
+        .iter()
+        .any(|r| r.text == "   doc · Decision memo · new · http://127.0.0.1:8420/docs/d0c00001"));
+    assert!(rows.iter().any(|r| r
+        .text
+        .contains("Old notes · read · http://127.0.0.1:8420/docs/d0c00003")));
+}

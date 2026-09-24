@@ -18,6 +18,7 @@ const DEFAULT_API_URL: &str = "http://127.0.0.1:8420";
 const CONTEXT_COMPACT_STALE_SECONDS: i64 = 10 * 60;
 const CLIENT_CONFIG_ENV: &str = "SM_CLIENT_CONFIG";
 const CLIENT_CONFIG_SUBPATH: &str = "session-manager/client.yaml";
+mod doc;
 mod watch;
 
 #[derive(Parser)]
@@ -98,6 +99,8 @@ enum Command {
     #[command(name = "codex-2")]
     Codex2(ProviderLaunchArgs),
     Watch(WatchArgs),
+    /// Publish and list docs written for the owner
+    Doc(doc::DocArgs),
 }
 
 #[derive(Args)]
@@ -1157,6 +1160,7 @@ fn run() -> Result<()> {
         Command::Review(args) => run_review(&client, args)?,
         Command::RequestCodexReview(args) => run_request_codex_review(&client, args)?,
         Command::Watch(args) => run_watch(&api_url, args)?,
+        Command::Doc(args) => doc::run_doc(&client, args)?,
         _ => bail!("this retained command is not implemented in the Rust core slice yet"),
     }
     Ok(())
@@ -4733,6 +4737,14 @@ impl ApiClient {
                 format!("/{path_prefix}")
             },
         })
+    }
+
+    /// Absolute URL for a server path, as this client reaches the server.
+    fn url_for(&self, path: &str) -> String {
+        format!(
+            "{}://{}{}{}",
+            self.scheme, self.authority, self.path_prefix, path
+        )
     }
 
     fn get_json(&self, path: &str) -> Result<Value> {

@@ -2619,6 +2619,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "INTEGER DEFAULT 0",
     )?;
     init_codex_review_requests_schema(conn)?;
+    crate::owner_docs::init_owner_docs_schema(conn)?;
     Ok(())
 }
 

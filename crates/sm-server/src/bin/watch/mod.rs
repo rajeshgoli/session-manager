@@ -177,6 +177,42 @@ fn obligation_context(
     lines
 }
 
+/// Docs the owner hasn't read yet, or that await the owner's review.
+fn unread_doc_count(obligation: &Value) -> usize {
+    array(obligation, "docs")
+        .iter()
+        .filter(|doc| matches!(s(doc, "state"), "new" | "updated" | "review_requested"))
+        .count()
+}
+
+/// Expanded view: one line per doc with its reader URL.
+fn doc_rows(obligation: &Value, prefix: &str, base_url: &str) -> Vec<Row> {
+    array(obligation, "docs")
+        .iter()
+        .map(|doc| {
+            let path = s(doc, "reader_path");
+            let path = if path.is_empty() {
+                format!("/docs/{}", s(doc, "id"))
+            } else {
+                path.to_owned()
+            };
+            let state = s(doc, "state").replace('_', " ");
+            Row {
+                text: format!(
+                    "{prefix}   doc · {} · {state} · {base_url}{path}",
+                    s(doc, "title")
+                ),
+                target: None,
+                style: if matches!(s(doc, "state"), "read" | "reviewed") {
+                    ""
+                } else {
+                    "\x1b[36m"
+                },
+            }
+        })
+        .collect()
+}
+
 /// One visible row per PR combines the current watch with retained review counts.
 fn review_rows(
     obligation: &Value,
@@ -825,6 +861,8 @@ struct View {
     retire: Option<(String, Instant)>,
     busy: bool,
     free_scroll: bool,
+    /// API base, for absolute doc reader URLs.
+    base_url: String,
 }
 impl View {
     fn new(args: &WatchArgs) -> Self {
@@ -850,6 +888,7 @@ impl View {
             retire: None,
             busy: false,
             free_scroll: false,
+            base_url: String::new(),
         }
     }
     fn interest(&self) -> Interest {
@@ -1031,9 +1070,10 @@ impl View {
         } else {
             s(v, "activity_state")
         };
+        let unread_docs = obligation.map_or(0, unread_doc_count);
         rows.push(Row {
             text: format!(
-                "{prefix}{} {:20} {:8} {:10} {:5} {:10} {:8} {:8}",
+                "{prefix}{} {:20} {:8} {:10} {:5} {:10} {:8} {:8}{}",
                 if state == "waiting" { "◷ " } else { "+-" },
                 clipped(name(v), 20),
                 id,
@@ -1041,7 +1081,12 @@ impl View {
                 age(s(v, "last_activity"), now),
                 s(v, "provider"),
                 s(v, "role"),
-                s(v, "node")
+                s(v, "node"),
+                if unread_docs > 0 {
+                    format!(" [docs {unread_docs}]")
+                } else {
+                    String::new()
+                }
             ),
             target: Some(Target::Session(id.into())),
             style: match state {
@@ -1133,6 +1178,9 @@ impl View {
                     .map(|k| s(v, k))
                     .find(|v| !v.is_empty())
                     .unwrap_or("");
+                if let Some(obligation) = obligation {
+                    rows.extend(doc_rows(obligation, &prefix, &self.base_url));
+                }
                 rows.push(Row::plain(format!(
                     "{prefix}   thinking duration: {}",
                     if matches!(state, "working" | "thinking") {
@@ -1752,6 +1800,7 @@ pub(super) fn run(url: &str, mut args: WatchArgs) -> Result<()> {
     let terminal = Terminal::enter()?;
     let worker = Worker::start(Client::new(url), &args);
     let mut view = View::new(&args);
+    view.base_url = url.trim_end_matches('/').into();
     let mut interest = Interest::default();
     let mut last_frame = String::new();
     while !STOP.load(Ordering::Relaxed) {
