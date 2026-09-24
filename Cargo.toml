@@ -17,6 +17,7 @@ futures-util = "0.3"
 jsonwebtoken = "9.3"
 nix = "0.29"
 p256 = "0.13"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 qrcode = "0.14"
 rand_core = "0.6"
 serde = "1.0"

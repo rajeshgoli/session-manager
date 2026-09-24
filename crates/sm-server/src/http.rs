@@ -311,6 +311,9 @@ pub enum GitHubPullRequestState {
     Closed { state: String },
 }
 
+mod docs;
+pub use docs::{DocFetchError, OwnerDocSource};
+
 pub trait GitHubReviewPoster: Send + Sync {
     fn post_initial_review_request(
         &self,
@@ -419,6 +422,7 @@ pub struct AppState {
     config: AppConfig,
     session_store: SessionStore,
     github_review_poster: Arc<dyn GitHubReviewPoster>,
+    owner_doc_source: Arc<dyn OwnerDocSource>,
     codex_review_creation_locks: Arc<AsyncMutex<BTreeSet<String>>>,
     codex_review_watcher_ids: Arc<Mutex<BTreeSet<String>>>,
     tmux_client_event_state: Arc<Mutex<TmuxClientEventState>>,
@@ -529,6 +533,7 @@ impl AppState {
             config,
             session_store,
             github_review_poster: Arc::new(GhCliReviewPoster),
+            owner_doc_source: Arc::new(docs::GhCliDocSource),
             codex_review_creation_locks: Arc::new(AsyncMutex::new(BTreeSet::new())),
             codex_review_watcher_ids: Arc::new(Mutex::new(BTreeSet::new())),
             tmux_client_event_state: Arc::new(Mutex::new(TmuxClientEventState::default())),
@@ -560,6 +565,11 @@ impl AppState {
 
     pub fn with_github_review_poster(mut self, poster: Arc<dyn GitHubReviewPoster>) -> Self {
         self.github_review_poster = poster;
+        self
+    }
+
+    pub fn with_owner_doc_source(mut self, source: Arc<dyn OwnerDocSource>) -> Self {
+        self.owner_doc_source = source;
         self
     }
 
@@ -1266,6 +1276,7 @@ pub fn router(state: AppState) -> Router {
     ) {
         eprintln!("Codex review request schema initialization failed: {error:#}");
     }
+    docs::init_owner_docs(&state.config);
     recover_codex_review_request_watchers(state.clone());
     recover_btw_requests(state.clone());
     if state.config.rust_core.runtime_enabled {
@@ -1330,6 +1341,14 @@ pub fn router(state: AppState) -> Router {
             get(get_codex_review_request).delete(cancel_codex_review_request),
         )
         .route("/btw-requests/{request_id}", get(get_btw_request))
+        .route(
+            "/docs",
+            get(docs::list_owner_docs).post(docs::publish_owner_doc),
+        )
+        .route("/docs/{doc_id}", get(docs::get_owner_doc))
+        .route("/docs/{doc_id}/view", get(docs::view_owner_doc))
+        .route("/docs/{doc_id}/raw", get(docs::raw_owner_doc))
+        .route("/docs/{doc_id}/retract", post(docs::retract_owner_doc))
         .route("/scheduler/remind", post(schedule_reminder))
         .route(
             "/scheduler/remind/{reminder_id}",
@@ -5931,12 +5950,18 @@ async fn list_session_obligations(
             ..Default::default()
         },
     )?;
-    Ok(Json(project_session_obligations(&jobs, &reviews)))
+    let docs = docs::obligation_doc_summaries(&state)?;
+    Ok(Json(project_session_obligations(&jobs, &reviews, &docs)))
+}
+
+fn new_obligation_entry(session_id: &str) -> Value {
+    json!({"session_id": session_id, "waiting_on": [], "review_history": [], "docs": []})
 }
 
 fn project_session_obligations(
     jobs: &[QueueJobRecord],
     reviews: &[CodexReviewRequestRegistration],
+    docs: &[crate::owner_docs::OwnerDocSummary],
 ) -> Value {
     let mut sessions = BTreeMap::<String, Value>::new();
     for job in jobs
@@ -5946,9 +5971,9 @@ fn project_session_obligations(
         // A result is owed to the notification recipient, even when another
         // agent submitted it. Jobs without a recipient carry no obligation.
         if let Some(id) = job.notify_session_id.as_deref().filter(|id| !id.is_empty()) {
-            let entry = sessions.entry(id.to_owned()).or_insert_with(
-                || json!({"session_id": id, "waiting_on": [], "review_history": []}),
-            );
+            let entry = sessions
+                .entry(id.to_owned())
+                .or_insert_with(|| new_obligation_entry(id));
             entry["waiting_on"].as_array_mut().unwrap().push(json!({
                 "kind": "queue_job", "id": job.id, "label": job.label,
                 "state": job.state, "since": job.queued_at,
@@ -5991,7 +6016,7 @@ fn project_session_obligations(
         let id = &review.notify_session_id;
         let entry = sessions
             .entry(id.clone())
-            .or_insert_with(|| json!({"session_id": id, "waiting_on": [], "review_history": []}));
+            .or_insert_with(|| new_obligation_entry(id));
         if review.is_active {
             entry["waiting_on"].as_array_mut().unwrap().push(json!({
                 "kind": "review", "id": review.id,
@@ -6003,10 +6028,22 @@ fn project_session_obligations(
             }));
         }
         if let Some(requester) = &review.requester_session_id {
-            sessions.entry(requester.clone()).or_insert_with(
-                || json!({"session_id": requester, "waiting_on": [], "review_history": []}),
-            );
+            sessions
+                .entry(requester.clone())
+                .or_insert_with(|| new_obligation_entry(requester));
         }
+    }
+    // Docs attach to the session that wrote them, newest publish first.
+    let mut docs: Vec<_> = docs.iter().collect();
+    docs.sort_by(|a, b| b.published_at.cmp(&a.published_at));
+    for doc in docs {
+        let author = &doc.doc.author_session_id;
+        sessions
+            .entry(author.clone())
+            .or_insert_with(|| new_obligation_entry(author))["docs"]
+            .as_array_mut()
+            .unwrap()
+            .push(docs::obligation_doc_entry(doc));
     }
     for (id, entry) in &mut sessions {
         if let Some(prs) = session_prs.get(id.as_str()) {
@@ -6032,7 +6069,7 @@ fn project_session_obligations(
             .map(str::to_owned);
         entry["waiting_since"] = json!(since);
     }
-    json!({"schema_version": 1, "sessions": sessions.into_values().collect::<Vec<_>>()})
+    json!({"schema_version": 2, "sessions": sessions.into_values().collect::<Vec<_>>()})
 }
 
 async fn list_queue_jobs(
@@ -6078,44 +6115,90 @@ async fn list_queue_jobs(
         RetainedQueueStore::list_queue_jobs_from_path(&queue_db_path, QueueJobFilters::default())?;
     let jobs = limit_terminal_jobs_per_session(jobs, query.terminal_limit_per_session);
     // Resolve names from one registry snapshot, not two full reads per job.
-    let sessions = state.session_store.list_sessions(!query.current_sessions_only)?;
-    let current_session_ids: BTreeSet<_> = sessions.iter().map(|session| session.id.clone()).collect();
+    let sessions = state
+        .session_store
+        .list_sessions(!query.current_sessions_only)?;
+    let current_session_ids: BTreeSet<_> =
+        sessions.iter().map(|session| session.id.clone()).collect();
     let mut names = BTreeMap::new();
     for session in &sessions {
         names.insert(session.id.clone(), session_display_name(session.clone()));
     }
     for session in &sessions {
         for alias in &session.aliases {
-            names.entry(alias.clone()).or_insert_with(|| session_display_name(session.clone()));
+            names
+                .entry(alias.clone())
+                .or_insert_with(|| session_display_name(session.clone()));
         }
     }
     for session in sessions {
-        for name in [session.cached_display_name(), session.friendly_name.clone(), session.native_title.clone(), Some(session.name.clone())].into_iter().flatten() {
-            names.entry(name).or_insert_with(|| session_display_name(session.clone()));
+        for name in [
+            session.cached_display_name(),
+            session.friendly_name.clone(),
+            session.native_title.clone(),
+            Some(session.name.clone()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            names
+                .entry(name)
+                .or_insert_with(|| session_display_name(session.clone()));
         }
     }
     let mut response_jobs = Vec::with_capacity(jobs.len());
     for job in jobs {
         if query.current_sessions_only {
-            let recipient = job.notify_session_id.as_deref().filter(|id| !id.trim().is_empty())
+            let recipient = job
+                .notify_session_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
                 .or(job.requester_session_id.as_deref());
-            if !recipient.is_some_and(|id| current_session_ids.contains(id.trim())) { continue; }
+            if !recipient.is_some_and(|id| current_session_ids.contains(id.trim())) {
+                continue;
+            }
         }
-        let requester_name = job.requester_session_id.as_ref().and_then(|id| names.get(id.trim())).cloned();
-        let notify_name = job.notify_session_id.as_ref().map(|id| names.get(id.trim()).unwrap_or(id).clone());
-        response_jobs.push(queue_job_response_with_names(&state, job, &active, requester_name, notify_name)?);
+        let requester_name = job
+            .requester_session_id
+            .as_ref()
+            .and_then(|id| names.get(id.trim()))
+            .cloned();
+        let notify_name = job
+            .notify_session_id
+            .as_ref()
+            .map(|id| names.get(id.trim()).unwrap_or(id).clone());
+        response_jobs.push(queue_job_response_with_names(
+            &state,
+            job,
+            &active,
+            requester_name,
+            notify_name,
+        )?);
     }
     Ok(Json(json!({ "jobs": response_jobs })))
 }
 
-fn limit_terminal_jobs_per_session(mut jobs: Vec<QueueJobRecord>, limit: Option<usize>) -> Vec<QueueJobRecord> {
-    let Some(limit) = limit else { return jobs; };
+fn limit_terminal_jobs_per_session(
+    mut jobs: Vec<QueueJobRecord>,
+    limit: Option<usize>,
+) -> Vec<QueueJobRecord> {
+    let Some(limit) = limit else {
+        return jobs;
+    };
     // The durable listing is oldest first; retain recent terminal work per recipient.
     jobs.reverse();
     let mut counts = BTreeMap::<String, usize>::new();
     jobs.retain(|job| {
-        if matches!(job.state.as_str(), "pending" | "running") { return true; }
-        let recipient = job.notify_session_id.as_ref().filter(|id| !id.is_empty()).or(job.requester_session_id.as_ref()).cloned().unwrap_or_default();
+        if matches!(job.state.as_str(), "pending" | "running") {
+            return true;
+        }
+        let recipient = job
+            .notify_session_id
+            .as_ref()
+            .filter(|id| !id.is_empty())
+            .or(job.requester_session_id.as_ref())
+            .cloned()
+            .unwrap_or_default();
         let count = counts.entry(recipient).or_default();
         *count += 1;
         *count <= limit
@@ -7131,7 +7214,12 @@ async fn mobile_terminal_websocket(mut socket: WebSocket, state: Arc<AppState>) 
     match consume_mobile_terminal_ticket(&state, &auth_frame) {
         Ok((ticket, attach_id, stop)) => {
             run_mobile_terminal_bridge(
-                socket, state, ticket, attach_id, stop, auth_frame.output_ack,
+                socket,
+                state,
+                ticket,
+                attach_id,
+                stop,
+                auth_frame.output_ack,
             )
             .await;
         }
@@ -13093,6 +13181,8 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/codex-review-requests"
         || path.starts_with("/codex-review-requests/")
         || path == "/session-obligations"
+        || path == "/docs"
+        || path.starts_with("/docs/")
         || path == "/queue-jobs"
         || path.starts_with("/queue-jobs/")
         || path == "/nodes"
@@ -14878,7 +14968,7 @@ mod tests {
             })
             .collect();
         let start = std::time::Instant::now();
-        let retained = project_session_obligations(&[], &history);
+        let retained = project_session_obligations(&[], &history, &[]);
         eprintln!("4000 retained reviews projected in {:?}", start.elapsed());
         let retained_sessions = retained["sessions"].as_array().unwrap();
         assert_eq!(retained_sessions.len(), 8000);
@@ -14889,7 +14979,7 @@ mod tests {
             assert!(session["waiting_on"].as_array().unwrap().is_empty());
         }
         let projected =
-            project_session_obligations(&[job.clone()], &[review, completed, duplicate]);
+            project_session_obligations(&[job.clone()], &[review, completed, duplicate], &[]);
         let sessions = projected["sessions"].as_array().unwrap();
         let recipient = sessions
             .iter()
@@ -14910,10 +15000,12 @@ mod tests {
         );
         let mut finished = job;
         finished.state = "succeeded".into();
-        assert!(project_session_obligations(&[finished], &[])["sessions"]
-            .as_array()
-            .unwrap()
-            .is_empty());
+        assert!(
+            project_session_obligations(&[finished], &[], &[])["sessions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert!(is_protected_read_surface("GET", "/session-obligations"));
     }
 
@@ -15359,7 +15451,15 @@ mod tests {
         ));
         let created = Command::new("tmux")
             .args([
-                "-L", &tmux.0, "-f", "/dev/null", "new-session", "-d", "-s", "activity", "cat",
+                "-L",
+                &tmux.0,
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                "activity",
+                "cat",
             ])
             .output()
             .unwrap();
@@ -19098,29 +19198,54 @@ mod tests {
     async fn mobile_job_history_keeps_recent_results_per_recipient_and_all_active_jobs() {
         let signing_key = SigningKey::random(&mut OsRng);
         let config = mobile_ticket_config(&signing_key);
-        let mut fixture: Value = serde_json::from_slice(&fs::read(&config.paths.state_file).unwrap()).unwrap();
+        let mut fixture: Value =
+            serde_json::from_slice(&fs::read(&config.paths.state_file).unwrap()).unwrap();
         let mut stopped = fixture["sessions"][0].clone();
         stopped["id"] = json!("other-agent");
         stopped["status"] = json!("stopped");
         stopped["completion_status"] = json!("retired");
         fixture["sessions"].as_array_mut().unwrap().push(stopped);
         fixture["sessions"][0]["friendly_name"] = json!("other-agent");
-        fs::write(&config.paths.state_file, serde_json::to_vec(&fixture).unwrap()).unwrap();
+        fs::write(
+            &config.paths.state_file,
+            serde_json::to_vec(&fixture).unwrap(),
+        )
+        .unwrap();
         let queue_dir = config.queue_runner_state_dir();
         for (index, (recipient, status)) in [
-            ("fork1001", "failed"), ("fork1001", "succeeded"),
-            ("other-agent", "memory_exceeded"), ("fork1001", "pending"),
+            ("fork1001", "failed"),
+            ("fork1001", "succeeded"),
+            ("other-agent", "memory_exceeded"),
+            ("fork1001", "pending"),
             ("fork1001", "running"),
-        ].into_iter().enumerate() {
-            let job = RetainedQueueStore::create_queue_job_in_state_dir(&queue_dir, crate::queue::CreateQueueJob {
-                job_type: "test".into(), label: format!("history-{index}"),
-                requester_session_id: Some("requester".into()), notify_session_id: recipient.into(),
-                cwd: queue_dir.display().to_string(), argv: Some(vec!["true".into()]), script: None,
-                env: BTreeMap::new(), timeout_seconds: 30, cpu_percent: None, gpu_percent: None, memory_bytes: None,
-            }).unwrap();
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let job = RetainedQueueStore::create_queue_job_in_state_dir(
+                &queue_dir,
+                crate::queue::CreateQueueJob {
+                    job_type: "test".into(),
+                    label: format!("history-{index}"),
+                    requester_session_id: Some("requester".into()),
+                    notify_session_id: recipient.into(),
+                    cwd: queue_dir.display().to_string(),
+                    argv: Some(vec!["true".into()]),
+                    script: None,
+                    env: BTreeMap::new(),
+                    timeout_seconds: 30,
+                    cpu_percent: None,
+                    gpu_percent: None,
+                    memory_bytes: None,
+                },
+            )
+            .unwrap();
             let conn = rusqlite::Connection::open(queue_dir.join("queue_runner.db")).unwrap();
-            conn.execute("UPDATE queue_jobs SET state = ?1, queued_at = ?2 WHERE id = ?3",
-                [status, &format!("2026-09-12T12:00:0{index}Z"), &job.id]).unwrap();
+            conn.execute(
+                "UPDATE queue_jobs SET state = ?1, queued_at = ?2 WHERE id = ?3",
+                [status, &format!("2026-09-12T12:00:0{index}Z"), &job.id],
+            )
+            .unwrap();
         }
         let app = router(AppState::new(config));
         for (uri, expected) in [
@@ -19175,17 +19300,30 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let signing_key = SigningKey::random(&mut OsRng);
         let mut config = mobile_ticket_config(&signing_key);
-        let root = std::path::Path::new(&config.paths.state_file).parent().unwrap().join("model-workspace");
+        let root = std::path::Path::new(&config.paths.state_file)
+            .parent()
+            .unwrap()
+            .join("model-workspace");
         fs::create_dir_all(&root).unwrap();
         let command = root.join("codex");
-        fs::write(&command, r#"#!/bin/sh
+        fs::write(
+            &command,
+            r#"#!/bin/sh
 printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
         config.codex.command = "./codex".into();
         let app = router(AppState::new(config));
-        let uri = format!("/client/session-models?provider=codex&working_dir={}", root.display());
-        let response = app.oneshot(local_request(Method::GET, &uri, Body::empty())).await.unwrap();
+        let uri = format!(
+            "/client/session-models?provider=codex&working_dir={}",
+            root.display()
+        );
+        let response = app
+            .oneshot(local_request(Method::GET, &uri, Body::empty()))
+            .await
+            .unwrap();
         let (status, body) = response_json(response).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["models"], json!(["workspace-model"]));

@@ -108,3 +108,12 @@ Then:
 2. **Correctness only** — no document nits, no wording preferences, no nits about following process for process's sake. That excludes process *preference*, not process *correctness*: when the thing under review is a workflow, an instruction file, CI, or a deploy step, its behaviour is the correctness surface, and a defect in it is a correctness finding however procedural it sounds. "This deploys without re-running the tests" is a bug, not a nit.
 3. **Any unresolved P1 blocks.** A P1 is resolved either by fixing it or by answering it: a P1 you classify invalid, with your reasoning posted on the PR, is resolved and does not block. It is unresolved only while it is neither fixed nor answered — otherwise a single false positive strands the PR forever, since there is no code change to push for the next round. If the reviewer re-raises the same P1 after reading your reasoning, that is a real disagreement: escalate it rather than looping. A round that returns only P2 or lower, or a clean review, exits the loop. Do not keep chasing P2s and P3s. `specs/1268_pr_review_process.md` does not apply here. Session manager is not a high risk repo. The high risk repo is my primary repo only. 
 5. Fix, push, and re-review at the exact head. Fewest rounds to correctness — which does not mean dropping correctness issues.
+
+## Docs for the owner
+
+If you need the owner to read a doc (memo, readout, decision doc), it must be in git
+and published with `sm doc publish`. Don't just leave it on disk or mention a path.
+
+- Read only: commit and push the file, then `sm doc publish <path>`. This pins the
+  pushed HEAD commit.
+- Prefer self-contained HTML (inline CSS, images as data URIs). Markdown also works.
