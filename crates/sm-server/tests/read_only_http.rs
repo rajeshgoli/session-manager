@@ -2048,6 +2048,64 @@ async fn inbound_email_requires_worker_proof_and_delivers_to_session() {
     ));
 }
 
+/// Mapping the webhook's hostname to the Cloudflare Access browser app must not
+/// change how the webhook authenticates: the worker secret, no assertion.
+#[tokio::test]
+async fn inbound_email_on_browser_access_hostname_still_uses_worker_secret() {
+    let state_file = write_session_fixture();
+    let bridge_config = write_email_bridge_config(None, Some("worker-secret"));
+    let mut config = config_with_state_file_and_email(&state_file, &bridge_config, true);
+    config.cloudflare_access.team_domain = Some("team.cloudflareaccess.com".to_owned());
+    config.cloudflare_access.browser.enabled = true;
+    config.cloudflare_access.browser.hostname = Some("sm.example.com".to_owned());
+    config.cloudflare_access.browser.jwt_audience = Some("sm-browser-aud".to_owned());
+    config.google_auth = GoogleAuthConfig {
+        enabled: true,
+        public_host: Some("sm.example.com".to_owned()),
+        client_id: Some("web-client-id".to_owned()),
+        client_secret: Some("web-client-secret".to_owned()),
+        redirect_uri: Some("https://sm.example.com/auth/google/callback".to_owned()),
+        allowlist_emails: vec!["operator@example.com".to_owned()],
+        session_cookie_secret: Some("session-cookie-secret".to_owned()),
+        ..GoogleAuthConfig::default()
+    };
+    let app = router(AppState::new(config));
+    // The tunnel connects from loopback with the public Host header.
+    let tunnel_peer = Some(SocketAddr::from(([127, 0, 0, 1], 49152)));
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app.clone(),
+        "/api/email-inbound",
+        json!({
+            "from_address": "operator@example.com",
+            "body": "no routing footer"
+        }),
+        &[("host", "sm.example.com")],
+        tunnel_peer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{payload}");
+    assert_eq!(payload["detail"], "Invalid email worker secret");
+
+    let (status, payload) = post_json_with_headers_and_peer(
+        app,
+        "/api/email-inbound",
+        json!({
+            "from_address": "operator@example.com",
+            "body": "no routing footer"
+        }),
+        &[
+            ("host", "sm.example.com"),
+            ("x-email-worker-secret", "worker-secret"),
+        ],
+        tunnel_peer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["status"], "ignored");
+    assert_eq!(payload["reason"], "missing_routing_footer");
+}
+
 #[tokio::test]
 async fn app_artifact_upload_metadata_and_downloads_are_auth_gated() {
     let artifact_root = unique_short_temp_dir("sm-rust-app-artifacts");

@@ -354,7 +354,12 @@ pub(crate) fn resolve_doc_publish(
     })
 }
 
+/// The browser-hostname link when the server has one, so the owner can open
+/// it off the studio; otherwise the API base this CLI talks to.
 fn reader_url(client: &ApiClient, doc: &Value) -> String {
+    if let Some(url) = doc["browser_url"].as_str().filter(|url| !url.is_empty()) {
+        return url.to_owned();
+    }
     match doc["reader_path"].as_str() {
         Some(path) => client.url_for(path),
         None => json_string(doc, "reader_url"),
@@ -499,6 +504,24 @@ fn run_doc_show(client: &ApiClient, args: DocShowArgs) -> Result<()> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn reader_url_prefers_the_browser_hostname_link() {
+        let client = ApiClient::parse("http://127.0.0.1:8420").unwrap();
+        let doc = json!({"reader_path": "/docs/d0c00001"});
+        assert_eq!(
+            reader_url(&client, &doc),
+            "http://127.0.0.1:8420/docs/d0c00001"
+        );
+        let doc = json!({
+            "reader_path": "/docs/d0c00001",
+            "browser_url": "https://sm.example.com/docs/d0c00001",
+        });
+        assert_eq!(
+            reader_url(&client, &doc),
+            "https://sm.example.com/docs/d0c00001"
+        );
+    }
 
     /// Scripted git/gh: `(program, args)` → output. Unscripted calls fail.
     #[derive(Default)]

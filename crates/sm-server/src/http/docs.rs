@@ -213,10 +213,32 @@ fn doc_reader_url(headers: &HeaderMap, doc_id: &str) -> String {
     format!("{scheme}://{host}{path}")
 }
 
-fn summary_json(summary: &OwnerDocSummary, headers: &HeaderMap) -> Result<Value, ApiError> {
+/// `https://<browser host>` when `cloudflare_access.browser` is enabled with a
+/// hostname: the base the owner opens doc links under from any browser.
+pub(super) fn doc_browser_base_url(config: &AppConfig) -> Option<String> {
+    let browser = &config.cloudflare_access.browser;
+    if !browser.enabled {
+        return None;
+    }
+    let host = browser
+        .hostname
+        .as_deref()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())?;
+    Some(format!("https://{}", host.trim_end_matches('/')))
+}
+
+fn summary_json(
+    config: &AppConfig,
+    summary: &OwnerDocSummary,
+    headers: &HeaderMap,
+) -> Result<Value, ApiError> {
     let mut value = serde_json::to_value(summary)?;
     value["reader_path"] = json!(doc_reader_path(&summary.doc.id));
     value["reader_url"] = json!(doc_reader_url(headers, &summary.doc.id));
+    if let Some(base) = doc_browser_base_url(config) {
+        value["browser_url"] = json!(format!("{base}{}", doc_reader_path(&summary.doc.id)));
+    }
     Ok(value)
 }
 
@@ -330,7 +352,7 @@ pub(super) async fn publish_owner_doc(
     let summary = store
         .summary(&published.doc.id)?
         .ok_or(ApiError::NotFound("Doc not found"))?;
-    let mut response = summary_json(&summary, &headers)?;
+    let mut response = summary_json(&state.config, &summary, &headers)?;
     response["created"] = json!(published.created);
     response["publish"] = serde_json::to_value(&published.publish)?;
     Ok(Json(response))
@@ -352,7 +374,7 @@ pub(super) async fn list_owner_docs(
     Query(query): Query<ListOwnerDocsQuery>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
+    ensure_owner_doc_read_allowed(&state, &request)?;
     let authors = match query
         .session
         .as_deref()
@@ -386,7 +408,7 @@ pub(super) async fn list_owner_docs(
     let docs = owner_doc_store(&state)
         .summaries(authors.as_ref(), query.include_retracted)?
         .iter()
-        .map(|summary| summary_json(summary, request.headers()))
+        .map(|summary| summary_json(&state.config, summary, request.headers()))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(json!({ "docs": docs })))
 }
@@ -403,14 +425,14 @@ pub(super) async fn get_owner_doc(
     Query(query): Query<GetOwnerDocQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
+    ensure_owner_doc_read_allowed(&state, &request)?;
     let doc = find_doc(&state, &doc_id)?;
     let store = owner_doc_store(&state);
     let summary = store
         .summary(&doc.id)?
         .ok_or(ApiError::NotFound("Doc not found"))?;
     if query.format.as_deref() == Some("json") {
-        let mut value = summary_json(&summary, request.headers())?;
+        let mut value = summary_json(&state.config, &summary, request.headers())?;
         value["publishes"] = serde_json::to_value(store.publishes(&doc.id)?)?;
         return Ok(Json(value).into_response());
     }
@@ -478,7 +500,7 @@ pub(super) async fn view_owner_doc(
     Query(query): Query<DocShaQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
+    ensure_owner_doc_read_allowed(&state, &request)?;
     let (doc, _, bytes) = doc_bytes_for_request(&state, &doc_id, query.sha.as_deref()).await?;
     if let Err(error) = owner_doc_store(&state).record_view(&doc.id, &git_blob_sha(&bytes)) {
         eprintln!("Owner doc view record failed: {error:#}");
@@ -500,7 +522,7 @@ pub(super) async fn raw_owner_doc(
     Query(query): Query<DocShaQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
+    ensure_owner_doc_read_allowed(&state, &request)?;
     let (doc, _, bytes) = doc_bytes_for_request(&state, &doc_id, query.sha.as_deref()).await?;
     let file_name = doc
         .path
@@ -546,7 +568,7 @@ pub(super) async fn retract_owner_doc(
     let summary = store
         .summary(&doc_id)?
         .ok_or(ApiError::NotFound("Doc not found"))?;
-    Ok(Json(summary_json(&summary, &headers)?))
+    Ok(Json(summary_json(&state.config, &summary, &headers)?))
 }
 
 /// Docs for the obligations projection: stored data only, never `gh`.
@@ -554,8 +576,8 @@ pub(super) fn obligation_doc_summaries(state: &AppState) -> Result<Vec<OwnerDocS
     Ok(owner_doc_store(state).summaries(None, false)?)
 }
 
-pub(super) fn obligation_doc_entry(summary: &OwnerDocSummary) -> Value {
-    json!({
+pub(super) fn obligation_doc_entry(summary: &OwnerDocSummary, browser_base: Option<&str>) -> Value {
+    let mut entry = json!({
         "id": summary.doc.id,
         "title": summary.doc.title,
         "state": summary.state,
@@ -565,7 +587,11 @@ pub(super) fn obligation_doc_entry(summary: &OwnerDocSummary) -> Value {
         "latest_commit_sha": summary.latest_commit_sha,
         "published_at": summary.published_at,
         "reader_path": doc_reader_path(&summary.doc.id),
-    })
+    });
+    if let Some(base) = browser_base {
+        entry["browser_url"] = json!(format!("{base}{}", doc_reader_path(&summary.doc.id)));
+    }
+    entry
 }
 
 #[cfg(test)]
@@ -593,6 +619,20 @@ mod tests {
             DocFetchError::from_gh("HTTP 502".into()),
             DocFetchError::Other(_)
         ));
+    }
+
+    #[test]
+    fn browser_url_needs_an_enabled_browser_hostname() {
+        let mut config = AppConfig::default();
+        config.cloudflare_access.browser.hostname = Some("sm.example.com".to_owned());
+        assert_eq!(doc_browser_base_url(&config), None);
+        config.cloudflare_access.browser.enabled = true;
+        assert_eq!(
+            doc_browser_base_url(&config).as_deref(),
+            Some("https://sm.example.com")
+        );
+        config.cloudflare_access.browser.hostname = Some("  ".to_owned());
+        assert_eq!(doc_browser_base_url(&config), None);
     }
 
     #[test]
