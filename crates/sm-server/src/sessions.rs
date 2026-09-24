@@ -880,17 +880,11 @@ impl SessionStore {
             // subsequent restore can obtain authoritative absence checks.
             if session_predates_boot(&record, boot_time) {
                 if let Err(error) = session_runtime.ensure_recovery_server_anchor() {
-                    eprintln!(
-                        "preserving session {} after inconclusive reboot probe: {error:#}",
-                        record.id
-                    );
+                    eprintln!("preserving session {} after inconclusive reboot probe: {error:#}", record.id);
                     continue;
                 }
             }
-            if !matches!(
-                session_runtime.probe_session_for_restore(&record.tmux_session),
-                RestoreTmuxLivenessOutcome::Absent
-            ) {
+            if !matches!(session_runtime.probe_session_for_restore(&record.tmux_session), RestoreTmuxLivenessOutcome::Absent) {
                 continue;
             }
             if ensure_session_not_reparent_fenced(&state, &record.id).is_err() {
@@ -5696,8 +5690,7 @@ impl SessionStore {
         }
         if !record.is_stopped()
             && !matches!(
-                runtime
-                    .for_socket_name(record.tmux_socket_name.as_deref())
+                runtime.for_socket_name(record.tmux_socket_name.as_deref())
                     .probe_session_for_restore(&record.tmux_session),
                 RestoreTmuxLivenessOutcome::Absent
             )
@@ -13725,59 +13718,37 @@ fn session_lifetime_overlaps(
 }
 
 fn session_restore_is_fenced(state: &Value, session_id: &str) -> bool {
-    state
-        .get("sessions")
-        .and_then(Value::as_array)
+    state.get("sessions").and_then(Value::as_array)
         .and_then(|sessions| sessions.iter().find(|session| session["id"] == session_id))
         .and_then(|session| session["error_message"].as_str())
-        .is_some_and(|error| {
-            error.starts_with("codex_fork_restore_teardown_inconclusive:")
-                || error.starts_with("codex_fork_restore_recovery_inconclusive:")
-        })
+        .is_some_and(|error| error.starts_with("codex_fork_restore_teardown_inconclusive:")
+            || error.starts_with("codex_fork_restore_recovery_inconclusive:"))
 }
 
 /// Read the OS boot timestamp. Unknown platforms conservatively require tmux proof.
 fn system_boot_time() -> Option<OffsetDateTime> {
     #[cfg(target_os = "macos")]
     {
-        let output = Command::new("/usr/sbin/sysctl")
-            .args(["-n", "kern.boottime"])
-            .output()
-            .ok()?;
+        let output = Command::new("/usr/sbin/sysctl").args(["-n", "kern.boottime"]).output().ok()?;
         if !output.status.success() {
             return None;
         }
         let text = String::from_utf8(output.stdout).ok()?;
-        let seconds = text
-            .split("sec = ")
-            .nth(1)?
-            .split(',')
-            .next()?
-            .trim()
-            .parse::<i64>()
-            .ok()?;
+        let seconds = text.split("sec = ").nth(1)?.split(',').next()?.trim().parse::<i64>().ok()?;
         OffsetDateTime::from_unix_timestamp(seconds).ok()
     }
     #[cfg(target_os = "linux")]
     {
         let stat = fs::read_to_string("/proc/stat").ok()?;
-        let seconds = stat
-            .lines()
-            .find_map(|line| line.strip_prefix("btime "))?
-            .trim()
-            .parse::<i64>()
-            .ok()?;
+        let seconds = stat.lines().find_map(|line| line.strip_prefix("btime "))?.trim().parse::<i64>().ok()?;
         OffsetDateTime::from_unix_timestamp(seconds).ok()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        None
-    }
+    { None }
 }
 
 fn session_predates_boot(record: &SessionRecord, boot_time: Option<OffsetDateTime>) -> bool {
-    boot_time
-        .zip(parse_timestamp(&record.last_activity))
+    boot_time.zip(parse_timestamp(&record.last_activity))
         .is_some_and(|(boot, activity)| activity < boot)
 }
 
@@ -17392,10 +17363,7 @@ mod tests {
             fs::create_dir_all(&root).unwrap();
             let tmux = root.join("tmux");
             let marker = root.join("anchor-created");
-            fs::write(
-                &tmux,
-                format!(
-                    r#"#!/bin/sh
+            fs::write(&tmux, format!(r#"#!/bin/sh
 case "$*" in
   *new-session*)
     if [ '{failed_anchor}' = true ]; then echo 'permission denied' >&2; exit 1; fi
@@ -17405,12 +17373,7 @@ case "$*" in
     else echo 'no server running on default' >&2; fi
     exit 1 ;;
 esac
-"#,
-                    marker.display(),
-                    marker.display()
-                ),
-            )
-            .unwrap();
+"#, marker.display(), marker.display())).unwrap();
             fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
             let record = json!({"id": "lost", "name": "lost", "provider": "claude",
                 "working_dir": "/repo", "tmux_session": "lost", "provider_resume_id": "saved",
@@ -17422,9 +17385,7 @@ esac
             let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
                 .with_tmux_binary_for_test(tmux.display().to_string());
             let store = SessionStore::new(path).with_delivery_runtime(Some(runtime));
-            store
-                .reconcile_missing_session_runtimes_at_boot(parse_timestamp("2001-01-01T00:00:00Z"))
-                .unwrap();
+            store.reconcile_missing_session_runtimes_at_boot(parse_timestamp("2001-01-01T00:00:00Z")).unwrap();
             let state = store.load_raw_json_value().unwrap();
             if failed_anchor {
                 assert_eq!(state["sessions"][0], record);
@@ -17445,15 +17406,13 @@ esac
         let tmux = root.join("tmux");
         fs::write(&tmux, "#!/bin/sh\ncase \"$*\" in\n  *live*) exit 0 ;;\n  *ambiguous*) echo 'permission denied' >&2; exit 1 ;;\n  *) echo \"can't find session\" >&2; exit 1 ;;\nesac\n").unwrap();
         fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
-        let records = ["missing", "live", "ambiguous", "remote", "stopped"].map(|id| {
-            json!({
-                "id": id, "name": id, "provider": "claude", "working_dir": "/repo",
-                "tmux_session": id, "provider_resume_id": "saved-conversation",
-                "node": if id == "remote" { "studio" } else { "primary" },
-                "status": if id == "stopped" { "stopped" } else { "running" },
-                "created_at": now_rfc3339(), "last_activity": now_rfc3339()
-            })
-        });
+        let records = ["missing", "live", "ambiguous", "remote", "stopped"].map(|id| json!({
+            "id": id, "name": id, "provider": "claude", "working_dir": "/repo",
+            "tmux_session": id, "provider_resume_id": "saved-conversation",
+            "node": if id == "remote" { "studio" } else { "primary" },
+            "status": if id == "stopped" { "stopped" } else { "running" },
+            "created_at": now_rfc3339(), "last_activity": now_rfc3339()
+        }));
         let path = root.join("state.json");
         fs::write(&path, json!({"sessions": records}).to_string()).unwrap();
         let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
@@ -17462,23 +17421,13 @@ esac
         store.reconcile_missing_session_runtimes().unwrap();
         let state = store.load_raw_json_value().unwrap();
         assert_eq!(state["sessions"][0]["status"], "stopped");
-        assert_eq!(
-            state["sessions"][0]["provider_resume_id"],
-            "saved-conversation"
-        );
-        for index in 1..4 {
-            assert_eq!(state["sessions"][index]["status"], "running");
-        }
+        assert_eq!(state["sessions"][0]["provider_resume_id"], "saved-conversation");
+        for index in 1..4 { assert_eq!(state["sessions"][index]["status"], "running"); }
         assert_eq!(state["sessions"][4], records[4]);
         store.reconcile_missing_session_runtimes().unwrap();
         assert_eq!(store.load_raw_json_value().unwrap(), state);
         for id in ["live", "ambiguous"] {
-            assert!(matches!(
-                store
-                    .restore_core_session_with_runtime(id, &runtime)
-                    .unwrap(),
-                Some(CoreRestoreOutcome::NotStopped)
-            ));
+            assert!(matches!(store.restore_core_session_with_runtime(id, &runtime).unwrap(), Some(CoreRestoreOutcome::NotStopped)));
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -17488,16 +17437,9 @@ esac
         let record: SessionRecord = serde_json::from_value(json!({
             "id": "boot", "name": "boot", "working_dir": "/repo", "tmux_session": "boot",
             "created_at": "2026-09-07T10:00:00Z", "last_activity": "2026-09-07T11:00:00Z"
-        }))
-        .unwrap();
-        assert!(session_predates_boot(
-            &record,
-            parse_timestamp("2026-09-07T12:00:00Z")
-        ));
-        assert!(!session_predates_boot(
-            &record,
-            parse_timestamp("2026-09-07T09:00:00Z")
-        ));
+        })).unwrap();
+        assert!(session_predates_boot(&record, parse_timestamp("2026-09-07T12:00:00Z")));
+        assert!(!session_predates_boot(&record, parse_timestamp("2026-09-07T09:00:00Z")));
         assert!(!session_predates_boot(&record, None));
     }
 
@@ -17507,17 +17449,11 @@ esac
             let event = json!({"event_type": "thread/started", "session_id": "temporary-id",
                 "payload": {"thread": {"id": "temporary-id", "parentThreadId": null,
                     "threadSource": source, "ephemeral": ephemeral}}});
-            assert_eq!(
-                codex_fork_provider_resume_id(event.as_object().unwrap()),
-                None
-            );
+            assert_eq!(codex_fork_provider_resume_id(event.as_object().unwrap()), None);
         }
         let event = json!({"event_type": "thread/started", "payload": {"thread": {
             "id": "durable-id", "threadSource": "user", "ephemeral": false}}});
-        assert_eq!(
-            codex_fork_provider_resume_id(event.as_object().unwrap()),
-            Some("durable-id".to_owned())
-        );
+        assert_eq!(codex_fork_provider_resume_id(event.as_object().unwrap()), Some("durable-id".to_owned()));
     }
 
     #[test]
@@ -18089,25 +18025,15 @@ done
 printf '%s\n' '{"event_type":"thread_started","payload":{"thread":{"id":"durable-root"}}}' >> "$event_stream"
 sleep 30
 "#,
-        ) else {
-            return;
-        };
+        ) else { return; };
         let store = fixture.store();
         let mut state = store.load_raw_json_value().unwrap();
         state["sessions"][0]["status"] = json!("running");
         state["sessions"][0]["completion_status"] = Value::Null;
         state["sessions"][0]["stopped_at"] = Value::Null;
         store.write_raw_json_value(&state).unwrap();
-        assert!(matches!(
-            store
-                .restore_core_session_with_runtime("restore01", &fixture.runtime)
-                .unwrap(),
-            Some(CoreRestoreOutcome::Restored(_))
-        ));
-        assert_eq!(
-            store.load_raw_json_value().unwrap()["sessions"][0]["provider_resume_id"],
-            "durable-root"
-        );
+        assert!(matches!(store.restore_core_session_with_runtime("restore01", &fixture.runtime).unwrap(), Some(CoreRestoreOutcome::Restored(_))));
+        assert_eq!(store.load_raw_json_value().unwrap()["sessions"][0]["provider_resume_id"], "durable-root");
     }
 
     #[cfg(unix)]
