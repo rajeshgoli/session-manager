@@ -43,6 +43,8 @@ and a reason. "Should we delete this?" is not a question for me; "I recommend de
 
 **Reach me in-session, in prose.** Don't use AskUserQuestion unless I ask you to interview me. I am often on mobile — so prose, one question at a time works best. If sending me email, batch all your questions together.  Email (`sm email rajesh`) only on my standing ask, at an event I named such as convergence, or after roughly seventeen minutes of silence, which signals I stepped away. Say in the subject if it blocks.
 
+**Use sm doc publish to publish docs for me to read**: If you need me to read a doc (memo, readout, decision doc), it must be in git and published with `sm doc publish`. This makes it easy for me to read it on the sm app or on sm web.
+
 ---
 ## 2. Cost and context
 
@@ -109,31 +111,11 @@ Then:
 3. **Any unresolved P1 blocks.** A P1 is resolved either by fixing it or by answering it: a P1 you classify invalid, with your reasoning posted on the PR, is resolved and does not block. It is unresolved only while it is neither fixed nor answered — otherwise a single false positive strands the PR forever, since there is no code change to push for the next round. If the reviewer re-raises the same P1 after reading your reasoning, that is a real disagreement: escalate it rather than looping. A round that returns only P2 or lower, or a clean review, exits the loop. Do not keep chasing P2s and P3s. `specs/1268_pr_review_process.md` does not apply here. Session manager is not a high risk repo. The high risk repo is my primary repo only. 
 5. Fix, push, and re-review at the exact head. Fewest rounds to correctness — which does not mean dropping correctness issues.
 
-## Docs for the owner
-
-If you need the owner to read a doc (memo, readout, decision doc), it must be in git
-and published with `sm doc publish`. Don't just leave it on disk or mention a path.
-
-- Read only: commit and push the file, then `sm doc publish <path>`. This pins the
-  pushed HEAD commit.
-- Prefer self-contained HTML (inline CSS, images as data URIs). Markdown also works.
-
-## Repo reference
+## 5. Repo reference
 
 Session manager is a Rust server (Axum + Tokio, Rust 1.86+) that runs Claude Code and Codex agents in tmux, tracks parent–child agent trees, and carries durable messages, reminders, and queue jobs between them. State is in SQLite. The `sm` CLI is its client.
 
-| Where | What |
-|---|---|
-| `crates/sm-server/src/main.rs` | Server entry point |
-| `crates/sm-server/src/runtime.rs` | Provider and tmux lifecycle |
-| `crates/sm-server/src/sessions.rs` | Session persistence and lifecycle |
-| `crates/sm-server/src/http.rs` | HTTP API and hooks |
-| `crates/sm-server/src/queue.rs` | Message, reminder, and job queues |
-| `crates/sm-server/src/bin/sm.rs` | `sm` CLI |
-| `crates/sm-server/src/bin/watch/` | Terminal dashboard |
-| `hooks/` | Claude Code hooks: tool-use logging, context-usage status line. `scripts/install_notify_server_hook.sh` installs them all |
-
-**Restart the live server only with `scripts/restart-rust-server.sh`.** Running `cargo build` then `launchctl kickstart -k` by hand has taken the service down: launchd can pin a launch constraint into the job, and only re-registering the job clears it. The script also reinstalls the `sm` CLI. See `specs/1134_rust_restart_procedure.md`.
+**Restart the live server only with `scripts/restart-rust-server.sh`.** Running `cargo build` then `launchctl kickstart -k` by hand has taken the service down: launchd can pin a launch constraint into the job, and only re-registering the job clears it. The script also reinstalls the `sm` CLI. 
 
 **The live binaries are installed copies in `.local/bin/`, not `target/`.** An ordinary `cargo build` never touches the running server, and `cargo clean` never deletes `sm`. Keep `.local/bin` on `PATH`. To refresh only the CLI, run `scripts/install-sm-cli.sh`.
 
@@ -149,6 +131,4 @@ The restart script uses the installed config and falls back to the in-repo `conf
 
 **Run tests with `scripts/test-rust-isolated.sh`**, not bare `cargo test`. The launcher isolates and then cleans up test state.
 
-**Conventions.** Session ids are 8-character UUID prefixes (e.g. `a4af4272`). The tmux session is always `claude-<session id>`; the friendly name (`sm name`) is separate. A session can retire or clear only its own children. Tool-use logging is always on, with no sampling. The server sets `CLAUDE_SESSION_MANAGER_ID` in each session so hooks and `sm` know which session they are in.
-
-**Common failures.** Hooks not logging: check the server is up (`curl localhost:8420/health`). `sm` commands failing: check `CLAUDE_SESSION_MANAGER_ID` is set. Session not found: use the full session id or the exact friendly name.
+Common failures.** Hooks not logging: check the server is up (`curl localhost:8420/health`). `sm` commands failing: check `CLAUDE_SESSION_MANAGER_ID` is set. Session not found: use the full session id or the exact friendly name.
