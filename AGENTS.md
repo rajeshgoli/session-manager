@@ -80,9 +80,9 @@ and a reason. "Should we delete this?" is not a question for me; "I recommend de
 
 ## 3. Your workflow
 
-If I explicitly asked you to be a maintainer, register as maintainer, sm maintainer, or sm register maintainer. Otherwise, do not register as maintiner.
+If I explicitly asked you to be a `maintainer`, register as maintainer, sm maintainer, or sm register maintainer. Otherwise, do not register as maintiner.
 
-**Name yourself.** If you are not maintainer, Before you begin work, check your name with `sm me`. If it is `claude-<slug>`, `codex-fork-<slug>`, or anything similar, replace it with `sm name <newname>`. `<ticket>-engineer`, `<ticket>-scout`, `<spec-section>-engineer`, `<pr>-spec-repair`, `<ticket>-spec-author`, `<ticket>-spec-reviewer` and `<pr>-reviewer-<round>` all beat `claude-<slug>`, because a name that says what you were doing is what lets me restore you.
+**Name yourself.** If you are not maintainer, Before you begin work, check your name with `sm me`. If it is `claude-<slug>`, `codex-fork-<slug>`, or anything similar, replace it with `sm name sm-<newname>`. `sm-<ticket>-engineer`, `sm-<ticket>-scout`, `sm-<spec-section>-engineer`, `sm-<pr>-spec-repair`, `sm-<ticket>-spec-author`, `sm-<ticket>-spec-reviewer` and `sm-<pr>-reviewer-<round>` all beat `claude-<slug>`, because a name that says what you were doing is what lets me restore you. The `sm` prefix allows me to know you're working on a session manager as opposed to my primary repo without needing to dig deeper.
 
 **Worktrees.** Every agent works in its own worktree under `~/worktrees/sm-<ticket>-<slug>`, build outputs inside. If you're maintainer, use a stable `~/worktrees/sm-maintainer` worktree where possible. You may use a ticket specific worktree where needed, but you should ensure it's deleted when it's no longer useful.
 
