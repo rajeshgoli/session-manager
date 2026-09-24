@@ -174,6 +174,7 @@ CREATE TABLE owner_doc_reviews (
   id TEXT PRIMARY KEY,
   doc_id TEXT NOT NULL,
   commit_sha TEXT NOT NULL,
+  blob_sha TEXT NOT NULL,            -- blob reviewed, for state derivation
   verdict TEXT NOT NULL,             -- approve | changes_requested | comment
   body TEXT,
   comment_count INTEGER NOT NULL,
@@ -184,16 +185,24 @@ CREATE TABLE owner_doc_reviews (
 );
 ```
 
-Derived doc state:
+Derived doc state, first match wins. The *latest blob* is the `blob_sha` of the
+latest publish row. The projection uses stored data only (see "Fetching content"), so
+it never looks at the live PR head.
 
-- `review_requested`, with no review at a blob SHA ≥ the latest publish → **Review requested**
-- A review exists for the latest blob → **Reviewed**
-- The latest blob has been viewed → **Read**
-- An older blob has been viewed, the latest hasn't → **Updated**
-- Otherwise → **New**
+1. A review exists whose `blob_sha` equals the latest blob → **Reviewed**
+2. `review_requested` is set on the latest publish → **Review requested**
+3. A view exists for the latest blob → **Read**
+4. A view exists for some other blob → **Updated**
+5. Otherwise → **New**
 
 Compare **blob** SHAs, not commit SHAs, so pushes that don't touch the file don't
-mark it updated.
+mark it updated. Blob SHAs are equality-compared only; they have no order.
+
+The server computes a blob SHA from fetched content itself, as git does:
+`sha1("blob <byte length>\0" + bytes)`. That is how `/view` records a view and a
+review records its blob without an extra API call. At publish time, check the
+computed value against the contents API's `sha` once; a test pins that the two
+match.
 
 ### Fetching content
 
@@ -432,6 +441,9 @@ tests do (reuse that fixture pattern; don't invent a new one).
   when a later step fails; a closed PR is refused; wake message text and
   recipient routing (live author, retired author → parent, none → undelivered).
 - Doc token: accepted for its own doc, rejected for another doc or when expired.
+  When Google auth is not enabled, doc routes behave like other routes (no auth
+  needed) and the token is ignored.
+- Blob SHA: the locally computed value equals the contents API's `sha` for a real file.
 - Projection: `docs` and the `owner_review` waiting entry; old-schema Android
   parsing still works.
 - Manual: publish a real memo from a worktree, open it on the phone over the
