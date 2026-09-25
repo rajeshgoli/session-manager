@@ -1644,6 +1644,29 @@ fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
         "Termination: {}",
         payload["termination_reason"].as_str().unwrap_or("-")
     );
+    if let Some(guard) = payload["memory_guard"].as_object() {
+        let bytes = |key: &str| {
+            guard
+                .get(key)
+                .and_then(Value::as_i64)
+                .map_or_else(|| "unknown".to_owned(), |value| format!("{value}B"))
+        };
+        println!(
+            "Memory guard: rss={} limit={} host_available={} reserve={} failed_host_samples={} sampled_at={}",
+            bytes("process_group_rss_bytes"),
+            bytes("memory_limit_bytes"),
+            bytes("host_available_bytes"),
+            bytes("effective_reserve_bytes"),
+            guard
+                .get("failed_host_samples")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            guard
+                .get("sampled_at")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+        );
+    }
     println!(
         "Log: {}",
         payload["readable_log_path"]

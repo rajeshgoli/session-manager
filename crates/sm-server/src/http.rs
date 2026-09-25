@@ -14987,14 +14987,8 @@ fn queue_job_response_with_names(
     requester_name: Option<String>,
     notify_name: Option<String>,
 ) -> Result<Value, ApiError> {
-    let termination_reason = match job.state.as_str() {
-        "timed_out" => Some("timeout"),
-        "wait_expired" => Some("queue_wait_timeout"),
-        "cancelled" => Some("cancelled"),
-        "displaced" => Some("perf_displacement"),
-        "memory_exceeded" => Some("memory_budget"),
-        _ => None,
-    };
+    let termination_reason =
+        crate::queue::queue_job_termination_reason(&job.state, job.termination_detail.as_ref());
     let exit_evidence = if job.exit_code.is_some() {
         "recorded"
     } else if matches!(
@@ -15038,6 +15032,7 @@ fn queue_job_response_with_names(
         "exit_code": job.exit_code,
         "exit_evidence": exit_evidence,
         "termination_reason": termination_reason,
+        "memory_guard": job.termination_detail,
         "readable_log_path": job.log_path.as_deref().and_then(|p| std::path::Path::new(p).parent()).map(|p| p.join(crate::queue::queue_log_filename(&job.label, &job.id)).display().to_string()).filter(|p| std::path::Path::new(p).exists()),
         "log_path": job.log_path,
     }))
@@ -15267,6 +15262,7 @@ mod tests {
             process_group_id: None,
             exit_code: None,
             log_path: None,
+            termination_detail: None,
         };
         let mut completed = review.clone();
         completed.id = "r2".into();

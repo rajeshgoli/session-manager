@@ -5943,6 +5943,73 @@ async fn queue_runtime_admission_displaces_background_for_ready_perf_job() {
 }
 
 #[tokio::test]
+async fn queue_runtime_memory_guard_records_cause_and_sample_before_termination() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-memory-guard");
+    let message_queue_db = state_file.with_extension("queue-memory-guard-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            cancel_grace_seconds: 1,
+            configured: true,
+            ..QueueRunnerConfig::default()
+        },
+        sm_send: SmSendConfig {
+            db_path: message_queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.runtime_enabled = true;
+    let app = router(AppState::new(config));
+
+    // A one-byte budget: any live process group overruns it on the first real sample.
+    let (status, perf) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "perf",
+            "label": "tiny budget perf",
+            "script": "sleep 5",
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345",
+            "timeout_seconds": 30,
+            "cpu_percent": 100,
+            "gpu_percent": 0,
+            "memory_bytes": 1
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let perf_id = perf["id"].as_str().unwrap().to_owned();
+
+    let finished = wait_for_queue_job_state(app, &perf_id, &["memory_exceeded", "succeeded"]).await;
+    assert_eq!(finished["state"], "memory_exceeded");
+    assert_eq!(finished["termination_reason"], "memory_budget");
+    let guard = &finished["memory_guard"];
+    assert_eq!(guard["cause"], "memory_budget");
+    assert_eq!(guard["memory_limit_bytes"], 1);
+    assert!(guard["process_group_rss_bytes"].as_i64().unwrap() > 1);
+    assert!(guard["effective_reserve_bytes"].as_i64().unwrap() > 0);
+    assert_eq!(guard["failed_host_samples"], 0);
+    assert!(guard["sampled_at"].as_str().is_some());
+    let notifications = queued_message_texts(&message_queue_db, "run12345");
+    assert!(
+        notifications.iter().any(|text| {
+            queue_completion_matches(text, &perf_id, "memory_exceeded")
+                && text.contains("termination=memory_budget memory_guard: rss=")
+                && text.contains("limit=0.0 GiB")
+        }),
+        "{notifications:?}"
+    );
+}
+
+#[tokio::test]
 async fn queue_runtime_perf_waits_for_tests_and_blocks_new_tests_through_cooldown() {
     let state_file = write_session_fixture();
     let queue_state_dir = state_file.with_extension("queue-runner-perf-waits-tests");

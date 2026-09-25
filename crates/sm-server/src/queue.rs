@@ -165,6 +165,8 @@ pub struct QueueJobRecord {
     pub process_group_id: Option<i64>,
     pub exit_code: Option<i64>,
     pub log_path: Option<String>,
+    /// Memory-guard evidence recorded before a `memory_exceeded` termination.
+    pub termination_detail: Option<JsonValue>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,6 +234,7 @@ struct QueueJobRuntimeRecord {
     process_group_id: Option<i64>,
     exit_code: Option<i64>,
     completion_notified_at: Option<String>,
+    termination_detail_json: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2771,6 +2774,7 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
     ensure_column(conn, "queue_jobs", "cpu_percent", "INTEGER")?;
     ensure_column(conn, "queue_jobs", "gpu_percent", "INTEGER")?;
     ensure_column(conn, "queue_jobs", "memory_bytes", "INTEGER")?;
+    ensure_column(conn, "queue_jobs", "termination_detail_json", "TEXT")?;
     ensure_column(
         conn,
         "queue_jobs",
@@ -3005,7 +3009,7 @@ fn get_queue_job_runtime_conn(
                holding_reason, wrapper_path, log_path, exit_code_path, timeout_seconds,
                max_wait_seconds,
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
-               exit_code, completion_notified_at, label
+               exit_code, completion_notified_at, label, termination_detail_json
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -3043,6 +3047,7 @@ fn get_queue_job_runtime_conn(
                 exit_code: row.get(18)?,
                 completion_notified_at: row.get(19)?,
                 label: row.get(20)?,
+                termination_detail_json: row.get(21)?,
             })
         })
         .optional()
@@ -3056,7 +3061,7 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                holding_reason, wrapper_path, log_path, exit_code_path, timeout_seconds,
                max_wait_seconds,
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
-               exit_code, completion_notified_at, label
+               exit_code, completion_notified_at, label, termination_detail_json
         FROM queue_jobs
         ORDER BY queued_at, id
         "#,
@@ -3085,6 +3090,7 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                 exit_code: row.get(18)?,
                 completion_notified_at: row.get(19)?,
                 label: row.get(20)?,
+                termination_detail_json: row.get(21)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3890,21 +3896,27 @@ fn monitor_queue_job_completion(
             );
             return;
         }
-        if memory_bytes.is_some_and(|limit| {
+        let memory_trip = memory_bytes.and_then(|limit| {
             if Instant::now() < next_memory_check {
-                return false;
+                return None;
             }
             next_memory_check = Instant::now() + PERF_MEMORY_SAMPLE_INTERVAL;
             let rss = process_group_rss_bytes(pgid);
             let host = host_memory_capacity();
-            perf_memory_sample_requires_termination(
+            perf_memory_sample_trip(
                 limit,
                 rss,
                 host,
                 admission_policy.memory_min_free_bytes,
                 &mut failed_memory_samples,
             )
-        }) {
+        });
+        if let Some(trip) = memory_trip {
+            if let Err(error) =
+                mark_queue_job_memory_terminating_in_state_dir(&state_dir, &job_id, &trip)
+            {
+                eprintln!("queue perf memory guard could not record {job_id}: {error:#}");
+            }
             terminate_child_process_group_with_grace(&mut child, pgid, cancel_grace_seconds);
             let exit_code = read_queue_job_exit_code_from_state_dir(&state_dir, &job_id);
             let _ = finish_queue_job_in_state_dir_if_running(
@@ -3945,23 +3957,171 @@ fn parse_process_group_rss_bytes(text: &str, pgid: i64) -> Option<i64> {
         .checked_mul(1024)
 }
 
-fn perf_memory_sample_requires_termination(
+/// The sample that made the perf memory guard stop a job. It is persisted
+/// before termination so the completion can name the actual cause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PerfMemoryGuardTrip {
+    cause: &'static str,
+    sampled_at: String,
+    process_group_rss_bytes: Option<i64>,
+    memory_limit_bytes: Option<i64>,
+    host_available_bytes: Option<i64>,
+    effective_reserve_bytes: Option<i64>,
+    failed_host_samples: u8,
+}
+
+/// The job's own process-group RSS exceeded its declared memory budget.
+const MEMORY_GUARD_JOB_OVER_BUDGET: &str = "memory_budget";
+/// Host available memory fell below the safety reserve, whatever the job used.
+const MEMORY_GUARD_HOST_PRESSURE: &str = "host_memory_pressure";
+/// Two consecutive host-memory samples failed, so safety could not be verified.
+const MEMORY_GUARD_HOST_UNAVAILABLE: &str = "host_memory_unavailable";
+/// A recovered perf job had no declared memory budget to enforce.
+const MEMORY_GUARD_BUDGET_MISSING: &str = "memory_budget_missing";
+/// A `memory_exceeded` row with no recorded evidence (written before causes were kept).
+const MEMORY_GUARD_CAUSE_UNRECORDED: &str = "memory_guard";
+
+impl PerfMemoryGuardTrip {
+    fn budget_missing() -> Self {
+        Self {
+            cause: MEMORY_GUARD_BUDGET_MISSING,
+            sampled_at: now_rfc3339(),
+            process_group_rss_bytes: None,
+            memory_limit_bytes: None,
+            host_available_bytes: None,
+            effective_reserve_bytes: None,
+            failed_host_samples: 0,
+        }
+    }
+
+    fn to_json(&self) -> JsonValue {
+        serde_json::json!({
+            "cause": self.cause,
+            "sampled_at": self.sampled_at,
+            "process_group_rss_bytes": self.process_group_rss_bytes,
+            "memory_limit_bytes": self.memory_limit_bytes,
+            "host_available_bytes": self.host_available_bytes,
+            "effective_reserve_bytes": self.effective_reserve_bytes,
+            "failed_host_samples": self.failed_host_samples,
+        })
+    }
+}
+
+/// Returns the trip when this sample requires termination. When several
+/// conditions hold, the job's own overrun wins, then host pressure, then
+/// missing telemetry; the recorded measurements show the others.
+fn perf_memory_sample_trip(
     memory_limit: i64,
     rss: Option<i64>,
     host: Option<(i64, i64)>,
     configured_reserve: i64,
     failed_host_samples: &mut u8,
-) -> bool {
+) -> Option<PerfMemoryGuardTrip> {
     *failed_host_samples = if host.is_none() {
         failed_host_samples.saturating_add(1)
     } else {
         0
     };
-    let job_exceeded = rss.is_some_and(|rss| rss > memory_limit);
-    let host_unsafe = host.is_some_and(|(_, available)| {
-        available < effective_memory_reserve_bytes(configured_reserve)
-    });
-    job_exceeded || host_unsafe || *failed_host_samples >= 2
+    let reserve = effective_memory_reserve_bytes(configured_reserve);
+    let available = host.map(|(_, available)| available);
+    let cause = if rss.is_some_and(|rss| rss > memory_limit) {
+        MEMORY_GUARD_JOB_OVER_BUDGET
+    } else if available.is_some_and(|available| available < reserve) {
+        MEMORY_GUARD_HOST_PRESSURE
+    } else if *failed_host_samples >= 2 {
+        MEMORY_GUARD_HOST_UNAVAILABLE
+    } else {
+        return None;
+    };
+    Some(PerfMemoryGuardTrip {
+        cause,
+        sampled_at: now_rfc3339(),
+        process_group_rss_bytes: rss,
+        memory_limit_bytes: Some(memory_limit),
+        host_available_bytes: available,
+        effective_reserve_bytes: Some(reserve),
+        failed_host_samples: *failed_host_samples,
+    })
+}
+
+/// Records the trip and marks the job so recovery after a restart still
+/// finishes it as `memory_exceeded`. A cancel or displacement already in
+/// progress keeps precedence.
+fn mark_queue_job_memory_terminating_conn(
+    conn: &Connection,
+    job_id: &str,
+    trip: &PerfMemoryGuardTrip,
+) -> Result<()> {
+    eprintln!(
+        "queue perf memory guard stopping {job_id}: {}",
+        trip.to_json()
+    );
+    conn.execute(
+        r#"
+        UPDATE queue_jobs
+        SET holding_reason = 'memory_terminating',
+            termination_detail_json = ?2
+        WHERE id = ?1 AND state = 'running'
+          AND COALESCE(holding_reason, 'memory_terminating') = 'memory_terminating'
+        "#,
+        params![job_id, trip.to_json().to_string()],
+    )?;
+    Ok(())
+}
+
+fn mark_queue_job_memory_terminating_in_state_dir(
+    state_dir: &Path,
+    job_id: &str,
+    trip: &PerfMemoryGuardTrip,
+) -> Result<()> {
+    let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))?;
+    init_queue_jobs_schema(&conn)?;
+    mark_queue_job_memory_terminating_conn(&conn, job_id, trip)
+}
+
+/// Caller-facing termination reason. For `memory_exceeded` it names the
+/// guard condition that fired, so host pressure or missing telemetry is never
+/// reported as the job overrunning its budget.
+pub fn queue_job_termination_reason(
+    state: &str,
+    termination_detail: Option<&JsonValue>,
+) -> Option<String> {
+    let reason = match state {
+        "timed_out" => "timeout",
+        "wait_expired" => "queue_wait_timeout",
+        "cancelled" => "cancelled",
+        "displaced" => "perf_displacement",
+        "memory_exceeded" => termination_detail
+            .and_then(|detail| detail.get("cause"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or(MEMORY_GUARD_CAUSE_UNRECORDED),
+        _ => return None,
+    };
+    Some(reason.to_owned())
+}
+
+fn memory_guard_detail_text(detail: &JsonValue) -> String {
+    let bytes = |key: &str| {
+        detail
+            .get(key)
+            .and_then(JsonValue::as_i64)
+            .map_or_else(|| "unknown".to_owned(), memory_amount_text)
+    };
+    format!(
+        " memory_guard: rss={} limit={} host_available={} reserve={} failed_host_samples={} sampled_at={}",
+        bytes("process_group_rss_bytes"),
+        bytes("memory_limit_bytes"),
+        bytes("host_available_bytes"),
+        bytes("effective_reserve_bytes"),
+        detail
+            .get("failed_host_samples")
+            .and_then(JsonValue::as_u64)
+            .unwrap_or(0),
+        detail
+            .get("sampled_at")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("unknown"),
+    )
 }
 
 fn recover_running_queue_job_conn(
@@ -4013,13 +4173,19 @@ fn recover_running_queue_job_conn(
         return Ok(RecoveredQueueJobAction::Finished("timed_out"));
     }
     if job.job_type == "perf" && job.memory_bytes.is_none() {
+        mark_queue_job_memory_terminating_conn(
+            conn,
+            &job.id,
+            &PerfMemoryGuardTrip::budget_missing(),
+        )?;
         if let Some(pgid) = job.process_group_id.or(job.pid) {
             terminate_process_group_with_grace(pgid, cancel_grace_seconds);
         }
         let exit_code = read_exit_code(job.exit_code_path.as_deref());
+        let job = get_queue_job_runtime_conn(conn, &job.id)?.unwrap_or_else(|| job.clone());
         finish_queue_job_conn(
             conn,
-            job,
+            &job,
             "memory_exceeded",
             exit_code,
             Some(message_queue_db_path),
@@ -4139,9 +4305,9 @@ fn poll_recovered_queue_job(
             );
             return;
         }
-        if job.memory_bytes.is_some_and(|limit| {
+        let memory_trip = job.memory_bytes.and_then(|limit| {
             if Instant::now() < next_memory_check {
-                return false;
+                return None;
             }
             next_memory_check = Instant::now() + PERF_MEMORY_SAMPLE_INTERVAL;
             let rss = job
@@ -4149,22 +4315,36 @@ fn poll_recovered_queue_job(
                 .or(job.pid)
                 .and_then(process_group_rss_bytes);
             let host = host_memory_capacity();
-            perf_memory_sample_requires_termination(
+            perf_memory_sample_trip(
                 limit,
                 rss,
                 host,
                 admission_policy.memory_min_free_bytes,
                 &mut failed_memory_samples,
             )
-        }) {
+        });
+        if let Some(trip) = memory_trip {
+            if let Err(error) = mark_queue_job_memory_terminating_conn(&conn, &job.id, &trip) {
+                eprintln!(
+                    "queue perf memory guard could not record {}: {error:#}",
+                    job.id
+                );
+            }
             if let Some(pgid) = job.process_group_id.or(job.pid) {
                 terminate_process_group_with_grace(pgid, cancel_grace_seconds);
             }
             let exit_code = read_exit_code(job.exit_code_path.as_deref());
+            let job = get_queue_job_runtime_conn(&conn, &job.id)
+                .ok()
+                .flatten()
+                .unwrap_or(job);
+            let final_state =
+                forced_terminal_state_for_holding_reason(job.holding_reason.as_deref())
+                    .unwrap_or("memory_exceeded");
             let _ = finish_queue_job_conn(
                 &conn,
                 &job,
-                "memory_exceeded",
+                final_state,
                 exit_code,
                 Some(&message_queue_db_path),
             );
@@ -4262,6 +4442,7 @@ fn forced_terminal_state_for_holding_reason(holding_reason: Option<&str>) -> Opt
     match holding_reason {
         Some("cancelling") => Some("cancelled"),
         Some("displacing") => Some("displaced"),
+        Some("memory_terminating") => Some("memory_exceeded"),
         _ => None,
     }
 }
@@ -4328,6 +4509,10 @@ fn finish_queue_job_conn_with_policy(
         UPDATE queue_jobs
         SET state = ?2,
             holding_reason = CASE WHEN ?2 = 'wait_expired' THEN holding_reason ELSE NULL END,
+            termination_detail_json = CASE
+                WHEN ?2 = 'memory_exceeded' THEN termination_detail_json
+                ELSE NULL
+            END,
             finished_at = ?3,
             exit_code = ?4,
             completion_notification_required = 1
@@ -4636,14 +4821,15 @@ fn queue_job_completion_text_with_policy(
     let runtime = queue_duration_text(job.started_at.as_deref(), Some(finished_at));
     let queue_end = job.started_at.as_deref().unwrap_or(finished_at);
     let queued = queue_duration_text(Some(&job.queued_at), Some(queue_end));
-    let termination_text = match state {
-        "timed_out" => " termination=timeout",
-        "wait_expired" => " termination=queue_wait_timeout",
-        "cancelled" => " termination=cancelled",
-        "displaced" => " termination=perf_displacement",
-        "memory_exceeded" => " termination=memory_budget",
-        _ => "",
-    };
+    let termination_detail = (state == "memory_exceeded")
+        .then(|| job.termination_detail_json.as_deref())
+        .flatten()
+        .and_then(|raw| serde_json::from_str::<JsonValue>(raw).ok());
+    let mut termination_text = queue_job_termination_reason(state, termination_detail.as_ref())
+        .map_or_else(String::new, |reason| format!(" termination={reason}"));
+    if let Some(detail) = &termination_detail {
+        termination_text.push_str(&memory_guard_detail_text(detail));
+    }
     let exit_text = exit_code.map_or_else(
         || " exit=unknown (no exit receipt; output is partial/non-evidence)".to_owned(),
         |code| format!(" exit={code}"),
@@ -5145,12 +5331,13 @@ fn list_queue_jobs_conn(
     }
 
     let resource_columns = queue_job_resource_projection(conn)?;
+    let detail_column = queue_job_detail_projection(conn)?;
     let mut query = format!(
         r#"
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
                argv_json, script_path, timeout_seconds, {resource_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
-               exit_code, log_path
+               exit_code, log_path, {detail_column}
         FROM queue_jobs
     "#
     );
@@ -5178,12 +5365,13 @@ fn list_queue_jobs_conn(
 
 fn get_queue_job_conn(conn: &Connection, job_id: &str) -> Result<Option<QueueJobRecord>> {
     let resource_columns = queue_job_resource_projection(conn)?;
+    let detail_column = queue_job_detail_projection(conn)?;
     let query = format!(
         r#"
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
                argv_json, script_path, timeout_seconds, {resource_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
-               exit_code, log_path
+               exit_code, log_path, {detail_column}
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -5204,11 +5392,26 @@ fn get_queue_job_conn(conn: &Connection, job_id: &str) -> Result<Option<QueueJob
         .map_err(Into::into)
 }
 
-fn queue_job_resource_projection(conn: &Connection) -> Result<&'static str> {
+fn queue_job_columns(conn: &Connection) -> Result<BTreeSet<String>> {
     let mut statement = conn.prepare("PRAGMA table_info(queue_jobs)")?;
     let columns = statement
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    Ok(columns)
+}
+
+fn queue_job_detail_projection(conn: &Connection) -> Result<&'static str> {
+    Ok(
+        if queue_job_columns(conn)?.contains("termination_detail_json") {
+            "termination_detail_json"
+        } else {
+            "NULL AS termination_detail_json"
+        },
+    )
+}
+
+fn queue_job_resource_projection(conn: &Connection) -> Result<&'static str> {
+    let columns = queue_job_columns(conn)?;
     let has_budgets = columns.contains("cpu_percent")
         && columns.contains("gpu_percent")
         && columns.contains("memory_bytes");
@@ -5268,6 +5471,9 @@ fn queue_job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJ
         process_group_id: row.get(19)?,
         exit_code: row.get(20)?,
         log_path: row.get(21)?,
+        termination_detail: row
+            .get::<_, Option<String>>(22)?
+            .and_then(|raw| serde_json::from_str(&raw).ok()),
     })
 }
 
@@ -5778,36 +5984,244 @@ mod tests {
     }
 
     #[test]
-    fn perf_memory_monitor_enforces_rss_host_pressure_and_measurement_health() {
+    fn perf_memory_guard_names_the_condition_that_fired_with_its_sample() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let reserve = effective_memory_reserve_bytes(8 * GIB);
+        let healthy_host = Some((512 * GIB, 400 * GIB));
+        let pressured_host = Some((512 * GIB, reserve - 1));
         let mut failed = 0;
-        assert!(perf_memory_sample_requires_termination(
-            1024,
-            Some(2048),
-            Some((10_000, 8_000)),
-            100,
+
+        let over = perf_memory_sample_trip(
+            240 * GIB,
+            Some(241 * GIB),
+            healthy_host,
+            8 * GIB,
             &mut failed,
-        ));
-        assert!(perf_memory_sample_requires_termination(
-            4096,
-            None,
-            Some((10_000, 900)),
-            100,
+        )
+        .unwrap();
+        assert_eq!(over.cause, "memory_budget");
+        assert_eq!(over.process_group_rss_bytes, Some(241 * GIB));
+        assert_eq!(over.memory_limit_bytes, Some(240 * GIB));
+        assert_eq!(over.host_available_bytes, Some(400 * GIB));
+        assert_eq!(over.effective_reserve_bytes, Some(reserve));
+        assert_eq!(over.failed_host_samples, 0);
+
+        // The job's own overrun is the cause even when the host is also short.
+        let both = perf_memory_sample_trip(
+            240 * GIB,
+            Some(241 * GIB),
+            pressured_host,
+            8 * GIB,
             &mut failed,
-        ));
-        assert!(!perf_memory_sample_requires_termination(
-            4096,
-            None,
-            None,
-            100,
+        )
+        .unwrap();
+        assert_eq!(both.cause, "memory_budget");
+        assert_eq!(both.host_available_bytes, Some(reserve - 1));
+
+        let pressure = perf_memory_sample_trip(
+            240 * GIB,
+            Some(20 * GIB),
+            pressured_host,
+            8 * GIB,
             &mut failed,
-        ));
-        assert!(perf_memory_sample_requires_termination(
-            4096,
-            None,
-            None,
-            100,
-            &mut failed,
-        ));
+        )
+        .unwrap();
+        assert_eq!(pressure.cause, "host_memory_pressure");
+        assert_eq!(pressure.process_group_rss_bytes, Some(20 * GIB));
+
+        // Process inspection can fail without hiding host pressure.
+        let pressure_no_rss =
+            perf_memory_sample_trip(240 * GIB, None, pressured_host, 8 * GIB, &mut failed).unwrap();
+        assert_eq!(pressure_no_rss.cause, "host_memory_pressure");
+        assert_eq!(pressure_no_rss.process_group_rss_bytes, None);
+
+        assert!(perf_memory_sample_trip(
+            240 * GIB,
+            Some(20 * GIB),
+            healthy_host,
+            8 * GIB,
+            &mut failed
+        )
+        .is_none());
+        assert!(
+            perf_memory_sample_trip(240 * GIB, Some(20 * GIB), None, 8 * GIB, &mut failed)
+                .is_none()
+        );
+        let blind =
+            perf_memory_sample_trip(240 * GIB, Some(20 * GIB), None, 8 * GIB, &mut failed).unwrap();
+        assert_eq!(blind.cause, "host_memory_unavailable");
+        assert_eq!(blind.failed_host_samples, 2);
+        assert_eq!(blind.host_available_bytes, None);
+        assert_eq!(blind.process_group_rss_bytes, Some(20 * GIB));
+    }
+
+    fn running_perf_job_for_memory_guard(state_dir: &Path) -> (Connection, QueueJobRecord) {
+        let job = RetainedQueueStore::create_queue_job_in_state_dir(
+            state_dir,
+            CreateQueueJob {
+                job_type: "perf".into(),
+                label: "guarded perf".into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["true".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 600,
+                cpu_percent: Some(100),
+                gpu_percent: Some(0),
+                memory_bytes: Some(240 * 1024 * 1024 * 1024),
+            },
+        )
+        .unwrap();
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET state = 'running', started_at = ?2 WHERE id = ?1",
+            params![job.id, now_rfc3339()],
+        )
+        .unwrap();
+        (conn, job)
+    }
+
+    #[test]
+    fn host_pressure_termination_is_persisted_before_kill_and_reported_as_host_pressure() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let state_dir = unique_temp_path("memory-guard-host-pressure");
+        let message_queue_db = state_dir.join("messages.db");
+        let (conn, job) = running_perf_job_for_memory_guard(&state_dir);
+        let trip = PerfMemoryGuardTrip {
+            cause: MEMORY_GUARD_HOST_PRESSURE,
+            sampled_at: "2026-09-12T09:45:52Z".into(),
+            process_group_rss_bytes: Some(20 * GIB),
+            memory_limit_bytes: Some(240 * GIB),
+            host_available_bytes: Some(5 * GIB),
+            effective_reserve_bytes: Some(8 * GIB),
+            failed_host_samples: 0,
+        };
+        mark_queue_job_memory_terminating_conn(&conn, &job.id, &trip).unwrap();
+
+        // The evidence is durable while the job is still being stopped.
+        let stopping = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(stopping.state, "running");
+        assert_eq!(
+            stopping.holding_reason.as_deref(),
+            Some("memory_terminating")
+        );
+        assert_eq!(stopping.termination_detail, Some(trip.to_json()));
+
+        // A restart mid-termination still finishes the job as memory_exceeded.
+        let runtime = get_queue_job_runtime_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(
+            recover_running_queue_job_conn(
+                &conn,
+                &state_dir,
+                &message_queue_db,
+                &runtime,
+                0,
+                QueueAdmissionPolicy::default(),
+            )
+            .unwrap(),
+            RecoveredQueueJobAction::Finished("memory_exceeded")
+        );
+        let finished = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(finished.state, "memory_exceeded");
+        assert_eq!(finished.holding_reason, None);
+        assert_eq!(
+            queue_job_termination_reason(&finished.state, finished.termination_detail.as_ref())
+                .as_deref(),
+            Some("host_memory_pressure")
+        );
+        let notifications = RetainedQueueStore::new(message_queue_db)
+            .pending_messages_for_target_by_category("notify", "queue-completion", 10)
+            .unwrap();
+        assert_eq!(notifications.len(), 1);
+        let text = &notifications[0].text;
+        assert!(text.contains("completed: memory_exceeded termination=host_memory_pressure memory_guard: rss=20.0 GiB limit=240.0 GiB host_available=5.0 GiB reserve=8.0 GiB failed_host_samples=0 sampled_at=2026-09-12T09:45:52Z"), "{text}");
+        assert!(!text.contains("termination=memory_budget"), "{text}");
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn cancel_in_progress_keeps_precedence_over_memory_guard() {
+        let state_dir = unique_temp_path("memory-guard-cancel");
+        let message_queue_db = state_dir.join("messages.db");
+        let (conn, job) = running_perf_job_for_memory_guard(&state_dir);
+        mark_queue_job_cancelling_conn(&conn, &job.id).unwrap();
+        let mut failed = 0;
+        let trip = perf_memory_sample_trip(1, Some(2), None, 0, &mut failed).unwrap();
+        mark_queue_job_memory_terminating_conn(&conn, &job.id, &trip).unwrap();
+        let current = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(current.holding_reason.as_deref(), Some("cancelling"));
+        assert_eq!(current.termination_detail, None);
+
+        let runtime = get_queue_job_runtime_conn(&conn, &job.id).unwrap().unwrap();
+        recover_running_queue_job_conn(
+            &conn,
+            &state_dir,
+            &message_queue_db,
+            &runtime,
+            0,
+            QueueAdmissionPolicy::default(),
+        )
+        .unwrap();
+        let finished = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(finished.state, "cancelled");
+        assert_eq!(finished.termination_detail, None);
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn recovered_perf_job_without_budget_reports_missing_budget_not_overrun() {
+        let state_dir = unique_temp_path("memory-guard-budget-missing");
+        let message_queue_db = state_dir.join("messages.db");
+        let (conn, job) = running_perf_job_for_memory_guard(&state_dir);
+        conn.execute(
+            "UPDATE queue_jobs SET memory_bytes = NULL WHERE id = ?1",
+            params![job.id],
+        )
+        .unwrap();
+        let runtime = get_queue_job_runtime_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(
+            recover_running_queue_job_conn(
+                &conn,
+                &state_dir,
+                &message_queue_db,
+                &runtime,
+                0,
+                QueueAdmissionPolicy::default(),
+            )
+            .unwrap(),
+            RecoveredQueueJobAction::Finished("memory_exceeded")
+        );
+        let finished = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(
+            queue_job_termination_reason(&finished.state, finished.termination_detail.as_ref())
+                .as_deref(),
+            Some("memory_budget_missing")
+        );
+        let notifications = RetainedQueueStore::new(message_queue_db)
+            .pending_messages_for_target_by_category("notify", "queue-completion", 10)
+            .unwrap();
+        assert!(notifications[0]
+            .text
+            .contains("termination=memory_budget_missing memory_guard: rss=unknown limit=unknown"));
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn memory_exceeded_row_without_evidence_does_not_claim_a_budget_overrun() {
+        assert_eq!(
+            queue_job_termination_reason("memory_exceeded", None).as_deref(),
+            Some("memory_guard")
+        );
+        assert_eq!(
+            queue_job_termination_reason("timed_out", None).as_deref(),
+            Some("timeout")
+        );
+        assert_eq!(queue_job_termination_reason("failed", None), None);
     }
 
     #[test]
@@ -5835,6 +6249,7 @@ mod tests {
             process_group_id: None,
             exit_code: None,
             log_path: None,
+            termination_detail: None,
         };
         let pending = record("new-tests", "tests", "pending", Some("awaiting_tests"));
         let running = record("running-tests", "tests", "running", None);
@@ -5960,6 +6375,7 @@ mod tests {
             process_group_id: None,
             exit_code: None,
             completion_notified_at: None,
+            termination_detail_json: None,
         };
 
         let failed = queue_job_completion_text_with_policy(
@@ -6010,6 +6426,7 @@ mod tests {
             process_group_id: None,
             exit_code: None,
             completion_notified_at: None,
+            termination_detail_json: None,
         };
 
         let completion = queue_job_completion_text_with_policy(
@@ -6066,6 +6483,7 @@ mod tests {
             process_group_id: None,
             exit_code: None,
             completion_notified_at: None,
+            termination_detail_json: None,
         };
 
         let status = spawn_queue_job_process(&job).unwrap().wait().unwrap();
@@ -6126,6 +6544,7 @@ mod tests {
             process_group_id: None,
             exit_code: None,
             completion_notified_at: None,
+            termination_detail_json: None,
         };
 
         let status = spawn_queue_job_process(&job).unwrap().wait().unwrap();
@@ -6162,6 +6581,7 @@ mod tests {
             process_group_id: None,
             exit_code: None,
             completion_notified_at: None,
+            termination_detail_json: None,
         };
         let much_later = OffsetDateTime::parse("2026-08-17T20:00:01Z", &Rfc3339).unwrap();
         assert!(!queue_job_timed_out_at(&job, much_later));
@@ -7224,6 +7644,7 @@ mod tests {
             process_group_id: None,
             exit_code: None,
             completion_notified_at: None,
+            termination_detail_json: None,
         };
 
         assert!(!queue_job_timed_out_at(&job, now_utc));
