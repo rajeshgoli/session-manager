@@ -544,7 +544,7 @@ impl SessionStore {
             // but must never resolve the developer's live Codex index.
             let is_live_home_path =
                 path_is_under_home(session_index_path.to_string_lossy().as_ref()).unwrap_or(true);
-            if !test_root.is_some() || !is_live_home_path {
+            if test_root.is_none() || !is_live_home_path {
                 if let Some(parent) = session_index_path.parent() {
                     self.codex_sessions_root = parent.join("sessions");
                 }
@@ -880,11 +880,17 @@ impl SessionStore {
             // subsequent restore can obtain authoritative absence checks.
             if session_predates_boot(&record, boot_time) {
                 if let Err(error) = session_runtime.ensure_recovery_server_anchor() {
-                    eprintln!("preserving session {} after inconclusive reboot probe: {error:#}", record.id);
+                    eprintln!(
+                        "preserving session {} after inconclusive reboot probe: {error:#}",
+                        record.id
+                    );
                     continue;
                 }
             }
-            if !matches!(session_runtime.probe_session_for_restore(&record.tmux_session), RestoreTmuxLivenessOutcome::Absent) {
+            if !matches!(
+                session_runtime.probe_session_for_restore(&record.tmux_session),
+                RestoreTmuxLivenessOutcome::Absent
+            ) {
                 continue;
             }
             if ensure_session_not_reparent_fenced(&state, &record.id).is_err() {
@@ -1832,6 +1838,7 @@ impl SessionStore {
     /// - `received_at` — stamped on arrival, before the handler's transcript
     ///   retry sleep. This catches a `Stop` that arrived first but applied late,
     ///   and covers hooks emitted by a script too old to send `emitted_at`.
+    #[allow(clippy::too_many_arguments)] // each argument is a distinct field of the Stop hook payload
     pub fn apply_claude_stop_hook(
         &self,
         session_id: &str,
@@ -5673,7 +5680,7 @@ impl SessionStore {
         }
         let restored = serde_json::from_value::<SessionRecord>(Value::Object(session.clone()))?;
         self.write_raw_json_value(&state)?;
-        Ok(Some(CoreRestoreOutcome::Restored(restored)))
+        Ok(Some(CoreRestoreOutcome::Restored(Box::new(restored))))
     }
 
     pub fn restore_core_session_with_runtime(
@@ -5714,7 +5721,8 @@ impl SessionStore {
         }
         if !record.is_stopped()
             && !matches!(
-                runtime.for_socket_name(record.tmux_socket_name.as_deref())
+                runtime
+                    .for_socket_name(record.tmux_socket_name.as_deref())
                     .probe_session_for_restore(&record.tmux_session),
                 RestoreTmuxLivenessOutcome::Absent
             )
@@ -6037,7 +6045,7 @@ impl SessionStore {
         if let Some(artifacts) = codex_fork_artifacts {
             self.start_codex_fork_event_monitor(restored.id.clone(), artifacts.event_stream_path)?;
         }
-        Ok(Some(CoreRestoreOutcome::Restored(restored)))
+        Ok(Some(CoreRestoreOutcome::Restored(Box::new(restored))))
     }
 
     pub fn revive_stopped_tmux_client_session(
@@ -6695,6 +6703,7 @@ impl SessionStore {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // each argument is a distinct field of the queued message
     fn queue_parent_message(
         &self,
         state: &mut Value,
@@ -7093,6 +7102,7 @@ impl SessionStore {
         Ok(released)
     }
 
+    #[allow(clippy::too_many_arguments)] // each argument is a distinct reservation field
     fn with_current_claude_handoff_reservation<F>(
         &self,
         session_id: &str,
@@ -7631,13 +7641,12 @@ impl SessionStore {
             }
             if let Ok(chunk) = read_file_from_offset(event_stream_path, &mut offset) {
                 for line in split_complete_event_lines(&mut buffer, &chunk) {
-                    if codex_fork_event_is_turn_complete(&line) {
-                        if self
+                    if codex_fork_event_is_turn_complete(&line)
+                        && self
                             .execute_pending_codex_fork_handoff(session_id)
                             .is_ok_and(|completed| completed)
-                        {
-                            return;
-                        }
+                    {
+                        return;
                     }
                 }
             }
@@ -7886,7 +7895,7 @@ impl SessionStore {
             .into_iter()
             .find(|session| session.id == session_id)
             .ok_or_else(|| anyhow::anyhow!("updated session {session_id} was not readable"))?;
-        Ok(SessionMetadataOutcome::Updated(session))
+        Ok(SessionMetadataOutcome::Updated(Box::new(session)))
     }
 
     pub fn queue_provider_native_rename(
@@ -7961,7 +7970,7 @@ impl SessionStore {
                 let session = self.get_session(session_id)?.ok_or_else(|| {
                     anyhow::anyhow!("session disappeared after maintainer update")
                 })?;
-                Ok(MaintainerMutationOutcome::Updated(session))
+                Ok(MaintainerMutationOutcome::Updated(Box::new(session)))
             }
             RegistryMutationOutcome::NotFound => Ok(MaintainerMutationOutcome::NotFound),
             RegistryMutationOutcome::BadRequest(_) | RegistryMutationOutcome::Conflict(_) => Ok(
@@ -7990,7 +7999,7 @@ impl SessionStore {
                 let session = self
                     .get_session(session_id)?
                     .ok_or_else(|| anyhow::anyhow!("session disappeared after maintainer clear"))?;
-                Ok(MaintainerMutationOutcome::Updated(session))
+                Ok(MaintainerMutationOutcome::Updated(Box::new(session)))
             }
             RegistryMutationOutcome::NotFound => Ok(MaintainerMutationOutcome::NotFound),
             RegistryMutationOutcome::RoleNotRegistered
@@ -10529,7 +10538,7 @@ pub enum CoreClearOutcome {
 
 #[derive(Debug, Clone)]
 pub enum CoreRestoreOutcome {
-    Restored(SessionRecord),
+    Restored(Box<SessionRecord>),
     NotStopped,
     UnsupportedNode(String),
     UnsupportedProvider(String),
@@ -10716,14 +10725,14 @@ pub enum RegistryMutationOutcome {
 
 #[derive(Debug, Clone)]
 pub enum MaintainerMutationOutcome {
-    Updated(SessionRecord),
+    Updated(Box<SessionRecord>),
     NotFound,
     BadRequest(String),
 }
 
 #[derive(Debug, Clone)]
 pub enum SessionMetadataOutcome {
-    Updated(SessionRecord),
+    Updated(Box<SessionRecord>),
     NotFound,
     BadRequest(String),
 }
@@ -12295,6 +12304,7 @@ fn consume_completed_claude_handoff_raw(
     (cleared_pending, stopped_after_prompt)
 }
 
+#[allow(clippy::too_many_arguments)] // each argument is a distinct drain input or filter
 fn drain_pending_runtime_messages_raw(
     store: &SessionStore,
     state: &mut Value,
@@ -12808,10 +12818,10 @@ fn remove_raw_registration(state: &mut Value, role: &str) -> Result<()> {
     let normalized_role = normalize_role(role);
     let registrations = ensure_agent_registrations_array_mut(state)?;
     registrations.retain(|entry| {
-        !entry
+        entry
             .get("role")
             .and_then(Value::as_str)
-            .is_some_and(|value| normalize_role(value) == normalized_role)
+            .is_none_or(|value| normalize_role(value) != normalized_role)
     });
     Ok(())
 }
@@ -13748,37 +13758,59 @@ fn session_lifetime_overlaps(
 }
 
 fn session_restore_is_fenced(state: &Value, session_id: &str) -> bool {
-    state.get("sessions").and_then(Value::as_array)
+    state
+        .get("sessions")
+        .and_then(Value::as_array)
         .and_then(|sessions| sessions.iter().find(|session| session["id"] == session_id))
         .and_then(|session| session["error_message"].as_str())
-        .is_some_and(|error| error.starts_with("codex_fork_restore_teardown_inconclusive:")
-            || error.starts_with("codex_fork_restore_recovery_inconclusive:"))
+        .is_some_and(|error| {
+            error.starts_with("codex_fork_restore_teardown_inconclusive:")
+                || error.starts_with("codex_fork_restore_recovery_inconclusive:")
+        })
 }
 
 /// Read the OS boot timestamp. Unknown platforms conservatively require tmux proof.
 fn system_boot_time() -> Option<OffsetDateTime> {
     #[cfg(target_os = "macos")]
     {
-        let output = Command::new("/usr/sbin/sysctl").args(["-n", "kern.boottime"]).output().ok()?;
+        let output = Command::new("/usr/sbin/sysctl")
+            .args(["-n", "kern.boottime"])
+            .output()
+            .ok()?;
         if !output.status.success() {
             return None;
         }
         let text = String::from_utf8(output.stdout).ok()?;
-        let seconds = text.split("sec = ").nth(1)?.split(',').next()?.trim().parse::<i64>().ok()?;
+        let seconds = text
+            .split("sec = ")
+            .nth(1)?
+            .split(',')
+            .next()?
+            .trim()
+            .parse::<i64>()
+            .ok()?;
         OffsetDateTime::from_unix_timestamp(seconds).ok()
     }
     #[cfg(target_os = "linux")]
     {
         let stat = fs::read_to_string("/proc/stat").ok()?;
-        let seconds = stat.lines().find_map(|line| line.strip_prefix("btime "))?.trim().parse::<i64>().ok()?;
+        let seconds = stat
+            .lines()
+            .find_map(|line| line.strip_prefix("btime "))?
+            .trim()
+            .parse::<i64>()
+            .ok()?;
         OffsetDateTime::from_unix_timestamp(seconds).ok()
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    { None }
+    {
+        None
+    }
 }
 
 fn session_predates_boot(record: &SessionRecord, boot_time: Option<OffsetDateTime>) -> bool {
-    boot_time.zip(parse_timestamp(&record.last_activity))
+    boot_time
+        .zip(parse_timestamp(&record.last_activity))
         .is_some_and(|(boot, activity)| activity < boot)
 }
 
@@ -15143,6 +15175,7 @@ fn mark_runtime_launch_restore_request_inconclusive(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // each argument is a distinct field of the fingerprint
 fn reparent_topology_fingerprint(
     kind: &str,
     subject_session_id: &str,
@@ -15442,6 +15475,7 @@ fn reparent_stale_reason(
     None
 }
 
+#[allow(clippy::too_many_arguments)] // each argument is a distinct reparent input
 fn tree_reparent_edge_changes(
     source_session_id: &str,
     target_session_id: &str,
@@ -17274,14 +17308,16 @@ fn resolve_context_monitor_thresholds(
     };
     for value in &percentages {
         if !value.is_finite() || !(0.0..=100.0).contains(value) {
-            return Err(format!(
+            return Err(
                 "context-monitor thresholds must be finite percentages in the range (0, 100]"
-            ));
+                    .to_string(),
+            );
         }
         if *value == 0.0 {
-            return Err(format!(
+            return Err(
                 "context-monitor thresholds must be finite percentages in the range (0, 100]"
-            ));
+                    .to_string(),
+            );
         }
     }
     if percentages.is_empty() || percentages.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -17406,7 +17442,10 @@ mod tests {
             fs::create_dir_all(&root).unwrap();
             let tmux = root.join("tmux");
             let marker = root.join("anchor-created");
-            fs::write(&tmux, format!(r#"#!/bin/sh
+            fs::write(
+                &tmux,
+                format!(
+                    r#"#!/bin/sh
 case "$*" in
   *new-session*)
     if [ '{failed_anchor}' = true ]; then echo 'permission denied' >&2; exit 1; fi
@@ -17416,7 +17455,12 @@ case "$*" in
     else echo 'no server running on default' >&2; fi
     exit 1 ;;
 esac
-"#, marker.display(), marker.display())).unwrap();
+"#,
+                    marker.display(),
+                    marker.display()
+                ),
+            )
+            .unwrap();
             fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
             let record = json!({"id": "lost", "name": "lost", "provider": "claude",
                 "working_dir": "/repo", "tmux_session": "lost", "provider_resume_id": "saved",
@@ -17428,7 +17472,9 @@ esac
             let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
                 .with_tmux_binary_for_test(tmux.display().to_string());
             let store = SessionStore::new(path).with_delivery_runtime(Some(runtime));
-            store.reconcile_missing_session_runtimes_at_boot(parse_timestamp("2001-01-01T00:00:00Z")).unwrap();
+            store
+                .reconcile_missing_session_runtimes_at_boot(parse_timestamp("2001-01-01T00:00:00Z"))
+                .unwrap();
             let state = store.load_raw_json_value().unwrap();
             if failed_anchor {
                 assert_eq!(state["sessions"][0], record);
@@ -17449,13 +17495,15 @@ esac
         let tmux = root.join("tmux");
         fs::write(&tmux, "#!/bin/sh\ncase \"$*\" in\n  *live*) exit 0 ;;\n  *ambiguous*) echo 'permission denied' >&2; exit 1 ;;\n  *) echo \"can't find session\" >&2; exit 1 ;;\nesac\n").unwrap();
         fs::set_permissions(&tmux, fs::Permissions::from_mode(0o700)).unwrap();
-        let records = ["missing", "live", "ambiguous", "remote", "stopped"].map(|id| json!({
-            "id": id, "name": id, "provider": "claude", "working_dir": "/repo",
-            "tmux_session": id, "provider_resume_id": "saved-conversation",
-            "node": if id == "remote" { "studio" } else { "primary" },
-            "status": if id == "stopped" { "stopped" } else { "running" },
-            "created_at": now_rfc3339(), "last_activity": now_rfc3339()
-        }));
+        let records = ["missing", "live", "ambiguous", "remote", "stopped"].map(|id| {
+            json!({
+                "id": id, "name": id, "provider": "claude", "working_dir": "/repo",
+                "tmux_session": id, "provider_resume_id": "saved-conversation",
+                "node": if id == "remote" { "studio" } else { "primary" },
+                "status": if id == "stopped" { "stopped" } else { "running" },
+                "created_at": now_rfc3339(), "last_activity": now_rfc3339()
+            })
+        });
         let path = root.join("state.json");
         fs::write(&path, json!({"sessions": records}).to_string()).unwrap();
         let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
@@ -17464,13 +17512,23 @@ esac
         store.reconcile_missing_session_runtimes().unwrap();
         let state = store.load_raw_json_value().unwrap();
         assert_eq!(state["sessions"][0]["status"], "stopped");
-        assert_eq!(state["sessions"][0]["provider_resume_id"], "saved-conversation");
-        for index in 1..4 { assert_eq!(state["sessions"][index]["status"], "running"); }
+        assert_eq!(
+            state["sessions"][0]["provider_resume_id"],
+            "saved-conversation"
+        );
+        for index in 1..4 {
+            assert_eq!(state["sessions"][index]["status"], "running");
+        }
         assert_eq!(state["sessions"][4], records[4]);
         store.reconcile_missing_session_runtimes().unwrap();
         assert_eq!(store.load_raw_json_value().unwrap(), state);
         for id in ["live", "ambiguous"] {
-            assert!(matches!(store.restore_core_session_with_runtime(id, &runtime).unwrap(), Some(CoreRestoreOutcome::NotStopped)));
+            assert!(matches!(
+                store
+                    .restore_core_session_with_runtime(id, &runtime)
+                    .unwrap(),
+                Some(CoreRestoreOutcome::NotStopped)
+            ));
         }
         fs::remove_dir_all(root).unwrap();
     }
@@ -17480,9 +17538,16 @@ esac
         let record: SessionRecord = serde_json::from_value(json!({
             "id": "boot", "name": "boot", "working_dir": "/repo", "tmux_session": "boot",
             "created_at": "2026-09-07T10:00:00Z", "last_activity": "2026-09-07T11:00:00Z"
-        })).unwrap();
-        assert!(session_predates_boot(&record, parse_timestamp("2026-09-07T12:00:00Z")));
-        assert!(!session_predates_boot(&record, parse_timestamp("2026-09-07T09:00:00Z")));
+        }))
+        .unwrap();
+        assert!(session_predates_boot(
+            &record,
+            parse_timestamp("2026-09-07T12:00:00Z")
+        ));
+        assert!(!session_predates_boot(
+            &record,
+            parse_timestamp("2026-09-07T09:00:00Z")
+        ));
         assert!(!session_predates_boot(&record, None));
     }
 
@@ -17492,11 +17557,17 @@ esac
             let event = json!({"event_type": "thread/started", "session_id": "temporary-id",
                 "payload": {"thread": {"id": "temporary-id", "parentThreadId": null,
                     "threadSource": source, "ephemeral": ephemeral}}});
-            assert_eq!(codex_fork_provider_resume_id(event.as_object().unwrap()), None);
+            assert_eq!(
+                codex_fork_provider_resume_id(event.as_object().unwrap()),
+                None
+            );
         }
         let event = json!({"event_type": "thread/started", "payload": {"thread": {
             "id": "durable-id", "threadSource": "user", "ephemeral": false}}});
-        assert_eq!(codex_fork_provider_resume_id(event.as_object().unwrap()), Some("durable-id".to_owned()));
+        assert_eq!(
+            codex_fork_provider_resume_id(event.as_object().unwrap()),
+            Some("durable-id".to_owned())
+        );
     }
 
     #[test]
@@ -18105,15 +18176,25 @@ done
 printf '%s\n' '{"event_type":"thread_started","payload":{"thread":{"id":"durable-root"}}}' >> "$event_stream"
 sleep 30
 "#,
-        ) else { return; };
+        ) else {
+            return;
+        };
         let store = fixture.store();
         let mut state = store.load_raw_json_value().unwrap();
         state["sessions"][0]["status"] = json!("running");
         state["sessions"][0]["completion_status"] = Value::Null;
         state["sessions"][0]["stopped_at"] = Value::Null;
         store.write_raw_json_value(&state).unwrap();
-        assert!(matches!(store.restore_core_session_with_runtime("restore01", &fixture.runtime).unwrap(), Some(CoreRestoreOutcome::Restored(_))));
-        assert_eq!(store.load_raw_json_value().unwrap()["sessions"][0]["provider_resume_id"], "durable-root");
+        assert!(matches!(
+            store
+                .restore_core_session_with_runtime("restore01", &fixture.runtime)
+                .unwrap(),
+            Some(CoreRestoreOutcome::Restored(_))
+        ));
+        assert_eq!(
+            store.load_raw_json_value().unwrap()["sessions"][0]["provider_resume_id"],
+            "durable-root"
+        );
     }
 
     #[cfg(unix)]
@@ -24455,7 +24536,7 @@ sleep 30
             .append(true)
             .open(&event_stream)
             .unwrap();
-        stream.write_all(later[partial_len..].as_bytes()).unwrap();
+        stream.write_all(&later.as_bytes()[partial_len..]).unwrap();
         stream.write_all(b"\n").unwrap();
         let resumed = fs::read_to_string(&event_stream).unwrap();
         for line in resumed[recovery_offset as usize..].lines() {

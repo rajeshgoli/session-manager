@@ -319,7 +319,7 @@ fn raised_open_file_soft_limit(soft: u64, hard: u64, target: u64) -> Option<u64>
 mod tests {
     use super::raised_open_file_soft_limit;
 
-    const UNLIMITED: u64 = nix::libc::RLIM_INFINITY as u64;
+    const UNLIMITED: u64 = nix::libc::RLIM_INFINITY;
 
     #[test]
     fn raises_launchd_default_to_target_under_unlimited_hard_limit() {

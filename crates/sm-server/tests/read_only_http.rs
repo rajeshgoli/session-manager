@@ -48,7 +48,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{SocketAddr, TcpListener},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -217,7 +217,7 @@ async fn post_retire_as_parent(
     .await
 }
 
-fn queue_job_completion_notified_at(queue_state_dir: &PathBuf, job_id: &str) -> Option<String> {
+fn queue_job_completion_notified_at(queue_state_dir: &Path, job_id: &str) -> Option<String> {
     for attempt in 0..50 {
         let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
         let completion_notified_at = conn
@@ -235,10 +235,13 @@ fn queue_job_completion_notified_at(queue_state_dir: &PathBuf, job_id: &str) -> 
     None
 }
 
+/// One recorded review post: repo, PR number, and optional steer text.
+type ReviewPostCall = (String, i64, Option<String>);
+
 #[derive(Debug, Clone)]
 struct StubGitHubReviewPoster {
     result: Arc<Mutex<Result<GitHubReviewComment, String>>>,
-    calls: Arc<Mutex<Vec<(String, i64, Option<String>)>>>,
+    calls: Arc<Mutex<Vec<ReviewPostCall>>>,
     fresh_reviews: Arc<Mutex<VecDeque<GitHubReviewMatch>>>,
     current_head_sha: Arc<Mutex<String>>,
     closed_pr_state: Arc<Mutex<Option<String>>>,
@@ -458,7 +461,7 @@ fn codex_review_failure_comment() -> GitHubReviewMatch {
     }
 }
 
-fn queue_job_text_column(queue_state_dir: &PathBuf, job_id: &str, column: &str) -> String {
+fn queue_job_text_column(queue_state_dir: &Path, job_id: &str, column: &str) -> String {
     assert!(matches!(
         column,
         "exit_code_path" | "log_path" | "wrapper_path"
@@ -472,7 +475,7 @@ fn queue_job_text_column(queue_state_dir: &PathBuf, job_id: &str, column: &str) 
     .unwrap()
 }
 
-fn set_queue_job_text_column_null(queue_state_dir: &PathBuf, job_id: &str, column: &str) {
+fn set_queue_job_text_column_null(queue_state_dir: &Path, job_id: &str, column: &str) {
     assert!(matches!(column, "wrapper_path" | "log_path"));
     let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
     conn.execute(
@@ -482,7 +485,7 @@ fn set_queue_job_text_column_null(queue_state_dir: &PathBuf, job_id: &str, colum
     .unwrap();
 }
 
-fn set_queue_job_holding_reason(queue_state_dir: &PathBuf, job_id: &str, holding_reason: &str) {
+fn set_queue_job_holding_reason(queue_state_dir: &Path, job_id: &str, holding_reason: &str) {
     let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
     conn.execute(
         "UPDATE queue_jobs SET holding_reason = ?2 WHERE id = ?1",
@@ -492,7 +495,7 @@ fn set_queue_job_holding_reason(queue_state_dir: &PathBuf, job_id: &str, holding
 }
 
 fn mark_queue_job_terminal(
-    queue_state_dir: &PathBuf,
+    queue_state_dir: &Path,
     job_id: &str,
     state: &str,
     started_at: &str,
@@ -520,7 +523,7 @@ fn mark_queue_job_terminal(
 }
 
 fn mark_queue_job_running(
-    queue_state_dir: &PathBuf,
+    queue_state_dir: &Path,
     job_id: &str,
     started_at: &str,
     pid: i64,
@@ -537,7 +540,7 @@ fn mark_queue_job_running(
 }
 
 fn mark_queue_job_running_with_holding(
-    queue_state_dir: &PathBuf,
+    queue_state_dir: &Path,
     job_id: &str,
     started_at: &str,
     pid: i64,
@@ -567,9 +570,9 @@ fn test_now_rfc3339() -> String {
 }
 
 fn queue_runtime_test_app(
-    state_file: &PathBuf,
-    queue_state_dir: &PathBuf,
-    message_queue_db: &PathBuf,
+    state_file: &Path,
+    queue_state_dir: &Path,
+    message_queue_db: &Path,
     runtime_enabled: bool,
     fixture_writes_enabled: bool,
 ) -> axum::Router {
@@ -595,7 +598,7 @@ fn queue_runtime_test_app(
 
 async fn create_pending_queue_job(
     app: axum::Router,
-    working_dir: &PathBuf,
+    working_dir: &Path,
     label: &str,
     script: &str,
     timeout_seconds: i64,
@@ -606,7 +609,7 @@ async fn create_pending_queue_job(
 
 async fn create_pending_queue_job_of_type(
     app: axum::Router,
-    working_dir: &PathBuf,
+    working_dir: &Path,
     job_type: &str,
     label: &str,
     script: &str,
@@ -6051,17 +6054,15 @@ async fn queue_runtime_admission_displaces_background_for_ready_perf_job() {
     assert_eq!(second_final["termination_reason"], "perf_displacement");
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert!(notifications.iter().any(|text| queue_completion_matches(
-        &text,
+        text,
         &first_background_id,
         "displaced"
     )));
+    assert!(notifications
+        .iter()
+        .any(|text| queue_completion_matches(text, &perf_id, "succeeded")));
     assert!(notifications.iter().any(|text| queue_completion_matches(
-        &text,
-        &perf_id,
-        "succeeded"
-    )));
-    assert!(notifications.iter().any(|text| queue_completion_matches(
-        &text,
+        text,
         &second_background_id,
         "displaced"
     )));
@@ -6893,7 +6894,7 @@ async fn queue_runtime_recovery_polls_live_running_job_to_completion() {
 // A failed liveness sample once recorded a live job as failed without an exit
 // receipt (#1506). Startup recovery must return such a row to running, tell the
 // owner, and still deliver the real completion.
-fn mark_queue_job_failed_without_receipt(queue_state_dir: &PathBuf, job_id: &str) {
+fn mark_queue_job_failed_without_receipt(queue_state_dir: &Path, job_id: &str) {
     let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
     conn.execute(
         r#"
@@ -7449,7 +7450,7 @@ async fn queue_job_cancel_persists_pending_cancel() {
     assert_eq!(notifications.len(), 1);
     assert!(queue_completion_matches(
         &notifications[0],
-        &job_id,
+        job_id,
         "cancelled"
     ));
 }
@@ -14032,7 +14033,6 @@ async fn patch_session_metadata_updates_friendly_name_and_em_state() {
         },
         sm_send: SmSendConfig {
             db_path: queue_db.display().to_string(),
-            ..SmSendConfig::default()
         },
         rust_core: RustCoreConfig {
             fixture_writes_enabled: true,
@@ -14368,7 +14368,6 @@ async fn patch_session_metadata_is_em_does_not_load_human_config() {
         },
         email: EmailConfig {
             bridge_config: bridge_config.display().to_string(),
-            ..EmailConfig::default()
         },
         rust_core: RustCoreConfig {
             fixture_writes_enabled: true,
@@ -15481,7 +15480,8 @@ async fn runtime_core_delivers_sm_send_metadata_rows() {
     .await;
 
     let queue_conn = Connection::open(&queue_db_path).unwrap();
-    let pending: (
+    // One message_queue row, in the column order of the SELECT below.
+    type PendingRow = (
         String,
         Option<String>,
         Option<String>,
@@ -15496,7 +15496,8 @@ async fn runtime_core_delivers_sm_send_metadata_rows() {
         Option<String>,
         Option<String>,
         Option<String>,
-    ) = queue_conn
+    );
+    let pending: PendingRow = queue_conn
         .query_row(
             r#"
             SELECT text, sender_session_id, sender_name, from_sm_send, timeout_at,
@@ -20388,6 +20389,7 @@ async fn reparent_request_polls_are_snapshot_only_while_apply_lock_is_held() {
     let before_modified = fs::metadata(&state_file).unwrap().modified().unwrap();
     let lock_file = fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(state_file.with_extension("reparent-apply.lock"))
@@ -21320,7 +21322,7 @@ async fn reparent_tree_detaches_a_stopped_parent_and_consecutive_rotations_need_
     );
 }
 
-fn config_with_state_file(state_file: &PathBuf) -> AppConfig {
+fn config_with_state_file(state_file: &Path) -> AppConfig {
     AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
@@ -21329,7 +21331,7 @@ fn config_with_state_file(state_file: &PathBuf) -> AppConfig {
     }
 }
 
-fn config_with_state_file_and_mobile_terminal(state_file: &PathBuf) -> AppConfig {
+fn config_with_state_file_and_mobile_terminal(state_file: &Path) -> AppConfig {
     let mut config = config_with_state_file(state_file);
     config.external_access.public_http_host = Some("sm.example.com".to_owned());
     config.mobile_terminal.enabled = true;
@@ -21350,8 +21352,8 @@ fn config_with_state_file_and_mobile_terminal(state_file: &PathBuf) -> AppConfig
 }
 
 fn config_with_state_file_and_email(
-    state_file: &PathBuf,
-    bridge_config: &PathBuf,
+    state_file: &Path,
+    bridge_config: &Path,
     fixture_writes_enabled: bool,
 ) -> AppConfig {
     AppConfig {
@@ -21369,7 +21371,7 @@ fn config_with_state_file_and_email(
     }
 }
 
-fn config_with_state_file_and_queue(state_file: &PathBuf) -> AppConfig {
+fn config_with_state_file_and_queue(state_file: &Path) -> AppConfig {
     AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
@@ -21383,7 +21385,7 @@ fn config_with_state_file_and_queue(state_file: &PathBuf) -> AppConfig {
     }
 }
 
-fn queue_db_path_for_state_file(state_file: &PathBuf) -> PathBuf {
+fn queue_db_path_for_state_file(state_file: &Path) -> PathBuf {
     state_file.with_extension("message_queue.db")
 }
 
@@ -21836,7 +21838,7 @@ fn assert_python_naive_timestamp(value: &str) {
     );
 }
 
-fn config_with_state_file_and_auth(state_file: &PathBuf) -> AppConfig {
+fn config_with_state_file_and_auth(state_file: &Path) -> AppConfig {
     AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
@@ -22393,7 +22395,7 @@ fn touch_session_activity(state_file: &PathBuf, session_id: &str, tick: usize) {
     fs::write(state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 }
 
-fn runtime_app(state_file: &PathBuf, log_dir: &PathBuf, tmux_socket: &str) -> axum::Router {
+fn runtime_app(state_file: &Path, log_dir: &Path, tmux_socket: &str) -> axum::Router {
     runtime_app_with_command(
         state_file,
         log_dir,
@@ -22403,7 +22405,7 @@ fn runtime_app(state_file: &PathBuf, log_dir: &PathBuf, tmux_socket: &str) -> ax
 }
 
 fn runtime_app_with_structured_claude_provider(
-    state_file: &PathBuf,
+    state_file: &Path,
     log_dir: &PathBuf,
     tmux_socket: &str,
     acknowledge: bool,
@@ -22424,11 +22426,12 @@ fn runtime_app_with_structured_claude_provider(
             transcript_root.display()
         )
     };
-    let acknowledgement = acknowledge.then_some(
+    let acknowledgement = if acknowledge {
         r#"  printf '{"type":"user","sessionId":"%s","message":{"content":"%s"}}\n' "$session_id" "$line" >> "$transcript"
-"#,
-    )
-    .unwrap_or_default();
+"#
+    } else {
+        Default::default()
+    };
     // Claude 2.1.280 creates its transcript only when the first turn arrives.
     let create_transcript = r#"mkdir -p "$(dirname "$transcript")"
 [ -f "$transcript" ] || printf '{"type":"mode","sessionId":"%s"}\n' "$session_id" > "$transcript"
@@ -22500,7 +22503,7 @@ done
 }
 
 fn runtime_app_with_codex_fork_initial_brief_provider(
-    state_file: &PathBuf,
+    state_file: &Path,
     log_dir: &PathBuf,
     tmux_socket: &str,
     directory_trust: bool,
@@ -22577,8 +22580,8 @@ fn runtime_app_with_codex_fork_initial_brief_provider(
 }
 
 fn runtime_app_with_codex_composer(
-    state_file: &PathBuf,
-    log_dir: &PathBuf,
+    state_file: &Path,
+    log_dir: &Path,
     tmux_socket: &str,
 ) -> axum::Router {
     runtime_app_with_command(
@@ -22590,8 +22593,8 @@ fn runtime_app_with_codex_composer(
 }
 
 fn runtime_app_with_command(
-    state_file: &PathBuf,
-    log_dir: &PathBuf,
+    state_file: &Path,
+    log_dir: &Path,
     tmux_socket: &str,
     runtime_command: &str,
 ) -> axum::Router {
@@ -22786,11 +22789,11 @@ fn spawn_codex_fork_stale_epoch_control_socket(
     receiver
 }
 
-fn core_log_file_path(log_dir: &PathBuf, session_id: &str) -> PathBuf {
+fn core_log_file_path(log_dir: &Path, session_id: &str) -> PathBuf {
     log_dir.join(format!("{}.log", safe_session_basename(session_id)))
 }
 
-fn codex_fork_artifact_paths(log_dir: &PathBuf, session_id: &str) -> (PathBuf, PathBuf) {
+fn codex_fork_artifact_paths(log_dir: &Path, session_id: &str) -> (PathBuf, PathBuf) {
     let basename = safe_session_basename(session_id);
     (
         log_dir.join(format!("{basename}.codex-fork.events.jsonl")),
@@ -23050,9 +23053,12 @@ fn queue_completion_matches(text: &str, id: &str, state: &str) -> bool {
     text.contains(&format!("completed: {state}")) && text.contains(&format!("ID: {id}"))
 }
 
+/// Repo, path, and commit SHA of a stubbed doc file.
+type DocFileKey = (String, String, String);
+
 #[derive(Clone, Default)]
 struct StubDocSource {
-    files: Arc<Mutex<std::collections::BTreeMap<(String, String, String), Vec<u8>>>>,
+    files: Arc<Mutex<std::collections::BTreeMap<DocFileKey, Vec<u8>>>>,
     fetches: Arc<AtomicU64>,
     wrong_blob_sha: bool,
     github: Arc<Mutex<FakeGitHub>>,
@@ -23713,8 +23719,10 @@ async fn owner_docs_publish_rejects_bad_input_and_reports_missing_files() {
     let (status, _) = get_json(app.clone(), "/docs/0123abcd/view?sha=HEAD").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    let mut mismatched = StubDocSource::default();
-    mismatched.wrong_blob_sha = true;
+    let mismatched = StubDocSource {
+        wrong_blob_sha: true,
+        ..StubDocSource::default()
+    };
     mismatched.put("acme/widgets", "memo.md", &"a".repeat(40), b"# Memo\n");
     let (app, _dir) = owner_docs_app(mismatched);
     let (status, payload) = post_json(app, "/docs", body(json!({}))).await;
@@ -24068,17 +24076,18 @@ async fn owner_doc_review_failure_deletes_the_pending_review_and_keeps_drafts() 
         )
         .await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{error}");
-        let github = source.github.lock().unwrap();
-        assert!(
-            github.reviews.is_empty(),
-            "{failure}: pending review left behind"
-        );
-        assert!(
-            github.calls.contains(&"delete".to_owned()),
-            "{:?}",
-            github.calls
-        );
-        drop(github);
+        {
+            let github = source.github.lock().unwrap();
+            assert!(
+                github.reviews.is_empty(),
+                "{failure}: pending review left behind"
+            );
+            assert!(
+                github.calls.contains(&"delete".to_owned()),
+                "{:?}",
+                github.calls
+            );
+        }
         // The drafts stay.
         let (_, drafts) = get_json(app.clone(), &format!("/docs/{id}/drafts")).await;
         assert_eq!(drafts["drafts"].as_array().unwrap().len(), 2);
@@ -24404,7 +24413,7 @@ async fn owner_doc_token_opens_the_json_endpoints_for_its_own_doc_only() {
         .id;
     let now = unix_timestamp();
     let valid = doc_token(SECRET, &id, now + 3600);
-    let external = Some(SocketAddr::from(([203, 0, 113, 7], 443)));
+    let external = SocketAddr::from(([203, 0, 113, 7], 443));
     let get = |uri: String, token: Option<String>| {
         let app = app.clone();
         async move {
@@ -24413,9 +24422,7 @@ async fn owner_doc_token_opens_the_json_endpoints_for_its_own_doc_only() {
                 request = request.header("x-sm-doc-token", token);
             }
             let mut request = request.body(Body::empty()).unwrap();
-            request
-                .extensions_mut()
-                .insert(ConnectInfo(external.unwrap()));
+            request.extensions_mut().insert(ConnectInfo(external));
             app.oneshot(request).await.unwrap().status()
         }
     };
@@ -24440,7 +24447,7 @@ async fn owner_doc_token_opens_the_json_endpoints_for_its_own_doc_only() {
             ("host", "sm.example.com"),
             ("x-sm-doc-token", valid.as_str()),
         ],
-        external,
+        Some(external),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{draft}");
@@ -24480,7 +24487,7 @@ async fn owner_doc_token_opens_the_json_endpoints_for_its_own_doc_only() {
             ("host", "sm.example.com"),
             ("x-sm-doc-token", valid.as_str()),
         ],
-        external,
+        Some(external),
     )
     .await;
     assert!(matches!(

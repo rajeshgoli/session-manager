@@ -1722,9 +1722,7 @@ impl RetainedQueueStore {
                     let valid = current.child_session_id == wake.child_session_id
                         && current.period_seconds == wake.period_seconds
                         && ((current.parent_session_id == wake.parent_session_id
-                            && current.is_active == wake.is_active)
-                            || (current.parent_session_id == wake.parent_session_id
-                                && !current.is_active)
+                            && (current.is_active == wake.is_active || !current.is_active))
                             || new_parent_session_id.is_some_and(|new_parent| {
                                 current.parent_session_id == new_parent
                                     && current.is_active == wake.is_active
@@ -3918,6 +3916,7 @@ fn spawn_queue_job_process(
         .with_context(|| format!("failed to start queue job {}", job.id))
 }
 
+#[allow(clippy::too_many_arguments)] // the monitor thread takes each owned job input separately
 fn monitor_queue_job_completion(
     state_dir: PathBuf,
     message_queue_db_path: PathBuf,
@@ -4056,6 +4055,7 @@ fn monitor_queue_job_completion(
 
 // The job's processes are already gone when this runs, and no other watcher will
 // record the outcome, so a transient database error is retried until it succeeds.
+#[allow(clippy::too_many_arguments)] // each argument is a distinct field of the job outcome
 fn finish_live_queue_job_until_recorded(
     state_dir: &Path,
     message_queue_db_path: &Path,
@@ -4938,10 +4938,11 @@ fn poll_recovered_queue_job(
             }
             continue;
         }
-        if !group_alive && !process_exists(pid) {
-            if finish(&conn, &job, "failed", None, process_guard.peak()) {
-                return;
-            }
+        if !group_alive
+            && !process_exists(pid)
+            && finish(&conn, &job, "failed", None, process_guard.peak())
+        {
+            return;
         }
     }
 }
@@ -7191,7 +7192,8 @@ mod tests {
             .as_i64()
             .unwrap();
         assert!((629..=630).contains(&estimate));
-        let stale = queue_hold_explanation(&pending, &[pending.clone()], policy).unwrap();
+        let stale =
+            queue_hold_explanation(&pending, std::slice::from_ref(&pending), policy).unwrap();
         assert!(stale["detail"]
             .as_str()
             .unwrap()

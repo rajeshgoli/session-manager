@@ -152,4 +152,6 @@ The restart script uses the installed config and falls back to the in-repo `conf
 
 **Run tests with `scripts/test-rust-isolated.sh`**, not bare `cargo test`. The launcher isolates and then cleans up test state.
 
+**Before opening a PR, run `cargo clippy -p sm-server --all-targets -- -D warnings` and `cargo fmt -p sm-server --check`.** Both pass on main. Fix whatever they report as part of your own ticket, including warnings a toolchain upgrade introduced in code the ticket touches. Suppress a lint only with a targeted `#[allow]` and a one-line reason.
+
 Common failures.** Hooks not logging: check the server is up (`curl localhost:8420/health`). `sm` commands failing: check `CLAUDE_SESSION_MANAGER_ID` is set. Session not found: use the full session id or the exact friendly name.

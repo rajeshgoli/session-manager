@@ -688,10 +688,11 @@ fn build_window_report(
             model.first_bucket_ts = row.first_bucket_ts.clone();
         }
     }
-    let unassigned_points = (premium_units == 0.0)
-        .then_some(premium_points)
-        .unwrap_or(0.0)
-        + (rest_units == 0.0).then_some(rest_points).unwrap_or(0.0);
+    let unassigned_points = (if premium_units == 0.0 {
+        premium_points
+    } else {
+        0.0
+    }) + if rest_units == 0.0 { rest_points } else { 0.0 };
     if unassigned_points > 0.0 {
         *burn_by_seat.entry("unassigned".to_owned()).or_default() += unassigned_points;
         burn_by_model

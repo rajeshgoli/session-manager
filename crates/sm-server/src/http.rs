@@ -1128,13 +1128,13 @@ fn find_fresh_codex_review_or_comment_with_gh_filtered(
                     .map(ToOwned::to_owned),
                 head_sha: None,
             };
-            if source_filter.map_or(true, |source| source == review_match.source) {
+            if source_filter.is_none_or(|source| source == review_match.source) {
                 candidates.push(review_match);
             }
         }
     }
 
-    if source_filter.map_or(true, |source| source == "comment") {
+    if source_filter.is_none_or(|source| source == "comment") {
         let comments = gh_api_json(
             repo,
             &format!(
@@ -3004,7 +3004,7 @@ async fn inbound_email_webhook(
         };
         match outcome {
             Some(CoreRestoreOutcome::Restored(restored_session)) => {
-                session = restored_session;
+                session = *restored_session;
                 restored = true;
             }
             Some(CoreRestoreOutcome::NotStopped) => {}
@@ -3989,6 +3989,7 @@ async fn create_session(
 /// Accept a textual brief durably before session creation.  The returned prompt
 /// is read back from the artifact so the runtime never launches from mutable
 /// caller input.
+#[allow(clippy::too_many_arguments)] // each argument is a distinct field of the spawn request
 fn accept_spawn_brief(
     state: &AppState,
     prompt: Option<&str>,
@@ -4762,7 +4763,7 @@ async fn restore_node_restore_candidate(
     };
     match outcome {
         Some(CoreRestoreOutcome::Restored(session)) => {
-            Ok(Json(session_response_with_live_activity(&state, session)))
+            Ok(Json(session_response_with_live_activity(&state, *session)))
         }
         Some(CoreRestoreOutcome::NotStopped) => Err(ApiError::Status {
             status: StatusCode::CONFLICT,
@@ -5110,7 +5111,7 @@ fn normalized_codex_review_steer(steer: Option<&str>) -> Option<&str> {
         })
     {
         normalized = normalized[TRIGGER.len()..]
-            .trim_start_matches(|ch| matches!(ch, ' ' | '\t' | '\n' | '.' | ':' | '-'))
+            .trim_start_matches([' ', '\t', '\n', '.', ':', '-'])
             .trim();
     }
     (!normalized.is_empty()).then_some(normalized)
@@ -5821,7 +5822,7 @@ async fn run_codex_review_request_watcher(
                     &comment.posted_at,
                     registration.retry_interval_seconds.max(1),
                 )
-                .unwrap_or_else(|| now_rfc3339());
+                .unwrap_or_else(now_rfc3339);
                 let _ = RetainedQueueStore::retry_codex_review_request_in_path(
                     &queue_db_path,
                     &request_id,
@@ -7055,7 +7056,7 @@ async fn update_session_metadata(
                     let _ = runtime.set_status_bar(&session.tmux_session, friendly_name);
                 }
             }
-            Ok(Json(session_response_with_live_activity(&state, session)))
+            Ok(Json(session_response_with_live_activity(&state, *session)))
         }
         SessionMetadataOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
         SessionMetadataOutcome::BadRequest(detail) => Err(ApiError::Status {
@@ -8827,7 +8828,7 @@ fn finish_btw_request(
         }
         Err(error) => store.fail(request_id, &error.to_string())?,
     }
-    deliver_btw_response(state, &store, request_id)?;
+    deliver_btw_response(state, store, request_id)?;
     Ok(())
 }
 
@@ -9627,7 +9628,7 @@ async fn restore_session(
     };
     match outcome {
         CoreRestoreOutcome::Restored(session) => {
-            Ok(Json(session_response_with_live_activity(&state, session)))
+            Ok(Json(session_response_with_live_activity(&state, *session)))
         }
         CoreRestoreOutcome::NotStopped => Err(ApiError::Status {
             status: StatusCode::CONFLICT,
@@ -9854,7 +9855,7 @@ async fn set_maintainer(
         .set_maintainer_session(&session_id, payload)?
     {
         MaintainerMutationOutcome::Updated(session) => {
-            Ok(Json(session_response_with_live_activity(&state, session)))
+            Ok(Json(session_response_with_live_activity(&state, *session)))
         }
         MaintainerMutationOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
         MaintainerMutationOutcome::BadRequest(detail) => Err(ApiError::Status {
@@ -9883,7 +9884,7 @@ async fn clear_maintainer(
         .clear_maintainer_session(&session_id, payload)?
     {
         MaintainerMutationOutcome::Updated(session) => {
-            Ok(Json(session_response_with_live_activity(&state, session)))
+            Ok(Json(session_response_with_live_activity(&state, *session)))
         }
         MaintainerMutationOutcome::NotFound => Err(ApiError::NotFound("Session not found")),
         MaintainerMutationOutcome::BadRequest(detail) => Err(ApiError::Status {
@@ -11210,11 +11211,10 @@ fn mobile_primary_action(mobile_terminal: &Value, attach_descriptor: &Value) -> 
             "type": "mobile_terminal",
             "label": "Attach",
         })
-    } else if attach_descriptor
+    } else if !attach_descriptor
         .get("attach_supported")
         .and_then(Value::as_bool)
         .unwrap_or(true)
-        != true
     {
         json!({
             "type": "details",
@@ -11880,11 +11880,10 @@ fn mobile_terminal_metadata(
             "reason": "registered mobile device key is required",
         });
     }
-    if attach_descriptor
+    if !attach_descriptor
         .get("attach_supported")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        != true
     {
         return json!({
             "supported": false,
@@ -11990,11 +11989,10 @@ fn authorize_mobile_terminal_ticket_request(
     }
 
     let attach = attach_descriptor_payload(session.clone());
-    if attach
+    if !attach
         .get("attach_supported")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        != true
     {
         let detail = attach
             .get("message")
@@ -13291,11 +13289,10 @@ fn consume_mobile_terminal_ticket(
         });
     }
     let attach = attach_descriptor_payload(session);
-    if attach
+    if !attach
         .get("attach_supported")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        != true
     {
         return Err(ApiError::Status {
             status: StatusCode::FORBIDDEN,
@@ -14285,7 +14282,7 @@ fn browser_session_user(headers: &HeaderMap, config: &AppConfig) -> Option<Authe
     let cookie = cookie_value(headers, SESSION_COOKIE_NAME)?;
     let secret = trimmed(&config.google_auth.session_cookie_secret)?;
     let payload = verify_starlette_session_cookie(&cookie, &secret)?;
-    if payload.get("google_authenticated")?.as_bool()? != true {
+    if !payload.get("google_authenticated")?.as_bool()? {
         return None;
     }
     Some(AuthenticatedUser {
@@ -15518,7 +15515,7 @@ mod tests {
             assert!(session["waiting_on"].as_array().unwrap().is_empty());
         }
         let projected = project_session_obligations(
-            &[job.clone()],
+            std::slice::from_ref(&job),
             &[review, completed, duplicate],
             &[],
             &[],
@@ -15891,12 +15888,16 @@ mod tests {
         let disabled_default = UsageConfig::default();
         assert!(!should_use_configured_usage_db_path(&disabled_default));
 
-        let mut enabled_default = UsageConfig::default();
-        enabled_default.enabled = true;
+        let enabled_default = UsageConfig {
+            enabled: true,
+            ..UsageConfig::default()
+        };
         assert!(should_use_configured_usage_db_path(&enabled_default));
 
-        let mut disabled_custom = UsageConfig::default();
-        disabled_custom.db_path = "/tmp/custom-usage.db".to_owned();
+        let disabled_custom = UsageConfig {
+            db_path: "/tmp/custom-usage.db".to_owned(),
+            ..UsageConfig::default()
+        };
         assert!(should_use_configured_usage_db_path(&disabled_custom));
     }
 
@@ -17058,9 +17059,7 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let event_stream = dir.join("events.jsonl");
-        let mut events = concat!(
-                "{\"event_type\":\"thread/status/changed\",\"session_id\":\"root-thread\",\"payload\":{\"threadId\":\"root-thread\",\"status\":{\"type\":\"idle\"}}}\n"
-            )
+        let mut events = "{\"event_type\":\"thread/status/changed\",\"session_id\":\"root-thread\",\"payload\":{\"threadId\":\"root-thread\",\"status\":{\"type\":\"idle\"}}}\n"
             .as_bytes()
             .to_vec();
         events.extend(std::iter::repeat_n(
