@@ -64,7 +64,8 @@ elif [[ "$SKIP_BUILD" -eq 1 ]]; then
   SOURCE="$SM_CLI_CARGO_OUTPUT"
 else
   step "Building sm"
-  cargo build --release --bin sm --target-dir "$SM_TARGET_DIR" \
+  # --manifest-path: build this checkout, not whichever one the caller is in.
+  cargo build --release --bin sm --manifest-path "$REPO_ROOT/Cargo.toml" --target-dir "$SM_TARGET_DIR" \
     || fail "build failed; the installed CLI at $SM_CLI_BINARY was not touched"
   SOURCE="$SM_CLI_CARGO_OUTPUT"
 fi

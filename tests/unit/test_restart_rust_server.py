@@ -1422,7 +1422,7 @@ def checkout(env):
     commit_file(
         seed,
         "scripts/install-sm-cli.sh",
-        f'#!/bin/bash\necho "install-sm-cli" >> "{env["log"]}"\n',
+        f'#!/bin/bash\necho "install-sm-cli $* target=$SM_TARGET_DIR" >> "{env["log"]}"\n',
         "cli stub",
         True,
     )
@@ -1590,3 +1590,50 @@ def test_default_lock_is_shared_across_different_tmpdirs(env, tmp_path):
         assert result.returncode != 0
         assert "already running" in result.stderr
     assert_service_untouched(env)
+
+
+def test_cli_is_installed_from_the_server_build_not_rebuilt(env, checkout):
+    """sm#1536: `sm` comes out of the server's own build of the checked source;
+    rebuilding it at the end could read a tree that has moved since."""
+    target = env["tmp"] / "target"
+
+    result = checkout["run"](SM_TARGET_DIR=str(target))
+
+    assert result.returncode == 0, result.stderr
+    assert f"install-sm-cli --skip-build target={target}" in calls(env)
+
+
+def test_cli_installer_builds_its_own_checkout_from_any_cwd(tmp_path):
+    """sm#1536: without --manifest-path, cargo builds whatever tree the caller
+    is standing in."""
+    log = tmp_path / "cargo.log"
+    target = tmp_path / "target"
+    _write(
+        tmp_path / "bin" / "cargo",
+        f"""#!/bin/bash
+echo "$*" > "{log}"
+mkdir -p "{target}/release"
+printf '#!/bin/bash\\necho sm-test\\n' > "{target}/release/sm"
+chmod 755 "{target}/release/sm"
+""",
+        executable=True,
+    )
+    elsewhere = tmp_path / "some-other-checkout"
+    elsewhere.mkdir()
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "install-sm-cli.sh")],
+        cwd=elsewhere,
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
+            "SM_TARGET_DIR": str(target),
+            "SM_CLI_BINARY": str(tmp_path / "installed" / "sm"),
+        },
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"--manifest-path {REPO_ROOT}/Cargo.toml" in log.read_text()
+    assert (tmp_path / "installed" / "sm").exists()

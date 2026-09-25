@@ -875,10 +875,10 @@ fi
 step "Refreshing the installed sm CLI"
 if [[ "$SKIP_BUILD" -eq 1 ]]; then
   echo "skipped (--skip-build): the installed CLI is whatever was there before"
-elif [[ "$(source_fingerprint)" != "$SOURCE_AT_START" ]]; then
-  echo "WARNING: $REPO_ROOT changed after the server build, so the sm CLI was not" >&2
-  echo "         rebuilt from it; $SM_LABEL itself is healthy. Re-run with --update." >&2
-elif "$REPO_ROOT/scripts/install-sm-cli.sh"; then
+# The server build above also built `sm` (same package) from the fingerprinted
+# source. Install that one rather than rebuilding, which could read a tree that
+# has moved since.
+elif SM_TARGET_DIR="$SM_TARGET_DIR" "$REPO_ROOT/scripts/install-sm-cli.sh" --skip-build; then
   :
 else
   echo "WARNING: the sm CLI was not reinstalled; $SM_LABEL itself is healthy." >&2
