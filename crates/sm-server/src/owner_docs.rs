@@ -934,6 +934,29 @@ impl OwnerDocStore {
         Ok(())
     }
 
+    /// The revision's latest unfinished (`submitting`) submission. While it
+    /// exists its drafts are frozen and new submissions resume it.
+    pub fn unfinished_review(
+        &self,
+        doc_id: &str,
+        commit_sha: &str,
+    ) -> Result<Option<OwnerDocReview>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        Ok(conn
+            .query_row(
+                &format!(
+                    "SELECT {REVIEW_COLUMNS} FROM owner_doc_reviews
+                     WHERE doc_id = ?1 AND commit_sha = ?2 AND status = 'submitting'
+                     ORDER BY submitted_at DESC, rowid DESC LIMIT 1"
+                ),
+                params![doc_id, commit_sha],
+                review_from_row,
+            )
+            .optional()?)
+    }
+
     /// A retry of a `failed` submission: back to `submitting`, to be
     /// reconciled against GitHub. Other states are returned unchanged.
     pub fn reopen_review(&self, submission_id: &str) -> Result<OwnerDocReview> {

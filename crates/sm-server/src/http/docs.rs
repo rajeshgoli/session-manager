@@ -216,17 +216,21 @@ const DELETE_REVIEW: &str = "mutation($review: ID!) {
 }";
 /// `comments(first: 100)` matches `MAX_DRAFTS_PER_REVISION`: a review sm posts
 /// never has more comments than one page.
-const VIEWER_REVIEWS: &str = "query($owner: String!, $name: String!, $number: Int!) {
-  viewer { login }
+const VIEWER_LOGIN: &str = "query { viewer { login } }";
+const VIEWER_REVIEWS: &str =
+    "query($owner: String!, $name: String!, $number: Int!, $author: String!, $after: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      reviews(last: 100) {
-        nodes { id databaseId url state body author { login }
+      reviews(author: $author, first: 50, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id databaseId url state body
           comments(first: 100) { nodes { body line originalLine } } }
       }
     }
   }
 }";
+/// Enough for any PR: 50 reviews a page from one author.
+const VIEWER_REVIEW_PAGES: usize = 40;
 
 fn contents_endpoint(repo: &str, path: &str, commit_sha: &str) -> Result<String, DocFetchError> {
     let (owner, name) = split_github_repo(repo).map_err(DocFetchError::Other)?;
@@ -400,19 +404,34 @@ impl OwnerDocSource for GhCliDocSource {
 
     fn viewer_reviews(&self, repo: &str, pr_number: i64) -> Result<Vec<DocReviewOnGitHub>, String> {
         let (owner, name) = split_github_repo(repo)?;
-        let data = gh_graphql(
-            VIEWER_REVIEWS,
-            json!({"owner": owner, "name": name, "number": pr_number}),
-            true,
-        )?;
-        let viewer = data["viewer"]["login"].as_str().unwrap_or_default();
-        let nodes = data["repository"]["pullRequest"]["reviews"]["nodes"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let viewer = gh_graphql(VIEWER_LOGIN, json!({}), true)?["viewer"]["login"]
+            .as_str()
+            .filter(|login| !login.is_empty())
+            .ok_or("GitHub returned no viewer login")?
+            .to_owned();
+        // Only the viewer's reviews, every page: a marker older than any
+        // fixed window must still be found.
+        let mut nodes = Vec::new();
+        let mut after = Value::Null;
+        for page in 0.. {
+            if page == VIEWER_REVIEW_PAGES {
+                return Err("too many reviews by the viewer to reconcile".to_owned());
+            }
+            let data = gh_graphql(
+                VIEWER_REVIEWS,
+                json!({"owner": owner, "name": name, "number": pr_number,
+                       "author": viewer, "after": after}),
+                true,
+            )?;
+            let reviews = &data["repository"]["pullRequest"]["reviews"];
+            nodes.extend(reviews["nodes"].as_array().cloned().unwrap_or_default());
+            if reviews["pageInfo"]["hasNextPage"].as_bool() != Some(true) {
+                break;
+            }
+            after = reviews["pageInfo"]["endCursor"].clone();
+        }
         Ok(nodes
             .iter()
-            .filter(|node| node["author"]["login"].as_str() == Some(viewer))
             .map(|node| DocReviewOnGitHub {
                 node_id: node["id"].as_str().unwrap_or_default().to_owned(),
                 database_id: node["databaseId"].as_i64(),
@@ -1025,6 +1044,10 @@ async fn view_doc_response(
         "token": issue_doc_token(&state.config, &doc.id),
         "revisions": revision_entries(doc, &publishes),
         "drafts": store.drafts(&doc.id)?,
+        // A reloaded page resumes an unfinished submission, never a new one.
+        "unfinishedReview": store.unfinished_review(&doc.id, commit_sha)?.map(|review| json!({
+            "id": review.id, "verdict": review.verdict, "body": review.body.unwrap_or_default(),
+        })),
     });
     Ok((
         StatusCode::OK,
@@ -1319,7 +1342,14 @@ pub(super) async fn patch_owner_doc_subpath(
     let payload: UpdateDraftRequest = parse_json_body(&body)?;
     let text = validated_draft_body(&payload.body)?;
     let _guard = state.owner_doc_review_lock.lock().await;
-    let draft = owner_doc_store(&state)
+    let store = owner_doc_store(&state);
+    let existing = store
+        .drafts(&doc.id)?
+        .into_iter()
+        .find(|draft| draft.id == draft_id)
+        .ok_or(ApiError::NotFound("Draft not found"))?;
+    ensure_drafts_unfrozen(&state, &doc, &existing.commit_sha)?;
+    let draft = store
         .update_draft(&doc.id, draft_id, &text)?
         .ok_or(ApiError::NotFound("Draft not found"))?;
     Ok(Json(serde_json::to_value(draft)?))
@@ -1336,10 +1366,32 @@ pub(super) async fn delete_owner_doc_subpath(
     let draft_id = draft_subroute(&rest)?;
     let doc = find_doc(&state, &doc_id)?;
     let _guard = state.owner_doc_review_lock.lock().await;
-    if !owner_doc_store(&state).delete_draft(&doc.id, draft_id)? {
+    let store = owner_doc_store(&state);
+    let existing = store
+        .drafts(&doc.id)?
+        .into_iter()
+        .find(|draft| draft.id == draft_id)
+        .ok_or(ApiError::NotFound("Draft not found"))?;
+    ensure_drafts_unfrozen(&state, &doc, &existing.commit_sha)?;
+    if !store.delete_draft(&doc.id, draft_id)? {
         return Err(ApiError::NotFound("Draft not found"));
     }
     Ok(Json(json!({ "deleted": true, "id": draft_id })))
+}
+
+/// A revision's drafts are frozen while a submission of it is unfinished:
+/// the retry posts them, and GitHub may already hold their text.
+fn ensure_drafts_unfrozen(state: &AppState, doc: &OwnerDoc, sha: &str) -> Result<(), ApiError> {
+    if owner_doc_store(state)
+        .unfinished_review(&doc.id, sha)?
+        .is_some()
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "A review of this revision is still being submitted; submit again to finish it before changing its drafts".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn draft_subroute(rest: &str) -> Result<&str, ApiError> {
@@ -1403,6 +1455,7 @@ fn create_draft(
         )));
     }
     let body = validated_draft_body(&payload.body)?;
+    ensure_drafts_unfrozen(state, doc, &sha)?;
     let store = owner_doc_store(state);
     let on_revision = store
         .drafts(&doc.id)?

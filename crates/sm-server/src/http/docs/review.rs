@@ -188,6 +188,12 @@ pub(super) async fn submit_owner_doc_review(
         };
     }
 
+    // Whatever id the page sends (a reload loses the one it had), an
+    // unfinished submission of this revision is finished first: starting a
+    // second one could post the drafts twice.
+    if let Some(unfinished) = store.unfinished_review(&doc.id, &sha)? {
+        return run_blocking(state, unfinished, None).await;
+    }
     let Some(pr_number) = doc.pr_number else {
         return Err(conflict("This doc has no PR, so it is read-only"));
     };

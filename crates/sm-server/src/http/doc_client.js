@@ -10,7 +10,8 @@
     head: null,
     canComment: !!CONFIG.canComment,
     prState: CONFIG.prState,
-    attempt: null
+    // A reloaded page resumes the server's unfinished submission.
+    attempt: CONFIG.unfinishedReview || null
   };
   var coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
   var BLOCK = '[data-sm-line]';

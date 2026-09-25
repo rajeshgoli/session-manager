@@ -23956,19 +23956,53 @@ async fn owner_doc_review_retries_under_one_id_never_post_twice() {
         store.review("sub-stuck-delete").unwrap().unwrap().status,
         "submitting"
     );
+    // Until it resolves, its drafts are frozen, and a reloaded page (which
+    // lost the id) is handed the unfinished submission to resume.
+    let (_, drafts) = get_json(app.clone(), &format!("/docs/{id}/drafts")).await;
+    let draft_id = drafts["drafts"][0]["id"].as_str().unwrap().to_owned();
+    let (status, _) = patch_json(
+        app.clone(),
+        &format!("/docs/{id}/drafts/{draft_id}"),
+        json!({"body": "edited mid-submit"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = delete_json(
+        app.clone(),
+        &format!("/docs/{id}/drafts/{draft_id}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = post_json(
+        app.clone(),
+        &format!("/docs/{id}/drafts"),
+        json!({"sha": c1, "line": 3, "body": "added mid-submit"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (_, _, page) = get_response(app.clone(), "/docs/widgets/specs/b.html").await;
+    assert!(String::from_utf8(page).unwrap().contains(
+        "\"unfinishedReview\":{\"body\":\"\",\"id\":\"sub-stuck-delete\",\"verdict\":\"comment\"}"
+    ));
     {
         let mut github = source.github.lock().unwrap();
         github.fail_submit = false;
         github.fail_delete = false;
         github.calls.clear();
     }
-    let (status, review) = submit(id, "sub-stuck-delete").await;
+    let (status, review) = submit(id.clone(), "sub-after-reload").await;
+    assert_eq!(review["submission_id"], "sub-stuck-delete");
     assert_eq!(status, StatusCode::OK, "{review}");
     assert_eq!(
         source.github.lock().unwrap().calls,
         ["viewer_reviews", "submit"]
     );
     assert_eq!(take_only_review(&source).threads.len(), 2);
+    let (_, _, page) = get_response(app.clone(), "/docs/widgets/specs/b.html").await;
+    assert!(String::from_utf8(page)
+        .unwrap()
+        .contains("\"unfinishedReview\":null"));
 
     // A line thread that took but whose response was lost is not repeated
     // as a file comment.

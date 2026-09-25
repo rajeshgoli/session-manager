@@ -327,7 +327,7 @@ POST, PATCH and DELETE under a doc are id-only (`/retract`, `/drafts`, `/review`
 4. **Inject the review client** (one `<script>` plus one `<style>`, just before
    the first real `</body>` end tag, or appended if there's none) with this config
    inlined: `{docId, title, name, sha, latestSha, prNumber, prState, prUrl,
-   canComment, token, revisions[], drafts[]}`. `revisions` lists the publishes
+   canComment, token, revisions[], drafts[], unfinishedReview}`. `revisions` lists the publishes
    newest first (`sha`, `blobSha`, `publishedAt`, `reviewRequested`, readable
    `path`); `drafts` holds every draft on the doc, across revisions. `prState` is
    `open`/`closed`/`merged`, `unknown` when `gh` fails (commenting then stays off
@@ -402,11 +402,15 @@ panel opens and reuses it on every retry of that submit.
 `id = submission_id` and `status = submitting`. If the row already exists:
 `posted` → return the stored result without touching GitHub; `failed` or
 `submitting` → set it `submitting` and reconcile (below) instead of starting over.
-A `submission_id` from another doc is a 409. Submits, reconciliation and draft
-writes are serialized, so drafts can't change under a review being posted. The review body ends with a hidden
+A `submission_id` from another doc is a 409. A new `submission_id` for a revision
+that still has a `submitting` row resumes that row instead (a reloaded page has
+lost its id), and the page config carries it as `unfinishedReview: {id, verdict,
+body}` so the panel shows what will be posted. Until that row resolves, draft
+writes for its revision are a 409. Submits, reconciliation and draft writes are
+serialized. The review body ends with a hidden
 marker, `<!-- sm-review:<submission_id> -->`. To reconcile, list the PR's reviews by
 the viewer (GraphQL `pullRequest.reviews(author: <viewer login>)`, including
-`PENDING`) and look for the marker:
+`PENDING`, every page) and look for the marker:
 - a submitted review carries it → finish steps 5–6 from that review, counting its
   comments with a line as line comments and the rest as file comments;
 - a pending review carries it → add the threads of drafts whose quoted body isn't
