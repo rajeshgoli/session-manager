@@ -10,7 +10,7 @@
     head: null,
     canComment: !!CONFIG.canComment,
     prState: CONFIG.prState,
-    submissionId: null
+    attempt: null
   };
   var coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
   var BLOCK = '[data-sm-line]';
@@ -160,6 +160,7 @@
 
   // ---- banners ---------------------------------------------------------
   var discardArmed = {};
+  var discardError = {};
   function renderBanner() {
     clear(banner);
     var head = S.head;
@@ -178,14 +179,21 @@
     Object.keys(other).forEach(function (sha) {
       var list = other[sha];
       var path = pathFor(sha);
-      var parts = [el('span', { text: list.length + ' draft comment' + (list.length === 1 ? '' : 's') + ' on ' + sha7(sha) })];
+      var parts = [el('span', { text: list.length + ' draft comment' + (list.length === 1 ? '' : 's') + ' on ' + sha7(sha) + (discardError[sha] ? ' (' + discardError[sha] + ')' : '') })];
       if (path) parts.push(el('a', { href: path, text: 'Submit them against ' + sha7(sha) }));
       parts.push(el('button', { class: 'lk', text: discardArmed[sha] ? 'Tap again to discard' : 'Discard', onclick: function () {
         if (!discardArmed[sha]) { discardArmed[sha] = 1; renderBanner(); return; }
-        Promise.all(list.map(function (d) { return api('DELETE', '/drafts/' + d.id).catch(function () {}); })).then(function () {
-          S.drafts = S.drafts.filter(function (d) { return d.commit_sha !== sha; });
+        // Only drafts the server deleted leave the list; a failed delete
+        // keeps its draft (and would still be submitted), so say so.
+        var gone = {};
+        var failures = 0;
+        Promise.all(list.map(function (d) {
+          return api('DELETE', '/drafts/' + d.id).then(function () { gone[d.id] = 1; }, function () { failures++; });
+        })).then(function () {
+          S.drafts = S.drafts.filter(function (d) { return !gone[d.id]; });
           delete discardArmed[sha];
-          renderBanner();
+          discardError[sha] = failures ? failures + ' could not be discarded; try again.' : '';
+          markers(); renderBar(); renderBanner();
         });
       } }));
       lines.push(parts);
@@ -330,11 +338,28 @@
   }
 
   // ---- review panel ------------------------------------------------------
+  // The server posts every stored draft for this revision, so the panel
+  // always shows the stored list: it reloads drafts when it opens and
+  // checks them again right before submitting.
+  function draftKey(list) {
+    return list.map(function (d) { return d.id + '\u0000' + d.body; }).sort().join('\u0001');
+  }
+  function refreshDrafts() {
+    return api('GET', '/drafts').then(function (res) {
+      S.drafts = (res && res.drafts) || [];
+      markers(); renderBar(); renderBanner();
+    });
+  }
   function openReview() {
     hideChip();
+    refreshDrafts().then(function () { renderReview(''); }, function (err) {
+      renderReview('Could not reload drafts: ' + err.message);
+    });
+  }
+  function renderReview(notice) {
     clear(sheet);
-    if (!S.submissionId) S.submissionId = newId();
     var drafts = currentDrafts();
+    var shownKey = draftKey(drafts);
     sheet.appendChild(el('h3', { text: 'Review ' + sha7(CONFIG.sha) + ' (' + drafts.length + ' comment' + (drafts.length === 1 ? '' : 's') + ')' }));
     drafts.forEach(function (d) {
       sheet.appendChild(el('div', { class: 'item' }, [
@@ -346,46 +371,57 @@
         ])
       ]));
     });
-    var msg = el('div');
+    var msg = el('div', { class: notice ? 'err' : '', text: notice });
     if (!S.canComment) {
       sheet.appendChild(el('div', { class: 'ro', text: stateText()[0] + '. These drafts cannot be submitted.' }));
       sheet.appendChild(el('div', { class: 'row' }, [el('button', { text: 'Close', onclick: closeSheet })]));
       sheet.hidden = false;
       return;
     }
+    // A retry reuses the earlier attempt's id, and the server keeps that
+    // attempt's verdict and text, so the panel shows them and locks them.
+    var attempt = S.attempt;
     var verdicts = [['approve', 'Approve'], ['changes_requested', 'Request changes'], ['comment', 'Comment']];
-    var radios = verdicts.map(function (v, i) {
+    var radios = verdicts.map(function (v) {
       var r = el('input', { type: 'radio', name: 'sm-verdict', value: v[0] });
-      if (i === 2) r.checked = true;
+      r.checked = v[0] === (attempt ? attempt.verdict : 'comment');
+      r.disabled = !!attempt;
       return el('label', {}, [r, v[1]]);
     });
     var body = el('textarea', { placeholder: 'Overall comment (optional)' });
-    var submit = el('button', { class: 'p', text: 'Submit review', onclick: function () {
+    if (attempt) { body.value = attempt.body; body.disabled = true; }
+    var submit = el('button', { class: 'p', text: attempt ? 'Submit again' : 'Submit review', onclick: function () {
       var picked = root.querySelector ? root.querySelector('input[name=sm-verdict]:checked') : null;
       submit.disabled = true;
       msg.className = 'muted';
       msg.textContent = 'Submitting…';
-      api('POST', '/review', { submission_id: S.submissionId, sha: CONFIG.sha, verdict: picked ? picked.value : 'comment', body: body.value })
-        .then(function (res) {
-          S.submissionId = null;
-          S.drafts = S.drafts.filter(function (d) { return d.commit_sha !== CONFIG.sha; });
-          markers(); renderBar();
-          clear(sheet);
-          sheet.appendChild(el('h3', { class: 'ok', text: 'Review posted' }));
-          sheet.appendChild(el('a', { href: res.github_review_url, target: '_blank', rel: 'noopener', text: 'Open it on GitHub' }));
-          sheet.appendChild(el('div', { class: 'row' }, [el('button', { text: 'Close', onclick: closeSheet })]));
-        })
-        .catch(function (err) {
-          // Keep the id: the server reconciles a retry against GitHub, so
-          // resubmitting can never post the review twice.
-          submit.disabled = false;
-          msg.className = 'err';
-          msg.textContent = err.message + ' Submitting again is safe.';
-        });
+      refreshDrafts().then(function () {
+        if (draftKey(currentDrafts()) !== shownKey) {
+          renderReview('The drafts changed on another device. Check them, then submit.');
+          return;
+        }
+        if (!S.attempt) S.attempt = { id: newId(), verdict: picked ? picked.value : 'comment', body: body.value };
+        return api('POST', '/review', { submission_id: S.attempt.id, sha: CONFIG.sha, verdict: S.attempt.verdict, body: S.attempt.body })
+          .then(function (res) {
+            S.attempt = null;
+            S.drafts = S.drafts.filter(function (d) { return d.commit_sha !== CONFIG.sha; });
+            markers(); renderBar();
+            clear(sheet);
+            sheet.appendChild(el('h3', { class: 'ok', text: 'Review posted' }));
+            sheet.appendChild(el('a', { href: res.github_review_url, target: '_blank', rel: 'noopener', text: 'Open it on GitHub' }));
+            sheet.appendChild(el('div', { class: 'row' }, [el('button', { text: 'Close', onclick: closeSheet })]));
+          });
+      }).catch(function (err) {
+        // Keep the attempt: the server reconciles a retry against GitHub,
+        // so resubmitting can never post the review twice.
+        renderReview(err.message + ' Submitting again is safe.');
+      });
     } });
-    [el('div', { class: 'row' }, radios), body, msg,
+    [el('div', { class: 'row' }, radios), body,
+      attempt ? el('div', { class: 'muted', text: 'Retrying your earlier submission with its verdict and text.' }) : null,
+      msg,
       el('div', { class: 'row' }, [el('button', { text: 'Cancel', onclick: closeSheet }), submit])
-    ].forEach(function (c) { sheet.appendChild(c); });
+    ].forEach(function (c) { if (c) sheet.appendChild(c); });
     sheet.hidden = false;
   }
 

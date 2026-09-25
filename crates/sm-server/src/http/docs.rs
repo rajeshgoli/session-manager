@@ -214,6 +214,8 @@ const SUBMIT_REVIEW: &str = "mutation($review: ID!, $body: String!) {
 const DELETE_REVIEW: &str = "mutation($review: ID!) {
   deletePullRequestReview(input: {pullRequestReviewId: $review}) { clientMutationId }
 }";
+/// `comments(first: 100)` matches `MAX_DRAFTS_PER_REVISION`: a review sm posts
+/// never has more comments than one page.
 const VIEWER_REVIEWS: &str = "query($owner: String!, $name: String!, $number: Int!) {
   viewer { login }
   repository(owner: $owner, name: $name) {
@@ -1350,6 +1352,9 @@ fn draft_subroute(rest: &str) -> Result<&str, ApiError> {
 /// GitHub's 65536-character comment limit once quoted.
 const MAX_DRAFT_BODY: usize = 20_000;
 const MAX_DRAFT_QUOTE: usize = 20_000;
+/// Drafts per revision: one review carries at most this many comments, which
+/// is the page size reconciliation reads back from GitHub (`comments(first:)`).
+pub(super) const MAX_DRAFTS_PER_REVISION: usize = 100;
 
 fn validated_draft_body(body: &str) -> Result<String, ApiError> {
     let body = body.trim();
@@ -1398,7 +1403,18 @@ fn create_draft(
         )));
     }
     let body = validated_draft_body(&payload.body)?;
-    let draft = owner_doc_store(state).create_draft(&doc.id, &sha, payload.line, quote, &body)?;
+    let store = owner_doc_store(state);
+    let on_revision = store
+        .drafts(&doc.id)?
+        .iter()
+        .filter(|draft| draft.commit_sha == sha)
+        .count();
+    if on_revision >= MAX_DRAFTS_PER_REVISION {
+        return Err(bad_request(format!(
+            "A review holds at most {MAX_DRAFTS_PER_REVISION} comments; submit these first"
+        )));
+    }
+    let draft = store.create_draft(&doc.id, &sha, payload.line, quote, &body)?;
     Ok(serde_json::to_value(draft)?)
 }
 

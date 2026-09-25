@@ -373,17 +373,23 @@ and use a shadow DOM for its UI.
   - Anchor: `line` = the `data-sm-line` of the closest ancestor with one;
     `quote` = the selected text, or the block's `textContent` (trimmed, capped at 300
     chars) on a tap.
-- **Composer**: textarea → `POST /docs/{id}/drafts`. Drafts show as margin markers
+- **Composer**: textarea → `POST /docs/{id}/drafts`. A revision holds at most 100
+  drafts (a 400 beyond that), the page size reconciliation reads back from GitHub. Drafts show as margin markers
   (desktop) or inline badges (mobile) on their block; tap to edit or delete.
 - **Submit panel**: a "Review (N)" button opens the drafts for this revision (each
   with Edit), verdict radios (Approve / Request changes / Comment), an overall body
   textarea and Submit → `POST /docs/{id}/review`. On success it shows the GitHub
-  review link and clears the drafts. The panel keeps one `submission_id` until the
-  review is posted: every retry, after any error, reuses it, and the server
-  reconciles it against GitHub, so resubmitting never posts twice.
+  review link and clears the drafts. The server posts every stored draft for the
+  revision, so the panel reloads the drafts when it opens and again right before
+  submitting; if they changed (another tab or device), it shows the new list and
+  asks the owner to submit again. The panel keeps one `submission_id`, with the
+  verdict and body of that first attempt, until the review is posted: every retry,
+  after any error, reuses all three (the verdict and body show read-only), and the
+  server reconciles it against GitHub, so resubmitting never posts twice.
 - **Drafts from another revision**: if drafts exist for a different SHA than the one
   being viewed, show "N draft comments on <sha7>", with actions *Submit them against
-  <sha7>* (switches the view to that SHA) or *Discard*. Don't auto-migrate drafts
+  <sha7>* (switches the view to that SHA) or *Discard*. Discard drops only the
+  drafts the server deleted and says how many could not be discarded. Don't auto-migrate drafts
   between revisions.
 
 ### Submitting a review (`POST /docs/{id}/review`)

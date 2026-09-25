@@ -23976,7 +23976,7 @@ async fn owner_doc_review_retries_under_one_id_never_post_twice() {
     let memo = meta["id"].as_str().unwrap().to_owned();
     add_draft(&app, &memo, &c1, json!(3), "Buy the dip.", "Again?").await;
     source.github.lock().unwrap().lose_line_response = true;
-    let (status, review) = submit(memo, "sub-lost-line").await;
+    let (status, review) = submit(memo.clone(), "sub-lost-line").await;
     source.github.lock().unwrap().lose_line_response = false;
     assert_eq!(status, StatusCode::OK, "{review}");
     assert_eq!(review["line_comment_count"], 1);
@@ -23988,4 +23988,18 @@ async fn owner_doc_review_retries_under_one_id_never_post_twice() {
 
     // One wake per posted review, however many attempts it took.
     assert_eq!(queued_wakes(&dir, "[sm review]").len(), 4);
+
+    // A revision holds at most 100 drafts, the page reconciliation reads.
+    for n in 0..100 {
+        add_draft(&app, &memo, &c1, json!(3), "Buy", &format!("note {n}")).await;
+    }
+    let (status, refused) = post_json(
+        app.clone(),
+        &format!("/docs/{memo}/drafts"),
+        json!({"sha": c1, "line": 3, "quote": "Buy", "body": "one too many"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    // Another revision has its own budget.
+    add_draft(&app, &memo, &"b".repeat(40), json!(3), "Buy", "elsewhere").await;
 }
