@@ -21,7 +21,7 @@ HOST="127.0.0.1"
 PORT="8420"
 CONFIG="$REPO_ROOT/config.yaml"
 LOCAL_ENV=""
-BINARY="$REPO_ROOT/target/release/sm-server"
+BINARY="$REPO_ROOT/.local/bin/sm-server"
 RUST_LABEL="com.rajeshgoli.session-manager-rust"
 PYTHON_LABELS=("com.rajeshgoli.session-manager" "com.claude.session-manager")
 PLIST_DST="$HOME/Library/LaunchAgents/$RUST_LABEL.plist"
@@ -48,10 +48,10 @@ usage() {
 Usage: scripts/rust-service-cutover.sh <command> [options]
 
 NOTE: to bring the Rust service up, prefer scripts/restart-rust-server.sh. It
-drives start-rust/stop-rust below in the one safe order and registers launchd
-against an installed copy. Calling start-rust directly with the default --binary
-registers cargo's output, so a later 'cargo build' can replace the executable
-launchd is running. See specs/1134_rust_restart_procedure.md.
+builds, signs, and installs the binary, then drives start-rust/stop-rust below
+in the one safe order. start-rust refuses a --binary inside a cargo target
+directory: registering cargo's output lets a later 'cargo build' replace the
+executable launchd is running. See specs/1134_rust_restart_procedure.md.
 
 Commands:
   plan             Show Rust service command, launchd paths, port owners, and blockers.
@@ -68,13 +68,14 @@ Options:
   --port PORT          Listen port for Rust (default: $PORT)
   --config PATH        Rust config path (default: config.yaml)
   --local-env PATH     Optional local env overlay path
-  --binary PATH        Rust sm-server binary (default: target/release/sm-server)
+  --binary PATH        Rust sm-server binary (default: .local/bin/sm-server)
   --label LABEL        Rust launchd label (default: $RUST_LABEL)
   --plist PATH         Rust plist destination (default: ~/Library/LaunchAgents/<label>.plist)
   --log-dir PATH       Rust launchd stdout/stderr directory (default: logs/)
 
 First canary shape:
   cargo build -p sm-server --release
+  mkdir -p .local/bin && cp -p target/release/sm-server .local/bin/sm-server
   ./scripts/rust-service-cutover.sh plan
   ./scripts/rust-service-cutover.sh stop-python
   ./venv/bin/python -m scripts.rust_migration.final_backup --config config.yaml --output-dir .local/rust-final-backup-\$(date -u +%Y%m%dT%H%M%SZ) --ledger .local/rust-cutover-ledger.jsonl --record-ledger --execute --fail-on-blockers
@@ -175,10 +176,32 @@ print_port_owners() {
   done <<< "$pids"
 }
 
+# True when BINARY resolves inside a cargo target directory: the repo's own, or
+# CARGO_TARGET_DIR when set. Resolved canonically so a symlink or `..` alias
+# cannot hide it.
+binary_in_cargo_target_dir() {
+  python3 - "$BINARY" "$REPO_ROOT/target" "${CARGO_TARGET_DIR:-}" <<'PY'
+import os
+import sys
+
+binary = os.path.realpath(sys.argv[1])
+for target_dir in sys.argv[2:]:
+    if not target_dir:
+        continue
+    target_dir = os.path.realpath(target_dir)
+    if os.path.commonpath([binary, target_dir]) == target_dir:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
 collect_blockers() {
   local blockers=()
   if [[ ! -x "$BINARY" ]]; then
     blockers+=("rust_binary_not_executable: $BINARY")
+  fi
+  if binary_in_cargo_target_dir; then
+    blockers+=("rust_binary_in_build_dir: $BINARY is cargo's output; a later build would replace the executable launchd runs. Install a copy (scripts/restart-rust-server.sh does this) and pass that")
   fi
   if [[ ! -r "$CONFIG" ]]; then
     blockers+=("config_not_readable: $CONFIG")

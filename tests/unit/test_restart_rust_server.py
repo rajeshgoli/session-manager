@@ -746,6 +746,26 @@ def test_service_must_not_be_registered_against_cargo_output(env):
     assert "cutover stop-rust" not in calls(env)
 
 
+@pytest.mark.parametrize("where", ["sm_target_dir", "cargo_target_dir"])
+def test_binary_inside_a_cargo_target_dir_is_rejected_before_stopping(env, where):
+    """start-rust refuses such a binary only after the service is stopped, so
+    the preflight must refuse it first."""
+    if where == "sm_target_dir":
+        target_dir = env["cargo_output"].parent.parent / "target"
+        overrides = {}
+    else:
+        target_dir = env["tmp"] / "shared-cargo-target"
+        overrides = {"CARGO_TARGET_DIR": str(target_dir)}
+    inside = _write(target_dir / "installed" / "sm-server", _fake(env, "ORIGINAL"), executable=True)
+
+    result = env["run"](SM_BINARY=str(inside), **overrides)
+
+    assert result.returncode != 0
+    assert "is inside a cargo target directory" in result.stderr
+    assert "cargo build" not in calls(env)
+    assert "cutover stop-rust" not in calls(env)
+
+
 # --- signing and the restart path -------------------------------------------
 
 

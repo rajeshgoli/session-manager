@@ -243,8 +243,9 @@ Or install/start the launchd-managed Rust service:
 `restart-rust-server.sh` builds, signs, installs, restarts, and verifies in the
 one safe order, and registers launchd against an installed copy at
 `.local/bin/sm-server` rather than `target/release/sm-server`. Do not call
-`rust-service-cutover.sh start-rust` directly to bring the service up: its
-default binary is cargo's output, so registering that way lets any later
+`rust-service-cutover.sh start-rust` directly to bring the service up: it only
+registers whatever binary is already installed. It refuses a `--binary` inside a
+cargo target directory, because registering cargo's output lets any later
 `cargo build` replace the executable launchd is running, which is how the service
 was taken down twice on 2026-07-27. See `specs/1134_rust_restart_procedure.md`.
 The durable non-secret default lives in `config/rust-server-signing.env` and
