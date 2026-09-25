@@ -288,8 +288,10 @@
     var r = h.getBoundingClientRect();
     var top = collapsed ? 8 : bar.getBoundingClientRect().height + 8;
     var bottom = (vv ? vv.height + vv.offsetTop : window.innerHeight) - 8;
-    if (r.bottom > bottom) window.scrollBy(0, Math.min(r.bottom - bottom, r.top - top));
-    else if (r.top < top) window.scrollBy(0, r.top - top);
+    // The buttons are at the bottom: if the bubble is taller than the
+    // visible space, keep its bottom in view and let the quote go under the bar.
+    if (r.bottom > bottom) window.scrollBy(0, r.bottom - bottom);
+    else if (r.top < top) window.scrollBy(0, Math.max(r.top - top, r.bottom - bottom));
   }
   var composer = null; // {host, draftId, block}
   function keepComposerVisible() { if (composer) ensureVisible(composer.host); }
