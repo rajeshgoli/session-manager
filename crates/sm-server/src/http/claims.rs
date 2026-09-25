@@ -177,7 +177,7 @@ fn parse_kind(kind: &str) -> Result<WorkKind, ApiError> {
 }
 
 fn validated_repo(repo: &str) -> Result<String, ApiError> {
-    let repo = repo.trim().to_owned();
+    let repo = crate::work_claims::canonical_repo(repo);
     crate::owner_docs::validate_repo_slug(&repo).map_err(|error| bad_request(error.to_string()))?;
     Ok(repo)
 }

@@ -411,6 +411,20 @@ async fn spawn_with_a_ticket_claims_before_the_first_turn_or_creates_nothing() {
     let ended = f.store().claims_for_session("kid00002", false).unwrap();
     assert_eq!(ended[0].claim.end_reason.as_deref(), Some("retired"));
 
+    // Retiring a session that is already stopped still ends its claims.
+    f.items.put(3, WorkKind::Ticket, "open");
+    let (status, body) = claim(&f, "asleep01", "ticket", 3, json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) =
+        request(&f.app, "POST", "/sessions/asleep01/retire", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        f.store().claims_for_item(REPO, 3).unwrap()[0]
+            .end_reason
+            .as_deref(),
+        Some("retired")
+    );
+
     // A failed session creation (the id is taken) deletes the reservation.
     let (status, body) = request(
         &f.app,

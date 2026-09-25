@@ -521,6 +521,12 @@ pub struct ClaimView {
     pub history_path: String,
 }
 
+/// GitHub slugs are case-insensitive; claims key on the lowercase form so
+/// `Acme/Widgets` and `acme/widgets` are one item.
+pub fn canonical_repo(repo: &str) -> String {
+    repo.trim().to_ascii_lowercase()
+}
+
 /// `/t/<repo-name>/<n>`: the item's timeline page.
 pub fn history_path(repo: &str, number: i64) -> String {
     format!("/t/{}/{number}", repo_name(repo))
@@ -741,6 +747,7 @@ impl WorkClaimStore {
         numbers: &[i64],
         fetched: &Result<BatchFetch, String>,
     ) -> Result<()> {
+        let repo = &canonical_repo(repo);
         let mut conn = self.open_write()?;
         let tx = conn.transaction()?;
         let now = now_rfc3339();
@@ -767,6 +774,10 @@ impl WorkClaimStore {
         fetched: Result<BatchFetch, String>,
         sessions: &SessionDirectory,
     ) -> Result<ClaimResult> {
+        let request = &ClaimRequest {
+            repo: canonical_repo(&request.repo),
+            ..request.clone()
+        };
         validate_repo_slug(&request.repo)?;
         let mut numbers = vec![request.number];
         numbers.extend(request.tickets.iter().copied());
@@ -828,6 +839,7 @@ impl WorkClaimStore {
         source: ClaimSource,
         sessions: &SessionDirectory,
     ) -> Result<Option<Vec<String>>> {
+        let repo = &canonical_repo(repo);
         validate_repo_slug(repo)?;
         let mut conn = self.open_write()?;
         let tx = conn.transaction()?;
@@ -844,6 +856,7 @@ impl WorkClaimStore {
         number: i64,
         kind: WorkKind,
     ) -> Result<Option<WorkClaim>> {
+        let repo = &canonical_repo(repo);
         let mut conn = self.open_write()?;
         let tx = conn.transaction()?;
         let Some(claim) = query_claims(
@@ -1010,7 +1023,9 @@ impl WorkClaimStore {
         }
         let mut earliest = BTreeMap::<(String, i64, String), String>::new();
         let mut note = |repo: String, pr: i64, session: String, at: String| {
-            let entry = earliest.entry((repo, pr, session)).or_insert(at.clone());
+            let entry = earliest
+                .entry((canonical_repo(&repo), pr, session))
+                .or_insert(at.clone());
             if at < *entry {
                 *entry = at;
             }
@@ -1044,6 +1059,7 @@ impl WorkClaimStore {
             }
         }
         for ((repo, pr, session_id), claimed_at) in earliest {
+            let repo = canonical_repo(&repo);
             if validate_repo_slug(&repo).is_err() || has_any_claim(&tx, &repo, pr, &session_id)? {
                 continue;
             }
@@ -1150,6 +1166,7 @@ impl WorkClaimStore {
         }
         let mut recorded = 0;
         for (repo, pr, session_id, source) in pending {
+            let repo = canonical_repo(&repo);
             if validate_repo_slug(&repo).is_err() || has_any_claim(&tx, &repo, pr, &session_id)? {
                 continue;
             }

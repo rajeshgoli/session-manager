@@ -8124,6 +8124,8 @@ impl SessionStore {
                 return Ok(authority.rejection_outcome(session));
             }
             if raw_session_is_stopped(session) {
+                // Already stopped: retiring still ends its work claims.
+                self.end_work_claims_after_retire(session_id);
                 return Ok(CoreRetireOutcome::Retired(retire_result(session_id)));
             }
             raw_session_display_name(session, session_id)
@@ -8183,6 +8185,8 @@ impl SessionStore {
                 return Ok(authority.rejection_outcome(session));
             }
             if raw_session_is_stopped(session) {
+                // Already stopped: retiring still ends its work claims.
+                self.end_work_claims_after_retire(session_id);
                 return Ok(CoreRetireOutcome::Retired(retire_result(session_id)));
             }
             let node = json_text(session.get("node")).unwrap_or_else(default_node);

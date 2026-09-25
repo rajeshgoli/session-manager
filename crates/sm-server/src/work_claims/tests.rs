@@ -977,3 +977,36 @@ fn reconciliation_records_implicit_claims_whose_hook_failed() {
     );
     assert_eq!(store.reconcile_implicit(&dir).unwrap(), 0, "idempotent");
 }
+
+#[test]
+fn repo_slugs_are_case_insensitive() {
+    let (store, _) = new_store();
+    let dir = directory();
+    claim_ticket(&store, "eng1", &dir);
+    let mut shouted = request(WorkKind::Ticket, 1, "other", &dir);
+    shouted.repo = "Acme/Widgets".into();
+    let result = store
+        .claim_explicit(&shouted, fetch(&[(1, ticket("open"))]), &dir)
+        .unwrap();
+    assert!(
+        matches!(result.outcome, ClaimOutcome::Collision { .. }),
+        "{result:?}"
+    );
+    assert_eq!(
+        store
+            .claim_implicit(
+                "ACME/widgets",
+                1,
+                dir.get("eng1").unwrap(),
+                ClaimSource::CodexReview,
+                &dir
+            )
+            .unwrap(),
+        None,
+        "#1 is a ticket already cached under the canonical slug"
+    );
+    assert!(store
+        .release("eng1", "Acme/Widgets", 1, WorkKind::Ticket)
+        .unwrap()
+        .is_some());
+}
