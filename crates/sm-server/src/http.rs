@@ -15380,6 +15380,11 @@ mod tests {
                 "http::tests::test_isolation_direct_harness_without_wrapper_cannot_open_production_state_paths",
                 "--nocapture",
             ])
+            // The lsof check must see only files the child opened itself, not
+            // stdio inherited from a launcher such as sm queue's job log.
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .env(DIRECT_HARNESS_PROBE_ENV, probe_path);
         if let Some(isolation_root) = isolation_root {
             command.env(TEST_ISOLATION_ROOT_ENV, isolation_root);
