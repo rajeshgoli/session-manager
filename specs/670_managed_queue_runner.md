@@ -176,7 +176,7 @@ Displacement behavior:
 
 V1 does not automatically resubmit displaced jobs. Manual resubmission is clearer and avoids surprising repeated resource churn from work that may not be safe to restart.
 
-Completion notifications name scheduler-controlled termination (`timeout`, `cancelled`, `perf_displacement`, or `memory_budget`). If the wrapper did not persist an exit receipt, the notification reports `exit=unknown` and labels the captured output partial/non-evidence; lines in that log must not be treated as a completed test result.
+Completion notifications name scheduler-controlled termination (`timeout`, `cancelled`, `perf_displacement`, or, for `memory_exceeded`, the memory-guard cause described under perf memory enforcement). If the wrapper did not persist an exit receipt, the notification reports `exit=unknown` and labels the captured output partial/non-evidence; lines in that log must not be treated as a completed test result.
 
 ## Exclusive Perf Resource Gates
 
@@ -202,7 +202,17 @@ If the gate fails, the job remains pending with holding reason `memory_pressure`
 
 A resource-blocked perf job does not reserve the exclusive window or displace running background work. Other eligible jobs may continue while it waits; exclusivity begins only after the perf job has safe memory headroom and is otherwise ready to start.
 
-While a perf job runs, SM samples aggregate RSS for its full process group and current host memory pressure every 250 ms. It terminates the job as `memory_exceeded` if measured aggregate RSS exceeds the declaration, host reclaimable memory enters the safety reserve, or two consecutive host-memory samples are unavailable. The short grace avoids misclassifying a process that exits during sampling while still failing closed within 500 ms on a broken host-safety monitor. If process inspection is restricted, the host-pressure backstop remains active even though the declared per-job RSS ceiling cannot be measured directly. CPU/GPU declarations are reported and reserved for the exclusive window but do not cause termination. The explicit wall-time budget continues to terminate as `timed_out`.
+While a perf job runs, SM samples aggregate RSS for its full process group and current host memory pressure every 250 ms. It terminates the job as `memory_exceeded` if measured aggregate RSS exceeds the declaration, host reclaimable memory enters the safety reserve, or two consecutive host-memory samples are unavailable. The short grace avoids misclassifying a process that exits during sampling while still failing closed within 500 ms on a broken host-safety monitor. Before terminating, SM persists which condition fired and the sample that tripped it, so a caller is never told its workload overran the reservation when the host or the monitor was at fault:
+
+| `termination_reason` | Condition | What the caller should do |
+|---|---|---|
+| `memory_budget` | process-group RSS exceeded the declared `memory_bytes` | reduce the workload or raise the budget |
+| `host_memory_pressure` | host available memory fell below the effective reserve (at least 8 GiB on macOS) | diagnose other memory users on the host |
+| `host_memory_unavailable` | two consecutive host-memory samples failed | repair host-memory sampling |
+| `memory_budget_missing` | a perf job recovered after restart had no declared memory budget | resubmit with an explicit budget |
+| `memory_guard` | a legacy row terminated before causes were recorded | none; the cause is unknown |
+
+When several conditions hold at once, the job's own overrun wins, then host pressure, then unavailable telemetry. The recorded sample (`memory_guard` in `GET /queue-jobs/{id}`, and a `memory_guard:` suffix on the completion notification) carries `cause`, `sampled_at`, `process_group_rss_bytes`, `memory_limit_bytes`, `host_available_bytes`, `effective_reserve_bytes`, and `failed_host_samples`; a measurement that could not be taken is `null` (`unknown` in text). The job is marked `memory_terminating` while it is being stopped, so a server restart mid-termination still finishes it as `memory_exceeded` with the recorded cause. A cancel or perf displacement already in progress keeps precedence, and any terminal state other than `memory_exceeded` clears the recorded sample. If process inspection is restricted, the host-pressure backstop remains active even though the declared per-job RSS ceiling cannot be measured directly. CPU/GPU declarations are reported and reserved for the exclusive window but do not cause termination. The explicit wall-time budget continues to terminate as `timed_out`.
 
 Perf cooldown protects measurement quality:
 
