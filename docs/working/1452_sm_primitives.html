@@ -371,12 +371,12 @@ results not yet pushed), run `sm worktree keep --reason "&lt;why&gt;"`.
 <table>
 <thead><tr><th style="width:24%">Ticket</th><th>Scope</th><th style="width:18%">Depends on</th></tr></thead>
 <tbody>
-<tr><td><b>1. Claims core</b></td><td>Storage and the <code>events</code> table; <code>sm ticket</code>, <code>sm spawn --ticket</code>, <code>sm pr</code>, release and list; collisions; implicit claims; backfill; claims ending; GitHub sync; <code>claims</code> in the session feed; the <code>sm watch</code> claim marker; the <code>AGENTS.md</code> paragraph.</td><td>—</td></tr>
-<tr><td><b>2. Open-work checks</b></td><td>Checks A, B and C; the closing-reference note on <code>sm pr</code>.</td><td>1</td></tr>
-<tr><td><b>3. Worktree lifecycle</b></td><td><code>--setup-worktree</code>, <code>sm worktree keep</code>, deletion at retire.</td><td>1</td></tr>
-<tr><td><b>4. History page</b></td><td><code>/history</code>, the ticket page at <code>/t/…</code>, <code>sm history</code>, the login gate for owner pages.</td><td>1</td></tr>
-<tr><td><b>5. Web watch and TUI docs</b></td><td>The watch at <code>/</code> and <code>/watch</code>; the Docs section and marker in <code>sm watch</code>.</td><td>4 (shares the page shell and gate)</td></tr>
-<tr><td><b>6. Android</b></td><td>History action and the Work line, opening the pages with device login.</td><td>4</td></tr>
+<tr><td><b>1. Claims core</b> #1485</td><td>Storage and the <code>events</code> table; <code>sm ticket</code>, <code>sm spawn --ticket</code>, <code>sm pr</code>, release and list; collisions; implicit claims; backfill; claims ending; GitHub sync; <code>claims</code> in the session feed; the <code>sm watch</code> claim marker; the <code>AGENTS.md</code> paragraph.</td><td>—</td></tr>
+<tr><td><b>2. Open-work checks</b> #1486</td><td>Checks A, B and C; the closing-reference note on <code>sm pr</code>.</td><td>1</td></tr>
+<tr><td><b>3. Worktree lifecycle</b> #1487</td><td><code>--setup-worktree</code>, <code>sm worktree keep</code>, deletion at retire.</td><td>1</td></tr>
+<tr><td><b>4. History page</b> #1488</td><td><code>/history</code>, the ticket page at <code>/t/…</code>, <code>sm history</code>, the login gate for owner pages.</td><td>1</td></tr>
+<tr><td><b>5. Web watch and TUI docs</b> #1489</td><td>The watch at <code>/</code> and <code>/watch</code>; the Docs section and marker in <code>sm watch</code>.</td><td>4 (shares the page shell and gate)</td></tr>
+<tr><td><b>6. Android</b> #1490</td><td>History action and the Work line, opening the pages with device login.</td><td>4</td></tr>
 </tbody>
 </table>
 <p class="small">After ticket 1, tickets 2, 3 and 4 touch different files and run in parallel.</p>
@@ -804,19 +804,19 @@ PR <code>state</code> is <code>OPEN | CLOSED | MERGED</code>; map to <code>open 
 <tr><td>Docs section in <code>sm watch</code></td><td>J</td><td>L14</td></tr>
 <tr><td>Backfill without messages</td><td>E</td><td>L11, L4</td></tr>
 <tr><td>AGENTS.md paragraph</td><td>N</td><td>Ticket 1's PR diff</td></tr>
-<tr><td>Six tickets</td><td>N</td><td>Filed under #1452</td></tr>
+<tr><td>Six tickets</td><td>N</td><td>#1485–#1490 under #1452</td></tr>
 </tbody>
 </table>
 
 <h3>N. Tickets in detail</h3>
-<p>#1452 becomes the epic. Each sub-ticket body says: "Read <code>specs/1452_sm_primitives.html</code> (<code>docs/working/1452_sm_primitives.html</code> until the work ships) before implementing or reviewing; this ticket only sets scope."</p>
+<p>#1452 is the epic; its tickets are #1485–#1490. Each sub-ticket body says: "Read <code>specs/1452_sm_primitives.html</code> (<code>docs/working/1452_sm_primitives.html</code> until the work ships) before implementing or reviewing; this ticket only sets scope."</p>
 <ol>
-<li><b>Claims core.</b> Appendices A (including the <code>events</code> table), B (including <code>sm spawn --ticket</code>; minus <code>sm history</code>, <code>--setup-worktree</code> and <code>sm worktree</code>), C, D (minus the check calls), E, H (<code>/claims</code>, <code>/claims/release</code>, <code>GET /claims</code>), J (feed and the <code>sm watch</code> claim marker). The <code>AGENTS.md</code> paragraph from the memo, verbatim, in this repo, <i>except</i> the lines about commands later tickets ship: start with plain <code>sm ticket &lt;N&gt;</code>, leave out the worktree sentences (ticket 3 adds them) and the last two <code>[sm claim]</code> bullets (ticket 2 adds them). Agents are never told to use a command that doesn't exist yet. List the shared template's path in the PR so the owner can apply it elsewhere. Done when L1–L3, L7, L10–L12 and the feed part of L14 pass.</li>
-<li><b>Open-work checks.</b> Appendix F, and the memo paragraph's last two <code>[sm claim]</code> bullets in <code>AGENTS.md</code>. Done when L4–L7 pass and the manual run shows Check A.</li>
-<li><b>Worktree lifecycle.</b> Appendix G, <code>/claims/worktree</code>, <code>/worktrees/keep</code>, the CLI rows of B, the retire response's <code>worktrees</code>, and the memo paragraph's worktree sentences in <code>AGENTS.md</code> (<code>sm ticket &lt;N&gt; --setup-worktree</code> as the way to start, and <code>sm worktree keep</code>). Done when L8–L9 pass and the manual run shows a deletion and a keep.</li>
-<li><b>History page.</b> Appendices H (<code>/history</code>, <code>/t/…</code> and the gate rename), I, <code>page_shell</code>, and <code>sm history</code>. Done when L13 passes and the page opens from the laptop browser through the Cloudflare login.</li>
-<li><b>Web watch and TUI docs.</b> Appendix O, the <code>/watch</code> routes, and J's <code>sm watch</code> docs bullet. Done when L14–L15 pass and <code>/watch</code> updates live in the laptop browser.</li>
-<li><b>Android.</b> Appendix J's Android bullet. Done when the Work line and History action open the pages on the phone with no 401 on navigation.</li>
+<li><b>#1485 Claims core.</b> Appendices A (including the <code>events</code> table), B (including <code>sm spawn --ticket</code>; minus <code>sm history</code>, <code>--setup-worktree</code> and <code>sm worktree</code>), C, D (minus the check calls), E, H (<code>/claims</code>, <code>/claims/release</code>, <code>GET /claims</code>), J (feed and the <code>sm watch</code> claim marker). The <code>AGENTS.md</code> paragraph from the memo, verbatim, in this repo, <i>except</i> the lines about commands later tickets ship: start with plain <code>sm ticket &lt;N&gt;</code>, leave out the worktree sentences (ticket 3 adds them) and the last two <code>[sm claim]</code> bullets (ticket 2 adds them). Agents are never told to use a command that doesn't exist yet. List the shared template's path in the PR so the owner can apply it elsewhere. Done when L1–L3, L7, L10–L12 and the feed part of L14 pass.</li>
+<li><b>#1486 Open-work checks.</b> Appendix F, and the memo paragraph's last two <code>[sm claim]</code> bullets in <code>AGENTS.md</code>. Done when L4–L7 pass and the manual run shows Check A.</li>
+<li><b>#1487 Worktree lifecycle.</b> Appendix G, <code>/claims/worktree</code>, <code>/worktrees/keep</code>, the CLI rows of B, the retire response's <code>worktrees</code>, and the memo paragraph's worktree sentences in <code>AGENTS.md</code> (<code>sm ticket &lt;N&gt; --setup-worktree</code> as the way to start, and <code>sm worktree keep</code>). Done when L8–L9 pass and the manual run shows a deletion and a keep.</li>
+<li><b>#1488 History page.</b> Appendices H (<code>/history</code>, <code>/t/…</code> and the gate rename), I, <code>page_shell</code>, and <code>sm history</code>. Done when L13 passes and the page opens from the laptop browser through the Cloudflare login.</li>
+<li><b>#1489 Web watch and TUI docs.</b> Appendix O, the <code>/watch</code> routes, and J's <code>sm watch</code> docs bullet. Done when L14–L15 pass and <code>/watch</code> updates live in the laptop browser.</li>
+<li><b>#1490 Android.</b> Appendix J's Android bullet. Done when the Work line and History action open the pages on the phone with no 401 on navigation.</li>
 </ol>
 <p>After ticket 1, tickets 2 (<code>work_claims.rs</code> checks), 3 (CLI git, <code>sessions.rs</code> retire hook) and 4 (<code>http/history.rs</code>, <code>page_shell</code>) touch different files and run in parallel. Ticket 5 reuses ticket 4's shell and gate; ticket 6 needs 4's pages.</p>
 
