@@ -170,8 +170,8 @@ async fn main() -> Result<()> {
     if state.config().rust_core.runtime_enabled {
         let queue_delivery_state = state.clone();
         thread::spawn(move || loop {
-            if let Err(error) = queue_delivery_state.drain_queue_completion_wakes() {
-                eprintln!("queue completion delivery retry failed: {error:#}");
+            if let Err(error) = queue_delivery_state.drain_background_retry_wakes() {
+                eprintln!("background wake delivery retry failed: {error:#}");
             }
             thread::sleep(QUEUE_COMPLETION_RETRY_INTERVAL);
         });
