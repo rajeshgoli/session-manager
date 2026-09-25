@@ -710,7 +710,7 @@ fn gh_command_output(args: &[String], timeout_duration: Duration) -> Result<Outp
         || {
             let mut command = Command::new("gh");
             command.args(args);
-            command_output_with_timeout(command, timeout_duration)
+            crate::child_output::output_with_timeout(command, timeout_duration)
         },
         || thread::sleep(GH_TRANSPORT_RETRY_DELAY),
     )
@@ -795,35 +795,6 @@ fn post_pr_review_comment_with_gh(
         comment_url,
         posted_at: now_rfc3339(),
     })
-}
-
-fn command_output_with_timeout(
-    mut command: Command,
-    timeout_duration: Duration,
-) -> Result<Output, String> {
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().map_err(|error| error.to_string()),
-            Ok(None) => {}
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.to_string());
-            }
-        }
-        if start.elapsed() >= timeout_duration {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("timed out after {}s", timeout_duration.as_secs()));
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
 }
 
 fn gh_api_json(repo: &str, endpoint: &str, paginate: bool) -> Result<Value, String> {

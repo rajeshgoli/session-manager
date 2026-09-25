@@ -3,9 +3,9 @@ use std::{
     fs,
     io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::Command,
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
@@ -66,7 +66,7 @@ fn resolve_project_key_with_command(
     command: Command,
     timeout: Duration,
 ) -> String {
-    if let Some(output) = command_output_with_timeout(command, timeout) {
+    if let Ok(output) = crate::child_output::output_with_timeout(command, timeout) {
         if output.status.success() {
             if let Some(path) = String::from_utf8_lossy(&output.stdout)
                 .lines()
@@ -91,32 +91,6 @@ fn primary_key_includes(connection: &Connection, table: &str, column: &str) -> R
     Ok(columns
         .into_iter()
         .any(|(name, primary_key_position)| name == column && primary_key_position > 0))
-}
-
-fn command_output_with_timeout(mut command: Command, timeout: Duration) -> Option<Output> {
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let started_at = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
-            Ok(None) => {}
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-        if started_at.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return None;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
