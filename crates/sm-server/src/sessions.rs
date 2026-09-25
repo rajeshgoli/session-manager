@@ -929,7 +929,7 @@ impl SessionStore {
                 let _guard = self.write_guard()?;
                 let parsed_state = self.load_parsed_state()?;
                 let state = &parsed_state.raw;
-                session_runtime_launch_records(&state)?
+                session_runtime_launch_records(state)?
                     .into_iter()
                     .find(|record| matches!(record.status.as_str(), "prepared" | "launching"))
                     .map(|record| record.id)
@@ -946,7 +946,7 @@ impl SessionStore {
             let _guard = self.write_guard()?;
             let parsed_state = self.load_parsed_state()?;
             let state = &parsed_state.raw;
-            session_runtime_launch_records(&state)?
+            session_runtime_launch_records(state)?
                 .into_iter()
                 .find(|record| record.id == launch_id)
         };
@@ -1368,7 +1368,7 @@ impl SessionStore {
             let _guard = self.write_guard()?;
             let parsed_state = self.load_parsed_state()?;
             let state = &parsed_state.raw;
-            let rotations = session_credential_rotation_records(&state)?;
+            let rotations = session_credential_rotation_records(state)?;
             let recovering_launch_id = rotations
                 .iter()
                 .find(|record| record.session_id == session_id && record.status == "relaunching")
@@ -1389,7 +1389,7 @@ impl SessionStore {
                 }) else {
                     return Ok(true);
                 };
-                let Some(session) = snapshot_from_raw_value(&state)?
+                let Some(session) = snapshot_from_raw_value(state)?
                     .sessions
                     .into_iter()
                     .find(|session| session.id == session_id)
@@ -2902,11 +2902,11 @@ impl SessionStore {
         let parsed_state = self.load_parsed_state()?;
         let state = &parsed_state.raw;
         let sessions = parsed_state.snapshot()?.into_sessions();
-        let mut records = reparent_request_records(&state)?;
+        let mut records = reparent_request_records(state)?;
         // This projection is intentionally not persisted.  It keeps the
         // response truthful at an expiry boundary while the lifecycle worker
         // performs the durable transition and outbox derivation separately.
-        refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc());
+        refresh_reparent_requests(&mut records, &sessions, state, OffsetDateTime::now_utc());
         Ok(records
             .into_iter()
             .find(|record| record.id == request_id.trim()))
@@ -2919,8 +2919,8 @@ impl SessionStore {
         let parsed_state = self.load_parsed_state()?;
         let state = &parsed_state.raw;
         let sessions = parsed_state.snapshot()?.into_sessions();
-        let mut records = reparent_request_records(&state)?;
-        refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc());
+        let mut records = reparent_request_records(state)?;
+        refresh_reparent_requests(&mut records, &sessions, state, OffsetDateTime::now_utc());
         records.sort_by(|left, right| {
             (&left.created_at, &left.id).cmp(&(&right.created_at, &right.id))
         });
@@ -2939,8 +2939,8 @@ impl SessionStore {
         if !session_credential_matches(&sessions, session_id, session_credential) {
             return Ok(None);
         }
-        let mut records = reparent_request_records(&state)?;
-        refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc());
+        let mut records = reparent_request_records(state)?;
+        refresh_reparent_requests(&mut records, &sessions, state, OffsetDateTime::now_utc());
         records.retain(|record| record.involves_session(session_id));
         records.sort_by(|left, right| {
             (&left.created_at, &left.id).cmp(&(&right.created_at, &right.id))
@@ -3078,7 +3078,7 @@ impl SessionStore {
                 let _guard = self.write_guard()?;
                 let parsed_state = self.load_parsed_state()?;
                 let state = &parsed_state.raw;
-                let records = reparent_request_records(&state)?;
+                let records = reparent_request_records(state)?;
                 let Some(record) = records
                     .iter()
                     .find(|record| record.id == desired.request_id)
@@ -3264,7 +3264,7 @@ impl SessionStore {
             let _guard = self.write_guard()?;
             let parsed_state = self.load_parsed_state()?;
             let state = &parsed_state.raw;
-            let record = reparent_request_records(&state)?
+            let record = reparent_request_records(state)?
                 .into_iter()
                 .find(|record| record.id == request_id)
                 .with_context(|| format!("reparent request {request_id} disappeared"))?;
@@ -3272,7 +3272,7 @@ impl SessionStore {
                 .affected_session_ids()
                 .into_iter()
                 .map(|session_id| {
-                    let session = raw_session_object(&state, &session_id);
+                    let session = raw_session_object(state, &session_id);
                     json!({
                         "id": session_id,
                         "parent_session_id": session.and_then(|value| value.get("parent_session_id")).cloned(),
@@ -3543,7 +3543,7 @@ impl SessionStore {
                 let _guard = self.write_guard()?;
                 let parsed_state = self.load_parsed_state()?;
                 let state = &parsed_state.raw;
-                let records = reparent_request_records(&state)?;
+                let records = reparent_request_records(state)?;
                 if records
                     .iter()
                     .find(|record| record.id == request_id)
@@ -3556,7 +3556,7 @@ impl SessionStore {
                     return Ok(());
                 }
                 let lease =
-                    reparent_apply_lease(&state)?.context("reparent apply lease disappeared")?;
+                    reparent_apply_lease(state)?.context("reparent apply lease disappeared")?;
                 if lease.request_id != request_id {
                     anyhow::bail!(
                         "reparent apply lease belongs to {}, not {request_id}",
@@ -3620,8 +3620,8 @@ impl SessionStore {
             let _guard = self.write_guard()?;
             let parsed_state = self.load_parsed_state()?;
             let state = &parsed_state.raw;
-            let records = reparent_request_records(&state)?;
-            let record = leased_reparent_request(&state, &records, request_id)?;
+            let records = reparent_request_records(state)?;
+            let record = leased_reparent_request(state, &records, request_id)?;
             queue_snapshot_from_plan(
                 record
                     .apply_plan
@@ -3671,8 +3671,8 @@ impl SessionStore {
             let _guard = self.write_guard()?;
             let parsed_state = self.load_parsed_state()?;
             let state = &parsed_state.raw;
-            let records = reparent_request_records(&state)?;
-            let record = leased_reparent_request(&state, &records, request_id)?;
+            let records = reparent_request_records(state)?;
+            let record = leased_reparent_request(state, &records, request_id)?;
             let plan = record
                 .apply_plan
                 .as_ref()
@@ -3737,8 +3737,8 @@ impl SessionStore {
                 let _guard = self.write_guard()?;
                 let parsed_state = self.load_parsed_state()?;
                 let state = &parsed_state.raw;
-                let records = reparent_request_records(&state)?;
-                leased_reparent_request(&state, &records, request_id)?
+                let records = reparent_request_records(state)?;
+                leased_reparent_request(state, &records, request_id)?
                     .deferred_routing_intents
                     .iter()
                     .find(|intent| {
@@ -3754,7 +3754,7 @@ impl SessionStore {
                 let _guard = self.write_guard()?;
                 let parsed_state = self.load_parsed_state()?;
                 let state = &parsed_state.raw;
-                raw_session_object(&state, &intent.child_session_id)
+                raw_session_object(state, &intent.child_session_id)
                     .and_then(|session| json_text(session.get("parent_session_id")))
             };
             match intent.operation.as_str() {
@@ -4100,8 +4100,8 @@ impl SessionStore {
             let _guard = self.write_guard()?;
             let parsed_state = self.load_parsed_state()?;
             let state = &parsed_state.raw;
-            let records = reparent_request_records(&state)?;
-            let record = leased_reparent_request(&state, &records, request_id)?;
+            let records = reparent_request_records(state)?;
+            let record = leased_reparent_request(state, &records, request_id)?;
             if !matches!(
                 record.apply_stage.as_deref(),
                 Some("json_routing_quiesced" | "routing_quiesced")
@@ -4293,7 +4293,7 @@ impl SessionStore {
         let _guard = self.write_guard()?;
         let parsed_state = self.load_parsed_state()?;
         let state = &parsed_state.raw;
-        let mut records = session_credential_rotation_records(&state)?;
+        let mut records = session_credential_rotation_records(state)?;
         records.sort_by(|left, right| {
             (&left.requested_at, &left.id).cmp(&(&right.requested_at, &right.id))
         });
@@ -4305,7 +4305,7 @@ impl SessionStore {
             let _guard = self.write_guard()?;
             let parsed_state = self.load_parsed_state()?;
             let state = &parsed_state.raw;
-            session_credential_rotation_records(&state)?
+            session_credential_rotation_records(state)?
                 .into_iter()
                 .filter(|record| record.status == "waiting_idle")
                 .map(|record| record.session_id)
@@ -5142,7 +5142,7 @@ impl SessionStore {
                 let _guard = self.write_guard()?;
                 let parsed_state = self.load_parsed_state()?;
                 let state = &parsed_state.raw;
-                reparent_runtime_delivery_target(&state, session_id, runtime)?
+                reparent_runtime_delivery_target(state, session_id, runtime)?
             };
             let Some(target) = target else {
                 return Ok(());
@@ -7085,7 +7085,7 @@ impl SessionStore {
         let _guard = self.write_guard()?;
         let parsed_state = self.load_parsed_state()?;
         let state = &parsed_state.raw;
-        let Some(session) = raw_session_object(&state, session_id) else {
+        let Some(session) = raw_session_object(state, session_id) else {
             return Ok(false);
         };
         Ok(claude_handoff_reservation_replaced_raw(
@@ -7154,7 +7154,7 @@ impl SessionStore {
         let _guard = self.write_guard()?;
         let parsed_state = self.load_parsed_state()?;
         let state = &parsed_state.raw;
-        let Some(session) = raw_session_object(&state, session_id) else {
+        let Some(session) = raw_session_object(state, session_id) else {
             return Ok(false);
         };
         let matches = json_text(session.get("provider")).as_deref() == Some("claude")
@@ -7188,7 +7188,7 @@ impl SessionStore {
         let _guard = self.write_guard()?;
         let parsed_state = self.load_parsed_state()?;
         let state = &parsed_state.raw;
-        let Some(session) = raw_session_object(&state, session_id) else {
+        let Some(session) = raw_session_object(state, session_id) else {
             return Ok(false);
         };
         let reservation_matches = json_text(session.get("provider")).as_deref() == Some("claude")
@@ -7220,7 +7220,7 @@ impl SessionStore {
             let _guard = self.write_guard()?;
             let parsed_state = self.load_parsed_state()?;
             let state = &parsed_state.raw;
-            let Some(session) = raw_session_object(&state, session_id) else {
+            let Some(session) = raw_session_object(state, session_id) else {
                 return Ok(false);
             };
             if json_text(session.get("provider")).as_deref() != Some("claude")
@@ -7695,7 +7695,7 @@ impl SessionStore {
     fn codex_fork_handoff_is_pending(&self, session_id: &str) -> Result<bool> {
         let parsed_state = self.load_parsed_state()?;
         let state = &parsed_state.raw;
-        Ok(raw_session_object(&state, session_id)
+        Ok(raw_session_object(state, session_id)
             .and_then(|session| json_text(session.get("pending_handoff_path")))
             .is_some())
     }
@@ -7712,7 +7712,7 @@ impl SessionStore {
             let _guard = self.write_guard()?;
             let parsed_state = self.load_parsed_state()?;
             let state = &parsed_state.raw;
-            let Some(session) = raw_session_object(&state, session_id) else {
+            let Some(session) = raw_session_object(state, session_id) else {
                 return Ok(false);
             };
             let Some(file_path) = json_text(session.get("pending_handoff_path")) else {
@@ -8686,7 +8686,7 @@ impl SessionStore {
     pub fn list_subagents(&self, session_id: &str) -> Result<Option<SubagentListResponse>> {
         let parsed_state = self.load_parsed_state()?;
         let state = &parsed_state.raw;
-        let Some(session) = raw_session_object(&state, session_id) else {
+        let Some(session) = raw_session_object(state, session_id) else {
             return Ok(None);
         };
         let subagents = session
