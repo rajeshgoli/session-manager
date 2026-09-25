@@ -298,7 +298,7 @@ sm all
 | `sm me` | Show the current session identity |
 | `sm all` | List active sessions |
 | `sm spawn <provider> <prompt> \| --prompt-file <path> \| --prompt-stdin [--model <model>] [--effort <level>]` | Start a managed agent. File/stdin briefs are accepted atomically, copied into private durable state, then delivered to the runtime as the verified accepted bytes. |
-| `sm send <id> "<text>"` | Send input to an agent |
+| `sm send <id> "<text>"` / `sm send <id> - <<'EOF'` | Send input to an agent; with no text or `-`, the message is read from piped stdin |
 | `sm what <id> [prompt]` / `sm btw ...` | Ask an agent for a provider-native context summary |
 | `sm wait <id> <seconds>` | Wait for a session state transition |
 | `sm attach <id>` | Attach to the live tmux session |
@@ -324,6 +324,15 @@ Message delivery modes:
 sm send agent "message"              # Sequential: wait for idle
 sm send agent "message" --important  # Queue behind current work
 sm send agent "message" --urgent     # Interrupt immediately
+```
+
+A message with backticks or `$()` is safest as a quoted heredoc on stdin, which
+the shell does not expand:
+
+```bash
+sm send agent - <<'EOF'
+Review `src/lib.rs`; $(this) is not run.
+EOF
 ```
 
 For a multiline or large spawn brief, use `--prompt-file` or `--prompt-stdin`

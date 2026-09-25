@@ -177,6 +177,7 @@ struct RecredentialArgs {
 #[derive(Args)]
 struct SendArgs {
     session_id: String,
+    /// Message text. Omit it, or pass `-`, to read the message from piped stdin.
     text: Vec<String>,
     #[arg(long)]
     urgent: bool,
@@ -268,6 +269,46 @@ struct SpawnArgs {
     /// directory's repo
     #[arg(long, value_name = "R", requires = "ticket")]
     ticket_repo: Option<String>,
+}
+
+const SEND_TEXT_REQUIRED: &str =
+    "send text is required: pass it as an argument, or pipe it on stdin \
+(for example: sm send <id> - <<'EOF' ... EOF)";
+
+fn read_send_text(text: &[String]) -> Result<String> {
+    let stdin = io::stdin();
+    let stdin_is_terminal = stdin.is_terminal();
+    read_send_text_from(text, &mut stdin.lock(), stdin_is_terminal)
+}
+
+/// Positional text wins and stdin stays unread. With no text, or a lone `-`,
+/// the message comes from stdin; a terminal stdin is refused rather than
+/// waited on, and an empty body is an error, never a silent drop.
+fn read_send_text_from<R: Read>(
+    text: &[String],
+    stdin: &mut R,
+    stdin_is_terminal: bool,
+) -> Result<String> {
+    let from_stdin = text.is_empty() || (text.len() == 1 && text[0] == "-");
+    if !from_stdin {
+        let text = text.join(" ");
+        if text.trim().is_empty() {
+            bail!(SEND_TEXT_REQUIRED);
+        }
+        return Ok(text);
+    }
+    if stdin_is_terminal {
+        bail!(SEND_TEXT_REQUIRED);
+    }
+    let mut input = String::new();
+    stdin
+        .read_to_string(&mut input)
+        .context("failed to read send text from stdin")?;
+    let input = input.trim_end_matches(['\n', '\r']);
+    if input.trim().is_empty() {
+        bail!("send text read from stdin is empty; nothing was sent");
+    }
+    Ok(input.to_owned())
 }
 
 fn read_spawn_prompt(args: &SpawnArgs) -> Result<(String, Value)> {
@@ -988,10 +1029,7 @@ fn run() -> Result<()> {
             args.node,
         )?,
         Command::Send(args) => {
-            let text = args.text.join(" ");
-            if text.trim().is_empty() {
-                bail!("send text is required");
-            }
+            let text = read_send_text(&args.text)?;
             let delivery_mode = if args.urgent { "urgent" } else { "sequential" };
             let targets = split_send_targets(&args.session_id);
             let mut payload = send_input_payload(text.clone(), delivery_mode, args.wait);
@@ -7481,6 +7519,45 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exactly one"));
+    }
+
+    #[test]
+    fn send_text_positional_wins_and_leaves_stdin_unread() {
+        let mut stdin = io::Cursor::new(b"ignored".to_vec());
+        let text =
+            read_send_text_from(&["hello".to_owned(), "there".to_owned()], &mut stdin, false)
+                .unwrap();
+        assert_eq!(text, "hello there");
+        assert_eq!(stdin.position(), 0);
+    }
+
+    #[test]
+    fn send_text_reads_piped_stdin_when_text_is_omitted_or_dash() {
+        let body = "Line one with `backticks` and $(not run)\n\nLine three\n";
+        for args in [Vec::new(), vec!["-".to_owned()]] {
+            let mut stdin = io::Cursor::new(body.as_bytes().to_vec());
+            let text = read_send_text_from(&args, &mut stdin, false).unwrap();
+            assert_eq!(
+                text,
+                "Line one with `backticks` and $(not run)\n\nLine three"
+            );
+        }
+    }
+
+    #[test]
+    fn send_text_rejects_terminal_and_empty_stdin_with_guidance() {
+        let mut stdin = io::Cursor::new(b"unused".to_vec());
+        let error = read_send_text_from(&[], &mut stdin, true).unwrap_err();
+        assert!(error.to_string().contains("pipe it on stdin"));
+        assert_eq!(stdin.position(), 0);
+
+        let mut stdin = io::Cursor::new(b" \n\n".to_vec());
+        let error = read_send_text_from(&["-".to_owned()], &mut stdin, false).unwrap_err();
+        assert!(error.to_string().contains("stdin is empty"));
+
+        let mut stdin = io::Cursor::new(Vec::new());
+        let error = read_send_text_from(&["  ".to_owned()], &mut stdin, false).unwrap_err();
+        assert!(error.to_string().contains("pipe it on stdin"));
     }
 
     #[test]
