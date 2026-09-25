@@ -1680,12 +1680,17 @@ pub struct WorkClaimsConfig {
     /// Seconds between GitHub syncs of tracked tickets and PRs; at least 60.
     #[serde(default = "default_work_claims_sync_interval_seconds")]
     pub sync_interval_seconds: u64,
+    /// Check C: minutes idle, waiting on nothing, before an agent holding
+    /// open work is told so; also the re-arm gap. At least 1.
+    #[serde(default = "default_work_claims_idle_nudge_minutes")]
+    pub idle_nudge_minutes: u64,
 }
 
 impl Default for WorkClaimsConfig {
     fn default() -> Self {
         Self {
             sync_interval_seconds: default_work_claims_sync_interval_seconds(),
+            idle_nudge_minutes: default_work_claims_idle_nudge_minutes(),
         }
     }
 }
@@ -1694,10 +1699,18 @@ impl WorkClaimsConfig {
     pub fn sync_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.sync_interval_seconds.max(60))
     }
+
+    pub fn idle_nudge(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.idle_nudge_minutes.max(1) * 60)
+    }
 }
 
 fn default_work_claims_sync_interval_seconds() -> u64 {
     300
+}
+
+fn default_work_claims_idle_nudge_minutes() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

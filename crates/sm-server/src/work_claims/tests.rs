@@ -1058,3 +1058,479 @@ fn a_spawn_supersedes_a_stopped_holder_only_once_its_session_exists() {
         vec!["[sm claim] While you were stopped, newkid02-name (newkid02) claimed ticket #1. Your claim on it ended."]
     );
 }
+
+// Open-work checks (appendix F, ticket #1486).
+
+fn at(minutes: i64) -> OffsetDateTime {
+    OffsetDateTime::parse("2026-09-24T12:00:00Z", &Rfc3339).unwrap()
+        + time::Duration::minutes(minutes)
+}
+
+fn merged_pr(closes: &[i64], merged_minute: i64) -> ItemFetch {
+    let mut merged = pr("merged", closes);
+    if let ItemFetch::Found(item) = &mut merged {
+        item.merged_at = Some(checks::format_time(at(merged_minute)));
+    }
+    merged
+}
+
+fn titled(number: i64, state: &str, title: &str) -> (i64, ItemFetch) {
+    let mut item = ticket(state);
+    if let ItemFetch::Found(found) = &mut item {
+        found.title = title.into();
+    }
+    (number, item)
+}
+
+fn answered(numbers: &[i64]) -> BTreeSet<(String, i64)> {
+    numbers.iter().map(|n| (REPO.to_owned(), *n)).collect()
+}
+
+/// A `claim.nudge` event: `(session_id, ticket, pr, payload)`.
+type Nudge = (Option<String>, Option<i64>, Option<i64>, Value);
+
+fn nudges(store: &WorkClaimStore) -> Vec<Nudge> {
+    store
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "claim.nudge")
+        .map(|e| (e.session_id, e.ticket, e.pr, e.payload))
+        .collect()
+}
+
+/// eng1 holds PR 9 (linked to ticket 1 by claim) and ticket 1.
+fn merge_setup(store: &WorkClaimStore, dir: &SessionDirectory) {
+    claim_ticket(store, "eng1", dir);
+    claim_pr(
+        store,
+        &request(WorkKind::Pr, 9, "eng1", dir),
+        &[(9, pr("open", &[]))],
+    );
+}
+
+#[test]
+fn check_a_messages_ticket_and_pr_holders_once() {
+    let (store, db) = new_store();
+    let dir = directory();
+    merge_setup(&store, &dir);
+    // child1 (eng1's child) shares the ticket.
+    claim_ticket(&store, "child1", &dir);
+    store
+        .record_fetch(
+            REPO,
+            &[1, 9],
+            &fetch(&[(1, ticket("open")), (9, merged_pr(&[], -3))]),
+        )
+        .unwrap();
+    assert_eq!(
+        store.item(REPO, 9).unwrap().unwrap().merge_check.as_deref(),
+        Some("pending")
+    );
+    let mut notified = store.run_check_a(&answered(&[1, 9]), &dir, at(0)).unwrap();
+    notified.sort();
+    assert_eq!(notified, vec!["child1", "eng1"]);
+    let text = "[sm claim] PR #9 merged 3m ago. Linked ticket #1 \"Agent work claims\" is open.";
+    // eng1 holds the ticket and held the PR: one message, deduplicated.
+    assert_eq!(queued(&db, "eng1"), vec![text]);
+    assert_eq!(queued(&db, "child1"), vec![text]);
+    assert_eq!(
+        store.item(REPO, 9).unwrap().unwrap().merge_check.as_deref(),
+        Some("done")
+    );
+    // A claim.nudge on each item named (the PR and the ticket), per message.
+    let events = nudges(&store);
+    assert_eq!(events.len(), 4);
+    for (session, ticket, pr, payload) in &events {
+        assert!(matches!(session.as_deref(), Some("eng1" | "child1")));
+        assert_eq!(*ticket, Some(1));
+        assert!(pr.is_none() || *pr == Some(9));
+        assert_eq!(payload["check"], "A");
+        assert_eq!(payload["text"], text);
+        assert!(payload["message_id"].as_str().is_some());
+    }
+    // Exactly once.
+    assert!(store
+        .run_check_a(&answered(&[1, 9]), &dir, at(10))
+        .unwrap()
+        .is_empty());
+    assert_eq!(queued(&db, "eng1").len(), 1);
+}
+
+#[test]
+fn check_a_is_silent_when_github_closed_the_ticket() {
+    let (store, db) = new_store();
+    let dir = directory();
+    merge_setup(&store, &dir);
+    store
+        .record_fetch(
+            REPO,
+            &[1, 9],
+            &fetch(&[(1, ticket("closed")), (9, merged_pr(&[1], -5))]),
+        )
+        .unwrap();
+    assert!(store
+        .run_check_a(&answered(&[1, 9]), &dir, at(0))
+        .unwrap()
+        .is_empty());
+    assert!(queued(&db, "eng1").is_empty());
+    assert!(nudges(&store).is_empty());
+    assert_eq!(
+        store.item(REPO, 9).unwrap().unwrap().merge_check.as_deref(),
+        Some("done")
+    );
+}
+
+#[test]
+fn check_a_waits_a_minute_after_the_merge_and_survives_a_restart() {
+    let (store, db) = new_store();
+    let dir = directory();
+    merge_setup(&store, &dir);
+    store
+        .record_fetch(
+            REPO,
+            &[1, 9],
+            &fetch(&[(1, ticket("open")), (9, merged_pr(&[], 0))]),
+        )
+        .unwrap();
+    // 30 s after the merge: still pending.
+    let early = at(0) + time::Duration::seconds(30);
+    assert!(store
+        .run_check_a(&answered(&[1, 9]), &dir, early)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.item(REPO, 9).unwrap().unwrap().merge_check.as_deref(),
+        Some("pending")
+    );
+    // A restart: a fresh store on the same DB; the next pass fetches the
+    // ticket again and fires.
+    let restarted = WorkClaimStore::new(db.clone());
+    assert!(restarted
+        .tracked_items()
+        .unwrap()
+        .get(REPO)
+        .is_some_and(|numbers| numbers.contains(&1)));
+    restarted
+        .record_fetch(REPO, &[1], &fetch(&[(1, ticket("open"))]))
+        .unwrap();
+    assert_eq!(
+        restarted.run_check_a(&answered(&[1]), &dir, at(5)).unwrap(),
+        vec!["eng1"]
+    );
+    assert_eq!(
+        queued(&db, "eng1"),
+        vec!["[sm claim] PR #9 merged 5m ago. Linked ticket #1 \"Agent work claims\" is open."]
+    );
+}
+
+#[test]
+fn check_a_waits_for_a_closing_reference_first_seen_at_the_merge() {
+    for (closed_by_github, expect) in [(true, 0), (false, 1)] {
+        let (store, db) = new_store();
+        let dir = directory();
+        claim_pr(
+            &store,
+            &request(WorkKind::Pr, 9, "eng1", &dir),
+            &[(9, pr("open", &[]))],
+        );
+        // The merge pass is the first to see "Closes #5": #5 is a stub.
+        store
+            .record_fetch(REPO, &[9], &fetch(&[(9, merged_pr(&[5], -10))]))
+            .unwrap();
+        assert!(store
+            .run_check_a(&answered(&[9]), &dir, at(0))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.item(REPO, 9).unwrap().unwrap().merge_check.as_deref(),
+            Some("pending")
+        );
+        assert!(store.tracked_items().unwrap()[REPO].contains(&5));
+        let state = if closed_by_github { "closed" } else { "open" };
+        store
+            .record_fetch(REPO, &[5], &fetch(&[titled(5, state, "Queue retry")]))
+            .unwrap();
+        store.run_check_a(&answered(&[5]), &dir, at(5)).unwrap();
+        assert_eq!(
+            queued(&db, "eng1").len(),
+            expect,
+            "closed={closed_by_github}"
+        );
+        if expect == 1 {
+            assert_eq!(
+                queued(&db, "eng1")[0],
+                "[sm claim] PR #9 merged 15m ago. Linked ticket #5 \"Queue retry\" is open."
+            );
+        }
+        assert_eq!(
+            store.item(REPO, 9).unwrap().unwrap().merge_check.as_deref(),
+            Some("done")
+        );
+    }
+}
+
+#[test]
+fn check_a_ignores_a_closing_reference_removed_before_the_merge() {
+    let (store, db) = new_store();
+    let dir = directory();
+    claim_pr(
+        &store,
+        &request(WorkKind::Pr, 9, "eng1", &dir),
+        &[(9, pr("open", &[1]))],
+    );
+    store
+        .record_fetch(REPO, &[1], &fetch(&[(1, ticket("open"))]))
+        .unwrap();
+    // "Closes #1" removed, then merged.
+    store
+        .record_fetch(REPO, &[9], &fetch(&[(9, pr("open", &[]))]))
+        .unwrap();
+    store
+        .record_fetch(
+            REPO,
+            &[1, 9],
+            &fetch(&[(1, ticket("open")), (9, merged_pr(&[], -2))]),
+        )
+        .unwrap();
+    store.run_check_a(&answered(&[1, 9]), &dir, at(0)).unwrap();
+    assert!(queued(&db, "eng1").is_empty());
+    assert_eq!(
+        store.item(REPO, 9).unwrap().unwrap().merge_check.as_deref(),
+        Some("done")
+    );
+}
+
+#[test]
+fn check_a_lists_several_tickets_and_records_an_unanswered_nudge() {
+    let (store, db) = new_store();
+    let dir = directory();
+    let mut claim = request(WorkKind::Pr, 9, "eng1", &dir);
+    claim.tickets = vec![1, 2];
+    claim_pr(
+        &store,
+        &claim,
+        &[
+            (9, pr("open", &[])),
+            titled(1, "open", "First"),
+            titled(2, "open", "Second"),
+        ],
+    );
+    store
+        .record_fetch(
+            REPO,
+            &[1, 2, 9],
+            &fetch(&[
+                titled(1, "open", "First"),
+                titled(2, "open", "Second"),
+                (9, merged_pr(&[], -120)),
+            ]),
+        )
+        .unwrap();
+    // The only holder has since been retired: nobody to tell.
+    let mut retired = directory();
+    retired.insert(session("eng1", Some("lead"), HolderState::Retired));
+    assert!(store
+        .run_check_a(&answered(&[1, 2, 9]), &retired, at(0))
+        .unwrap()
+        .is_empty());
+    assert!(queued(&db, "eng1").is_empty());
+    let events = nudges(&store);
+    assert_eq!(events.len(), 3, "the PR and both tickets");
+    for (session, _, _, payload) in &events {
+        assert!(session.is_none());
+        assert!(payload["message_id"].is_null());
+        assert_eq!(
+            payload["text"],
+            "[sm claim] PR #9 merged 2h ago. Linked tickets #1 \"First\", #2 \"Second\" are open."
+        );
+    }
+}
+
+#[test]
+fn check_a_never_fires_for_a_pr_first_seen_merged() {
+    let (store, db) = new_store();
+    let dir = directory();
+    store
+        .claim_implicit(
+            REPO,
+            9,
+            dir.get("eng1").unwrap(),
+            ClaimSource::CodexReview,
+            &dir,
+        )
+        .unwrap();
+    store
+        .record_fetch(REPO, &[9], &fetch(&[(9, merged_pr(&[1], -10))]))
+        .unwrap();
+    store
+        .record_fetch(REPO, &[1], &fetch(&[(1, ticket("open"))]))
+        .unwrap();
+    store.run_check_a(&answered(&[1, 9]), &dir, at(0)).unwrap();
+    assert!(queued(&db, "eng1").is_empty());
+    assert!(nudges(&store).is_empty());
+}
+
+/// GitHub for Check B: a fixed answer, filtered to the numbers asked.
+struct Answer(Result<BatchFetch, String>);
+
+impl WorkItemSource for Answer {
+    fn fetch(&self, _repo: &str, numbers: &[i64]) -> Result<BatchFetch, String> {
+        self.0.clone().map(|batch| {
+            batch
+                .into_iter()
+                .filter(|(number, _)| numbers.contains(number))
+                .collect()
+        })
+    }
+}
+
+#[test]
+fn check_b_lists_open_work_once_and_survives_a_restart() {
+    let (store, db) = new_store();
+    let dir = directory();
+    // The PR is claimed first; the message still lists the ticket first.
+    claim_pr(
+        &store,
+        &request(WorkKind::Pr, 9, "eng1", &dir),
+        &[(9, pr("open", &[]))],
+    );
+    claim_ticket(&store, "eng1", &dir);
+    assert_eq!(store.mark_check_b_due("eng1", at(0)).unwrap(), 2);
+    // A restart before the check ran: the next pass finds it due.
+    let restarted = WorkClaimStore::new(db.clone());
+    assert_eq!(restarted.sessions_due_check_b().unwrap(), vec!["eng1"]);
+    let github = Answer(fetch(&[(1, ticket("open")), (9, pr("open", &[]))]));
+    assert_eq!(
+        restarted.run_check_b("eng1", &dir, &github, at(1)).unwrap(),
+        vec!["eng1"]
+    );
+    let text = "[sm claim] At task-complete you hold: ticket #1 (open), PR #9 (open, not merged).";
+    assert_eq!(queued(&db, "eng1"), vec![text]);
+    assert!(restarted.sessions_due_check_b().unwrap().is_empty());
+    for claim in active(&restarted, 1).iter().chain(&active(&restarted, 9)) {
+        assert_eq!(claim.nudged_idle_at, Some(checks::format_time(at(1))));
+        assert!(claim.check_b_due_at.is_none());
+    }
+    let events = nudges(&restarted);
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().all(|(_, _, _, p)| p["check"] == "B"));
+    // Once: a second runner finds nothing due.
+    assert!(restarted
+        .run_check_b("eng1", &dir, &github, at(2))
+        .unwrap()
+        .is_empty());
+    assert_eq!(queued(&db, "eng1").len(), 1);
+}
+
+#[test]
+fn check_b_is_silent_with_nothing_open_and_waits_out_github() {
+    let (store, db) = new_store();
+    let dir = directory();
+    claim_ticket(&store, "eng1", &dir);
+    store.mark_check_b_due("eng1", at(0)).unwrap();
+    // GitHub down: no message, still due.
+    let down = Answer(Err("gh api graphql failed: timed out".into()));
+    assert!(store.run_check_b("eng1", &dir, &down, at(1)).is_err());
+    assert!(queued(&db, "eng1").is_empty());
+    assert_eq!(store.sessions_due_check_b().unwrap(), vec!["eng1"]);
+    // Closed by the time GitHub answers: the claim ends, no message.
+    let closed = Answer(fetch(&[(1, ticket("closed"))]));
+    assert!(store
+        .run_check_b("eng1", &dir, &closed, at(2))
+        .unwrap()
+        .is_empty());
+    assert!(queued(&db, "eng1").is_empty());
+    assert!(store.sessions_due_check_b().unwrap().is_empty());
+    assert_eq!(ended(&store, 1).as_deref(), Some("closed"));
+    // Nothing held: nothing marked.
+    assert_eq!(store.mark_check_b_due("eng1", at(3)).unwrap(), 0);
+}
+
+#[test]
+fn check_b_clears_a_retired_session_without_a_message() {
+    let (store, db) = new_store();
+    let dir = directory();
+    claim_ticket(&store, "eng1", &dir);
+    store.mark_check_b_due("eng1", at(0)).unwrap();
+    let mut retired = directory();
+    retired.insert(session("eng1", Some("lead"), HolderState::Retired));
+    let github = Answer(fetch(&[(1, ticket("open"))]));
+    assert!(store
+        .run_check_b("eng1", &retired, &github, at(1))
+        .unwrap()
+        .is_empty());
+    assert!(queued(&db, "eng1").is_empty());
+    assert!(store.sessions_due_check_b().unwrap().is_empty());
+}
+
+fn idle_lead(last_activity: i64, waiting: bool) -> Vec<IdleSession> {
+    vec![IdleSession {
+        session_id: "lead".into(),
+        last_activity: checks::format_time(at(last_activity)),
+        waiting,
+    }]
+}
+
+#[test]
+fn check_c_fires_at_thirty_idle_minutes_once_per_stretch() {
+    let (store, db) = new_store();
+    let dir = directory();
+    claim_ticket(&store, "lead", &dir);
+    let idle = Duration::from_secs(30 * 60);
+    let run = |store: &WorkClaimStore, sessions: &[IdleSession], now: i64| {
+        store.run_check_c(sessions, &dir, idle, at(now)).unwrap()
+    };
+    // 29 minutes: not yet.
+    assert!(run(&store, &idle_lead(0, false), 29).is_empty());
+    // Waiting on a queue job, Codex review or owner review: never.
+    assert!(run(&store, &idle_lead(0, true), 40).is_empty());
+    // 30 minutes, nothing pending.
+    assert_eq!(run(&store, &idle_lead(0, false), 30), vec!["lead"]);
+    assert_eq!(
+        queued(&db, "lead"),
+        vec!["[sm claim] Idle 30m, nothing pending. You hold: ticket #1 (open)."]
+    );
+    assert_eq!(nudges(&store)[0].3["check"], "C");
+    // Not twice in one stretch.
+    assert!(run(&store, &idle_lead(0, false), 50).is_empty());
+    // The reply to the nudge is a short turn: it does not re-arm. A
+    // restart in between changes nothing (everything is persisted).
+    let restarted = WorkClaimStore::new(db.clone());
+    assert!(run(&restarted, &idle_lead(32, false), 70).is_empty());
+    // A turn 31 minutes after the nudge re-arms the next idle stretch.
+    assert!(run(&restarted, &idle_lead(61, false), 90).is_empty());
+    assert_eq!(run(&restarted, &idle_lead(61, false), 95), vec!["lead"]);
+    assert_eq!(
+        queued(&db, "lead")[1],
+        "[sm claim] Idle 34m, nothing pending. You hold: ticket #1 (open)."
+    );
+}
+
+#[test]
+fn check_c_skips_working_sessions_and_closed_work() {
+    let (store, db) = new_store();
+    let dir = directory();
+    claim_ticket(&store, "eng1", &dir);
+    let idle = Duration::from_secs(30 * 60);
+    let eng1 = vec![IdleSession {
+        session_id: "eng1".into(),
+        last_activity: checks::format_time(at(0)),
+        waiting: false,
+    }];
+    // eng1 is working.
+    assert!(store
+        .run_check_c(&eng1, &dir, idle, at(60))
+        .unwrap()
+        .is_empty());
+    let mut idle_dir = directory();
+    idle_dir.insert(session("eng1", Some("lead"), HolderState::Idle));
+    store
+        .record_fetch(REPO, &[1], &fetch(&[(1, ticket("closed"))]))
+        .unwrap();
+    assert!(store
+        .run_check_c(&eng1, &idle_dir, idle, at(60))
+        .unwrap()
+        .is_empty());
+    assert!(queued(&db, "eng1").is_empty());
+}

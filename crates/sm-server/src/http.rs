@@ -6321,6 +6321,12 @@ async fn list_session_obligations(
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_read_allowed(&state, &request)?;
+    Ok(Json(session_obligations(&state)?))
+}
+
+/// The session feed's projection, shared by `/session-obligations` and the
+/// open-work idle check (sm#1452).
+fn session_obligations(state: &AppState) -> Result<Value, ApiError> {
     let queue_path = expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
         .join("queue_runner.db");
     let jobs =
@@ -6332,15 +6338,15 @@ async fn list_session_obligations(
             ..Default::default()
         },
     )?;
-    let docs = docs::obligation_doc_summaries(&state)?;
-    let claims = claims::work_claim_store(&state).active_claims()?;
-    Ok(Json(project_session_obligations(
+    let docs = docs::obligation_doc_summaries(state)?;
+    let claims = claims::work_claim_store(state).active_claims()?;
+    Ok(project_session_obligations(
         &jobs,
         &reviews,
         &docs,
         &claims,
         docs::doc_browser_base_url(&state.config).as_deref(),
-    )))
+    ))
 }
 
 fn new_obligation_entry(session_id: &str) -> Value {
@@ -9390,7 +9396,10 @@ async fn task_complete(
         .session_store
         .task_complete(&session_id, payload, runtime.as_ref())?
     {
-        TaskCompleteOutcome::Completed(result) => Ok(Json(serde_json::to_value(result)?)),
+        TaskCompleteOutcome::Completed(result) => {
+            claims::schedule_check_b(&state, &session_id);
+            Ok(Json(serde_json::to_value(result)?))
+        }
         TaskCompleteOutcome::Error(error) => Ok(Json(json!({ "error": error }))),
     }
 }

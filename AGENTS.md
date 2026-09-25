@@ -98,6 +98,13 @@ Reviewers and scouts don't claim.
   Use `--take` only when I say so.
 - Another agent claimed your ticket or PR: stop working on it and tell your parent
   or me the state you left it in.
+- A merged PR's ticket is still open: if the PR finished it, close it
+  (`gh issue close <N> --comment "Done in #<P>"`); otherwise comment on the ticket
+  what remains.
+- You hold open work at task-complete or while idle: if you are waiting on me, stay
+  idle. If you're finished, merge the PR once its review is clean, make sure the
+  ticket closes, and run `sm task-complete`. If not, comment on the ticket what
+  remains, then continue or stand by.
 
  Workflow as usual:
  1. Rebuild and restart session manager as required. If it's pure sm app update, you don't need to restart session manager, otherwise you may need to. Restart using `scripts/restart-rust-server.sh`. Follow other maintainer lessons from `docs/product/lessons.md` as needed. 
