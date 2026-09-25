@@ -26,6 +26,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
+import retrofit2.HttpException
 import retrofit2.Retrofit
 import java.io.File
 import java.time.Instant
@@ -96,6 +97,9 @@ class AndroidSmokeActivity : ComponentActivity() {
 
         step("auth_session") {
             val payload = sessionRepository.fetchAuthSession(serverUrl, accessToken)
+            check(payload.authenticated) {
+                "server did not accept the device bearer (auth_type=${payload.authType})"
+            }
             JSONObject()
                 .put("authenticated", payload.authenticated)
                 .put("auth_type", payload.authType)
@@ -207,6 +211,7 @@ class AndroidSmokeActivity : ComponentActivity() {
                 .put("finished_at", Instant.now().toString())
                 .put("error_class", error.javaClass.name)
                 .put("detail", error.message.orEmpty().take(MAX_DETAIL_CHARS))
+            httpFailure(error)?.let { result.put("http", it) }
             steps.put(result)
             Log.w(TAG, "android_smoke_step_blocked id=$id", error)
             return
@@ -221,6 +226,20 @@ class AndroidSmokeActivity : ComponentActivity() {
                 .put("finished_at", Instant.now().toString())
                 .put("detail", payload),
         )
+    }
+
+    // Records who refused an HTTP call: a Cloudflare edge refusal is an HTML page,
+    // an sm-server refusal is a JSON detail. The app's exception message hides both.
+    private fun httpFailure(error: Throwable): JSONObject? {
+        val http = generateSequence(error) { it.cause }
+            .filterIsInstance<HttpException>()
+            .firstOrNull() ?: return null
+        val raw = http.response()
+        val body = runCatching { raw?.errorBody()?.string() }.getOrNull().orEmpty()
+        return JSONObject()
+            .put("status", http.code())
+            .put("content_type", raw?.headers()?.get("content-type").orEmpty())
+            .put("body_snippet", body.replace(Regex("\\s+"), " ").trim().take(MAX_HTTP_BODY_CHARS))
     }
 
     private fun countSteps(status: String): Int =
@@ -379,6 +398,7 @@ class AndroidSmokeActivity : ComponentActivity() {
         const val TAG = "SM_ADB_SMOKE"
         const val DEFAULT_REPORT_FILE = "android-smoke-report.json"
         const val MAX_DETAIL_CHARS = 500
+        const val MAX_HTTP_BODY_CHARS = 240
         const val SOCKET_SMOKE_TIMEOUT_MS = 10_000L
         const val SMOKE_READ_ATTEMPTS = 6
         const val SMOKE_READ_RETRY_DELAY_MS = 1_000L
