@@ -124,42 +124,76 @@
 </style>
 
 <h1>1452 — Agent work claims and the history page</h1>
-<p class="sans"><small>Author: sm-1452-spec-author <code>b1f9510b</code> · Ticket #1452 · Revision 2 · 2026-09-24</small></p>
+<p class="sans"><small>Author: sm-1452-spec-author <code>b1f9510b</code> · Ticket #1452 · Revision 3 · 2026-09-24</small></p>
 
 <h2>Memo</h2>
 
-<p><b>Agents will tell sm which ticket and which pull request (PR) they are working on, and sm will use that to do three things it cannot do today.</b> It will show you, on one page, which agent worked on which ticket, opened which PR, wrote which docs and asked for how many reviews. It will refuse to let two unrelated agents work the same ticket or PR at once. And it will notice when an agent looks finished but its ticket or PR is still open, and ask that agent to close it out or write down what remains.</p>
+<style>
+  /* Mock screens use the shipped sm Watch app's palette (android-app/.../ui/theme/Color.kt). Human text sans, machine text mono; dotted underline = link, ↗ = leaves sm. */
+  .dk { --k0:#09090D; --k1:#121219; --k2:#181820; --k3:#1E1E28; --kl:#2B2B37; --kt:#F5F7FA; --kt2:#ADB2C2; --kt3:#777C8B; --kc:#5EE7FF; --kg:#4ADE80; --ka:#FBBF24; --kr:#FB7185; --kv:#A78BFA;
+        background: var(--k0); color: var(--kt); border-radius: 12px; padding: 12px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12.5px; line-height: 1.45; border: 1px solid #000; }
+  .dk .m { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; color: var(--kt3); letter-spacing: .01em; background: none; padding: 0; }
+  .dk .mt { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; color: var(--kt); background: none; padding: 0; }
+  .dk .top { display: flex; align-items: center; gap: 14px; padding: 2px 4px 10px; border-bottom: 1px solid var(--kl); margin-bottom: 10px; }
+  .dk .brand { font-weight: 700; font-family: ui-monospace, Menlo, monospace; color: var(--kc); }
+  .dk .tab { color: var(--kt3); } .dk .tab.on { color: var(--kt); border-bottom: 2px solid var(--kc); padding-bottom: 2px; }
+  .dk .sp { flex: 1; }
+  .dk .card { background: var(--k1); border-radius: 10px; padding: 8px 10px 8px 12px; margin: 0 0 7px; border-left: 3px solid var(--kl); }
+  .dk .card.c { border-left-color: var(--kc); } .dk .card.a { border-left-color: var(--ka); } .dk .card.r { border-left-color: var(--kr); } .dk .card.g { border-left-color: var(--kg); }
+  .dk .row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .dk .nm { font-family: ui-monospace, Menlo, monospace; font-size: 12px; color: var(--kt); font-weight: 600; }
+  .dk .st { color: var(--kt2); }
+  .dk .pill { font-family: ui-monospace, Menlo, monospace; font-size: 10.5px; border-radius: 999px; padding: 0 7px; border: 1px solid var(--kl); color: var(--kt2); white-space: nowrap; }
+  .dk .pill.c { color: var(--kc); border-color: #143744; background: #0f2530; } .dk .pill.a { color: var(--ka); border-color: #4a3a12; background: #221b08; }
+  .dk .pill.r { color: var(--kr); border-color: #4c2029; background: #22101a; } .dk .pill.g { color: var(--kg); border-color: #1d4a2e; background: #0d2016; } .dk .pill.v { color: var(--kv); border-color: #33295a; }
+  .dk .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin: 0 2px 1px 0; vertical-align: middle; background: var(--kt3); }
+  .dk .dot.w { background: var(--kg); box-shadow: 0 0 6px var(--kg); } .dk .dot.i { background: var(--kt3); } .dk .dot.o { background: none; border: 1px solid var(--kt3); }
+  .dk .lk { color: var(--kt); text-decoration: underline dotted var(--kt3); text-underline-offset: 3px; }
+  .dk .sec { margin: 7px 0 0; padding: 7px 0 0; border-top: 1px solid var(--k3); display: grid; grid-template-columns: 64px 1fr; gap: 3px 8px; }
+  .dk .lbl { font-family: ui-monospace, Menlo, monospace; font-size: 9.5px; letter-spacing: .12em; color: var(--kt3); text-transform: uppercase; padding-top: 2px; }
+  .dk .child { margin-left: 18px; }
+  .dk .strip { background: var(--k2); border-radius: 8px; padding: 7px 9px; margin: 6px 0 9px; }
+  .dk .tl { display: grid; grid-template-columns: 40px 1fr; gap: 3px 10px; border-left: 1px solid var(--kl); margin-left: 4px; padding-left: 10px; }
+  .dk .tl .m { color: var(--kt3); }
+  .dk .big { font-size: 14px; font-weight: 600; }
+  .shots { display: grid; grid-template-columns: 1.15fr 1fr; gap: 12px; margin-top: 12px; }
+  @media (max-width: 640px) { .shots { grid-template-columns: 1fr; } }
+</style>
 
-<p>The agent does this with two new commands, <code>sm ticket &lt;N&gt;</code> when it starts a ticket and <code>sm pr</code> when it opens a PR. sm also infers a PR claim whenever an agent runs <code>sm request-codex-review</code> or <code>sm doc publish</code> on a PR, so the record fills in even when an agent forgets. GitHub stays the source of truth for tickets and PRs; sm stores only who held what, and when.</p>
+<p><b>Agents will tell sm which ticket and which pull request (PR) they are working on. sm will use that to do four things it cannot do today.</b> It will show you, on one page, which agent worked on which ticket, opened which PR, wrote which docs and asked for how many reviews. It will refuse to let two unrelated agents work the same ticket or PR at once. It will tell an agent that looks finished, in plain facts, that its ticket or PR is still open. And it will own each agent's worktree from creation to deletion. Alongside, <code>sm watch</code> gets a web version on the laptop, and both show docs as a first-class section.</p>
 
-<p>I recommend building it as four tickets under #1452. The decisions I need from you are in the table below; every one has a recommendation.</p>
+<p>The agent uses two new commands: <code>sm ticket &lt;N&gt; --setup-worktree</code> when it starts a ticket, and <code>sm pr</code> when it opens a PR. sm also infers a PR claim whenever an agent runs <code>sm request-codex-review</code> or <code>sm doc publish</code> on a PR, so the record fills in even when an agent forgets. GitHub stays the source of truth for tickets and PRs; sm stores who held what, and when. sm's messages state facts only; what an agent does about them is written in <code>AGENTS.md</code>.</p>
+
+<p>You approved the design in revision 2. Four new decisions follow from your review comments; they are at the top of the decision surface.</p>
 
 <div class="vocab">
 <dl>
 <dt>Claim</dt>
-<dd>A record that one sm session is working on one ticket or one PR, from the moment it runs <code>sm ticket</code> or <code>sm pr</code> until the work closes on GitHub, the agent is retired, or it hands the claim over. The agent holding it is the <b>holder</b>.</dd>
+<dd>A record that one sm session is working on one ticket or one PR, from <code>sm ticket</code> or <code>sm pr</code> until the work closes on GitHub, the agent is retired, or the claim is handed over. The agent holding it is the <b>holder</b>.</dd>
 <dt>Same line</dt>
-<dd>Two sessions are in the same line when one is the parent, grandparent or other ancestor of the other in sm's parent–child tree. Siblings are not in the same line.</dd>
+<dd>Two sessions are in the same line when one is an ancestor of the other in sm's parent–child tree. Siblings are not.</dd>
 <dt>Collision</dt>
-<dd>Two live sessions that are not in the same line both claiming one ticket or PR.</dd>
+<dd>Two live sessions, not in the same line, both claiming one ticket or PR.</dd>
 <dt>Implicit claim</dt>
 <dd>A PR claim sm records on the agent's behalf when it runs <code>sm request-codex-review &lt;PR&gt;</code> or <code>sm doc publish</code> on a PR.</dd>
 <dt>Open-work check</dt>
-<dd>sm's test for "this agent looks finished, but its ticket or PR is still open". When it fires, sm sends the agent a message starting <code>[sm claim]</code>.</dd>
-<dt>History page</dt>
-<dd>A read-only web page, at <code>/history</code> on the sm server, listing tickets and PRs with the agents, PRs, docs and review counts attached to each.</dd>
+<dd>sm's test for "this agent looks finished, but its ticket or PR is still open". When it fires, sm sends the agent a message starting <code>[sm claim]</code> that lists the facts.</dd>
+<dt>Managed worktree</dt>
+<dd>A git worktree that <code>sm ticket --setup-worktree</code> created for the claim. sm deletes it when the agent is retired, unless it is unsafe or the agent asked to keep it.</dd>
+<dt>History page and web watch</dt>
+<dd>Two read-only pages on the sm server. <code>/history</code> lists tickets and PRs with their agents, PRs, docs and review counts. <code>/watch</code> is the browser version of the <code>sm watch</code> terminal view: live sessions, what each is doing, and what it holds.</dd>
 </dl>
 </div>
 
 <h3>What goes wrong today</h3>
-<p>These are from this repo, today:</p>
 <table>
-<thead><tr><th style="width:34%">Symptom</th><th>Evidence</th></tr></thead>
+<thead><tr><th style="width:32%">Symptom</th><th>Evidence, from this repo</th></tr></thead>
 <tbody>
-<tr><td>A ticket stays open after its work merged.</td><td>PR #1460 merged at 21:22 and says "Implements #1449". GitHub only auto-closes on "Closes #N", so #1449 is still open. Nothing prompted the agent to notice.</td></tr>
-<tr><td>Branches and worktrees outlive their PRs.</td><td>Merged PRs left 32 branches on GitHub, <code>1449-owner-docs</code> among them, because GitHub's "delete head branch on merge" setting was off. The worktree <code>~/worktrees/sm-agents-md-repo-reference</code> is still on disk after its PR #1462 merged.</td></tr>
-<tr><td>You cannot see who did what.</td><td>sm knows each session's docs and Codex review requests, but has no record of tickets at all, and nothing that joins a ticket to its PRs, agents and docs. Once an agent is retired, the only trace is its name in PR comments.</td></tr>
+<tr><td>A ticket stays open after its work merged.</td><td>PR #1460 merged and says "Implements #1449". GitHub auto-closes only on "Closes #N", so #1449 is still open. Nothing told the agent.</td></tr>
+<tr><td>Branches and worktrees outlive their PRs.</td><td>Merged PRs left 32 branches on GitHub because auto-delete was off (now on). The worktree <code>~/worktrees/sm-agents-md-repo-reference</code> is still on disk after its PR #1462 merged.</td></tr>
+<tr><td>You cannot see who did what.</td><td>sm has no record of tickets, and nothing joins a ticket to its PRs, agents and docs. Once an agent is retired, its only trace is its name in PR comments.</td></tr>
 <tr><td>Two agents on one ticket go unnoticed.</td><td>Nothing stops a second engineer on #1451 while the first is working. The collision shows up at merge.</td></tr>
+<tr><td>Off the phone, sessions live only in a terminal.</td><td>The laptop has <code>sm watch</code> in a terminal and no browser view. <code>sm watch</code> lists a session's docs only inside the expanded row, mixed with other detail.</td></tr>
 </tbody>
 </table>
 
@@ -177,7 +211,7 @@
   .ckt2 { fill: var(--ink-2); font-size: 10.5px; }
 </style>
 <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-3)"/></marker></defs>
-<rect class="bxa" x="5" y="10" width="170" height="56" rx="6"/><text class="t1" x="15" y="31">1. sm ticket 1452</text><text class="t2" x="15" y="49">claim starts; worktree noted</text>
+<rect class="bxa" x="5" y="10" width="170" height="56" rx="6"/><text class="t1" x="15" y="31">1. sm ticket 1452</text><text class="t2" x="15" y="49">claim + worktree created</text>
 <rect class="bx" x="195" y="10" width="170" height="56" rx="6"/><text class="t1" x="205" y="31">2. sm doc publish</text><text class="t2" x="205" y="49">spec joins ticket 1452</text>
 <rect class="bxa" x="385" y="10" width="170" height="56" rx="6"/><text class="t1" x="395" y="31">3. open PR, sm pr</text><text class="t2" x="395" y="49">body says "Closes #1452"</text>
 <rect class="bx" x="575" y="10" width="180" height="56" rx="6"/><text class="t1" x="585" y="31">4. request-codex-review</text><text class="t2" x="585" y="49">counted per PR (implicit claim)</text>
@@ -186,95 +220,155 @@
 <rect class="bx" x="5" y="112" width="170" height="56" rx="6"/><text class="t1" x="15" y="133">5. agent merges PR</text><text class="t2" x="15" y="151">PR claim ends: merged</text>
 <rect class="bx" x="195" y="112" width="170" height="56" rx="6"/><text class="t1" x="205" y="133">6. GitHub closes #1452</text><text class="t2" x="205" y="151">ticket claim ends: closed</text>
 <rect class="bx" x="385" y="112" width="170" height="56" rx="6"/><text class="t1" x="395" y="133">7. sm task-complete</text><text class="t2" x="395" y="151">parent told, as today</text>
-<rect class="bx" x="575" y="112" width="180" height="56" rx="6"/><text class="t1" x="585" y="133">8. retired</text><text class="t2" x="585" y="151">clean merged worktree removed</text>
+<rect class="bx" x="575" y="112" width="180" height="56" rx="6"/><text class="t1" x="585" y="133">8. retired</text><text class="t2" x="585" y="151">worktree deleted if safe</text>
 <path class="ln" d="M175,140 H193" marker-end="url(#ar)"/><path class="ln" d="M365,140 H383" marker-end="url(#ar)"/><path class="ln" d="M555,140 H573" marker-end="url(#ar)"/>
-<rect class="ck" x="5" y="186" width="360" height="44" rx="6"/><text class="ckt" x="15" y="204">Check A · after the merge</text><text class="ckt2" x="15" y="221">ticket still open (no "Closes") → [sm claim] to the holder</text>
-<rect class="ck" x="385" y="186" width="370" height="44" rx="6"/><text class="ckt" x="395" y="204">Check B · at task-complete</text><text class="ckt2" x="395" y="221">agent holds an open ticket or PR → [sm claim] to the agent</text>
-<rect class="ck" x="5" y="244" width="750" height="44" rx="6"/><text class="ckt" x="15" y="262">Check C · any time</text><text class="ckt2" x="15" y="279">idle 30 minutes, waiting on nothing, still holds an open ticket or PR → one [sm claim] to the agent</text>
+<rect class="ck" x="5" y="186" width="360" height="44" rx="6"/><text class="ckt" x="15" y="204">Check A · after the merge</text><text class="ckt2" x="15" y="221">a linked ticket is still open → [sm claim] facts to its holder</text>
+<rect class="ck" x="385" y="186" width="370" height="44" rx="6"/><text class="ckt" x="395" y="204">Check B · at task-complete</text><text class="ckt2" x="395" y="221">agent holds an open ticket or PR → [sm claim] facts</text>
+<rect class="ck" x="5" y="244" width="750" height="44" rx="6"/><text class="ckt" x="15" y="262">Check C · any time</text><text class="ckt2" x="15" y="279">idle 30 minutes, waiting on nothing, holds an open ticket or PR → one [sm claim] with the facts</text>
 </svg>
-<figcaption>Blue boxes are the two new agent commands. Everything else the agent already does. The dashed orange boxes are the open-work check: the three moments sm asks an agent whether it is finished. A healthy ticket passes all three without a message.</figcaption>
+<figcaption>Blue boxes are the two new agent commands. The dashed orange boxes are the open-work check: the three moments sm tells an agent that it looks finished but still holds open work. A tidy agent never gets a message.</figcaption>
 </figure>
 
 <h3>What you see</h3>
 <figure>
-<div class="mock">
-<div class="bar"><b>sm · History</b> &nbsp; Filter: <span class="chip">All repos ▾</span> <span class="chip">Agent: any ▾</span> <span class="chip open">Open only</span> <span class="chip">Search #</span></div>
-<table>
-<thead><tr><th>Ticket / PR</th><th>Agents</th><th>PRs · reviews</th><th>Docs</th><th>Last</th></tr></thead>
-<tbody>
-<tr><td><b>#1449</b> Owner docs: publish, storage, web reader <span class="chip warn">Open after merge</span></td><td><span class="dot gone"></span>sm-1449-engineer</td><td>#1460 <span class="chip done">merged</span> · 3 Codex</td><td>—</td><td>2h</td></tr>
-<tr><td><b>#1451</b> Owner docs: comment in the reader <span class="chip open">open</span></td><td><span class="dot live"></span>sm-1451-owner-doc-review</td><td>—</td><td>—</td><td>6m</td></tr>
-<tr><td><b>#1452</b> Agent work claims and history page <span class="chip open">open</span></td><td><span class="dot live"></span>sm-1452-spec-author</td><td>#1470 <span class="chip open">open</span> · 1 Codex</td><td>1452 — Agent work claims… <span class="chip">Review requested</span></td><td>1m</td></tr>
-<tr><td><b>#1480</b> Queue retry on host sleep <span class="chip bad">2 agents</span></td><td><span class="dot live"></span>sm-1480-engineer<br><span class="dot idle"></span>sm-1480-fixer</td><td>#1481 <span class="chip open">open</span> · 2 Codex</td><td>—</td><td>12m</td></tr>
-<tr><td><b>#1450</b> Android: Docs row and doc reader <span class="chip done">closed</span></td><td><span class="dot gone"></span>sm-1450-engineer</td><td>#1467 <span class="chip done">merged</span> · 2 Codex</td><td>—</td><td>4h</td></tr>
-</tbody>
-</table>
+<div class="dk">
+  <div class="top"><span class="brand">sm</span><span class="tab on">Watch</span><span class="tab">History</span><span class="sp"></span><span class="m">6 live · 1 waiting on you · updated 2s ago</span></div>
+  <div class="card c">
+    <div class="row"><span class="dot i"></span><span class="nm">sm-1452-spec-author</span><span class="m">claude · idle 4m</span><span class="pill c">#1452</span><span class="pill v">docs 1 · review requested</span><span class="pill a">waiting on you</span></div>
+    <div class="st">1452 spec at revision 3; waiting on Rajesh's decisions</div>
+    <div class="sec">
+      <span class="lbl">Work</span><span><a class="lk mt">ticket #1452</a> <span class="pill c">open</span> · <a class="lk mt">PR #1470 ↗</a> <span class="pill c">open</span> <span class="m">3 Codex reviews · worktree ~/worktrees/sm-1452-spec</span></span>
+      <span class="lbl">Docs</span><span><a class="lk">1452 — Agent work claims and the history page</a> <span class="pill v">review requested</span> <span class="m">2h</span></span>
+      <span class="lbl">Reviews</span><span>Waiting for your review of the doc <span class="m">· 42m</span></span>
+      <span class="lbl">Attach</span><span class="mt">$ sm attach sm-1452-spec-author ⧉</span>
+    </div>
+  </div>
+  <div class="card r">
+    <div class="row"><span class="dot w"></span><span class="nm">sm-1480-engineer</span><span class="m">codex · working 12s</span><span class="pill c">#1480</span><span class="pill r">2 agents</span></div>
+    <div class="st">wiring retry backoff into the queue runner</div>
+  </div>
+  <div class="card c child">
+    <div class="row"><span class="dot w"></span><span class="nm">sm-1480-reviewer-1</span><span class="m">claude · working 40s</span><span class="pill">PR #1481</span></div>
+  </div>
+  <div class="card r">
+    <div class="row"><span class="dot i"></span><span class="nm">sm-1480-fixer</span><span class="m">claude · idle 9m</span><span class="pill c">#1480</span><span class="pill r">2 agents</span></div>
+  </div>
 </div>
-<figcaption>Mock of <code>/history</code>. Ticket #1480 and the agent names are illustrative. Each row is one ticket, or one PR that no ticket owns. The dot is the agent's state: green working, grey idle, hollow retired. Tapping a ticket opens its timeline: every claim, PR, review request, doc publish, <code>[sm claim]</code> message and state change, in order. Tapping an agent filters the page to that agent. The same page opens in the app and in a laptop browser; <code>sm history</code> prints the same rows in the terminal.</figcaption>
+<div class="shots">
+<div class="dk">
+  <div class="top"><span class="brand">sm</span><span class="tab">Watch</span><span class="tab on">History</span><span class="sp"></span><span class="m">open only ▾</span></div>
+  <div class="card a"><div class="row"><span class="mt">#1449</span><span class="big">Owner docs: publish, storage, reader</span></div>
+    <div class="row"><span class="pill a">open after merge</span><span class="m">PR #1460 merged · 3 Codex · sm-1449-engineer (retired)</span></div></div>
+  <div class="card r"><div class="row"><span class="mt">#1480</span><span class="big">Queue retry on host sleep</span></div>
+    <div class="row"><span class="pill r">2 agents</span><span class="m">PR #1481 open · 2 Codex · sm-1480-engineer, sm-1480-fixer</span></div></div>
+  <div class="card c"><div class="row"><span class="mt">#1452</span><span class="big">Agent work claims and history</span></div>
+    <div class="row"><span class="pill c">open</span><span class="m">PR #1470 open · 3 Codex · 1 doc, review requested · sm-1452-spec-author</span></div></div>
+  <div class="card g"><div class="row"><span class="mt">#1450</span><span class="big">Android: Docs row and reader</span></div>
+    <div class="row"><span class="pill g">closed</span><span class="m">PR #1467 merged · 2 Codex · sm-1450-engineer (retired)</span></div></div>
+</div>
+<div class="dk">
+  <div class="top"><span class="brand">sm</span><span class="m">history / session-manager / 1449</span></div>
+  <div class="row"><span class="mt">#1449</span><span class="big">Owner docs: publish, storage, reader</span> <a class="lk m">GitHub ↗</a></div>
+  <div class="strip"><div class="row"><span class="pill a">open after merge</span><a class="lk mt">PR #1460 ↗</a><span class="pill g">merged</span><span class="m">3 Codex · worktree removed</span></div></div>
+  <div class="tl">
+    <span class="m">14:02</span><span><span class="mt">sm-1449-engineer</span> claimed the ticket</span>
+    <span class="m">15:40</span><span>claimed <span class="mt">PR #1460</span></span>
+    <span class="m">15:41</span><span>requested Codex review <span class="m">×3 by 20:30</span></span>
+    <span class="m">21:22</span><span>PR #1460 merged; ticket still open</span>
+    <span class="m">21:23</span><span>told: <span class="m">[sm claim] PR #1460 merged 1m ago. Linked ticket #1449 … is open.</span></span>
+    <span class="m">22:10</span><span>retired · worktree deleted</span>
+  </div>
+</div>
+</div>
+<figcaption>Mock, in the sm Watch app's palette. Ticket #1480, its agents and the times are illustrative. <b>Top:</b> the web watch at <code>/watch</code>, the browser twin of <code>sm watch</code>: one card per live session, children indented. The expanded card shows Work (claims), Docs, Reviews and a copyable attach command, and the collapsed card's chips carry the same facts. <b>Bottom left:</b> <code>/history</code>, one card per ticket; the card's left edge is amber for open after merge, red for two agents, green for done. <b>Bottom right:</b> a ticket's timeline, every claim, PR, review request, doc, <code>[sm claim]</code> message and state change in order. Human-written text is sans, machine output is mono, a dotted underline is a link and ↗ leaves sm. The phone app opens <code>/history</code> in its web view; it keeps its native watch screen.</figcaption>
 </figure>
 
 <h3>Decision surface</h3>
+<p>New in this revision, from your comments:</p>
 <table>
 <thead>
-<tr><th style="width:21%">Question</th><th>Recommendation</th><th style="width:28%">Why, in one line</th></tr>
+<tr><th style="width:21%">Question</th><th>Recommendation</th><th style="width:27%">Why, in one line</th></tr>
 </thead>
 <tbody>
-<tr><td>1. Does <code>sm task-complete</code> mean the ticket is done?</td><td><b>No.</b> It still means "this agent finished what it was asked to do" and still tells the parent. A ticket is done when it closes on GitHub. At task-complete sm looks at the agent's claims, and if a ticket or PR is still open it sends the agent one <code>[sm claim]</code> message (Check B).</td><td>You often give an agent more work after it completes; the ticket's real state lives on GitHub.</td></tr>
-<tr><td>2. When does sm ask "are you done?"</td><td><b>Three moments, one message each:</b> (A) a PR merges and a ticket it was for is still open; (B) at task-complete; (C) the agent has been idle 30 minutes, waits on nothing (no queue job, review, or owner review outstanding), and holds an open ticket or PR. Check C fires once per claim and re-arms only when the agent starts new work later. The message tells the agent to close the ticket, merge the PR, or comment on the ticket what remains, and to stay idle if it is waiting on you.</td><td>Catches #1449-style leftovers without nagging: a finished agent gets at most one short message per moment.</td></tr>
-<tr><td>3. What happens on a collision?</td><td><b>sm refuses the second explicit claim</b> and names the holder and its state. The agent must ask you; <code>--take</code> moves the claim and tells the old holder, and agents are told to use it only on your word. Same-line claims (parent and child on one ticket) are allowed. Implicit claims never block a command; they record the collision and flag it red on the page.</td><td>Refusing at claim time is when the collision is cheapest to fix; blocking a review request would only strand work.</td></tr>
-<tr><td>4. When does a claim end?</td><td><b>When the ticket closes or the PR merges or closes on GitHub, when the holder is retired, or on <code>--release</code> or <code>--take</code>.</b> Not at task-complete, not at <code>sm handoff</code>. A stopped but restorable holder's claim does not block anyone; if another agent claims, the old one ends and the restored agent is told.</td><td>A claim should mean "someone is on this", and stay true across feedback rounds.</td></tr>
-<tr><td>5. Should sm merge PRs on task-complete?</td><td><b>No.</b> The agent keeps merging, as step 6 of the workflow says. Check A and C nudge an agent that stops short of merging.</td><td>Only the agent knows whether the review loop is clean; sm cannot see P1 classifications.</td></tr>
-<tr><td>6. Branch cleanup on GitHub</td><td><b>Decided and done:</b> GitHub's "Automatically delete head branches" is on for this repo and your primary repo. No sm code.</td><td>GitHub already does this well.</td></tr>
-<tr><td>7. Worktree cleanup</td><td><b>sm removes the agent's worktree when the agent is retired</b>, only if the PR merged, the worktree's commit is exactly the merged PR head, and git's own safe remove succeeds (it refuses any modified or untracked file; build output that git ignores goes with it). Otherwise sm leaves it, lists it in the retire output, and flags it on the page.</td><td>Retire is when the agent is certainly gone; git's refusal is the safety net, so nothing unmerged is lost.</td></tr>
-<tr><td>8. How do docs fit the lifecycle?</td><td><b>A doc joins the PR it was published on, and through it the PR's tickets.</b> A doc published without a PR joins the tickets its author held at that moment. Publishing on a PR also claims it (implicit claim).</td><td>No new flag for agents to remember; the join falls out of records sm already has.</td></tr>
-<tr><td>9. Where does the history page live?</td><td><b>A plain server page at <code>/history</code></b>, behind the same login as the doc reader: your Cloudflare login on the laptop, the app's device login on the phone (the app opens it like a doc). Plus <code>sm history</code> in the terminal. The session expansion in the app gains a Work line, "Ticket #1452 · PR #1470", that opens the ticket's timeline.</td><td>One implementation serves every screen, exactly as the doc reader does.</td></tr>
-<tr><td>10. Start empty or backfill?</td><td><b>Backfill</b> PR claims from past Codex review requests and past doc publishes, and their tickets from each PR's "Closes #N". Backfilled records never trigger messages.</td><td>The page is useful on day one.</td></tr>
-<tr><td>11. How is it built?</td><td><b>Four tickets under #1452</b>, which becomes the epic: claims core; open-work checks and worktree cleanup; history page and <code>sm history</code>; Android. Details below.</td><td>Each fits one agent without compaction.</td></tr>
+<tr><td>1. Does sm create worktrees?</td><td><b>Yes: <code>sm ticket &lt;N&gt; --setup-worktree</code></b> creates <code>~/worktrees/&lt;prefix&gt;-&lt;N&gt;-&lt;slug&gt;</code> on a new branch <code>&lt;N&gt;-&lt;slug&gt;</code> from the latest <code>origin/main</code>. The prefix is <code>sm</code> for this repo and the repo name elsewhere; the slug is the first words of the ticket title, or one the agent passes. <code>AGENTS.md</code> makes it the default way to start a ticket.</td><td>The worktree becomes part of the claim, so sm knows exactly which one to delete.</td></tr>
+<tr><td>2. When is a worktree kept?</td><td><b>Deletion at retire is the default.</b> sm keeps a worktree when the agent ran <code>sm worktree keep --reason "…"</code> (a server running, results not yet pushed), when any process still runs inside it, or when deleting would lose work: uncommitted or untracked files, or commits that are not in a merged PR. Kept worktrees show on the page with their reason; <code>sm worktree keep --off</code> clears the flag.</td><td>Your running-server case is covered twice: the agent says so, and sm checks for itself.</td></tr>
+<tr><td>3. Web watch</td><td><b>A read-only <code>/watch</code> page</b> that mirrors <code>sm watch</code>, refreshing every 3 seconds, behind the same login as docs and history (your Cloudflare login on the laptop). It has no buttons that act on sessions, such as send or retire; you use the terminal or the app for those.</td><td>Viewing adds no new risk to the login model; acting from a browser would, and deserves its own decision.</td></tr>
+<tr><td>4. Docs in <code>sm watch</code></td><td><b>A Docs section in the expanded view, before Reviews</b>, one line per doc with its state and link, the same way the app shows it. The collapsed row always shows <code>[docs N]</code>, with the unread count when there is one: <code>[docs 3·1 new]</code>.</td><td>Docs get the same standing as reviews on every screen.</td></tr>
+</tbody>
+</table>
+
+<p>Decided in revision 2, unchanged apart from the message wording:</p>
+<table>
+<thead><tr><th style="width:26%">Topic</th><th>Decision</th></tr></thead>
+<tbody>
+<tr><td><code>sm task-complete</code></td><td>Means "this agent's task is done", not "the ticket is done". A ticket is done when it closes on GitHub.</td></tr>
+<tr><td>Open-work check</td><td>Three moments, one message each: a PR merged while a linked ticket is still open; at task-complete; idle 30 minutes with nothing pending. Check C fires once per claim and re-arms when the agent starts new work later.</td></tr>
+<tr><td>sm messages</td><td>State facts only. What an agent should do is written in <code>AGENTS.md</code> (below), not in the message.</td></tr>
+<tr><td>Collisions</td><td>The second explicit claim is refused; <code>--take</code> moves it, only on your word. Parent and child share. Implicit claims never block; they flag red.</td></tr>
+<tr><td>Claim lifetime</td><td>Ends when the ticket or PR closes on GitHub, the holder is retired, or on release or take. It survives task-complete and handoff. A stopped holder does not block anyone.</td></tr>
+<tr><td>Merging</td><td>sm never merges; the agent does.</td></tr>
+<tr><td>Branches on GitHub</td><td>Auto-delete on merge is on for this repo and your primary repo.</td></tr>
+<tr><td>Docs</td><td>A doc joins the PR it was published on and that PR's tickets; a doc with no PR joins its author's tickets.</td></tr>
+<tr><td>History page</td><td><code>/history</code>, with the same login as docs; the app opens it in its web view; <code>sm history</code> in the terminal.</td></tr>
+<tr><td>Backfill</td><td>From past Codex review requests and doc publishes, with no messages sent.</td></tr>
 </tbody>
 </table>
 
 <h3>What the agent sees</h3>
-<p>Collisions, by example. <i>A</i> holds the claim; <i>B</i> tries to claim the same thing.</p>
+<p>sm's texts are facts. <code>&lt;…&gt;</code> are filled in.</p>
 <table>
-<thead><tr><th style="width:42%">Situation</th><th>Result</th></tr></thead>
+<thead><tr><th style="width:30%">Event</th><th>What the agent gets</th></tr></thead>
 <tbody>
-<tr><td>A is the live engineer on #1451. B, a second engineer in another tree, runs <code>sm ticket 1451</code>.</td><td>Refused. B sees <i>"Ticket #1451 is held by sm-1451-owner-doc-review (4d2a91c0), working, claimed 2h ago in ~/worktrees/sm-1451-owner-doc-review. Ask Rajesh before working on it; rerun with --take only if he says so."</i></td></tr>
-<tr><td>You tell B to take over; B runs <code>sm ticket 1451 --take</code>.</td><td>B holds it. A gets <i>"[sm claim] sm-1451-engineer-2 took ticket #1451 from you. Stop working on it, and tell your parent or Rajesh the state you left it in."</i></td></tr>
-<tr><td>A, a spec author, spawns child B to implement, and B claims the same ticket.</td><td>Allowed: same line. Both show on the page.</td></tr>
-<tr><td>A crashed and is stopped but not retired.</td><td>B's claim succeeds; A's claim ends. If you restore A, its first message says B now holds the ticket.</td></tr>
-<tr><td>A was retired yesterday.</td><td>A's claim ended at retire. No collision.</td></tr>
-<tr><td>B runs <code>sm request-codex-review</code> on A's PR.</td><td>The review request goes through. B's implicit claim is recorded, B sees a one-line warning, and the page shows <span class="chip bad">2 agents</span>.</td></tr>
+<tr><td>Claim refused (collision)</td><td><code>Refused: ticket #1451 is held by sm-1451-owner-doc-review (4d2a91c0), working, claimed 2h ago, worktree ~/worktrees/sm-1451-owner-doc-review.</code> Exit code 3.</td></tr>
+<tr><td>Someone took its claim</td><td><code>[sm claim] sm-1451-engineer-2 (a1b2c3d4) claimed ticket #1451. Your claim on it ended.</code></td></tr>
+<tr><td>Check A</td><td><code>[sm claim] PR #1460 merged 3m ago. Linked ticket #1449 "Owner docs: sm doc publish, storage, and web reader" is open.</code></td></tr>
+<tr><td>Check B</td><td><code>[sm claim] At task-complete you hold: ticket #1452 (open), PR #1470 (open, not merged).</code></td></tr>
+<tr><td>Check C</td><td><code>[sm claim] Idle 30m, nothing pending. You hold: ticket #1452 (open), PR #1470 (open, not merged).</code></td></tr>
+<tr><td>Worktree at retire (in <code>sm retire</code> output)</td><td><code>Deleted worktree ~/worktrees/sm-1449-owner-docs (PR #1460 merged).</code> or <code>Kept worktree ~/worktrees/sm-1480-queue: process 4121 (node) runs in it.</code></td></tr>
 </tbody>
 </table>
 
-<p>The open-work check, by example. These are the exact texts; <code>&lt;…&gt;</code> are filled in.</p>
-<div class="msg">[sm claim] PR #1460 merged, but ticket #1449 ("Owner docs: sm doc publish, storage, and web reader") is still open. If the PR finished it, close it: gh issue close 1449 --repo rajeshgoli/session-manager --comment "Done in #1460". If work remains, comment on #1449 what remains. Then carry on.</div>
-<div class="msg">[sm claim] You've been idle 30 minutes with nothing pending, and you still hold: ticket #1452 (open), PR #1470 (open, not merged). If you are waiting on Rajesh, stay idle. If you're finished: merge the PR once its review is clean, make sure the ticket closes, and run sm task-complete. If not: comment on #1452 what remains, then continue or stand by.</div>
-<p class="small">Check B sends the second text without the idle clause. Each message costs the agent one short turn; a finished, tidy agent never sees one.</p>
-
 <h3>The agent contract</h3>
-<p>This paragraph goes into <code>AGENTS.md</code>, section 3, right after "Worktrees", in this repo and in the shared template your other repos use:</p>
-<pre>**Claim your work.** When you start on a ticket, run `sm ticket &lt;N&gt;`. When you open
+<p>This goes into <code>AGENTS.md</code>, section 3, right after "Worktrees", replacing that paragraph's "create your own worktree" guidance. It goes into this repo and into the shared template your other repos use. The policy lives here, not in sm's messages:</p>
+<pre>**Claim your work.** Start a ticket with `sm ticket &lt;N&gt; --setup-worktree` and work in
+the worktree it prints (plain `sm ticket &lt;N&gt;` if you already have one). When you open
 a PR, or take over someone else's, run `sm pr` from its branch. Put `Closes #&lt;N&gt;` in
 the PR body for each ticket the PR finishes; "Implements #N" does not close it.
-Reviewers and scouts don't claim; only the agent doing the work does. If `sm ticket`
-or `sm pr` refuses because another live agent holds it, stop and tell me; use
-`--take` only when I say so. A `[sm claim]` message means sm found your ticket or PR
-still open when you look finished: do what it says.</pre>
+Reviewers and scouts don't claim. When you are retired, sm deletes your worktree if
+nothing would be lost; if something there must outlive you (a running server,
+results not yet pushed), run `sm worktree keep --reason "&lt;why&gt;"`.
+
+`[sm claim]` messages state facts. Act on them like this:
+- Your claim is refused because another live agent holds it: stop and tell me.
+  Use `--take` only when I say so.
+- Another agent claimed your ticket or PR: stop working on it and tell your parent
+  or me the state you left it in.
+- A merged PR's ticket is still open: if the PR finished it, close it
+  (`gh issue close &lt;N&gt; --comment "Done in #&lt;P&gt;"`); otherwise comment on the ticket
+  what remains.
+- You hold open work at task-complete or while idle: if you are waiting on me, stay
+  idle. If you're finished, merge the PR once its review is clean, make sure the
+  ticket closes, and run `sm task-complete`. If not, comment on the ticket what
+  remains, then continue or stand by.</pre>
 
 <h3>Tickets</h3>
 <table>
-<thead><tr><th style="width:24%">Ticket</th><th>Scope</th><th style="width:22%">Depends on</th></tr></thead>
+<thead><tr><th style="width:24%">Ticket</th><th>Scope</th><th style="width:18%">Depends on</th></tr></thead>
 <tbody>
-<tr><td><b>Claims core</b></td><td>Storage; <code>sm ticket</code>, <code>sm pr</code>, release and list; collision rules; implicit claims; backfill; claims ending on close, merge, retire and stop; GitHub state sync every 5 minutes; <code>claims</code> in the session feed the app and <code>sm watch</code> read; the <code>sm watch</code> marker; the <code>AGENTS.md</code> paragraph.</td><td>—</td></tr>
-<tr><td><b>Open-work checks and cleanup</b></td><td>Checks A, B and C with the texts above; <code>sm pr</code> warning when the PR body doesn't close a held ticket; worktree removal at retire.</td><td>Claims core</td></tr>
-<tr><td><b>History page</b></td><td><code>/history</code> and the per-ticket timeline; <code>sm history</code>; the login gate extended from docs to history.</td><td>Claims core</td></tr>
-<tr><td><b>Android</b></td><td>History entry in the app, the Work line in the session expansion, both opening the page with device login.</td><td>History page</td></tr>
+<tr><td><b>1. Claims core</b></td><td>Storage; <code>sm ticket</code>, <code>sm pr</code>, release and list; collisions; implicit claims; backfill; claims ending; GitHub sync; <code>claims</code> in the session feed; the <code>sm watch</code> claim marker; the <code>AGENTS.md</code> paragraph.</td><td>—</td></tr>
+<tr><td><b>2. Open-work checks</b></td><td>Checks A, B and C; the closing-reference note on <code>sm pr</code>.</td><td>1</td></tr>
+<tr><td><b>3. Worktree lifecycle</b></td><td><code>--setup-worktree</code>, <code>sm worktree keep</code>, deletion at retire.</td><td>1</td></tr>
+<tr><td><b>4. History page</b></td><td><code>/history</code>, the ticket timeline, <code>sm history</code>, the login gate for owner pages.</td><td>1</td></tr>
+<tr><td><b>5. Web watch and TUI docs</b></td><td><code>/watch</code>; the Docs section and marker in <code>sm watch</code>.</td><td>4 (shares the page shell and gate)</td></tr>
+<tr><td><b>6. Android</b></td><td>History action and the Work line, opening the pages with device login.</td><td>4</td></tr>
 </tbody>
 </table>
+<p class="small">After ticket 1, tickets 2, 3 and 4 touch different files and run in parallel.</p>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p>Revision 2 corrects implementation details in the appendices after code review: a PR is linked only to the tickets it names (or the single ticket its agent holds), a merge check deferred by GitHub's delay is stored rather than dropped, backfilled records are fetched from GitHub, a stopped agent's worktree is never removed, and backfill counts every doc publish. A second review round fixed two more: rerunning <code>sm pr</code> with <code>--ticket</code> on an already-held PR now adds the link, and the merge check waits until every linked ticket has been fetched. The memo's decisions are unchanged, except row 6: branch auto-delete is on for both repos, as you approved.</p>
+<p><b>Revision 3 (your review).</b> Messages now state facts only, and all policy moved into the <code>AGENTS.md</code> paragraph. Worktrees are managed: <code>sm ticket --setup-worktree</code> creates one, <code>sm worktree keep</code> protects one, and sm also refuses to delete a worktree with a process running in it. New <code>/watch</code> page; docs get their own section in <code>sm watch</code>. The mock is redrawn in the Watch app's style and now includes the web watch and the ticket timeline. Two tickets are added (worktree lifecycle; web watch and TUI docs), for six in all.</p>
+<p><b>Revision 2 (code review).</b> Appendix-level correctness fixes, and branch auto-delete turned on as you approved.</p>
+
 
 <hr class="appendix-divider">
 <h2>Appendices</h2>
@@ -287,7 +381,7 @@ still open when you look finished: do what it says.</pre>
 <div>D. GitHub sync</div>
 <div>E. Implicit claims and backfill</div>
 <div>F. Open-work checks</div>
-<div>G. Worktree cleanup at retire</div>
+<div>G. Worktree lifecycle</div>
 <div>H. Server endpoints</div>
 <div>I. History page</div>
 <div>J. Session feed, sm watch, Android</div>
@@ -295,6 +389,7 @@ still open when you look finished: do what it says.</pre>
 <div>L. Tests</div>
 <div>M. Requirement trace</div>
 <div>N. Tickets in detail</div>
+<div>O. Web watch</div>
 <div>Z. FAQ</div>
 </div>
 
@@ -333,12 +428,21 @@ CREATE TABLE IF NOT EXISTS work_claims (
   ended_at TEXT,                   -- NULL = active
   end_reason TEXT,                 -- closed | merged | retired | released | taken | superseded
   ended_by_session_id TEXT,        -- for taken | superseded
-  nudged_idle_at TEXT              -- Check C bookkeeping (appendix F)
+  nudged_idle_at TEXT,             -- Check C bookkeeping (appendix F)
+  managed_worktree INTEGER NOT NULL DEFAULT 0,  -- 1 = created by --setup-worktree (appendix G)
+  base_sha TEXT                    -- managed worktrees: the commit it was created from
 );
 CREATE INDEX IF NOT EXISTS work_claims_item ON work_claims(repo, number);
 CREATE INDEX IF NOT EXISTS work_claims_session ON work_claims(session_id);
 CREATE UNIQUE INDEX IF NOT EXISTS work_claims_one_active
   ON work_claims(repo, number, session_id) WHERE ended_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS worktree_keeps (  -- sm worktree keep (appendix G)
+  path TEXT PRIMARY KEY,           -- absolute, symlinks resolved
+  session_id TEXT,
+  reason TEXT NOT NULL,
+  kept_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS work_links (      -- PR → ticket, same repo only
   repo TEXT NOT NULL,
@@ -371,7 +475,7 @@ CREATE INDEX IF NOT EXISTS work_events_session ON work_events(session_id, at);</
 <tr><td><code>state_changed</code></td><td>sync sees a new <code>state</code></td><td><code>{from, to, state_reason}</code></td></tr>
 <tr><td><code>linked</code></td><td>a <code>work_links</code> row is inserted (on the PR and on the ticket)</td><td><code>{pr_number, ticket_number, source}</code></td></tr>
 <tr><td><code>nudge</code></td><td>an open-work message is enqueued (on each item it names)</td><td><code>{check: A|B|C, message_id, text}</code></td></tr>
-<tr><td><code>worktree_removed</code> / <code>worktree_left</code></td><td>retire cleanup (appendix G)</td><td><code>{path, branch, reason}</code></td></tr>
+<tr><td><code>worktree_removed</code> / <code>worktree_left</code></td><td>retire deletion (appendix G)</td><td><code>{path, branch, reason}</code></td></tr>
 </tbody>
 </table>
 <p>Review requests and doc publishes are <b>not</b> copied into <code>work_events</code>; the history page reads them from <code>codex_review_request_registrations</code> and <code>owner_doc_publishes</code> / <code>owner_doc_reviews</code> and merges them into the timeline at render time. One store per fact.</p>
@@ -384,6 +488,9 @@ sm ticket --release &lt;N&gt; [--repo R]     # end your claim (end_reason releas
 sm ticket                              # list your active claims (tickets and PRs)
 sm pr [N] [--repo R] [--take] [--ticket T]...   # claim PR N; no N = the current branch's open PR
 sm pr --release &lt;N&gt; [--repo R]
+sm ticket &lt;N&gt; --setup-worktree[=SLUG] [--base REF]   # claim, then create the worktree (appendix G)
+sm worktree keep [--path P] --reason "…"             # don't delete this worktree at retire
+sm worktree keep --off [--path P]
 sm history [--agent A] [--repo R] [--item N] [--open] [--json] [--limit 50]</code></pre>
 <ul>
 <li><code>--repo R</code> takes <code>owner/name</code> or a bare <code>name</code>. A bare name takes its owner from the cwd's repo slug; outside a repo, a bare name is an error ("pass owner/name").</li>
@@ -399,12 +506,12 @@ sm history [--agent A] [--repo R] [--item N] [--open] [--json] [--limit 50]</cod
 <tr><td>claimed</td><td><code>Claimed ticket #1452 "Agent work claims…" (session-manager). History: &lt;url&gt;</code></td><td>0</td></tr>
 <tr><td>already yours</td><td><code>You already hold ticket #1452.</code></td><td>0</td></tr>
 <tr><td>claimed, same line also holds</td><td>claimed line, plus <code>Also held by your parent sm-1452-lead (1a2b3c4d).</code></td><td>0</td></tr>
-<tr><td>claimed over a dormant holder</td><td>claimed line, plus <code>Took over from stopped session sm-1452-engineer (…); it will be told if restored.</code></td><td>0</td></tr>
-<tr><td>collision refused</td><td>stderr: <code>Ticket #1451 is held by sm-1451-owner-doc-review (4d2a91c0), working, claimed 2h ago in ~/worktrees/sm-1451-owner-doc-review. Ask Rajesh before working on it; rerun with --take only if he says so.</code> One line per holder.</td><td>3</td></tr>
-<tr><td>taken</td><td><code>Took ticket #1451 from sm-1451-owner-doc-review (4d2a91c0); it has been told.</code></td><td>0</td></tr>
+<tr><td>claimed over a dormant holder</td><td>claimed line, plus <code>Previous holder sm-1452-engineer (…) is stopped; its claim ended.</code></td><td>0</td></tr>
+<tr><td>collision refused</td><td>stderr: <code>Refused: ticket #1451 is held by sm-1451-owner-doc-review (4d2a91c0), working, claimed 2h ago, worktree ~/worktrees/sm-1451-owner-doc-review.</code> One line per holder.</td><td>3</td></tr>
+<tr><td>taken</td><td><code>Took ticket #1451 from sm-1451-owner-doc-review (4d2a91c0).</code></td><td>0</td></tr>
 <tr><td>wrong kind</td><td><code>#1467 is a pull request; use sm pr 1467.</code> / <code>#1449 is a ticket; use sm ticket 1449.</code></td><td>1</td></tr>
-<tr><td>ticket closed</td><td><code>Ticket #1450 is closed. If you are continuing it, reopen it first (gh issue reopen 1450).</code></td><td>1</td></tr>
-<tr><td>PR merged/closed</td><td><code>PR #1467 is merged; there is nothing to claim.</code></td><td>1</td></tr>
+<tr><td>ticket closed</td><td><code>Ticket #1450 is closed.</code></td><td>1</td></tr>
+<tr><td>PR merged/closed</td><td><code>PR #1467 is merged.</code></td><td>1</td></tr>
 <tr><td>not found</td><td><code>No ticket or PR #99999 in rajeshgoli/session-manager.</code></td><td>1</td></tr>
 <tr><td>GitHub unreachable</td><td><code>Could not reach GitHub to check #1452: &lt;error&gt;. Nothing was recorded.</code></td><td>1</td></tr>
 <tr><td>release, none held</td><td><code>You don't hold ticket #1452.</code></td><td>1</td></tr>
@@ -419,7 +526,7 @@ sm history [--agent A] [--repo R] [--item N] [--open] [--json] [--limit 50]</cod
 <li><b>Already held by C</b> (active row, same session) → no new claim row. For an explicit PR claim, still apply step 5's linking rule (so <code>sm pr &lt;P&gt; --ticket &lt;N&gt;</code> after an earlier claim adds the link) and fill <code>worktree_path</code> and <code>branch</code> if they are NULL (an implicit claim later made explicit). Output "already yours", plus <code>Linked PR #P to ticket #N.</code> per new link. Otherwise nothing is written.</li>
 <li><b>Other active holders H.</b> Classify each:
   <ul>
-  <li><i>dormant</i>: H's session is stopped but not retired → end H's claim with <code>superseded</code>, <code>ended_by_session_id = C</code>, and enqueue to H (delivered on restore, as all sends to stopped sessions are): <code>[sm claim] While you were stopped, &lt;C name&gt; (&lt;C id&gt;) took over &lt;ticket|PR&gt; #N. Don't continue it; tell your parent or Rajesh what state you left it in.</code></li>
+  <li><i>dormant</i>: H's session is stopped but not retired → end H's claim with <code>superseded</code>, <code>ended_by_session_id = C</code>, and enqueue to H (delivered on restore, as all sends to stopped sessions are): <code>[sm claim] While you were stopped, &lt;C name&gt; (&lt;C id&gt;) claimed &lt;ticket|PR&gt; #N. Your claim on it ended.</code></li>
   <li><i>retired</i>: cannot occur (retire ends claims); if found, end it with <code>retired</code> and continue.</li>
   <li><i>same line</i>: H is an ancestor or descendant of C, walking <code>parent_session_id</code> on live session records (cap 32 hops) → allowed; note for output.</li>
   <li><i>unrelated live</i>: any other case → a collision holder.</li>
@@ -427,10 +534,10 @@ sm history [--agent A] [--repo R] [--item N] [--open] [--json] [--limit 50]</cod
 <li><b>Collision holders exist</b>:
   <ul>
   <li>explicit claim without <code>--take</code> → refuse (exit 3), write <code>collision_refused</code>, write nothing else;</li>
-  <li>explicit claim with <code>--take</code> → end every collision holder's claim with <code>taken</code>, enqueue to each: <code>[sm claim] &lt;C name&gt; took &lt;ticket|PR&gt; #N from you. Stop working on it, and tell your parent or Rajesh the state you left it in.</code>, then insert C's claim;</li>
-  <li>implicit claim → insert C's claim, write <code>collision_recorded</code>, return a warning the calling command prints: <code>Warning: PR #N is also held by &lt;H name&gt; (&lt;H id&gt;), working. Two agents on one PR collide at merge; tell Rajesh.</code></li>
+  <li>explicit claim with <code>--take</code> → end every collision holder's claim with <code>taken</code>, enqueue to each: <code>[sm claim] &lt;C name&gt; (&lt;C id&gt;) claimed &lt;ticket|PR&gt; #N. Your claim on it ended.</code>, then insert C's claim;</li>
+  <li>implicit claim → insert C's claim, write <code>collision_recorded</code>, return a warning the calling command prints: <code>Warning: PR #N is also held by &lt;H name&gt; (&lt;H id&gt;), working.</code></li>
   </ul></li>
-<li><b>Insert</b> C's claim and a <code>claimed</code> event. For an explicit PR claim, insert <code>work_links</code> rows (<code>source = claim</code>): to each <code>--ticket</code> given; if none is given and C actively holds exactly one ticket in the same repo, to that ticket; if C holds several and names none, to none, and print <code>You hold tickets #a, #b; this PR is linked to neither. Link it with sm pr &lt;P&gt; --ticket &lt;N&gt;, or put "Closes #N" in the PR body.</code> Implicit claims never create <code>claim</code> links. GitHub closing references add links independently (appendix D). A wrong link would misfile the PR on the page and make Check A ask about an unrelated ticket, so ambiguity links nothing.</li>
+<li><b>Insert</b> C's claim and a <code>claimed</code> event. For an explicit PR claim, insert <code>work_links</code> rows (<code>source = claim</code>): to each <code>--ticket</code> given; if none is given and C actively holds exactly one ticket in the same repo, to that ticket; if C holds several and names none, to none, and print <code>You hold tickets #a, #b; PR #P is linked to neither (--ticket links one).</code> Implicit claims never create <code>claim</code> links. GitHub closing references add links independently (appendix D). A wrong link would misfile the PR on the page and make Check A ask about an unrelated ticket, so ambiguity links nothing.</li>
 </ol>
 <p><b>Ending claims.</b></p>
 <table>
@@ -498,13 +605,13 @@ PR <code>state</code> is <code>OPEN | CLOSED | MERGED</code>; map to <code>open 
 <li>When: sync records a PR open→merged transition → set <code>merge_check = pending</code> in the same write. After each pass, for every pending PR whose <code>merged_at</code> is at least 60 s before now (GitHub closes linked tickets asynchronously), run the check and set <code>merge_check = done</code> in the same transaction that enqueues the messages. A pending PR younger than 60 s stays pending for the next pass; a restart keeps it pending.</li>
 <li>Tickets considered: every ticket linked to the PR (<code>work_links</code>, either source). Run the check only when every linked ticket is <i>settled</i>: either it was fetched successfully in this pass, or an earlier fetch already recorded it closed. A ticket that is a never-fetched stub (for example a closing reference first seen in the same pass as the merge), or whose fetch failed this pass, leaves the PR pending; the tracked-set rule fetches it next pass. Keep the settled tickets that are still open.</li>
 <li>Recipients: the live-or-dormant holders of each open ticket, plus the PR's holders whose claim just ended <code>merged</code>. Deduplicate by session; one message per session naming all its tickets. Retired recipients are skipped; if no one remains, the <code>nudge</code> event is written with <code>message_id = null</code> and the page shows <span class="chip warn">Open after merge</span>.</li>
-<li>Text (one ticket): as in the memo. Several tickets: <code>[sm claim] PR #&lt;P&gt; merged, but tickets #a ("…"), #b ("…") are still open. If the PR finished them, close each: gh issue close &lt;n&gt; --repo &lt;repo&gt; --comment "Done in #&lt;P&gt;". If work remains, comment on the ticket what remains. Then carry on.</code></li>
+<li>Text: <code>[sm claim] PR #&lt;P&gt; merged &lt;age&gt; ago. Linked ticket #&lt;n&gt; "&lt;title&gt;" is open.</code> For several tickets: <code>… Linked tickets #a "…", #b "…" are open.</code> Facts only; what the agent does is in <code>AGENTS.md</code>.</li>
 </ul>
 
 <h4>Check B — at task-complete</h4>
 <ul>
 <li>When: after <code>SessionStore::task_complete</code> (<code>sessions.rs:8273</code>) succeeds. Run in a spawned task; never delay or fail the task-complete response or the parent notification.</li>
-<li>Fetch the caller's actively claimed items fresh (one query per repo). If any is open, send the caller one message listing each, with the open-PR clause when a claimed PR is open: <code>[sm claim] You ran sm task-complete, and you still hold: ticket #1452 (open), PR #1470 (open, not merged). If you're finished: merge the PR once its review is clean, make sure the ticket closes, and run sm task-complete again. If not: comment on #1452 what remains, then continue or stand by.</code> Omit the clauses that don't apply (no PR clause when no open PR is held; no ticket clause when no open ticket is held).</li>
+<li>Fetch the caller's actively claimed items fresh (one query per repo). If any is open, send the caller one message: <code>[sm claim] At task-complete you hold: ticket #1452 (open), PR #1470 (open, not merged).</code> The list names every open claimed item, tickets first, in claim order; a PR is described as <code>(open, not merged)</code>. Facts only.</li>
 <li>Sets <code>nudged_idle_at</code> = now on the claims named, so Check C does not repeat it.</li>
 </ul>
 
@@ -516,42 +623,63 @@ PR <code>state</code> is <code>OPEN | CLOSED | MERGED</code>; map to <code>open 
   <li>the session's entry in <code>project_session_obligations</code> (<code>http.rs:6253</code>) has an empty <code>waiting_on</code> (no queue job, Codex review or owner review outstanding);</li>
   <li>at least one named claim is <i>armed</i>: <code>nudged_idle_at</code> is NULL, or the session started a turn more than 30 min after <code>nudged_idle_at</code> (use <code>activity_turn_start_hook_at</code> where the provider sets it, else the last idle→running transition of <code>status</code>).</li>
   </ol></li>
-<li>Message: the idle text in the memo, listing every armed open item, same clause rules as Check B. Set <code>nudged_idle_at</code> = now on those claims.</li>
+<li>Message: <code>[sm claim] Idle &lt;minutes&gt;m, nothing pending. You hold: …</code> with the list as in Check B, naming every armed open item. Set <code>nudged_idle_at</code> = now on those claims.</li>
 <li>Why the re-arm rule: the nudge itself starts a turn within seconds, so it cannot re-arm itself. A later turn more than 30 minutes on means new work arrived (you, a parent, a queue wake), and the next idle stretch deserves a fresh check.</li>
 </ul>
 
-<h4><code>sm pr</code> closing-keyword warning</h4>
-<p>After a successful explicit PR claim, for each ticket linked to the PR with <code>source = claim</code> that is not in the PR's <code>closingIssuesReferences</code>, print: <code>Note: PR #1470 doesn't close ticket #1452. If it finishes the ticket, add "Closes #1452" to the PR body (gh pr edit 1470 --body ...).</code> One line per ticket. A warning only; the claim stands.</p>
+<h4><code>sm pr</code> closing-reference note</h4>
+<p>After a successful explicit PR claim, for each ticket linked to the PR with <code>source = claim</code> that is not in the PR's <code>closingIssuesReferences</code>, print: <code>Note: PR #1470's closing references don't include ticket #1452.</code> One line per ticket. A warning only; the claim stands.</p>
 
-<h3>G. Worktree cleanup at retire</h3>
-<p>Runs in a spawned task after the claims end at retire. Candidates: each distinct <code>worktree_path</code> on the session's PR claims (any end reason), plus the session's <code>working_dir</code> if its current branch equals the <code>head_ref</code> of a merged PR the session claimed. Sessions on remote nodes are skipped (the path is not local). For each candidate, all must hold, else write <code>worktree_left</code> with the first failing reason:</p>
+<h3>G. Worktree lifecycle</h3>
+
+<h4>Creating: <code>sm ticket &lt;N&gt; --setup-worktree[=&lt;slug&gt;] [--base &lt;ref&gt;]</code></h4>
+<p>The CLI runs the git commands in the agent's cwd, which must be inside a checkout (main or linked) of the ticket's repo; otherwise it fails with <code>--setup-worktree must run inside a checkout of &lt;repo&gt;</code>. Order: claim first (appendix C). If the claim is refused, no worktree is created. Then:</p>
+<ol>
+<li><b>Names.</b> <code>slug</code> = the given slug, or the ticket title lowercased, with runs of non-alphanumerics turned into <code>-</code>, the first 4 words, cut to 30 characters and trimmed of <code>-</code>. Branch = <code>&lt;N&gt;-&lt;slug&gt;</code>. Path = <code>&lt;root&gt;/&lt;prefix&gt;-&lt;N&gt;-&lt;slug&gt;</code>, where <code>root</code> = config <code>work_claims.worktree_root</code> (default <code>~/worktrees</code>) and <code>prefix</code> = <code>work_claims.worktree_prefixes[&lt;owner/name&gt;]</code>, defaulting to the repo name. The installed config sets <code>rajeshgoli/session-manager: sm</code>. Example: ticket #1452 "Agent work claims (sm ticket / sm pr) and an agent history page" → <code>~/worktrees/sm-1452-agent-work-claims-sm</code>, branch <code>1452-agent-work-claims-sm</code>.</li>
+<li><b>Base.</b> <code>git fetch origin</code>, then base = <code>--base</code> if given, else <code>origin/&lt;default branch&gt;</code> (<code>git symbolic-ref refs/remotes/origin/HEAD</code>, falling back to <code>origin/main</code>). Record <code>base_sha</code> = the resolved commit.</li>
+<li><b>Reuse.</b> If the path is already a worktree of this repo on that branch, reuse it (idempotent rerun). If the path exists as anything else, fail: <code>~/worktrees/… exists and is not this ticket's worktree.</code></li>
+<li><b>Create.</b> If the branch exists locally: <code>git worktree add &lt;path&gt; &lt;branch&gt;</code>; else <code>git worktree add -b &lt;branch&gt; &lt;path&gt; &lt;base&gt;</code>. On failure, the claim stands and the CLI prints git's error with exit 1.</li>
+<li><b>Record.</b> <code>POST /claims/worktree</code> sets the claim's <code>worktree_path</code>, <code>branch</code>, <code>base_sha</code> and <code>managed_worktree = 1</code>. Print <code>Worktree ~/worktrees/sm-1452-… on branch 1452-… from origin/main (a1b2c3d).</code></li>
+</ol>
+<p>The agent's shell working directory is not changed; agents address the printed path (Claude Code resets its shell cwd between calls anyway).</p>
+
+<h4>Keeping: <code>sm worktree keep [--path P] --reason "&lt;why&gt;"</code> and <code>sm worktree keep --off [--path P]</code></h4>
+<p><code>P</code> defaults to the git top-level of the cwd. Stored in <code>worktree_keeps</code> (appendix A), keyed by absolute path, with the session and reason; <code>--off</code> deletes the row. A keep outlives the session that set it and ends when the owner or any agent runs <code>--off</code> or the path no longer exists. Output: <code>Keeping ~/worktrees/x: &lt;reason&gt;.</code> / <code>No longer keeping ~/worktrees/x.</code></p>
+
+<h4>Deleting at retire</h4>
+<p>Runs in a spawned task after the claims end at retire and the session's tmux panes are gone. Candidates: each distinct <code>worktree_path</code> on the session's claims (any kind, any end reason), plus the session's <code>working_dir</code> if its current branch equals the <code>head_ref</code> of a merged PR the session claimed. Sessions on remote nodes are skipped (the path is not local). For each candidate, all must hold, checked in this order; the first failure writes <code>worktree_left</code> with its reason:</p>
 <table>
-<thead><tr><th style="width:6%">#</th><th>Condition</th><th style="width:26%">Reason when it fails</th></tr></thead>
+<thead><tr><th style="width:5%">#</th><th>Condition</th><th style="width:27%">Reason when it fails</th></tr></thead>
 <tbody>
-<tr><td>1</td><td>The path exists and is a linked worktree: <code>git rev-parse --git-dir</code> ≠ <code>--git-common-dir</code>.</td><td><code>not a linked worktree</code></td></tr>
-<tr><td>2</td><td>No other non-retired session (working, idle, or stopped but restorable) has a <code>working_dir</code> equal to or inside the path; removing it would break that session's restore.</td><td><code>in use by &lt;name&gt;</code></td></tr>
-<tr><td>3</td><td>A PR the session claimed in this repo is merged, and <code>git -C path rev-parse HEAD</code> equals that PR's frozen <code>head_sha</code>.</td><td><code>no merged PR at this commit</code></td></tr>
-<tr><td>4</td><td><code>git -C &lt;common repo&gt; worktree remove &lt;path&gt;</code>, <b>without</b> <code>--force</code>, exits 0. Git refuses modified or untracked files and removes ignored ones (appendix K).</td><td><code>git refused: &lt;stderr first line&gt;</code></td></tr>
+<tr><td>1</td><td>The path exists and is a linked worktree: <code>git rev-parse --git-dir</code> ≠ <code>--git-common-dir</code>. A main checkout is never deleted.</td><td><code>not a linked worktree</code></td></tr>
+<tr><td>2</td><td>No <code>worktree_keeps</code> row for the path.</td><td><code>kept: &lt;reason&gt;</code></td></tr>
+<tr><td>3</td><td>No other non-retired session (working, idle, or stopped but restorable) has a <code>working_dir</code> equal to or inside the path; deleting it would break that session's restore.</td><td><code>in use by &lt;name&gt;</code></td></tr>
+<tr><td>4</td><td>No process has its current directory inside the path: <code>lsof -a -d cwd -Fpcn</code>, run by the server from outside the path, lists no <code>n</code> path equal to or under it (appendix K).</td><td><code>process &lt;pid&gt; (&lt;command&gt;) runs in it</code></td></tr>
+<tr><td>5</td><td><b>Nothing committed would be lost:</b> <code>git -C path rev-parse HEAD</code> equals the frozen <code>head_sha</code> of a merged PR the session claimed in this repo, <b>or</b> the claim is a managed worktree and HEAD equals its <code>base_sha</code> (nothing was ever committed).</td><td><code>commits not in a merged PR</code></td></tr>
+<tr><td>6</td><td><code>git -C &lt;common repo&gt; worktree remove &lt;path&gt;</code>, <b>without</b> <code>--force</code>, exits 0. Git refuses modified or untracked files and removes ignored ones such as build output (appendix K).</td><td><code>git refused: &lt;stderr first line&gt;</code></td></tr>
 </tbody>
 </table>
-<p>After a removal, delete the local branch with <code>git branch -D &lt;branch&gt;</code> only if <code>branch</code> is set and its tip still equals the PR's <code>head_sha</code> (<code>-D</code> is needed because a squash merge never makes the branch an ancestor of main). Write <code>worktree_removed</code>. The retire response gains <code>worktrees: [{path, removed: bool, reason}]</code>; <code>sm retire</code> prints one line each: <code>Removed worktree ~/worktrees/sm-1449-owner-docs (PR #1460 merged).</code> or <code>Left worktree ~/worktrees/x: git refused: contains modified or untracked files.</code> Because cleanup runs asynchronously, the response reports results available within 10 s and says <code>cleanup pending</code> otherwise; the page always shows the final event.</p>
-<p>Remote branches are not touched; that is GitHub's "Automatically delete head branches" setting (memo row 6): <code>gh api -X PATCH repos/rajeshgoli/&lt;repo&gt; -F delete_branch_on_merge=true</code>. It is on for <code>session-manager</code> and <code>fractal-algo-rust</code> since 2026-09-24.</p>
+<p>After a deletion, delete the local branch with <code>git branch -D &lt;branch&gt;</code> only if <code>branch</code> is set and its tip still equals the HEAD checked in condition 5 (<code>-D</code> is needed because a squash merge never makes the branch an ancestor of main). Write <code>worktree_removed</code>. The retire response gains <code>worktrees: [{path, removed: bool, reason}]</code>; <code>sm retire</code> prints one line each, as in the memo: <code>Deleted worktree &lt;path&gt; (PR #P merged).</code>, <code>Deleted worktree &lt;path&gt; (no commits).</code>, or <code>Kept worktree &lt;path&gt;: &lt;reason&gt;.</code> Cleanup is asynchronous: the response carries results available within 10 s and <code>cleanup pending</code> for the rest; the page always shows the final event.</p>
+<p>Remote branches are not touched; GitHub's "Automatically delete head branches" setting handles them. It is on for <code>session-manager</code> and <code>fractal-algo-rust</code> since 2026-09-24 (<code>gh api -X PATCH repos/rajeshgoli/&lt;repo&gt; -F delete_branch_on_merge=true</code>).</p>
 
 <h3>H. Server endpoints</h3>
 <table>
 <thead><tr><th style="width:8%">Method</th><th style="width:30%">Path</th><th>Purpose and auth</th></tr></thead>
 <tbody>
 <tr><td>POST</td><td><code>/claims</code></td><td>Body <code>{requester_session_id, kind, repo, number, take, worktree_path?, branch?, tickets?: [int]}</code> (<code>tickets</code> = <code>--ticket</code>, PR claims only). Self-directed like task-complete (the requester is the claimant); <code>ensure_core_writes_enabled</code>. Responses: 201 <code>{outcome: "claimed"|"taken", claim, notes[]}</code>; 200 <code>{outcome: "already_held", claim, notes[]}</code> (<code>notes</code> carries the <code>Linked PR…</code> lines and closing-keyword notes of appendices C and F); 409 <code>{outcome: "collision", holders: [{session_id, name, state, claimed_at, worktree_path}]}</code>; 422 wrong kind / closed / merged / not found with <code>detail</code> = the CLI text; 502 GitHub unreachable.</td></tr>
+<tr><td>POST</td><td><code>/claims/worktree</code></td><td>Body <code>{requester_session_id, claim_id, worktree_path, branch, base_sha}</code>; sets <code>managed_worktree = 1</code>. Self-directed. 200 or 404.</td></tr>
+<tr><td>POST</td><td><code>/worktrees/keep</code></td><td>Body <code>{requester_session_id, path, reason?, off: bool}</code>. Any managed session may set or clear a keep. 200.</td></tr>
+<tr><td>GET</td><td><code>/watch</code>, <code>/watch/state</code></td><td>Web watch page and its JSON (appendix O). Owner page gate.</td></tr>
 <tr><td>POST</td><td><code>/claims/release</code></td><td>Body <code>{requester_session_id, kind, repo, number}</code>. 200 or 404.</td></tr>
 <tr><td>GET</td><td><code>/claims?session=&lt;id&gt;&amp;active=true</code></td><td>JSON <code>{claims: [...]}</code>, each claim row plus <code>title</code>, <code>state</code>, <code>history_path</code>. Read auth.</td></tr>
 <tr><td>GET</td><td><code>/history</code></td><td>HTML page (appendix I); <code>?format=json</code> for the CLI. Query: <code>agent</code> (session id, id prefix ≥ 8, or name; resolved via <code>resolve_session_or_registry_role</code>, falling back to matching <code>session_name</code> snapshots), <code>repo</code> (repo name, case-insensitive), <code>open=1</code>, <code>before=&lt;cursor&gt;</code>.</td></tr>
 <tr><td>GET</td><td><code>/history/&lt;repo-name&gt;/&lt;n&gt;</code></td><td>Timeline for one ticket or PR (GitHub numbers them in one space, so <code>n</code> is unambiguous). <code>?format=json</code>. 404 <code>Not tracked</code> when sm has no row for it.</td></tr>
 </tbody>
 </table>
-<p><b>Auth for the two history routes.</b> Rename <code>ensure_owner_doc_read_allowed</code> (<code>http.rs:13741</code>) to <code>ensure_owner_page_read_allowed</code> and call it from the history handlers too, so the owner's Cloudflare Access browser login works on <code>/history</code> exactly as on <code>/docs</code>. Update its doc comment ("docs and history only"). Everything else on the browser host still needs the SM Google session, per <code>specs/945_cloudflare_access_auth_model.md</code>. Add all five routes to <code>tests/read_only_http.rs</code> where that inventory applies.</p>
+<p><b>Auth for the history and watch routes.</b> Rename <code>ensure_owner_doc_read_allowed</code> (<code>http.rs:13741</code>) to <code>ensure_owner_page_read_allowed</code> and call it from the history and watch handlers too, so the owner's Cloudflare Access browser login works on <code>/history</code> and <code>/watch</code> exactly as on <code>/docs</code>. These are GET routes only. Update its doc comment ("owner pages: docs, history and watch; reads only"). Everything else on the browser host still needs the SM Google session, per <code>specs/945_cloudflare_access_auth_model.md</code>. Add the new routes to <code>tests/read_only_http.rs</code> where that inventory applies.</p>
 
 <h3>I. History page</h3>
-<p>Server-rendered HTML, no script required, readable at phone width. Add a shared <code>page_shell(title, body)</code> next to <code>doc_shell</code> (<code>owner_docs.rs:878</code>) reusing its styles (light/dark by <code>color-scheme</code>). Stored data only.</p>
+<p>Server-rendered HTML, no script required, readable at phone width. Add a shared <code>page_shell(title, active_tab, body)</code> next to <code>doc_shell</code> (<code>owner_docs.rs:878</code>), styled as appendix O specifies (the Watch app palette, cards with a colored left edge, sans for human text and mono for machine text) with the <b>Watch · History</b> top bar. Rows render as cards (memo mock), not a table. Stored data only.</p>
 <p><b>Rows.</b> One row per <i>thread</i>: a ticket sm tracks, or a PR sm tracks that links to no ticket. A PR linked to several tickets appears under each. Sorted by last activity (latest of any event, claim, review request or doc publish on the thread) descending; 50 per page; <code>before</code> is an opaque cursor of <code>(last_activity, repo, number)</code>.</p>
 <table>
 <thead><tr><th style="width:18%">Column</th><th>Content</th></tr></thead>
@@ -580,6 +708,7 @@ PR <code>state</code> is <code>OPEN | CLOSED | MERGED</code>; map to <code>open 
 <ul>
 <li><b>Session feed.</b> <code>project_session_obligations</code> (<code>http.rs:6253</code>) adds per session <code>claims: [{kind, repo, number, title, state, claimed_at, source, history_path}]</code> for its active claims, and bumps <code>schema_version</code> from 2 to 3.</li>
 <li><b><code>sm watch</code>.</b> A session row with active claims appends <code>[#1452]</code> (the earliest active ticket, or PR if no ticket), with <code>+k</code> for more, in <code>session_rows</code> (<code>bin/watch/mod.rs:1051</code>), ASCII like the <code>[docs N]</code> marker. The expanded view lists each claim: <code>ticket #1452 open  Agent work claims…  &lt;history url&gt;</code>.</li>
+<li><b><code>sm watch</code> docs.</b> In the expanded view, docs move out of the detail lines (<code>doc_rows</code> called at <code>bin/watch/mod.rs:1197</code>) into a <b>Docs</b> section placed immediately before the Reviews section (<code>review_rows</code>), with the same header style as Reviews and one row per doc: <code>&lt;state&gt;  &lt;title&gt;  &lt;age&gt;  &lt;url&gt;</code>, plus <code>review not delivered</code> when flagged. The collapsed row's marker (<code>session_rows</code>) shows whenever the session has docs: <code>[docs N]</code>, or <code>[docs N·U new]</code> when U docs are new, updated or awaiting review.</li>
 <li><b>Android.</b> <code>ApiModels.kt</code>: <code>SessionObligations.claims: List&lt;SessionClaim&gt; = emptyList()</code>, every field defaulted, following <code>SessionDoc</code>. <code>AgentWorkSections</code> (<code>WatchScreen.kt</code>): a <b>Work</b> line first, "Ticket #1452 · PR #1470", each tappable, opening <code>history_path</code>. A <b>History</b> action in the watch screen's top bar opens <code>/history</code>. Both use the doc reader's WebView (<code>DocReader.kt</code>) with the same device auth, client certificate and navigation override; widen the override's same-origin rule from <code>/docs/</code> to <code>/docs/</code> and <code>/history</code>.</li>
 </ul>
 
@@ -593,6 +722,7 @@ PR <code>state</code> is <code>OPEN | CLOSED | MERGED</code>; map to <code>open 
 <tr><td>G4</td><td>Same on merged PR #1460 ("Implements #1449")</td><td><code>[]</code>; #1449 is still open. This is the Check A case.</td></tr>
 <tr><td>G5</td><td><code>repos/rajeshgoli/session-manager</code> settings</td><td><code>delete_branch_on_merge: false</code> at the time (turned on after the owner's approval); 35 branches on origin, 32 of them from merged PRs; <code>1449-owner-docs</code> remains after its PR merged.</td></tr>
 <tr><td>G6</td><td>GraphQL rate limit</td><td>5,000 points per hour; a small aliased query costs 1.</td></tr>
+<tr><td>G8</td><td><code>lsof -a -d cwd -Fpcn</code> (macOS)</td><td>Lists every process of the user with its cwd in 0.3 s; a <code>sleep</code> started inside a scratch worktree appears with its path. The <code>lsof</code> process itself shows up if it is run from inside the path, so run it from elsewhere.</td></tr>
 <tr><td>G7</td><td><code>git worktree remove</code> (no <code>--force</code>) on a scratch repo</td><td>Removes a worktree whose only extra files are gitignored (<code>target/</code>); refuses one with an untracked file: <code>contains modified or untracked files, use --force to delete it</code>.</td></tr>
 </tbody>
 </table>
@@ -604,16 +734,18 @@ PR <code>state</code> is <code>OPEN | CLOSED | MERGED</code>; map to <code>open 
 <li><b>Ending</b>: sync closed ticket → <code>closed</code>; merged PR → <code>merged</code> and <code>head_sha</code> frozen; retire and kill both end claims <code>retired</code>; handoff, rename, task-complete, fork leave claims.</li>
 <li><b>Sync parsing</b>: aliases across 50+ numbers split into batches; exit 1 with valid JSON parsed; <code>NOT_FOUND</code> alias sets <code>sync_error</code> only for that item; invalid JSON marks the batch; closing refs from another repo ignored; closed items not re-polled.</li>
 <li><b>Check A</b>: open→merged with an open linked ticket messages the ticket holder and PR holder once (deduplicated); ticket closed in the same fetch → no message; merged under 60 s → stays <code>pending</code> and fires on a later pass, including after a server restart; fires exactly once (<code>done</code>); a closing reference first seen in the merge pass keeps it pending until that ticket is fetched, and no message is sent if GitHub closed it; backfilled first-sight merged → no message; no live recipient → event with null message id and the flag.</li>
-<li><b>Check B</b>: task-complete with open ticket and PR → one message with both clauses; nothing open → no message; GitHub failure → no message, task-complete unaffected; parent notification unchanged.</li>
+<li><b>Check B</b>: task-complete with open ticket and PR → one message listing both; nothing open → no message; GitHub failure → no message, task-complete unaffected; parent notification unchanged.</li>
 <li><b>Check C</b>: fires at 30 min idle with empty <code>waiting_on</code>; not at 29; not with a queue job, Codex review or <code>owner_review</code> in <code>waiting_on</code>; not twice in one stretch; not re-armed by the nudge's own turn; re-armed by a turn 31 min later.</li>
 <li><b>Links and the closing-keyword warning</b>: one held ticket → linked; several held and none named → no link and the note; <code>--ticket</code> links exactly the named ones, including on a rerun when the PR is already held (and fills a NULL worktree); implicit claims add no <code>claim</code> links; the warning is printed for a <code>claim</code>-linked ticket not in <code>closingIssuesReferences</code> and absent when it is.</li>
-<li><b>Worktree cleanup</b> (real git in a temp dir): removed when merged, HEAD = frozen head, only ignored files; kept with untracked file (reason from git); kept when HEAD ≠ head; kept when another non-retired session's <code>working_dir</code> is inside, including a stopped one; main checkout never removed; local branch deleted only when its tip = head.</li>
+<li><b>Worktree setup</b> (real git): slug and path rules including the prefix map; branch from <code>origin/&lt;default&gt;</code>; <code>base_sha</code> recorded; rerun reuses; foreign existing path refused; refused claim creates nothing; git failure leaves the claim. <b>Keep</b>: set, clear, survives the session. </li>
+<li><b>Worktree deletion</b> (real git in a temp dir): removed when merged, HEAD = frozen head, only ignored files; removed for a managed worktree at its <code>base_sha</code>; kept with a keep row (reason shown); kept while a process has its cwd inside; kept with untracked file (reason from git); kept when HEAD ≠ head; kept when another non-retired session's <code>working_dir</code> is inside, including a stopped one; main checkout never removed; local branch deleted only when its tip = head.</li>
 <li><b>Implicit claims</b>: Codex review request and doc publish on a PR create claims; neither host command fails when claim recording fails; <code>claim_warning</code> surfaces.</li>
 <li><b>Backfill</b>: idempotent (second start does nothing); retired requesters get ended claims; a doc republished by a second session backfills a claim for each publisher; stubs whose only claims are ended are fetched on the first sync and their closing-reference tickets on the next; runs no checks.</li>
 <li><b>CLI</b> (<code>bin/claims</code>): repo resolution SSH/HTTPS/bare name/<code>--repo</code>; <code>sm pr</code> with no number uses the branch PR and errors without one; worktree and branch sent; each output row of appendix B and its exit code.</li>
 <li><b>HTTP</b>: <code>/claims</code> status codes; history HTML and JSON shapes; filters (agent by id, prefix, name, retired snapshot; repo; open); cursor paging; timeline merges review requests and doc publishes; flags; Cloudflare browser login accepted on <code>/history</code> and still rejected on other routes; <code>read_only_http</code> inventory.</li>
-<li><b>Feed</b>: <code>claims</code> in <code>/session-obligations</code>, <code>schema_version</code> 3; Android parses old and new responses; <code>sm watch</code> marker and expanded rows.</li>
-<li><b>Manual</b>: in a scratch server on a copy of live state, claim a real ticket from a worktree, open a PR without "Closes", merge it, and see Check A arrive and the ticket flag on the page, from the laptop browser and the phone app; retire the agent and see its worktree removed.</li>
+<li><b>Feed</b>: <code>claims</code> in <code>/session-obligations</code>, <code>schema_version</code> 3; Android parses old and new responses; <code>sm watch</code> claim marker, Docs section before Reviews, and the <code>[docs N·U new]</code> marker.</li>
+<li><b>Web watch</b>: <code>/watch/state</code> matches the TUI's data for the same fixture (sessions, tree order, states, obligations); filters; stopped excluded by default; first paint without scripts; the Cloudflare browser login is accepted on <code>/watch</code> and <code>/watch/state</code> and rejected on every write route.</li>
+<li><b>Manual</b>: in a scratch server on a copy of live state, claim a real ticket from a worktree, open a PR without "Closes", merge it, and see Check A arrive and the ticket flag on the page, from the laptop browser and the phone app; retire the agent and see its worktree removed; start a server in another agent's worktree, retire it and see the worktree kept with the process named; open <code>/watch</code> in the laptop browser and watch a session change state.</li>
 </ol>
 
 <h3>M. Requirement trace</h3>
@@ -622,36 +754,71 @@ PR <code>state</code> is <code>OPEN | CLOSED | MERGED</code>; map to <code>open 
 <tbody>
 <tr><td>task-complete ≠ ticket done; Check B</td><td>F</td><td><code>task_complete</code> hook; L5</td></tr>
 <tr><td>Checks A, C, exact texts, once each, re-arm</td><td>F</td><td>sync pass; L4, L6</td></tr>
-<tr><td>Collision refusal, <code>--take</code>, same line, implicit never blocks</td><td>C, E</td><td>claim rules; L1, L9</td></tr>
+<tr><td>Collision refusal, <code>--take</code>, same line, implicit never blocks</td><td>C, E</td><td>claim rules; L1, L10</td></tr>
 <tr><td>Claim lifetime</td><td>C</td><td>retire hook, sync; L2</td></tr>
-<tr><td>sm does not merge</td><td>—</td><td>No code. Nudges in F tell the agent to merge.</td></tr>
-<tr><td>GitHub branch auto-delete</td><td>G</td><td>Owner setting; no code</td></tr>
-<tr><td>Worktree removal at retire</td><td>G</td><td>L8</td></tr>
-<tr><td>Docs join via PR or held ticket</td><td>E, I</td><td>L9, L12</td></tr>
-<tr><td>History page, same login, app, <code>sm history</code></td><td>H, I, J</td><td>L11, L12, L13</td></tr>
-<tr><td>Backfill without messages</td><td>E</td><td>L10, L4</td></tr>
-<tr><td>AGENTS.md paragraph</td><td>N</td><td>Claims core PR diff</td></tr>
-<tr><td>Four tickets</td><td>N</td><td>Filed under #1452</td></tr>
+<tr><td>sm does not merge</td><td>—</td><td>No code. <code>AGENTS.md</code> tells the agent to merge.</td></tr>
+<tr><td>Messages state facts only</td><td>C, F, B</td><td>L1, L4–L6 assert exact texts</td></tr>
+<tr><td>GitHub branch auto-delete</td><td>G</td><td>Owner setting; done</td></tr>
+<tr><td><code>--setup-worktree</code>, keep, deletion at retire</td><td>G</td><td>L8, L9</td></tr>
+<tr><td>Docs join via PR or held ticket</td><td>E, I</td><td>L10, L13</td></tr>
+<tr><td>History page, same login, app, <code>sm history</code></td><td>H, I, J</td><td>L12, L13, L14</td></tr>
+<tr><td>Web watch, read-only</td><td>H, O</td><td>L15</td></tr>
+<tr><td>Docs section in <code>sm watch</code></td><td>J</td><td>L14</td></tr>
+<tr><td>Backfill without messages</td><td>E</td><td>L11, L4</td></tr>
+<tr><td>AGENTS.md paragraph</td><td>N</td><td>Ticket 1's PR diff</td></tr>
+<tr><td>Six tickets</td><td>N</td><td>Filed under #1452</td></tr>
 </tbody>
 </table>
 
 <h3>N. Tickets in detail</h3>
 <p>#1452 becomes the epic. Each sub-ticket body says: "Read <code>specs/1452_sm_primitives.html</code> (<code>docs/working/1452_sm_primitives.html</code> until the work ships) before implementing or reviewing; this ticket only sets scope."</p>
 <ol>
-<li><b>Claims core.</b> Appendices A, B (minus <code>sm history</code>), C, D (minus the check calls), E, H (<code>/claims*</code>), J (feed and <code>sm watch</code>). The AGENTS.md paragraph from the memo, verbatim, in this repo; list the shared template's path in the PR so the owner can apply it to other repos. Done when L1–L3, L9–L11 and L13 (minus Android) pass.</li>
-<li><b>Open-work checks and cleanup.</b> Appendices F and G; the retire response's <code>worktrees</code>. Done when L4–L8 pass and the manual run shows Check A and a worktree removal.</li>
-<li><b>History page.</b> Appendices H (<code>/history*</code> and the auth rename), I, and <code>sm history</code> from B. Done when L12 passes and the page opens from the laptop browser through the Cloudflare login.</li>
-<li><b>Android.</b> Appendix J's Android bullet. Done when the Work line and History action open the page on the phone with no 401 on navigation.</li>
+<li><b>Claims core.</b> Appendices A, B (minus <code>sm history</code>, <code>--setup-worktree</code> and <code>sm worktree</code>), C, D (minus the check calls), E, H (<code>/claims</code>, <code>/claims/release</code>, <code>GET /claims</code>), J (feed and the <code>sm watch</code> claim marker). The <code>AGENTS.md</code> paragraph from the memo, verbatim, in this repo; list the shared template's path in the PR so the owner can apply it elsewhere. Done when L1–L3, L7, L10–L12 and the feed part of L14 pass.</li>
+<li><b>Open-work checks.</b> Appendix F. Done when L4–L7 pass and the manual run shows Check A.</li>
+<li><b>Worktree lifecycle.</b> Appendix G, <code>/claims/worktree</code>, <code>/worktrees/keep</code>, the CLI rows of B, the retire response's <code>worktrees</code>. Done when L8–L9 pass and the manual run shows a deletion and a keep.</li>
+<li><b>History page.</b> Appendices H (<code>/history*</code> and the gate rename), I, <code>page_shell</code>, and <code>sm history</code>. Done when L13 passes and the page opens from the laptop browser through the Cloudflare login.</li>
+<li><b>Web watch and TUI docs.</b> Appendix O, the <code>/watch</code> routes, and J's <code>sm watch</code> docs bullet. Done when L14–L15 pass and <code>/watch</code> updates live in the laptop browser.</li>
+<li><b>Android.</b> Appendix J's Android bullet. Done when the Work line and History action open the pages on the phone with no 401 on navigation.</li>
 </ol>
-<p>Tickets 2 and 3 touch different files (<code>work_claims.rs</code> checks and <code>sessions.rs</code> retire hook vs. <code>http/history.rs</code> and <code>owner_docs.rs</code> shell) and can run in parallel after ticket 1.</p>
+<p>After ticket 1, tickets 2 (<code>work_claims.rs</code> checks), 3 (CLI git, <code>sessions.rs</code> retire hook) and 4 (<code>http/history.rs</code>, <code>page_shell</code>) touch different files and run in parallel. Ticket 5 reuses ticket 4's shell and gate; ticket 6 needs 4's pages.</p>
+
+<h3>O. Web watch</h3>
+<p><b>What it is.</b> <code>GET /watch</code> is the browser version of <code>sm watch</code> (<code>bin/watch/mod.rs</code>): the same sessions, tree, states and obligations, rendered as cards (memo mock). It is read-only. It has no send, retire, kill, restore or attach actions; the attach command is shown as copyable text.</p>
+<p><b>Data.</b> <code>GET /watch/state</code> returns one JSON document that the page renders:</p>
+<pre><code>{ "schema_version": 1, "generated_at": "…",
+  "sessions": [ { "id", "name", "provider", "role", "state",      // working | idle | waiting | stopped
+                  "status_text", "status_at", "last_activity", "parent_session_id", "depth",
+                  "repo", "node", "context_percent",
+                  "claims": [...], "docs": [...], "waiting_on": [...], "review_history": [...],
+                  "jobs": [ {id, label, state, started_at} ],
+                  "attach": "sm attach &lt;name&gt;" } ],
+  "counts": { "live", "waiting_on_owner" } }</code></pre>
+<ul>
+<li>Built server-side from the same sources <code>sm watch</code> polls (<code>/sessions</code>, <code>/queue-jobs</code>, <code>/session-obligations</code>, per <code>bin/watch/mod.rs</code> <code>refresh()</code>), by calling the same internal functions rather than HTTP. <code>claims</code>, <code>docs</code>, <code>waiting_on</code> and <code>review_history</code> are the session-feed fields verbatim (appendix J). <code>waiting_on_owner</code> counts sessions with an <code>owner_review</code> waiting entry.</li>
+<li>Ordering and tree are those of <code>sm watch</code>'s default view: top-level sessions by the TUI's default sort, children indented under their parent (<code>depth</code>). Stopped sessions are excluded unless <code>?stopped=1</code>. Filters mirror the TUI flags: <code>repo</code>, <code>role</code>, <code>top_level=1</code>, <code>node</code>.</li>
+</ul>
+<p><b>Page.</b> Server-rendered first paint (so it works with scripts off), plus an inline script under 10 KB, no dependencies, that fetches <code>/watch/state</code> every 3 s (config <code>web_watch.refresh_seconds</code>, minimum 2) while the tab is visible, and re-renders in place, keeping open cards open. On a fetch failure it keeps the last render and shows <code>stale · &lt;age&gt;</code> in the top bar. Card anatomy:</p>
+<table>
+<thead><tr><th style="width:24%">Part</th><th>Content</th></tr></thead>
+<tbody>
+<tr><td>Collapsed line</td><td>state dot (working green with glow, idle grey, waiting amber, stopped hollow), name (mono, bold), <code>provider · state age</code> (mono, muted), chips: first active ticket claim <code>#N</code> (+k), docs <code>docs N</code> or <code>docs N · U new</code> or <code>· review requested</code>, <code>waiting on you</code> (amber) for an <code>owner_review</code> entry, <code>2 agents</code> (rose) for a collision.</td></tr>
+<tr><td>Second line</td><td><code>status_text</code> (sans), omitted when empty.</td></tr>
+<tr><td>Expanded</td><td>Labelled rows, each omitted when empty: <b>Work</b> (claims: ticket and PR with state chips, Codex review count, worktree path; ticket links to <code>/history/&lt;repo&gt;/&lt;n&gt;</code>, PR links to GitHub ↗), <b>Docs</b> (title linking to <code>reader_path</code>, state chip, age), <b>Reviews</b> (waiting entries, then review history counts), <b>Jobs</b> (active queue jobs), <b>Attach</b> (the command, click copies).</td></tr>
+<tr><td>Card edge</td><td>3 px left edge: cyan normally, amber when waiting on you, rose on a collision.</td></tr>
+</tbody>
+</table>
+<p><b>Style</b> for <code>/watch</code> and <code>/history</code>: the sm Watch app palette (<code>android-app/.../ui/theme/Color.kt</code>: ground <code>#09090D</code>, panel <code>#121219</code>, raised <code>#181820</code>, border <code>#2B2B37</code>, text <code>#F5F7FA</code> / <code>#ADB2C2</code> / <code>#777C8B</code>, cyan <code>#5EE7FF</code>, green <code>#4ADE80</code>, amber <code>#FBBF24</code>, rose <code>#FB7185</code>, violet <code>#A78BFA</code>). Human-written text (status, titles) in the system sans; machine text (names, ids, times, counts) in the system mono. Links have a dotted underline; links that leave sm end in ↗. Amber means waiting or needs attention; rose means a collision or failure; green means done. Both pages share one <code>page_shell</code> (appendix I) with the two-tab top bar <b>Watch · History</b>. The page is usable at 360 px width.</p>
+<p><b>Auth.</b> <code>/watch</code> and <code>/watch/state</code> use <code>ensure_owner_page_read_allowed</code> (appendix H), like docs and history. No write route accepts the browser login.</p>
 
 <h3>Z. FAQ</h3>
 <p><b>Why not infer tickets from branch names like <code>1452-spec</code>?</b> Branch names are a convention, not a contract; the primary repo's branches don't follow it, and a wrong inference would create false collisions. A PR's "Closes #N" is GitHub's own link and is used.</p>
 <p><b>Why do reviewers not claim?</b> A claim means "I am changing this"; a reviewer changes nothing. If reviewers claimed, every review would be a collision.</p>
 <p><b>Why not block <code>sm task-complete</code> until the ticket is closed?</b> A blocked completion strands the parent's wake and can loop an agent that legitimately left work for a follow-up ticket. One message is enough; the history page shows anything left open.</p>
 <p><b>Why 30 minutes for Check C?</b> Long enough that an agent between two quick steps, or one briefly waiting on a reply, is left alone; short enough that a stalled finish is caught the same hour. It is config (<code>work_claims.idle_nudge_minutes</code>).</p>
-<p><b>What about an agent waiting on the owner in chat?</b> sm cannot see that, which is why the texts say "if you are waiting on Rajesh, stay idle". It costs one short turn once per stretch.</p>
-<p><b>Why a server page rather than the unmounted <code>web/sm-watch</code> React app?</b> The Rust server serves no web app today (<code>web/sm-watch</code> was a Python-era mount). A plain server page matches the doc reader, works in the app's WebView with the existing auth, and needs no build pipeline.</p>
+<p><b>What about an agent waiting on the owner in chat?</b> sm cannot see that. <code>AGENTS.md</code> tells an idle agent that is waiting on the owner to stay idle when a <code>[sm claim]</code> arrives. It costs one short turn once per stretch.</p>
+<p><b>Why do sm messages carry no instructions?</b> Policy changes more often than facts, and differs by repo. Keeping it in <code>AGENTS.md</code> means changing what agents do never needs an sm release, and sm stays a set of primitives, as #1399 intends.</p>
+<p><b>Why not detect running servers some other way?</b> A process whose current directory is inside the worktree covers servers, watchers and shells started there. A process started elsewhere that only holds files open inside is not detected; <code>sm worktree keep</code> is the agent's way to cover it.</p>
+<p><b>Why server pages rather than reviving the unmounted <code>web/sm-watch</code> React app?</b> The Rust server serves no web app today (<code>web/sm-watch</code> was a Python-era mount). Server pages with a small inline script match the doc reader, work in the app's web view with the existing auth, and need no build pipeline. The visual design comes from the shipped Watch app instead.</p>
 <p><b>Relation to the direction in #1399.</b> Claims here are the "claims" primitive that direction names: mutual exclusion bound to session liveness, with tickets and PRs staying in GitHub. The per-ticket timeline page is a first version of a stable per-ticket page.</p>
 <p><b>Cross-repo links</b> (a PR in one repo closing a ticket in another) are ignored in this version; GitHub reports them, and <code>work_links</code> can take a <code>ticket_repo</code> column later.</p>
 
