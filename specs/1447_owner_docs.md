@@ -2,7 +2,7 @@
 
 ## Problem
 
-Agents often write docs (decision memos, readouts) for the owner to read. Today:
+Agents often write docs (decision memos, readouts) for the owner to read. Today (probe edit, reverted):
 
 - On the studio, the owner opens the file in a browser. Anywhere else it is hard to find.
 - On a laptop, the owner runs `python -m http.server` in `~` and hunts for the path.
