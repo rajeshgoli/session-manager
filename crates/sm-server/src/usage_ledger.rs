@@ -249,6 +249,12 @@ impl UsageLedgerStore {
                   ON message_ledger(account_key, bucket_ts);
                 CREATE INDEX IF NOT EXISTS idx_ledger_window_materialization
                   ON message_ledger(account_key, recorded_at);
+                -- Every scan looks up provisional and unknown-model rows; without these
+                -- partial indexes each lookup walks the whole ledger (#1524).
+                CREATE INDEX IF NOT EXISTS idx_ledger_unassigned_source
+                  ON message_ledger(source_ref, msg_id) WHERE seat_id = 'unassigned';
+                CREATE INDEX IF NOT EXISTS idx_ledger_unknown_model
+                  ON message_ledger(msg_id, seat_id) WHERE model = 'unknown';
 
                 CREATE TABLE IF NOT EXISTS message_window (
                   msg_id       INTEGER NOT NULL REFERENCES message_ledger(msg_id) ON DELETE CASCADE,
@@ -594,7 +600,7 @@ impl UsageLedgerStore {
                 _ => continue,
             };
             let msg_ids = tx
-                .prepare(
+                .prepare_cached(
                     r#"
                     SELECT msg_id
                     FROM message_ledger
@@ -633,12 +639,24 @@ impl UsageLedgerStore {
         seat_meta: &BTreeMap<String, UsageSeatMetadata>,
     ) -> Result<()> {
         let connection = self.open()?;
+        // Only rows whose seat can resolve a model are rewritten; filtering here keeps
+        // unresolvable rows from taking the write lock on every scan.
         let ids = connection
             .prepare(
-                "SELECT msg_id FROM message_ledger WHERE model = 'unknown' AND seat_id != 'unassigned' ORDER BY msg_id",
+                "SELECT msg_id, seat_id FROM message_ledger WHERE model = 'unknown' AND seat_id != 'unassigned' ORDER BY msg_id",
             )?
-            .query_map([], |row| row.get::<_, i64>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(_, seat_id)| {
+                seat_meta.get(seat_id).is_some_and(|metadata| {
+                    normalized_model(metadata.model.as_deref())
+                        .or_else(|| self.default_model(&metadata.provider))
+                        .is_some()
+                })
+            })
+            .map(|(msg_id, _)| msg_id)
+            .collect::<Vec<_>>();
         drop(connection);
 
         let mut connection = self.open()?;
@@ -3000,6 +3018,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(view_tokens, 25);
+    }
+
+    #[test]
+    fn per_scan_ledger_lookups_use_partial_indexes() {
+        let dir = TestDir::new("per-scan-ledger-lookups");
+        let db_path = dir.0.join("usage.db");
+        UsageLedgerStore::new(&db_path).unwrap();
+        let connection = Connection::open(&db_path).unwrap();
+        let plan = |sql: &str| {
+            connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("\n")
+        };
+        let rebind = plan(
+            "SELECT msg_id FROM message_ledger WHERE seat_id = 'unassigned' \
+             AND source_ref = 'session' AND account_key LIKE 'claude:%' ORDER BY msg_id",
+        );
+        assert!(
+            rebind.contains("idx_ledger_unassigned_source"),
+            "rebind lookup must not scan the ledger: {rebind}"
+        );
+        let unknown = plan(
+            "SELECT msg_id, seat_id FROM message_ledger WHERE model = 'unknown' \
+             AND seat_id != 'unassigned' ORDER BY msg_id",
+        );
+        assert!(
+            unknown.contains("idx_ledger_unknown_model"),
+            "unknown-model lookup must not scan the ledger: {unknown}"
+        );
     }
 
     #[test]

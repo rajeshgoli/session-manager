@@ -108,6 +108,8 @@ pub struct SessionStore {
     usage_ledger_store: Option<UsageLedgerStore>,
     usage_report_store: Option<UsageReportStore>,
     usage_project_keys: Arc<Mutex<BTreeMap<String, (String, String)>>>,
+    /// The last parse of the state file, reused until the file changes (#1530).
+    parsed_state: Arc<Mutex<Option<CachedParsedState>>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -230,6 +232,7 @@ impl SessionStore {
             usage_ledger_store: None,
             usage_report_store: None,
             usage_project_keys: Arc::new(Mutex::new(BTreeMap::new())),
+            parsed_state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -509,6 +512,16 @@ impl SessionStore {
         let Some(attribution) = identity_store.account_at(provider, observed_at)? else {
             return Ok(());
         };
+        // Runs for every statusline event and almost never changes anything;
+        // check the shared parse before copying state under the write lock.
+        let parsed_state = self.load_parsed_state()?;
+        if raw_session_object(&parsed_state.raw, session_id).is_none_or(|session| {
+            json_text(session.get("account_key")).as_deref()
+                == Some(attribution.account_key.as_str())
+        }) {
+            return Ok(());
+        }
+        drop(parsed_state);
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
         let sessions = ensure_sessions_array_mut(&mut state)?;
@@ -908,7 +921,8 @@ impl SessionStore {
         loop {
             let launch_id = {
                 let _guard = self.write_guard()?;
-                let state = self.load_raw_json_value()?;
+                let parsed_state = self.load_parsed_state()?;
+                let state = &parsed_state.raw;
                 session_runtime_launch_records(&state)?
                     .into_iter()
                     .find(|record| matches!(record.status.as_str(), "prepared" | "launching"))
@@ -924,7 +938,8 @@ impl SessionStore {
     fn recover_session_runtime_launch(&self, launch_id: &str) -> Result<()> {
         let pending_launch = {
             let _guard = self.write_guard()?;
-            let state = self.load_raw_json_value()?;
+            let parsed_state = self.load_parsed_state()?;
+            let state = &parsed_state.raw;
             session_runtime_launch_records(&state)?
                 .into_iter()
                 .find(|record| record.id == launch_id)
@@ -1345,7 +1360,8 @@ impl SessionStore {
     fn try_apply_waiting_credential_rotation(&self, session_id: &str) -> Result<bool> {
         let (rotation, session, recovering_launch_id) = {
             let _guard = self.write_guard()?;
-            let state = self.load_raw_json_value()?;
+            let parsed_state = self.load_parsed_state()?;
+            let state = &parsed_state.raw;
             let rotations = session_credential_rotation_records(&state)?;
             let recovering_launch_id = rotations
                 .iter()
@@ -1698,6 +1714,7 @@ impl SessionStore {
             usage_ledger_store: None,
             usage_report_store: None,
             usage_project_keys: Arc::new(Mutex::new(BTreeMap::new())),
+            parsed_state: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -2875,8 +2892,9 @@ impl SessionStore {
         // so a direct snapshot read sees either the old or new complete state
         // without waiting for a writer.  Lifecycle transitions belong to the
         // reparent worker, not to a GET request.
-        let state = self.load_raw_json_value()?;
-        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        let parsed_state = self.load_parsed_state()?;
+        let state = &parsed_state.raw;
+        let sessions = parsed_state.snapshot()?.into_sessions();
         let mut records = reparent_request_records(&state)?;
         // This projection is intentionally not persisted.  It keeps the
         // response truthful at an expiry boundary while the lifecycle worker
@@ -2891,8 +2909,9 @@ impl SessionStore {
         // Keep collection reads in the same lock-free snapshot class as
         // `list_sessions`.  In particular, do not refresh expiry/staleness
         // here: doing so turns a watch poll into a durable mutation.
-        let state = self.load_raw_json_value()?;
-        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        let parsed_state = self.load_parsed_state()?;
+        let state = &parsed_state.raw;
+        let sessions = parsed_state.snapshot()?.into_sessions();
         let mut records = reparent_request_records(&state)?;
         refresh_reparent_requests(&mut records, &sessions, &state, OffsetDateTime::now_utc());
         records.sort_by(|left, right| {
@@ -2907,8 +2926,9 @@ impl SessionStore {
         session_credential: &str,
     ) -> Result<Option<Vec<ReparentRequestRecord>>> {
         let session_id = session_id.trim();
-        let state = self.load_raw_json_value()?;
-        let sessions = snapshot_from_raw_value(&state)?.into_sessions();
+        let parsed_state = self.load_parsed_state()?;
+        let state = &parsed_state.raw;
+        let sessions = parsed_state.snapshot()?.into_sessions();
         if !session_credential_matches(&sessions, session_id, session_credential) {
             return Ok(None);
         }
@@ -3049,7 +3069,8 @@ impl SessionStore {
         for desired in pending {
             let desired = {
                 let _guard = self.write_guard()?;
-                let state = self.load_raw_json_value()?;
+                let parsed_state = self.load_parsed_state()?;
+                let state = &parsed_state.raw;
                 let records = reparent_request_records(&state)?;
                 let Some(record) = records
                     .iter()
@@ -3234,7 +3255,8 @@ impl SessionStore {
     fn verify_reparent_repair(&self, request_id: &str, attempted_at: &str) -> Result<()> {
         let (record, state_projection) = {
             let _guard = self.write_guard()?;
-            let state = self.load_raw_json_value()?;
+            let parsed_state = self.load_parsed_state()?;
+            let state = &parsed_state.raw;
             let record = reparent_request_records(&state)?
                 .into_iter()
                 .find(|record| record.id == request_id)
@@ -3512,7 +3534,8 @@ impl SessionStore {
         for _ in 0..8 {
             let stage = {
                 let _guard = self.write_guard()?;
-                let state = self.load_raw_json_value()?;
+                let parsed_state = self.load_parsed_state()?;
+                let state = &parsed_state.raw;
                 let records = reparent_request_records(&state)?;
                 if records
                     .iter()
@@ -3588,7 +3611,8 @@ impl SessionStore {
     fn quiesce_reparent_queue_routing(&self, request_id: &str) -> Result<()> {
         let snapshot = {
             let _guard = self.write_guard()?;
-            let state = self.load_raw_json_value()?;
+            let parsed_state = self.load_parsed_state()?;
+            let state = &parsed_state.raw;
             let records = reparent_request_records(&state)?;
             let record = leased_reparent_request(&state, &records, request_id)?;
             queue_snapshot_from_plan(
@@ -3638,7 +3662,8 @@ impl SessionStore {
     fn finish_reparent_routing(&self, request_id: &str) -> Result<()> {
         let route_groups = {
             let _guard = self.write_guard()?;
-            let state = self.load_raw_json_value()?;
+            let parsed_state = self.load_parsed_state()?;
+            let state = &parsed_state.raw;
             let records = reparent_request_records(&state)?;
             let record = leased_reparent_request(&state, &records, request_id)?;
             let plan = record
@@ -3703,7 +3728,8 @@ impl SessionStore {
         loop {
             let intent = {
                 let _guard = self.write_guard()?;
-                let state = self.load_raw_json_value()?;
+                let parsed_state = self.load_parsed_state()?;
+                let state = &parsed_state.raw;
                 let records = reparent_request_records(&state)?;
                 leased_reparent_request(&state, &records, request_id)?
                     .deferred_routing_intents
@@ -3719,7 +3745,8 @@ impl SessionStore {
             };
             let resolved_parent_session_id = {
                 let _guard = self.write_guard()?;
-                let state = self.load_raw_json_value()?;
+                let parsed_state = self.load_parsed_state()?;
+                let state = &parsed_state.raw;
                 raw_session_object(&state, &intent.child_session_id)
                     .and_then(|session| json_text(session.get("parent_session_id")))
             };
@@ -4064,7 +4091,8 @@ impl SessionStore {
     ) -> Result<()> {
         let (plan, route_groups) = {
             let _guard = self.write_guard()?;
-            let state = self.load_raw_json_value()?;
+            let parsed_state = self.load_parsed_state()?;
+            let state = &parsed_state.raw;
             let records = reparent_request_records(&state)?;
             let record = leased_reparent_request(&state, &records, request_id)?;
             if !matches!(
@@ -4256,7 +4284,8 @@ impl SessionStore {
         &self,
     ) -> Result<Vec<SessionCredentialRotationRecord>> {
         let _guard = self.write_guard()?;
-        let state = self.load_raw_json_value()?;
+        let parsed_state = self.load_parsed_state()?;
+        let state = &parsed_state.raw;
         let mut records = session_credential_rotation_records(&state)?;
         records.sort_by(|left, right| {
             (&left.requested_at, &left.id).cmp(&(&right.requested_at, &right.id))
@@ -4267,7 +4296,8 @@ impl SessionStore {
     pub fn recover_session_credential_rotation_workers(&self) -> Result<usize> {
         let session_ids = {
             let _guard = self.write_guard()?;
-            let state = self.load_raw_json_value()?;
+            let parsed_state = self.load_parsed_state()?;
+            let state = &parsed_state.raw;
             session_credential_rotation_records(&state)?
                 .into_iter()
                 .filter(|record| record.status == "waiting_idle")
@@ -4283,7 +4313,8 @@ impl SessionStore {
     /// An id no session uses yet, for a create that must name the session
     /// before it exists (`sm spawn --ticket` reserves its claim under it).
     pub fn allocate_session_id(&self) -> Result<String> {
-        let state = self.load_raw_json_value()?;
+        let parsed_state = self.load_parsed_state()?;
+        let state = &parsed_state.raw;
         let sessions = state
             .get("sessions")
             .and_then(Value::as_array)
@@ -4361,7 +4392,8 @@ impl SessionStore {
     ) -> Result<SessionRecord> {
         let (provider, working_dir) = {
             let _guard = self.write_guard()?;
-            let state = self.load_raw_json_value()?;
+            let parsed_state = self.load_parsed_state()?;
+            let state = &parsed_state.raw;
             let sessions = state
                 .get("sessions")
                 .and_then(Value::as_array)
@@ -5101,7 +5133,8 @@ impl SessionStore {
             };
             let target = {
                 let _guard = self.write_guard()?;
-                let state = self.load_raw_json_value()?;
+                let parsed_state = self.load_parsed_state()?;
+                let state = &parsed_state.raw;
                 reparent_runtime_delivery_target(&state, session_id, runtime)?
             };
             let Some(target) = target else {
@@ -6881,7 +6914,8 @@ impl SessionStore {
         if self.delivery_runtime.is_none() {
             return Ok(0);
         }
-        let state = self.load_raw_json_value()?;
+        let parsed_state = self.load_parsed_state()?;
+        let state = &parsed_state.raw;
         let session_ids = state
             .get("sessions")
             .and_then(Value::as_array)
@@ -7040,7 +7074,8 @@ impl SessionStore {
         reservation_at: &str,
     ) -> Result<bool> {
         let _guard = self.write_guard()?;
-        let state = self.load_raw_json_value()?;
+        let parsed_state = self.load_parsed_state()?;
+        let state = &parsed_state.raw;
         let Some(session) = raw_session_object(&state, session_id) else {
             return Ok(false);
         };
@@ -7107,7 +7142,8 @@ impl SessionStore {
         F: FnOnce() -> Result<()>,
     {
         let _guard = self.write_guard()?;
-        let state = self.load_raw_json_value()?;
+        let parsed_state = self.load_parsed_state()?;
+        let state = &parsed_state.raw;
         let Some(session) = raw_session_object(&state, session_id) else {
             return Ok(false);
         };
@@ -7140,7 +7176,8 @@ impl SessionStore {
         previous_reset_emitted_at: Option<&str>,
     ) -> Result<bool> {
         let _guard = self.write_guard()?;
-        let state = self.load_raw_json_value()?;
+        let parsed_state = self.load_parsed_state()?;
+        let state = &parsed_state.raw;
         let Some(session) = raw_session_object(&state, session_id) else {
             return Ok(false);
         };
@@ -7171,7 +7208,8 @@ impl SessionStore {
         let _clear_guard = self.lock_clear_operation(session_id)?;
         let (file_path, recorded_at, reservation_at, tmux_session, socket_name, reset_emitted_at) = {
             let _guard = self.write_guard()?;
-            let state = self.load_raw_json_value()?;
+            let parsed_state = self.load_parsed_state()?;
+            let state = &parsed_state.raw;
             let Some(session) = raw_session_object(&state, session_id) else {
                 return Ok(false);
             };
@@ -7646,7 +7684,8 @@ impl SessionStore {
     }
 
     fn codex_fork_handoff_is_pending(&self, session_id: &str) -> Result<bool> {
-        let state = self.load_raw_json_value()?;
+        let parsed_state = self.load_parsed_state()?;
+        let state = &parsed_state.raw;
         Ok(raw_session_object(&state, session_id)
             .and_then(|session| json_text(session.get("pending_handoff_path")))
             .is_some())
@@ -7662,7 +7701,8 @@ impl SessionStore {
             previous_provider_resume_id,
         ) = {
             let _guard = self.write_guard()?;
-            let state = self.load_raw_json_value()?;
+            let parsed_state = self.load_parsed_state()?;
+            let state = &parsed_state.raw;
             let Some(session) = raw_session_object(&state, session_id) else {
                 return Ok(false);
             };
@@ -8635,7 +8675,8 @@ impl SessionStore {
     }
 
     pub fn list_subagents(&self, session_id: &str) -> Result<Option<SubagentListResponse>> {
-        let state = self.load_raw_json_value()?;
+        let parsed_state = self.load_parsed_state()?;
+        let state = &parsed_state.raw;
         let Some(session) = raw_session_object(&state, session_id) else {
             return Ok(None);
         };
@@ -8661,7 +8702,11 @@ impl SessionStore {
         if !state_file.exists() {
             return Ok(StateSnapshot::default());
         }
-        match read_snapshot(&state_file) {
+        match self.parsed_state_at(&state_file).and_then(|parsed| {
+            parsed.snapshot().with_context(|| {
+                format!("failed to parse session records {}", state_file.display())
+            })
+        }) {
             Ok(snapshot) => Ok(snapshot),
             Err(primary_error) => {
                 if state_file == self.state_file {
@@ -8693,14 +8738,56 @@ impl SessionStore {
     }
 
     fn load_raw_json_value(&self) -> Result<Value> {
+        Ok(self.load_parsed_state()?.raw.clone())
+    }
+
+    /// The current state file, parsed once per version and shared read-only.
+    /// Callers that only inspect state should borrow this instead of cloning
+    /// it through `load_raw_json_value`: a copy costs half a parse.
+    fn load_parsed_state(&self) -> Result<Arc<ParsedState>> {
         let state_file = self.readable_state_file();
         if !state_file.exists() {
-            return Ok(json!({ "sessions": [] }));
+            return Ok(Arc::new(ParsedState::new(json!({ "sessions": [] }))));
         }
-        let content = fs::read_to_string(&state_file)
+        self.parsed_state_at(&state_file)
+    }
+
+    fn parsed_state_at(&self, state_file: &Path) -> Result<Arc<ParsedState>> {
+        // Stamp the open handle, not the path: the file is replaced by rename,
+        // so the handle's inode is exactly the content read below. A replace
+        // after the stamp only makes the cached entry miss on the next read.
+        let mut file = fs::File::open(state_file)
             .with_context(|| format!("failed to read session state {}", state_file.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("failed to parse session state {}", state_file.display()))
+        let stamp =
+            StateFileStamp::of(&file.metadata().with_context(|| {
+                format!("failed to read session state {}", state_file.display())
+            })?);
+        if let Some(parsed) = self
+            .parsed_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session state cache lock poisoned"))?
+            .as_ref()
+            .filter(|cached| cached.path == state_file && cached.stamp == stamp)
+            .map(|cached| Arc::clone(&cached.parsed))
+        {
+            return Ok(parsed);
+        }
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .with_context(|| format!("failed to read session state {}", state_file.display()))?;
+        let raw = serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse session state {}", state_file.display()))?;
+        let parsed = Arc::new(ParsedState::new(raw));
+        *self
+            .parsed_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session state cache lock poisoned"))? =
+            Some(CachedParsedState {
+                path: state_file.to_path_buf(),
+                stamp,
+                parsed: Arc::clone(&parsed),
+            });
+        Ok(parsed)
     }
 
     fn write_raw_json_value(&self, value: &Value) -> Result<()> {
@@ -8716,12 +8803,18 @@ impl SessionStore {
         ));
         fs::write(&tmp, serde_json::to_vec_pretty(value)?)
             .with_context(|| format!("failed to write temp state {}", tmp.display()))?;
-        fs::rename(&tmp, &self.state_file).with_context(|| {
+        let renamed = fs::rename(&tmp, &self.state_file).with_context(|| {
             format!(
                 "failed to atomically replace session state {}",
                 self.state_file.display()
             )
-        })?;
+        });
+        // The stamp already misses after a rename; clearing also covers a
+        // filesystem whose timestamps are too coarse to tell two writes apart.
+        if let Ok(mut cached) = self.parsed_state.lock() {
+            *cached = None;
+        }
+        renamed?;
         Ok(())
     }
 
@@ -8825,7 +8918,8 @@ impl SessionStore {
     }
 
     fn codex_fork_monitor_should_continue(&self, session_id: &str) -> Result<bool> {
-        let state = self.load_raw_json_value()?;
+        let parsed_state = self.load_parsed_state()?;
+        let state = &parsed_state.raw;
         let Some(sessions) = state.get("sessions").and_then(Value::as_array) else {
             return Ok(false);
         };
@@ -10793,9 +10887,62 @@ fn read_snapshot(path: &Path) -> Result<StateSnapshot> {
 }
 
 fn snapshot_from_raw_value(value: &Value) -> Result<StateSnapshot> {
-    let raw = serde_json::from_value::<RawStateSnapshot>(value.clone())
-        .context("failed to parse raw session state")?;
+    let raw = RawStateSnapshot::deserialize(value).context("failed to parse raw session state")?;
     StateSnapshot::try_from(raw).context("failed to parse raw session records")
+}
+
+/// Identity and change stamps of one version of the state file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StateFileStamp {
+    device: u64,
+    inode: u64,
+    len: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl StateFileStamp {
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            len: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CachedParsedState {
+    path: PathBuf,
+    stamp: StateFileStamp,
+    parsed: Arc<ParsedState>,
+}
+
+/// One parse of the state file. The typed snapshot is derived on first use.
+#[derive(Debug)]
+struct ParsedState {
+    raw: Value,
+    snapshot: std::sync::OnceLock<StateSnapshot>,
+}
+
+impl ParsedState {
+    fn new(raw: Value) -> Self {
+        Self {
+            raw,
+            snapshot: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn snapshot(&self) -> Result<StateSnapshot> {
+        if let Some(snapshot) = self.snapshot.get() {
+            return Ok(snapshot.clone());
+        }
+        let snapshot = snapshot_from_raw_value(&self.raw)?;
+        Ok(self.snapshot.get_or_init(|| snapshot).clone())
+    }
 }
 
 fn ensure_object_mut(value: &mut Value) -> Result<&mut Map<String, Value>> {
@@ -15624,7 +15771,7 @@ pub fn expand_home(path: &str) -> PathBuf {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct StateSnapshot {
     #[serde(default)]
     sessions: Vec<SessionRecord>,
@@ -17484,6 +17631,41 @@ esac
         let event = json!({"event_type": "thread/started", "payload": {"thread": {
             "id": "durable-id", "threadSource": "user", "ephemeral": false}}});
         assert_eq!(codex_fork_provider_resume_id(event.as_object().unwrap()), Some("durable-id".to_owned()));
+    }
+
+    #[test]
+    fn parsed_state_is_reused_until_the_state_file_changes() {
+        let state_file = unique_temp_path("parsed-state-cache");
+        let record = |name: &str| {
+            json!({"sessions": [{"id": "cache001", "name": name, "working_dir": "/repo",
+                "tmux_session": "cache001", "created_at": "2026-09-24T00:00:00Z",
+                "last_activity": "2026-09-24T00:00:00Z"}]})
+        };
+        let name_of = |store: &SessionStore| store.get_session("cache001").unwrap().unwrap().name;
+        fs::write(&state_file, record("first").to_string()).unwrap();
+        let store = SessionStore::new(state_file.clone());
+        let first = store.load_parsed_state().unwrap();
+        assert!(Arc::ptr_eq(&first, &store.load_parsed_state().unwrap()));
+        assert_eq!(name_of(&store), "first");
+
+        // Same length, same inode: an in-place rewrite by another process.
+        fs::write(&state_file, record("secnd").to_string()).unwrap();
+        assert_eq!(name_of(&store), "secnd");
+
+        // Atomic replace by another process.
+        let replacement = state_file.with_extension("replacement");
+        fs::write(&replacement, record("third").to_string()).unwrap();
+        fs::rename(&replacement, &state_file).unwrap();
+        assert_eq!(name_of(&store), "third");
+
+        // This process's own write, seen through a clone sharing the cache.
+        let clone = store.clone();
+        let mut state = store.load_raw_json_value().unwrap();
+        state["sessions"][0]["name"] = json!("fourth");
+        clone.write_raw_json_value(&state).unwrap();
+        assert_eq!(name_of(&store), "fourth");
+        assert!(!Arc::ptr_eq(&first, &store.load_parsed_state().unwrap()));
+        let _ = fs::remove_file(state_file);
     }
 
     #[test]
