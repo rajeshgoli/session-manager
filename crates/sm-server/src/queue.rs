@@ -299,6 +299,71 @@ pub struct PendingMessage {
     pub parent_session_id: Option<String>,
     pub message_category: Option<String>,
     pub response_relay_source: Option<String>,
+    /// When the row entered the queue; `None` for a message built for
+    /// immediate delivery that never waited there.
+    pub queued_at: Option<String>,
+}
+
+/// A queued `sm send` message delivered at least this long after it was
+/// sent carries its send instant, so the recipient reads whatever the
+/// sender said about itself as of that instant rather than as current.
+pub const QUEUED_SEND_STAMP_MIN_DELAY_SECONDS: i64 = 60;
+
+impl PendingMessage {
+    /// The text to type into the recipient. An `sm send` message that
+    /// waited in the queue for `QUEUED_SEND_STAMP_MIN_DELAY_SECONDS` or
+    /// longer has its `[Input from: ...]` header extended with the send
+    /// time and the delay (#1224); every other message goes out as stored.
+    pub fn delivery_text(&self, now_utc: OffsetDateTime) -> String {
+        let Some(stamp) = self.queued_send_stamp(now_utc) else {
+            return self.text.clone();
+        };
+        let (first_line, rest) = match self.text.split_once('\n') {
+            Some((first_line, rest)) => (first_line, Some(rest)),
+            None => (self.text.as_str(), None),
+        };
+        let header = first_line
+            .strip_suffix(" via sm send]")
+            .filter(|_| first_line.starts_with("[Input from: "));
+        match (header, rest) {
+            (Some(header), Some(rest)) => format!("{header} via sm send \u{b7} {stamp}]\n{rest}"),
+            (Some(header), None) => format!("{header} via sm send \u{b7} {stamp}]"),
+            (None, _) => format!("[sm send \u{b7} {stamp}]\n{}", self.text),
+        }
+    }
+
+    fn queued_send_stamp(&self, now_utc: OffsetDateTime) -> Option<String> {
+        if !self.from_sm_send {
+            return None;
+        }
+        // Rows this server writes carry an offset; a legacy naive local
+        // timestamp cannot give a trustworthy delay, so it gets no stamp.
+        let sent_at = OffsetDateTime::parse(self.queued_at.as_deref()?.trim(), &Rfc3339).ok()?;
+        let delay_seconds = (now_utc - sent_at).whole_seconds();
+        if delay_seconds < QUEUED_SEND_STAMP_MIN_DELAY_SECONDS {
+            return None;
+        }
+        let sent_at = sent_at
+            .to_offset(time::UtcOffset::UTC)
+            .format(format_description!("[hour]:[minute]:[second]"))
+            .ok()?;
+        Some(format!(
+            "sent {sent_at} UTC, delivered {} later; sender state may have changed since",
+            queued_delay_text(delay_seconds)
+        ))
+    }
+}
+
+fn queued_delay_text(seconds: i64) -> String {
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}h {}m", minutes % 60);
+    }
+    format!("{}d {}h", hours / 24, hours % 24)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1797,7 +1862,8 @@ impl RetainedQueueStore {
                     sender_session_id, sender_name, from_sm_send, notify_on_delivery,
                     notify_after_seconds, notify_on_stop, remind_soft_threshold,
                     remind_hard_threshold, remind_cancel_on_reply_session_id,
-                    parent_session_id, message_category, response_relay_source
+                    parent_session_id, message_category, response_relay_source,
+                    queued_at
                 FROM message_queue
                 WHERE target_session_id = ?1 AND delivered_at IS NULL
                 ORDER BY queued_at ASC, id ASC
@@ -1824,6 +1890,7 @@ impl RetainedQueueStore {
                         parent_session_id: row.get(14)?,
                         message_category: row.get(15)?,
                         response_relay_source: row.get(16)?,
+                        queued_at: row.get(17)?,
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1883,7 +1950,8 @@ impl RetainedQueueStore {
                     sender_session_id, sender_name, from_sm_send, notify_on_delivery,
                     notify_after_seconds, notify_on_stop, remind_soft_threshold,
                     remind_hard_threshold, remind_cancel_on_reply_session_id,
-                    parent_session_id, message_category, response_relay_source
+                    parent_session_id, message_category, response_relay_source,
+                    queued_at
                 FROM message_queue
                 WHERE target_session_id = ?1
                     AND delivery_mode = ?2
@@ -1914,6 +1982,7 @@ impl RetainedQueueStore {
                             parent_session_id: row.get(14)?,
                             message_category: row.get(15)?,
                             response_relay_source: row.get(16)?,
+                            queued_at: row.get(17)?,
                         })
                     },
                 )?
@@ -1951,7 +2020,8 @@ impl RetainedQueueStore {
                     sender_session_id, sender_name, from_sm_send, notify_on_delivery,
                     notify_after_seconds, notify_on_stop, remind_soft_threshold,
                     remind_hard_threshold, remind_cancel_on_reply_session_id,
-                    parent_session_id, message_category, response_relay_source
+                    parent_session_id, message_category, response_relay_source,
+                    queued_at
                 FROM message_queue
                 WHERE target_session_id = ?1
                     AND message_category = ?2
@@ -1982,6 +2052,7 @@ impl RetainedQueueStore {
                             parent_session_id: row.get(14)?,
                             message_category: row.get(15)?,
                             response_relay_source: row.get(16)?,
+                            queued_at: row.get(17)?,
                         })
                     },
                 )?
@@ -8644,5 +8715,84 @@ mod tests {
                 "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6]"
             ))
             .unwrap()
+    }
+
+    fn queued_sm_send(text: &str, queued_at: Option<&str>) -> PendingMessage {
+        PendingMessage {
+            id: "msg-1224".into(),
+            target_session_id: "recipient".into(),
+            text: text.into(),
+            delivery_mode: "sequential".into(),
+            has_delivery_side_effects: false,
+            sender_session_id: Some("orch1234".into()),
+            sender_name: Some("orchestrator".into()),
+            from_sm_send: true,
+            notify_on_delivery: false,
+            notify_after_seconds: None,
+            notify_on_stop: false,
+            remind_soft_threshold: None,
+            remind_hard_threshold: None,
+            remind_cancel_on_reply_session_id: None,
+            parent_session_id: None,
+            message_category: None,
+            response_relay_source: Some("sm-send".into()),
+            queued_at: queued_at.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn delayed_sm_send_header_carries_send_time_and_delay() {
+        let now = OffsetDateTime::parse("2026-09-24T21:19:40Z", &Rfc3339).unwrap();
+        let message = queued_sm_send(
+            "[Input from: orchestrator (orch1234) via sm send]\nI am the seated orchestrator.\nProceed.",
+            Some("2026-09-24T21:02:11Z"),
+        );
+        assert_eq!(
+            message.delivery_text(now),
+            "[Input from: orchestrator (orch1234) via sm send \u{b7} sent 21:02:11 UTC, \
+             delivered 17m later; sender state may have changed since]\n\
+             I am the seated orchestrator.\nProceed."
+        );
+    }
+
+    #[test]
+    fn delayed_sm_send_stamp_scales_and_covers_headerless_messages() {
+        let now = OffsetDateTime::parse("2026-09-24T21:00:00Z", &Rfc3339).unwrap();
+        let header_only = queued_sm_send(
+            "[Input from: orchestrator (orch1234) via sm send]",
+            Some("2026-09-24T07:55:00-07:00"),
+        );
+        assert_eq!(
+            header_only.delivery_text(now),
+            "[Input from: orchestrator (orch1234) via sm send \u{b7} sent 14:55:00 UTC, \
+             delivered 6h 5m later; sender state may have changed since]"
+        );
+        let headerless = queued_sm_send("owner note", Some("2026-09-21T20:00:00Z"));
+        assert_eq!(
+            headerless.delivery_text(now),
+            "[sm send \u{b7} sent 20:00:00 UTC, delivered 3d 1h later; \
+             sender state may have changed since]\nowner note"
+        );
+    }
+
+    #[test]
+    fn prompt_non_sm_send_and_unparseable_messages_go_out_as_stored() {
+        let now = OffsetDateTime::parse("2026-09-24T21:00:00Z", &Rfc3339).unwrap();
+        let text = "[Input from: orchestrator (orch1234) via sm send]\nhello";
+        let just_under = queued_sm_send(text, Some("2026-09-24T20:59:01Z"));
+        assert_eq!(just_under.delivery_text(now), text);
+        let at_threshold = queued_sm_send(text, Some("2026-09-24T20:59:00Z"));
+        assert!(at_threshold
+            .delivery_text(now)
+            .contains("delivered 1m later"));
+        let system = PendingMessage {
+            from_sm_send: false,
+            ..queued_sm_send(text, Some("2026-09-24T20:00:00Z"))
+        };
+        assert_eq!(system.delivery_text(now), text);
+        assert_eq!(queued_sm_send(text, None).delivery_text(now), text);
+        // Legacy naive local timestamps have no trustworthy offset.
+        let legacy = queued_sm_send(text, Some("2026-09-24T13:00:00.000000"));
+        assert_eq!(legacy.delivery_text(now), text);
     }
 }

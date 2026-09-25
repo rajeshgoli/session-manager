@@ -15682,6 +15682,118 @@ async fn runtime_core_delivers_sm_send_metadata_rows() {
 }
 
 #[tokio::test]
+async fn runtime_core_stamps_sm_send_delivered_after_queueing() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let queue_db_path = queue_db_path_for_state_file(&state_file);
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-queued-stamp-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
+
+    for (id, name) in [
+        ("stamprecv", "stamp-recipient"),
+        ("stampsend", "stamp-sender"),
+    ] {
+        let (status, _payload) = post_json(
+            app.clone(),
+            "/sessions",
+            json!({
+                "id": id,
+                "name": name,
+                "working_dir": working_dir.display().to_string(),
+                "provider": "claude",
+                "initial_message": format!("{id} initial")
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    wait_for_output_contains(app.clone(), "stamprecv", "runtime:stamprecv initial").await;
+
+    // A message `sm send` queued 17m20s ago that has not reached the
+    // recipient yet, followed by a fresh one that drains it.
+    let sent_at = time::OffsetDateTime::now_utc() - time::Duration::seconds(17 * 60 + 20);
+    let sent_at_text = sent_at
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    let sent_clock = sent_at
+        .format(time::macros::format_description!(
+            "[hour]:[minute]:[second]"
+        ))
+        .unwrap();
+    Connection::open(&queue_db_path)
+        .unwrap()
+        .execute(
+            r#"
+            INSERT INTO message_queue
+                (id, target_session_id, sender_session_id, sender_name, text,
+                 delivery_mode, from_sm_send, queued_at, response_relay_source)
+            VALUES ('stale-claim', 'stamprecv', 'stampsend', 'stamp-sender', ?1,
+                    'sequential', 1, ?2, 'sm-send')
+            "#,
+            rusqlite::params![
+                "[Input from: stamp-sender (stampsen) via sm send]\nI am the seated orchestrator",
+                sent_at_text
+            ],
+        )
+        .unwrap();
+    let (status, payload) = post_json(
+        app.clone(),
+        "/sessions/stamprecv/input",
+        json!({
+            "text": "fresh message",
+            "sender_session_id": "stampsend",
+            "delivery_mode": "sequential",
+            "from_sm_send": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["delivered"], true);
+    let payload = wait_for_output_contains(app.clone(), "stamprecv", "runtime:fresh message").await;
+
+    // The pane wraps long lines, so compare with all whitespace removed.
+    let compact = |text: &str| text.split_whitespace().collect::<String>();
+    let output = compact(payload["output"].as_str().unwrap());
+    let stamped = compact(&format!(
+        "runtime:[Input from: stamp-sender (stampsen) via sm send \u{b7} sent {sent_clock} UTC, \
+         delivered 17m later; sender state may have changed since]"
+    ));
+    assert!(output.contains(&stamped), "{output}");
+    assert!(output.contains(&compact("runtime:I am the seated orchestrator")));
+    // The fresh message went out as soon as it was sent, so it is not stamped.
+    assert!(output.contains(&compact(
+        "runtime:[Input from: stamp-sender (stampsen) via sm send]"
+    )));
+    assert!(output.contains(&compact("runtime:fresh message")));
+    // The queue keeps the text as sent; only the delivered copy is stamped.
+    let stored: String = Connection::open(&queue_db_path)
+        .unwrap()
+        .query_row(
+            "SELECT text FROM message_queue WHERE id = 'stale-claim' AND delivered_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stored,
+        "[Input from: stamp-sender (stampsen) via sm send]\nI am the seated orchestrator"
+    );
+}
+
+#[tokio::test]
 async fn runtime_core_input_batch_delivers_to_multiple_sessions() {
     if !tmux_available() {
         return;
