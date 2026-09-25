@@ -41,7 +41,9 @@ def fake_binary(state: Path, marker: str) -> str:
 
     The marker line is how tests tell which build is sitting at a given path.
     --help advertises --check-config only when the knob says so, so the
-    older-build path can be exercised too.
+    older-build path can be exercised too. help_trailing_bytes pads the help
+    past a pipe buffer, so a reader that stops at the flag makes this write die
+    of SIGPIPE the way a real binary's does.
     """
     return f"""#!/bin/bash
 # MARKER={marker}
@@ -50,6 +52,9 @@ if [[ "$1" == "--help" ]]; then
   echo "Usage: sm-server [OPTIONS]"
   if [[ "$(cat "{state}/supports_check_config")" == "1" ]]; then
     echo "      --check-config"
+  fi
+  if (( $(cat "{state}/help_trailing_bytes") > 0 )); then
+    printf '%*s\n' "$(cat "{state}/help_trailing_bytes")" ''
   fi
   exit 0
 fi
@@ -87,6 +92,8 @@ def env(tmp_path, request):
     (state / "codesign_requirement_rc").write_text("0")
     (state / "signing_identity_present").write_text("1")
     (state / "available_signing_identity").write_text(SIGN_IDENTITY)
+    (state / "security_trailing_bytes").write_text("0")
+    (state / "help_trailing_bytes").write_text("0")
     (state / "signed_identifier").write_text("com.rajeshgoli.sm-server")
     (state / "signed_signature").write_text("")
     (state / "signed_authority").write_text("Office Automate Local Signing")
@@ -176,6 +183,9 @@ if [[ "$(cat "{state}/signing_identity_present")" == "1" ]]; then
   echo '     1 valid identities found'
 else
   echo '     0 valid identities found'
+fi
+if (( $(cat "{state}/security_trailing_bytes") > 0 )); then
+  printf '%*s\n' "$(cat "{state}/security_trailing_bytes")" ''
 fi
 """,
         executable=True,
@@ -454,6 +464,17 @@ def test_unusable_keychain_identity_blocks_before_service_mutation(env):
     assert "not a valid usable codesigning identity" in result.stderr
     assert "cargo build" not in calls(env)
     assert_service_untouched(env)
+
+
+def test_identity_check_accepts_a_lister_that_outlives_the_match(env):
+    """The matching line comes first and more output follows past a pipe buffer.
+    A pipe into `grep -q` would SIGPIPE the lister and, under pipefail, reject
+    an identity that is present (#1423)."""
+    (env["state"] / "security_trailing_bytes").write_text("300000")
+
+    result = env["run"]()
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_ad_hoc_staged_output_blocks_before_service_mutation(env):
@@ -1076,6 +1097,20 @@ def test_config_validation_is_skipped_on_a_binary_without_the_flag(env):
 
     assert result.returncode == 0, result.stderr
     assert "no --check-config" in result.stderr
+
+
+def test_config_validation_runs_when_help_outlives_the_match(env):
+    """A pipe from --help into `grep -q` would SIGPIPE the binary once the flag
+    matched and, under pipefail, skip validation with only a warning."""
+    (env["state"] / "help_trailing_bytes").write_text("300000")
+    (env["state"] / "check_config_rc").write_text("1")
+
+    result = env["run"]()
+
+    assert result.returncode != 0
+    assert "rejected the configuration" in result.stderr
+    assert "no --check-config" not in result.stderr
+    assert_service_untouched(env)
 
 
 def test_config_validation_covers_the_listen_address(env):
