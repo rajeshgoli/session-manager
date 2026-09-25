@@ -342,6 +342,25 @@ canonical_path() {
   python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
 }
 
+# True when $1 resolves inside a cargo target directory: the one we build into,
+# or either one rust-service-cutover.sh start-rust refuses (the repo's target/
+# and CARGO_TARGET_DIR).
+path_in_cargo_target_dir() {
+  python3 - "$1" "$SM_TARGET_DIR" "$REPO_ROOT/target" "${CARGO_TARGET_DIR:-}" <<'PY'
+import os
+import sys
+
+path = os.path.realpath(sys.argv[1])
+for target_dir in sys.argv[2:]:
+    if not target_dir:
+        continue
+    target_dir = os.path.realpath(target_dir)
+    if os.path.commonpath([path, target_dir]) == target_dir:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
 SM_BINARY="$(resolve_path "$SM_BINARY")"
 SM_CARGO_OUTPUT="$(resolve_path "$SM_CARGO_OUTPUT")"
 SM_TARGET_DIR="$(resolve_path "$SM_TARGET_DIR")"
@@ -662,6 +681,15 @@ if [[ "$(canonical_path "$SM_BINARY")" == "$(canonical_path "$SM_CARGO_OUTPUT")"
        output path: a build would then write the registered binary directly, and
        a server that exited before the restart would be respawned by KeepAlive
        onto an unverified build. The running service was not touched."
+fi
+
+# start-rust refuses a binary inside a cargo target directory, and it only
+# checks after the service is stopped. Refuse here first, while nothing is.
+if path_in_cargo_target_dir "$SM_BINARY"; then
+  fail "$SM_BINARY is inside a cargo target directory ($SM_TARGET_DIR,
+       $REPO_ROOT/target, or CARGO_TARGET_DIR). start-rust refuses to register
+       it, because a later build would replace the executable launchd runs.
+       The running service was not touched."
 fi
 
 # Same hazard, one step removed: the configuration above may already be correct

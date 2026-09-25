@@ -26,10 +26,14 @@ Build the Rust server and CLI from the exact commit being deployed:
 
 ```bash
 cargo build -p sm-server --release
+mkdir -p .local/bin && cp -p target/release/sm-server .local/bin/sm-server
 ```
 
-The service helper defaults to `target/release/sm-server`. Use
-`--binary target/debug/sm-server` only for a local dry run, not production.
+The service helper defaults to the installed copy at `.local/bin/sm-server`.
+`start-rust` refuses any `--binary` inside a cargo target directory (`target/`
+or `$CARGO_TARGET_DIR`), because a later `cargo build` would replace the
+executable launchd runs. After the first cutover, deploy with
+`scripts/restart-rust-server.sh`, which builds, signs, and installs the copy.
 
 ## Pre-Cutover Review
 
