@@ -2,11 +2,13 @@
 
 use super::*;
 use crate::owner_docs::{
-    default_doc_title, doc_name, doc_readable_path, git_blob_sha, is_doc_version,
-    is_full_commit_sha, is_owner_doc_id, render_doc_page, validate_repo_path, validate_repo_slug,
-    DocCache, OwnerDoc, OwnerDocPublish, OwnerDocStore, OwnerDocSummary, PublishOwnerDoc,
-    ReadableDocError, DOC_CACHE_MAX_IDLE,
+    default_doc_title, doc_dir_reader_prefix, doc_name, doc_readable_path, git_blob_sha,
+    is_doc_version, is_full_commit_sha, is_owner_doc_id, render_doc_page, validate_repo_path,
+    validate_repo_slug, DocCache, OwnerDoc, OwnerDocPublish, OwnerDocStore, OwnerDocSummary,
+    PublishOwnerDoc, ReadableDocError, DOC_CACHE_MAX_IDLE,
 };
+use axum::http::header::{ETAG, SET_COOKIE, X_CONTENT_TYPE_OPTIONS};
+use axum::http::HeaderValue;
 
 mod review;
 pub(super) use review::recover_owner_doc_reviews;
@@ -494,17 +496,18 @@ pub(super) fn init_owner_docs(config: &AppConfig) {
     });
 }
 
-fn load_doc_bytes(
+fn load_repo_file(
     source: &dyn OwnerDocSource,
     cache: &DocCache,
-    doc: &OwnerDoc,
+    repo: &str,
+    path: &str,
     commit_sha: &str,
 ) -> Result<Vec<u8>, DocFetchError> {
-    if let Some(bytes) = cache.get(&doc.repo, commit_sha, &doc.path) {
+    if let Some(bytes) = cache.get(repo, commit_sha, path) {
         return Ok(bytes);
     }
-    let bytes = source.fetch_doc(&doc.repo, &doc.path, commit_sha)?;
-    if let Err(error) = cache.put(&doc.repo, commit_sha, &doc.path, &bytes) {
+    let bytes = source.fetch_doc(repo, path, commit_sha)?;
+    if let Err(error) = cache.put(repo, commit_sha, path, &bytes) {
         eprintln!("Owner doc cache write failed: {error:#}");
     }
     Ok(bytes)
@@ -882,15 +885,31 @@ async fn load_doc_bytes_async(
     doc: &OwnerDoc,
     commit_sha: &str,
 ) -> Result<Vec<u8>, ApiError> {
+    load_repo_file_async(state, &doc.repo, &doc.path, commit_sha).await
+}
+
+async fn load_repo_file_async(
+    state: &Arc<AppState>,
+    repo: &str,
+    path: &str,
+    commit_sha: &str,
+) -> Result<Vec<u8>, ApiError> {
     let source = state.owner_doc_source.clone();
     let cache = owner_doc_cache(&state.config);
-    let (fetch_doc, fetch_sha) = (doc.clone(), commit_sha.to_owned());
+    let (fetch_repo, fetch_path, fetch_sha) =
+        (repo.to_owned(), path.to_owned(), commit_sha.to_owned());
     tokio::task::spawn_blocking(move || {
-        load_doc_bytes(source.as_ref(), &cache, &fetch_doc, &fetch_sha)
+        load_repo_file(
+            source.as_ref(),
+            &cache,
+            &fetch_repo,
+            &fetch_path,
+            &fetch_sha,
+        )
     })
     .await
     .map_err(|error| anyhow::anyhow!("doc fetch task failed: {error}"))?
-    .map_err(|error| doc_fetch_api_error(error, &doc.path, commit_sha))
+    .map_err(|error| doc_fetch_api_error(error, path, commit_sha))
 }
 
 /// PR state and head are cached for 30s; `fresh` skips the cache (submit).
@@ -947,17 +966,54 @@ async fn doc_pull_request_async(
 const DOC_TOKEN_TTL_SECONDS: i64 = 24 * 60 * 60;
 pub(super) const DOC_TOKEN_HEADER: &str = "x-sm-doc-token";
 
-fn doc_token_signature(secret: &str, doc_id: &str, expires_at: i64) -> Option<String> {
+/// What a signed doc token opens. The page token is handed to the page's
+/// scripts; the file token lives only in an HttpOnly cookie, so a script
+/// that reads the page token cannot open the files beside the doc with it.
+#[derive(Clone, Copy)]
+enum DocTokenUse {
+    Page,
+    Files,
+}
+
+impl DocTokenUse {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Page => "smdt_",
+            Self::Files => "smdf_",
+        }
+    }
+
+    fn signed_message(self, doc_id: &str, expires_at: i64) -> String {
+        match self {
+            Self::Page => format!("{doc_id}|{expires_at}"),
+            Self::Files => format!("files|{doc_id}|{expires_at}"),
+        }
+    }
+}
+
+fn doc_token_signature(
+    secret: &str,
+    use_: DocTokenUse,
+    doc_id: &str,
+    expires_at: i64,
+) -> Option<String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
-    mac.update(format!("{doc_id}|{expires_at}").as_bytes());
+    mac.update(use_.signed_message(doc_id, expires_at).as_bytes());
     Some(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
 }
 
-fn issue_doc_token_at(config: &AppConfig, doc_id: &str, now: i64) -> Option<String> {
+fn issue_token_at(config: &AppConfig, use_: DocTokenUse, doc_id: &str, now: i64) -> Option<String> {
     let secret = trimmed(&config.google_auth.session_cookie_secret)?;
     let expires_at = now + DOC_TOKEN_TTL_SECONDS;
-    let signature = doc_token_signature(&secret, doc_id, expires_at)?;
-    Some(format!("smdt_{doc_id}.{expires_at}.{signature}"))
+    let signature = doc_token_signature(&secret, use_, doc_id, expires_at)?;
+    Some(format!(
+        "{}{doc_id}.{expires_at}.{signature}",
+        use_.prefix()
+    ))
+}
+
+fn issue_doc_token_at(config: &AppConfig, doc_id: &str, now: i64) -> Option<String> {
+    issue_token_at(config, DocTokenUse::Page, doc_id, now)
 }
 
 pub(super) fn issue_doc_token(config: &AppConfig, doc_id: &str) -> Option<String> {
@@ -965,12 +1021,16 @@ pub(super) fn issue_doc_token(config: &AppConfig, doc_id: &str) -> Option<String
 }
 
 pub(super) fn doc_token_valid(config: &AppConfig, doc_id: &str, token: &str) -> bool {
+    token_valid(config, DocTokenUse::Page, doc_id, token)
+}
+
+fn token_valid(config: &AppConfig, use_: DocTokenUse, doc_id: &str, token: &str) -> bool {
     let Some(secret) = trimmed(&config.google_auth.session_cookie_secret) else {
         return false;
     };
     let Some((token_doc, rest)) = token
         .trim()
-        .strip_prefix("smdt_")
+        .strip_prefix(use_.prefix())
         .and_then(|t| t.split_once('.'))
     else {
         return false;
@@ -987,7 +1047,7 @@ pub(super) fn doc_token_valid(config: &AppConfig, doc_id: &str, token: &str) -> 
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
         return false;
     };
-    mac.update(format!("{token_doc}|{expires_at}").as_bytes());
+    mac.update(use_.signed_message(token_doc, expires_at).as_bytes());
     token_doc == doc_id
         && mac.verify_slice(&signature).is_ok()
         && expires_at > OffsetDateTime::now_utc().unix_timestamp()
@@ -1072,7 +1132,7 @@ async fn view_doc_response(
             .as_ref()
             .map(review::unfinished_review_json),
     });
-    Ok((
+    let mut response = (
         StatusCode::OK,
         [
             (CONTENT_TYPE, "text/html; charset=utf-8".to_owned()),
@@ -1085,7 +1145,204 @@ async fn view_doc_response(
             &review_client_injection(&config),
         )),
     )
-        .into_response())
+        .into_response();
+    if let Some(cookie) = doc_file_cookie(&state.config, doc) {
+        if let Ok(value) = HeaderValue::from_str(&cookie) {
+            response.headers_mut().insert(SET_COOKIE, value);
+        }
+    }
+    Ok(response)
+}
+
+/// The cookie that lets the page's own image and script requests read the
+/// files beside it. The Android reader sends its device token on the page
+/// load only, never on the requests the page makes, so without this the
+/// page renders with broken images there.
+fn doc_file_cookie(config: &AppConfig, doc: &OwnerDoc) -> Option<String> {
+    let token = issue_token_at(
+        config,
+        DocTokenUse::Files,
+        &doc.id,
+        OffsetDateTime::now_utc().unix_timestamp(),
+    )?;
+    Some(format!(
+        "{DOC_FILE_COOKIE_PREFIX}{}={token}; Path={}; Max-Age={DOC_TOKEN_TTL_SECONDS}; HttpOnly; Secure; SameSite=Strict",
+        doc.id,
+        doc_dir_reader_prefix(&doc.repo, &doc.path)
+    ))
+}
+
+const DOC_FILE_COOKIE_PREFIX: &str = "sm_doc_";
+
+/// Static files a doc may reference, by extension. Docs themselves (`.html`,
+/// `.md`) are not in the list: those are read only once published.
+fn doc_file_content_type(path: &str) -> Option<&'static str> {
+    let extension = path.rsplit('/').next()?.rsplit_once('.')?.1;
+    Some(match extension.to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json",
+        "csv" => "text/csv; charset=utf-8",
+        "tsv" => "text/tab-separated-values; charset=utf-8",
+        "txt" => "text/plain; charset=utf-8",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "pdf" => "application/pdf",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        _ => return None,
+    })
+}
+
+/// `GET /docs/<repo-name>/<path>` for a file that is not a published doc but
+/// sits under the directory of one: an image, chart or stylesheet the doc
+/// references by relative path. The file is read from git at the commit of
+/// the revision being read — the Referer's `?version=` when the Referer is
+/// that doc's reader page, the newest publish otherwise.
+///
+/// `owner` says whether the request passed owner auth; without it, only a
+/// file cookie from one of the docs holding the file opens it. `None` means
+/// no published doc holds the file (or none the cookie opens).
+async fn doc_file_response(
+    state: &Arc<AppState>,
+    name: &str,
+    path: &str,
+    headers: &HeaderMap,
+    owner: bool,
+) -> Result<Option<Response>, ApiError> {
+    let Some(content_type) = doc_file_content_type(path) else {
+        return Ok(None);
+    };
+    if validate_repo_path(path).is_err() {
+        return Ok(None);
+    }
+    let has_file_cookie = || {
+        headers.get_all(COOKIE).iter().any(|value| {
+            value
+                .to_str()
+                .is_ok_and(|value| value.contains(DOC_FILE_COOKIE_PREFIX))
+        })
+    };
+    if !owner && !has_file_cookie() {
+        return Ok(None);
+    }
+    let store = owner_doc_store(state);
+    let mut anchors = store.file_anchors(name, path)?;
+    if !owner {
+        // Only the docs whose cookie was presented, so a cookie for one repo
+        // never serves another repo that shares its name.
+        anchors.retain(|(doc, _)| {
+            cookie_value(headers, &format!("{DOC_FILE_COOKIE_PREFIX}{}", doc.id)).is_some_and(
+                |token| token_valid(&state.config, DocTokenUse::Files, &doc.id, &token),
+            )
+        });
+        if anchors.is_empty() {
+            return Ok(None);
+        }
+    }
+    let referred = match referring_doc(headers, name)
+        .filter(|(doc_path, _)| anchors.iter().any(|(doc, _)| doc.path == *doc_path))
+    {
+        Some((doc_path, version)) => {
+            match store.resolve_readable(name, &doc_path, version.as_deref())? {
+                Ok((doc, sha)) => Some((doc.repo, sha)),
+                Err(ReadableDocError::VersionNotFound) => {
+                    readable_pr_head(state, name, &doc_path, version.as_deref())
+                        .await?
+                        .map(|(doc, sha)| (doc.repo, sha))
+                }
+                Err(_) => None,
+            }
+        }
+        None => None,
+    };
+    let Some((repo, commit_sha)) = referred.or_else(|| {
+        anchors
+            .iter()
+            .max_by_key(|(_, publish)| publish.id)
+            .map(|(doc, publish)| (doc.repo.clone(), publish.commit_sha.clone()))
+    }) else {
+        return Ok(None);
+    };
+    let bytes = load_repo_file_async(state, &repo, path, &commit_sha).await?;
+    let etag = format!("\"{}\"", git_blob_sha(&bytes));
+    let fresh = header_text(headers, "if-none-match").is_some_and(|tags| {
+        tags.split(',')
+            .any(|tag| tag.trim().trim_start_matches("W/") == etag)
+    });
+    let status = if fresh {
+        StatusCode::NOT_MODIFIED
+    } else {
+        StatusCode::OK
+    };
+    let body = if fresh {
+        Body::empty()
+    } else {
+        Body::from(bytes)
+    };
+    Ok(Some(
+        (
+            status,
+            [
+                (CONTENT_TYPE, content_type.to_owned()),
+                (CACHE_CONTROL, "private, no-cache".to_owned()),
+                (ETAG, etag),
+                (X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+            ],
+            body,
+        )
+            .into_response(),
+    ))
+}
+
+/// The reader page a request came from, as `(doc path, ?version=)`, when the
+/// Referer is a reader page in the repo named `name`.
+fn referring_doc(headers: &HeaderMap, name: &str) -> Option<(String, Option<String>)> {
+    let referer: Uri = header_text(headers, "referer")?.parse().ok()?;
+    let (repo, path) = referer.path().strip_prefix("/docs/")?.split_once('/')?;
+    if !percent_decode_path_segment(repo)?.eq_ignore_ascii_case(name) {
+        return None;
+    }
+    let path = path
+        .split('/')
+        .map(percent_decode_path_segment)
+        .collect::<Option<Vec<_>>>()?
+        .join("/");
+    let version = referer.query().and_then(|query| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("version="))
+            .map(str::to_owned)
+    });
+    Some((path, version))
+}
+
+/// Percent-decodes one path segment; unlike a query component, `+` stays.
+fn percent_decode_path_segment(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = hex_value(*bytes.get(index + 1)?)?;
+            let low = hex_value(*bytes.get(index + 2)?)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 /// `GET /docs/{id}/head?sha=`: what the banners need. `pr_head_blob_differs`
@@ -1217,7 +1474,13 @@ pub(super) async fn get_owner_doc_subpath(
             Ok(Json(json!({ "drafts": owner_doc_store(&state).drafts(&doc.id)? })).into_response())
         };
     }
-    ensure_owner_page_read_allowed(&state, &request)?;
+    if let Err(error) = ensure_owner_page_read_allowed(&state, &request) {
+        // A doc's file cookie opens the files beside it, and nothing else.
+        return match doc_file_response(&state, &first, &rest, request.headers(), false).await? {
+            Some(response) => Ok(response),
+            None => Err(error),
+        };
+    }
     if let Some(doc) = id_subroute(&state, &first, &rest, &["view", "raw"])? {
         let commit_sha = id_route_commit(&state, &doc, query.sha.as_deref())?;
         return if rest == "raw" {
@@ -1239,6 +1502,12 @@ pub(super) async fn get_owner_doc_subpath(
                 Some(resolved) => resolved,
                 None => return Err(readable_not_found(ReadableDocError::VersionNotFound)),
             }
+        }
+        Err(ReadableDocError::NotFound) => {
+            return match doc_file_response(&state, &first, &rest, request.headers(), true).await? {
+                Some(response) => Ok(response),
+                None => Err(readable_not_found(ReadableDocError::NotFound)),
+            };
         }
         Err(error) => return Err(readable_not_found(error)),
     };
