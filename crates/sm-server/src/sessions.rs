@@ -8762,10 +8762,13 @@ impl SessionStore {
             StateFileStamp::of(&file.metadata().with_context(|| {
                 format!("failed to read session state {}", state_file.display())
             })?);
-        if let Some(parsed) = self
+        // Parse while holding the lock: after a write, every poller misses at
+        // once, and waiting for the first parse is cheaper than repeating it.
+        let mut cached = self
             .parsed_state
             .lock()
-            .map_err(|_| anyhow::anyhow!("session state cache lock poisoned"))?
+            .map_err(|_| anyhow::anyhow!("session state cache lock poisoned"))?;
+        if let Some(parsed) = cached
             .as_ref()
             .filter(|cached| cached.path == state_file && cached.stamp == stamp)
             .map(|cached| Arc::clone(&cached.parsed))
@@ -8778,15 +8781,11 @@ impl SessionStore {
         let raw = serde_json::from_str(&content)
             .with_context(|| format!("failed to parse session state {}", state_file.display()))?;
         let parsed = Arc::new(ParsedState::new(raw));
-        *self
-            .parsed_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session state cache lock poisoned"))? =
-            Some(CachedParsedState {
-                path: state_file.to_path_buf(),
-                stamp,
-                parsed: Arc::clone(&parsed),
-            });
+        *cached = Some(CachedParsedState {
+            path: state_file.to_path_buf(),
+            stamp,
+            parsed: Arc::clone(&parsed),
+        });
         Ok(parsed)
     }
 
