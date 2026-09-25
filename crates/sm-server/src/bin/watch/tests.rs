@@ -912,3 +912,29 @@ fn doc_rows_prefer_the_browser_hostname_link_when_the_server_sends_one() {
         .iter()
         .any(|r| r.text == "   doc · Readout · new · http://127.0.0.1:8420/docs/widgets/notes/read%20out.md?version=cccccccccccc"));
 }
+
+#[test]
+fn owner_review_waits_are_named_and_undelivered_reviews_flagged() {
+    let waiting = json!({"session_id":"a", "waiting_on":[
+        {"kind":"queue_job","id":"j1","label":"tests","since":""},
+        {"kind":"owner_review","id":"d0c00001","label":"Owner review · Decision memo","since":""}]});
+    assert_eq!(
+        obligation_context(&waiting, &[], "a", false, 0),
+        ["Waiting for 1 job and 1 owner review"]
+    );
+    let a = args();
+    let mut view = View::new(&a);
+    view.base_url = "http://127.0.0.1:8420".into();
+    view.expanded.insert("a".into());
+    let snap = Snapshot {
+        sessions: vec![session("a", "", "/repo")],
+        obligations: vec![
+            json!({"session_id":"a", "waiting_on":[], "review_history":[], "docs":[
+            {"id":"d0c00001","title":"Decision memo","state":"reviewed","review_undelivered":true,
+             "reader_path":"/docs/widgets/memo.html?version=aaaaaaaaaaaa"}]}),
+        ],
+        ..Default::default()
+    };
+    assert!(view.rows(&snap, &a, 0).iter().any(|r| r.text
+        == "   doc · Decision memo · reviewed · review not delivered: author retired · http://127.0.0.1:8420/docs/widgets/memo.html?version=aaaaaaaaaaaa"));
+}

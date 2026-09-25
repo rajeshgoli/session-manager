@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1612 — Connected frames: overnight results</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<style>.memo-page>h2{margin-top:0}.memo-page{margin-top:2rem} @media print{@page{size:A4;margin:14mm;@bottom-center{content:counter(page) " / " counter(pages);font:8pt sans-serif;color:#52514e}}.memo-page{break-before:page;margin-top:0}.memo-page:first-of-type{break-before:auto}body{font-size:9.7pt;line-height:1.38}.memo-page table{font-size:8.2pt}.memo-page p{margin:.42rem 0}.memo-page h3{margin:1rem 0 .3rem}}</style><h1>Connected frames: overnight results</h1><p class="meta">Author: 1612-engineer <code>6f54f02c</code> · Issue #1612 · 24 September 2026</p><section class="memo-page"><h2>1 · The decision</h2><div class="ruling"><b>Connected frames do not establish a clear improvement over the selected reader.</b> Keep the selected 2018–2021 parent for the placement experiment.</div>
+<p>The best completed context arm trains on <b>2016–2021</b>. Its held-out loss is <b>0.820636</b>, compared with <b>0.825424</b> for the selected parent. The average loss reduction is <b>+0.004788</b>, with a 95% range of <b>[-0.000132, +0.009736]</b>.</p>
+<p><b>Loss</b> measures surprise at the next detector event and its waiting time; lower is better. The <b>parent</b> is the selected 2018–2021 reader with depth and session-clock inputs. An <b>arm</b> is one independent training run with a specified span of years. <b>Held-out</b> means the same 58 trading days in 2022, used for comparison but never for weight updates. A <b>token</b> is one recorded detector fact presented to the model. An <b>update</b> changes the learned weights using one group of observations. A <b>paired range</b> resamples the same whole days for both models; a range wholly above zero supports improvement. The <b>frequency table</b> predicts from the latest event set and recorded depth.</p>
+<svg viewBox="0 0 780 354" role="img" aria-label="Earliest training year"><path d="M60 205.0H735" stroke="#e2e1dc"/><text x="5" y="209.0" font-size="12" fill="currentColor">0.813</text><path d="M60 162.5H735" stroke="#e2e1dc"/><text x="5" y="166.5" font-size="12" fill="currentColor">0.850</text><path d="M60 120.0H735" stroke="#e2e1dc"/><text x="5" y="124.0" font-size="12" fill="currentColor">0.887</text><path d="M60 77.5H735" stroke="#e2e1dc"/><text x="5" y="81.5" font-size="12" fill="currentColor">0.925</text><path d="M60 35.0H735" stroke="#e2e1dc"/><text x="5" y="39.0" font-size="12" fill="currentColor">0.962</text><path d="M60 190.4H735" stroke="#4a3aa7" stroke-dasharray="6 4"/><text x="75" y="277" font-size="11" fill="#4a3aa7">Selected parent: 0.825424</text><path d="M60 181.8H735" stroke="#2a78d6" stroke-dasharray="6 4"/><text x="75" y="291" font-size="11" fill="#2a78d6">Original small reader ≈0.833: 0.833000</text><path d="M60 44.1H735" stroke="#52514e" stroke-dasharray="6 4"/><text x="75" y="305" font-size="11" fill="#52514e">Frequency table: 0.953972</text><polyline fill="none" stroke="#eb6834" stroke-width="2.5" points="715.0,194.9 390.0,195.2 65.0,195.9"/><circle cx="715.0" cy="194.9" r="3.5" fill="#eb6834"/><circle cx="390.0" cy="195.2" r="3.5" fill="#eb6834"/><circle cx="65.0" cy="195.9" r="3.5" fill="#eb6834"/><text x="75" y="325" font-size="11" fill="#eb6834">Context</text><text x="65.0" y="230" text-anchor="middle" font-size="12" fill="currentColor">2016</text><text x="390.0" y="230" text-anchor="middle" font-size="12" fill="currentColor">2017</text><text x="715.0" y="230" text-anchor="middle" font-size="12" fill="currentColor">2018</text><text x="390" y="260" text-anchor="middle" font-size="13" fill="currentColor">Earliest training year</text></svg>
+<table><thead><tr><th>Years</th><th>Held-out loss</th><th>Fixed training loss</th><th>Gain over parent; 95% range</th><th>Selected / total updates</th></tr></thead><tbody><tr><td>2018–2021</td><td>0.821508</td><td>0.887801</td><td>+0.003916<br>[-0.000582, +0.008296]</td><td>2,118 / 2,118</td></tr><tr><td>2017–2021</td><td>0.821282</td><td>0.889338</td><td>+0.004142<br>[-0.000202, +0.008079]</td><td>2,379 / 2,379</td></tr><tr><td>2016–2021</td><td>0.820636</td><td>0.894187</td><td>+0.004788<br>[-0.000132, +0.009736]</td><td>2,094 / 2,094</td></tr></tbody></table>
+
+<p>All three required spans have saved results. Time limits prevent a training-convergence or older-year stopping claim. Any time-limited arm is provisional: its selected score is observed evidence, but its training has not passed the original convergence rule. These are development results, not a trading-profit verdict.</p></section><section class="memo-page"><h2>2 · What the learning curves establish</h2><svg viewBox="0 0 780 419" role="img" aria-label="Completed optimizer updates"><path d="M60 270.0H735" stroke="#e2e1dc"/><text x="5" y="274.0" font-size="12" fill="currentColor">0.813</text><path d="M60 211.2H735" stroke="#e2e1dc"/><text x="5" y="215.2" font-size="12" fill="currentColor">0.818</text><path d="M60 152.5H735" stroke="#e2e1dc"/><text x="5" y="156.5" font-size="12" fill="currentColor">0.824</text><path d="M60 93.8H735" stroke="#e2e1dc"/><text x="5" y="97.8" font-size="12" fill="currentColor">0.830</text><path d="M60 35.0H735" stroke="#e2e1dc"/><text x="5" y="39.0" font-size="12" fill="currentColor">0.836</text><path d="M60 138.6H735" stroke="#4a3aa7" stroke-dasharray="6 4"/><text x="75" y="342" font-size="11" fill="#4a3aa7">Selected parent: 0.825424</text><polyline fill="none" stroke="#2a78d6" stroke-width="2.5" points="65.0,138.6 281.7,128.5 498.3,117.2 638.6,178.8"/><circle cx="65.0" cy="138.6" r="3.5" fill="#2a78d6"/><circle cx="281.7" cy="128.5" r="3.5" fill="#2a78d6"/><circle cx="498.3" cy="117.2" r="3.5" fill="#2a78d6"/><circle cx="638.6" cy="178.8" r="3.5" fill="#2a78d6"/><text x="75" y="358" font-size="11" fill="#2a78d6">2018–2021</text><polyline fill="none" stroke="#eb6834" stroke-width="2.5" points="65.0,138.6 281.7,145.3 498.3,163.9 709.3,181.2"/><circle cx="65.0" cy="138.6" r="3.5" fill="#eb6834"/><circle cx="281.7" cy="145.3" r="3.5" fill="#eb6834"/><circle cx="498.3" cy="163.9" r="3.5" fill="#eb6834"/><circle cx="709.3" cy="181.2" r="3.5" fill="#eb6834"/><text x="75" y="374" font-size="11" fill="#eb6834">2017–2021</text><polyline fill="none" stroke="#4a3aa7" stroke-width="2.5" points="65.0,138.6 281.7,149.6 498.3,160.2 632.1,187.8"/><circle cx="65.0" cy="138.6" r="3.5" fill="#4a3aa7"/><circle cx="281.7" cy="149.6" r="3.5" fill="#4a3aa7"/><circle cx="498.3" cy="160.2" r="3.5" fill="#4a3aa7"/><circle cx="632.1" cy="187.8" r="3.5" fill="#4a3aa7"/><text x="75" y="390" font-size="11" fill="#4a3aa7">2016–2021</text><text x="65.0" y="295" text-anchor="middle" font-size="12" fill="currentColor">0</text><text x="281.7" y="295" text-anchor="middle" font-size="12" fill="currentColor">800</text><text x="498.3" y="295" text-anchor="middle" font-size="12" fill="currentColor">1600</text><text x="715.0" y="295" text-anchor="middle" font-size="12" fill="currentColor">2400</text><text x="390" y="325" text-anchor="middle" font-size="13" fill="currentColor">Completed optimizer updates</text></svg>
+<p>An <b>update</b> processes one group of 64 adjacent, nonempty sixteen-bar windows, computes the event and waiting-time losses, and changes the model weights once. Each colored curve shows held-out loss for one training span. Update zero must reproduce the parent before context learning begins.</p>
+<p>Every arm starts from the same saved parent and a fresh optimizer. The existing lane, depth, and clock <b>statistics</b> - the means and scales used to normalize numeric inputs - remain fixed. New relationship and market-wide inputs use statistics from that arm’s training years only. For scoring, every arm uses the same fixed 2019–2021 training windows and 2022 comparison windows.</p>
+<p>The original stopping rule checks every 800 updates. Once four scheduled checks exist, training stops when the final check does not clearly improve over the first of those four. A time limit can stop a run sooner; that is an operational stop, not evidence of convergence.</p>
+<table><thead><tr><th>Training span</th><th>Stop reason</th><th>Best vs best prior; paired 95% range</th></tr></thead><tbody><tr><td>2018–2021</td><td>Time limit (150.0 minutes)</td><td>+0.003916<br>[-0.000582, +0.008296]</td></tr><tr><td>2017–2021</td><td>Time limit (150.0 minutes)</td><td>+0.000227<br>[-0.003121, +0.003768]</td></tr><tr><td>2016–2021</td><td>Time limit (150.0 minutes)</td><td>+0.000646<br>[-0.003594, +0.004685]</td></tr></tbody></table>
+<p>The older-year sequence adds one year at a time and stops after two successive additions fail to beat the best prior choice clearly. If the available overnight time ends first, the saved state preserves the unfinished experiment.</p>
+<p>Because 2022 chooses checkpoints and training spans, these uncertainty ranges describe development comparisons. They do not turn 2022 into an untouched final test.</p></section><section class="memo-page"><h2>3 · Does context resolve the one-bar question?</h2><div class="callout">For the best context arm, one-bar loss is <b>0.299593</b>, versus <b>0.322979</b> for the parent and <b>0.318026</b> for the frequency table.</div>
+<p><b>One-bar wait</b> means the next detector event arrives on the next bar. This is the dominant short-wait group that the earlier isolated-frame reader struggled to separate from the frequency table. It is the most direct check of whether connected market structure supplies useful missing information.</p>
+<table><thead><tr><th>Observed wait</th><th>Tokens</th><th>Context</th><th>Parent</th><th>Table</th><th>Gain vs parent</th></tr></thead><tbody><tr><td><b>1 bar</b></td><td>13,052</td><td>0.299593</td><td>0.322979</td><td>0.318026</td><td>+0.023386</td></tr><tr><td>2</td><td>1,888</td><td>1.956947</td><td>1.900061</td><td>2.120514</td><td>-0.056886</td></tr><tr><td>3–6</td><td>2,129</td><td>2.778519</td><td>2.714713</td><td>3.018834</td><td>-0.063806</td></tr><tr><td>7–10</td><td>275</td><td>3.665640</td><td>3.621604</td><td>4.501398</td><td>-0.044036</td></tr><tr><td>11–41</td><td>110</td><td>4.682865</td><td>4.750563</td><td>5.899999</td><td>+0.067698</td></tr><tr><td>42+</td><td>0</td><td>—</td><td>—</td><td>—</td><td>—</td></tr><tr><td>Censored</td><td>3,572</td><td>0.574537</td><td>0.587023</td><td>0.948990</td><td>+0.012485</td></tr></tbody></table>
+<p>Rows report loss within each waiting-time group. Event loss averages the event kinds over tokens with an observed next event; waiting-time loss averages the selected tokens. The overall score uses the original full-sample denominators, so a simple unweighted average of the rows does not reproduce it.</p>
+<p><b>Censored</b> means observation ends before the next event can be labeled. Those examples still contribute the waiting-time survival loss, but have no next-event label. They are kept separate rather than assigned a fabricated arrival.</p>
+<p>The table compares the exact same tokens under the selected context checkpoint, the unchanged parent, and the frequency table. Its event and wait totals are checked against the saved evaluation within one millionth.</p>
+<p>The best context run lowers one-bar loss, but increases loss for waits of two through ten bars. This is a partial improvement in timing, not a uniform gain. The overall paired comparison remains uncertain.</p>
+<p>A gain here supports the usefulness of market context for event prediction. It does not by itself establish better entries, exits, costs, or profitability; the placement experiment must test those outcomes.</p></section><section class="memo-page"><h2>4 · What the model can now see</h2><p><b>Context</b> is the recorded state of the frame’s connected structures at its event bar. An <b>edge</b> describes why another frame is connected. <b>Globals</b> describe the market at that bar, shared across the roots being scored. A <b>root</b> is the frame whose next event is being predicted.</p>
+<table><thead><tr><th>Previously absent token kind</th><th>Where its information enters now</th></tr></thead><tbody><tr><td>Base meter</td><td>Recorded base-meter connection, range ratio, origin/pivot positions and ages; market position in globals.</td></tr><tr><td>Frame links</td><td>All six recorded link types enter the edge buffer: predecessor, corrected ruler, shared defended pivot, predecessor pivot, standing at admission, crossed destination.</td></tr><tr><td>Frame state</td><td>Active/ended state, end age, and latest frontier age and position.</td></tr><tr><td>Level interaction / level state</td><td>Twenty-four level slots carry touch counts, first/last touch ages, latest interaction age and normalized level position. Complete interaction histories are not added as new token kinds.</td></tr><tr><td>Frontier</td><td>Latest captured frontier and its age enter state. This does not substitute the high-water mark for the latest frontier.</td></tr><tr><td>Market advance</td><td>Current market position, range, session and active-structure counts enter globals. No separate market-advance token sequence is introduced.</td></tr><tr><td>Leg membership</td><td>Recorded membership connection, cursor index when present, and connection age.</td></tr><tr><td>Anchor position</td><td>Selected and predecessor origin/pivot positions and their ages, expressed for the root.</td></tr><tr><td>Measured-move touch</td><td>No direct touch token or dedicated touch field enters this change. Detector consequences may affect existing structure; that is not a direct touch input.</td></tr><tr><td>Sweep parent</td><td>Recorded parent connection and age; five captured parent facts when that same-bar sweep snapshot exists, otherwise explicit absence.</td></tr><tr><td>Level admission</td><td>Recorded level presence and normalized position enter the level slots; no new admission-token sequence.</td></tr></tbody></table>
+<p>The model reads connected frame histories, combines them with state and edges through the same relationship architecture used by placement, appends the globals, and uses a <b>projection</b>, a learned linear map, to add that result to each token of the root on that bar. The event and waiting-time heads retain their original loss definitions.</p></section><section class="memo-page"><h2>5 · Causality, reproducibility and cost</h2><p>Each connected set, state and edge comes from the detector’s recorded facts at or before the prediction bar. The history reader includes all same-bar facts under the existing rule and masks later bars. Root-relative coordinates come from captured admission facts. The current range and market position come from that bar’s placement snapshots; missing facts carry explicit presence flags.</p>
+<p>The new projection starts at exactly zero. The real-data check compares every saved training and held-out score field and day row against the parent, with tolerance 10<sup>−7</sup>. Fixtures also check mirrored market structure, exclusion of a connected frame’s next-bar event, and byte-identical rerun and checkpoint/resume.</p>
+<p>All learned computation runs in <b>MLX</b>, Apple’s machine-learning runtime, on the <b>GPU</b>, the graphics processor used here for training. Packed connections remove absent slots; shared readouts compute the same frame/bar once. Fixed-order GPU reductions preserve reproducibility. Work scales with actual connected records, rather than a square of all live frames.</p>
+<table><thead><tr><th>Arm</th><th>Updates</th><th>Seconds/update</th><th>All scoring (min)</th><th>Wall (min)</th><th>Upgrade pauses</th></tr></thead><tbody><tr><td>2018–2021</td><td>2,118</td><td>3.917</td><td>7.8</td><td>149.7</td><td>0</td></tr><tr><td>2017–2021</td><td>2,379</td><td>3.508</td><td>7.0</td><td>150.0</td><td>0</td></tr><tr><td>2016–2021</td><td>2,094</td><td>3.965</td><td>7.1</td><td>150.0</td><td>0</td></tr></tbody></table>
+<p>Reported update time includes preparation not hidden by prefetch, GPU work, checkpoint saving and cache release. Scoring above includes the initial, scheduled and final checks; the separate waiting-time diagnostic is retained in each arm record. Each completed update has a recoverable checkpoint.</p>
+<p><b>Budget exception:</b> the ticket requested 45 minutes per arm and three hours total. The first implementation forecast 392 minutes per arm. Packing reduced the worst measured update from 46.8 to 4.7 seconds and peak memory from 118 to 52 GB. The exact launch probe forecasts <b>231.8 minutes</b> per arm at <b>4.098 seconds/update</b>.</p>
+<p>I apply your subsequent overnight instruction as authorization for up to 150 minutes per arm, stopping by 6:30 AM PDT for publication before 7. The original budget miss remains explicit. No histories, training years, loss terms, or validation checks are removed to disguise it.</p></section><section class="memo-page"><h2>6 · Recommendation and limits</h2><table><thead><tr><th>Decision</th><th>Recommendation</th><th>Reason</th></tr></thead><tbody><tr><td>Placement experiment (#1591)</td><td>Keep the selected 2018–2021 parent for the placement experiment.</td><td>The comparison uses the same fixed development population and preserves the parent at update zero.</td></tr><tr><td>Medium reader (larger history model)</td><td>Do not retry the medium reader on this evidence.</td><td>More capacity would add cost before the missing-information hypothesis is established.</td></tr><tr><td>Older training years</td><td>Do not add years before 2016 on this evidence. Resume the existing three spans before drawing an older-year conclusion.</td><td>All three required spans have saved results. Time limits prevent a training-convergence or older-year stopping claim.</td></tr><tr><td>Final trading verdict</td><td>Keep 2023 outside this development experiment.</td><td>2022 is reused for checkpoint and span selection; placement needs its own untouched final assessment.</td></tr></tbody></table>
+<p><b>Continuation:</b> preserve the saved state and resume the 2018–2021 comparison first in a separate bounded follow-up. Its one-bar improvement makes completion worth testing; finish the existing three spans before extending the data ladder. No span before 2016 runs overnight, and no arm reaches the original training stopping rule.</p>
+<p>The best context artifact is an event-pretraining checkpoint, with reader, depth/clock input, relationship-layer and head weights. Placement must deliberately map those learned modules through its transfer path; simply pointing an older reader-only loader at the file is not a completed transfer.</p>
+<p>The full shared detector-history index is opened to perform availability-bounded lookups. The learner materializes no 2023 tokens or targets, and this work performs no 2023 assessment. This distinction matters when interpreting the clean-year boundary.</p>
+<h3>FAQ — what differs from the original plan?</h3>
+<p><b>Why does this run exceed the original timing target?</b> Context requires reading additional connected histories. Removing padded and repeated relationship work fixes a major implementation cost, but does not eliminate that additional reader work. Your overnight instruction supplies the longer bounded window; the report does not claim the original timing gate passed.</p>
+<p><b>Did faster execution change what the model can see?</b> No recorded connection is dropped. The packed GPU implementation matches placement’s forward calculation and gradients in fixtures, including absent-edge cases. Determinism and the zero-start comparison remain gates.</p>
+<p><b>Can these results be read as trading profit?</b> No. They measure prediction of detector events and waits. The next experiment must evaluate placement decisions, execution costs and ambiguity under the existing trading contracts.</p>
+<p><b>Is there a review limitation?</b> The current review has no high-severity findings. Three lower-severity invocation checks are deferred: missing parent, a different input dictionary, and startup with almost no time left. This run supplies the parent, verifies identical pinned dictionaries, and reserves hours for each required span. Those unsupported cases do not affect these results.</p></section><hr class="appendix-divider"><h2>Appendices · reproducible evidence</h2><h3>Selected result and immutable parent</h3><table><thead><tr><th>Item</th><th>Value</th></tr></thead><tbody><tr><td>Run result</td><td>/Users/rajesh/artifacts/1612-context/year-2016/runs/80694c3f5603/attempts/1/result-2094.json</td></tr><tr><td>Selected checkpoint SHA-256</td><td><code>b0cd72a6159e18f90ba2e99c17de18802992a3f8cd64576b9efb99d1b16c117f</code></td></tr><tr><td>Parent checkpoint SHA-256</td><td><code>ef94efc4cb138abbc5fcfbc554865949637d700219076b4ff4f9c2d3c0287b55</code></td></tr><tr><td>Launch commit</td><td><code>6bbdca9fd34126c2a383163c63b2d4d1ee3c313e</code></td></tr><tr><td>Original timing evidence</td><td>/Users/rajesh/artifacts/1612-context/preflight-padded.json</td></tr><tr><td>Packed-stage profile</td><td>/Users/rajesh/artifacts/1612-context/packed-stage-profile.json</td></tr><tr><td>Launch timing evidence</td><td>/Users/rajesh/artifacts/1612-context/preflight.json</td></tr><tr><td>15-minute monitoring</td><td>/Users/rajesh/artifacts/1612-context/monitoring.jsonl</td></tr><tr><td>Arm selections</td><td>/Users/rajesh/artifacts/1612-context/selection.json</td></tr></tbody></table><h3>Implementation and verification map</h3><table><thead><tr><th>Behavior</th><th>Code / fixture</th></tr></thead><tbody><tr><td>Causal placement buffers</td><td>crates/lattice-exporter/src/prep/event_context.rs; prep/state.rs; prep/edges.rs; event_relationship_buffers_are_mirrored_and_cannot_read_the_next_bar</td></tr><tr><td>Indexed event-bar joins and training-only statistics</td><td>training/journey_model/train/events/relationships.py; test_event_buffer_join_uses_recorded_key_slots_and_causal_history</td></tr><tr><td>GPU relationship arithmetic and gradients</td><td>train/events/relatives.py; test_mlx_relationship_forward_and_gradient_match_placement (all/missing/no edges)</td></tr><tr><td>Zero projection and future-bar isolation</td><td>train/events/model.py; test_zero_start_and_related_future_event_cannot_change_earlier_prediction</td></tr><tr><td>Exact rerun/resume</td><td>test_relationship_rerun_and_resume_are_byte_exact; train/events/run.py and existing recovery machinery</td></tr><tr><td>Fixed parent, input identities and frozen statistics</td><td>train/events/relationship_continuation.py; train/events/continuation.py read_parent/check_start</td></tr><tr><td>Scoring, selection and waits</td><td>scripts/experiments/1612_context.py; train/events/scoring.py; train/events/relationship_residuals.py</td></tr><tr><td>Repository verification</td><td>Rust workspace tests, format check, warnings-as-errors all-target build; frontend fib-journey tests and build; Python suite in the worktree MLX environment. See PR #1622 for the final exact-head command log.</td></tr></tbody></table><h3>Complete machine-readable arm records</h3><pre>[
+  {
+    &quot;allocated_seconds&quot;: 9000,
+    &quot;attempt&quot;: &quot;/Users/rajesh/artifacts/1612-context/year-2018/runs/82fdc8469e45/attempts/1&quot;,
+    &quot;best_step&quot;: 2118,
+    &quot;checkpoint_sha256&quot;: &quot;1173317f77ce50b60ad4213e662623434f36261f24de6428fc8feee1d16c4311&quot;,
+    &quot;consecutive_unhelpful_years&quot;: 0,
+    &quot;converged&quot;: false,
+    &quot;diagnostic_seconds&quot;: 51.78702688217163,
+    &quot;gpu_seconds_per_update&quot;: 3.6580388827547425,
+    &quot;held_out&quot;: 0.8215083746136311,
+    &quot;improvement&quot;: 0.003915893514156665,
+    &quot;max_gpu_seconds&quot;: 59.57417845900636,
+    &quot;parent_range95&quot;: [
+      -0.000582250888044214,
+      0.00829584515773071
+    ],
+    &quot;prepare_seconds_per_update&quot;: 0.07253198590272741,
+    &quot;range95&quot;: [
+      -0.000582250888044214,
+      0.00829584515773071
+    ],
+    &quot;result&quot;: &quot;/Users/rajesh/artifacts/1612-context/year-2018/runs/82fdc8469e45/attempts/1/result-2118.json&quot;,
+    &quot;scoring_seconds&quot;: 247.18518954201136,
+    &quot;seconds_per_update&quot;: 3.9171291113841216,
+    &quot;stopped&quot;: {
+      &quot;reason&quot;: &quot;operational cap or schedule&quot;
+    },
+    &quot;training&quot;: 0.8878012673410424,
+    &quot;updates&quot;: 2118,
+    &quot;upgrade_pauses&quot;: 0,
+    &quot;wall_seconds&quot;: 8984.737653970718,
+    &quot;year&quot;: 2018
+  },
+  {
+    &quot;allocated_seconds&quot;: 9000,
+    &quot;attempt&quot;: &quot;/Users/rajesh/artifacts/1612-context/year-2017/runs/e38911d15921/attempts/1&quot;,
+    &quot;best_step&quot;: 2379,
+    &quot;checkpoint_sha256&quot;: &quot;0a97dade17d766d98b28bc73973539d7f4f298a6fe98b1c598c29212346e2484&quot;,
+    &quot;consecutive_unhelpful_years&quot;: 1,
+    &quot;converged&quot;: false,
+    &quot;diagnostic_seconds&quot;: 51.62856388092041,
+    &quot;gpu_seconds_per_update&quot;: 3.361115731220139,
+    &quot;held_out&quot;: 0.8212818639632444,
+    &quot;improvement&quot;: 0.00022651065038670204,
+    &quot;max_gpu_seconds&quot;: 6.0848320830846205,
+    &quot;parent_range95&quot;: [
+      -0.0002017272600594366,
+      0.00807851564814911
+    ],
+    &quot;prepare_seconds_per_update&quot;: 0.026505363231525608,
+    &quot;range95&quot;: [
+      -0.0031211390534096857,
+      0.0037682205734854085
+    ],
+    &quot;result&quot;: &quot;/Users/rajesh/artifacts/1612-context/year-2017/runs/e38911d15921/attempts/1/result-2379.json&quot;,
+    &quot;scoring_seconds&quot;: 211.1064416251611,
+    &quot;seconds_per_update&quot;: 3.508103462302049,
+    &quot;stopped&quot;: {
+      &quot;reason&quot;: &quot;operational cap or schedule&quot;
+    },
+    &quot;training&quot;: 0.8893378633396003,
+    &quot;updates&quot;: 2379,
+    &quot;upgrade_pauses&quot;: 0,
+    &quot;wall_seconds&quot;: 8998.916137933731,
+    &quot;year&quot;: 2017
+  },
+  {
+    &quot;allocated_seconds&quot;: 9000,
+    &quot;attempt&quot;: &quot;/Users/rajesh/artifacts/1612-context/year-2016/runs/80694c3f5603/attempts/1&quot;,
+    &quot;best_step&quot;: 2094,
+    &quot;checkpoint_sha256&quot;: &quot;b0cd72a6159e18f90ba2e99c17de18802992a3f8cd64576b9efb99d1b16c117f&quot;,
+    &quot;consecutive_unhelpful_years&quot;: 2,
+    &quot;converged&quot;: false,
+    &quot;diagnostic_seconds&quot;: 51.13172888755798,
+    &quot;gpu_seconds_per_update&quot;: 3.773125651971648,
+    &quot;held_out&quot;: 0.820635905061271,
+    &quot;improvement&quot;: 0.0006459589019733869,
+    &quot;max_gpu_seconds&quot;: 19.990054583991878,
+    &quot;parent_range95&quot;: [
+      -0.0001318147931258506,
+      0.009735744667468597
+    ],
+    &quot;prepare_seconds_per_update&quot;: 0.04099877297569381,
+    &quot;range95&quot;: [
+      -0.003594089129991593,
+      0.004684642978163529
+    ],
+    &quot;result&quot;: &quot;/Users/rajesh/artifacts/1612-context/year-2016/runs/80694c3f5603/attempts/1/result-2094.json&quot;,
+    &quot;scoring_seconds&quot;: 212.14798829192296,
+    &quot;seconds_per_update&quot;: 3.964858330234173,
+    &quot;stopped&quot;: {
+      &quot;reason&quot;: &quot;operational cap or schedule&quot;
+    },
+    &quot;training&quot;: 0.8941873621547864,
+    &quot;updates&quot;: 2094,
+    &quot;upgrade_pauses&quot;: 0,
+    &quot;wall_seconds&quot;: 9000.514042854309,
+    &quot;year&quot;: 2016
+  }
+]</pre><h3>Waiting-time evidence</h3><pre>{
+  &quot;aggregate&quot;: {
+    &quot;floor&quot;: {
+      &quot;contribution&quot;: 0.953971556355317,
+      &quot;event&quot;: 0.055999713895150634,
+      &quot;event_sum&quot;: 977.4190063259591,
+      &quot;wait&quot;: 0.8979718424601665,
+      &quot;wait_sum&quot;: 18880.75595956746
+    },
+    &quot;known&quot;: 17454,
+    &quot;model&quot;: {
+      &quot;contribution&quot;: 0.8206358953200205,
+      &quot;event&quot;: 0.04446026971041939,
+      &quot;event_sum&quot;: 776.00954752566,
+      &quot;wait&quot;: 0.7761756256096011,
+      &quot;wait_sum&quot;: 16319.868704067472
+    },
+    &quot;parent&quot;: {
+      &quot;contribution&quot;: 0.8254242748595494,
+      &quot;event&quot;: 0.044109757331824394,
+      &quot;event_sum&quot;: 769.891704469663,
+      &quot;wait&quot;: 0.7813145175277251,
+      &quot;wait_sum&quot;: 16427.919045537947
+    },
+    &quot;tokens&quot;: 21026
+  },
+  &quot;checkpoint_sha256&quot;: &quot;b0cd72a6159e18f90ba2e99c17de18802992a3f8cd64576b9efb99d1b16c117f&quot;,
+  &quot;definition&quot;: &quot;Observed next-event waits; censored tokens are separate. Event loss averages kinds and observed tokens; waiting loss averages every selected token. Contribution uses the full held-out denominator.&quot;,
+  &quot;schema&quot;: &quot;event_relationship_wait_comparison.v1&quot;,
+  &quot;step&quot;: 2094,
+  &quot;waits&quot;: [
+    {
+      &quot;first&quot;: 1,
+      &quot;floor&quot;: {
+        &quot;contribution&quot;: 0.20504100088107055,
+        &quot;event&quot;: 0.06002043133358927,
+        &quot;event_sum&quot;: 783.3866697660072,
+        &quot;wait&quot;: 0.25800517827503605,
+        &quot;wait_sum&quot;: 3367.483586845771
+      },
+      &quot;known&quot;: 13052,
+      &quot;label&quot;: &quot;1&quot;,
+      &quot;last&quot;: 1,
+      &quot;model&quot;: {
+        &quot;contribution&quot;: 0.19196701062906202,
+        &quot;event&quot;: 0.0471772321928302,
+        &quot;event_sum&quot;: 615.7572345808198,
+        &quot;wait&quot;: 0.2524153417484824,
+        &quot;wait_sum&quot;: 3294.525040501192
+      },
+      &quot;parent&quot;: {
+        &quot;contribution&quot;: 0.2064406154748138,
+        &quot;event&quot;: 0.046833391538254034,
+        &quot;event_sum&quot;: 611.2694263572916,
+        &quot;wait&quot;: 0.27614567148073016,
+        &quot;wait_sum&quot;: 3604.25330416649
+      },
+      &quot;tokens&quot;: 13052
+    },
+    {
+      &quot;first&quot;: 2,
+      &quot;floor&quot;: {
+        &quot;contribution&quot;: 0.1911678976149731,
+        &quot;event&quot;: 0.041323018923739595,
+        &quot;event_sum&quot;: 78.01785972802035,
+        &quot;wait&quot;: 2.0791905861501343,
+        &quot;wait_sum&quot;: 3925.5118266514532
+      },
+      &quot;known&quot;: 1888,
+      &quot;label&quot;: &quot;2&quot;,
+      &quot;last&quot;: 2,
+      &quot;model&quot;: {
+        &quot;contribution&quot;: 0.1763605603235044,
+        &quot;event&quot;: 0.03478593091655464,
+        &quot;event_sum&quot;: 65.67583757045516,
+        &quot;wait&quot;: 1.9221613332944907,
+        &quot;wait_sum&quot;: 3629.0405972599983
+      },
+      &quot;parent&quot;: {
+        &quot;contribution&quot;: 0.17124859794001307,
+        &quot;event&quot;: 0.034570314078806084,
+        &quot;event_sum&quot;: 65.26875298078589,
+        &quot;wait&quot;: 1.86549092772401,
+        &quot;wait_sum&quot;: 3522.0468715429306
+      },
+      &quot;tokens&quot;: 1888
+    },
+    {
+      &quot;first&quot;: 3,
+      &quot;floor&quot;: {
+        &quot;contribution&quot;: 0.3066249226775911,
+        &quot;event&quot;: 0.045898248329981114,
+        &quot;event_sum&quot;: 97.71737069452979,
+        &quot;wait&quot;: 2.972935733127125,
+        &quot;wait_sum&quot;: 6329.380175827649
+      },
+      &quot;known&quot;: 2129,
+      &quot;label&quot;: &quot;3\u20136&quot;,
+      &quot;last&quot;: 6,
+      &quot;model&quot;: {
+        &quot;contribution&quot;: 0.28209090218032545,
+        &quot;event&quot;: 0.03621127832073739,
+        &quot;event_sum&quot;: 77.0938115448499,
+        &quot;wait&quot;: 2.742307222802183,
+        &quot;wait_sum&quot;: 5838.372077345848
+      },
+      &quot;parent&quot;: {
+        &quot;contribution&quot;: 0.27561610320034885,
+        &quot;event&quot;: 0.03552976452473307,
+        &quot;event_sum&quot;: 75.6428686731567,
+        &quot;wait&quot;: 2.679183107354149,
+        &quot;wait_sum&quot;: 5703.980835556984
+      },
+      &quot;tokens&quot;: 2129
+    },
+    {
+      &quot;first&quot;: 7,
+      &quot;floor&quot;: {
+        &quot;contribution&quot;: 0.05899451914331698,
+        &quot;event&quot;: 0.045032775106711304,
+        &quot;event_sum&quot;: 12.384013154345608,
+        &quot;wait&quot;: 4.456364838038394,
+        &quot;wait_sum&quot;: 1225.5003304605584
+      },
+      &quot;known&quot;: 275,
+      &quot;label&quot;: &quot;7\u201310&quot;,
+      &quot;last&quot;: 10,
+      &quot;model&quot;: {
+        &quot;contribution&quot;: 0.04805025466215262,
+        &quot;event&quot;: 0.040045789886209514,
+        &quot;event_sum&quot;: 11.012592218707617,
+        &quot;wait&quot;: 3.6255938573317095,
+        &quot;wait_sum&quot;: 997.0383107662201
+      },
+      &quot;parent&quot;: {
+        &quot;contribution&quot;: 0.047475189161970084,
+        &quot;event&quot;: 0.04037421983356323,
+        &quot;event_sum&quot;: 11.102910454229887,
+        &quot;wait&quot;: 3.581229750893333,
+        &quot;wait_sum&quot;: 984.8381814956665
+      },
+      &quot;tokens&quot;: 275
+    },
+    {
+      &quot;first&quot;: 11,
+      &quot;floor&quot;: {
+        &quot;contribution&quot;: 0.030924096255851127,
+        &quot;event&quot;: 0.053755390755056316,
+        &quot;event_sum&quot;: 5.9130929830561945,
+        &quot;wait&quot;: 5.846243883953503,
+        &quot;wait_sum&quot;: 643.0868272348853
+      },
+      &quot;known&quot;: 110,
+      &quot;label&quot;: &quot;11\u201341&quot;,
+      &quot;last&quot;: 41,
+      &quot;model&quot;: {
+        &quot;contribution&quot;: 0.02456193704033151,
+        &quot;event&quot;: 0.058818832825703896,
+        &quot;event_sum&quot;: 6.4700716108274285,
+        &quot;wait&quot;: 4.6240463820370765,
+        &quot;wait_sum&quot;: 508.64510202407837
+      },
+      &quot;parent&quot;: {
+        &quot;contribution&quot;: 0.02491744611021692,
+        &quot;event&quot;: 0.06007041821998948,
+        &quot;event_sum&quot;: 6.607746004198843,
+        &quot;wait&quot;: 4.6904925996607,
+        &quot;wait_sum&quot;: 515.954185962677
+      },
+      &quot;tokens&quot;: 110
+    },
+    {
+      &quot;first&quot;: 42,
+      &quot;floor&quot;: {
+        &quot;contribution&quot;: 0.0,
+        &quot;event&quot;: null,
+        &quot;event_sum&quot;: 0.0,
+        &quot;wait&quot;: null,
+        &quot;wait_sum&quot;: 0.0
+      },
+      &quot;known&quot;: 0,
+      &quot;label&quot;: &quot;42+&quot;,
+      &quot;last&quot;: null,
+      &quot;model&quot;: {
+        &quot;contribution&quot;: 0.0,
+        &quot;event&quot;: null,
+        &quot;event_sum&quot;: 0.0,
+        &quot;wait&quot;: null,
+        &quot;wait_sum&quot;: 0.0
+      },
+      &quot;parent&quot;: {
+        &quot;contribution&quot;: 0.0,
+        &quot;event&quot;: null,
+        &quot;event_sum&quot;: 0.0,
+        &quot;wait&quot;: null,
+        &quot;wait_sum&quot;: 0.0
+      },
+      &quot;tokens&quot;: 0
+    },
+    {
+      &quot;floor&quot;: {
+        &quot;contribution&quot;: 0.16121911978251421,
+        &quot;event&quot;: null,
+        &quot;event_sum&quot;: 0.0,
+        &quot;wait&quot;: 0.9489902610714288,
+        &quot;wait_sum&quot;: 3389.793212547144
+      },
+      &quot;known&quot;: 0,
+      &quot;label&quot;: &quot;Censored&quot;,
+      &quot;model&quot;: {
+        &quot;contribution&quot;: 0.0976052304846445,
+        &quot;event&quot;: null,
+        &quot;event_sum&quot;: 0.0,
+        &quot;wait&quot;: 0.5745373953443828,
+        &quot;wait_sum&quot;: 2052.2475761701353
+      },
+      &quot;parent&quot;: {
+        &quot;contribution&quot;: 0.09972632297218674,
+        &quot;event&quot;: null,
+        &quot;event_sum&quot;: 0.0,
+        &quot;wait&quot;: 0.5870228630496076,
+        &quot;wait_sum&quot;: 2096.8456668131985
+      },
+      &quot;tokens&quot;: 3572
+    }
+  ]
+}</pre><h3>Retention</h3><p>Artifacts live outside the repository. RETENTION.md in the artifact directory defines preservation through 2026-12-31 and while placement depends on the selected checkpoint. Bulk buffers may be removed only after downstream users no longer require them.</p><!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>

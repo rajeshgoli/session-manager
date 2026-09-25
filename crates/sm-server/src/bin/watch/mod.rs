@@ -148,12 +148,21 @@ fn obligation_context(
             .iter()
             .filter(|item| s(item, "kind") == "review")
             .count();
-        let other = items.len() - jobs - reviews;
-        let counts: Vec<_> = [(jobs, "job"), (reviews, "review"), (other, "result")]
-            .into_iter()
-            .filter(|(n, _)| *n > 0)
-            .map(|(n, kind)| format!("{n} {kind}{}", if n == 1 { "" } else { "s" }))
-            .collect();
+        let owner_reviews = items
+            .iter()
+            .filter(|item| s(item, "kind") == "owner_review")
+            .count();
+        let other = items.len() - jobs - reviews - owner_reviews;
+        let counts: Vec<_> = [
+            (jobs, "job"),
+            (reviews, "review"),
+            (owner_reviews, "owner review"),
+            (other, "result"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, kind)| format!("{n} {kind}{}", if n == 1 { "" } else { "s" }))
+        .collect();
         lines.push(format!("Waiting for {}", counts.join(" and ")));
     }
     if items.len() == 1 || expanded {
@@ -202,7 +211,10 @@ fn doc_rows(obligation: &Value, prefix: &str, base_url: &str) -> Vec<Row> {
                 ),
                 (_, path) => format!("{base_url}{path}"),
             };
-            let state = s(doc, "state").replace('_', " ");
+            let mut state = s(doc, "state").replace('_', " ");
+            if doc["review_undelivered"].as_bool() == Some(true) {
+                state.push_str(" · review not delivered: author retired");
+            }
             Row {
                 text: format!("{prefix}   doc · {} · {state} · {url}", s(doc, "title")),
                 target: None,

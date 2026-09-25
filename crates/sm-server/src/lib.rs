@@ -12,6 +12,7 @@ pub mod google_auth;
 pub mod http;
 pub mod mobile_analytics;
 pub mod mobile_devices;
+pub mod owner_doc_render;
 pub mod owner_docs;
 pub mod queue;
 pub mod queue_authority;

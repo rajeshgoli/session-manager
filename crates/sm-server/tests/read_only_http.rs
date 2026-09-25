@@ -27,10 +27,11 @@ use sm_server::{
         SmSendConfig, ToolLoggingConfig, UsageAccountConfig,
     },
     http::{
-        router, AppState, DocFetchError, GitHubPullRequestState, GitHubReviewComment,
-        GitHubReviewMatch, GitHubReviewPoster, OwnerDocSource,
+        router, AppState, DocFetchError, DocPullRequest, DocReviewOnGitHub, GitHubPullRequestState,
+        GitHubReviewComment, GitHubReviewMatch, GitHubReviewPoster, OwnerDocSource,
+        SubmittedDocReview,
     },
-    owner_docs::git_blob_sha,
+    owner_docs::{git_blob_sha, OwnerDocStore, OwnerDocVerdict},
     runtime::TmuxRuntime,
     sessions::{SendCoreInputRequest, SessionStore},
     usage_burn::{BurnWindowSample, UsageBurnStore},
@@ -22462,6 +22463,66 @@ struct StubDocSource {
     files: Arc<Mutex<std::collections::BTreeMap<(String, String, String), Vec<u8>>>>,
     fetches: Arc<AtomicU64>,
     wrong_blob_sha: bool,
+    github: Arc<Mutex<FakeGitHub>>,
+}
+
+/// GitHub's pending-review behaviour as the spec's findings record it.
+#[derive(Default)]
+struct FakeGitHub {
+    /// pr number -> (state, head sha)
+    prs: std::collections::BTreeMap<i64, (String, String)>,
+    reviews: Vec<FakeReview>,
+    calls: Vec<String>,
+    /// LINE threads on these lines come back `null` without an error (F2).
+    null_lines: std::collections::BTreeSet<i64>,
+    /// LINE threads on these lines are refused (F1).
+    error_lines: std::collections::BTreeSet<i64>,
+    fail_file_threads: bool,
+    fail_submit: bool,
+    /// The mutation takes effect but its response is lost.
+    lose_pending_response: bool,
+    lose_line_response: bool,
+    fail_delete: bool,
+}
+
+#[derive(Clone, Debug)]
+struct FakeReview {
+    node_id: String,
+    database_id: i64,
+    commit: String,
+    state: String,
+    body: String,
+    threads: Vec<(Option<i64>, String)>,
+}
+
+impl FakeGitHub {
+    fn set_pr(&mut self, pr: i64, state: &str, head: &str) {
+        self.prs.insert(pr, (state.to_owned(), head.to_owned()));
+    }
+
+    fn add_review(&mut self, commit: &str, state: &str, body: &str) -> String {
+        let database_id = 1000 + self.reviews.len() as i64;
+        let node_id = format!("PRR_{database_id}");
+        self.reviews.push(FakeReview {
+            node_id: node_id.clone(),
+            database_id,
+            commit: commit.to_owned(),
+            state: state.to_owned(),
+            body: body.to_owned(),
+            threads: Vec::new(),
+        });
+        node_id
+    }
+
+    fn review_mut(&mut self, node_id: &str) -> Option<&mut FakeReview> {
+        self.reviews
+            .iter_mut()
+            .find(|review| review.node_id == node_id)
+    }
+}
+
+fn review_url(database_id: i64) -> String {
+    format!("https://github.com/acme/widgets/pull/12#pullrequestreview-{database_id}")
 }
 
 impl StubDocSource {
@@ -22498,9 +22559,143 @@ impl OwnerDocSource for StubDocSource {
         };
         Ok((bytes, blob))
     }
+
+    fn pull_request(&self, repo: &str, pr_number: i64) -> Result<DocPullRequest, String> {
+        let mut github = self.github.lock().unwrap();
+        github.calls.push("pull_request".to_owned());
+        let (state, head) = github
+            .prs
+            .get(&pr_number)
+            .cloned()
+            .ok_or_else(|| format!("PR #{pr_number} not found"))?;
+        Ok(DocPullRequest {
+            node_id: format!("PR_{pr_number}"),
+            state,
+            head_sha: head,
+            url: format!("https://github.com/{repo}/pull/{pr_number}"),
+        })
+    }
+
+    fn add_pending_review(
+        &self,
+        _pr_node_id: &str,
+        commit_sha: &str,
+        body: &str,
+    ) -> Result<String, String> {
+        let mut github = self.github.lock().unwrap();
+        github.calls.push("add_pending_review".to_owned());
+        if github
+            .reviews
+            .iter()
+            .any(|review| review.state == "PENDING")
+        {
+            return Err("User can only have one pending review per pull request".to_owned());
+        }
+        let node = github.add_review(commit_sha, "PENDING", body);
+        if github.lose_pending_response {
+            return Err("gh api graphql failed: timed out after 30s".to_owned());
+        }
+        Ok(node)
+    }
+
+    fn add_review_thread(
+        &self,
+        review_node_id: &str,
+        _path: &str,
+        line: Option<i64>,
+        body: &str,
+    ) -> Result<bool, String> {
+        let mut github = self.github.lock().unwrap();
+        github.calls.push(match line {
+            Some(line) => format!("line_thread {line}"),
+            None => "file_thread".to_owned(),
+        });
+        match line {
+            Some(line) if github.error_lines.contains(&line) => {
+                return Err("Line could not be resolved".to_owned())
+            }
+            Some(line) if github.null_lines.contains(&line) => return Ok(false),
+            None if github.fail_file_threads => return Err("Something went wrong".to_owned()),
+            _ => {}
+        }
+        let lose = line.is_some() && github.lose_line_response;
+        let review = github
+            .review_mut(review_node_id)
+            .ok_or_else(|| "no such review".to_owned())?;
+        review.threads.push((line, body.to_owned()));
+        if lose {
+            return Err("gh api graphql failed: timed out after 30s".to_owned());
+        }
+        Ok(true)
+    }
+
+    fn submit_pending_review(
+        &self,
+        review_node_id: &str,
+        body: &str,
+    ) -> Result<SubmittedDocReview, String> {
+        let mut github = self.github.lock().unwrap();
+        github.calls.push("submit".to_owned());
+        if github.fail_submit {
+            return Err("Something went wrong while executing your query".to_owned());
+        }
+        let review = github
+            .review_mut(review_node_id)
+            .ok_or_else(|| "no such review".to_owned())?;
+        review.state = "COMMENTED".to_owned();
+        review.body = body.to_owned();
+        Ok(SubmittedDocReview {
+            database_id: Some(review.database_id),
+            url: review_url(review.database_id),
+        })
+    }
+
+    fn delete_pending_review(&self, review_node_id: &str) -> Result<(), String> {
+        let mut github = self.github.lock().unwrap();
+        github.calls.push("delete".to_owned());
+        if github.fail_delete {
+            return Err("gh api graphql failed: timed out after 30s".to_owned());
+        }
+        let before = github.reviews.len();
+        github
+            .reviews
+            .retain(|review| !(review.node_id == review_node_id && review.state == "PENDING"));
+        if github.reviews.len() == before {
+            return Err("Could not resolve to a node".to_owned());
+        }
+        Ok(())
+    }
+
+    fn viewer_reviews(&self, _repo: &str, _pr: i64) -> Result<Vec<DocReviewOnGitHub>, String> {
+        let mut github = self.github.lock().unwrap();
+        github.calls.push("viewer_reviews".to_owned());
+        Ok(github
+            .reviews
+            .iter()
+            .map(|review| DocReviewOnGitHub {
+                node_id: review.node_id.clone(),
+                database_id: Some(review.database_id),
+                url: review_url(review.database_id),
+                state: review.state.clone(),
+                body: review.body.clone(),
+                comments: review
+                    .threads
+                    .iter()
+                    .map(|(line, body)| (body.clone(), line.is_some()))
+                    .collect(),
+            })
+            .collect())
+    }
 }
 
 fn owner_docs_app(source: StubDocSource) -> (axum::Router, PathBuf) {
+    owner_docs_app_with(source, |_| {})
+}
+
+fn owner_docs_app_with(
+    source: StubDocSource,
+    configure: impl FnOnce(&mut AppConfig),
+) -> (axum::Router, PathBuf) {
     let dir = unique_temp_path();
     fs::create_dir_all(&dir).unwrap();
     let state_file = dir.join("sessions.json");
@@ -22518,12 +22713,20 @@ fn owner_docs_app(source: StubDocSource) -> (axum::Router, PathBuf) {
             "parent_session_id": parent,
         })
     };
+    let retired = |id: &str, parent: Option<&str>| {
+        let mut record = session(id, parent);
+        record["status"] = json!("stopped");
+        record["completion_status"] = json!("retired");
+        record
+    };
     fs::write(
         &state_file,
         json!({"sessions": [
             session("author01", None),
             session("child001", Some("author01")),
             session("other001", None),
+            retired("retired1", Some("author01")),
+            retired("orphan01", None),
         ]})
         .to_string(),
     )
@@ -22538,6 +22741,7 @@ fn owner_docs_app(source: StubDocSource) -> (axum::Router, PathBuf) {
         ..AppConfig::default()
     };
     config.rust_core.fixture_writes_enabled = true;
+    configure(&mut config);
     (
         router(AppState::new(config).with_owner_doc_source(Arc::new(source))),
         dir,
@@ -22609,7 +22813,20 @@ async fn owner_docs_publish_read_and_project_state() {
         get_response(app.clone(), &format!("/docs/{id}/view?sha={c1}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers["content-type"], "text/html; charset=utf-8");
-    assert_eq!(body, memo);
+    // The owner's HTML is kept apart from the line anchors and the review
+    // client, injected just before </body>.
+    let body = String::from_utf8(body).unwrap();
+    let memo_text = String::from_utf8(memo.to_vec()).unwrap();
+    let (before_client, client) = body.split_once("<style id=\"sm-doc-style\">").unwrap();
+    assert_eq!(
+        before_client.replace(" data-sm-line=\"2\"", ""),
+        memo_text.split_once("</body>").unwrap().0
+    );
+    assert!(
+        before_client.contains("<p data-sm-line=\"2\">Buy</p>"),
+        "{body}"
+    );
+    assert!(client.ends_with("</script></body></html>\n"), "{client}");
     assert_eq!(source.fetches.load(Ordering::SeqCst), fetches);
 
     let (_, obligations) = get_json(app.clone(), "/session-obligations").await;
@@ -22675,7 +22892,7 @@ async fn owner_docs_publish_read_and_project_state() {
     )
     .await;
     let body = String::from_utf8(body).unwrap();
-    assert!(body.contains("<h1>Readout</h1>") && body.contains("<table>"));
+    assert!(body.contains("<h1 data-sm-line=\"1\">Readout</h1>") && body.contains("<table>"));
     let (_, txt) = post_json(
         app.clone(),
         "/docs",
@@ -22778,7 +22995,7 @@ async fn owner_docs_readable_urls_resolve_names_and_versions() {
         assert_eq!(status, StatusCode::OK, "{uri}");
         assert!(headers.get("location").is_none(), "{uri}");
         assert!(
-            body_of(body).contains(&format!("<h1>{expected}</h1>")),
+            body_of(body).contains(&format!("<h1 data-sm-line=\"1\">{expected}</h1>")),
             "{uri}"
         );
     }
@@ -22837,13 +23054,13 @@ async fn owner_docs_readable_urls_resolve_names_and_versions() {
     }
     let (_, _, body) =
         get_response(app.clone(), "/docs/widgets/specs/memo.md?version=abcdef12").await;
-    assert!(body_of(body).contains("<h1>near2</h1>"));
+    assert!(body_of(body).contains("<h1 data-sm-line=\"1\">near2</h1>"));
 
     // A commit-only doc on the same path is a second doc; without a version
     // the newest publish across both wins.
     post_json(app.clone(), "/docs", publish("specs/memo.md", &c1, None)).await;
     let (_, _, body) = get_response(app.clone(), "/docs/widgets/specs/memo.md").await;
-    assert!(body_of(body).contains("<h1>v1</h1>"));
+    assert!(body_of(body).contains("<h1 data-sm-line=\"1\">v1</h1>"));
     let (_, meta) = get_json(app.clone(), "/docs/widgets/specs/memo.md?format=json").await;
     assert_ne!(meta["id"], id);
     assert!(meta["pr_number"].is_null());
@@ -22862,7 +23079,7 @@ async fn owner_docs_readable_urls_resolve_names_and_versions() {
     );
     let (status, _, body) = get_response(app.clone(), &reader_path).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body_of(body).contains("<h1>Spaced</h1>"));
+    assert!(body_of(body).contains("<h1 data-sm-line=\"1\">Spaced</h1>"));
 
     // `view` after a repo name is a path, not the id route.
     post_json(app.clone(), "/docs", publish("view", &c1, None)).await;
@@ -22931,6 +23148,8 @@ async fn owner_doc_routes_require_auth_when_google_auth_is_enabled() {
         "/docs/0123abcd",
         "/docs/0123abcd/view",
         "/docs/0123abcd/raw",
+        "/docs/0123abcd/head",
+        "/docs/0123abcd/drafts",
         "/docs/widgets/specs/memo.html",
         "/docs/widgets/specs/memo.html?version=aaaaaaaaaaaa",
     ] {
@@ -22949,4 +23168,872 @@ async fn owner_doc_routes_require_auth_when_google_auth_is_enabled() {
             "{uri}: {status}"
         );
     }
+    for (method, uri) in [
+        ("POST", "/docs/0123abcd/drafts"),
+        ("POST", "/docs/0123abcd/review"),
+        ("PATCH", "/docs/0123abcd/drafts/abc"),
+        ("DELETE", "/docs/0123abcd/drafts/abc"),
+    ] {
+        let (status, _) = json_request_with_headers_and_peer(
+            app.clone(),
+            method,
+            uri,
+            json!({}),
+            &[("host", "sm.example.com")],
+            Some(SocketAddr::from(([203, 0, 113, 7], 443))),
+        )
+        .await;
+        assert!(
+            matches!(
+                status,
+                StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE
+            ),
+            "{method} {uri}: {status}"
+        );
+    }
+}
+
+const REVIEW_MEMO: &[u8] = b"<!doctype html>\n<html><body>\n<p>Buy the dip.</p>\n<p>Size it small.</p>\n<p>Exit on close.</p>\n</body></html>\n";
+
+fn queued_wakes(dir: &std::path::Path, text_prefix: &str) -> Vec<(String, String)> {
+    let conn = Connection::open(dir.join("message_queue.db")).unwrap();
+    // No wake yet means no queue table yet.
+    let Ok(mut statement) =
+        conn.prepare("SELECT target_session_id, text FROM message_queue ORDER BY queued_at")
+    else {
+        return Vec::new();
+    };
+    let rows = statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<(String, String)>, _>>()
+        .unwrap();
+    rows.into_iter()
+        .filter(|(_, text)| text.starts_with(text_prefix))
+        .collect()
+}
+
+/// Publishes `specs/memo.html` on PR 12 at `commit` and returns its doc id.
+async fn publish_review_memo(
+    app: &axum::Router,
+    path: &str,
+    commit: &str,
+    session: &str,
+    review: bool,
+) -> Value {
+    let (status, doc) = post_json(
+        app.clone(),
+        "/docs",
+        json!({"repo": "acme/widgets", "path": path, "commit_sha": commit, "pr_number": 12,
+               "session_id": session, "title": "Decision memo", "review": review}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    doc
+}
+
+async fn add_draft(
+    app: &axum::Router,
+    id: &str,
+    sha: &str,
+    line: Value,
+    quote: &str,
+    body: &str,
+) -> Value {
+    let (status, draft) = post_json(
+        app.clone(),
+        &format!("/docs/{id}/drafts"),
+        json!({"sha": sha, "line": line, "quote": quote, "body": body}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{draft}");
+    draft
+}
+
+fn review_memo_source(head: &str) -> StubDocSource {
+    let source = StubDocSource::default();
+    for sha in [&"a".repeat(40), &"b".repeat(40)] {
+        for path in ["specs/memo.html", "specs/a.html", "specs/b.html"] {
+            source.put("acme/widgets", path, sha, REVIEW_MEMO);
+        }
+    }
+    source.github.lock().unwrap().set_pr(12, "open", head);
+    source
+}
+
+#[tokio::test]
+async fn owner_doc_review_posts_one_github_review_and_wakes_the_author_once() {
+    let (c1, c2) = ("a".repeat(40), "b".repeat(40));
+    let source = review_memo_source(&c1);
+    let (app, dir) = owner_docs_app(source.clone());
+
+    // --review needs an open PR and marks the doc; the author waits on the owner.
+    let doc = publish_review_memo(&app, "specs/memo.html", &c1, "author01", true).await;
+    let id = doc["id"].as_str().unwrap().to_owned();
+    assert_eq!(doc["state"], "review_requested");
+    assert_eq!(doc["publish"]["review_requested"], true);
+    let (_, obligations) = get_json(app.clone(), "/session-obligations").await;
+    let author = owner_doc_session(&obligations, "author01");
+    assert_eq!(author["waiting_on"][0]["kind"], "owner_review");
+    assert_eq!(author["waiting_on"][0]["id"], id);
+    assert_eq!(
+        author["waiting_on"][0]["label"],
+        "Owner review · Decision memo"
+    );
+
+    // The reader carries line anchors and the review client, commenting on.
+    let (status, _, page) = get_response(app.clone(), "/docs/widgets/specs/memo.html").await;
+    assert_eq!(status, StatusCode::OK);
+    let page = String::from_utf8(page).unwrap();
+    assert!(
+        page.contains("<p data-sm-line=\"3\">Buy the dip.</p>"),
+        "{page}"
+    );
+    assert!(page.contains(&format!("\"docId\":\"{id}\"")), "{page}");
+    assert!(page.contains("\"canComment\":true") && page.contains("\"prState\":\"open\""));
+    assert!(
+        page.contains("\"token\":null"),
+        "no session secret, no token"
+    );
+
+    // Drafts: line 3 posts inline; line 4 comes back null and line 5 is
+    // refused, so both fall back to the file; a line-less draft is a file
+    // comment; every comment quotes its selection.
+    {
+        let mut github = source.github.lock().unwrap();
+        github.null_lines.insert(4);
+        github.error_lines.insert(5);
+    }
+    let first = add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Why now?").await;
+    add_draft(&app, &id, &c1, json!(4), "Size it small.", "How small?").await;
+    add_draft(&app, &id, &c1, json!(5), "Exit on close.", "Or earlier?").await;
+    add_draft(&app, &id, &c1, Value::Null, "", "Overall too terse.").await;
+    let scratch = add_draft(&app, &id, &c1, json!(3), "Buy", "scratch").await;
+    let (status, edited) = patch_json(
+        app.clone(),
+        &format!("/docs/{id}/drafts/{}", first["id"].as_str().unwrap()),
+        json!({"body": "Why now, exactly?"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+    let (status, _) = delete_json(
+        app.clone(),
+        &format!("/docs/{id}/drafts/{}", scratch["id"].as_str().unwrap()),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, drafts) = get_json(app.clone(), &format!("/docs/{id}/drafts")).await;
+    assert_eq!(drafts["drafts"].as_array().unwrap().len(), 4);
+    for (payload, expected) in [
+        (json!({"sha": "HEAD", "body": "x"}), StatusCode::BAD_REQUEST),
+        (json!({"sha": c1, "body": "  "}), StatusCode::BAD_REQUEST),
+        (
+            json!({"sha": c1, "line": 0, "body": "x"}),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (status, _) = post_json(app.clone(), &format!("/docs/{id}/drafts"), payload).await;
+        assert_eq!(status, expected);
+    }
+
+    let submit = json!({"submission_id": "sub-aaaaaaaa", "sha": c1,
+                        "verdict": "changes_requested", "body": "Tighten it."});
+    let (status, review) =
+        post_json(app.clone(), &format!("/docs/{id}/review"), submit.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert_eq!(review["status"], "posted");
+    assert_eq!(review["line_comment_count"], 1);
+    assert_eq!(review["file_comment_count"], 3);
+    assert_eq!(review["delivered_to_session_id"], "author01");
+    let url = review["github_review_url"].as_str().unwrap().to_owned();
+
+    let posted = {
+        let github = source.github.lock().unwrap();
+        assert_eq!(github.reviews.len(), 1);
+        let calls: Vec<_> = github
+            .calls
+            .iter()
+            .filter(|c| *c != "pull_request")
+            .cloned()
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                "add_pending_review",
+                "line_thread 3",
+                "line_thread 4",
+                "file_thread",
+                "line_thread 5",
+                // An error may be a lost response: check before falling back.
+                "viewer_reviews",
+                "file_thread",
+                "file_thread",
+                "submit"
+            ]
+        );
+        github.reviews[0].clone()
+    };
+    // Pinned to the viewed commit; the event is COMMENT with the verdict in the body.
+    assert_eq!(posted.commit, c1);
+    assert_eq!(posted.state, "COMMENTED");
+    assert_eq!(
+        posted.body,
+        "**Verdict: Changes requested**\n\nTighten it.\n\n<!-- sm-review:sub-aaaaaaaa -->"
+    );
+    assert_eq!(
+        posted.threads,
+        [
+            (Some(3), "> Buy the dip.\n\nWhy now, exactly?".to_owned()),
+            (None, "> Size it small.\n\nHow small?".to_owned()),
+            (None, "> Exit on close.\n\nOr earlier?".to_owned()),
+            (None, "Overall too terse.".to_owned()),
+        ]
+    );
+    let (_, drafts) = get_json(app.clone(), &format!("/docs/{id}/drafts")).await;
+    assert!(drafts["drafts"].as_array().unwrap().is_empty());
+    let wakes = queued_wakes(&dir, "[sm review] Rajesh's review");
+    assert_eq!(
+        wakes,
+        [(
+            "author01".to_owned(),
+            format!(
+                "[sm review] Rajesh's review of \"Decision memo\" (PR #12 @ aaaaaaa) is here: {url}\nVerdict: changes requested · 1 line comment · 3 file comments"
+            )
+        )]
+    );
+
+    // A retry of the same submission changes nothing.
+    let calls_before = source.github.lock().unwrap().calls.len();
+    let (status, again) = post_json(app.clone(), &format!("/docs/{id}/review"), submit).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(again["github_review_url"], url.as_str());
+    assert_eq!(source.github.lock().unwrap().calls.len(), calls_before);
+    assert_eq!(queued_wakes(&dir, "[sm review] Rajesh's review").len(), 1);
+
+    let (_, meta) = get_json(app.clone(), &format!("/docs/{id}?format=json")).await;
+    assert_eq!(meta["state"], "reviewed");
+    assert_eq!(meta["reviews"][0]["verdict"], "changes_requested");
+    assert_eq!(meta["reviews"][0]["github_review_url"], url.as_str());
+    let (_, obligations) = get_json(app.clone(), "/session-obligations").await;
+    assert!(owner_doc_session(&obligations, "author01")["waiting_on"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+
+    // Asking again for the same blob is a new request.
+    let doc = publish_review_memo(&app, "specs/memo.html", &c2, "author01", true).await;
+    assert_eq!(doc["state"], "review_requested");
+
+    // A closed PR is read-only: no review, no review request.
+    source.github.lock().unwrap().set_pr(12, "closed", &c2);
+    let (status, refused) = post_json(
+        app.clone(),
+        &format!("/docs/{id}/review"),
+        json!({"submission_id": "sub-bbbbbbbb", "sha": c2, "verdict": "approve"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    let (status, _) = post_json(
+        app.clone(),
+        "/docs",
+        json!({"repo": "acme/widgets", "path": "specs/memo.html", "commit_sha": c2,
+               "pr_number": 12, "session_id": "author01", "review": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (_, _, page) = get_response(app.clone(), "/docs/widgets/specs/memo.html").await;
+    assert!(String::from_utf8(page)
+        .unwrap()
+        .contains("\"canComment\":false"));
+    assert_eq!(source.github.lock().unwrap().reviews.len(), 1);
+}
+
+#[tokio::test]
+async fn owner_doc_review_failure_deletes_the_pending_review_and_keeps_drafts() {
+    let c1 = "a".repeat(40);
+    let source = review_memo_source(&c1);
+    let (app, dir) = owner_docs_app(source.clone());
+    let id = publish_review_memo(&app, "specs/memo.html", &c1, "author01", true).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Why now?").await;
+    add_draft(&app, &id, &c1, Value::Null, "", "Overall.").await;
+
+    for failure in ["submit", "file_thread"] {
+        {
+            let mut github = source.github.lock().unwrap();
+            github.fail_submit = failure == "submit";
+            github.fail_file_threads = failure == "file_thread";
+            github.calls.clear();
+        }
+        let submission = format!("sub-fail-{failure}");
+        let (status, error) = post_json(
+            app.clone(),
+            &format!("/docs/{id}/review"),
+            json!({"submission_id": submission, "sha": c1, "verdict": "comment"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{error}");
+        let github = source.github.lock().unwrap();
+        assert!(
+            github.reviews.is_empty(),
+            "{failure}: pending review left behind"
+        );
+        assert!(
+            github.calls.contains(&"delete".to_owned()),
+            "{:?}",
+            github.calls
+        );
+        drop(github);
+        // The drafts stay.
+        let (_, drafts) = get_json(app.clone(), &format!("/docs/{id}/drafts")).await;
+        assert_eq!(drafts["drafts"].as_array().unwrap().len(), 2);
+    }
+    assert!(queued_wakes(&dir, "[sm review]").is_empty());
+
+    // A leftover pending review under the owner's account blocks the next one.
+    {
+        let mut github = source.github.lock().unwrap();
+        github.fail_submit = false;
+        github.fail_file_threads = false;
+        github.add_review(&c1, "PENDING", "started in the GitHub UI");
+    }
+    let (status, _) = post_json(
+        app.clone(),
+        &format!("/docs/{id}/review"),
+        json!({"submission_id": "sub-blocked1", "sha": c1, "verdict": "comment"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    source.github.lock().unwrap().reviews.clear();
+    let (status, review) = post_json(
+        app.clone(),
+        &format!("/docs/{id}/review"),
+        json!({"submission_id": "sub-works01", "sha": c1, "verdict": "comment"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert_eq!(review["line_comment_count"], 1);
+    assert_eq!(review["file_comment_count"], 1);
+    assert_eq!(queued_wakes(&dir, "[sm review]").len(), 1);
+}
+
+#[tokio::test]
+async fn owner_doc_review_reconciles_a_submission_a_crash_interrupted() {
+    let c1 = "a".repeat(40);
+    let blob = git_blob_sha(REVIEW_MEMO);
+    let source = review_memo_source(&c1);
+    let (app, dir) = owner_docs_app(source.clone());
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    let marker = |id: &str| format!("<!-- sm-review:{id} -->");
+
+    // Crash after submitPullRequestReview: the review is on GitHub, the row
+    // still says submitting. The retry finishes from GitHub, posting nothing.
+    let doc_a = publish_review_memo(&app, "specs/a.html", &c1, "author01", true).await;
+    let id_a = doc_a["id"].as_str().unwrap();
+    add_draft(&app, id_a, &c1, json!(3), "Buy the dip.", "Why now?").await;
+    store
+        .begin_review(
+            "sub-crash-after",
+            id_a,
+            &c1,
+            &blob,
+            OwnerDocVerdict::Comment,
+            None,
+        )
+        .unwrap();
+    {
+        let mut github = source.github.lock().unwrap();
+        let node = github.add_review(
+            &c1,
+            "COMMENTED",
+            &format!("**Verdict: Comments**\n\n{}", marker("sub-crash-after")),
+        );
+        let review = github.review_mut(&node).unwrap();
+        review
+            .threads
+            .push((Some(3), "> Buy the dip.\n\nWhy now?".to_owned()));
+        review.threads.push((None, "Overall.".to_owned()));
+        github.calls.clear();
+    }
+    let submit_a = json!({"submission_id": "sub-crash-after", "sha": c1, "verdict": "comment"});
+    for _ in 0..2 {
+        let (status, review) = post_json(
+            app.clone(),
+            &format!("/docs/{id_a}/review"),
+            submit_a.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{review}");
+        assert_eq!(review["status"], "posted");
+        assert_eq!(review["line_comment_count"], 1);
+        assert_eq!(review["file_comment_count"], 1);
+    }
+    assert_eq!(source.github.lock().unwrap().calls, ["viewer_reviews"]);
+    assert_eq!(source.github.lock().unwrap().reviews.len(), 1);
+    assert_eq!(queued_wakes(&dir, "[sm review]").len(), 1);
+    let (_, drafts) = get_json(app.clone(), &format!("/docs/{id_a}/drafts")).await;
+    assert!(drafts["drafts"].as_array().unwrap().is_empty());
+
+    // Crash after addPullRequestReview, one of two threads added: the retry
+    // resumes the pending review, adds only the missing thread, submits it.
+    source.github.lock().unwrap().reviews.clear();
+    let doc_b = publish_review_memo(&app, "specs/b.html", &c1, "author01", true).await;
+    let id_b = doc_b["id"].as_str().unwrap();
+    add_draft(&app, id_b, &c1, json!(3), "Buy the dip.", "Why now?").await;
+    add_draft(&app, id_b, &c1, json!(4), "Size it small.", "How small?").await;
+    store
+        .begin_review(
+            "sub-crash-mid",
+            id_b,
+            &c1,
+            &blob,
+            OwnerDocVerdict::Approve,
+            None,
+        )
+        .unwrap();
+    {
+        let mut github = source.github.lock().unwrap();
+        let node = github.add_review(
+            &c1,
+            "PENDING",
+            &format!("**Verdict: Approved**\n\n{}", marker("sub-crash-mid")),
+        );
+        github
+            .review_mut(&node)
+            .unwrap()
+            .threads
+            .push((Some(3), "> Buy the dip.\n\nWhy now?".to_owned()));
+        store
+            .set_pending_review_node_id("sub-crash-mid", Some(&node))
+            .unwrap();
+        github.calls.clear();
+    }
+    let (status, review) = post_json(
+        app.clone(),
+        &format!("/docs/{id_b}/review"),
+        json!({"submission_id": "sub-crash-mid", "sha": c1, "verdict": "approve"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert_eq!(review["line_comment_count"], 2);
+    {
+        let github = source.github.lock().unwrap();
+        assert_eq!(github.calls, ["viewer_reviews", "line_thread 4", "submit"]);
+        assert_eq!(github.reviews.len(), 1);
+        assert_eq!(github.reviews[0].threads.len(), 2);
+        assert_eq!(github.reviews[0].state, "COMMENTED");
+    }
+
+    // Crash before anything reached GitHub: the retry starts clean.
+    source.github.lock().unwrap().reviews.clear();
+    add_draft(&app, id_b, &c1, json!(5), "Exit on close.", "Or earlier?").await;
+    store
+        .begin_review(
+            "sub-crash-before",
+            id_b,
+            &c1,
+            &blob,
+            OwnerDocVerdict::Comment,
+            None,
+        )
+        .unwrap();
+    source.github.lock().unwrap().calls.clear();
+    let (status, review) = post_json(
+        app.clone(),
+        &format!("/docs/{id_b}/review"),
+        json!({"submission_id": "sub-crash-before", "sha": c1, "verdict": "comment"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert_eq!(
+        source.github.lock().unwrap().calls,
+        [
+            "viewer_reviews",
+            "pull_request",
+            "add_pending_review",
+            "line_thread 5",
+            "submit"
+        ]
+    );
+    assert_eq!(queued_wakes(&dir, "[sm review]").len(), 3);
+}
+
+#[tokio::test]
+async fn owner_doc_review_wake_goes_to_a_retired_authors_parent_or_nobody() {
+    let c1 = "a".repeat(40);
+    let source = review_memo_source(&c1);
+    let (app, dir) = owner_docs_app(source.clone());
+    for (path, author, submission, expected) in [
+        ("specs/a.html", "retired1", "sub-retired1", Some("author01")),
+        ("specs/b.html", "orphan01", "sub-orphan01", None),
+    ] {
+        let id = publish_review_memo(&app, path, &c1, author, false).await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Why now?").await;
+        let (status, review) = post_json(
+            app.clone(),
+            &format!("/docs/{id}/review"),
+            json!({"submission_id": submission, "sha": c1, "verdict": "comment"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{review}");
+        assert_eq!(review["delivered_to_session_id"], json!(expected));
+        let (_, meta) = get_json(app.clone(), &format!("/docs/{id}?format=json")).await;
+        assert_eq!(meta["review_undelivered"], expected.is_none(), "{meta}");
+    }
+    let wakes = queued_wakes(&dir, "[sm review]");
+    assert_eq!(wakes.len(), 1);
+    assert_eq!(wakes[0].0, "author01");
+    let (_, obligations) = get_json(app.clone(), "/session-obligations").await;
+    assert_eq!(
+        owner_doc_session(&obligations, "orphan01")["docs"][0]["review_undelivered"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn owner_doc_reader_defaults_to_the_latest_publish_and_links_the_pr_head() {
+    let (c1, head) = ("a".repeat(40), "c".repeat(40));
+    let source = review_memo_source(&head);
+    source.put(
+        "acme/widgets",
+        "specs/memo.html",
+        &head,
+        b"<html><body>\n<p>Pushed, not republished.</p>\n</body></html>\n",
+    );
+    let (app, _dir) = owner_docs_app(source.clone());
+    let id = publish_review_memo(&app, "specs/memo.html", &c1, "author01", false).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (_, _, page) = get_response(app.clone(), "/docs/widgets/specs/memo.html").await;
+    let page = String::from_utf8(page).unwrap();
+    assert!(
+        page.contains(&format!("\"sha\":\"{c1}\"")),
+        "latest publish, not the PR head"
+    );
+    assert!(page.contains("Buy the dip."));
+
+    let (status, heads) = get_json(app.clone(), &format!("/docs/{id}/head")).await;
+    assert_eq!(status, StatusCode::OK, "{heads}");
+    assert_eq!(heads["latest_published_sha"], c1.as_str());
+    assert_eq!(heads["pr_head_sha"], head.as_str());
+    assert_eq!(heads["pr_state"], "open");
+    assert_eq!(heads["pr_head_blob_differs"], true);
+    assert_eq!(
+        heads["pr_head_reader_path"],
+        "/docs/widgets/specs/memo.html?version=cccccccccccc"
+    );
+    // The banner's link renders the unpublished head in place.
+    let (status, _, page) = get_response(
+        app.clone(),
+        "/docs/widgets/specs/memo.html?version=cccccccccccc",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let page = String::from_utf8(page).unwrap();
+    assert!(
+        page.contains("Pushed, not republished.") && page.contains(&format!("\"sha\":\"{head}\""))
+    );
+    let (_, heads) = get_json(app.clone(), &format!("/docs/{id}/head?sha={head}")).await;
+    assert_eq!(heads["pr_head_blob_differs"], false);
+    // Any other unknown version is still a 404.
+    let (status, _) = get_json(
+        app.clone(),
+        "/docs/widgets/specs/memo.html?version=dddddddddddd",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A head whose file matches the published blob is not "newer".
+    source
+        .github
+        .lock()
+        .unwrap()
+        .set_pr(12, "open", &"b".repeat(40));
+    let (app, _dir) = owner_docs_app(source);
+    let id = publish_review_memo(&app, "specs/memo.html", &c1, "author01", false).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (_, heads) = get_json(app.clone(), &format!("/docs/{id}/head")).await;
+    assert_eq!(heads["pr_head_blob_differs"], false);
+}
+
+fn doc_token(secret: &str, doc_id: &str, expires_at: i64) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(format!("{doc_id}|{expires_at}").as_bytes());
+    format!(
+        "smdt_{doc_id}.{expires_at}.{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    )
+}
+
+#[tokio::test]
+async fn owner_doc_token_opens_the_json_endpoints_for_its_own_doc_only() {
+    const SECRET: &str = "doc-token-test-secret";
+    let c1 = "a".repeat(40);
+    let source = review_memo_source(&c1);
+    let (app, dir) = owner_docs_app_with(source, |config| {
+        config.google_auth = GoogleAuthConfig {
+            enabled: true,
+            public_host: Some("sm.example.com".to_owned()),
+            session_cookie_secret: Some(SECRET.to_owned()),
+            ..GoogleAuthConfig::default()
+        };
+    });
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    let publish = |path: &str| sm_server::owner_docs::PublishOwnerDoc {
+        repo: "acme/widgets".into(),
+        path: path.into(),
+        pr_number: Some(12),
+        session_id: "author01".into(),
+        session_name: None,
+        title: "Memo".into(),
+        note: None,
+        commit_sha: "a".repeat(40),
+        blob_sha: git_blob_sha(REVIEW_MEMO),
+        review_requested: false,
+    };
+    let id = store.publish(publish("specs/memo.html")).unwrap().doc.id;
+    let other = store.publish(publish("specs/a.html")).unwrap().doc.id;
+    let now = unix_timestamp();
+    let valid = doc_token(SECRET, &id, now + 3600);
+    let external = Some(SocketAddr::from(([203, 0, 113, 7], 443)));
+    let get = |uri: String, token: Option<String>| {
+        let app = app.clone();
+        async move {
+            let mut request = Request::builder().uri(uri).header("host", "sm.example.com");
+            if let Some(token) = token {
+                request = request.header("x-sm-doc-token", token);
+            }
+            let mut request = request.body(Body::empty()).unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(external.unwrap()));
+            app.oneshot(request).await.unwrap().status()
+        }
+    };
+    // Its own doc, at any revision.
+    assert_eq!(
+        get(format!("/docs/{id}/head"), Some(valid.clone())).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get(format!("/docs/{id}/head?sha={c1}"), Some(valid.clone())).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        get(format!("/docs/{id}/drafts"), Some(valid.clone())).await,
+        StatusCode::OK
+    );
+    let (status, draft) = post_json_with_headers_and_peer(
+        app.clone(),
+        &format!("/docs/{id}/drafts"),
+        json!({"sha": c1, "line": 3, "quote": "Buy", "body": "Why?"}),
+        &[
+            ("host", "sm.example.com"),
+            ("x-sm-doc-token", valid.as_str()),
+        ],
+        external,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{draft}");
+    // Not another doc, not expired or forged, and never the page itself.
+    for (uri, token) in [
+        (format!("/docs/{other}/head"), Some(valid.clone())),
+        (format!("/docs/{other}/drafts"), Some(valid.clone())),
+        (
+            format!("/docs/{id}/head"),
+            Some(doc_token(SECRET, &id, now - 1)),
+        ),
+        (
+            format!("/docs/{id}/head"),
+            Some(doc_token("wrong-secret", &id, now + 3600)),
+        ),
+        (format!("/docs/{id}/head"), None),
+        (format!("/docs/{id}/view"), Some(valid.clone())),
+        (
+            "/docs/widgets/specs/memo.html".to_owned(),
+            Some(valid.clone()),
+        ),
+    ] {
+        let status = get(uri.clone(), token).await;
+        assert!(
+            matches!(
+                status,
+                StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE
+            ),
+            "{uri}: {status}"
+        );
+    }
+    let (status, _) = post_json_with_headers_and_peer(
+        app.clone(),
+        &format!("/docs/{other}/review"),
+        json!({"submission_id": "sub-otherdoc", "sha": c1, "verdict": "comment"}),
+        &[
+            ("host", "sm.example.com"),
+            ("x-sm-doc-token", valid.as_str()),
+        ],
+        external,
+    )
+    .await;
+    assert!(matches!(
+        status,
+        StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE
+    ));
+}
+
+#[tokio::test]
+async fn owner_doc_review_retries_under_one_id_never_post_twice() {
+    let c1 = "a".repeat(40);
+    let source = review_memo_source(&c1);
+    let (app, dir) = owner_docs_app(source.clone());
+    let submit = |id: String, submission: &'static str| {
+        let app = app.clone();
+        let body =
+            json!({"submission_id": submission, "sha": "a".repeat(40), "verdict": "comment"});
+        async move { post_json(app, &format!("/docs/{id}/review"), body).await }
+    };
+    let doc = |path: &'static str| {
+        let app = app.clone();
+        async move {
+            let c1 = "a".repeat(40);
+            let id = publish_review_memo(&app, path, &c1, "author01", true).await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Why now?").await;
+            add_draft(&app, &id, &c1, Value::Null, "", "Overall.").await;
+            id
+        }
+    };
+    let take_only_review = |source: &StubDocSource| {
+        let mut github = source.github.lock().unwrap();
+        assert_eq!(github.reviews.len(), 1, "{:?}", github.reviews);
+        github.reviews.remove(0)
+    };
+
+    // A failed attempt is retried under the same id once GitHub recovers.
+    let id = doc("specs/memo.html").await;
+    source.github.lock().unwrap().fail_submit = true;
+    let (status, _) = submit(id.clone(), "sub-retry-failed").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    source.github.lock().unwrap().fail_submit = false;
+    let (status, review) = submit(id, "sub-retry-failed").await;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert_eq!(take_only_review(&source).threads.len(), 2);
+
+    // addPullRequestReview takes effect but its response is lost: the review
+    // found by its marker is used, not abandoned.
+    let id = doc("specs/a.html").await;
+    source.github.lock().unwrap().lose_pending_response = true;
+    let (status, review) = submit(id, "sub-lost-pending").await;
+    source.github.lock().unwrap().lose_pending_response = false;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    let posted = take_only_review(&source);
+    assert_eq!(posted.state, "COMMENTED");
+    assert_eq!(posted.threads.len(), 2);
+
+    // Submitting fails and so does deleting the pending review: the row
+    // stays recoverable, and the retry resumes that pending review without
+    // repeating its threads.
+    let id = doc("specs/b.html").await;
+    {
+        let mut github = source.github.lock().unwrap();
+        github.fail_submit = true;
+        github.fail_delete = true;
+    }
+    let (status, error) = submit(id.clone(), "sub-stuck-delete").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{error}");
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    assert_eq!(
+        store.review("sub-stuck-delete").unwrap().unwrap().status,
+        "submitting"
+    );
+    // Until it resolves, its drafts are frozen, and a reloaded page (which
+    // lost the id) is handed the unfinished submission to resume.
+    let (_, drafts) = get_json(app.clone(), &format!("/docs/{id}/drafts")).await;
+    let draft_id = drafts["drafts"][0]["id"].as_str().unwrap().to_owned();
+    let (status, _) = patch_json(
+        app.clone(),
+        &format!("/docs/{id}/drafts/{draft_id}"),
+        json!({"body": "edited mid-submit"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = delete_json(
+        app.clone(),
+        &format!("/docs/{id}/drafts/{draft_id}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = post_json(
+        app.clone(),
+        &format!("/docs/{id}/drafts"),
+        json!({"sha": c1, "line": 3, "body": "added mid-submit"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (_, _, page) = get_response(app.clone(), "/docs/widgets/specs/b.html").await;
+    assert!(String::from_utf8(page).unwrap().contains(
+        "\"unfinishedReview\":{\"body\":\"\",\"id\":\"sub-stuck-delete\",\"verdict\":\"comment\"}"
+    ));
+    {
+        let mut github = source.github.lock().unwrap();
+        github.fail_submit = false;
+        github.fail_delete = false;
+        github.calls.clear();
+    }
+    let (status, review) = submit(id.clone(), "sub-after-reload").await;
+    assert_eq!(review["submission_id"], "sub-stuck-delete");
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert_eq!(
+        source.github.lock().unwrap().calls,
+        ["viewer_reviews", "submit"]
+    );
+    assert_eq!(take_only_review(&source).threads.len(), 2);
+    let (_, _, page) = get_response(app.clone(), "/docs/widgets/specs/b.html").await;
+    assert!(String::from_utf8(page)
+        .unwrap()
+        .contains("\"unfinishedReview\":null"));
+
+    // A line thread that took but whose response was lost is not repeated
+    // as a file comment.
+    let (_, meta) = get_json(app.clone(), "/docs/widgets/specs/memo.html?format=json").await;
+    let memo = meta["id"].as_str().unwrap().to_owned();
+    add_draft(&app, &memo, &c1, json!(3), "Buy the dip.", "Again?").await;
+    source.github.lock().unwrap().lose_line_response = true;
+    let (status, review) = submit(memo.clone(), "sub-lost-line").await;
+    source.github.lock().unwrap().lose_line_response = false;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert_eq!(review["line_comment_count"], 1);
+    assert_eq!(review["file_comment_count"], 0);
+    assert_eq!(
+        take_only_review(&source).threads,
+        [(Some(3), "> Buy the dip.\n\nAgain?".to_owned())]
+    );
+
+    // One wake per posted review, however many attempts it took.
+    assert_eq!(queued_wakes(&dir, "[sm review]").len(), 4);
+
+    // A revision holds at most 100 drafts, the page reconciliation reads.
+    for n in 0..100 {
+        add_draft(&app, &memo, &c1, json!(3), "Buy", &format!("note {n}")).await;
+    }
+    let (status, refused) = post_json(
+        app.clone(),
+        &format!("/docs/{memo}/drafts"),
+        json!({"sha": c1, "line": 3, "quote": "Buy", "body": "one too many"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    // Another revision has its own budget.
+    add_draft(&app, &memo, &"b".repeat(40), json!(3), "Buy", "elsewhere").await;
 }

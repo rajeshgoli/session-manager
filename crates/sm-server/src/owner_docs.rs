@@ -84,6 +84,102 @@ pub struct OwnerDocSummary {
     pub latest_blob_sha: String,
     pub published_at: String,
     pub publish_count: usize,
+    /// The latest posted review reached no session: its author was retired
+    /// with no parent to take it.
+    pub review_undelivered: bool,
+}
+
+/// A comment the owner is writing, anchored to a revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OwnerDocDraft {
+    pub id: String,
+    pub doc_id: String,
+    pub commit_sha: String,
+    /// Source line in the file at `commit_sha`; `None` is not placeable.
+    pub line: Option<i64>,
+    pub quote: String,
+    pub body: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OwnerDocVerdict {
+    Approve,
+    ChangesRequested,
+    Comment,
+}
+
+impl OwnerDocVerdict {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "approve" => Some(Self::Approve),
+            "changes_requested" => Some(Self::ChangesRequested),
+            "comment" => Some(Self::Comment),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::ChangesRequested => "changes_requested",
+            Self::Comment => "comment",
+        }
+    }
+
+    /// The first line of the GitHub review body.
+    pub fn body_header(self) -> &'static str {
+        match self {
+            Self::Approve => "**Verdict: Approved**",
+            Self::ChangesRequested => "**Verdict: Changes requested**",
+            Self::Comment => "**Verdict: Comments**",
+        }
+    }
+
+    /// How the wake message names the verdict.
+    pub fn wake_label(self) -> &'static str {
+        match self {
+            Self::Approve => "approved",
+            Self::ChangesRequested => "changes requested",
+            Self::Comment => "comments",
+        }
+    }
+}
+
+/// One `POST /docs/{id}/review` submission, keyed by the client's
+/// `submission_id`. `status` is `submitting`, `posted` or `failed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OwnerDocReview {
+    pub id: String,
+    pub status: String,
+    pub pending_review_node_id: Option<String>,
+    pub doc_id: String,
+    pub commit_sha: String,
+    pub blob_sha: String,
+    pub verdict: String,
+    pub body: Option<String>,
+    pub line_comment_count: i64,
+    pub file_comment_count: i64,
+    pub github_review_id: Option<i64>,
+    pub github_review_url: Option<String>,
+    pub submitted_at: String,
+    pub delivered_to_session_id: Option<String>,
+}
+
+/// What a review submission records once GitHub has the review.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostedOwnerDocReview {
+    pub github_review_id: Option<i64>,
+    pub github_review_url: String,
+    pub line_comment_count: i64,
+    pub file_comment_count: i64,
+    /// Drafts the review carried; they are deleted with the transition.
+    pub draft_ids: Vec<String>,
+    /// `(session id, text)` of the `[sm review]` wake, or `None` when no
+    /// session can take it (recorded as undelivered).
+    pub wake: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -559,19 +655,24 @@ impl OwnerDocStore {
             }
         }
         let mut reviews = BTreeMap::<String, Vec<(String, String)>>::new();
+        // Whether each doc's latest posted review reached a session.
+        let mut latest_delivered = BTreeMap::<String, bool>::new();
         {
             let mut statement = conn.prepare(
-                "SELECT doc_id, blob_sha, submitted_at FROM owner_doc_reviews
-                 WHERE status = 'posted'",
+                "SELECT doc_id, blob_sha, submitted_at, delivered_to_session_id
+                 FROM owner_doc_reviews WHERE status = 'posted'
+                 ORDER BY submitted_at, rowid",
             )?;
             for row in statement.query_map([], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
                 ))
             })? {
-                let (doc_id, blob, submitted_at) = row?;
+                let (doc_id, blob, submitted_at, delivered_to) = row?;
+                latest_delivered.insert(doc_id.clone(), delivered_to.is_some());
                 reviews
                     .entry(doc_id)
                     .or_default()
@@ -608,6 +709,7 @@ impl OwnerDocStore {
                 latest_blob_sha: latest.blob_sha.clone(),
                 published_at: latest.published_at.clone(),
                 publish_count: doc_publishes.len(),
+                review_undelivered: latest_delivered.get(&doc.id) == Some(&false),
                 doc,
             });
         }
@@ -677,6 +779,336 @@ impl OwnerDocStore {
             .into_iter()
             .find(|summary| summary.doc.id == doc_id))
     }
+
+    /// PR docs named `<repo-name>/<path>`: the candidates whose current PR
+    /// head a readable `?version=` may name when it matches no publish.
+    pub fn pr_docs_named(&self, name: &str, path: &str) -> Result<Vec<OwnerDoc>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = conn.prepare(&format!(
+            "SELECT {DOC_COLUMNS} FROM owner_docs WHERE path = ?1 AND pr_number IS NOT NULL
+             ORDER BY created_at, id"
+        ))?;
+        let rows = statement
+            .query_map(params![path], doc_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|doc| repo_name(&doc.repo).eq_ignore_ascii_case(name))
+            .collect())
+    }
+
+    /// Every draft on the doc, across revisions, oldest first.
+    pub fn drafts(&self, doc_id: &str) -> Result<Vec<OwnerDocDraft>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        drafts_conn(&conn, doc_id)
+    }
+
+    pub fn create_draft(
+        &self,
+        doc_id: &str,
+        commit_sha: &str,
+        line: Option<i64>,
+        quote: &str,
+        body: &str,
+    ) -> Result<OwnerDocDraft> {
+        let conn = self.open_write()?;
+        let now = now_rfc3339();
+        let id = random_hex(6);
+        conn.execute(
+            "INSERT INTO owner_doc_drafts
+             (id, doc_id, commit_sha, line, quote, body, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![id, doc_id, commit_sha, line, quote, body, now],
+        )?;
+        get_draft_conn(&conn, doc_id, &id)?.context("created draft vanished")
+    }
+
+    pub fn update_draft(
+        &self,
+        doc_id: &str,
+        draft_id: &str,
+        body: &str,
+    ) -> Result<Option<OwnerDocDraft>> {
+        let conn = self.open_write()?;
+        conn.execute(
+            "UPDATE owner_doc_drafts SET body = ?3, updated_at = ?4
+             WHERE doc_id = ?1 AND id = ?2",
+            params![doc_id, draft_id, body, now_rfc3339()],
+        )?;
+        get_draft_conn(&conn, doc_id, draft_id)
+    }
+
+    pub fn delete_draft(&self, doc_id: &str, draft_id: &str) -> Result<bool> {
+        let conn = self.open_write()?;
+        Ok(conn.execute(
+            "DELETE FROM owner_doc_drafts WHERE doc_id = ?1 AND id = ?2",
+            params![doc_id, draft_id],
+        )? > 0)
+    }
+
+    pub fn review(&self, submission_id: &str) -> Result<Option<OwnerDocReview>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        get_review_conn(&conn, submission_id)
+    }
+
+    /// The doc's review submissions, oldest first.
+    pub fn reviews(&self, doc_id: &str) -> Result<Vec<OwnerDocReview>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = conn.prepare(&format!(
+            "SELECT {REVIEW_COLUMNS} FROM owner_doc_reviews WHERE doc_id = ?1
+             ORDER BY submitted_at, rowid"
+        ))?;
+        let rows = statement
+            .query_map(params![doc_id], review_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Rows a crash or restart left mid-submit.
+    pub fn submitting_reviews(&self) -> Result<Vec<OwnerDocReview>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = conn.prepare(&format!(
+            "SELECT {REVIEW_COLUMNS} FROM owner_doc_reviews WHERE status = 'submitting'
+             ORDER BY submitted_at, rowid"
+        ))?;
+        let rows = statement
+            .query_map([], review_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Records a submission as `submitting` before any GitHub call. Returns
+    /// the stored row and whether this call inserted it; an existing row
+    /// (a retry of the same `submission_id`) is returned unchanged.
+    pub fn begin_review(
+        &self,
+        submission_id: &str,
+        doc_id: &str,
+        commit_sha: &str,
+        blob_sha: &str,
+        verdict: OwnerDocVerdict,
+        body: Option<&str>,
+    ) -> Result<(OwnerDocReview, bool)> {
+        let conn = self.open_write()?;
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO owner_doc_reviews
+             (id, status, pending_review_node_id, doc_id, commit_sha, blob_sha, verdict, body,
+              line_comment_count, file_comment_count, github_review_id, github_review_url,
+              submitted_at, delivered_to_session_id)
+             VALUES (?1, 'submitting', NULL, ?2, ?3, ?4, ?5, ?6, 0, 0, NULL, NULL, ?7, NULL)",
+            params![
+                submission_id,
+                doc_id,
+                commit_sha,
+                blob_sha,
+                verdict.as_str(),
+                body,
+                now_rfc3339()
+            ],
+        )? > 0;
+        let review = get_review_conn(&conn, submission_id)?.context("review row vanished")?;
+        Ok((review, inserted))
+    }
+
+    pub fn set_pending_review_node_id(
+        &self,
+        submission_id: &str,
+        node_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.open_write()?;
+        conn.execute(
+            "UPDATE owner_doc_reviews SET pending_review_node_id = ?2
+             WHERE id = ?1 AND status = 'submitting'",
+            params![submission_id, node_id],
+        )?;
+        Ok(())
+    }
+
+    /// The revision's latest unfinished (`submitting`) submission. While it
+    /// exists its drafts are frozen and new submissions resume it.
+    pub fn unfinished_review(
+        &self,
+        doc_id: &str,
+        commit_sha: &str,
+    ) -> Result<Option<OwnerDocReview>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        Ok(conn
+            .query_row(
+                &format!(
+                    "SELECT {REVIEW_COLUMNS} FROM owner_doc_reviews
+                     WHERE doc_id = ?1 AND commit_sha = ?2 AND status = 'submitting'
+                     ORDER BY submitted_at DESC, rowid DESC LIMIT 1"
+                ),
+                params![doc_id, commit_sha],
+                review_from_row,
+            )
+            .optional()?)
+    }
+
+    /// A retry of a `failed` submission: back to `submitting`, to be
+    /// reconciled against GitHub. Other states are returned unchanged.
+    pub fn reopen_review(&self, submission_id: &str) -> Result<OwnerDocReview> {
+        let conn = self.open_write()?;
+        conn.execute(
+            "UPDATE owner_doc_reviews SET status = 'submitting'
+             WHERE id = ?1 AND status = 'failed'",
+            params![submission_id],
+        )?;
+        get_review_conn(&conn, submission_id)?.context("review row vanished")
+    }
+
+    /// `submitting` → `failed`; the drafts stay for a retry.
+    pub fn fail_review(&self, submission_id: &str) -> Result<()> {
+        let conn = self.open_write()?;
+        conn.execute(
+            "UPDATE owner_doc_reviews SET status = 'failed', pending_review_node_id = NULL
+             WHERE id = ?1 AND status = 'submitting'",
+            params![submission_id],
+        )?;
+        Ok(())
+    }
+
+    /// `submitting` → `posted`, in one transaction with deleting the review's
+    /// drafts and queueing its wake, so the wake is queued exactly once.
+    /// Returns the row and whether this call made the transition.
+    pub fn finish_review(
+        &self,
+        submission_id: &str,
+        posted: &PostedOwnerDocReview,
+    ) -> Result<(OwnerDocReview, bool)> {
+        let mut conn = self.open_write()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE owner_doc_reviews
+             SET status = 'posted', pending_review_node_id = NULL,
+                 line_comment_count = ?2, file_comment_count = ?3,
+                 github_review_id = ?4, github_review_url = ?5,
+                 delivered_to_session_id = ?6
+             WHERE id = ?1 AND status = 'submitting'",
+            params![
+                submission_id,
+                posted.line_comment_count,
+                posted.file_comment_count,
+                posted.github_review_id,
+                posted.github_review_url,
+                posted.wake.as_ref().map(|(session, _)| session)
+            ],
+        )? > 0;
+        if changed {
+            let doc_id: String = tx.query_row(
+                "SELECT doc_id FROM owner_doc_reviews WHERE id = ?1",
+                params![submission_id],
+                |row| row.get(0),
+            )?;
+            for draft_id in &posted.draft_ids {
+                tx.execute(
+                    "DELETE FROM owner_doc_drafts WHERE doc_id = ?1 AND id = ?2",
+                    params![doc_id, draft_id],
+                )?;
+            }
+            if let Some((session_id, text)) = &posted.wake {
+                crate::queue::enqueue_message_once_in_conn(
+                    &tx,
+                    &format!("owner-review-{submission_id}"),
+                    session_id,
+                    text,
+                )?;
+            }
+        }
+        let review = get_review_conn(&tx, submission_id)?.context("review row vanished")?;
+        tx.commit()?;
+        Ok((review, changed))
+    }
+}
+
+const REVIEW_COLUMNS: &str = "id, status, pending_review_node_id, doc_id, commit_sha, blob_sha, \
+     verdict, body, line_comment_count, file_comment_count, github_review_id, github_review_url, \
+     submitted_at, delivered_to_session_id";
+const DRAFT_COLUMNS: &str = "id, doc_id, commit_sha, line, quote, body, created_at, updated_at";
+
+fn review_from_row(row: &Row<'_>) -> rusqlite::Result<OwnerDocReview> {
+    Ok(OwnerDocReview {
+        id: row.get(0)?,
+        status: row.get(1)?,
+        pending_review_node_id: row.get(2)?,
+        doc_id: row.get(3)?,
+        commit_sha: row.get(4)?,
+        blob_sha: row.get(5)?,
+        verdict: row.get(6)?,
+        body: row.get(7)?,
+        line_comment_count: row.get(8)?,
+        file_comment_count: row.get(9)?,
+        github_review_id: row.get(10)?,
+        github_review_url: row.get(11)?,
+        submitted_at: row.get(12)?,
+        delivered_to_session_id: row.get(13)?,
+    })
+}
+
+fn draft_from_row(row: &Row<'_>) -> rusqlite::Result<OwnerDocDraft> {
+    Ok(OwnerDocDraft {
+        id: row.get(0)?,
+        doc_id: row.get(1)?,
+        commit_sha: row.get(2)?,
+        line: row.get(3)?,
+        quote: row.get(4)?,
+        body: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+fn drafts_conn(conn: &Connection, doc_id: &str) -> Result<Vec<OwnerDocDraft>> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT {DRAFT_COLUMNS} FROM owner_doc_drafts WHERE doc_id = ?1
+         ORDER BY created_at, rowid"
+    ))?;
+    let rows = statement
+        .query_map(params![doc_id], draft_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn get_draft_conn(
+    conn: &Connection,
+    doc_id: &str,
+    draft_id: &str,
+) -> Result<Option<OwnerDocDraft>> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {DRAFT_COLUMNS} FROM owner_doc_drafts WHERE doc_id = ?1 AND id = ?2"),
+            params![doc_id, draft_id],
+            draft_from_row,
+        )
+        .optional()?)
+}
+
+fn get_review_conn(conn: &Connection, submission_id: &str) -> Result<Option<OwnerDocReview>> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {REVIEW_COLUMNS} FROM owner_doc_reviews WHERE id = ?1"),
+            params![submission_id],
+            review_from_row,
+        )
+        .optional()?)
+}
+
+fn random_hex(bytes: usize) -> String {
+    let mut buffer = vec![0u8; bytes];
+    OsRng.fill_bytes(&mut buffer);
+    buffer.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 const DOC_COLUMNS: &str = "id, repo, path, pr_number, author_session_id, author_session_name, \
@@ -849,29 +1281,32 @@ pub fn doc_kind(path: &str) -> DocKind {
     }
 }
 
-/// The page served by the doc reader. HTML is served byte for byte.
-pub fn render_doc_page(path: &str, title: &str, bytes: &[u8]) -> Vec<u8> {
+/// The page served by the doc reader, with `injection` (the review client)
+/// just before `</body>`. HTML keeps every byte of the owner's document
+/// apart from the inserted `data-sm-line` attributes; markdown carries the
+/// same attributes from its source offsets.
+pub fn render_doc_page(path: &str, title: &str, bytes: &[u8], injection: &str) -> Vec<u8> {
+    use crate::owner_doc_render::{
+        annotate_html_lines, find_body_end, inject_before_body_end, render_markdown_with_lines,
+    };
+    let shell = |body: String| {
+        let page = doc_shell(title, &body).into_bytes();
+        let body_end = find_body_end(&page);
+        inject_before_body_end(page, body_end, injection)
+    };
     match doc_kind(path) {
-        DocKind::Html => bytes.to_vec(),
-        DocKind::Markdown => {
-            let source = String::from_utf8_lossy(bytes);
-            let options = pulldown_cmark::Options::ENABLE_TABLES
-                | pulldown_cmark::Options::ENABLE_STRIKETHROUGH
-                | pulldown_cmark::Options::ENABLE_TASKLISTS
-                | pulldown_cmark::Options::ENABLE_FOOTNOTES;
-            let parser = pulldown_cmark::Parser::new_ext(&source, options);
-            let mut body = String::new();
-            pulldown_cmark::html::push_html(&mut body, parser);
-            doc_shell(title, &format!("<article>\n{body}</article>")).into_bytes()
+        DocKind::Html => {
+            let annotated = annotate_html_lines(bytes);
+            inject_before_body_end(annotated.bytes, annotated.body_end, injection)
         }
-        DocKind::Text => doc_shell(
-            title,
-            &format!(
-                "<pre>{}</pre>",
-                escape_html(&String::from_utf8_lossy(bytes))
-            ),
-        )
-        .into_bytes(),
+        DocKind::Markdown => shell(format!(
+            "<article>\n{}</article>",
+            render_markdown_with_lines(&String::from_utf8_lossy(bytes))
+        )),
+        DocKind::Text => shell(format!(
+            "<pre>{}</pre>",
+            escape_html(&String::from_utf8_lossy(bytes))
+        )),
     }
 }
 
@@ -1075,6 +1510,124 @@ mod tests {
     }
 
     #[test]
+    fn finishing_a_review_deletes_its_drafts_and_queues_one_wake() {
+        let (store, dir) = store();
+        let doc = store.publish(publish(Some(7), "a", "1")).unwrap().doc;
+        let (sha, other_sha) = ("a".repeat(40), "b".repeat(40));
+        let draft = store
+            .create_draft(&doc.id, &sha, Some(3), "the quote", "fix this")
+            .unwrap();
+        assert_eq!(draft.line, Some(3));
+        let edited = store
+            .update_draft(&doc.id, &draft.id, "fix this, please")
+            .unwrap()
+            .unwrap();
+        assert_eq!(edited.body, "fix this, please");
+        let later = store
+            .create_draft(&doc.id, &other_sha, None, "", "later")
+            .unwrap();
+        assert!(store
+            .update_draft("ffffffff", &draft.id, "x")
+            .unwrap()
+            .is_none());
+
+        let (row, inserted) = store
+            .begin_review(
+                "sub-00000001",
+                &doc.id,
+                &sha,
+                &"1".repeat(40),
+                OwnerDocVerdict::Comment,
+                None,
+            )
+            .unwrap();
+        assert!(inserted);
+        assert_eq!(row.status, "submitting");
+        // A retry of the same submission gets the stored row back.
+        let (_, inserted) = store
+            .begin_review(
+                "sub-00000001",
+                &doc.id,
+                &sha,
+                &"1".repeat(40),
+                OwnerDocVerdict::Approve,
+                None,
+            )
+            .unwrap();
+        assert!(!inserted);
+        assert_eq!(store.submitting_reviews().unwrap().len(), 1);
+
+        let posted = PostedOwnerDocReview {
+            github_review_id: Some(99),
+            github_review_url: "https://github.com/acme/widgets/pull/7#pullrequestreview-99".into(),
+            line_comment_count: 1,
+            file_comment_count: 0,
+            draft_ids: vec![draft.id.clone()],
+            wake: Some(("agent001".into(), "[sm review] ...".into())),
+        };
+        let (row, changed) = store.finish_review("sub-00000001", &posted).unwrap();
+        assert!(changed);
+        assert_eq!(row.status, "posted");
+        assert_eq!(row.verdict, "comment");
+        assert_eq!(row.delivered_to_session_id.as_deref(), Some("agent001"));
+        let (_, changed) = store.finish_review("sub-00000001", &posted).unwrap();
+        assert!(!changed, "a second finish is a no-op");
+        assert_eq!(store.drafts(&doc.id).unwrap(), vec![later]);
+        let conn = Connection::open(dir.join("message_queue.db")).unwrap();
+        let wakes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message_queue
+                 WHERE id = 'owner-review-sub-00000001' AND target_session_id = 'agent001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wakes, 1);
+        let summary = store.summary(&doc.id).unwrap().unwrap();
+        assert_eq!(summary.state, OwnerDocState::Reviewed);
+        assert!(!summary.review_undelivered);
+
+        // A review nobody could take is recorded as undelivered.
+        store
+            .begin_review(
+                "sub-00000002",
+                &doc.id,
+                &sha,
+                &"1".repeat(40),
+                OwnerDocVerdict::Comment,
+                None,
+            )
+            .unwrap();
+        let undelivered = PostedOwnerDocReview {
+            wake: None,
+            draft_ids: Vec::new(),
+            ..posted
+        };
+        store.finish_review("sub-00000002", &undelivered).unwrap();
+        assert!(store.summary(&doc.id).unwrap().unwrap().review_undelivered);
+        store
+            .begin_review(
+                "sub-00000003",
+                &doc.id,
+                &sha,
+                "x",
+                OwnerDocVerdict::Comment,
+                None,
+            )
+            .unwrap();
+        store.fail_review("sub-00000003").unwrap();
+        assert_eq!(
+            store.review("sub-00000003").unwrap().unwrap().status,
+            "failed"
+        );
+        assert!(store
+            .delete_draft(&doc.id, &store.drafts(&doc.id).unwrap()[0].id)
+            .unwrap());
+        assert!(store.drafts(&doc.id).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn retract_hides_until_republished() {
         let (store, dir) = store();
         let doc = store.publish(publish(None, "a", "1")).unwrap().doc;
@@ -1170,20 +1723,38 @@ mod tests {
 
     #[test]
     fn renders_by_extension() {
+        let client = "<script>client()</script>";
         let html = b"<html><body><p>as-is</p></body></html>";
-        assert_eq!(render_doc_page("a/memo.HTML", "t", html), html);
+        assert_eq!(
+            render_doc_page("a/memo.HTML", "t", html, client),
+            b"<html><body><p data-sm-line=\"1\">as-is</p><script>client()</script></body></html>"
+        );
         let md = String::from_utf8(render_doc_page(
             "a.md",
             "T <1>",
             b"# Hi\n\n| a |\n|---|\n| b |\n",
+            client,
         ))
         .unwrap();
-        assert!(md.contains("<h1>Hi</h1>"));
+        assert!(md.contains("<h1 data-sm-line=\"1\">Hi</h1>"), "{md}");
         assert!(md.contains("<table>"));
         assert!(md.contains("<title>T &lt;1&gt;</title>"));
-        let text =
-            String::from_utf8(render_doc_page("notes.txt", "t", b"<script>x</script>")).unwrap();
+        assert!(
+            md.contains("</article>\n<script>client()</script></body>"),
+            "{md}"
+        );
+        let text = String::from_utf8(render_doc_page(
+            "notes.txt",
+            "t",
+            b"<script>x</script>",
+            client,
+        ))
+        .unwrap();
         assert!(text.contains("<pre>&lt;script&gt;x&lt;/script&gt;</pre>"));
+        assert!(
+            text.contains("</pre>\n<script>client()</script></body>"),
+            "{text}"
+        );
     }
 
     #[test]

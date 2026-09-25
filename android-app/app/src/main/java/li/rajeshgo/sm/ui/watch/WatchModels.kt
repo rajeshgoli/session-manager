@@ -480,7 +480,7 @@ fun waitingSummary(session: ClientSession): String? {
     if (waits.isEmpty()) return null
     val prefix = if (isWaitingForResult(session)) "Waiting for " else "Pending: "
     return if (waits.size == 1) prefix + waits.first().label + " · " + ageFromIso(waits.first().since)
-    else prefix + listOf("queue_job" to "job", "review" to "review").mapNotNull { (kind, label) ->
+    else prefix + listOf("queue_job" to "job", "review" to "review", "owner_review" to "owner review").mapNotNull { (kind, label) ->
         val count = waits.count { it.kind == kind }
         if (count == 0) null else "$count $label${if (count == 1) "" else "s"}"
     }.joinToString(" and ")
