@@ -1,5 +1,6 @@
-//! Work claims over HTTP (sm#1452, ticket #1485): `/claims`, `sm spawn
-//! --ticket`, retire, implicit claims and the session feed.
+//! Work claims over HTTP (sm#1452, tickets #1485 and #1486): `/claims`,
+//! `sm spawn --ticket`, retire, implicit claims, the session feed, and the
+//! open-work checks run by task-complete and the sync pass.
 
 use axum::{
     body::{to_bytes, Body},
@@ -35,6 +36,8 @@ const REPO: &str = "acme/widgets";
 #[derive(Clone, Default)]
 struct StubItems {
     items: Arc<Mutex<BTreeMap<i64, GhItem>>>,
+    /// GitHub unreachable for every repo.
+    down: Arc<Mutex<bool>>,
 }
 
 impl StubItems {
@@ -55,11 +58,25 @@ impl StubItems {
             },
         );
     }
+
+    /// PR `number` merged `minutes_ago`.
+    fn merge(&self, number: i64, minutes_ago: i64) {
+        self.put(number, WorkKind::Pr, "merged");
+        let merged_at = (time::OffsetDateTime::now_utc() - time::Duration::minutes(minutes_ago))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        self.items
+            .lock()
+            .unwrap()
+            .get_mut(&number)
+            .unwrap()
+            .merged_at = Some(merged_at);
+    }
 }
 
 impl WorkItemSource for StubItems {
     fn fetch(&self, repo: &str, numbers: &[i64]) -> Result<BatchFetch, String> {
-        if repo == "acme/down" {
+        if repo == "acme/down" || *self.down.lock().unwrap() {
             return Err("gh api graphql failed: timed out after 30s".into());
         }
         let items = self.items.lock().unwrap();
@@ -533,4 +550,157 @@ async fn the_sync_pass_backfills_ends_claims_and_skips_closed_items() {
     // A second pass is a no-op: backfill ran once.
     f.state.run_work_claims_sync_pass().unwrap();
     assert_eq!(store.claims_for_item(REPO, 1).unwrap().len(), 1);
+}
+
+/// `[sm claim]` messages queued to `target`; none when nothing was queued.
+fn claim_texts(f: &Fixture, target: &str) -> Vec<String> {
+    let conn = rusqlite::Connection::open(f.dir.join("message_queue.db")).unwrap();
+    let queue_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'message_queue')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if !queue_exists {
+        return Vec::new();
+    }
+    queued_texts(f, target)
+        .into_iter()
+        .filter(|text| text.starts_with("[sm claim]"))
+        .collect()
+}
+
+async fn task_complete(f: &Fixture, who: &str) -> Value {
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &format!("/sessions/{who}/task-complete"),
+        Some(json!({"requester_session_id": who})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "completed", "{body}");
+    body
+}
+
+/// Waits for the background Check B that task-complete starts.
+async fn check_b_settled(f: &Fixture) {
+    for _ in 0..200 {
+        if f.store().sessions_due_check_b().unwrap().is_empty() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("Check B still due");
+}
+
+#[tokio::test]
+async fn task_complete_sends_check_b_once_and_leaves_the_parent_wake_alone() {
+    // The parent's wake without any claims, for comparison.
+    let baseline = fixture();
+    task_complete(&baseline, "eng00001").await;
+    let parent_wake = queued_texts(&baseline, "lead0001");
+
+    let f = fixture();
+    claim(&f, "eng00001", "ticket", 1, json!({})).await;
+    claim(&f, "eng00001", "pr", 9, json!({})).await;
+    task_complete(&f, "eng00001").await;
+    check_b_settled(&f).await;
+    // The sync pass finds nothing still due: one message only.
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert_eq!(
+        claim_texts(&f, "eng00001"),
+        vec!["[sm claim] At task-complete you hold: ticket #1 (open), PR #9 (open, not merged)."]
+    );
+    assert_eq!(queued_texts(&f, "lead0001"), parent_wake);
+    // Nothing open: no message.
+    let f = fixture();
+    claim(&f, "eng00001", "ticket", 1, json!({})).await;
+    f.items.put(1, WorkKind::Ticket, "closed");
+    task_complete(&f, "eng00001").await;
+    check_b_settled(&f).await;
+    assert!(claim_texts(&f, "eng00001").is_empty());
+}
+
+#[tokio::test]
+async fn check_b_waits_out_github_and_is_delivered_by_a_later_sync_pass() {
+    let f = fixture();
+    claim(&f, "eng00001", "ticket", 1, json!({})).await;
+    *f.items.down.lock().unwrap() = true;
+    // Task-complete itself is unaffected.
+    task_complete(&f, "eng00001").await;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(claim_texts(&f, "eng00001").is_empty());
+    assert_eq!(f.store().sessions_due_check_b().unwrap(), vec!["eng00001"]);
+    *f.items.down.lock().unwrap() = false;
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert_eq!(
+        claim_texts(&f, "eng00001"),
+        vec!["[sm claim] At task-complete you hold: ticket #1 (open)."]
+    );
+}
+
+#[tokio::test]
+async fn the_sync_pass_runs_check_a_after_a_merge_without_closes() {
+    let f = fixture();
+    claim(&f, "eng00001", "ticket", 1, json!({})).await;
+    // Linked to ticket 1 by the claim; the PR body has no "Closes".
+    let (_, body) = claim(&f, "eng00001", "pr", 9, json!({})).await;
+    assert_eq!(
+        body["notes"],
+        json!(["Note: PR #9's closing references don't include ticket #1."])
+    );
+    f.items.merge(9, 3);
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert_eq!(
+        claim_texts(&f, "eng00001"),
+        vec!["[sm claim] PR #9 merged 3m ago. Linked ticket #1 \"Item 1\" is open."]
+    );
+    assert_eq!(
+        f.store()
+            .item(REPO, 9)
+            .unwrap()
+            .unwrap()
+            .merge_check
+            .as_deref(),
+        Some("done")
+    );
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert_eq!(claim_texts(&f, "eng00001").len(), 1);
+}
+
+#[tokio::test]
+async fn the_sync_pass_runs_check_c_for_an_idle_holder_waiting_on_nothing() {
+    // lead0001 is idle, last active long ago.
+    let f = fixture();
+    claim(&f, "lead0001", "ticket", 1, json!({})).await;
+    // A Codex review it waits on holds the check back.
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/codex-review-requests",
+        Some(json!({"pr_number": 9, "repo": REPO, "requester_session_id": "lead0001"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert!(claim_texts(&f, "lead0001").is_empty());
+
+    let f = fixture();
+    claim(&f, "lead0001", "ticket", 1, json!({})).await;
+    f.state.run_work_claims_sync_pass().unwrap();
+    let texts = claim_texts(&f, "lead0001");
+    assert_eq!(texts.len(), 1, "{texts:?}");
+    assert!(texts[0].starts_with("[sm claim] Idle "), "{}", texts[0]);
+    assert!(
+        texts[0].ends_with("m, nothing pending. You hold: ticket #1 (open)."),
+        "{}",
+        texts[0]
+    );
+    // Once per idle stretch.
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert_eq!(claim_texts(&f, "lead0001").len(), 1);
 }

@@ -1,13 +1,14 @@
 //! Work claims HTTP surface (sm#1452, ticket #1485): `POST /claims`,
 //! `POST /claims/release`, `GET /claims`, implicit PR claims, the
-//! `sm spawn --ticket` reservation, and the periodic GitHub sync.
+//! `sm spawn --ticket` reservation, the periodic GitHub sync, and the
+//! open-work checks that follow it (ticket #1486).
 
 use super::*;
 use crate::work_claims::{
     closing_refs_page_query, items_query, parse_closing_refs_page, parse_items_response,
     BatchFetch, ClaimOutcome, ClaimRequest, ClaimResult, ClaimSource, ClaimView, HolderState,
-    ItemFetch, SessionDirectory, SessionInfo, WorkClaimStore, WorkItemSource, WorkKind,
-    MAX_ALIASES_PER_QUERY,
+    IdleSession, ItemFetch, SessionDirectory, SessionInfo, WorkClaimStore, WorkItemSource,
+    WorkKind, MAX_ALIASES_PER_QUERY,
 };
 
 /// `gh api graphql`, parsed whatever the exit code (appendix D).
@@ -511,9 +512,76 @@ pub(super) fn finish_spawn_ticket(
     }
 }
 
+/// Check B at task-complete (appendix F): marks the session's active claims
+/// due before the response, then checks in the background. Never fails or
+/// delays task-complete; a mark that fails is logged, and a check that fails
+/// stays due for the next sync pass.
+pub(super) fn schedule_check_b(state: &Arc<AppState>, session_id: &str) {
+    let now = time::OffsetDateTime::now_utc();
+    match work_claim_store(state).mark_check_b_due(session_id, now) {
+        Ok(0) => return,
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("Check B mark for {session_id} failed: {error:#}");
+            return;
+        }
+    }
+    let state = state.clone();
+    let session_id = session_id.to_owned();
+    tokio::spawn(async move {
+        let task_state = state.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let sessions = session_directory(&task_state)?;
+            let notified = work_claim_store(&task_state).run_check_b(
+                &session_id,
+                &sessions,
+                task_state.work_item_source.as_ref(),
+                time::OffsetDateTime::now_utc(),
+            )?;
+            deliver_claim_notices(&task_state, &notified);
+            anyhow::Ok(())
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!("{error:#}"),
+            Err(error) => eprintln!("Check B task failed: {error}"),
+        }
+    });
+}
+
+/// Check C's inputs: every live session's persisted last activity and
+/// whether the session feed shows it waiting on anything.
+fn idle_sessions(state: &AppState) -> anyhow::Result<Vec<IdleSession>> {
+    let feed = session_obligations(state).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let waiting: BTreeSet<&str> = feed["sessions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry["waiting_on"]
+                .as_array()
+                .is_some_and(|waiting| !waiting.is_empty())
+        })
+        .filter_map(|entry| entry["session_id"].as_str())
+        .collect();
+    Ok(state
+        .session_store
+        .list_sessions(false)?
+        .into_iter()
+        .filter(|record| !is_retired(record) && !record.is_stopped())
+        .map(|record| IdleSession {
+            waiting: waiting.contains(record.id.as_str()),
+            session_id: record.id,
+            last_activity: record.last_activity,
+        })
+        .collect())
+}
+
 /// Startup and every sync pass: backfill once, settle old spawn
 /// reservations, end claims of retired sessions, reconcile implicit claims,
-/// then fetch the tracked set from GitHub (appendices B, D, E).
+/// fetch the tracked set from GitHub (appendices B, D, E), then run the
+/// open-work checks: A, any Check B still due, and C (appendix F).
 pub(super) fn run_sync_pass(state: &AppState) -> anyhow::Result<()> {
     let store = work_claim_store(state);
     if !expand_home(&state.config.sm_send.db_path).exists() {
@@ -525,15 +593,35 @@ pub(super) fn run_sync_pass(state: &AppState) -> anyhow::Result<()> {
     store.recover_reservations(&sessions)?;
     store.end_claims_of_retired_sessions(&sessions)?;
     store.reconcile_implicit(&sessions)?;
+    let mut answered = BTreeSet::new();
     for (repo, numbers) in store.tracked_items()? {
         for chunk in numbers.chunks(MAX_ALIASES_PER_QUERY) {
             let fetched = state.work_item_source.fetch(&repo, chunk);
-            if let Err(error) = &fetched {
-                eprintln!("work claims sync of {repo} failed: {error}");
+            match &fetched {
+                Ok(batch) => answered.extend(batch.keys().map(|number| (repo.clone(), *number))),
+                Err(error) => eprintln!("work claims sync of {repo} failed: {error}"),
             }
             store.record_fetch(&repo, chunk, &fetched)?;
         }
     }
+    let now = time::OffsetDateTime::now_utc();
+    let mut notified = store.run_check_a(&answered, &sessions, now)?;
+    for session_id in store.sessions_due_check_b()? {
+        match store.run_check_b(&session_id, &sessions, state.work_item_source.as_ref(), now) {
+            Ok(sent) => notified.extend(sent),
+            Err(error) => eprintln!("{error:#}"),
+        }
+    }
+    notified.extend(store.run_check_c(
+        &answered,
+        &idle_sessions(state)?,
+        &sessions,
+        state.config.work_claims.idle_nudge(),
+        now,
+    )?);
+    notified.sort();
+    notified.dedup();
+    deliver_claim_notices(state, &notified);
     Ok(())
 }
 
