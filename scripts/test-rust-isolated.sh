@@ -8,7 +8,8 @@ set -euo pipefail
 # temp dir, so resolve a relative TMPDIR before anything derives from it.
 case "${TMPDIR:-/tmp}" in
   /*) ;;
-  *) TMPDIR="$(cd -- "$TMPDIR" && pwd)"; export TMPDIR ;;
+  # The ./ prefix keeps cd from searching (and echoing) a CDPATH match.
+  *) TMPDIR="$(cd -- "./$TMPDIR" && pwd)"; export TMPDIR ;;
 esac
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/sm-rust-test.XXXXXX")"
 cleanup() {
