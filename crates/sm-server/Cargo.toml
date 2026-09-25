@@ -13,7 +13,8 @@ clap = { workspace = true, features = ["derive"] }
 futures-util = { workspace = true }
 hmac = { workspace = true }
 jsonwebtoken = { workspace = true }
-nix = { workspace = true, features = ["fs", "poll", "term"] }
+libc = { workspace = true }
+nix = { workspace = true, features = ["fs", "poll", "signal", "term"] }
 p256 = { workspace = true, features = ["ecdsa", "pem"] }
 pulldown-cmark = { workspace = true }
 qrcode = { workspace = true }

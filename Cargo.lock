@@ -1291,6 +1291,7 @@ dependencies = [
  "futures-util",
  "hmac",
  "jsonwebtoken",
+ "libc",
  "nix",
  "p256",
  "pulldown-cmark",
