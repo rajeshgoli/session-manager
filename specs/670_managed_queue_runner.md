@@ -464,7 +464,7 @@ Sampling must run in a background task and must not block job admission, `/healt
 
 1. This feature executes arbitrary local commands from already-authorized local agents. It does not introduce remote command execution.
 2. `cwd` must be absolute after CLI normalization.
-3. Environment capture is explicit and small. The CLI passes `PATH`, `PYTHONPATH`, `VIRTUAL_ENV`, and repeated `--env` values; it does not copy the entire agent environment.
+3. Environment capture is explicit and small. The runner starts each job from an empty environment. The CLI passes the submitting shell's baseline variables (`PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `TERM`, `LANG`, and every `LC_*`) plus repeated `--env` values, which add to or override them. It does not copy the entire agent environment; project state such as `PYTHONPATH` or `VIRTUAL_ENV` travels only through `--env`. Example: a shell with `TMPDIR=/var/folders/xy/T/` and `VIRTUAL_ENV=/repo/.venv` submits a job that sees `TMPDIR` but not `VIRTUAL_ENV`; `--env VIRTUAL_ENV=/repo/.venv` adds it.
 4. Cancellation targets the process group, not just the wrapper PID.
 5. The scheduler and process reaper must not block the FastAPI event loop.
 
