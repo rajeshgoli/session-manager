@@ -1479,7 +1479,9 @@ fn check_c_fires_at_thirty_idle_minutes_once_per_stretch() {
     claim_ticket(&store, "lead", &dir);
     let idle = Duration::from_secs(30 * 60);
     let run = |store: &WorkClaimStore, sessions: &[IdleSession], now: i64| {
-        store.run_check_c(sessions, &dir, idle, at(now)).unwrap()
+        store
+            .run_check_c(&answered(&[1]), sessions, &dir, idle, at(now))
+            .unwrap()
     };
     // 29 minutes: not yet.
     assert!(run(&store, &idle_lead(0, false), 29).is_empty());
@@ -1520,17 +1522,55 @@ fn check_c_skips_working_sessions_and_closed_work() {
     }];
     // eng1 is working.
     assert!(store
-        .run_check_c(&eng1, &dir, idle, at(60))
+        .run_check_c(&answered(&[1]), &eng1, &dir, idle, at(60))
         .unwrap()
         .is_empty());
     let mut idle_dir = directory();
     idle_dir.insert(session("eng1", Some("lead"), HolderState::Idle));
+    // This pass's fetch failed: the cached "open" is stale, so no message.
+    store
+        .record_fetch(REPO, &[1], &Err("gh api graphql failed".into()))
+        .unwrap();
+    assert!(store
+        .run_check_c(&answered(&[]), &eng1, &idle_dir, idle, at(60))
+        .unwrap()
+        .is_empty());
+    // GitHub answered, but omitted the alias: also stale.
+    store.record_fetch(REPO, &[1], &fetch(&[])).unwrap();
+    assert!(store
+        .run_check_c(&answered(&[]), &eng1, &idle_dir, idle, at(60))
+        .unwrap()
+        .is_empty());
     store
         .record_fetch(REPO, &[1], &fetch(&[(1, ticket("closed"))]))
         .unwrap();
     assert!(store
-        .run_check_c(&eng1, &idle_dir, idle, at(60))
+        .run_check_c(&answered(&[1]), &eng1, &idle_dir, idle, at(60))
         .unwrap()
         .is_empty());
     assert!(queued(&db, "eng1").is_empty());
+}
+
+#[test]
+fn check_b_defers_when_github_omits_an_alias() {
+    let (store, db) = new_store();
+    let dir = directory();
+    claim_ticket(&store, "eng1", &dir);
+    claim_pr(
+        &store,
+        &request(WorkKind::Pr, 9, "eng1", &dir),
+        &[(9, pr("open", &[]))],
+    );
+    store.mark_check_b_due("eng1", at(0)).unwrap();
+    // Valid JSON, but #1's alias failed: its cached "open" is stale.
+    let partial = Answer(fetch(&[(9, pr("open", &[]))]));
+    assert!(store.run_check_b("eng1", &dir, &partial, at(1)).is_err());
+    assert!(queued(&db, "eng1").is_empty());
+    assert_eq!(store.sessions_due_check_b().unwrap(), vec!["eng1"]);
+    let full = Answer(fetch(&[(1, ticket("open")), (9, pr("open", &[]))]));
+    assert_eq!(
+        store.run_check_b("eng1", &dir, &full, at(2)).unwrap(),
+        vec!["eng1"]
+    );
+    assert_eq!(queued(&db, "eng1").len(), 1);
 }

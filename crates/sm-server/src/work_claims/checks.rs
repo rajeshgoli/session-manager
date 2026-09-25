@@ -135,7 +135,15 @@ impl WorkClaimStore {
                 for chunk in numbers.chunks(MAX_ALIASES_PER_QUERY) {
                     let fetched = source.fetch(&repo, chunk);
                     self.record_fetch(&repo, chunk, &fetched)?;
-                    if let Err(error) = fetched {
+                    let missing = match &fetched {
+                        Err(error) => Some(error.clone()),
+                        // Valid JSON can still omit an alias that failed.
+                        Ok(batch) => chunk
+                            .iter()
+                            .find(|number| !batch.contains_key(number))
+                            .map(|number| format!("no answer for #{number}")),
+                    };
+                    if let Some(error) = missing {
                         bail!("Check B for {session_id} deferred: {repo}: {error}");
                     }
                 }
@@ -178,11 +186,13 @@ impl WorkClaimStore {
 
     /// Check C, after a sync pass: one message to each idle session that has
     /// waited on nothing for at least `idle` since its last activity and
-    /// holds an armed claim on an open item. A claim is armed until it is
-    /// named, and re-arms once the session's activity lands more than
-    /// `idle` after that. Returns the sessions sent a message.
+    /// holds an armed claim on an item GitHub reported open in this pass
+    /// (`answered`, as for Check A). A claim is armed until it is named, and
+    /// re-arms once the session's activity lands more than `idle` after
+    /// that. Returns the sessions sent a message.
     pub fn run_check_c(
         &self,
+        answered: &BTreeSet<(String, i64)>,
         candidates: &[IdleSession],
         sessions: &SessionDirectory,
         idle: Duration,
@@ -210,11 +220,12 @@ impl WorkClaimStore {
                 params![candidate.session_id],
             )?;
             let armed = claims.iter().filter(|claim| {
-                claim
-                    .nudged_idle_at
-                    .as_deref()
-                    .and_then(parse_time)
-                    .is_none_or(|nudged| last_activity - nudged > idle)
+                answered.contains(&(claim.repo.clone(), claim.number))
+                    && claim
+                        .nudged_idle_at
+                        .as_deref()
+                        .and_then(parse_time)
+                        .is_none_or(|nudged| last_activity - nudged > idle)
             });
             let named = open_claims(&tx, armed)?;
             if named.is_empty() {
@@ -387,8 +398,9 @@ fn format_age(age: time::Duration) -> String {
     }
 }
 
-/// Of `claims`, those still active on an open, fetched item: tickets
-/// first, then in claim order.
+/// Of `claims`, those still active on an item whose last fetch succeeded
+/// and found it open: tickets first, then in claim order. An item whose
+/// latest fetch failed keeps a stale state, so it is never named.
 fn open_claims<'a>(
     conn: &Connection,
     claims: impl Iterator<Item = &'a WorkClaim>,
@@ -398,8 +410,9 @@ fn open_claims<'a>(
         if claim.ended_at.is_some() || claim.reserved_at.is_some() {
             continue;
         }
-        let open = get_item(conn, &claim.repo, claim.number)?
-            .is_some_and(|item| item.synced_at.is_some() && item.state == "open");
+        let open = get_item(conn, &claim.repo, claim.number)?.is_some_and(|item| {
+            item.synced_at.is_some() && item.sync_error.is_none() && item.state == "open"
+        });
         if open {
             named.push(claim.clone());
         }

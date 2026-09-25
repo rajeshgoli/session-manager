@@ -613,6 +613,7 @@ pub(super) fn run_sync_pass(state: &AppState) -> anyhow::Result<()> {
         }
     }
     notified.extend(store.run_check_c(
+        &answered,
         &idle_sessions(state)?,
         &sessions,
         state.config.work_claims.idle_nudge(),
