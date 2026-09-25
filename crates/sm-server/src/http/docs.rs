@@ -162,7 +162,7 @@ fn gh_graphql(query: &str, variables: Value, retry: bool) -> Result<Value, Strin
     } else {
         let mut command = Command::new("gh");
         command.args(&args);
-        command_output_with_timeout(command, Duration::from_secs(30))
+        crate::child_output::output_with_timeout(command, Duration::from_secs(30))
     };
     let _ = fs::remove_file(&input);
     let output = output.map_err(|error| format!("gh api graphql failed: {error}"))?;
