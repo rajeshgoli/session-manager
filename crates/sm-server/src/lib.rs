@@ -22,6 +22,7 @@ pub mod sessions;
 pub mod studio_ssh;
 pub mod tool_usage;
 pub mod usage_burn;
+mod usage_db;
 pub mod usage_identity;
 pub mod usage_ledger;
 pub mod usage_report;

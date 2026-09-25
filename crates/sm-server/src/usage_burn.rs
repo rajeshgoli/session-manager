@@ -9,7 +9,10 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use serde_json::{Map, Value};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::usage_identity::{AccountIdentity, Provider, UsageIdentityStore};
+use crate::{
+    usage_db::{PooledConnection, UsageDbPool},
+    usage_identity::{AccountIdentity, Provider, UsageIdentityStore},
+};
 
 const USAGE_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_WINDOW_MINUTES: i64 = 300;
@@ -31,7 +34,7 @@ pub struct BurnWindowSample {
 
 #[derive(Debug, Clone)]
 pub struct UsageBurnStore {
-    db_path: PathBuf,
+    db: UsageDbPool,
     identity_store: UsageIdentityStore,
 }
 
@@ -40,7 +43,7 @@ impl UsageBurnStore {
         let db_path = db_path.into();
         let store = Self {
             identity_store: UsageIdentityStore::new(&db_path)?,
-            db_path,
+            db: UsageDbPool::new(db_path, USAGE_DB_BUSY_TIMEOUT),
         };
         store.initialize()?;
         Ok(store)
@@ -77,22 +80,8 @@ impl UsageBurnStore {
         Ok(())
     }
 
-    fn open(&self) -> Result<Connection> {
-        if let Some(parent) = self
-            .db_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create usage DB directory {}", parent.display())
-            })?;
-        }
-        let connection = Connection::open(&self.db_path)
-            .with_context(|| format!("failed to open usage DB {}", self.db_path.display()))?;
-        connection.busy_timeout(USAGE_DB_BUSY_TIMEOUT)?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "foreign_keys", true)?;
-        Ok(connection)
+    fn open(&self) -> Result<PooledConnection> {
+        self.db.get()
     }
 
     pub fn record_for_provider(
