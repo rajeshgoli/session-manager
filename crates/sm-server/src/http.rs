@@ -15458,8 +15458,11 @@ mod tests {
                     .display()
                     .to_string(),
             ];
+            // Publish atomically: the parent reads as soon as the path exists
+            // and must never see a created-but-unwritten file (sm#1432).
+            let staged_path = probe_path.with_extension("staged");
             fs::write(
-                &probe_path,
+                &staged_path,
                 format!(
                     "{}\n{}\n{}",
                     process::id(),
@@ -15468,6 +15471,7 @@ mod tests {
                 ),
             )
             .unwrap();
+            fs::rename(&staged_path, &probe_path).unwrap();
 
             let release_path = probe_path.with_extension("release");
             for _ in 0..500 {

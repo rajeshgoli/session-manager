@@ -134,6 +134,7 @@ async fn delete_json(app: axum::Router, uri: &str, payload: Value) -> (StatusCod
 }
 
 async fn wait_for_queue_job_state(app: axum::Router, job_id: &str, states: &[&str]) -> Value {
+    let mut last = Value::Null;
     for _ in 0..80 {
         let (status, payload) = get_json(app.clone(), &format!("/queue-jobs/{job_id}")).await;
         assert_eq!(status, StatusCode::OK);
@@ -143,9 +144,13 @@ async fn wait_for_queue_job_state(app: axum::Router, job_id: &str, states: &[&st
         {
             return payload;
         }
+        last = payload;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("queue job {job_id} did not reach one of {states:?}");
+    panic!(
+        "queue job {job_id} did not reach one of {states:?}; last state={} holding_reason={}",
+        last["state"], last["holding_reason"]
+    );
 }
 
 fn queued_message_texts(db_path: &PathBuf, target_session_id: &str) -> Vec<String> {
@@ -12977,7 +12982,18 @@ async fn fixture_core_session_graph_endpoints_round_trip_state() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload, json!({ "status": "ok", "enabled": true }));
+    assert_eq!(
+        payload,
+        json!({
+            "status": "ok",
+            "enabled": true,
+            "enforced": true,
+            "warning_percentage": 50.0,
+            "critical_percentage": 65.0,
+            "threshold_percentages": [50.0, 65.0],
+            "threshold_source": "default"
+        })
+    );
 
     let (status, payload) = get_json(app.clone(), "/sessions/context-monitor").await;
     assert_eq!(status, StatusCode::OK);
@@ -18197,28 +18213,6 @@ async fn runtime_core_delayed_initial_codex_binding_updates_session_chain() {
         .join(format!("{:02}", now.day()));
     fs::create_dir_all(&day_dir).unwrap();
     let rollout_path = day_dir.join("rollout-delayed-create-thread.jsonl");
-    let rollout_working_dir = working_dir.clone();
-    let writer = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(1_200));
-        fs::write(
-            rollout_path,
-            format!(
-                "{}\n",
-                json!({
-                    "type": "session_meta",
-                    "payload": {
-                        "id": "delayed-create-thread",
-                        "cwd": rollout_working_dir.display().to_string(),
-                        "timestamp": (time::OffsetDateTime::now_utc()
-                            + time::Duration::seconds(1))
-                            .format(&time::format_description::well_known::Rfc3339)
-                            .unwrap()
-                    }
-                })
-            ),
-        )
-        .unwrap();
-    });
 
     let (status, payload) = post_json(
         app,
@@ -18233,9 +18227,31 @@ async fn runtime_core_delayed_initial_codex_binding_updates_session_chain() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(payload["provider_resume_id"].is_null());
-    writer.join().unwrap();
+    // Write the rollout only after create has given up on inline binding, so
+    // a slow create under a loaded suite cannot bind it inline (sm#1432).
+    fs::write(
+        rollout_path,
+        format!(
+            "{}\n",
+            json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "delayed-create-thread",
+                    "cwd": working_dir.display().to_string(),
+                    "timestamp": (time::OffsetDateTime::now_utc()
+                        + time::Duration::seconds(1))
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap()
+                }
+            })
+        ),
+    )
+    .unwrap();
 
+    // The session record and the usage ledger row are written separately, so
+    // wait for both before asserting (sm#1432).
     let mut bound = false;
+    let mut ledger_rows = None;
     for _ in 0..30 {
         let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
         bound = state["sessions"]
@@ -18244,7 +18260,16 @@ async fn runtime_core_delayed_initial_codex_binding_updates_session_chain() {
             .iter()
             .find(|session| session["id"] == "createcodex")
             .is_some_and(|session| session["provider_resume_id"] == "delayed-create-thread");
-        if bound {
+        ledger_rows = Connection::open(state_file.with_extension("usage.db"))
+            .and_then(|connection| {
+                connection.query_row(
+                    "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'createcodex' AND provider_session_id = 'delayed-create-thread'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+            })
+            .ok();
+        if bound && ledger_rows == Some(1) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -18253,15 +18278,7 @@ async fn runtime_core_delayed_initial_codex_binding_updates_session_chain() {
         bound,
         "deferred creation binding did not update the session"
     );
-    let count: i64 = Connection::open(state_file.with_extension("usage.db"))
-        .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM seat_sessions WHERE seat_id = 'createcodex' AND provider_session_id = 'delayed-create-thread'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(ledger_rows, Some(1));
 }
 
 #[tokio::test]
@@ -20484,7 +20501,7 @@ async fn reparent_tree_dry_run_reports_exact_plan_without_persisting_a_request()
 }
 
 #[tokio::test]
-async fn reparent_tree_dry_run_reports_an_overlapping_active_request_as_a_blocker() {
+async fn reparent_tree_dry_run_rejects_an_overlapping_active_request_like_apply() {
     let state_file = write_reparent_tree_fixture();
     let mut config = config_with_state_file(&state_file);
     config.rust_core.fixture_writes_enabled = true;
@@ -20504,7 +20521,7 @@ async fn reparent_tree_dry_run_reports_an_overlapping_active_request_as_a_blocke
     assert_eq!(status, StatusCode::CREATED);
     let active_id = active["id"].as_str().unwrap();
 
-    let (status, preview) = post_json_with_headers_and_peer(
+    let (status, rejection) = post_json_with_headers_and_peer(
         app,
         "/sessions/source01/reparent-tree-requests",
         json!({
@@ -20517,11 +20534,10 @@ async fn reparent_tree_dry_run_reports_an_overlapping_active_request_as_a_blocke
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
-    let blockers = preview["blockers"].as_array().unwrap();
-    assert_eq!(blockers.len(), 1);
-    assert!(blockers[0].as_str().unwrap().contains(active_id));
-    assert!(blockers[0].as_str().unwrap().contains("sibling01"));
+    assert_eq!(status, StatusCode::CONFLICT);
+    let detail = rejection["detail"].as_str().unwrap();
+    assert!(detail.contains(active_id));
+    assert!(detail.contains("sibling01"));
 
     let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
     assert_eq!(state["reparent_requests"].as_array().unwrap().len(), 1);
