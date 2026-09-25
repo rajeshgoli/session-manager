@@ -18,7 +18,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use rand_core::{OsRng, RngCore};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior};
 use serde::Serialize;
 use serde_json::{json, Value};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -749,7 +749,7 @@ impl WorkClaimStore {
     ) -> Result<()> {
         let repo = &canonical_repo(repo);
         let mut conn = self.open_write()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = now_rfc3339();
         for number in numbers {
             match fetched {
@@ -806,7 +806,7 @@ impl WorkClaimStore {
         }
         self.record_fetch(&request.repo, &numbers, &fetched)?;
         let mut conn = self.open_write()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let item = get_item(&tx, &request.repo, request.number)?
             .context("claimed item vanished after its fetch")?;
         if let Some(detail) = validate_item(&item, request.kind) {
@@ -842,7 +842,7 @@ impl WorkClaimStore {
         let repo = &canonical_repo(repo);
         validate_repo_slug(repo)?;
         let mut conn = self.open_write()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let result = implicit_claim_conn(&tx, repo, pr, session, source, sessions, false)?;
         tx.commit()?;
         Ok(result)
@@ -858,7 +858,7 @@ impl WorkClaimStore {
     ) -> Result<Option<WorkClaim>> {
         let repo = &canonical_repo(repo);
         let mut conn = self.open_write()?;
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let Some(claim) = query_claims(
             &tx,
             "WHERE repo = ?1 AND number = ?2 AND session_id = ?3 AND kind = ?4
@@ -880,7 +880,7 @@ impl WorkClaimStore {
         let Some(mut conn) = self.open_existing()? else {
             return Ok(0);
         };
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let claims = query_claims(
             &tx,
             "WHERE session_id = ?1 AND ended_at IS NULL",
@@ -894,13 +894,19 @@ impl WorkClaimStore {
         Ok(claims.len())
     }
 
-    /// Spawn step 4: the session exists, so the claim becomes real.
-    pub fn confirm_reservation(&self, claim_id: &str) -> Result<()> {
+    /// Spawn step 4: the session exists, so the claim becomes real and
+    /// supersedes any stopped holders. Returns the sessions sent a message.
+    pub fn confirm_reservation(
+        &self,
+        claim_id: &str,
+        sessions: &SessionDirectory,
+    ) -> Result<Vec<String>> {
         let mut conn = self.open_write()?;
-        let tx = conn.transaction()?;
-        confirm_reservation_conn(&tx, claim_id)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut notified = Vec::new();
+        confirm_reservation_conn(&tx, claim_id, sessions, &mut notified)?;
         tx.commit()?;
-        Ok(())
+        Ok(notified)
     }
 
     /// Spawn step 3 failed: no session, so no claim.
@@ -915,14 +921,11 @@ impl WorkClaimStore {
 
     /// Reservations older than `RESERVATION_RECOVERY_AGE`: confirmed when
     /// their session exists, deleted otherwise. Returns (confirmed, deleted).
-    pub fn recover_reservations(
-        &self,
-        session_exists: impl Fn(&str) -> bool,
-    ) -> Result<(usize, usize)> {
+    pub fn recover_reservations(&self, sessions: &SessionDirectory) -> Result<(usize, usize)> {
         let Some(mut conn) = self.open_existing()? else {
             return Ok((0, 0));
         };
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let cutoff = rfc3339_before(RESERVATION_RECOVERY_AGE);
         let stale = query_claims(
             &tx,
@@ -931,8 +934,8 @@ impl WorkClaimStore {
         )?;
         let (mut confirmed, mut deleted) = (0, 0);
         for claim in stale {
-            if session_exists(&claim.session_id) {
-                confirm_reservation_conn(&tx, &claim.id)?;
+            if sessions.get(&claim.session_id).is_some() {
+                confirm_reservation_conn(&tx, &claim.id, sessions, &mut Vec::new())?;
                 confirmed += 1;
             } else {
                 tx.execute("DELETE FROM work_claims WHERE id = ?1", params![claim.id])?;
@@ -949,7 +952,7 @@ impl WorkClaimStore {
         let Some(mut conn) = self.open_existing()? else {
             return Ok(0);
         };
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let claims = query_claims(&tx, "WHERE ended_at IS NULL AND reserved_at IS NULL", [])?;
         let now = now_rfc3339();
         let mut ended = 0;
@@ -1017,7 +1020,7 @@ impl WorkClaimStore {
         let Some(mut conn) = self.open_existing()? else {
             return Ok(false);
         };
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if meta_get(&tx, "backfill_done_at")?.is_some() {
             return Ok(false);
         }
@@ -1112,7 +1115,7 @@ impl WorkClaimStore {
         let Some(mut conn) = self.open_existing()? else {
             return Ok(0);
         };
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut pending = Vec::<(String, i64, String, ClaimSource)>::new();
         let reviews_mark = meta_get(&tx, "implicit_watermark_reviews")?
             .and_then(|value| value.parse::<i64>().ok())
@@ -1494,6 +1497,9 @@ fn resolve_others(
     let number = request.number;
     for entry in classified {
         match entry {
+            // A spawn reservation supersedes stopped holders only once its
+            // session exists (confirm), so a failed spawn tells nobody.
+            Classified::Dormant(_) if request.reserve => {}
             Classified::Dormant(claim) => {
                 supersede(conn, claim, claimant, noun, number, now, notes, notified)?
             }
@@ -1709,13 +1715,50 @@ fn implicit_claim_conn(
     }
 }
 
-fn confirm_reservation_conn(conn: &Connection, claim_id: &str) -> Result<()> {
+fn confirm_reservation_conn(
+    conn: &Connection,
+    claim_id: &str,
+    sessions: &SessionDirectory,
+    notified: &mut Vec<String>,
+) -> Result<()> {
     let changed = conn.execute(
         "UPDATE work_claims SET reserved_at = NULL WHERE id = ?1 AND reserved_at IS NOT NULL",
         params![claim_id],
     )?;
-    if changed > 0 {
-        write_claim_taken(conn, claim_id, &now_rfc3339())?;
+    if changed == 0 {
+        return Ok(());
+    }
+    let now = now_rfc3339();
+    write_claim_taken(conn, claim_id, &now)?;
+    let claim = get_claim(conn, claim_id)?.context("confirmed claim vanished")?;
+    let claimant = sessions
+        .get(&claim.session_id)
+        .cloned()
+        .unwrap_or(SessionInfo {
+            id: claim.session_id.clone(),
+            name: claim_holder_name(&claim),
+            parent_session_id: claim.parent_session_id.clone(),
+            state: HolderState::Working,
+            stopped_at: None,
+        });
+    let others = query_claims(
+        conn,
+        "WHERE repo = ?1 AND number = ?2 AND ended_at IS NULL AND session_id != ?3",
+        params![claim.repo, claim.number, claim.session_id],
+    )?;
+    for entry in classify(&others, &claimant, sessions) {
+        if let Classified::Dormant(dormant) = entry {
+            supersede(
+                conn,
+                dormant,
+                &claimant,
+                claim.kind().noun(),
+                claim.number,
+                &now,
+                &mut Vec::new(),
+                notified,
+            )?;
+        }
     }
     Ok(())
 }

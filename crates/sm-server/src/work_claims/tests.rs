@@ -498,7 +498,7 @@ fn spawn_reservation_confirms_or_is_deleted_and_recovers_after_a_crash() {
             .outcome,
         ClaimOutcome::Collision { .. }
     ));
-    store.confirm_reservation(&claim.id).unwrap();
+    store.confirm_reservation(&claim.id, &dir).unwrap();
     dir.insert(session("newkid01", Some("eng1"), HolderState::Working));
     assert_eq!(store.claims_for_session("newkid01", true).unwrap().len(), 1);
     assert_eq!(
@@ -514,7 +514,7 @@ fn spawn_reservation_confirms_or_is_deleted_and_recovers_after_a_crash() {
     let made = reserve("newkid03", 3, &dir);
     let lost = reserve("newkid04", 4, &dir);
     assert_eq!(
-        store.recover_reservations(|_| true).unwrap(),
+        store.recover_reservations(&dir).unwrap(),
         (0, 0),
         "too young"
     );
@@ -526,7 +526,13 @@ fn spawn_reservation_confirms_or_is_deleted_and_recovers_after_a_crash() {
         )
         .unwrap();
     assert_eq!(
-        store.recover_reservations(|id| id == "newkid03").unwrap(),
+        store
+            .recover_reservations(&{
+                let mut with_made = dir.clone();
+                with_made.insert(session("newkid03", Some("eng1"), HolderState::Working));
+                with_made
+            })
+            .unwrap(),
         (1, 1)
     );
     assert!(store
@@ -1009,4 +1015,46 @@ fn repo_slugs_are_case_insensitive() {
         .release("eng1", "Acme/Widgets", 1, WorkKind::Ticket)
         .unwrap()
         .is_some());
+}
+
+#[test]
+fn a_spawn_supersedes_a_stopped_holder_only_once_its_session_exists() {
+    let (store, db) = new_store();
+    let dir = directory();
+    claim_ticket(&store, "asleep", &dir);
+    let reserve = |id: &str| {
+        let mut claim = request(WorkKind::Ticket, 1, "eng1", &dir);
+        claim.claimant = session(id, Some("eng1"), HolderState::Working);
+        claim.source = ClaimSource::Spawn;
+        claim.reserve = true;
+        match store
+            .claim_explicit(&claim, fetch(&[(1, ticket("open"))]), &dir)
+            .unwrap()
+            .outcome
+        {
+            ClaimOutcome::Claimed { claim, notes, .. } => {
+                assert!(notes.is_empty(), "{notes:?}");
+                claim
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    // A failed spawn: the stopped holder keeps its claim and hears nothing.
+    let failed = reserve("newkid01");
+    store.delete_reservation(&failed.id).unwrap();
+    assert_eq!(active(&store, 1).len(), 1);
+    assert!(queued(&db, "asleep").is_empty());
+    // A spawn that succeeds supersedes it at confirmation.
+    let made = reserve("newkid02");
+    let mut with_kid = dir.clone();
+    with_kid.insert(session("newkid02", Some("eng1"), HolderState::Working));
+    assert_eq!(
+        store.confirm_reservation(&made.id, &with_kid).unwrap(),
+        vec!["asleep"]
+    );
+    assert_eq!(ended(&store, 1).as_deref(), Some("superseded"));
+    assert_eq!(
+        queued(&db, "asleep"),
+        vec!["[sm claim] While you were stopped, newkid02-name (newkid02) claimed ticket #1. Your claim on it ended."]
+    );
 }

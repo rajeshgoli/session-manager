@@ -488,12 +488,15 @@ pub(super) fn finish_spawn_ticket(
 ) -> Option<Value> {
     let store = work_claim_store(state);
     if created {
-        if let Err(error) = store.confirm_reservation(&reservation.claim_id) {
+        let confirmed = session_directory(state)
+            .and_then(|sessions| store.confirm_reservation(&reservation.claim_id, &sessions));
+        match confirmed {
+            Ok(notified) => deliver_claim_notices(state, &notified),
             // Recovery confirms it within minutes: the session exists.
-            eprintln!(
+            Err(error) => eprintln!(
                 "spawn claim {} confirmation failed: {error:#}",
                 reservation.claim_id
-            );
+            ),
         }
         let claim = claim_json(state, &reservation.claim_id).ok()?;
         Some(json!({ "claim": claim, "notes": reservation.notes }))
@@ -519,7 +522,7 @@ pub(super) fn run_sync_pass(state: &AppState) -> anyhow::Result<()> {
     store.ensure_schema()?;
     let sessions = session_directory(state)?;
     store.backfill(&sessions)?;
-    store.recover_reservations(|id| sessions.get(id).is_some())?;
+    store.recover_reservations(&sessions)?;
     store.end_claims_of_retired_sessions(&sessions)?;
     store.reconcile_implicit(&sessions)?;
     for (repo, numbers) in store.tracked_items()? {
