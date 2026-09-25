@@ -322,6 +322,7 @@ pub enum GitHubPullRequestState {
 mod claims;
 mod docs;
 mod worktrees;
+mod history;
 pub use docs::{
     DocFetchError, DocPullRequest, DocReviewOnGitHub, OwnerDocSource, SubmittedDocReview,
 };
@@ -1441,6 +1442,8 @@ pub fn router(state: AppState) -> Router {
         .route("/claims/release", post(claims::release_claim))
         .route("/claims/worktree", post(worktrees::post_claim_worktree))
         .route("/worktrees/keep", post(worktrees::post_worktree_keep))
+        .route("/history", get(history::get_history))
+        .route("/t/{repo}/{number}", get(history::get_timeline))
         .route("/docs/{doc_id}", get(docs::get_owner_doc))
         // `/docs/{id}/view|raw|retract` (internal API) and the readable
         // reader `/docs/<repo-name>/<path in repo>` share one pattern.
@@ -13616,6 +13619,8 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path.starts_with("/codex-review-requests/")
         || path == "/session-obligations"
         || path == "/claims"
+        || path == "/history"
+        || path.starts_with("/t/")
         || path == "/docs"
         || path.starts_with("/docs/")
         || path == "/queue-jobs"
@@ -13881,12 +13886,14 @@ fn ensure_core_runtime_node_supported(node: &str) -> Result<(), ApiError> {
     })
 }
 
-/// Owner doc reads (`/docs`, `/docs/{id}`, `/view`, `/raw`, and the readable
-/// `/docs/<repo-name>/<path>`) also accept the owner's interactive Cloudflare
-/// Access login on the browser hostname. Docs only: every other route there still needs the SM Google session (spec 945).
+/// Owner pages: docs, history and watch; reads only. Doc reads (`/docs`,
+/// `/docs/{id}`, `/view`, `/raw`, the readable `/docs/<repo-name>/<path>`),
+/// `/history` and `/t/<repo-name>/<n>` also accept the owner's interactive
+/// Cloudflare Access login on the browser hostname. Every other route there
+/// still needs the SM Google session (spec 945).
 /// A present assertion must verify; a verified non-owner email falls through
 /// to the Google session check like a request without one.
-fn ensure_owner_doc_read_allowed(state: &AppState, request: &Request) -> Result<(), ApiError> {
+fn ensure_owner_page_read_allowed(state: &AppState, request: &Request) -> Result<(), ApiError> {
     if request_cloudflare_access_application(state, request)
         == Some(CloudflareAccessApplication::Browser)
         && !is_request_local_bypass(state, request)
@@ -18220,11 +18227,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_history_pages_accept_owner_cloudflare_browser_login() {
+        let app = owner_doc_browser_access_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let (status, body) = browser_host_get(&app, "/history?format=json", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["schema_version"], 1);
+        assert_eq!(body["page_url"], "https://sm.example.com/history");
+        let mut request =
+            public_request_with_host(Method::GET, "/history", Body::empty(), "sm.example.com");
+        request
+            .headers_mut()
+            .insert("cf-access-jwt-assertion", owner.parse().unwrap());
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
+        // Nothing is tracked, so a request past auth gets 404.
+        let (status, body) = browser_host_get(&app, "/t/widgets/1?format=json", Some(&owner)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["detail"], "Not tracked");
+
+        let expired =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 1_700_000_100);
+        let stranger =
+            test_browser_access_assertion("sm-browser-aud", "stranger@example.com", 4_102_444_800);
+        for uri in ["/history", "/t/widgets/1"] {
+            let (status, _) = browser_host_get(&app, uri, Some(&expired)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+            for assertion in [Some(stranger.as_str()), None] {
+                let (status, _) = browser_host_get(&app, uri, assertion).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn owner_browser_login_does_not_open_non_doc_routes() {
         let app = owner_doc_browser_access_app();
         let owner =
             test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
-        for uri in ["/sessions", "/session-obligations", "/queue-jobs"] {
+        for uri in [
+            "/sessions",
+            "/session-obligations",
+            "/queue-jobs",
+            "/claims",
+        ] {
             let (status, body) = browser_host_get(&app, uri, Some(&owner)).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}: {body}");
         }

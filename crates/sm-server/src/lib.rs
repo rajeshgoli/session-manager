@@ -26,5 +26,6 @@ pub mod usage_identity;
 pub mod usage_ledger;
 pub mod usage_report;
 pub mod work_claims;
+pub mod work_history;
 
 pub mod host_status;

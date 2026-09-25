@@ -21,6 +21,7 @@ const CLIENT_CONFIG_SUBPATH: &str = "session-manager/client.yaml";
 mod claims;
 mod doc;
 mod git_repo;
+mod history;
 mod watch;
 
 #[derive(Parser)]
@@ -109,6 +110,8 @@ enum Command {
     Pr(claims::PrArgs),
     /// Keep a worktree past your retirement
     Worktree(claims::worktree::WorktreeArgs),
+    /// Tickets and PRs with their agents, PRs, docs and reviews; --item N for one timeline
+    History(history::HistoryArgs),
 }
 
 #[derive(Args)]
@@ -1244,6 +1247,7 @@ fn run() -> Result<()> {
         Command::Ticket(args) => claims::run_ticket(&client, args)?,
         Command::Pr(args) => claims::run_pr(&client, args)?,
         Command::Worktree(args) => claims::worktree::run_worktree(&client, args)?,
+        Command::History(args) => history::run_history(&client, args)?,
         _ => bail!("this retained command is not implemented in the Rust core slice yet"),
     }
     Ok(())
