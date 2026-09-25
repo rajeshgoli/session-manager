@@ -4830,7 +4830,7 @@ async fn queue_job_log_reads_a_bounded_derived_tail() {
     assert_eq!(payload["text"], "two\nthree\n");
     let (status, payload) = get_json(app.clone(), "/session-obligations").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["schema_version"], 2);
+    assert_eq!(payload["schema_version"], 3);
     assert_eq!(payload["sessions"].as_array().unwrap().len(), 2);
     assert_eq!(payload["sessions"][0]["session_id"], "notify1");
     assert_eq!(
@@ -22966,7 +22966,7 @@ async fn owner_docs_publish_read_and_project_state() {
     assert_eq!(source.fetches.load(Ordering::SeqCst), fetches);
 
     let (_, obligations) = get_json(app.clone(), "/session-obligations").await;
-    assert_eq!(obligations["schema_version"], 2);
+    assert_eq!(obligations["schema_version"], 3);
     let author = owner_doc_session(&obligations, "author01");
     assert_eq!(author["docs"][0]["id"], id);
     assert_eq!(

@@ -18,7 +18,9 @@ const DEFAULT_API_URL: &str = "http://127.0.0.1:8420";
 const CONTEXT_COMPACT_STALE_SECONDS: i64 = 10 * 60;
 const CLIENT_CONFIG_ENV: &str = "SM_CLIENT_CONFIG";
 const CLIENT_CONFIG_SUBPATH: &str = "session-manager/client.yaml";
+mod claims;
 mod doc;
+mod git_repo;
 mod watch;
 
 #[derive(Parser)]
@@ -101,6 +103,10 @@ enum Command {
     Watch(WatchArgs),
     /// Publish and list docs written for the owner
     Doc(doc::DocArgs),
+    /// Claim the ticket you work on; no number lists your claims
+    Ticket(claims::TicketArgs),
+    /// Claim the PR you work on; no number uses the current branch's PR
+    Pr(claims::PrArgs),
 }
 
 #[derive(Args)]
@@ -250,6 +256,13 @@ struct SpawnArgs {
     json: bool,
     #[arg(long, hide = true)]
     id: Option<String>,
+    /// The new session claims this ticket before its first turn
+    #[arg(long, value_name = "N")]
+    ticket: Option<i64>,
+    /// The ticket's repo (owner/name or bare name); default: the working
+    /// directory's repo
+    #[arg(long, value_name = "R", requires = "ticket")]
+    ticket_repo: Option<String>,
 }
 
 fn read_spawn_prompt(args: &SpawnArgs) -> Result<(String, Value)> {
@@ -804,23 +817,79 @@ fn run() -> Result<()> {
             let (prompt, prompt_source) = read_spawn_prompt(&args)?;
             let parent_session_id = optional_current_session_id();
             let provider = launch_provider_for_alias(&args.provider)?;
+            if args.ticket.is_some() && parent_session_id.is_none() {
+                bail!("sm spawn --ticket must run inside a managed session (CLAUDE_SESSION_MANAGER_ID)");
+            }
             let payload = if let Some(parent_session_id) = parent_session_id {
-                client.post_json(
-                    "/sessions/spawn",
-                    json!({
-                        "id": args.id,
-                        "parent_session_id": parent_session_id,
-                        "prompt": prompt,
-                        "prompt_source": prompt_source,
-                        "name": args.name,
-                        "wait": args.wait,
-                        "model": args.model,
-                        "reasoning_effort": args.effort,
-                        "working_dir": args.working_dir,
-                        "provider": provider,
-                        "node": args.node
-                    }),
-                )?
+                let mut body = json!({
+                    "id": args.id,
+                    "parent_session_id": parent_session_id,
+                    "prompt": prompt,
+                    "prompt_source": prompt_source,
+                    "name": args.name,
+                    "wait": args.wait,
+                    "model": args.model,
+                    "reasoning_effort": args.effort,
+                    "working_dir": args.working_dir,
+                    "provider": provider,
+                    "node": args.node
+                });
+                match args.ticket {
+                    Some(ticket) => {
+                        let working_dir = match args.working_dir.as_deref() {
+                            Some(dir) => expand_home_path(dir),
+                            None => env::current_dir()?,
+                        };
+                        let fields = claims::spawn_ticket_fields(
+                            &git_repo::ProcessTools,
+                            &working_dir,
+                            ticket,
+                            args.ticket_repo.as_deref(),
+                        )?;
+                        for (key, value) in fields.as_object().into_iter().flatten() {
+                            body[key] = value.clone();
+                        }
+                        let response = client.request("POST", "/sessions/spawn", Some(body))?;
+                        let payload: Value =
+                            serde_json::from_str(&response.body).unwrap_or(Value::Null);
+                        if response.status == 409 && payload["outcome"] == "collision" {
+                            for line in claims::refusal_lines(
+                                "ticket",
+                                ticket,
+                                payload["holders"]
+                                    .as_array()
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[]),
+                            ) {
+                                eprintln!("{line}");
+                            }
+                            process::exit(claims::EXIT_COLLISION);
+                        }
+                        if !(200..300).contains(&response.status) {
+                            bail!(
+                                "{}",
+                                payload["detail"]
+                                    .as_str()
+                                    .map(ToOwned::to_owned)
+                                    .unwrap_or_else(|| format!(
+                                        "HTTP {}: {}",
+                                        response.status, response.body
+                                    ))
+                            );
+                        }
+                        if let Some(claim) = payload.get("ticket_claim") {
+                            eprintln!(
+                                "{}",
+                                claims::claimed_line(&claim["claim"], |path| client.url_for(path))
+                            );
+                            for note in claim["notes"].as_array().into_iter().flatten() {
+                                eprintln!("{}", note.as_str().unwrap_or_default());
+                            }
+                        }
+                        payload
+                    }
+                    None => client.post_json("/sessions/spawn", body)?,
+                }
             } else {
                 client.post_json(
                     "/sessions",
@@ -1161,6 +1230,8 @@ fn run() -> Result<()> {
         Command::RequestCodexReview(args) => run_request_codex_review(&client, args)?,
         Command::Watch(args) => run_watch(&api_url, args)?,
         Command::Doc(args) => doc::run_doc(&client, args)?,
+        Command::Ticket(args) => claims::run_ticket(&client, args)?,
+        Command::Pr(args) => claims::run_pr(&client, args)?,
         _ => bail!("this retained command is not implemented in the Rust core slice yet"),
     }
     Ok(())
@@ -2042,6 +2113,9 @@ fn run_request_codex_review_create(client: &ApiClient, args: RequestCodexReviewA
     );
     let response = client.post_json("/codex-review-requests", payload)?;
     println!("Review requested for PR #{pr_number}, will sm send you when review arrives.");
+    if let Some(warning) = response["claim_warning"].as_str() {
+        eprintln!("{warning}");
+    }
     println!(
         "  Request: {} -> {}",
         response["id"].as_str().unwrap_or("unknown"),
@@ -7211,6 +7285,8 @@ mod tests {
             node: None,
             json: false,
             id: None,
+            ticket: None,
+            ticket_repo: None,
         };
         assert!(read_spawn_prompt(&args)
             .unwrap_err()
@@ -7243,6 +7319,8 @@ mod tests {
             node: None,
             json: false,
             id: None,
+            ticket: None,
+            ticket_repo: None,
         };
         let expected = "# Brief\n\nBackticks: `x`\n";
         let mut input = io::Cursor::new(expected.as_bytes());

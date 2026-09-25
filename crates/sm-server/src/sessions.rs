@@ -4280,6 +4280,30 @@ impl SessionStore {
         Ok(session_ids.len())
     }
 
+    /// An id no session uses yet, for a create that must name the session
+    /// before it exists (`sm spawn --ticket` reserves its claim under it).
+    pub fn allocate_session_id(&self) -> Result<String> {
+        let state = self.load_raw_json_value()?;
+        let sessions = state
+            .get("sessions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        generate_unique_session_id(&sessions)
+    }
+
+    /// Retire and kill end the session's work claims (sm#1452). A failure is
+    /// logged; the next claims sync ends them.
+    fn end_work_claims_after_retire(&self, session_id: &str) {
+        let Some(queue) = &self.queue_store else {
+            return;
+        };
+        let store = crate::work_claims::WorkClaimStore::new(queue.db_path().to_path_buf());
+        if let Err(error) = store.end_claims_for_session(session_id) {
+            eprintln!("ending work claims of retired session {session_id} failed: {error:#}");
+        }
+    }
+
     pub fn create_core_session(
         &self,
         request: CreateCoreSessionRequest,
@@ -8120,6 +8144,7 @@ impl SessionStore {
         }
         complete_stop_notify_after_stop_raw(self, &mut state, None, session_id, &recipient_name)?;
         self.write_raw_json_value(&state)?;
+        self.end_work_claims_after_retire(session_id);
         Ok(CoreRetireOutcome::Retired(retire_result(session_id)))
     }
 
@@ -8229,6 +8254,7 @@ impl SessionStore {
             &recipient_name,
         )?;
         self.write_raw_json_value(&state)?;
+        self.end_work_claims_after_retire(session_id);
         Ok(CoreRetireOutcome::Retired(retire_result(session_id)))
     }
 

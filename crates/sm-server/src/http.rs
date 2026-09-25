@@ -316,6 +316,7 @@ pub enum GitHubPullRequestState {
     Closed { state: String },
 }
 
+mod claims;
 mod docs;
 pub use docs::{
     DocFetchError, DocPullRequest, DocReviewOnGitHub, OwnerDocSource, SubmittedDocReview,
@@ -456,6 +457,8 @@ pub struct AppState {
     owner_doc_pr_cache: Arc<Mutex<docs::DocPullRequestCache>>,
     /// Serializes owner doc review submits and their reconciliation.
     owner_doc_review_lock: Arc<AsyncMutex<()>>,
+    /// Ticket and PR state for work claims (sm#1452).
+    work_item_source: Arc<dyn crate::work_claims::WorkItemSource>,
     codex_review_creation_locks: Arc<AsyncMutex<BTreeSet<String>>>,
     codex_review_watcher_ids: Arc<Mutex<BTreeSet<String>>>,
     tmux_client_event_state: Arc<Mutex<TmuxClientEventState>>,
@@ -569,6 +572,7 @@ impl AppState {
             owner_doc_source: Arc::new(docs::GhCliDocSource),
             owner_doc_pr_cache: Arc::new(Mutex::new(BTreeMap::new())),
             owner_doc_review_lock: Arc::new(AsyncMutex::new(())),
+            work_item_source: Arc::new(claims::GhCliWorkItemSource),
             codex_review_creation_locks: Arc::new(AsyncMutex::new(BTreeSet::new())),
             codex_review_watcher_ids: Arc::new(Mutex::new(BTreeSet::new())),
             tmux_client_event_state: Arc::new(Mutex::new(TmuxClientEventState::default())),
@@ -606,6 +610,20 @@ impl AppState {
     pub fn with_owner_doc_source(mut self, source: Arc<dyn OwnerDocSource>) -> Self {
         self.owner_doc_source = source;
         self
+    }
+
+    pub fn with_work_item_source(
+        mut self,
+        source: Arc<dyn crate::work_claims::WorkItemSource>,
+    ) -> Self {
+        self.work_item_source = source;
+        self
+    }
+
+    /// One work claims sync pass (backfill, recovery, reconciliation, GitHub
+    /// fetch). The live server runs it on a timer; tests call it directly.
+    pub fn run_work_claims_sync_pass(&self) -> anyhow::Result<()> {
+        claims::run_sync_pass(self)
     }
 
     /// Shared handle to the Studio SSH desired-state flag, for the reconcile loop.
@@ -1346,6 +1364,7 @@ pub fn router(state: AppState) -> Router {
     }
     docs::init_owner_docs(&state.config);
     docs::recover_owner_doc_reviews(state.clone());
+    claims::init_work_claims(state.clone());
     recover_codex_review_request_watchers(state.clone());
     recover_btw_requests(state.clone());
     if state.config.rust_core.runtime_enabled {
@@ -1414,6 +1433,8 @@ pub fn router(state: AppState) -> Router {
             "/docs",
             get(docs::list_owner_docs).post(docs::publish_owner_doc),
         )
+        .route("/claims", get(claims::list_claims).post(claims::post_claim))
+        .route("/claims/release", post(claims::release_claim))
         .route("/docs/{doc_id}", get(docs::get_owner_doc))
         // `/docs/{id}/view|raw|retract` (internal API) and the readable
         // reader `/docs/<repo-name>/<path in repo>` share one pattern.
@@ -3950,7 +3971,6 @@ async fn spawn_session(
             detail: "Rust core spawn does not support track_seconds yet".to_owned(),
         });
     }
-    let wait_seconds = payload.wait;
     let provider = payload
         .provider
         .as_deref()
@@ -3972,10 +3992,88 @@ async fn spawn_session(
         .filter(|value| !value.is_empty())
         .unwrap_or(parent.node.as_str())
         .to_owned();
-    let accepted = accept_spawn_brief(
+    // The ticket claim is reserved under the new session's id before the
+    // session exists, so a collision refuses the spawn with nothing created
+    // (sm#1452, appendix B).
+    let mut child_id = payload.id.clone();
+    let ticket_reservation = match payload.ticket {
+        Some(ticket) => {
+            let Some(ticket_repo) = trimmed(&payload.ticket_repo) else {
+                return Err(ApiError::Status {
+                    status: StatusCode::BAD_REQUEST,
+                    detail: "ticket_repo is required with ticket".to_owned(),
+                });
+            };
+            let id = match trimmed(&payload.id) {
+                Some(id) => id,
+                None => state.session_store.allocate_session_id()?,
+            };
+            let reservation = claims::reserve_spawn_ticket(
+                &state,
+                claims::SpawnTicket {
+                    session_id: &id,
+                    name: payload.name.as_deref(),
+                    parent: &parent,
+                    ticket,
+                    repo: &ticket_repo,
+                    worktree_path: trimmed(&payload.ticket_worktree_path),
+                    branch: trimmed(&payload.ticket_branch),
+                },
+            )
+            .await?;
+            child_id = Some(id);
+            Some(reservation)
+        }
+        None => None,
+    };
+    let created = spawn_child_session(
         &state,
+        &payload,
+        &parent,
+        child_id,
+        provider,
+        working_dir,
+        node,
+    )
+    .await;
+    let ticket_claim = ticket_reservation
+        .as_ref()
+        .and_then(|reservation| claims::finish_spawn_ticket(&state, reservation, created.is_ok()));
+    let child = created?;
+    if parent.is_em && child.provider != "codex-fork" {
+        let _ = state.session_store.arm_stop_notify(
+            &child.id,
+            ArmStopNotifyRequest {
+                sender_session_id: parent.id.clone(),
+                requester_session_id: parent.id.clone(),
+                delay_seconds: EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS,
+            },
+        )?;
+    }
+    if let Some(wait_seconds) = payload.wait {
+        spawn_child_wait_monitor(state.clone(), child.clone(), wait_seconds);
+    }
+    let mut response = serde_json::to_value(SpawnSessionResponse::from(child))?;
+    if let Some(ticket_claim) = ticket_claim {
+        response["ticket_claim"] = ticket_claim;
+    }
+    Ok(Json(response))
+}
+
+async fn spawn_child_session(
+    state: &Arc<AppState>,
+    payload: &SpawnCoreSessionRequest,
+    parent: &SessionRecord,
+    child_id: Option<String>,
+    provider: String,
+    working_dir: String,
+    node: String,
+) -> Result<SessionRecord, ApiError> {
+    let wait_seconds = payload.wait;
+    let accepted = accept_spawn_brief(
+        state,
         Some(&payload.prompt),
-        payload.prompt_source.unwrap_or(SpawnBriefSource {
+        payload.prompt_source.clone().unwrap_or(SpawnBriefSource {
             kind: "positional".to_owned(),
             path: None,
         }),
@@ -3988,15 +4086,15 @@ async fn spawn_session(
         Some(working_dir.clone()),
     )?;
     let create_payload = CreateCoreSessionRequest {
-        id: payload.id,
-        name: payload.name,
+        id: child_id,
+        name: payload.name.clone(),
         working_dir: Some(working_dir),
         provider: Some(provider),
         parent_session_id: Some(parent.id.clone()),
         node: Some(node),
         initial_message: Some(accepted.0),
-        model: payload.model,
-        reasoning_effort: payload.reasoning_effort,
+        model: payload.model.clone(),
+        reasoning_effort: payload.reasoning_effort.clone(),
         wait: wait_seconds,
         spawn_prompt_source: None,
         spawn_brief: Some(SpawnBriefBinding {
@@ -4005,31 +4103,15 @@ async fn spawn_session(
         }),
     };
     let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
-    let child = if state.config.rust_core.runtime_enabled {
+    if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_provider_supported(&create_payload)?;
-        ensure_core_runtime_request_node_supported(&state, &create_payload)?;
-        create_runtime_core_session(state.clone(), create_payload, log_dir).await?
+        ensure_core_runtime_request_node_supported(state, &create_payload)?;
+        create_runtime_core_session(state.clone(), create_payload, log_dir).await
     } else {
-        state
+        Ok(state
             .session_store
-            .create_core_session(create_payload, log_dir)?
-    };
-    if parent.is_em && child.provider != "codex-fork" {
-        let _ = state.session_store.arm_stop_notify(
-            &child.id,
-            ArmStopNotifyRequest {
-                sender_session_id: parent.id.clone(),
-                requester_session_id: parent.id.clone(),
-                delay_seconds: EM_SPAWN_STOP_NOTIFY_DELAY_SECONDS,
-            },
-        )?;
+            .create_core_session(create_payload, log_dir)?)
     }
-    if let Some(wait_seconds) = wait_seconds {
-        spawn_child_wait_monitor(state.clone(), child.clone(), wait_seconds);
-    }
-    Ok(Json(serde_json::to_value(SpawnSessionResponse::from(
-        child,
-    ))?))
 }
 
 /// Runtime creation includes tmux and provider polling. Keep it off Axum's
@@ -4739,7 +4821,8 @@ async fn create_codex_review_request(
                 });
             }
             if existing.requested_head_sha.as_deref() == Some(initial_head_sha.as_str()) {
-                let response = codex_review_request_response(&state, existing.clone())?;
+                let mut response = codex_review_request_response(&state, existing.clone())?;
+                add_codex_review_claim_warning(&state, &existing, &mut response);
                 spawn_codex_review_request_watcher(state.clone(), existing.id);
                 return Ok(Json(response));
             }
@@ -4808,7 +4891,8 @@ async fn create_codex_review_request(
                 codex_review_store_error(error)
             }
         })?;
-        let response = codex_review_request_response(&state, registration.clone())?;
+        let mut response = codex_review_request_response(&state, registration.clone())?;
+        add_codex_review_claim_warning(&state, &registration, &mut response);
         spawn_codex_review_request_watcher(state.clone(), registration.id);
         Ok(Json(response))
     }
@@ -4819,6 +4903,31 @@ async fn create_codex_review_request(
         .await
         .remove(&creation_key);
     create_result
+}
+
+/// The requester's implicit PR claim (sm#1452); its warning, if any, rides
+/// on the response as `claim_warning`.
+fn add_codex_review_claim_warning(
+    state: &AppState,
+    registration: &CodexReviewRequestRegistration,
+    response: &mut Value,
+) {
+    let Some(requester) = registration
+        .requester_session_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+    if let Some(warning) = claims::record_implicit_pr_claim(
+        state,
+        &registration.repo,
+        registration.pr_number,
+        requester,
+        crate::work_claims::ClaimSource::CodexReview,
+    ) {
+        response["claim_warning"] = json!(warning);
+    }
 }
 
 async fn start_pr_review(
@@ -6221,22 +6330,26 @@ async fn list_session_obligations(
         },
     )?;
     let docs = docs::obligation_doc_summaries(&state)?;
+    let claims = claims::work_claim_store(&state).active_claims()?;
     Ok(Json(project_session_obligations(
         &jobs,
         &reviews,
         &docs,
+        &claims,
         docs::doc_browser_base_url(&state.config).as_deref(),
     )))
 }
 
 fn new_obligation_entry(session_id: &str) -> Value {
-    json!({"session_id": session_id, "waiting_on": [], "review_history": [], "docs": []})
+    json!({"session_id": session_id, "waiting_on": [], "review_history": [], "docs": [],
+           "claims": []})
 }
 
 fn project_session_obligations(
     jobs: &[QueueJobRecord],
     reviews: &[CodexReviewRequestRegistration],
     docs: &[crate::owner_docs::OwnerDocSummary],
+    claims: &[crate::work_claims::ClaimView],
     doc_browser_base: Option<&str>,
 ) -> Value {
     let mut sessions = BTreeMap::<String, Value>::new();
@@ -6330,6 +6443,18 @@ fn project_session_obligations(
             }));
         }
     }
+    // Active claims, in claim order (sm#1452).
+    for view in claims {
+        let id = &view.claim.session_id;
+        let entry = sessions
+            .entry(id.clone())
+            .or_insert_with(|| new_obligation_entry(id));
+        entry["claims"].as_array_mut().unwrap().push(json!({
+            "kind": view.claim.kind, "repo": view.claim.repo, "number": view.claim.number,
+            "title": view.title, "state": view.state, "claimed_at": view.claim.claimed_at,
+            "source": view.claim.source, "history_path": view.history_path,
+        }));
+    }
     for (id, entry) in &mut sessions {
         if let Some(prs) = session_prs.get(id.as_str()) {
             for &(repo, pr) in prs {
@@ -6354,7 +6479,7 @@ fn project_session_obligations(
             .map(str::to_owned);
         entry["waiting_since"] = json!(since);
     }
-    json!({"schema_version": 2, "sessions": sessions.into_values().collect::<Vec<_>>()})
+    json!({"schema_version": 3, "sessions": sessions.into_values().collect::<Vec<_>>()})
 }
 
 async fn list_queue_jobs(
@@ -13467,6 +13592,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/codex-review-requests"
         || path.starts_with("/codex-review-requests/")
         || path == "/session-obligations"
+        || path == "/claims"
         || path == "/docs"
         || path.starts_with("/docs/")
         || path == "/queue-jobs"
@@ -14761,6 +14887,16 @@ struct SpawnCoreSessionRequest {
     node: Option<String>,
     #[serde(default)]
     track_seconds: Option<u64>,
+    /// `sm spawn --ticket N`: the new session claims N before its first turn.
+    #[serde(default)]
+    ticket: Option<i64>,
+    #[serde(default)]
+    ticket_repo: Option<String>,
+    /// The spawn's working directory when it is inside the ticket's repo.
+    #[serde(default)]
+    ticket_worktree_path: Option<String>,
+    #[serde(default)]
+    ticket_branch: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -15285,7 +15421,7 @@ mod tests {
             })
             .collect();
         let start = std::time::Instant::now();
-        let retained = project_session_obligations(&[], &history, &[], None);
+        let retained = project_session_obligations(&[], &history, &[], &[], None);
         eprintln!("4000 retained reviews projected in {:?}", start.elapsed());
         let retained_sessions = retained["sessions"].as_array().unwrap();
         assert_eq!(retained_sessions.len(), 8000);
@@ -15295,8 +15431,13 @@ mod tests {
             assert_eq!(session["review_history"][0]["landed_count"], 1);
             assert!(session["waiting_on"].as_array().unwrap().is_empty());
         }
-        let projected =
-            project_session_obligations(&[job.clone()], &[review, completed, duplicate], &[], None);
+        let projected = project_session_obligations(
+            &[job.clone()],
+            &[review, completed, duplicate],
+            &[],
+            &[],
+            None,
+        );
         let sessions = projected["sessions"].as_array().unwrap();
         let recipient = sessions
             .iter()
@@ -15318,7 +15459,7 @@ mod tests {
         let mut finished = job;
         finished.state = "succeeded".into();
         assert!(
-            project_session_obligations(&[finished], &[], &[], None)["sessions"]
+            project_session_obligations(&[finished], &[], &[], &[], None)["sessions"]
                 .as_array()
                 .unwrap()
                 .is_empty()
