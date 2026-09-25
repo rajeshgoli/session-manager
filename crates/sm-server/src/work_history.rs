@@ -6,7 +6,7 @@
 //! owner docs with their publishes and posted reviews. Review requests and
 //! doc publishes are not copied into `events`; they are merged in here at
 //! read time (one store per fact). Nothing here calls GitHub. See
-//! `docs/working/1452_sm_primitives.html`, appendices H and I.
+//! `specs/1452_sm_primitives.html`, appendices H and I.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
