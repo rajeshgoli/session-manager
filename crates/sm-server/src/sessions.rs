@@ -19014,14 +19014,18 @@ sleep 30
         // Rust durable-path isolation deliberately does not choose a tmux
         // socket.  Tests which model a missing runtime must therefore use an
         // unguessable private socket rather than accidentally inspecting or
-        // targeting the operator's default tmux server.
+        // targeting the operator's default tmux server.  The counter keeps
+        // parallel tests apart: macOS clocks tick in microseconds, so two tests
+        // could otherwise share one tmux server and each other's panes (sm#1378).
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let socket_name = format!(
-            "sm-test-1322-{}-{}",
+            "sm-test-1322-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
             .for_socket_name(Some(&socket_name));
@@ -20734,6 +20738,26 @@ sleep 30
             }
             Vec::new()
         }
+
+        /// Waits until `ready` accepts the pane's input lines. `send-keys`
+        /// returns before the pane's shell appends a line, and under
+        /// full-suite load that can take well over a second (sm#1378).
+        fn input_lines_when(&self, ready: impl Fn(&[String]) -> bool) -> Vec<String> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let lines = fs::read_to_string(&self.input_path)
+                    .map(|text| text.lines().map(ToOwned::to_owned).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                if ready(&lines) || std::time::Instant::now() >= deadline {
+                    return lines;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn wait_for_input_lines(&self, count: usize) -> Vec<String> {
+            self.input_lines_when(|lines| lines.len() >= count)
+        }
     }
 
     fn queue_completion_test_shell_quote(value: &str) -> String {
@@ -20837,7 +20861,10 @@ sleep 30
             .pending_messages_for_target_by_category("queue-target", "queue-completion", 10)
             .unwrap()
             .is_empty());
-        assert_eq!(pane.input_lines(), vec!["[sm queue] test job completed"]);
+        assert_eq!(
+            pane.wait_for_input_lines(1),
+            vec!["[sm queue] test job completed"]
+        );
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }
@@ -20924,7 +20951,10 @@ sleep 30
 
         assert_eq!(status, "idle");
         assert!(delivered);
-        assert_eq!(pane.input_lines(), vec!["[sm queue] handoff retry drain"]);
+        assert_eq!(
+            pane.wait_for_input_lines(1),
+            vec!["[sm queue] handoff retry drain"]
+        );
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }
@@ -20948,7 +20978,7 @@ sleep 30
             .drain_runtime_pending_message_targets_by_category("queue-completion")
             .unwrap();
 
-        let inputs = pane.input_lines();
+        let inputs = pane.wait_for_input_lines(1);
         assert_eq!(inputs.len(), 1);
         assert!(inputs[0].ends_with("[sm queue] urgent predecessor"));
         assert_eq!(
@@ -20968,7 +20998,7 @@ sleep 30
             .unwrap()
             .is_empty());
         assert_eq!(
-            pane.input_lines(),
+            pane.wait_for_input_lines(2),
             vec![
                 inputs[0].clone(),
                 "[sm queue] test job completed".to_owned()
@@ -21017,7 +21047,10 @@ sleep 30
             .pending_messages_for_target_by_category("queue-target", "queue-completion", 10)
             .unwrap()
             .is_empty());
-        assert_eq!(pane.input_lines(), vec!["[sm queue] test job completed"]);
+        assert_eq!(
+            pane.wait_for_input_lines(1),
+            vec!["[sm queue] test job completed"]
+        );
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }
@@ -21070,7 +21103,9 @@ sleep 30
             .pending_messages_for_target_by_category("queue-target", "scheduled_reminder", 10)
             .unwrap()
             .is_empty());
-        let input = pane.input_lines().join("\n");
+        let input = pane
+            .input_lines_when(|lines| lines.join("\n").contains("Check the gate"))
+            .join("\n");
         assert_eq!(input.matches(&reminder_id).count(), 1, "{input}");
         assert!(input.contains("Check the gate"), "{input}");
         let _ = fs::remove_file(state_file);
@@ -21125,7 +21160,10 @@ sleep 30
             .pending_messages_for_target_by_category("queue-target", "queue-completion", 10)
             .unwrap()
             .is_empty());
-        assert_eq!(pane.input_lines(), vec!["[sm queue] test job completed"]);
+        assert_eq!(
+            pane.wait_for_input_lines(1),
+            vec!["[sm queue] test job completed"]
+        );
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }
