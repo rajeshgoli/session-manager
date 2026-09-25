@@ -263,8 +263,12 @@ require_signing_identity() {
   # the staged file. This early keychain check produces an actionable failure
   # before a build/sign attempt and rejects a missing or unavailable identity
   # while the currently registered service remains untouched.
-  if ! security find-identity -v -p codesigning 2>/dev/null \
-      | grep -Eq "^[[:space:]]*[0-9]+\\) $SM_SIGN_IDENTITY "; then
+  # Capture before matching: `grep -q` exits at the first match, and a later
+  # write from `security` then dies of SIGPIPE, which `pipefail` turns into a
+  # rejection of an identity that is present.
+  local identities
+  identities="$(security find-identity -v -p codesigning 2>/dev/null)" || identities=""
+  if ! grep -Eq "^[[:space:]]*[0-9]+\\) $SM_SIGN_IDENTITY " <<<"$identities"; then
     fail "configured signing identity $SM_SIGN_IDENTITY is not a valid usable codesigning identity; the running service was not touched"
   fi
 }
@@ -643,7 +647,10 @@ step "Validating the configuration with the new binary"
 # the bind, so it is safe while the old server still holds the port.
 check_config_args=(--check-config --config "$SM_CONFIG" --host "$SM_HOST" --port "$SM_PORT")
 [[ -n "$SM_LOCAL_ENV" ]] && check_config_args+=(--local-env "$SM_LOCAL_ENV")
-if "$SM_STAGING" --help 2>&1 | grep -q -- '--check-config'; then
+# Captured before matching for the same SIGPIPE reason as require_signing_identity;
+# a lost race here would skip validation instead of failing.
+staged_help="$("$SM_STAGING" --help 2>&1)" || staged_help=""
+if grep -q -- '--check-config' <<<"$staged_help"; then
   "$SM_STAGING" "${check_config_args[@]}" \
     || fail "the new binary rejected the configuration or the listen address; see the
        error above and fix $SM_CONFIG${SM_LOCAL_ENV:+ / $SM_LOCAL_ENV} or the
