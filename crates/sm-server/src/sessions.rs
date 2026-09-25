@@ -55,6 +55,9 @@ const MAX_OUTPUT_TAIL_BYTES: u64 = 1024 * 1024;
 const CODEX_CLI_SESSION_BIND_TIMEOUT: Duration = Duration::from_secs(1);
 const CODEX_CLI_DEFERRED_BIND_TIMEOUT: Duration = Duration::from_secs(30);
 const CODEX_CLI_SESSION_BIND_POLL: Duration = Duration::from_millis(50);
+/// Wake categories the background delivery loop retries until an idle target
+/// accepts them: sm queue completion wakes and sm remind reminders.
+const BACKGROUND_RETRY_MESSAGE_CATEGORIES: [&str; 2] = ["queue-completion", "scheduled_reminder"];
 const CODEX_FORK_THREAD_STARTED_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_CODEX_FORK_CREATE_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const CODEX_FORK_EVENT_MONITOR_POLL: Duration = Duration::from_millis(250);
@@ -5264,6 +5267,26 @@ impl SessionStore {
                 "failed to drain {message_category} messages for {}",
                 failures.join("; ")
             ))
+        }
+    }
+
+    /// Retry every durable row whose producer made only one immediate delivery
+    /// attempt after committing it. A crash or tmux failure between that
+    /// commit and the attempt otherwise strands the wake until some unrelated
+    /// event drains the target's queue.
+    pub fn drain_runtime_background_retry_messages(&self) -> Result<usize> {
+        let mut drained = 0;
+        let mut failures = Vec::new();
+        for message_category in BACKGROUND_RETRY_MESSAGE_CATEGORIES {
+            match self.drain_runtime_pending_message_targets_by_category(message_category) {
+                Ok(targets) => drained += targets,
+                Err(error) => failures.push(format!("{error:#}")),
+            }
+        }
+        if failures.is_empty() {
+            Ok(drained)
+        } else {
+            Err(anyhow::anyhow!(failures.join("; ")))
         }
     }
 
@@ -20879,6 +20902,81 @@ sleep 30
             .unwrap()
             .is_empty());
         assert_eq!(pane.input_lines(), vec!["[sm queue] test job completed"]);
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    /// Claim a due one-shot reminder without its immediate delivery attempt,
+    /// which is the durable state a crash between claim and drain leaves.
+    fn claim_reminder_without_delivery(queue: &RetainedQueueStore, queue_db: &Path) -> String {
+        let reminder = queue
+            .schedule_reminder("queue-target", 60, "Check the gate", None)
+            .unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        rusqlite::Connection::open(queue_db)
+            .unwrap()
+            .execute(
+                "UPDATE scheduled_reminders SET fire_at = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    reminder.id,
+                    (now - time::Duration::seconds(1))
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap()
+                ],
+            )
+            .unwrap();
+        queue
+            .claim_due_scheduled_reminder(&reminder.id, now)
+            .unwrap()
+            .unwrap();
+        reminder.id
+    }
+
+    #[test]
+    fn background_retry_delivers_a_claimed_reminder_after_restart() {
+        let pane = queue_completion_test_pane(true);
+        let (store, queue, state_file, queue_db) = queue_completion_test_store(&pane, "idle");
+        let reminder_id = claim_reminder_without_delivery(&queue, &queue_db);
+        drop(store);
+        let restarted = SessionStore::new_with_queue(state_file.clone(), queue_db.clone())
+            .with_delivery_runtime(Some(pane.runtime.clone()));
+
+        assert_eq!(
+            restarted.drain_runtime_background_retry_messages().unwrap(),
+            1
+        );
+        assert_eq!(
+            restarted.drain_runtime_background_retry_messages().unwrap(),
+            0
+        );
+
+        assert!(queue
+            .pending_messages_for_target_by_category("queue-target", "scheduled_reminder", 10)
+            .unwrap()
+            .is_empty());
+        let input = pane.input_lines().join("\n");
+        assert_eq!(input.matches(&reminder_id).count(), 1, "{input}");
+        assert!(input.contains("Check the gate"), "{input}");
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+    }
+
+    #[test]
+    fn background_retry_holds_a_claimed_reminder_while_the_target_is_busy() {
+        let pane = queue_completion_test_pane(false);
+        let (store, queue, state_file, queue_db) = queue_completion_test_store(&pane, "running");
+        claim_reminder_without_delivery(&queue, &queue_db);
+
+        store.drain_runtime_background_retry_messages().unwrap();
+
+        assert_eq!(
+            queue
+                .pending_messages_for_target_by_category("queue-target", "scheduled_reminder", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(pane.input_lines().is_empty());
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }

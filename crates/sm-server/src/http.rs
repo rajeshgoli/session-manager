@@ -596,9 +596,8 @@ impl AppState {
         })
     }
 
-    pub fn drain_queue_completion_wakes(&self) -> anyhow::Result<usize> {
-        self.session_store
-            .drain_runtime_pending_message_targets_by_category("queue-completion")
+    pub fn drain_background_retry_wakes(&self) -> anyhow::Result<usize> {
+        self.session_store.drain_runtime_background_retry_messages()
     }
 
     /// Advance time/topology-derived reparent state and retry the durable
