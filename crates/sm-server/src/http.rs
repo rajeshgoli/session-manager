@@ -1289,32 +1289,96 @@ async fn resolve_codex_review_repo(
             detail: format!("Requester session {requester_session_id} not found"),
         });
     };
-    let working_dir = requester.working_dir;
-    let output = tokio::task::spawn_blocking(move || {
-        Command::new("gh")
-            .args([
-                "repo",
-                "view",
-                "--json",
-                "nameWithOwner",
-                "--jq",
-                ".nameWithOwner",
-            ])
-            .current_dir(working_dir)
-            .output()
+    repo_from_session_working_dir(requester_session_id, requester.working_dir)
+        .await
+        .map_err(|detail| ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail,
+        })
+}
+
+/// Resolves `owner/name` for a session's working directory: `gh repo view`
+/// (with the GitHub transport retry), then the directory's `origin` remote
+/// when `gh` fails. The error carries `gh`'s own failure text.
+async fn repo_from_session_working_dir(
+    session_id: &str,
+    working_dir: String,
+) -> Result<String, String> {
+    let dir = working_dir.clone();
+    let resolved = tokio::task::spawn_blocking(move || {
+        let gh_error = match gh_repo_view_in_dir(&dir) {
+            Ok(repo) => return Ok(repo),
+            Err(error) => error,
+        };
+        git_origin_github_repo(&dir).ok_or(gh_error)
     })
     .await
-    .ok()
-    .and_then(Result::ok);
-    if let Some(output) = output {
-        if output.status.success() {
-            let repo = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if !repo.is_empty() {
-                return Ok(repo);
-            }
-        }
+    .unwrap_or_else(|error| Err(format!("repo lookup task failed: {error}")));
+    resolved.map_err(|gh_error| {
+        format!(
+            "Could not determine GitHub repo from requester session {session_id} working directory {working_dir}: {gh_error}; pass --repo explicitly"
+        )
+    })
+}
+
+fn gh_repo_view_in_dir(dir: &str) -> Result<String, String> {
+    let output = retry_github_transport(
+        || {
+            let mut command = Command::new("gh");
+            command
+                .args([
+                    "repo",
+                    "view",
+                    "--json",
+                    "nameWithOwner",
+                    "--jq",
+                    ".nameWithOwner",
+                ])
+                .current_dir(dir);
+            crate::child_output::output_with_timeout(command, Duration::from_secs(15))
+        },
+        || thread::sleep(GH_TRANSPORT_RETRY_DELAY),
+    )
+    .map_err(|error| format!("gh repo view failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "gh repo view exited with {}: {}",
+            output.status,
+            command_stderr(&output)
+        ));
     }
-    Err(codex_review_repo_error())
+    let repo = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if repo.is_empty() {
+        return Err("gh repo view returned no repository".to_owned());
+    }
+    Ok(repo)
+}
+
+fn git_origin_github_repo(dir: &str) -> Option<String> {
+    let mut command = Command::new("git");
+    command.args(["-C", dir, "remote", "get-url", "origin"]);
+    let output = crate::child_output::output_with_timeout(command, Duration::from_secs(5)).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    github_repo_from_remote_url(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+/// `git@github.com:owner/name.git`, `ssh://git@github.com/owner/name`, and
+/// `https://github.com/owner/name.git` all yield `owner/name`.
+fn github_repo_from_remote_url(url: &str) -> Option<String> {
+    let path = [
+        "git@github.com:",
+        "ssh://git@github.com/",
+        "https://github.com/",
+    ]
+    .iter()
+    .find_map(|prefix| url.strip_prefix(prefix))?;
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, name) = path.split_once('/')?;
+    (!owner.is_empty() && !name.is_empty() && !name.contains('/'))
+        .then(|| format!("{owner}/{name}"))
 }
 
 fn codex_review_repo_error() -> ApiError {
@@ -5019,32 +5083,7 @@ async fn resolve_pr_review_repo(
             "Could not determine repo. Provide --repo or run from a git directory.".to_owned(),
         );
     };
-    let working_dir = caller.working_dir;
-    let output = tokio::task::spawn_blocking(move || {
-        Command::new("gh")
-            .args([
-                "repo",
-                "view",
-                "--json",
-                "nameWithOwner",
-                "--jq",
-                ".nameWithOwner",
-            ])
-            .current_dir(working_dir)
-            .output()
-    })
-    .await
-    .ok()
-    .and_then(Result::ok);
-    if let Some(output) = output {
-        if output.status.success() {
-            let repo = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if !repo.is_empty() {
-                return Ok(repo);
-            }
-        }
-    }
-    Err("Could not determine repo. Provide --repo or run from a git directory.".to_owned())
+    repo_from_session_working_dir(caller_session_id, caller.working_dir).await
 }
 
 fn codex_review_comment_body(steer: Option<&str>) -> String {
@@ -15877,6 +15916,80 @@ mod tests {
         .unwrap();
         assert!(!semantic.status.success());
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn github_repo_from_remote_url_accepts_ssh_and_https_forms() {
+        for url in [
+            "git@github.com:rajeshgoli/session-manager.git",
+            "git@github.com:rajeshgoli/session-manager",
+            "ssh://git@github.com/rajeshgoli/session-manager.git",
+            "https://github.com/rajeshgoli/session-manager.git",
+            "https://github.com/rajeshgoli/session-manager/",
+        ] {
+            assert_eq!(
+                github_repo_from_remote_url(url).as_deref(),
+                Some("rajeshgoli/session-manager"),
+                "{url}"
+            );
+        }
+        for url in [
+            "https://gitlab.com/owner/name.git",
+            "https://github.com/owner",
+            "https://github.com/owner/name/extra",
+            "/local/path/repo.git",
+        ] {
+            assert_eq!(github_repo_from_remote_url(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn git_origin_github_repo_reads_the_origin_remote() {
+        let dir = env::temp_dir().join(format!("sm-1520-origin-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let status = process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        let dir_str = dir.to_str().unwrap();
+        assert_eq!(git_origin_github_repo(dir_str), None);
+        git(&["init", "-q"]);
+        assert_eq!(git_origin_github_repo(dir_str), None);
+        git(&["remote", "add", "origin", "git@github.com:acme/widgets.git"]);
+        assert_eq!(
+            git_origin_github_repo(dir_str).as_deref(),
+            Some("acme/widgets")
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_repo_lookup_failure_reports_the_gh_failure_not_missing_context() {
+        let dir = env::temp_dir().join(format!("sm-1520-nogit-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let working_dir = dir.to_str().unwrap().to_owned();
+        let error = repo_from_session_working_dir("abc123", working_dir.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with(&format!(
+                "Could not determine GitHub repo from requester session abc123 working directory {working_dir}: gh repo view"
+            )),
+            "{error}"
+        );
+        assert!(error.ends_with("; pass --repo explicitly"), "{error}");
+        assert!(
+            !error.contains("without requester session context"),
+            "{error}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
