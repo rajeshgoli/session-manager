@@ -96,10 +96,7 @@ fn pressure_label(value: &str) -> Option<&'static str> {
 }
 
 fn cpu_percent(top: &str) -> Option<f64> {
-    let line = top
-        .lines()
-        .filter(|line| line.starts_with("CPU usage:"))
-        .last()?;
+    let line = top.lines().rfind(|line| line.starts_with("CPU usage:"))?;
     let idle = line
         .split(',')
         .find(|part| part.contains("idle"))?
@@ -115,7 +112,7 @@ fn memory_used(top: &str) -> Option<u64> {
     let amount = top
         .lines()
         .filter_map(|line| line.strip_prefix("PhysMem: "))
-        .last()?
+        .next_back()?
         .split_whitespace()
         .next()?;
     let unit = amount.chars().last()?;

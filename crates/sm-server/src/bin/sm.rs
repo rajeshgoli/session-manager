@@ -487,7 +487,7 @@ struct QueueArgs {
 #[derive(Subcommand)]
 enum QueueCommand {
     /// Submit work and receive a completion notification
-    Run(QueueRunArgs),
+    Run(Box<QueueRunArgs>),
     /// List queued and running jobs
     List(QueueListArgs),
     /// Show a job and explain what it is waiting on
@@ -1423,7 +1423,7 @@ fn run_queue(client: &ApiClient, args: QueueArgs) -> Result<()> {
         QueueCommand::List(args) => run_queue_list(client, args),
         QueueCommand::Status(args) => run_queue_status(client, args),
         QueueCommand::Log(args) => run_queue_log(client, args),
-        QueueCommand::Run(args) => run_queue_run(client, args),
+        QueueCommand::Run(args) => run_queue_run(client, *args),
         QueueCommand::Cancel(args) => run_queue_cancel(client, args),
     }
 }
@@ -1612,7 +1612,7 @@ fn run_queue_list(client: &ApiClient, args: QueueListArgs) -> Result<()> {
         bail!("No session context. Use --notify or --all.");
     }
     if let Some(ref notify) = effective_notify {
-        query.push(format!("notify_target={}", encode_query_component(&notify)));
+        query.push(format!("notify_target={}", encode_query_component(notify)));
     }
     if let Some(job_type) = args
         .job_type

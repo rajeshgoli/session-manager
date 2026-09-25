@@ -699,6 +699,7 @@ impl TmuxRuntime {
         Ok(SessionInputGuard { lock })
     }
 
+    #[allow(clippy::too_many_arguments)] // each argument is a distinct review-request parameter
     pub fn send_review_sequence(
         &self,
         tmux_session: &str,
@@ -1739,15 +1740,11 @@ impl TmuxRuntime {
     }
 
     fn claude_empty_composer_pane(&self, tmux_session: &str) -> Option<String> {
-        let Some(pane) = self.capture_pane_text(tmux_session) else {
-            return None;
-        };
+        let pane = self.capture_pane_text(tmux_session)?;
         if !claude_composer_layout_is_candidate(&pane) {
             return None;
         }
-        let Some((cursor_x, cursor_y)) = self.pane_cursor_position(tmux_session) else {
-            return None;
-        };
+        let (cursor_x, cursor_y) = self.pane_cursor_position(tmux_session)?;
         if !claude_empty_composer_cursor(&pane, cursor_x, cursor_y) {
             return None;
         }
@@ -1803,14 +1800,14 @@ impl TmuxRuntime {
                 }
                 .into());
             }
-            if !directory_trust_accepted && matches!(provider, "codex" | "codex-fork") {
-                if self
+            if !directory_trust_accepted
+                && matches!(provider, "codex" | "codex-fork")
+                && self
                     .capture_pane_text(tmux_session)
                     .is_some_and(|pane| is_codex_directory_trust_prompt(&pane))
-                {
-                    self.send_key(tmux_session, "Enter")?;
-                    directory_trust_accepted = true;
-                }
+            {
+                self.send_key(tmux_session, "Enter")?;
+                directory_trust_accepted = true;
             }
             if self.session_input_ready(tmux_session, provider) {
                 return Ok(());
@@ -2105,7 +2102,7 @@ fn shell_quote(value: &str) -> String {
 fn pane_last_line(text: &str) -> Option<String> {
     text.trim_end_matches('\n')
         .split('\n')
-        .last()
+        .next_back()
         .map(str::trim)
         .map(ToOwned::to_owned)
 }
@@ -2384,12 +2381,9 @@ fn ansi_visible_cells(text: &str) -> Option<Vec<(char, bool)>> {
                     _ => payload.push(next),
                 }
             }
-            let Some((parameters, uri)) = payload
+            let (parameters, uri) = payload
                 .strip_prefix("8;")
-                .and_then(|hyperlink| hyperlink.split_once(';'))
-            else {
-                return None;
-            };
+                .and_then(|hyperlink| hyperlink.split_once(';'))?;
             if !terminated
                 || parameters.chars().any(char::is_control)
                 || uri.chars().any(char::is_control)
@@ -2644,16 +2638,16 @@ fn command_output_with_timeout(
         }
         thread::sleep(Duration::from_millis(10));
     };
-    let stdout =
-        receive_stream_output(&stdout_reader, started, timeout, "stdout").map_err(|error| {
+    let stdout = receive_stream_output(&stdout_reader, started, timeout, "stdout").inspect_err(
+        |_error| {
             terminate_catalog_process(&mut child);
-            error
-        })?;
-    let stderr =
-        receive_stream_output(&stderr_reader, started, timeout, "stderr").map_err(|error| {
+        },
+    )?;
+    let stderr = receive_stream_output(&stderr_reader, started, timeout, "stderr").inspect_err(
+        |_error| {
             terminate_catalog_process(&mut child);
-            error
-        })?;
+        },
+    )?;
     Ok(std::process::Output {
         status,
         stdout,
@@ -3660,7 +3654,8 @@ esac
     #[cfg(unix)]
     #[test]
     fn restore_teardown_treats_only_authoritative_absence_as_idempotent() {
-        for message in ["can't find session: sm-test"] {
+        {
+            let message = "can't find session: sm-test";
             let (tmux_binary, _log_path, _temp_dir) = fake_tmux_binary();
             fs::write(
                 &tmux_binary,
@@ -4209,8 +4204,10 @@ esac
     #[test]
     fn create_session_does_not_mutate_default_tmux_server_options() {
         let (tmux_binary, log_path, temp_dir) = fake_tmux_binary_with_has_session(false);
-        let mut config = RustCoreConfig::default();
-        config.tmux_native_scrollback = Some(true);
+        let config = RustCoreConfig {
+            tmux_native_scrollback: Some(true),
+            ..RustCoreConfig::default()
+        };
         let mut runtime = TmuxRuntime::from_config(&config);
         runtime.tmux_binary = tmux_binary.display().to_string();
         let working_dir = temp_dir.join("repo");
@@ -4284,11 +4281,20 @@ esac
         let _server_guard = ServerGuard(runtime.clone());
         runtime.ensure_server_anchor().unwrap();
         let server_pid = runtime
-            .tmux_command(["display-message", "-p", "-t", "=__sm_server_anchor", "#{pid}"])
+            .tmux_command([
+                "display-message",
+                "-p",
+                "-t",
+                "=__sm_server_anchor",
+                "#{pid}",
+            ])
             .unwrap()
             .output()
             .unwrap();
-        let server_pid = String::from_utf8(server_pid.stdout).unwrap().trim().to_owned();
+        let server_pid = String::from_utf8(server_pid.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
         assert!(!server_pid.is_empty());
 
         let held = Command::new("lsof")

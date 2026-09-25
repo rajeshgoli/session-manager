@@ -73,7 +73,7 @@ fn list_codex_events_conn(
     let mut gap_reason = None;
     let start_seq = match since_seq {
         None => earliest_seq.max(latest_seq.saturating_sub(limit as i64 - 1)),
-        Some(seq) if seq < earliest_seq.checked_sub(1).unwrap_or(i64::MIN) => {
+        Some(seq) if seq < earliest_seq.saturating_sub(1) => {
             history_gap = true;
             gap_reason = Some("retention".to_owned());
             earliest_seq
@@ -144,7 +144,7 @@ fn empty_response(since_seq: Option<i64>) -> CodexEventsResponse {
 }
 
 fn next_seq_value(seq: i64) -> i64 {
-    seq.checked_add(1).unwrap_or(i64::MAX)
+    seq.saturating_add(1)
 }
 
 fn parse_payload_preview(raw: &str) -> Value {

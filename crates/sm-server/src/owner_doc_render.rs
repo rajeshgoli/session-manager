@@ -277,10 +277,7 @@ fn apply_line_sentinels(html: &str, sentinel_open: &str) -> String {
             let name = &after[..name_len];
             output.push_str(&segment[..open + 1 + name_len]);
             segment = &after[name_len..];
-            if let Some(position) = pending
-                .iter()
-                .position(|(names, _)| names.contains(&name))
-            {
+            if let Some(position) = pending.iter().position(|(names, _)| names.contains(&name)) {
                 let (_, line) = pending.remove(position);
                 output.push_str(&format!(" {LINE_ATTRIBUTE}=\"{line}\""));
             }

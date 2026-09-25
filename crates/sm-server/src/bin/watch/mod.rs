@@ -1479,7 +1479,9 @@ fn show_help() -> Result<()> {
         print!("{}\r\n", clipped(line, w - 1));
     }
     io::stdout().flush()?;
-    while !STOP.load(Ordering::Relaxed) && key()? == Key::None {}
+    while !STOP.load(Ordering::Relaxed) && key()? == Key::None {
+        std::hint::spin_loop()
+    }
     Ok(())
 }
 fn navigation(rows: &[Row], selection: &mut Option<Target>, delta: isize) {

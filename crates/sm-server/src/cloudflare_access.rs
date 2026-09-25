@@ -65,10 +65,7 @@ impl From<CloudflareAccessError> for CloudflareAccessContextError {
 }
 
 impl CloudflareAccessApplication {
-    pub fn config<'a>(
-        self,
-        config: &'a CloudflareAccessConfig,
-    ) -> &'a CloudflareAccessApplicationConfig {
+    pub fn config(self, config: &CloudflareAccessConfig) -> &CloudflareAccessApplicationConfig {
         match self {
             CloudflareAccessApplication::Browser => &config.browser,
             CloudflareAccessApplication::MobileApp => &config.mobile_app,

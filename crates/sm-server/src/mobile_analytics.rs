@@ -252,7 +252,7 @@ fn series_points(
     window_start: OffsetDateTime,
     window_end: OffsetDateTime,
 ) -> Vec<(OffsetDateTime, i64)> {
-    let bucket_count = ((window_end - window_start).whole_seconds() / (BUCKET_HOURS * 3600)) as i64;
+    let bucket_count = (window_end - window_start).whole_seconds() / (BUCKET_HOURS * 3600);
     let mut buckets = (0..bucket_count)
         .map(|index| (window_start + Duration::hours(index * BUCKET_HOURS), 0_i64))
         .collect::<Vec<_>>();

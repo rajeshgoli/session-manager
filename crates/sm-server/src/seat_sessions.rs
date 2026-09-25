@@ -411,7 +411,9 @@ mod tests {
             artifact_path: Some("/tmp/provisional.jsonl".to_owned()),
         };
 
-        store.append_batch(&[provisional.clone()]).unwrap();
+        store
+            .append_batch(std::slice::from_ref(&provisional))
+            .unwrap();
         store
             .append(
                 "seat-1",
