@@ -691,23 +691,33 @@ pub(super) async fn publish_owner_doc(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| default_doc_title(&path, &bytes));
     let store = owner_doc_store(&state);
-    let published = store.publish(PublishOwnerDoc {
-        repo,
-        path,
-        pr_number: payload.pr_number,
-        session_id: author.id.clone(),
-        session_name: author.friendly_name.clone().or(Some(author.name.clone())),
-        title,
-        note: payload
-            .note
-            .as_deref()
-            .map(str::trim)
-            .filter(|note| !note.is_empty())
-            .map(ToOwned::to_owned),
-        commit_sha,
-        blob_sha,
-        review_requested: payload.review,
-    })?;
+    let published = store.publish(
+        PublishOwnerDoc {
+            repo,
+            path,
+            pr_number: payload.pr_number,
+            session_id: author.id.clone(),
+            session_name: author.friendly_name.clone().or(Some(author.name.clone())),
+            title,
+            note: payload
+                .note
+                .as_deref()
+                .map(str::trim)
+                .filter(|note| !note.is_empty())
+                .map(ToOwned::to_owned),
+            commit_sha,
+            blob_sha,
+            review_requested: payload.review,
+        },
+        |author_id| {
+            // An unreadable session store keeps the recorded author.
+            match state.session_store.get_session(author_id) {
+                Ok(Some(author)) => !review::is_retired(&author),
+                Ok(None) => false,
+                Err(_) => true,
+            }
+        },
+    )?;
     let summary = store
         .summary(&published.doc.id)?
         .ok_or(ApiError::NotFound("Doc not found"))?;

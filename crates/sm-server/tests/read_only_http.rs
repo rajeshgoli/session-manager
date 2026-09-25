@@ -23800,8 +23800,16 @@ async fn owner_doc_token_opens_the_json_endpoints_for_its_own_doc_only() {
         blob_sha: git_blob_sha(REVIEW_MEMO),
         review_requested: false,
     };
-    let id = store.publish(publish("specs/memo.html")).unwrap().doc.id;
-    let other = store.publish(publish("specs/a.html")).unwrap().doc.id;
+    let id = store
+        .publish(publish("specs/memo.html"), |_| true)
+        .unwrap()
+        .doc
+        .id;
+    let other = store
+        .publish(publish("specs/a.html"), |_| true)
+        .unwrap()
+        .doc
+        .id;
     let now = unix_timestamp();
     let valid = doc_token(SECRET, &id, now + 3600);
     let external = Some(SocketAddr::from(([203, 0, 113, 7], 443)));

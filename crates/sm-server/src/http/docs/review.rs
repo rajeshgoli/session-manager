@@ -81,7 +81,7 @@ pub(super) fn render_owner_review_wake(
     )
 }
 
-fn is_retired(session: &SessionRecord) -> bool {
+pub(super) fn is_retired(session: &SessionRecord) -> bool {
     matches!(
         session.completion_status.as_deref(),
         Some("retired" | "killed")
