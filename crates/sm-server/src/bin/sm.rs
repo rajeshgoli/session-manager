@@ -5473,9 +5473,32 @@ mod tests {
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                 .unwrap();
+            // Read the whole request: a client may send headers and body in
+            // separate writes, and replying early fails the request (sm#1432).
+            let mut raw = Vec::new();
             let mut buffer = [0_u8; 8192];
-            let bytes_read = stream.read(&mut buffer).unwrap();
-            let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+            loop {
+                let bytes_read = stream.read(&mut buffer).unwrap();
+                raw.extend_from_slice(&buffer[..bytes_read]);
+                let text = String::from_utf8_lossy(&raw);
+                let Some(header_end) = text.find("\r\n\r\n") else {
+                    assert!(bytes_read > 0, "client closed before sending headers");
+                    continue;
+                };
+                let content_length = text[..header_end]
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if raw.len() >= header_end + 4 + content_length || bytes_read == 0 {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&raw).to_string();
             let reason = if status == 200 { "OK" } else { "Error" };
             let response = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

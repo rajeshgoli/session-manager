@@ -6010,7 +6010,9 @@ mod tests {
         );
         release_queue_admission_retry(&state_dir);
         drop(conn);
-        fs::remove_dir_all(state_dir).unwrap();
+        // The admitted job's monitor thread may still be writing its log and
+        // final state here, so cleanup is best-effort (sm#1432).
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     #[test]

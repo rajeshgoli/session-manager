@@ -18722,29 +18722,26 @@ sleep 30
     fn credential_rotation_terminal_completion_marker_blocks_prepared_and_launching_recovery_without_runtime_invocation(
     ) {
         // The durable completion marker is authoritative even if a delayed
-        // activity-state writer left `status` looking idle.  Put a sentinel
-        // tmux binary first on PATH: recovery must finalize the records
-        // without invoking it for every persisted terminal-marker/launch
-        // interleaving.
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        // activity-state writer left `status` looking idle.  Give the runtime a
+        // sentinel tmux binary: recovery must finalize the records without
+        // invoking it for every persisted terminal-marker/launch interleaving.
+        // The sentinel goes on the runtime, not on the process-wide PATH, so
+        // concurrent tests keep the real tmux (sm#1432).
         let root = unique_temp_path("terminal-marker-recovery");
         fs::create_dir_all(&root).unwrap();
         let tmux = root.join("tmux");
         let invoked = root.join("runtime-invoked");
         fs::write(
             &tmux,
-            "#!/bin/sh\n: > \"$SM_1322_FAKE_TMUX_SENTINEL\"\nexit 99\n",
+            format!(
+                "#!/bin/sh\n: > {}\nexit 99\n",
+                shell_quote_handoff_fixture(&invoked.display().to_string())
+            ),
         )
         .unwrap();
         let mut permissions = fs::metadata(&tmux).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&tmux, permissions).unwrap();
-        let old_path = env::var_os("PATH").unwrap_or_default();
-        let _path = EnvVarRestore::set(
-            "PATH",
-            format!("{}:{}", root.display(), old_path.to_string_lossy()),
-        );
-        let _sentinel = EnvVarRestore::set("SM_1322_FAKE_TMUX_SENTINEL", &invoked);
 
         for (completion_status, launch_status) in [
             ("retired", "prepared"),
@@ -18769,7 +18766,8 @@ sleep 30
                 fs::write(&state_file, state.to_string()).unwrap();
 
                 let store = SessionStore::new(state_file.clone()).with_delivery_runtime(Some(
-                    TmuxRuntime::from_config(&crate::config::RustCoreConfig::default()),
+                    TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
+                        .with_tmux_binary_for_test(tmux.display().to_string()),
                 ));
                 store.recover_session_runtime_launches().unwrap();
 
