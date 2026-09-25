@@ -415,7 +415,7 @@ mod tests {
 
         let stale_dir = unique_temp_dir("stale");
         let stale_path = stale_dir.join(AUTHORITY_SOCKET_FILE);
-        UnixListener::bind(&stale_path).unwrap();
+        bind_stale_socket(&stale_path);
         let server = QueueAuthorityServer::bind(&stale_dir, fixture_identity()).unwrap();
         assert!(server.socket_path().exists());
         drop(server);
@@ -451,6 +451,36 @@ mod tests {
         stream.read_to_string(&mut body).unwrap();
         server_thread.join().unwrap();
         serde_json::from_str(&body).unwrap()
+    }
+
+    /// Leaves a socket file with no listener behind it. A bound-then-dropped
+    /// `UnixListener` is not reliable here: on macOS std sets close-on-exec
+    /// after `socket()`, so a child spawned concurrently by another test can
+    /// inherit the listening descriptor and keep the path connectable (#1417).
+    /// A socket that never calls `listen()` refuses connections even if a
+    /// child inherits it.
+    fn bind_stale_socket(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path_bytes = path.as_os_str().as_bytes();
+        unsafe {
+            let fd = nix::libc::socket(nix::libc::AF_UNIX, nix::libc::SOCK_STREAM, 0);
+            assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+            let mut address: nix::libc::sockaddr_un = std::mem::zeroed();
+            assert!(path_bytes.len() < address.sun_path.len());
+            address.sun_family = nix::libc::AF_UNIX as nix::libc::sa_family_t;
+            for (slot, byte) in address.sun_path.iter_mut().zip(path_bytes) {
+                *slot = *byte as nix::libc::c_char;
+            }
+            let result = nix::libc::bind(
+                fd,
+                &address as *const nix::libc::sockaddr_un as *const nix::libc::sockaddr,
+                std::mem::size_of::<nix::libc::sockaddr_un>() as nix::libc::socklen_t,
+            );
+            let bind_error = std::io::Error::last_os_error();
+            nix::libc::close(fd);
+            assert_eq!(result, 0, "bind: {bind_error}");
+        }
     }
 
     fn fixture_identity() -> QueueAuthorityServiceIdentity {
