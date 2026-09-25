@@ -136,6 +136,7 @@ def env(tmp_path, request):
         f"""#!/bin/bash
 {reg}
 echo "cargo $* [registered=$reg]" >> "{log}"
+echo "$PWD" > "{state}/cargo_cwd"
 # Lets a test act mid-build, as another agent working in the checkout would.
 [[ -x "{state}/cargo_hook" ]] && "{state}/cargo_hook"
 rc="$(cat "{state}/cargo_rc")"
@@ -1454,6 +1455,8 @@ def test_update_fast_forwards_then_builds_the_fetched_commit(env, checkout):
     assert git(checkout["deployed"], "rev-parse", "HEAD") == landed != before
     text = calls(env)
     assert f"--manifest-path {checkout['deployed']}/Cargo.toml" in text
+    # cargo reads .cargo/config.toml from its cwd, not from the manifest's dir.
+    assert (env["state"] / "cargo_cwd").read_text().strip() == str(checkout["deployed"])
     assert "MARKER=REBUILT" in env["installed"].read_text()
     assert not env["lock"].exists()
 
@@ -1651,7 +1654,7 @@ def test_cli_installer_builds_its_own_checkout_from_any_cwd(tmp_path):
     _write(
         tmp_path / "bin" / "cargo",
         f"""#!/bin/bash
-echo "$*" > "{log}"
+echo "$* cwd=$PWD" > "{log}"
 mkdir -p "{target}/release"
 printf '#!/bin/bash\\necho sm-test\\n' > "{target}/release/sm"
 chmod 755 "{target}/release/sm"
@@ -1676,6 +1679,7 @@ chmod 755 "{target}/release/sm"
 
     assert result.returncode == 0, result.stderr
     assert f"--manifest-path {REPO_ROOT}/Cargo.toml" in log.read_text()
+    assert log.read_text().strip().endswith(f"cwd={REPO_ROOT}")
     assert (tmp_path / "installed" / "sm").exists()
 
 
@@ -1691,3 +1695,32 @@ def test_cli_is_staged_even_when_the_install_dir_does_not_exist_yet(env, checkou
     assert result.returncode == 0, result.stderr
     assert "install-sm-cli --source " in calls(env)
     assert "no sm CLI" not in result.stderr
+
+
+def test_update_refuses_a_head_that_moves_before_the_handoff(env, checkout):
+    """A clean commit or checkout between the last check and the exec must not
+    become the baseline the updated script builds."""
+    land_on_main(checkout)
+    real_git = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+    deployed = checkout["deployed"]
+    _write(
+        env["tmp"] / "bin" / "git",
+        f"""#!/bin/bash
+{real_git} "$@"; rc=$?
+if [[ " $* " == *" log -1 --format=checkout "* ]]; then
+  echo x > {deployed}/sneaked.txt
+  {real_git} -C {deployed} add sneaked.txt
+  {real_git} -C {deployed} commit -q -m sneaked
+fi
+exit $rc
+""",
+        executable=True,
+    )
+
+    result = checkout["run"]("--update")
+
+    assert result.returncode != 0
+    assert "moved away from the fetched" in result.stderr
+    assert "cargo build" not in calls(env)
+    assert_service_untouched(env)
+    assert not env["lock"].exists()

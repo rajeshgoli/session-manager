@@ -572,6 +572,7 @@ update_checkout() {
        editing the deployed checkout (git -C $REPO_ROOT status). The running
        service was not touched."
   git_repo log -1 --format='checkout at %h %s' HEAD
+  UPDATED_HEAD="$head"
 }
 
 # ---------------------------------------------------------------------------
@@ -590,8 +591,22 @@ if [[ "$UPDATE" -eq 1 ]]; then
   # The fast-forward may have changed this script. Finish with the new copy, so
   # the restart logic matches the code it deploys; it keeps the lock (see
   # acquire_lock). exec does not run the EXIT trap, so the lock survives.
-  export SM_LOCK SM_RESTART_LOCK_HANDOFF="$SM_LOCK"
+  export SM_LOCK SM_RESTART_LOCK_HANDOFF="$SM_LOCK" SM_UPDATE_EXPECTED_HEAD="$UPDATED_HEAD"
   exec bash "$REPO_ROOT/scripts/restart-rust-server.sh" ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}
+fi
+
+# The copy --update handed off to must still be building what it fetched: a
+# checkout or commit in the gap before the exec would otherwise become the
+# baseline below and be deployed.
+if [[ -n "${SM_UPDATE_EXPECTED_HEAD:-}" ]]; then
+  git_repo update-index -q --refresh >/dev/null 2>&1 || true
+  if [[ "$(git_repo rev-parse HEAD 2>/dev/null)" != "$SM_UPDATE_EXPECTED_HEAD" ]] \
+      || ! git_repo diff --quiet HEAD; then
+    fail "$REPO_ROOT moved away from the fetched $SM_UPDATE_EXPECTED_HEAD during --update.
+       Something is changing the deployed checkout outside the restart lock.
+       The running service was not touched."
+  fi
+  unset SM_UPDATE_EXPECTED_HEAD
 fi
 
 # Taken under the lock, so any change to the source from here on is somebody
@@ -731,7 +746,9 @@ elif [[ "$SKIP_BUILD" -eq 1 ]]; then
   SOURCE_BINARY="$SM_BINARY"
 else
   step "Building sm-server (service still running)"
-  cargo build --release -p sm-server --manifest-path "$REPO_ROOT/Cargo.toml" --target-dir "$SM_TARGET_DIR" \
+  # From REPO_ROOT: cargo reads .cargo/config.toml from the cwd, which
+  # --manifest-path does not redirect.
+  (cd "$REPO_ROOT" && cargo build --release -p sm-server --manifest-path "$REPO_ROOT/Cargo.toml" --target-dir "$SM_TARGET_DIR") \
     || fail "build failed - the running service was not touched"
   [[ -x "$SM_CARGO_OUTPUT" ]] \
     || fail "build reported success but produced no executable at $SM_CARGO_OUTPUT - the running service was not touched"
