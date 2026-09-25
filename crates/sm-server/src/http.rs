@@ -17281,6 +17281,11 @@ mod tests {
             serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
         session_state["sessions"][0]["completion_status"] = json!("killed");
         fs::write(&state_path, serde_json::to_vec(&session_state).unwrap()).unwrap();
+        // The runtime-disabled router never initializes the reminder schema, and
+        // the rejection happens before any store write.
+        RetainedQueueStore::new(queue_path.clone())
+            .ensure_schema()
+            .unwrap();
         let app = router(AppState::new(config));
 
         let response = app
