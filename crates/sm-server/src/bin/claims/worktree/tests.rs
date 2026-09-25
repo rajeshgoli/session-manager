@@ -88,7 +88,7 @@ struct Recorded {
 }
 
 impl WorktreeRecorder for Recorded {
-    fn record(&mut self, state: &str, plan: &WorktreePlan, base_sha: &str) -> Result<()> {
+    fn record(&mut self, state: &str, plan: &WorktreePlan, base_sha: Option<&str>) -> Result<()> {
         if self.fail_intent && state == "intent" {
             bail!("HTTP 502");
         }
@@ -96,7 +96,7 @@ impl WorktreeRecorder for Recorded {
             state.to_owned(),
             plan.path.clone(),
             plan.branch.clone(),
-            base_sha.to_owned(),
+            base_sha.unwrap_or("").to_owned(),
         ));
         Ok(())
     }
@@ -197,17 +197,26 @@ fn creates_the_branch_from_origin_default_records_base_and_reuses_on_rerun() {
     .unwrap();
     assert_eq!(again, SetupOutcome::Existing { plan: plan.clone() });
     // Rerun without the record (a lost confirmation): the path is this
-    // ticket's worktree, so it is reused too.
+    // ticket's worktree, so it is reused too. A reuse sends no base: origin
+    // may have moved since, and the worktree's base is what was recorded
+    // when it was created.
+    let mut rerun = Recorded::default();
     let again = setup_worktree(
         &ProcessTools,
         &c.checkout,
         &claim(&root, None),
         None,
         None,
-        &mut Recorded::default(),
+        &mut rerun,
     )
     .unwrap();
     assert_eq!(again, SetupOutcome::Existing { plan: plan.clone() });
+    assert_eq!(rerun.calls.len(), 2);
+    assert!(
+        rerun.calls.iter().all(|call| call.3.is_empty()),
+        "{:?}",
+        rerun.calls
+    );
     // A different slug on a claim that has a worktree is refused.
     let error = setup_worktree(
         &ProcessTools,

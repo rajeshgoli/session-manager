@@ -259,7 +259,9 @@ impl SetupOutcome {
 
 /// `POST /claims/worktree` with `intent` or `created`.
 pub(crate) trait WorktreeRecorder {
-    fn record(&mut self, state: &str, plan: &WorktreePlan, base_sha: &str) -> Result<()>;
+    /// `base_sha` is `None` when an existing worktree is reused: its base
+    /// was recorded when it was created, and today's origin head is not it.
+    fn record(&mut self, state: &str, plan: &WorktreePlan, base_sha: Option<&str>) -> Result<()>;
 }
 
 /// The git half of `--setup-worktree`, after the claim succeeded (appendix
@@ -332,8 +334,9 @@ pub(crate) fn setup_worktree(
     } else {
         false
     };
+    let recorded_base = (!existing).then_some(base_sha.as_str());
     recorder
-        .record("intent", &plan, &base_sha)
+        .record("intent", &plan, recorded_base)
         .context("could not record the worktree on the claim; nothing was created")?;
     if !existing {
         let branch_ref = format!("refs/heads/{}", plan.branch);
@@ -363,7 +366,7 @@ pub(crate) fn setup_worktree(
     }
     // The intent already names the path, so a failed confirmation leaks
     // nothing: retire finds it either way.
-    if let Err(error) = recorder.record("created", &plan, &base_sha) {
+    if let Err(error) = recorder.record("created", &plan, recorded_base) {
         eprintln!("Warning: could not confirm the worktree on the claim: {error:#}");
     }
     Ok(if existing {
@@ -407,7 +410,7 @@ struct ApiRecorder<'a> {
 }
 
 impl WorktreeRecorder for ApiRecorder<'_> {
-    fn record(&mut self, state: &str, plan: &WorktreePlan, base_sha: &str) -> Result<()> {
+    fn record(&mut self, state: &str, plan: &WorktreePlan, base_sha: Option<&str>) -> Result<()> {
         let response = self.client.request(
             "POST",
             "/claims/worktree",

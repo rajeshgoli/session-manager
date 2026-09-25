@@ -782,6 +782,12 @@ async fn setup_intent_keep_and_the_retire_response_worktrees() {
         assert_eq!(body["claim"]["worktree_path"], path);
         assert_eq!(body["claim"]["base_sha"], head);
     }
+    // A rerun that reuses the worktree sends no base and keeps the recorded one.
+    let mut rerun = worktree("eng00001", &claim_id, "intent");
+    rerun["base_sha"] = Value::Null;
+    let (status, body) = request(&f.app, "POST", "/claims/worktree", Some(rerun)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["claim"]["base_sha"], head);
     let (status, _) = request(
         &f.app,
         "POST",

@@ -39,7 +39,8 @@ const ABSENT: &str = "absent";
 
 impl WorkClaimStore {
     /// `POST /claims/worktree`: records the managed worktree on the caller's
-    /// active claim. `None` when the caller holds no such claim.
+    /// active claim. A `None` base keeps the recorded one (a rerun reusing
+    /// the worktree). `None` when the caller holds no such claim.
     pub fn set_claim_worktree(
         &self,
         session_id: &str,
@@ -51,7 +52,8 @@ impl WorkClaimStore {
         let conn = self.open_write()?;
         let changed = conn.execute(
             "UPDATE work_claims
-                SET worktree_path = ?3, branch = ?4, base_sha = ?5, managed_worktree = 1
+                SET worktree_path = ?3, branch = ?4, base_sha = COALESCE(?5, base_sha),
+                    managed_worktree = 1
               WHERE id = ?1 AND session_id = ?2 AND ended_at IS NULL AND reserved_at IS NULL",
             params![claim_id, session_id, path, branch, base_sha],
         )?;
@@ -485,10 +487,14 @@ fn is_inside(path: &str, root: &str) -> bool {
 
 /// Processes whose current directory is `root` or under it:
 /// `lsof -a -d cwd -Fpcn`, run from the server's own cwd (appendix K, G8).
+/// A shell is usually just the wrapper around the process that matters, so
+/// another process inside is named first when there is one.
 fn processes_inside(root: &str, listing: &[(u32, String, String)]) -> Option<(u32, String)> {
-    listing
-        .iter()
-        .find(|(_, _, cwd)| is_inside(cwd, root))
+    const SHELLS: [&str; 6] = ["zsh", "bash", "sh", "fish", "dash", "ksh"];
+    let inside = || listing.iter().filter(|(_, _, cwd)| is_inside(cwd, root));
+    inside()
+        .find(|(_, command, _)| !SHELLS.contains(&command.trim_start_matches('-')))
+        .or_else(|| inside().next())
         .map(|(pid, command, _)| (*pid, command.clone()))
 }
 

@@ -580,4 +580,15 @@ fn lsof_records_parse_into_pid_command_and_cwd() {
         processes_inside("/Users/r/worktrees/sm-1480", &listing),
         None
     );
+
+    // The shell a server was started from is not the process to name.
+    let wrapped = parse_lsof("p10\nczsh\nn/w/x\np11\ncPython\nn/w/x/sub\np12\nc-zsh\nn/w/y\n");
+    assert_eq!(
+        processes_inside("/w/x", &wrapped),
+        Some((11, "Python".to_owned()))
+    );
+    assert_eq!(
+        processes_inside("/w/y", &wrapped),
+        Some((12, "-zsh".to_owned()))
+    );
 }
