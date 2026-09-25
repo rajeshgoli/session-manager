@@ -55,6 +55,7 @@ pub struct AppConfig {
     pub queue_runner: QueueRunnerConfig,
     pub rust_shadow: RustShadowConfig,
     pub rust_core: RustCoreConfig,
+    pub work_claims: WorkClaimsConfig,
 }
 
 impl Default for AppConfig {
@@ -100,6 +101,7 @@ impl Default for AppConfig {
             queue_runner: QueueRunnerConfig::default(),
             rust_shadow: RustShadowConfig::default(),
             rust_core: RustCoreConfig::default(),
+            work_claims: WorkClaimsConfig::default(),
         }
     }
 }
@@ -1672,6 +1674,32 @@ fn codex_requests_config_for_state_file(state_file: &str) -> CodexRequestsConfig
     }
 }
 
+/// `work_claims`: ticket and PR claims (sm#1452).
+#[derive(Debug, Clone, Deserialize)]
+pub struct WorkClaimsConfig {
+    /// Seconds between GitHub syncs of tracked tickets and PRs; at least 60.
+    #[serde(default = "default_work_claims_sync_interval_seconds")]
+    pub sync_interval_seconds: u64,
+}
+
+impl Default for WorkClaimsConfig {
+    fn default() -> Self {
+        Self {
+            sync_interval_seconds: default_work_claims_sync_interval_seconds(),
+        }
+    }
+}
+
+impl WorkClaimsConfig {
+    pub fn sync_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.sync_interval_seconds.max(60))
+    }
+}
+
+fn default_work_claims_sync_interval_seconds() -> u64 {
+    300
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RustShadowConfig {
     #[serde(default)]
@@ -1770,6 +1798,8 @@ struct RawConfig {
     rust_shadow: RustShadowConfig,
     #[serde(default)]
     rust_core: RustCoreConfig,
+    #[serde(default)]
+    work_claims: WorkClaimsConfig,
 }
 
 impl From<RawConfig> for AppConfig {
@@ -1875,6 +1905,7 @@ impl From<RawConfig> for AppConfig {
             queue_runner,
             rust_shadow: raw.rust_shadow,
             rust_core,
+            work_claims: raw.work_claims,
         }
     }
 }

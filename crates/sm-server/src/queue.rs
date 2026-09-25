@@ -2226,6 +2226,27 @@ pub(crate) fn enqueue_message_once_in_conn(
     )
 }
 
+/// Queues an `important` message on the caller's connection, so it commits or
+/// rolls back with the caller's transaction. Returns the message id.
+pub(crate) fn enqueue_important_in_conn(
+    conn: &Connection,
+    target_session_id: &str,
+    text: &str,
+    message_category: &str,
+) -> Result<String> {
+    init_schema(conn)?;
+    enqueue_message_with_metadata_conn(
+        conn,
+        target_session_id,
+        text,
+        "important",
+        QueueMessageMetadata {
+            message_category: Some(message_category.to_owned()),
+            ..QueueMessageMetadata::default()
+        },
+    )
+}
+
 fn enqueue_message_with_metadata_conn(
     conn: &Connection,
     target_session_id: &str,
@@ -2707,6 +2728,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
     )?;
     init_codex_review_requests_schema(conn)?;
     crate::owner_docs::init_owner_docs_schema(conn)?;
+    crate::work_claims::init_work_claims_schema(conn)?;
     Ok(())
 }
 

@@ -88,6 +88,17 @@ If I explicitly asked you to be a `maintainer`, register as maintainer, sm maint
 
 **Worktrees.** Every agent works in its own worktree under `~/worktrees/sm-<ticket>-<slug>`, build outputs inside. If you're maintainer, use a stable `~/worktrees/sm-maintainer` worktree where possible. You may use a ticket specific worktree where needed, but you should ensure it's deleted when it's no longer useful.
 
+**Claim your work.** Start a ticket with `sm ticket <N>`. When you open
+a PR, or take over someone else's, run `sm pr` from its branch. Put `Closes #<N>` in
+the PR body for each ticket the PR finishes; "Implements #N" does not close it.
+Reviewers and scouts don't claim.
+
+`[sm claim]` messages state facts. Act on them like this:
+- Your claim is refused because another live agent holds it: stop and tell me.
+  Use `--take` only when I say so.
+- Another agent claimed your ticket or PR: stop working on it and tell your parent
+  or me the state you left it in.
+
  Workflow as usual:
  1. Rebuild and restart session manager as required. If it's pure sm app update, you don't need to restart session manager, otherwise you may need to. Restart using `scripts/restart-rust-server.sh`. Follow other maintainer lessons from `docs/product/lessons.md` as needed. 
  2. If I need to test something let me know. For example, if something can be tested with sm cli or sm app, let me know exactly what to try out.  If you can test directly that's preferred. For example, if you can reliable reproduce the issue I reported and you can verify it no longer occurs, you can tell me what you did and ask me to try it optionally.

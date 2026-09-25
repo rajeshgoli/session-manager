@@ -4,6 +4,9 @@
 //! path and the commit the owner will read. The server only stores pointers.
 
 use super::*;
+#[cfg(test)]
+use crate::git_repo::{parse_github_remote, ToolOutput};
+use crate::git_repo::{resolve_repo_slug, run_ok, DocTools, ProcessTools};
 
 #[derive(Args)]
 pub(crate) struct DocArgs {
@@ -170,43 +173,6 @@ fn url_segment(value: &str) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ToolOutput {
-    pub success: bool,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-/// git and gh, behind a seam so resolution is testable without a repo.
-pub(crate) trait DocTools {
-    fn run(&self, program: &str, cwd: &Path, args: &[&str]) -> Result<ToolOutput>;
-}
-
-struct ProcessTools;
-
-impl DocTools for ProcessTools {
-    fn run(&self, program: &str, cwd: &Path, args: &[&str]) -> Result<ToolOutput> {
-        let output = process::Command::new(program)
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .with_context(|| format!("failed to run {program}"))?;
-        Ok(ToolOutput {
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        })
-    }
-}
-
-fn run_ok(tools: &dyn DocTools, program: &str, cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = tools.run(program, cwd, args)?;
-    if !output.success {
-        bail!("{program} {} failed: {}", args.join(" "), output.stderr);
-    }
-    Ok(output.stdout)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedDoc {
     pub repo: String,
     pub path: String,
@@ -221,55 +187,6 @@ pub(crate) struct PublishRequest<'a> {
     pub pr: Option<i64>,
     pub commit: Option<&'a str>,
     pub no_pr: bool,
-}
-
-/// `owner/name` from an `origin` URL: SSH, scp-style, or HTTPS. The host
-/// must be exactly `github.com`; anything else falls back to `gh repo view`.
-pub(crate) fn parse_github_remote(url: &str) -> Option<String> {
-    let url = url.trim();
-    let (authority, rest) = if let Some((_, after_scheme)) = url.split_once("://") {
-        after_scheme.split_once('/')?
-    } else {
-        // scp-style: [user@]host:owner/name
-        url.split_once(':')?
-    };
-    let host = authority.rsplit('@').next()?;
-    let host = host.split(':').next()?;
-    if !host.eq_ignore_ascii_case("github.com") {
-        return None;
-    }
-    let rest = rest.trim_end_matches('/');
-    let rest = rest.strip_suffix(".git").unwrap_or(rest);
-    let mut parts = rest.split('/');
-    let (owner, name) = (parts.next()?, parts.next()?);
-    (parts.next().is_none() && !owner.is_empty() && !name.is_empty())
-        .then(|| format!("{owner}/{name}"))
-}
-
-fn resolve_repo_slug(tools: &dyn DocTools, root: &Path) -> Result<String> {
-    if let Ok(url) = run_ok(tools, "git", root, &["remote", "get-url", "origin"]) {
-        if let Some(repo) = parse_github_remote(&url) {
-            return Ok(repo);
-        }
-    }
-    let repo = run_ok(
-        tools,
-        "gh",
-        root,
-        &[
-            "repo",
-            "view",
-            "--json",
-            "nameWithOwner",
-            "--jq",
-            ".nameWithOwner",
-        ],
-    )
-    .context("could not determine the GitHub repo for this checkout")?;
-    if repo.is_empty() {
-        bail!("could not determine the GitHub repo for this checkout");
-    }
-    Ok(repo)
 }
 
 /// Repo root and repo-relative path. The file itself may be absent locally
@@ -478,6 +395,9 @@ fn run_doc_publish(client: &ApiClient, args: DocPublishArgs) -> Result<()> {
         &resolved.commit_sha[..7],
         reader_url(client, &doc)
     );
+    if let Some(warning) = doc["claim_warning"].as_str() {
+        eprintln!("{warning}");
+    }
     if args.review {
         println!(
             "Review requested. The owner's review arrives as a GitHub PR review on #{}; sm wakes you with [sm review] when it lands.",

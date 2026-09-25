@@ -29,6 +29,18 @@ class DocReaderTest {
         assertTrue(session.docs.isEmpty())
     }
 
+    @Test fun schemaThreeObligationsWithClaimsStillParse() {
+        val body = """
+            {"schema_version":3,"sessions":[{"session_id":"abc12345","waiting_on":[],"review_history":[],"docs":[],
+              "claims":[{"kind":"ticket","repo":"rajeshgoli/session-manager","number":1452,"title":"Agent work claims",
+                         "state":"open","claimed_at":"2026-09-24T20:00:00Z","source":"explicit",
+                         "history_path":"/t/session-manager/1452"}]}]}
+        """.trimIndent()
+        val session = json.decodeFromString(SessionObligationsResponse.serializer(), body).sessions.single()
+        assertEquals("abc12345", session.sessionId)
+        assertTrue(session.docs.isEmpty())
+    }
+
     @Test fun obligationsWithDocsParse() {
         val body = """
             {"schema_version":2,"sessions":[{"session_id":"abc12345","waiting_on":[],"review_history":[],"docs":[

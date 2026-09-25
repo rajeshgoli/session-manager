@@ -194,6 +194,47 @@ fn unread_doc_count(obligation: &Value) -> usize {
         .count()
 }
 
+/// Collapsed row marker for active claims: `[#1452]`, or `[#1452 +2]` with
+/// more. The earliest ticket leads; a PR only when no ticket is held.
+fn claim_marker(obligation: &Value) -> String {
+    let claims = array(obligation, "claims");
+    let lead = claims
+        .iter()
+        .find(|claim| s(claim, "kind") == "ticket")
+        .or_else(|| claims.first());
+    match lead {
+        None => String::new(),
+        Some(lead) => {
+            let number = lead["number"].as_i64().unwrap_or_default();
+            match claims.len() - 1 {
+                0 => format!(" [#{number}]"),
+                more => format!(" [#{number} +{more}]"),
+            }
+        }
+    }
+}
+
+/// Expanded view: one line per claim, `ticket #1452 open  Title  <history url>`.
+fn claim_rows(obligation: &Value, prefix: &str, base_url: &str) -> Vec<Row> {
+    array(obligation, "claims")
+        .iter()
+        .map(|claim| {
+            Row::plain(format!(
+                "{prefix}   {} #{} {}  {}  {base_url}{}",
+                if s(claim, "kind") == "pr" {
+                    "PR"
+                } else {
+                    "ticket"
+                },
+                claim["number"].as_i64().unwrap_or_default(),
+                s(claim, "state"),
+                s(claim, "title"),
+                s(claim, "history_path"),
+            ))
+        })
+        .collect()
+}
+
 /// Expanded view: one line per doc with its reader URL.
 fn doc_rows(obligation: &Value, prefix: &str, base_url: &str) -> Vec<Row> {
     array(obligation, "docs")
@@ -1086,9 +1127,10 @@ impl View {
             s(v, "activity_state")
         };
         let unread_docs = obligation.map_or(0, unread_doc_count);
+        let claims = obligation.map(claim_marker).unwrap_or_default();
         rows.push(Row {
             text: format!(
-                "{prefix}{} {:20} {:8} {:10} {:5} {:10} {:8} {:8}{}",
+                "{prefix}{} {:20} {:8} {:10} {:5} {:10} {:8} {:8}{}{claims}",
                 if state == "waiting" { "◷ " } else { "+-" },
                 clipped(name(v), 20),
                 id,
@@ -1194,6 +1236,7 @@ impl View {
                     .find(|v| !v.is_empty())
                     .unwrap_or("");
                 if let Some(obligation) = obligation {
+                    rows.extend(claim_rows(obligation, &prefix, &self.base_url));
                     rows.extend(doc_rows(obligation, &prefix, &self.base_url));
                 }
                 rows.push(Row::plain(format!(

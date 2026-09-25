@@ -724,6 +724,18 @@ pub(super) async fn publish_owner_doc(
     let mut response = summary_json(&state.config, &summary, &headers)?;
     response["created"] = json!(published.created);
     response["publish"] = serde_json::to_value(&published.publish)?;
+    if let Some(pr_number) = published.doc.pr_number {
+        // The publishing session's implicit PR claim (sm#1452).
+        if let Some(warning) = super::claims::record_implicit_pr_claim(
+            &state,
+            &published.doc.repo,
+            pr_number,
+            &published.publish.session_id,
+            crate::work_claims::ClaimSource::DocPublish,
+        ) {
+            response["claim_warning"] = json!(warning);
+        }
+    }
     Ok(Json(response))
 }
 

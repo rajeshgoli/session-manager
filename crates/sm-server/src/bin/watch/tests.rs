@@ -938,3 +938,55 @@ fn owner_review_waits_are_named_and_undelivered_reviews_flagged() {
     assert!(view.rows(&snap, &a, 0).iter().any(|r| r.text
         == "   doc · Decision memo · reviewed · review not delivered: author retired · http://127.0.0.1:8420/docs/widgets/memo.html?version=aaaaaaaaaaaa"));
 }
+
+#[test]
+fn claims_mark_the_session_row_and_list_history_urls_when_expanded() {
+    let a = args();
+    let mut view = View::new(&a);
+    view.base_url = "http://127.0.0.1:8420".into();
+    let claim = |kind: &str, number: i64, title: &str| {
+        json!({"kind": kind, "repo": "acme/widgets", "number": number, "title": title,
+               "state": "open", "claimed_at": "2026-09-24T00:00:00Z", "source": "explicit",
+               "history_path": format!("/t/widgets/{number}")})
+    };
+    let snap = Snapshot {
+        sessions: vec![
+            session("a", "", "/repo"),
+            session("b", "", "/repo"),
+            session("c", "", "/repo"),
+        ],
+        obligations: vec![
+            // A PR claimed first still yields to the ticket in the marker.
+            json!({"session_id":"a", "waiting_on":[], "review_history":[], "docs":[],
+                   "claims":[claim("pr", 1470, "Claims core"), claim("ticket", 1452, "Agent work claims")]}),
+            json!({"session_id":"b", "waiting_on":[], "review_history":[], "docs":[],
+                   "claims":[claim("pr", 1481, "Retry")]}),
+            // A schema-2 server sends no claims.
+            json!({"session_id":"c", "waiting_on":[], "review_history":[], "docs":[]}),
+        ],
+        ..Default::default()
+    };
+    let row = |rows: &[Row], id: &str| {
+        rows.iter()
+            .find(|r| r.target == Some(Target::Session(id.into())))
+            .unwrap()
+            .text
+            .clone()
+    };
+    let rows = view.rows(&snap, &a, 0);
+    assert!(
+        row(&rows, "a").ends_with(" [#1452 +1]"),
+        "{}",
+        row(&rows, "a")
+    );
+    assert!(row(&rows, "b").ends_with(" [#1481]"));
+    assert!(!row(&rows, "c").contains("[#"));
+
+    view.expanded.insert("a".into());
+    let rows = view.rows(&snap, &a, 0);
+    assert!(rows.iter().any(|r| r.text
+        == "   ticket #1452 open  Agent work claims  http://127.0.0.1:8420/t/widgets/1452"));
+    assert!(rows
+        .iter()
+        .any(|r| r.text == "   PR #1470 open  Claims core  http://127.0.0.1:8420/t/widgets/1470"));
+}
