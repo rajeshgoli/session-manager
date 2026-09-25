@@ -73,6 +73,7 @@
   root.appendChild(el('style', { text: [
     ':host{all:initial}',
     '[hidden]{display:none!important}',
+    '.bar,.pill,.ban,.chip,.sheet{pointer-events:auto}',
     '*{box-sizing:border-box;font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
     '.bar{position:fixed;top:0;left:0;right:0;display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:6px 10px;background:#111827;color:#f9fafb;box-shadow:0 1px 4px rgba(0,0,0,.3)}',
     '.bar .t{font-weight:600;max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
@@ -86,7 +87,7 @@
     '.ban{position:fixed;left:0;right:0;padding:6px 10px;background:#fef3c7;color:#78350f;display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center}',
     '.ban a,.ban .lk{color:#1d4ed8;text-decoration:underline;cursor:pointer;background:none;padding:0}',
     '.chip{position:fixed;background:#2563eb;color:#fff;border-radius:16px;padding:6px 14px;box-shadow:0 2px 8px rgba(0,0,0,.35)}',
-    '.sheet{position:fixed;bottom:0;right:0;width:min(440px,100vw);max-height:80vh;overflow:auto;background:#fff;color:#111827;border-radius:10px 10px 0 0;box-shadow:0 -2px 16px rgba(0,0,0,.35);padding:12px;display:flex;flex-direction:column;gap:8px}',
+    '.sheet{position:fixed;bottom:0;right:0;width:min(440px,100%);max-height:85%;overflow:auto;background:#fff;color:#111827;border-radius:10px 10px 0 0;box-shadow:0 -2px 16px rgba(0,0,0,.35);padding:12px;display:flex;flex-direction:column;gap:8px}',
     '.q{border-left:3px solid #d1d5db;padding-left:8px;color:#4b5563;max-height:6em;overflow:auto;white-space:pre-wrap}',
     'textarea{width:100%;min-height:6em;padding:8px;border:1px solid #d1d5db;border-radius:6px;resize:vertical}',
     '.row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;align-items:center}',
@@ -95,7 +96,7 @@
     'label{display:flex;gap:6px;align-items:center}',
     // Touch: 16px text (no zoom on focus) and finger-sized controls.
     '.touch .sheet,.touch .sheet *{font-size:16px}',
-    '.touch .sheet{width:100vw;border-radius:12px 12px 0 0;padding:14px}',
+    '.touch .sheet{width:100%;border-radius:12px 12px 0 0;padding:14px}',
     '.touch .sheet button{padding:10px 16px}',
     '.touch textarea{min-height:9em}',
     '.touch .chip{font-size:16px;padding:10px 18px}'
@@ -121,24 +122,43 @@
   function layout() {
     bar.hidden = collapsed;
     pill.hidden = !collapsed;
-    var h = collapsed ? 0 : bar.getBoundingClientRect().height;
+    // offsetHeight: the bar's size before the zoom compensation below.
+    var h = collapsed ? 0 : bar.offsetHeight;
     document.documentElement.style.setProperty('--sm-doc-bar', h + 'px');
     document.documentElement.classList.toggle('sm-doc-bar-open', !collapsed);
     banner.style.top = (collapsed ? 40 : h) + 'px';
   }
   window.addEventListener('resize', layout);
 
-  // The on-screen keyboard shrinks the visual viewport, not the layout one,
-  // so a sheet pinned to the layout bottom would sit under the keyboard.
-  // Pin it to the bottom of what is visible and cap it to that height.
+  // Fixed elements are placed against the layout viewport. On a phone that
+  // is often not what is on screen: a page wider than the screen widens it
+  // (so "bottom" and "centre" land off-screen until you zoom out), pinch
+  // zoom shows only part of it, and the keyboard covers its bottom. So every
+  // floating control lives in `ui`, which tracks the visual viewport: it sits
+  // at the visible area's offset, spans it, and undoes the zoom so controls
+  // keep their size. Its fixed children are then placed within it.
   var vv = window.visualViewport;
-  function placeSheet() {
-    if (!vv) return;
-    var hidden = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
-    sheet.style.bottom = hidden + 'px';
-    sheet.style.maxHeight = Math.max(160, vv.height - 12) + 'px';
+  function syncViewport() {
+    if (!vv) {
+      ui.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;pointer-events:none';
+      return;
+    }
+    var scale = vv.scale || 1;
+    ui.style.cssText = 'position:fixed;left:' + vv.offsetLeft + 'px;top:' + vv.offsetTop + 'px;' +
+      'width:' + vv.width * scale + 'px;height:' + vv.height * scale + 'px;' +
+      'transform:scale(' + 1 / scale + ');transform-origin:0 0;pointer-events:none';
   }
-  if (vv) { vv.addEventListener('resize', placeSheet); vv.addEventListener('scroll', placeSheet); }
+  var syncQueued = false;
+  function queueSync() {
+    if (syncQueued) return;
+    syncQueued = true;
+    requestAnimationFrame(function () { syncQueued = false; syncViewport(); });
+  }
+  function placeSheet() { syncViewport(); }
+  if (vv) { vv.addEventListener('resize', queueSync); vv.addEventListener('scroll', queueSync); }
+  window.addEventListener('scroll', queueSync, { passive: true });
+  window.addEventListener('resize', queueSync);
+  syncViewport();
 
   function stateText() {
     if (!CONFIG.prNumber) return ['Read-only: no PR', 'ro'];
@@ -286,7 +306,8 @@
   function ensureVisible(h) {
     if (!h || !h.isConnected) return;
     var r = h.getBoundingClientRect();
-    var top = collapsed ? 8 : bar.getBoundingClientRect().height + 8;
+    // Page coordinates of the visible area, below the bar.
+    var top = (collapsed ? (vv ? vv.offsetTop : 0) : bar.getBoundingClientRect().bottom) + 8;
     var bottom = (vv ? vv.height + vv.offsetTop : window.innerHeight) - 8;
     // The buttons are at the bottom: if the bubble is taller than the
     // visible space, keep its bottom in view and let the quote go under the bar.
@@ -346,9 +367,13 @@
     var r = anchor.rect();
     if (coarse) { chip.style.left = '50%'; chip.style.transform = 'translateX(-50%)'; chip.style.top = ''; chip.style.bottom = '16px'; }
     else {
+      // Page coordinates to `ui` coordinates (visible area, unzoomed).
+      var scale = vv ? vv.scale || 1 : 1;
+      var ox = vv ? vv.offsetLeft : 0, oy = vv ? vv.offsetTop : 0;
+      var width = vv ? vv.width * scale : window.innerWidth, height = vv ? vv.height * scale : window.innerHeight;
       chip.style.transform = ''; chip.style.bottom = '';
-      chip.style.top = Math.max(8, Math.min(window.innerHeight - 44, r.bottom + 6)) + 'px';
-      chip.style.left = Math.max(8, Math.min(window.innerWidth - 120, r.right - 60)) + 'px';
+      chip.style.top = Math.max(8, Math.min(height - 44, (r.bottom - oy) * scale + 6)) + 'px';
+      chip.style.left = Math.max(8, Math.min(width - 120, (r.right - ox) * scale - 60)) + 'px';
     }
     chip.hidden = false;
   }
