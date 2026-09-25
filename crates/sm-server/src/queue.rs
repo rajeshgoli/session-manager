@@ -2203,6 +2203,26 @@ impl RetainedQueueStore {
     }
 }
 
+/// Queues `text` for `target_session_id` under a fixed message `id` on the
+/// caller's connection, so it commits or rolls back with the caller's
+/// transaction. A repeated id is a no-op. Returns whether it was inserted.
+pub(crate) fn enqueue_message_once_in_conn(
+    conn: &Connection,
+    id: &str,
+    target_session_id: &str,
+    text: &str,
+) -> Result<bool> {
+    init_schema(conn)?;
+    enqueue_message_with_id_and_metadata_conn(
+        conn,
+        id,
+        target_session_id,
+        text,
+        "sequential",
+        QueueMessageMetadata::default(),
+    )
+}
+
 fn enqueue_message_with_metadata_conn(
     conn: &Connection,
     target_session_id: &str,

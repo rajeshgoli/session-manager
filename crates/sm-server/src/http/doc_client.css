@@ -1,0 +1,4 @@
+html.sm-doc-bar-open{padding-top:var(--sm-doc-bar,0px)!important;scroll-padding-top:var(--sm-doc-bar,0px)}
+[data-sm-selected]{outline:2px solid #f59e0b!important;outline-offset:2px;background-color:rgba(245,158,11,.1)!important}
+[data-sm-drafts]{box-shadow:-5px 0 0 #3b82f6!important}
+@media (pointer:coarse){[data-sm-drafts]::after{content:"\1F4AC\00a0" attr(data-sm-drafts);display:inline-block;margin-left:.4em;padding:0 .5em;border-radius:9px;background:#3b82f6;color:#fff;font:600 12px/1.7 -apple-system,BlinkMacSystemFont,sans-serif;vertical-align:middle;text-indent:0}}

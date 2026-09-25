@@ -317,7 +317,9 @@ pub enum GitHubPullRequestState {
 }
 
 mod docs;
-pub use docs::{DocFetchError, OwnerDocSource};
+pub use docs::{
+    DocFetchError, DocPullRequest, DocReviewOnGitHub, OwnerDocSource, SubmittedDocReview,
+};
 
 pub trait GitHubReviewPoster: Send + Sync {
     fn post_initial_review_request(
@@ -450,6 +452,10 @@ pub struct AppState {
     session_store: SessionStore,
     github_review_poster: Arc<dyn GitHubReviewPoster>,
     owner_doc_source: Arc<dyn OwnerDocSource>,
+    /// PR state and head per `(repo, pr)` for owner docs, cached for 30s.
+    owner_doc_pr_cache: Arc<Mutex<docs::DocPullRequestCache>>,
+    /// Serializes owner doc review submits and their reconciliation.
+    owner_doc_review_lock: Arc<AsyncMutex<()>>,
     codex_review_creation_locks: Arc<AsyncMutex<BTreeSet<String>>>,
     codex_review_watcher_ids: Arc<Mutex<BTreeSet<String>>>,
     tmux_client_event_state: Arc<Mutex<TmuxClientEventState>>,
@@ -561,6 +567,8 @@ impl AppState {
             session_store,
             github_review_poster: Arc::new(GhCliReviewPoster),
             owner_doc_source: Arc::new(docs::GhCliDocSource),
+            owner_doc_pr_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            owner_doc_review_lock: Arc::new(AsyncMutex::new(())),
             codex_review_creation_locks: Arc::new(AsyncMutex::new(BTreeSet::new())),
             codex_review_watcher_ids: Arc::new(Mutex::new(BTreeSet::new())),
             tmux_client_event_state: Arc::new(Mutex::new(TmuxClientEventState::default())),
@@ -1366,6 +1374,7 @@ pub fn router(state: AppState) -> Router {
         eprintln!("Codex review request schema initialization failed: {error:#}");
     }
     docs::init_owner_docs(&state.config);
+    docs::recover_owner_doc_reviews(state.clone());
     recover_codex_review_request_watchers(state.clone());
     recover_btw_requests(state.clone());
     if state.config.rust_core.runtime_enabled {
@@ -1439,7 +1448,10 @@ pub fn router(state: AppState) -> Router {
         // reader `/docs/<repo-name>/<path in repo>` share one pattern.
         .route(
             "/docs/{doc_id}/{*rest}",
-            get(docs::get_owner_doc_subpath).post(docs::post_owner_doc_subpath),
+            get(docs::get_owner_doc_subpath)
+                .post(docs::post_owner_doc_subpath)
+                .patch(docs::patch_owner_doc_subpath)
+                .delete(docs::delete_owner_doc_subpath),
         )
         .route("/scheduler/remind", post(schedule_reminder))
         .route(
@@ -6331,12 +6343,21 @@ fn project_session_obligations(
     docs.sort_by(|a, b| b.published_at.cmp(&a.published_at));
     for doc in docs {
         let author = &doc.doc.author_session_id;
-        sessions
+        let entry = sessions
             .entry(author.clone())
-            .or_insert_with(|| new_obligation_entry(author))["docs"]
+            .or_insert_with(|| new_obligation_entry(author));
+        entry["docs"]
             .as_array_mut()
             .unwrap()
             .push(docs::obligation_doc_entry(doc, doc_browser_base));
+        // A review request blocks the author on the owner.
+        if doc.state == crate::owner_docs::OwnerDocState::ReviewRequested {
+            entry["waiting_on"].as_array_mut().unwrap().push(json!({
+                "kind": "owner_review", "id": doc.doc.id,
+                "label": format!("Owner review · {}", doc.doc.title),
+                "state": "review_requested", "since": doc.published_at,
+            }));
+        }
     }
     for (id, entry) in &mut sessions {
         if let Some(prs) = session_prs.get(id.as_str()) {

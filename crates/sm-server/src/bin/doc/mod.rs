@@ -39,6 +39,10 @@ struct DocPublishArgs {
     title: Option<String>,
     #[arg(long)]
     note: Option<String>,
+    /// Ask the owner to review this revision (needs an open PR); the review
+    /// arrives as a GitHub PR review and wakes you with `[sm review]`
+    #[arg(long, conflicts_with_all = ["commit", "no_pr"])]
+    review: bool,
 }
 
 #[derive(Args)]
@@ -140,10 +144,12 @@ fn without_doc_ids(mut doc: Value) -> Value {
     };
     object.remove("id");
     // `get_mut`, not indexing: a list record has no `publishes` to add.
-    if let Some(publishes) = object.get_mut("publishes").and_then(Value::as_array_mut) {
-        for publish in publishes {
-            if let Some(object) = publish.as_object_mut() {
-                object.remove("doc_id");
+    for key in ["publishes", "reviews"] {
+        if let Some(rows) = object.get_mut(key).and_then(Value::as_array_mut) {
+            for row in rows {
+                if let Some(object) = row.as_object_mut() {
+                    object.remove("doc_id");
+                }
             }
         }
     }
@@ -449,6 +455,9 @@ fn run_doc_publish(client: &ApiClient, args: DocPublishArgs) -> Result<()> {
     for message in &resolved.messages {
         eprintln!("{message}");
     }
+    if args.review && resolved.pr_number.is_none() {
+        bail!("--review needs an open PR: open one containing the file, then pass --pr <N>");
+    }
     let doc = client.post_json(
         "/docs",
         json!({
@@ -459,6 +468,7 @@ fn run_doc_publish(client: &ApiClient, args: DocPublishArgs) -> Result<()> {
             "session_id": session_id,
             "title": args.title,
             "note": args.note,
+            "review": args.review,
         }),
     )?;
     println!(
@@ -468,6 +478,12 @@ fn run_doc_publish(client: &ApiClient, args: DocPublishArgs) -> Result<()> {
         &resolved.commit_sha[..7],
         reader_url(client, &doc)
     );
+    if args.review {
+        println!(
+            "Review requested. The owner's review arrives as a GitHub PR review on #{}; sm wakes you with [sm review] when it lands.",
+            resolved.pr_number.unwrap_or_default()
+        );
+    }
     Ok(())
 }
 
@@ -560,13 +576,52 @@ fn run_doc_show(client: &ApiClient, args: DocShowArgs) -> Result<()> {
     println!("Revisions ({}):", publishes.len());
     for publish in publishes.iter().rev() {
         println!(
-            "  {}  blob {}  {}",
+            "  {}  blob {}  {}{}",
             short_sha(publish["commit_sha"].as_str().unwrap_or("")),
             short_sha(publish["blob_sha"].as_str().unwrap_or("")),
-            json_string(publish, "published_at")
+            json_string(publish, "published_at"),
+            if publish["review_requested"].as_bool() == Some(true) {
+                "  review requested"
+            } else {
+                ""
+            }
         );
     }
+    let reviews = doc["reviews"].as_array().cloned().unwrap_or_default();
+    if !reviews.is_empty() {
+        println!("Reviews ({}):", reviews.len());
+        for review in reviews.iter().rev() {
+            println!("  {}", review_line(review));
+        }
+    }
+    if doc["review_undelivered"].as_bool() == Some(true) {
+        println!("Review not delivered: author retired");
+    }
     Ok(())
+}
+
+/// One review submission as `sm doc show` prints it.
+fn review_line(review: &Value) -> String {
+    let status = json_string(review, "status");
+    let mut line = format!(
+        "{}  {}  {}  {}",
+        short_sha(review["commit_sha"].as_str().unwrap_or("")),
+        json_string(review, "verdict").replace('_', " "),
+        status,
+        json_string(review, "submitted_at")
+    );
+    if status == "posted" {
+        line.push_str(&format!(
+            "  {} line / {} file comments  {}",
+            review["line_comment_count"].as_i64().unwrap_or(0),
+            review["file_comment_count"].as_i64().unwrap_or(0),
+            json_string(review, "github_review_url")
+        ));
+        if review["delivered_to_session_id"].is_null() {
+            line.push_str("  (not delivered)");
+        }
+    }
+    line
 }
 
 #[cfg(test)]
@@ -631,11 +686,29 @@ mod tests {
     }
 
     #[test]
+    fn review_lines_show_verdict_counts_and_delivery() {
+        let review = json!({
+            "commit_sha": "abcdef0123", "verdict": "changes_requested", "status": "posted",
+            "submitted_at": "2026-09-24T10:00:00Z", "line_comment_count": 2,
+            "file_comment_count": 1, "github_review_url": "https://github.com/a/b/pull/1#r",
+            "delivered_to_session_id": null,
+        });
+        assert_eq!(
+            review_line(&review),
+            "abcdef0  changes requested  posted  2026-09-24T10:00:00Z  2 line / 1 file comments  https://github.com/a/b/pull/1#r  (not delivered)"
+        );
+        let failed = json!({"commit_sha": "abcdef0123", "verdict": "comment", "status": "failed",
+                            "submitted_at": "t"});
+        assert_eq!(review_line(&failed), "abcdef0  comment  failed  t");
+    }
+
+    #[test]
     fn json_output_drops_the_internal_doc_id() {
         let doc = without_doc_ids(json!({
             "id": "d0c00001",
             "name": "widgets/memo.md",
             "publishes": [{"id": 1, "doc_id": "d0c00001", "commit_sha": "a"}],
+            "reviews": [{"id": "sub-1", "doc_id": "d0c00001"}],
         }));
         assert!(!doc.to_string().contains("d0c00001"), "{doc}");
         assert_eq!(doc["name"], "widgets/memo.md");

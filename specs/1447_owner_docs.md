@@ -263,7 +263,11 @@ https://sm.rajeshgo.li/docs/fractal-algo-rust/docs/working/ticket-title.html?ver
   segment percent-encoded (`notes/my memo#1.md` → `notes/my%20memo%231.md`).
 - `?version=` is a commit SHA prefix, 7 to 40 hex characters, any case, that must
   match one of the doc's publishes. Printed links carry 12 characters of the latest
-  publish's commit. Without `?version=` the page renders the latest publish.
+  publish's commit. Without `?version=` the page renders the latest publish. A
+  version that matches no publish may name a PR doc's current PR head; that is the
+  link the unpublished-changes banner and the revision picker use to show changes
+  the agent pushed without republishing. Once the head moves on, the link is a 404
+  like any other unknown version.
 - The page renders in place. It never redirects, so the address bar keeps the
   readable URL.
 - One path can hold two docs, a PR doc and a commit-only doc. Without a version, the
@@ -298,8 +302,9 @@ the latest publish. Each doc projection also carries `name`
 (`<repo-name>/<path in repo>`).
 
 A GET under `/docs/<a>/<rest>` is an id route only when `<a>` is a stored doc id and
-`<rest>` is `view` or `raw`; everything else is a readable name. POST under a doc is
-id-only (`/docs/{id}/retract`); a POST to a readable name is a 404.
+`<rest>` is `view`, `raw`, `head` or `drafts`; everything else is a readable name.
+POST, PATCH and DELETE under a doc are id-only (`/retract`, `/drafts`, `/review`,
+`/drafts/{draft_id}`); one to a readable name is a 404.
 
 ### Rendering
 
@@ -320,12 +325,19 @@ id-only (`/docs/{id}/retract`); a POST to a readable name is a 404.
    untouched byte for byte. For markdown, add the attribute from the source offsets
    during rendering.
 4. **Inject the review client** (one `<script>` plus one `<style>`, just before
-   `</body>`, or appended if there's none) with this config inlined:
-   `{docId, sha, latestSha, prNumber, prState, canComment, token, drafts[]}`.
+   the first real `</body>` end tag, or appended if there's none) with this config
+   inlined: `{docId, title, name, sha, latestSha, prNumber, prState, prUrl,
+   canComment, token, revisions[], drafts[]}`. `revisions` lists the publishes
+   newest first (`sha`, `blobSha`, `publishedAt`, `reviewRequested`, readable
+   `path`); `drafts` holds every draft on the doc, across revisions. `prState` is
+   `open`/`closed`/`merged`, `unknown` when `gh` fails (commenting then stays off
+   until `/head` answers), or null for a commit-only doc. `<` in the inlined JSON
+   is escaped so the config can't close the script.
 5. Record a view of this blob SHA.
 
 `token` is an HMAC over `doc_id|expiry` (24h), signed with the server's existing
-session-cookie secret. It covers the whole doc, not one SHA, so it stays valid across
+session-cookie secret, sent as `smdt_<doc_id>.<expiry unix seconds>.<base64url
+HMAC-SHA256>`; it is null when the server has no session-cookie secret. It covers the whole doc, not one SHA, so it stays valid across
 revisions. The doc's JSON endpoints (`/head`, `/drafts`, `/review`) accept either
 normal auth or an `X-SM-Doc-Token` header for that doc. That way the page's own
 `fetch` calls work in the Android WebView, where device auth headers don't accompany
@@ -342,11 +354,17 @@ and use a shadow DOM for its UI.
   events, plus the PR head when its blob differs from every published one), PR link,
   state. If `canComment` is false, it reads
   "Read-only: PR closed / no PR".
-- **Newer-revision banner**: poll `GET /docs/{id}/head` every 60s, which returns
-  `{latest_published_sha, pr_head_sha, pr_head_blob_differs, pr_state}`. If a newer
-  revision has been **published**, show "A newer revision was published. Load it."
-  Otherwise, if the PR head's blob differs from the viewed one, show the
-  unpublished-changes banner.
+- **Newer-revision banner**: poll `GET /docs/{id}/head?sha=<viewed sha>` on load and
+  every 60s while the page is visible. It returns `{latest_published_sha,
+  latest_reader_path, pr_head_sha, pr_head_blob_sha, pr_head_blob_differs,
+  pr_head_reader_path, pr_state}`; `pr_head_blob_differs` compares the file at the
+  PR head with the viewed revision (the latest publish without `?sha=`), and is
+  false when the file doesn't exist at the head. If a newer revision has been
+  **published** (after the page loaded, or the viewed publish is not the latest),
+  show "A newer revision was published. Load it." Otherwise, if the PR head's blob
+  differs from the viewed one, show "The PR has newer unpublished changes to this
+  doc" with a link to the head. The poll also refreshes `prState` and whether
+  commenting is on.
 - **Selecting what to comment on**:
   - Desktop: select text → a "Comment" chip appears next to the selection.
   - Touch: tap a block with `data-sm-line` → it highlights and the chip appears (text
@@ -357,10 +375,13 @@ and use a shadow DOM for its UI.
     chars) on a tap.
 - **Composer**: textarea → `POST /docs/{id}/drafts`. Drafts show as margin markers
   (desktop) or inline badges (mobile) on their block; tap to edit or delete.
-- **Submit panel**: a "Review (N)" button opens verdict radios (Approve / Request
-  changes / Comment), an overall body textarea and Submit →
-  `POST /docs/{id}/review`. On success it shows the GitHub review link and clears the
-  drafts.
+- **Submit panel**: a "Review (N)" button opens the drafts for this revision (each
+  with Edit), verdict radios (Approve / Request changes / Comment), an overall body
+  textarea and Submit → `POST /docs/{id}/review`. On success it shows the GitHub
+  review link and clears the drafts. When the server answers with an error the
+  submission is finished (failed or refused), so the next Submit uses a new
+  `submission_id`; when the request never got an answer (network), the next Submit
+  reuses the same one.
 - **Drafts from another revision**: if drafts exist for a different SHA than the one
   being viewed, show "N draft comments on <sha7>", with actions *Submit them against
   <sha7>* (switches the view to that SHA) or *Discard*. Don't auto-migrate drafts
@@ -374,13 +395,16 @@ panel opens and reuses it on every retry of that submit.
 
 **Idempotency.** Before any GitHub call, insert the `owner_doc_reviews` row with
 `id = submission_id` and `status = submitting`. If the row already exists:
-`posted` → return the stored result without touching GitHub; `submitting` →
-reconcile (below) instead of starting over. The review body ends with a hidden
+`posted` → return the stored result without touching GitHub; `failed` → 409 (the
+drafts were kept; submit again with a new id); `submitting` → reconcile (below)
+instead of starting over. A `submission_id` from another doc is a 409. The review body ends with a hidden
 marker, `<!-- sm-review:<submission_id> -->`. To reconcile, list the PR's reviews by
 the viewer (GraphQL `pullRequest.reviews(author: <viewer login>)`, including
 `PENDING`) and look for the marker:
-- a submitted review carries it → finish steps 5–6 from that review;
-- a pending review carries it → submit it (step 2.4), then finish;
+- a submitted review carries it → finish steps 5–6 from that review, counting its
+  comments with a line as line comments and the rest as file comments;
+- a pending review carries it → add the threads of drafts whose quoted body isn't
+  on it yet (steps 2.2–2.3), submit it (step 2.4), then finish;
 - neither → delete any pending review recorded in `pending_review_node_id`, then
   run the flow again.
 
@@ -406,10 +430,13 @@ behaviour each step relies on was verified on PR #1448; see "GitHub API findings
       comment on the doc, and it works inside a review (F3).
    4. `submitPullRequestReview(input: {pullRequestReviewId, event: COMMENT, body})`,
       with the same body as step 1, marker included.
-   5. If GitHub returns an error after step 1, delete the pending review
-      (`deletePullRequestReview`) so no half-built pending review is left under the
-      owner's account (a leftover pending review blocks creating the next one). Then
-      mark the row `failed` and keep the drafts. The client retries with a new
+   5. If GitHub returns an error after step 1, first check the viewer's reviews for a
+      *submitted* one carrying the marker (a lost response to step 4) and finish from
+      it if found. Otherwise delete the pending review (`deletePullRequestReview`) so
+      no half-built pending review is left under the owner's account (a leftover
+      pending review blocks creating the next one). Then mark the row `failed` and
+      keep the drafts. GraphQL mutations are not retried on transport errors, since
+      a retry after a lost response could add a second thread. The client retries with a new
       `submission_id`. A crash, as opposed to an error, leaves the row `submitting`,
       and reconciliation handles it.
 3. **Every comment body quotes the selected text**, as `> <quote>\n\n<comment>`. A
@@ -432,9 +459,11 @@ behaviour each step relies on was verified on PR #1448; see "GitHub API findings
    ```
    Recipient: the author session if it exists (stopped sessions get the queued
    message on restore, as with other sends). If the author has been retired, send to
-   its parent if there is one. Otherwise, leave `delivered_to_session_id` NULL and
-   show "Review not delivered: author retired" on the doc row and in `sm doc show`.
-   Don't fail the submit.
+   its parent if there is one and it isn't retired too. Otherwise, leave
+   `delivered_to_session_id` NULL and show "Review not delivered: author retired" on
+   the doc row (Android, `sm watch`) and in `sm doc show`; doc projections carry
+   `review_undelivered` for the latest posted review. Don't fail the submit.
+   Zero counts are left out of the second line ("no comments" when both are zero).
 
 When does a comment fall back to file level? Only when the file is **modified** by
 the PR (it existed on the base branch) and the selected block is outside the diff
@@ -463,11 +492,12 @@ existing optional-field pattern.
 | POST | `/docs` | publish (from the CLI; session auth like other CLI writes) |
 | GET | `/docs?session=<id>` | JSON list for the CLI (a session and, optionally, its descendants) |
 | GET | `/docs/<repo-name>/<path>?version=` | readable reader: the rendered doc (JSON metadata with `?format=json`); see "Doc URLs" |
-| GET | `/docs/{id}` | redirect to the readable URL of the latest publish (JSON metadata with `?format=json`) |
+| GET | `/docs/{id}` | redirect to the readable URL of the latest publish (JSON metadata with `?format=json`, including `publishes` and `reviews`) |
 | GET | `/docs/{id}/view?sha=` | rendered doc plus the review client |
 | GET | `/docs/{id}/raw?sha=` | raw file (download, debugging) |
-| GET | `/docs/{id}/head` | `{latest_published_sha, pr_head_sha, pr_head_blob_differs, pr_state}` for the banners |
-| POST/PATCH/DELETE | `/docs/{id}/drafts[/{draft_id}]` | draft CRUD |
+| GET | `/docs/{id}/head?sha=` | `{latest_published_sha, latest_reader_path, pr_head_sha, pr_head_blob_sha, pr_head_blob_differs, pr_head_reader_path, pr_state}` for the banners |
+| GET/POST | `/docs/{id}/drafts` | list the doc's drafts / create one: `{sha, line, quote, body}` |
+| PATCH/DELETE | `/docs/{id}/drafts/{draft_id}` | edit a draft's `body` / delete it |
 | POST | `/docs/{id}/review` | submit the review |
 | POST | `/docs/{id}/retract` | hide |
 

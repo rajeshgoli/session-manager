@@ -593,6 +593,8 @@ data class SessionDoc(
     val name: String? = null,
     @SerialName("reader_path") val readerPath: String? = null,
     @SerialName("browser_url") val browserUrl: String? = null,
+    /** The latest review reached no session: the author was retired with no parent. */
+    @SerialName("review_undelivered") val reviewUndelivered: Boolean = false,
 )
 
 @Serializable

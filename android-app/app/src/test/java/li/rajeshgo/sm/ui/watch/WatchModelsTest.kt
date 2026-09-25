@@ -65,6 +65,17 @@ class WatchModelsTest {
     }
 
     @Test
+    fun ownerReviewWaitsAreCountedByName() {
+        val waits = listOf(
+            li.rajeshgo.sm.data.model.WaitingObligation(kind = "queue_job", label = "Tests"),
+            li.rajeshgo.sm.data.model.WaitingObligation(kind = "owner_review", label = "Owner review · Memo"),
+        )
+        val waiting = session(status = "idle", activityState = "idle")
+            .copy(obligations = li.rajeshgo.sm.data.model.SessionObligations("a", waitingOn = waits))
+        assertEquals("Waiting for 1 job and 1 owner review", waitingSummary(waiting))
+    }
+
+    @Test
     fun schedulerReasonAndRunningPidAreKeptOnTheirJobs() {
         val pending = li.rajeshgo.sm.data.model.SessionJob("j", label = "Tests", state = "pending", holdingReason = "concurrency_cap", pid = 42)
         assertTrue(jobSummary(pending).contains("free slot"))

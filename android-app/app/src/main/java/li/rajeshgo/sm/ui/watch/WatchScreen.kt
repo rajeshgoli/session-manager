@@ -1537,6 +1537,7 @@ private fun DocRow(doc: SessionDoc, onClick: () -> Unit) {
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(doc.title.ifBlank { docDisplayName(doc) }, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface, maxLines = 2, overflow = TextOverflow.Ellipsis)
             Text("Published ${relativeSummaryAge(doc.publishedAt).replaceFirstChar { it.lowercaseChar() }}", style = MaterialTheme.typography.bodySmall, color = TextMuted, maxLines = 1)
+            if (doc.reviewUndelivered) Text("Review not delivered: author retired", style = MaterialTheme.typography.bodySmall, color = Amber, maxLines = 1)
         }
         StatusChip(label = docStateLabel(doc.state), tint = docStateTint(doc.state))
     }

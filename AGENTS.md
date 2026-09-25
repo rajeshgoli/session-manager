@@ -43,7 +43,7 @@ and a reason. "Should we delete this?" is not a question for me; "I recommend de
 
 **Reach me in-session, in prose.** Don't use AskUserQuestion unless I ask you to interview me. I am often on mobile — so prose, one question at a time works best. If sending me email, batch all your questions together.  Email (`sm email rajesh`) only on my standing ask, at an event I named such as convergence, or after roughly seventeen minutes of silence, which signals I stepped away. Say in the subject if it blocks.
 
-**Use sm doc publish to publish docs for me to read**: If you need me to read a doc (memo, readout, decision doc), it must be in git and published with `sm doc publish`. This makes it easy for me to read it on the sm app or on sm web. `sm doc publish` only pulls from git, so make sure your latest revision is on git before using the command. 
+**Use sm doc publish to publish docs for me to read**: If you need me to read a doc (memo, readout, decision doc), it must be in git and published with `sm doc publish`. This makes it easy for me to read it on the sm app or on sm web. `sm doc publish` only pulls from git, so make sure your latest revision is on git before using the command. If you need my review, open a PR containing the doc and run `sm doc publish <path> --pr <N> --review`. My review arrives as a GitHub PR review, and sm wakes you with `[sm review] Rajesh's review of "<title>" (PR #N @ <sha7>) is here: <url>`. Read it with `gh`, address the comments, push, and publish again with the same `--pr` (add `--review` for another round) so I see the new revision.
 
 ---
 ## 2. Cost and context
