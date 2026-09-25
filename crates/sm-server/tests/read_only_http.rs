@@ -454,7 +454,10 @@ fn codex_review_failure_comment() -> GitHubReviewMatch {
 }
 
 fn queue_job_text_column(queue_state_dir: &PathBuf, job_id: &str, column: &str) -> String {
-    assert!(matches!(column, "exit_code_path" | "log_path"));
+    assert!(matches!(
+        column,
+        "exit_code_path" | "log_path" | "wrapper_path"
+    ));
     let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
     conn.query_row(
         &format!("SELECT {column} FROM queue_jobs WHERE id = ?1"),
@@ -6759,6 +6762,142 @@ async fn queue_runtime_recovery_polls_live_running_job_to_completion() {
     assert!(notifications[0].contains(&format!("Log: {log_path}")));
     assert!(!notifications[0].contains("recovered-live"));
     assert!(!notifications[0].contains("log tail:"));
+}
+
+// A failed liveness sample once recorded a live job as failed without an exit
+// receipt (#1506). Startup recovery must return such a row to running, tell the
+// owner, and still deliver the real completion.
+fn mark_queue_job_failed_without_receipt(queue_state_dir: &PathBuf, job_id: &str) {
+    let conn = Connection::open(queue_state_dir.join("queue_runner.db")).unwrap();
+    conn.execute(
+        r#"
+        UPDATE queue_jobs
+        SET state = 'failed',
+            exit_code = NULL,
+            finished_at = ?2,
+            completion_notification_required = 1,
+            completion_notified_at = ?2
+        WHERE id = ?1
+        "#,
+        (job_id, test_now_rfc3339()),
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn queue_runtime_recovery_revives_live_job_marked_failed_without_receipt() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-revive-live");
+    let message_queue_db = state_file.with_extension("queue-revive-live-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let job_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "revive live",
+        "printf placeholder",
+        60,
+    )
+    .await;
+    let exit_code_path = queue_job_text_column(&queue_state_dir, &job_id, "exit_code_path");
+    let wrapper_path = queue_job_text_column(&queue_state_dir, &job_id, "wrapper_path");
+    let ready_path = queue_state_dir.join("revive-live.ready");
+    let go_path = queue_state_dir.join("revive-live.go");
+    fs::write(
+        &wrapper_path,
+        format!(
+            "printf ready > '{}'; while [ ! -e '{}' ]; do sleep 0.05; done; printf '0\\n' > '{}'\n",
+            ready_path.display(),
+            go_path.display(),
+            exit_code_path
+        ),
+    )
+    .unwrap();
+    let mut child = Command::new("/bin/zsh")
+        .arg(&wrapper_path)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let _ready = wait_for_file_contains(&ready_path, "ready").await;
+    let pid = i64::from(child.id());
+    mark_queue_job_running(&queue_state_dir, &job_id, &test_now_rfc3339(), pid, pid);
+    mark_queue_job_failed_without_receipt(&queue_state_dir, &job_id);
+
+    let summary =
+        RetainedQueueStore::recover_queue_jobs_in_state_dir(&queue_state_dir, &message_queue_db, 0)
+            .unwrap();
+    assert_eq!(summary.revived_failed, 1);
+    assert_eq!(summary.polling_running, 1);
+    let (status, detail) = get_json(app.clone(), &format!("/queue-jobs/{job_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["state"], "running");
+    let notices = queued_message_texts(&message_queue_db, "run12345");
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("is still running"));
+
+    fs::write(&go_path, "go").unwrap();
+    let waiter = thread::spawn(move || child.wait());
+    let final_payload = wait_for_queue_job_state(app, &job_id, &["succeeded"]).await;
+    assert_eq!(final_payload["exit_code"], 0);
+    let _ = waiter.join();
+    assert!(queue_job_completion_notified_at(&queue_state_dir, &job_id).is_some());
+    let notifications = queued_message_texts(&message_queue_db, "run12345");
+    assert_eq!(notifications.len(), 2);
+    assert!(notifications[1].contains("completed: succeeded"));
+    assert!(notifications[1].contains("supersedes the earlier failed"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn queue_runtime_recovery_keeps_failed_row_when_pid_is_not_its_wrapper() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-revive-foreign");
+    let message_queue_db = state_file.with_extension("queue-revive-foreign-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let job_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "revive foreign",
+        "printf placeholder",
+        60,
+    )
+    .await;
+    // A live process that is not this job's wrapper stands in for a recycled pid.
+    let mut foreign = Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pid = i64::from(foreign.id());
+    mark_queue_job_running(&queue_state_dir, &job_id, &test_now_rfc3339(), pid, pid);
+    mark_queue_job_failed_without_receipt(&queue_state_dir, &job_id);
+
+    let summary =
+        RetainedQueueStore::recover_queue_jobs_in_state_dir(&queue_state_dir, &message_queue_db, 0)
+            .unwrap();
+    let _ = foreign.kill();
+    let _ = foreign.wait();
+    assert_eq!(summary.revived_failed, 0);
+    assert_eq!(summary.polling_running, 0);
+    let (status, detail) = get_json(app, &format!("/queue-jobs/{job_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["state"], "failed");
 }
 
 #[cfg(unix)]

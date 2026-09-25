@@ -11,6 +11,11 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use nix::{
+    errno::Errno,
+    sys::signal::{kill, killpg, Signal},
+    unistd::Pid,
+};
 use rand_core::{OsRng, RngCore};
 use rusqlite::{
     params,
@@ -209,6 +214,7 @@ pub struct QueueRecoverySummary {
     pub finished_timed_out: usize,
     pub finished_cancelled: usize,
     pub finished_displaced: usize,
+    pub revived_failed: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -235,6 +241,7 @@ struct QueueJobRuntimeRecord {
     exit_code: Option<i64>,
     completion_notified_at: Option<String>,
     termination_detail_json: Option<String>,
+    revived_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1241,6 +1248,13 @@ impl RetainedQueueStore {
         }
         let conn = open_queue_jobs_connection(&db_path)?;
         init_queue_jobs_schema(&conn)?;
+        let mut summary = QueueRecoverySummary {
+            revived_failed: revive_live_unreceipted_failed_queue_jobs_conn(
+                &conn,
+                message_queue_db_path,
+            )?,
+            ..QueueRecoverySummary::default()
+        };
         let mut statement = conn.prepare(
             r#"
             SELECT id
@@ -1254,7 +1268,6 @@ impl RetainedQueueStore {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
 
-        let mut summary = QueueRecoverySummary::default();
         for job_id in job_ids {
             let Some(job) = get_queue_job_runtime_conn(&conn, &job_id)? else {
                 continue;
@@ -2797,6 +2810,7 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
     ensure_column(conn, "queue_jobs", "gpu_percent", "INTEGER")?;
     ensure_column(conn, "queue_jobs", "memory_bytes", "INTEGER")?;
     ensure_column(conn, "queue_jobs", "termination_detail_json", "TEXT")?;
+    ensure_column(conn, "queue_jobs", "revived_at", "TEXT")?;
     ensure_column(
         conn,
         "queue_jobs",
@@ -3031,7 +3045,8 @@ fn get_queue_job_runtime_conn(
                holding_reason, wrapper_path, log_path, exit_code_path, timeout_seconds,
                max_wait_seconds,
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
-               exit_code, completion_notified_at, label, termination_detail_json
+               exit_code, completion_notified_at, label, termination_detail_json,
+               revived_at
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -3070,6 +3085,7 @@ fn get_queue_job_runtime_conn(
                 completion_notified_at: row.get(19)?,
                 label: row.get(20)?,
                 termination_detail_json: row.get(21)?,
+                revived_at: row.get(22)?,
             })
         })
         .optional()
@@ -3083,7 +3099,8 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                holding_reason, wrapper_path, log_path, exit_code_path, timeout_seconds,
                max_wait_seconds,
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
-               exit_code, completion_notified_at, label, termination_detail_json
+               exit_code, completion_notified_at, label, termination_detail_json,
+               revived_at
         FROM queue_jobs
         ORDER BY queued_at, id
         "#,
@@ -3113,6 +3130,7 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                 completion_notified_at: row.get(19)?,
                 label: row.get(20)?,
                 termination_detail_json: row.get(21)?,
+                revived_at: row.get(22)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -4172,6 +4190,108 @@ fn memory_guard_detail_text(detail: &JsonValue) -> String {
     )
 }
 
+/// A `failed` row with no exit code and no exit receipt whose wrapper is still
+/// running was terminalized by a failed liveness sample, not by an exit (#1506).
+/// Startup recovery returns it to `running` so the running-job recovery below
+/// polls it again, and tells its owner the earlier failure notice was false.
+/// The wrapper's command line must still name this job's wrapper script, so a
+/// recycled pid is never adopted.
+fn revive_live_unreceipted_failed_queue_jobs_conn(
+    conn: &Connection,
+    message_queue_db_path: &Path,
+) -> Result<usize> {
+    let mut statement = conn.prepare(
+        r#"
+        SELECT id
+        FROM queue_jobs
+        WHERE state = 'failed' AND exit_code IS NULL AND pid IS NOT NULL
+        ORDER BY queued_at, id
+        "#,
+    )?;
+    let job_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(statement);
+
+    let mut revived = 0;
+    for job_id in job_ids {
+        let Some(job) = get_queue_job_runtime_conn(conn, &job_id)? else {
+            continue;
+        };
+        let (Some(pid), Some(wrapper_path)) = (job.pid, job.wrapper_path.as_deref()) else {
+            continue;
+        };
+        if queue_job_exit_code_path_exists(&job)
+            || !process_group_exists(job.process_group_id.unwrap_or(pid))
+            || !process_command_mentions(pid, wrapper_path)
+        {
+            continue;
+        }
+        let revived_at = now_rfc3339();
+        let changed = conn.execute(
+            r#"
+            UPDATE queue_jobs
+            SET state = 'running',
+                finished_at = NULL,
+                completion_notification_required = 0,
+                completion_notified_at = NULL,
+                revived_at = ?2
+            WHERE id = ?1 AND state = 'failed' AND exit_code IS NULL
+            "#,
+            params![job.id, revived_at],
+        )?;
+        if changed == 0 {
+            continue;
+        }
+        revived += 1;
+        eprintln!(
+            "queue job {} revived: marked failed while its wrapper pid {pid} is still running",
+            job.id
+        );
+        let Some(target_session_id) = job
+            .notify_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let label = if job.label.trim().is_empty() {
+            &job.id
+        } else {
+            &job.label
+        };
+        let text = format!(
+            "[sm queue] {label} is still running. The earlier failed exit=unknown notice was a false liveness reading; the queue tracks the job again and will send its real completion. Log: {}. ID: {}",
+            job.log_path.as_deref().unwrap_or("-"),
+            job.id
+        );
+        RetainedQueueStore::new(message_queue_db_path.to_path_buf())
+            .enqueue_message_once_with_metadata(
+                &format!("queue-revived-{}-{revived_at}", job.id),
+                target_session_id,
+                &text,
+                "sequential",
+                QueueMessageMetadata {
+                    message_category: Some("queue-completion".to_owned()),
+                    ..QueueMessageMetadata::default()
+                },
+            )?;
+    }
+    Ok(revived)
+}
+
+fn process_command_mentions(pid: i64, needle: &str) -> bool {
+    Command::new("/bin/ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|output| {
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains(needle)
+        })
+}
+
 fn recover_running_queue_job_conn(
     conn: &Connection,
     state_dir: &Path,
@@ -4662,8 +4782,14 @@ fn queue_job_completion_notified_at(
     let text =
         queue_job_completion_text_with_policy(job, state, exit_code, finished_at, admission_policy);
     let queue = RetainedQueueStore::new(message_queue_db_path.to_path_buf());
+    // A revived job already sent a false completion under the plain id; its real
+    // completion needs its own id or the once-only enqueue rejects it.
+    let message_id = match job.revived_at.as_deref() {
+        Some(revived_at) => format!("queue-completion-{}-revived-{revived_at}", job.id),
+        None => format!("queue-completion-{}", job.id),
+    };
     queue.enqueue_message_once_with_metadata(
-        &format!("queue-completion-{}", job.id),
+        &message_id,
         target_session_id,
         &text,
         "sequential",
@@ -4897,8 +5023,13 @@ fn queue_job_completion_text_with_policy(
     } else {
         String::new()
     };
+    let revived_text = if job.revived_at.is_some() {
+        " This supersedes the earlier failed exit=unknown notice, which was a false liveness reading."
+    } else {
+        ""
+    };
     format!(
-        "[sm queue] {} completed: {}{}{}{}{} runtime={} queue={}. Log: {}. ID: {}",
+        "[sm queue] {} completed: {}{}{}{}{} runtime={} queue={}. Log: {}. ID: {}{}",
         if job.label.trim().is_empty() {
             &job.id
         } else {
@@ -4912,7 +5043,8 @@ fn queue_job_completion_text_with_policy(
         runtime,
         queued,
         job.log_path.as_deref().unwrap_or("-"),
-        job.id
+        job.id,
+        revived_text
     )
 }
 
@@ -4958,17 +5090,21 @@ fn read_exit_code(path: Option<&str>) -> Option<i64> {
     fs::read_to_string(path).ok()?.trim().parse::<i64>().ok()
 }
 
+// Signals go straight through kill(2): spawning /bin/kill can fail when the host
+// is out of process slots, and a lost signal must not pass for a delivered one.
 fn terminate_process_group(pgid: i64, force: bool) {
+    let Ok(pgid) = i32::try_from(pgid) else {
+        return;
+    };
     if pgid <= 0 {
         return;
     }
-    let signal = if force { "-KILL" } else { "-TERM" };
-    let _ = Command::new("/bin/kill")
-        .arg(signal)
-        .arg(format!("-{pgid}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let signal = if force {
+        Signal::SIGKILL
+    } else {
+        Signal::SIGTERM
+    };
+    let _ = killpg(Pid::from_raw(pgid), signal);
 }
 
 fn terminate_process_group_with_grace(pgid: i64, grace_seconds: u64) {
@@ -5003,30 +5139,30 @@ fn terminate_child_process_group_with_grace(child: &mut Child, pgid: i64, grace_
     }
 }
 
+/// False only when the kernel answers that the group has no live member. The probe
+/// is a direct kill(2) call because spawning /bin/kill fails with EAGAIN when the
+/// host is out of process slots, and reading that failure as an exit once
+/// terminalized a live training job (#1506).
 fn process_group_exists(pgid: i64) -> bool {
-    if pgid <= 0 {
-        return false;
+    match i32::try_from(pgid) {
+        Ok(pgid) if pgid > 0 => signal_probe_finds_target(killpg(Pid::from_raw(pgid), None)),
+        _ => false,
     }
-    Command::new("/bin/kill")
-        .arg("-0")
-        .arg(format!("-{pgid}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }
 
 fn process_exists(pid: i64) -> bool {
-    if pid <= 0 {
-        return false;
+    match i32::try_from(pid) {
+        Ok(pid) if pid > 0 => signal_probe_finds_target(kill(Pid::from_raw(pid), None)),
+        _ => false,
     }
-    Command::new("/bin/kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+}
+
+/// ESRCH means no such process. Queue jobs run as the server's own user, so EPERM
+/// cannot mean a live target owned by someone else; macOS returns it from
+/// killpg(2) when only unreaped zombies remain in the group. Any other error is a
+/// failed sample, not evidence of exit.
+fn signal_probe_finds_target(result: nix::Result<()>) -> bool {
+    !matches!(result, Err(Errno::ESRCH | Errno::EPERM))
 }
 
 fn is_terminal_queue_state(state: &str) -> bool {
@@ -6008,6 +6144,18 @@ mod tests {
                 .state,
             "pending"
         );
+        // The admitted job's monitor writes into state_dir until it records the
+        // job as finished; removing the directory before then races it.
+        let deadline = Instant::now() + StdDuration::from_secs(10);
+        while get_queue_job_conn(&conn, &eligible.id)
+            .unwrap()
+            .unwrap()
+            .state
+            == "running"
+            && Instant::now() < deadline
+        {
+            thread::sleep(StdDuration::from_millis(20));
+        }
         release_queue_admission_retry(&state_dir);
         drop(conn);
         fs::remove_dir_all(state_dir).unwrap();
@@ -6382,6 +6530,33 @@ mod tests {
     }
 
     #[test]
+    fn liveness_probe_treats_only_no_such_process_as_exit() {
+        assert!(signal_probe_finds_target(Ok(())));
+        assert!(!signal_probe_finds_target(Err(Errno::ESRCH)));
+        // macOS answers killpg(2) on a zombie-only group with EPERM.
+        assert!(!signal_probe_finds_target(Err(Errno::EPERM)));
+        // A failed sample is not evidence of exit (#1506).
+        assert!(signal_probe_finds_target(Err(Errno::EAGAIN)));
+        assert!(signal_probe_finds_target(Err(Errno::EINVAL)));
+
+        let own_pid = i64::from(std::process::id());
+        assert!(process_exists(own_pid));
+        let mut child = Command::new("/usr/bin/true")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let child_pid = i64::from(child.id());
+        thread::sleep(StdDuration::from_millis(200));
+        // Exited but unreaped: the group reads as gone, as /bin/kill reported it.
+        assert!(!process_group_exists(child_pid));
+        child.wait().unwrap();
+        assert!(!process_exists(child_pid));
+        assert!(!process_group_exists(child_pid));
+        assert!(!process_exists(0));
+        assert!(!process_group_exists(-1));
+    }
+
+    #[test]
     fn queue_completion_without_exit_receipt_is_explicitly_non_evidence() {
         let job = QueueJobRuntimeRecord {
             label: "friendly-job".into(),
@@ -6406,6 +6581,7 @@ mod tests {
             exit_code: None,
             completion_notified_at: None,
             termination_detail_json: None,
+            revived_at: None,
         };
 
         let failed = queue_job_completion_text_with_policy(
@@ -6457,6 +6633,7 @@ mod tests {
             exit_code: None,
             completion_notified_at: None,
             termination_detail_json: None,
+            revived_at: None,
         };
 
         let completion = queue_job_completion_text_with_policy(
@@ -6514,6 +6691,7 @@ mod tests {
             exit_code: None,
             completion_notified_at: None,
             termination_detail_json: None,
+            revived_at: None,
         };
 
         let status = spawn_queue_job_process(&job).unwrap().wait().unwrap();
@@ -6575,6 +6753,7 @@ mod tests {
             exit_code: None,
             completion_notified_at: None,
             termination_detail_json: None,
+            revived_at: None,
         };
 
         let status = spawn_queue_job_process(&job).unwrap().wait().unwrap();
@@ -6612,6 +6791,7 @@ mod tests {
             exit_code: None,
             completion_notified_at: None,
             termination_detail_json: None,
+            revived_at: None,
         };
         let much_later = OffsetDateTime::parse("2026-08-17T20:00:01Z", &Rfc3339).unwrap();
         assert!(!queue_job_timed_out_at(&job, much_later));
@@ -7675,6 +7855,7 @@ mod tests {
             exit_code: None,
             completion_notified_at: None,
             termination_detail_json: None,
+            revived_at: None,
         };
 
         assert!(!queue_job_timed_out_at(&job, now_utc));
