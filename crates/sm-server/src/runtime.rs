@@ -519,10 +519,14 @@ impl TmuxRuntime {
         let has_initial_stdin_prompt = initial_stdin_prompt(spec, &prompt_mode).is_some();
 
         let mut command = self.launch_command(spec, &prompt_mode)?;
+        let client_dir = env::current_exe()
+            .ok()
+            .and_then(|server| managed_client_dir(&server));
         command = managed_session_command(
             &command,
             &spec.session_id,
             spec.session_credential.as_deref(),
+            client_dir.as_deref(),
         );
 
         self.ensure_server_anchor()?;
@@ -2754,20 +2758,37 @@ fn hex_char(value: u8) -> char {
     }
 }
 
+/// The directory holding the `sm` client installed beside the running server.
+///
+/// tmux gives every session the PATH its server had when it first started, and
+/// that server outlives sm-server restarts. A session spawned after the service
+/// moved checkouts would otherwise inherit a PATH that may name a deleted
+/// worktree and lose `sm` (sm#1414).
+fn managed_client_dir(server_exe: &Path) -> Option<PathBuf> {
+    let dir = server_exe.parent()?;
+    is_executable_file(&dir.join("sm")).then(|| dir.to_path_buf())
+}
+
 fn managed_session_command(
     command: &str,
     session_id: &str,
     session_credential: Option<&str>,
+    client_dir: Option<&Path>,
 ) -> String {
     let session_id = shell_quote(session_id);
     let credential_export = session_credential
         .map(shell_quote)
         .map(|credential| format!("export SM_SESSION_CREDENTIAL={credential}; "))
         .unwrap_or_default();
+    let path_export = client_dir
+        .map(shell_quote_path)
+        .map(|dir| format!("export PATH={dir}:\"$PATH\"; "))
+        .unwrap_or_default();
     format!(
         "export SESSION_MANAGER_ID={session_id}; \
          export CLAUDE_SESSION_MANAGER_ID={session_id}; \
          {credential_export}\
+         {path_export}\
          unset CLAUDECODE; \
          export ENABLE_TOOL_SEARCH=false; \
          {command}"
@@ -3445,13 +3466,44 @@ esac
 
     #[test]
     fn managed_session_command_exports_canonical_and_legacy_session_ids() {
-        let command = managed_session_command("claude", "session'42", Some("credential'42"));
+        let command = managed_session_command("claude", "session'42", Some("credential'42"), None);
         assert!(command.contains("export SESSION_MANAGER_ID='session'\\''42'"));
         assert!(command.contains("export CLAUDE_SESSION_MANAGER_ID='session'\\''42'"));
         assert!(command.contains("export SM_SESSION_CREDENTIAL='credential'\\''42'"));
         assert!(command.contains("unset CLAUDECODE"));
         assert!(command.contains("export ENABLE_TOOL_SEARCH=false"));
         assert!(command.ends_with("; claude"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_session_resolves_the_client_installed_beside_the_server() {
+        let install_dir = tempfile_path("managed-client-dir");
+        fs::create_dir_all(&install_dir).unwrap();
+        let server = install_dir.join("sm-server");
+        assert_eq!(managed_client_dir(&server), None);
+
+        let client = install_dir.join("sm");
+        fs::write(&client, "#!/bin/sh\n").unwrap();
+        assert_eq!(managed_client_dir(&server), None, "sm must be executable");
+        fs::set_permissions(&client, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(managed_client_dir(&server), Some(install_dir.clone()));
+
+        // The inherited PATH names a worktree that no longer exists; the
+        // session must still resolve this server's client first.
+        let command =
+            managed_session_command("command -v sm", "session-1", None, Some(&install_dir));
+        let output = Command::new("/bin/sh")
+            .args(["-c", command.as_str()])
+            .env("PATH", "/deleted-worktree/.local/bin:/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            client.display().to_string()
+        );
+        let _ = fs::remove_dir_all(install_dir);
     }
 
     #[test]
