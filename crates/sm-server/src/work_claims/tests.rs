@@ -40,7 +40,7 @@ fn directory() -> SessionDirectory {
 }
 
 fn ticket(state: &str) -> ItemFetch {
-    ItemFetch::Found(GhItem {
+    ItemFetch::Found(Box::new(GhItem {
         kind: WorkKind::Ticket,
         title: "Agent work claims".into(),
         state: state.into(),
@@ -51,11 +51,11 @@ fn ticket(state: &str) -> ItemFetch {
         closed_at: None,
         merged_at: None,
         closing_refs: None,
-    })
+    }))
 }
 
 fn pr(state: &str, closes: &[i64]) -> ItemFetch {
-    ItemFetch::Found(GhItem {
+    ItemFetch::Found(Box::new(GhItem {
         kind: WorkKind::Pr,
         title: "Claims core".into(),
         state: state.into(),
@@ -66,7 +66,7 @@ fn pr(state: &str, closes: &[i64]) -> ItemFetch {
         closed_at: None,
         merged_at: (state == "merged").then(|| "2026-09-24T00:00:00Z".into()),
         closing_refs: Some(closes.iter().map(|n| (REPO.to_owned(), *n)).collect()),
-    })
+    }))
 }
 
 fn fetch(items: &[(i64, ItemFetch)]) -> Result<BatchFetch, String> {

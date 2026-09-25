@@ -71,7 +71,7 @@ impl WorkItemSource for StubItems {
                     items
                         .get(n)
                         .cloned()
-                        .map_or(ItemFetch::NotFound, ItemFetch::Found),
+                        .map_or(ItemFetch::NotFound, |item| ItemFetch::Found(Box::new(item))),
                 )
             })
             .collect())

@@ -280,7 +280,7 @@ pub struct GhItem {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemFetch {
-    Found(GhItem),
+    Found(Box<GhItem>),
     NotFound,
 }
 
@@ -396,7 +396,7 @@ pub fn parse_items_response(stdout: &[u8], numbers: &[i64]) -> Result<ParsedBatc
                 }
             }
         }
-        fetched.insert(*number, ItemFetch::Found(item));
+        fetched.insert(*number, ItemFetch::Found(Box::new(item)));
     }
     Ok((fetched, more))
 }
@@ -439,10 +439,11 @@ fn parse_ref_nodes(nodes: &Value) -> Vec<(String, i64)> {
         .collect()
 }
 
+/// A PR's closing references as `(owner/name, number)`.
+pub type ClosingRefs = Vec<(String, i64)>;
+
 /// One page of `closing_refs_page_query`: its references and the next cursor.
-pub fn parse_closing_refs_page(
-    stdout: &[u8],
-) -> Result<(Vec<(String, i64)>, Option<String>), String> {
+pub fn parse_closing_refs_page(stdout: &[u8]) -> Result<(ClosingRefs, Option<String>), String> {
     let payload: Value = serde_json::from_slice(stdout)
         .map_err(|error| format!("GitHub returned invalid JSON: {error}"))?;
     let refs = &payload["data"]["repository"]["pullRequest"]["closingIssuesReferences"];
