@@ -465,7 +465,7 @@ pub struct AppState {
     owner_doc_review_lock: Arc<AsyncMutex<()>>,
     /// Ticket and PR state for work claims (sm#1452).
     work_item_source: Arc<dyn crate::work_claims::WorkItemSource>,
-    codex_review_creation_locks: Arc<AsyncMutex<BTreeSet<String>>>,
+    codex_review_creation_locks: Arc<Mutex<BTreeSet<String>>>,
     codex_review_watcher_ids: Arc<Mutex<BTreeSet<String>>>,
     tmux_client_event_state: Arc<Mutex<TmuxClientEventState>>,
     tmux_client_event_tx: broadcast::Sender<Value>,
@@ -579,7 +579,7 @@ impl AppState {
             owner_doc_pr_cache: Arc::new(Mutex::new(BTreeMap::new())),
             owner_doc_review_lock: Arc::new(AsyncMutex::new(())),
             work_item_source: Arc::new(claims::GhCliWorkItemSource),
-            codex_review_creation_locks: Arc::new(AsyncMutex::new(BTreeSet::new())),
+            codex_review_creation_locks: Arc::new(Mutex::new(BTreeSet::new())),
             codex_review_watcher_ids: Arc::new(Mutex::new(BTreeSet::new())),
             tmux_client_event_state: Arc::new(Mutex::new(TmuxClientEventState::default())),
             tmux_client_event_tx,
@@ -4866,20 +4866,24 @@ async fn create_codex_review_request(
     .await?;
     let queue_db_path = expand_home(&state.config.sm_send.db_path);
     let creation_key = format!("{}\u{1f}{}", repo, payload.pr_number);
-    {
-        let mut locks = state.codex_review_creation_locks.lock().await;
-        if !locks.insert(creation_key.clone()) {
-            return Err(ApiError::Status {
-                status: StatusCode::CONFLICT,
-                detail: format!(
-                    "A Codex review request is being created for {} PR #{}; retry after it finishes registration",
-                    repo, payload.pr_number
-                ),
-            });
-        }
-    }
+    let Some(creation_lock) =
+        CodexReviewCreationLock::acquire(&state.codex_review_creation_locks, creation_key)
+    else {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: format!(
+                "A Codex review request is being created for {} PR #{}; retry after it finishes registration",
+                repo, payload.pr_number
+            ),
+        });
+    };
 
-    let create_result = async {
+    // Creation runs as its own task so a client that disconnects mid-request
+    // cannot cancel it between posting the `@codex review` comment and
+    // registering the request; the lock guard travels with the task and is
+    // released however it ends (#1563).
+    let create_task = tokio::spawn(async move {
+        let _creation_lock = creation_lock;
         let poster = state.github_review_poster.clone();
         let repo_for_head = repo.clone();
         let initial_head_sha = tokio::task::spawn_blocking(move || {
@@ -4891,8 +4895,8 @@ async fn create_codex_review_request(
             detail: format!("Failed to resolve current PR head: {error}"),
         })?
         .map_err(codex_review_poster_error)?;
-        let owner = trimmed(&payload.requester_session_id)
-            .unwrap_or_else(|| notify_session.id.clone());
+        let owner =
+            trimmed(&payload.requester_session_id).unwrap_or_else(|| notify_session.id.clone());
         let active = RetainedQueueStore::active_codex_review_requests_for_pr_from_path(
             &queue_db_path,
             &repo,
@@ -4982,7 +4986,10 @@ async fn create_codex_review_request(
             if error.to_string().starts_with("CONFLICT:") {
                 ApiError::Status {
                     status: StatusCode::CONFLICT,
-                    detail: error.to_string().trim_start_matches("CONFLICT: ").to_owned(),
+                    detail: error
+                        .to_string()
+                        .trim_start_matches("CONFLICT: ")
+                        .to_owned(),
                 }
             } else {
                 codex_review_store_error(error)
@@ -4992,14 +4999,40 @@ async fn create_codex_review_request(
         add_codex_review_claim_warning(&state, &registration, &mut response);
         spawn_codex_review_request_watcher(state.clone(), registration.id);
         Ok(Json(response))
+    });
+    create_task.await.map_err(|error| ApiError::Status {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        detail: format!("Codex review request creation failed: {error}"),
+    })?
+}
+
+/// Holds one repo/PR key in `codex_review_creation_locks` and releases it on
+/// drop, so completion, error, panic, and cancellation all free the key.
+struct CodexReviewCreationLock {
+    locks: Arc<Mutex<BTreeSet<String>>>,
+    key: String,
+}
+
+impl CodexReviewCreationLock {
+    fn acquire(locks: &Arc<Mutex<BTreeSet<String>>>, key: String) -> Option<Self> {
+        let inserted = locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.clone());
+        inserted.then(|| Self {
+            locks: locks.clone(),
+            key,
+        })
     }
-    .await;
-    state
-        .codex_review_creation_locks
-        .lock()
-        .await
-        .remove(&creation_key);
-    create_result
+}
+
+impl Drop for CodexReviewCreationLock {
+    fn drop(&mut self) {
+        self.locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
+    }
 }
 
 /// The requester's implicit PR claim (sm#1452); its warning, if any, rides

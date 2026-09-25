@@ -253,6 +253,8 @@ struct StubGitHubReviewPoster {
     review_failure: Arc<Mutex<Option<(GitHubReviewMatch, usize)>>>,
     // Posts beyond this count fail until it is raised.
     post_failures_after: Arc<Mutex<Option<usize>>>,
+    // When set, a post records its call and then blocks until released.
+    post_release: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
 }
 
 impl StubGitHubReviewPoster {
@@ -276,6 +278,7 @@ impl StubGitHubReviewPoster {
             pickup_detected: Arc::new(Mutex::new(false)),
             review_failure: Arc::new(Mutex::new(None)),
             post_failures_after: Arc::new(Mutex::new(None)),
+            post_release: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -292,6 +295,7 @@ impl StubGitHubReviewPoster {
             pickup_detected: Arc::new(Mutex::new(false)),
             review_failure: Arc::new(Mutex::new(None)),
             post_failures_after: Arc::new(Mutex::new(None)),
+            post_release: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -333,6 +337,12 @@ impl StubGitHubReviewPoster {
         *self.review_failure.lock().unwrap() = Some((failure, failing_through_post));
     }
 
+    fn hold_posts(&self) -> mpsc::Sender<()> {
+        let (release, held) = mpsc::channel();
+        *self.post_release.lock().unwrap() = Some(held);
+        release
+    }
+
     fn fail_posts_after(&self, successful_posts: Option<usize>) {
         *self.post_failures_after.lock().unwrap() = successful_posts;
     }
@@ -364,6 +374,9 @@ impl GitHubReviewPoster for StubGitHubReviewPoster {
             .lock()
             .unwrap()
             .push((repo.to_owned(), pr_number, steer.map(ToOwned::to_owned)));
+        if let Some(held) = self.post_release.lock().unwrap().take() {
+            let _ = held.recv();
+        }
         if let Some(head_sha) = self.head_after_post.lock().unwrap().take() {
             *self.current_head_sha.lock().unwrap() = head_sha;
         }
@@ -2695,6 +2708,89 @@ async fn codex_review_request_create_posts_and_persists_active_row() {
     let (status, payload) = get_json(app, &format!("/codex-review-requests/{request_id}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["id"], request_id);
+}
+
+#[tokio::test]
+async fn codex_review_request_create_survives_client_disconnect() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("codex-review-create-disconnect.db");
+    let poster = StubGitHubReviewPoster::successful();
+    let release_post = poster.hold_posts();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+    let create_body = json!({
+        "pr_number": 967,
+        "repo": "rajeshgoli/session-manager",
+        "notify_target": "run12345",
+        "poll_interval_seconds": 900,
+        "retry_interval_seconds": 900
+    });
+
+    // The client goes away while the `@codex review` comment is being posted.
+    let abandoned = tokio::spawn(post_json(
+        app.clone(),
+        "/codex-review-requests",
+        create_body.clone(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while poster.calls().is_empty() {
+        assert!(Instant::now() < deadline, "create never reached the post");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    abandoned.abort();
+    assert!(abandoned.await.unwrap_err().is_cancelled());
+
+    // Creation is still in flight, so a concurrent create is refused.
+    let (status, _) = post_json(app.clone(), "/codex-review-requests", create_body.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Creation finishes without its client and registers the posted comment.
+    release_post.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let registered = loop {
+        let (status, payload) = get_json(
+            app.clone(),
+            "/codex-review-requests?repo=rajeshgoli%2Fsession-manager&pr_number=967",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        if let Some(request) = payload["requests"].as_array().and_then(|rows| rows.first()) {
+            break request.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "abandoned create never registered"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(registered["latest_request_comment_id"], 4701290334_i64);
+
+    // The next create is not stuck on the lock: it reuses the registration.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let payload = loop {
+        let (status, payload) =
+            post_json(app.clone(), "/codex-review-requests", create_body.clone()).await;
+        if status == StatusCode::OK {
+            break payload;
+        }
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            Instant::now() < deadline,
+            "creation lock was never released"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(payload["id"], registered["id"]);
+    assert_eq!(poster.calls().len(), 1);
 }
 
 #[tokio::test]
