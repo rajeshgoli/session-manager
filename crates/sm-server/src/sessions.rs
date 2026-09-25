@@ -8196,11 +8196,13 @@ impl SessionStore {
                 return Ok(authority.rejection_outcome(session));
             }
             if raw_session_is_stopped(session) {
-                // Already stopped: retiring still ends its work claims.
-                self.end_work_claims_after_retire(session_id);
-                return Ok(CoreRetireOutcome::Retired(retire_result(session_id)));
+                None
+            } else {
+                Some(raw_session_display_name(session, session_id))
             }
-            raw_session_display_name(session, session_id)
+        };
+        let Some(recipient_name) = recipient_name else {
+            return self.retire_stopped_session(state, session_id, &authority);
         };
         // A terminal write and its rotation finalization share this one atomic
         // state replacement, so recovery cannot later relaunch the seat.
@@ -8248,7 +8250,7 @@ impl SessionStore {
         if !authority.is_authorized(&sessions_snapshot, session_credential) {
             return Ok(CoreRetireOutcome::Forbidden);
         }
-        let (node, tmux_session, session_socket_name, recipient_name) = {
+        let live = {
             let sessions = ensure_sessions_array_mut(&mut state)?;
             let Some(session) = session_object_mut(sessions, session_id) else {
                 return Ok(CoreRetireOutcome::NotFound);
@@ -8257,16 +8259,18 @@ impl SessionStore {
                 return Ok(authority.rejection_outcome(session));
             }
             if raw_session_is_stopped(session) {
-                // Already stopped: retiring still ends its work claims.
-                self.end_work_claims_after_retire(session_id);
-                return Ok(CoreRetireOutcome::Retired(retire_result(session_id)));
+                None
+            } else {
+                let node = json_text(session.get("node")).unwrap_or_else(default_node);
+                let tmux_session = json_text(session.get("tmux_session"))
+                    .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
+                let session_socket_name = json_text(session.get("tmux_socket_name"));
+                let recipient_name = raw_session_display_name(session, session_id);
+                Some((node, tmux_session, session_socket_name, recipient_name))
             }
-            let node = json_text(session.get("node")).unwrap_or_else(default_node);
-            let tmux_session = json_text(session.get("tmux_session"))
-                .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
-            let session_socket_name = json_text(session.get("tmux_socket_name"));
-            let recipient_name = raw_session_display_name(session, session_id);
-            (node, tmux_session, session_socket_name, recipient_name)
+        };
+        let Some((node, tmux_session, session_socket_name, recipient_name)) = live else {
+            return self.retire_stopped_session(state, session_id, &authority);
         };
         if !is_primary_node(&node) {
             return Ok(CoreRetireOutcome::UnsupportedNode(node));
@@ -8330,6 +8334,35 @@ impl SessionStore {
             &recipient_name,
         )?;
         self.write_raw_json_value(&state)?;
+        self.end_work_claims_after_retire(session_id);
+        Ok(CoreRetireOutcome::Retired(retire_result(session_id)))
+    }
+
+    /// Retires a seat that already stopped (a crash, a provider exit). The seat
+    /// still becomes terminal, because readers that end work at retirement,
+    /// such as Codex review requests, key on `completion_status`. The stop's
+    /// own provenance and stop-notify stay as they were; the tmux session is
+    /// not touched.
+    fn retire_stopped_session(
+        &self,
+        mut state: Value,
+        session_id: &str,
+        authority: &RetireAuthority,
+    ) -> Result<CoreRetireOutcome> {
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let already_retired = session_object_mut(sessions, session_id).is_some_and(|session| {
+            completion_status_is_retired(json_text(session.get("completion_status")).as_deref())
+        });
+        if !already_retired {
+            finalize_active_credential_rotations_for_terminal_session(&mut state, session_id)?;
+            let sessions = ensure_sessions_array_mut(&mut state)?;
+            let session = session_object_mut(sessions, session_id)
+                .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared during retire"))?;
+            let now = now_rfc3339();
+            mark_session_retired_status(session, &now);
+            set_terminal_provenance_if_absent(session, authority.terminal_provenance(&now, None));
+            self.write_raw_json_value(&state)?;
+        }
         self.end_work_claims_after_retire(session_id);
         Ok(CoreRetireOutcome::Retired(retire_result(session_id)))
     }
@@ -13294,6 +13327,14 @@ fn mark_session_retired(
     now: &str,
     provenance: TerminalProvenance,
 ) {
+    mark_session_retired_status(session, now);
+    session.insert(
+        "terminal_provenance".to_owned(),
+        serde_json::to_value(provenance).expect("terminal provenance serializes"),
+    );
+}
+
+fn mark_session_retired_status(session: &mut Map<String, Value>, now: &str) {
     session.insert(
         "completion_status".to_owned(),
         Value::String("retired".to_owned()),
@@ -13303,10 +13344,6 @@ fn mark_session_retired(
         Value::String("Retired via sm retire".to_owned()),
     );
     session.insert("completed_at".to_owned(), Value::String(now.to_owned()));
-    session.insert(
-        "terminal_provenance".to_owned(),
-        serde_json::to_value(provenance).expect("terminal provenance serializes"),
-    );
 }
 
 fn set_terminal_provenance_if_absent(
@@ -17894,6 +17931,78 @@ esac
         assert_eq!(state["sessions"].as_array().unwrap().len(), 1);
         assert_eq!(state["sessions"][0]["completion_status"], "retired");
         assert_eq!(state["session_runtime_launches"][0]["status"], "failed");
+    }
+
+    #[test]
+    fn retiring_an_already_stopped_seat_persists_retirement() {
+        let state_file = unique_temp_path("retire-already-stopped");
+        let mut crashed = reparent_test_session("crashed1", None, "secret");
+        crashed["status"] = json!("stopped");
+        crashed["stopped_at"] = json!("2026-06-01T00:02:00Z");
+        crashed["terminal_provenance"] = json!({
+            "cause": "tmux_disappearance",
+            "observed_at": "2026-06-01T00:02:00Z",
+            "authority": "runtime_observed",
+            "source": "health_check",
+            "tmux_disposition": "absent"
+        });
+        let mut bare = reparent_test_session("stopped1", None, "secret");
+        bare["status"] = json!("stopped");
+        let mut killed = reparent_test_session("killed01", None, "secret");
+        killed["status"] = json!("stopped");
+        killed["completion_status"] = json!("killed");
+        killed["completed_at"] = json!("2026-06-01T00:03:00Z");
+        fs::write(
+            &state_file,
+            json!({ "sessions": [crashed, bare, killed] }).to_string(),
+        )
+        .unwrap();
+        let store = SessionStore::new(state_file.clone());
+        // Any tmux call fails: an already-stopped seat must not reach tmux.
+        let runtime = TmuxRuntime::from_config(&crate::config::RustCoreConfig::default())
+            .with_tmux_binary_for_test("/nonexistent/tmux".to_owned());
+
+        for id in ["crashed1", "killed01"] {
+            assert!(matches!(
+                store
+                    .retire_core_session_with_runtime_authorized(
+                        id,
+                        RetireAuthority::operator("test"),
+                        None,
+                        &runtime,
+                    )
+                    .unwrap(),
+                CoreRetireOutcome::Retired(_)
+            ));
+        }
+        assert!(matches!(
+            store
+                .retire_core_session_authorized("stopped1", RetireAuthority::operator("test"), None)
+                .unwrap(),
+            CoreRetireOutcome::Retired(_)
+        ));
+
+        let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+        let crashed = &state["sessions"][0];
+        assert_eq!(crashed["completion_status"], "retired");
+        assert!(crashed["completed_at"].is_string());
+        assert_eq!(crashed["stopped_at"], "2026-06-01T00:02:00Z");
+        // The stop's own cause stays on record.
+        assert_eq!(
+            crashed["terminal_provenance"]["cause"],
+            "tmux_disappearance"
+        );
+        let bare = &state["sessions"][1];
+        assert_eq!(bare["completion_status"], "retired");
+        assert_eq!(bare["terminal_provenance"]["cause"], "explicit_retire");
+        assert_eq!(bare["terminal_provenance"]["authority"], "operator");
+        assert!(bare["terminal_provenance"]["tmux_disposition"].is_null());
+        let killed = &state["sessions"][2];
+        assert_eq!(killed["completion_status"], "killed");
+        assert_eq!(killed["completed_at"], "2026-06-01T00:03:00Z");
+        for id in ["crashed1", "stopped1", "killed01"] {
+            assert!(store.get_session(id).unwrap().unwrap().is_retired(), "{id}");
+        }
     }
 
     #[cfg(unix)]
