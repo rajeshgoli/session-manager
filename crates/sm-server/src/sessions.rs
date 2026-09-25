@@ -23398,8 +23398,12 @@ sleep 30
             );
         }
 
+        /// The failure path is one monitor poll (250ms) plus a
+        /// `tmux has-session` before the error is written. A fixed 3s deadline
+        /// flaked under full-suite load (#1337), as the success wait did at 8s
+        /// (#1401); the deadline only bounds a genuine failure, so be generous.
         fn wait_for_handoff_error(&self, store: &SessionStore) {
-            let deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 let state = store.load_raw_json_value().unwrap();
                 let session = raw_session_object(&state, "codex001").unwrap();
