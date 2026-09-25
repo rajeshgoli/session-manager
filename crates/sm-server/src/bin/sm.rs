@@ -532,7 +532,13 @@ struct QueueRunArgs {
         help = "Peak memory budget, for example 8G or 512M; required for perf"
     )]
     memory: Option<String>,
-    #[arg(long = "env")]
+    #[arg(
+        long = "env",
+        value_name = "KEY=VALUE",
+        help = "Extra job environment variable (repeatable). Jobs start from an empty \
+                environment plus PATH, HOME, USER, LOGNAME, SHELL, TMPDIR, TERM, LANG and \
+                LC_* captured from this shell; --env adds to or overrides those"
+    )]
     env_pairs: Vec<String>,
     #[arg(long)]
     script_file: Option<String>,
@@ -1541,22 +1547,28 @@ fn apply_queue_environment_overrides(
     Ok(env_values)
 }
 
+/// Baseline variables a queued job inherits from the submitting shell: tool
+/// lookup, user identity, scratch space, terminal, and locale. Project state
+/// such as PYTHONPATH or VIRTUAL_ENV stays out; callers pass it with --env.
+const QUEUE_CAPTURED_ENV_KEYS: &[&str] = &[
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "LANG",
+];
+
 fn captured_queue_environment() -> BTreeMap<String, String> {
-    queue_environment_from(|key| env::var(key).ok())
+    queue_environment_from(
+        env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?))),
+    )
 }
 
-fn queue_environment_from<F>(mut lookup: F) -> BTreeMap<String, String>
-where
-    F: FnMut(&str) -> Option<String>,
-{
-    ["PATH"]
-        .into_iter()
-        .filter_map(|key| {
-            lookup(key)
-                .filter(|value| !value.is_empty())
-                .map(|value| (key, value))
+fn queue_environment_from(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> BTreeMap<String, String> {
+    vars.into_iter()
+        .filter(|(key, value)| {
+            !value.is_empty()
+                && (QUEUE_CAPTURED_ENV_KEYS.contains(&key.as_str()) || key.starts_with("LC_"))
         })
-        .map(|(key, value)| (key.to_owned(), value))
         .collect()
 }
 
@@ -6600,23 +6612,44 @@ mod tests {
     }
 
     #[test]
-    fn queue_run_captures_only_path_and_allows_an_explicit_path_override() {
-        let captured = queue_environment_from(|key| match key {
-            "PATH" => Some("/opt/homebrew/bin:/usr/bin".to_owned()),
-            "PYTHONPATH" => Some("/workspace".to_owned()),
-            "VIRTUAL_ENV" => Some("/workspace/.venv".to_owned()),
-            _ => None,
-        });
+    fn queue_run_captures_baseline_environment_and_allows_explicit_overrides() {
+        let captured = queue_environment_from(
+            [
+                ("PATH", "/opt/homebrew/bin:/usr/bin"),
+                ("HOME", "/Users/agent"),
+                ("USER", "agent"),
+                ("LOGNAME", "agent"),
+                ("SHELL", "/bin/zsh"),
+                ("TMPDIR", "/var/folders/xy/T/"),
+                ("TERM", "xterm-256color"),
+                ("LANG", "en_US.UTF-8"),
+                ("LC_ALL", "en_US.UTF-8"),
+                ("LC_CTYPE", "UTF-8"),
+                ("LC_MESSAGES", ""),
+                ("PYTHONPATH", "/workspace"),
+                ("VIRTUAL_ENV", "/workspace/.venv"),
+                ("GITHUB_TOKEN", "secret"),
+                ("SM_SESSION_ID", "abc123"),
+            ]
+            .map(|(key, value)| (key.to_owned(), value.to_owned())),
+        );
 
         assert_eq!(
+            captured.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![
+                "HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "SHELL", "TERM", "TMPDIR",
+                "USER",
+            ]
+        );
+        assert_eq!(captured["TMPDIR"], "/var/folders/xy/T/");
+        let overridden = apply_queue_environment_overrides(
             captured,
-            BTreeMap::from([("PATH".to_owned(), "/opt/homebrew/bin:/usr/bin".to_owned())])
-        );
-        assert_eq!(
-            apply_queue_environment_overrides(captured, vec!["PATH=/custom/bin".to_owned()],)
-                .unwrap(),
-            BTreeMap::from([("PATH".to_owned(), "/custom/bin".to_owned())])
-        );
+            vec!["PATH=/custom/bin".to_owned(), "TERM=dumb".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(overridden["PATH"], "/custom/bin");
+        assert_eq!(overridden["TERM"], "dumb");
+        assert_eq!(overridden["HOME"], "/Users/agent");
     }
 
     #[test]
