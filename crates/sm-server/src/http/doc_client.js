@@ -50,7 +50,7 @@
       return r.text().then(function (t) {
         var j = null;
         try { j = t ? JSON.parse(t) : null; } catch (e) { j = null; }
-        if (!r.ok) { var err = new Error((j && j.detail) || ('HTTP ' + r.status)); err.status = r.status; throw err; }
+        if (!r.ok) { var err = new Error((j && j.detail) || ('HTTP ' + r.status)); err.status = r.status; err.body = j; throw err; }
         return j;
       });
     });
@@ -128,7 +128,6 @@
     document.documentElement.classList.toggle('sm-doc-bar-open', !collapsed);
     banner.style.top = (collapsed ? 40 : h) + 'px';
   }
-  window.addEventListener('resize', layout);
 
   // Fixed elements are placed against the layout viewport. On a phone that
   // is often not what is on screen: a page wider than the screen widens it
@@ -138,15 +137,22 @@
   // at the visible area's offset, spans it, and undoes the zoom so controls
   // keep their size. Its fixed children are then placed within it.
   var vv = window.visualViewport;
+  var uiWidth = null;
   function syncViewport() {
+    var width;
     if (!vv) {
       ui.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;pointer-events:none';
-      return;
+      width = window.innerWidth;
+    } else {
+      var scale = vv.scale || 1;
+      width = vv.width * scale;
+      ui.style.cssText = 'position:fixed;left:' + vv.offsetLeft + 'px;top:' + vv.offsetTop + 'px;' +
+        'width:' + width + 'px;height:' + vv.height * scale + 'px;' +
+        'transform:scale(' + 1 / scale + ');transform-origin:0 0;pointer-events:none';
     }
-    var scale = vv.scale || 1;
-    ui.style.cssText = 'position:fixed;left:' + vv.offsetLeft + 'px;top:' + vv.offsetTop + 'px;' +
-      'width:' + vv.width * scale + 'px;height:' + vv.height * scale + 'px;' +
-      'transform:scale(' + 1 / scale + ');transform-origin:0 0;pointer-events:none';
+    // A new width can wrap or unwrap the bar: measure it again once `ui`
+    // has that width, so the page offset and banner match its height.
+    if (width !== uiWidth) { uiWidth = width; layout(); }
   }
   var syncQueued = false;
   function queueSync() {
@@ -292,8 +298,10 @@
     var h = document.createElement(BUBBLE);
     h.setAttribute('data-kind', kind);
     h.style.cssText = 'all:initial;display:block;margin:10px 0';
-    // A bubble can't sit between table rows: a row's goes in its last cell.
-    var into = block.tagName === 'TR' ? (block.lastElementChild || block) : block;
+    // A bubble can't sit between table rows, and one cell is too narrow for
+    // it: anything in a table row puts its bubble in the row's last cell.
+    var row = block.closest('tr');
+    var into = row ? (row.lastElementChild || row) : block;
     into.appendChild(h);
     var r = h.attachShadow ? h.attachShadow({ mode: 'open' }) : h;
     r.appendChild(el('style', { text: BUBBLE_CSS }));
@@ -594,6 +602,13 @@
             sheet.appendChild(el('div', { class: 'row' }, [el('button', { text: 'Close', onclick: closeSheet })]));
           });
       }).catch(function (err) {
+        // Another device's submission of this revision takes over: resume
+        // that one (shown, locked) or, once it is done, start afresh.
+        if (err.status === 409 && err.body && 'unfinished_review' in err.body) {
+          S.attempt = err.body.unfinished_review;
+          renderReview(err.message);
+          return;
+        }
         // Keep the attempt: the server reconciles a retry against GitHub,
         // so resubmitting can never post the review twice.
         renderReview(err.message + ' Submitting again is safe.');

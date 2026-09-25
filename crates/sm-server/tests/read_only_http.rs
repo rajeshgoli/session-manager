@@ -23898,6 +23898,77 @@ async fn owner_doc_token_opens_the_json_endpoints_for_its_own_doc_only() {
 }
 
 #[tokio::test]
+async fn owner_doc_review_a_newer_submission_from_another_device_takes_over() {
+    let c1 = "a".repeat(40);
+    let source = review_memo_source(&c1);
+    let (app, dir) = owner_docs_app(source.clone());
+    let id = publish_review_memo(&app, "specs/memo.html", &c1, "author01", true).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Why now?").await;
+    let submit = |submission: &'static str, verdict: &'static str, body: &'static str| {
+        let app = app.clone();
+        let payload = json!({"submission_id": submission, "sha": "a".repeat(40),
+                             "verdict": verdict, "body": body});
+        let path = format!("/docs/{id}/review");
+        async move { post_json(app, &path, payload).await }
+    };
+
+    // Tab A's attempt fails cleanly: its row is failed, the drafts stay.
+    source.github.lock().unwrap().fail_submit = true;
+    let (status, _) = submit("sub-tab-a", "approve", "Ship it.").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    // Device B submits the same drafts under its own id and gets stuck.
+    source.github.lock().unwrap().fail_delete = true;
+    let (status, _) = submit("sub-device-b", "changes_requested", "Not yet.").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    {
+        let mut github = source.github.lock().unwrap();
+        github.fail_submit = false;
+        github.fail_delete = false;
+        github.calls.clear();
+    }
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    assert_eq!(
+        store.review("sub-device-b").unwrap().unwrap().status,
+        "submitting"
+    );
+
+    // Tab A's retry does not revive its own row past B's: it is handed B's
+    // submission to resume, verdict and text included.
+    let (status, refused) = submit("sub-tab-a", "approve", "Ship it.").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(
+        refused["unfinished_review"],
+        json!({"id": "sub-device-b", "verdict": "changes_requested", "body": "Not yet."})
+    );
+    assert_eq!(store.review("sub-tab-a").unwrap().unwrap().status, "failed");
+    assert!(source.github.lock().unwrap().calls.is_empty());
+
+    // Confirming resumes B's; A's retry after that is closed, not posted.
+    let (status, review) = submit("sub-device-b", "comment", "").await;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert_eq!(review["verdict"], "changes_requested");
+    let (status, refused) = submit("sub-tab-a", "approve", "Ship it.").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(refused["unfinished_review"], Value::Null);
+    assert_eq!(store.review("sub-tab-a").unwrap().unwrap().status, "failed");
+    assert_eq!(source.github.lock().unwrap().reviews.len(), 1);
+    assert_eq!(queued_wakes(&dir, "[sm review]").len(), 1);
+
+    // The newest failed attempt still retries under its own id.
+    add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "And later?").await;
+    source.github.lock().unwrap().fail_submit = true;
+    let (status, _) = submit("sub-tab-a-2", "comment", "").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    source.github.lock().unwrap().fail_submit = false;
+    let (status, review) = submit("sub-tab-a-2", "comment", "").await;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert_eq!(queued_wakes(&dir, "[sm review]").len(), 2);
+}
+
+#[tokio::test]
 async fn owner_doc_review_retries_under_one_id_never_post_twice() {
     let c1 = "a".repeat(40);
     let source = review_memo_source(&c1);
@@ -23999,7 +24070,16 @@ async fn owner_doc_review_retries_under_one_id_never_post_twice() {
         github.fail_delete = false;
         github.calls.clear();
     }
-    let (status, review) = submit(id.clone(), "sub-after-reload").await;
+    // A page that never saw it (loaded before it began) is handed its
+    // verdict and text to confirm, not left to post them unseen.
+    let (status, refused) = submit(id.clone(), "sub-after-reload").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(
+        refused["unfinished_review"],
+        json!({"id": "sub-stuck-delete", "verdict": "comment", "body": ""})
+    );
+    assert!(source.github.lock().unwrap().calls.is_empty());
+    let (status, review) = submit(id.clone(), "sub-stuck-delete").await;
     assert_eq!(review["submission_id"], "sub-stuck-delete");
     assert_eq!(status, StatusCode::OK, "{review}");
     assert_eq!(

@@ -132,6 +132,34 @@ fn conflict(detail: impl Into<String>) -> ApiError {
     }
 }
 
+/// What a page needs to resume an unfinished submission: its id and the
+/// verdict and text it will post.
+pub(super) fn unfinished_review_json(review: &OwnerDocReview) -> Value {
+    json!({
+        "id": review.id,
+        "verdict": review.verdict,
+        "body": review.body.clone().unwrap_or_default(),
+    })
+}
+
+/// 409 for a submit that another submission of the revision takes over.
+/// `unfinished_review` is the one to resume, or null when the newer one is
+/// done and the page should start afresh from the current drafts.
+fn superseded(unfinished: Option<OwnerDocReview>) -> ApiError {
+    let detail = if unfinished.is_some() {
+        "Another device is submitting a review of this revision, with the verdict and text shown here. Submit again to finish it."
+    } else {
+        "A newer review of this revision was submitted from another device, so this attempt is closed. Check the drafts, then submit."
+    };
+    ApiError::StatusBody {
+        status: StatusCode::CONFLICT,
+        body: json!({
+            "detail": detail,
+            "unfinished_review": unfinished.as_ref().map(unfinished_review_json),
+        }),
+    }
+}
+
 fn review_response(review: &OwnerDocReview) -> Value {
     json!({
         "submission_id": review.id,
@@ -183,16 +211,24 @@ pub(super) async fn submit_owner_doc_review(
             // client keeps one id until the review is posted.
             _ => {
                 let existing = store.reopen_review(&existing.id)?;
-                run_blocking(state, existing, None).await
+                if existing.status == "submitting" {
+                    run_blocking(state, existing, None).await
+                } else {
+                    Err(superseded(
+                        store.unfinished_review(&doc.id, &existing.commit_sha)?,
+                    ))
+                }
             }
         };
     }
 
-    // Whatever id the page sends (a reload loses the one it had), an
-    // unfinished submission of this revision is finished first: starting a
-    // second one could post the drafts twice.
+    // An unfinished submission of this revision under another id (another
+    // device's) is finished first: starting a second one could post the
+    // drafts twice. Its verdict and text may differ from what this page
+    // shows, so the page is handed them to confirm rather than posting them
+    // unseen.
     if let Some(unfinished) = store.unfinished_review(&doc.id, &sha)? {
-        return run_blocking(state, unfinished, None).await;
+        return Err(superseded(Some(unfinished)));
     }
     let Some(pr_number) = doc.pr_number else {
         return Err(conflict("This doc has no PR, so it is read-only"));

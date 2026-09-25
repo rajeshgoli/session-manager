@@ -1055,9 +1055,10 @@ async fn view_doc_response(
         "revisions": revision_entries(doc, &publishes),
         "drafts": store.drafts(&doc.id)?,
         // A reloaded page resumes an unfinished submission, never a new one.
-        "unfinishedReview": store.unfinished_review(&doc.id, commit_sha)?.map(|review| json!({
-            "id": review.id, "verdict": review.verdict, "body": review.body.unwrap_or_default(),
-        })),
+        "unfinishedReview": store
+            .unfinished_review(&doc.id, commit_sha)?
+            .as_ref()
+            .map(review::unfinished_review_json),
     });
     Ok((
         StatusCode::OK,

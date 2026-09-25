@@ -3055,7 +3055,7 @@ fn error_name(error: &ApiError) -> &'static str {
     match error {
         ApiError::Internal(_) => "internal",
         ApiError::NotFound(_) => "not_found",
-        ApiError::Status { .. } => "status",
+        ApiError::Status { .. } | ApiError::StatusBody { .. } => "status",
         ApiError::Auth { .. } => "auth",
     }
 }
@@ -13326,6 +13326,7 @@ fn mobile_terminal_ws_message(
 fn api_error_detail(error: &ApiError) -> String {
     match error {
         ApiError::Status { detail, .. } => detail.clone(),
+        ApiError::StatusBody { body, .. } => body["detail"].as_str().unwrap_or_default().to_owned(),
         ApiError::NotFound(detail) => (*detail).to_owned(),
         ApiError::Auth { detail, .. } => (*detail).to_owned(),
         ApiError::Internal(error) => error.to_string(),
@@ -13582,6 +13583,11 @@ enum ApiError {
         status: StatusCode,
         detail: String,
     },
+    /// A status whose JSON body carries fields beyond `detail`.
+    StatusBody {
+        status: StatusCode,
+        body: Value,
+    },
     Auth {
         status: StatusCode,
         detail: &'static str,
@@ -13637,6 +13643,7 @@ impl IntoResponse for ApiError {
             Self::Status { status, detail } => {
                 (status, Json(json!({ "detail": detail }))).into_response()
             }
+            Self::StatusBody { status, body } => (status, Json(body)).into_response(),
             Self::Auth {
                 status,
                 detail,
@@ -17831,6 +17838,10 @@ mod tests {
     fn api_error_status_detail(error: ApiError) -> (StatusCode, String) {
         match error {
             ApiError::Status { status, detail } => (status, detail),
+            ApiError::StatusBody { status, body } => (
+                status,
+                body["detail"].as_str().unwrap_or_default().to_owned(),
+            ),
             ApiError::NotFound(detail) => (StatusCode::NOT_FOUND, detail.to_owned()),
             ApiError::Auth { status, detail, .. } => (status, detail.to_owned()),
             ApiError::Internal(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
