@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Table comment test (#1476)</title>
+<style>
+body{font:16px/1.5 Georgia,serif;max-width:760px;margin:0 auto;padding:16px}
+table{border-collapse:collapse;width:100%;margin:16px 0}
+th,td{border:1px solid #bbb;padding:6px 8px;text-align:left;vertical-align:top}
+th{background:#f2f2f2}
+</style>
+</head>
+<body>
+<h1>Table comment test</h1>
+<p>Throwaway doc for checking two reader fixes on a phone. Nothing here is real.</p>
+<h2>1. Comment inside a table</h2>
+<p>Select a word in the narrow first column, "Id", and add a comment. The comment box should open across the row's last cell, "Notes", not inside the tapped cell.</p>
+<table>
+<tr><th>Id</th><th>Desk</th><th>Size</th><th>Side</th><th>Notes</th></tr>
+<tr><td>A1</td><td>Rates</td><td>25m</td><td>Buy</td><td>Roll into the December contract before the first notice day.</td></tr>
+<tr><td>B2</td><td>Credit</td><td>10m</td><td>Sell</td><td>Hedge ratio reviewed weekly; widen the band if spreads gap.</td></tr>
+<tr><td>C3</td><td>FX</td><td>5m</td><td>Buy</td><td>Stop at the prior swing low; no averaging down.</td></tr>
+<tr><td>D4</td><td>Equity</td><td>2m</td><td>Sell</td><td>Covered calls against the core position, 30-delta.</td></tr>
+</table>
+<h2>2. Header bar after rotating</h2>
+<p>With the dark header bar open, rotate the phone to landscape and back. After each rotation the page heading and the yellow banner (if one shows) should sit just below the bar: not hidden under it, and without a gap.</p>
+<p>Filler so the page scrolls. Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.</p>
+<p>Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.</p>
+<p>Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.</p>
+<p>Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.</p>
+</body>
+</html>
