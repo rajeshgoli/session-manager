@@ -578,6 +578,21 @@ data class SessionObligations(
     @SerialName("waiting_on") val waitingOn: List<WaitingObligation> = emptyList(),
     @SerialName("review_history") val reviewHistory: List<ReviewHistory> = emptyList(),
     val docs: List<SessionDoc> = emptyList(),
+    /** Active work claims (`sm ticket`, `sm pr`); schema 3 and later. */
+    val claims: List<SessionClaim> = emptyList(),
+)
+
+/** A ticket or PR this session holds. `history_path` is its ticket page, `/t/<repo-name>/<n>`. */
+@Serializable
+data class SessionClaim(
+    val kind: String = "",
+    val repo: String = "",
+    val number: Long = 0,
+    val title: String = "",
+    val state: String = "",
+    @SerialName("claimed_at") val claimedAt: String? = null,
+    val source: String = "",
+    @SerialName("history_path") val historyPath: String? = null,
 )
 
 /** A doc this session published for the owner (`sm doc publish`). The internal doc id is deliberately not parsed: every link uses the readable form. */
