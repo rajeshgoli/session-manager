@@ -462,6 +462,7 @@ PR <code>state</code> is <code>OPEN | CLOSED | MERGED</code>; map to <code>open 
 <li><b>Periodic sync</b>: a background task every 300 s (config <code>work_claims.sync_interval_seconds</code>, default 300, minimum 60). Tracked set: every <code>work_items</code> row whose <code>state = open</code> and which has an active claim or a <code>work_links</code> row to an item with an active claim; plus tickets linked from any open tracked PR. Closed items are never re-polled.</li>
 <li><b>On each item</b>: upsert; if <code>state</code> changed, write <code>state_changed</code> and apply the claim-ending rules; for PRs, insert <code>work_links</code> rows (<code>source = closing_ref</code>) for each <code>closingIssuesReferences</code> node whose <code>nameWithOwner</code> equals the PR's repo, and upsert those tickets into <code>work_items</code> (fetched in the same or next sync).</li>
 <li>After a sync pass, run Check A for PRs that turned merged in it (appendix F), then Check C.</li>
+<li>Output size: a 50-alias response is about 20 KB. <code>gh_command_output</code> deadlocks on output over 64 KB until #1471 is fixed; keep the 50-alias cap either way.</li>
 <li>Rate: one call per repo per 5 minutes is ~12 GraphQL points an hour per repo, against 5,000 (appendix K).</li>
 <li>The history page, <code>/session-obligations</code> and <code>sm ticket</code> listing read stored rows only and never call <code>gh</code> (same rule as the docs spec's list projection).</li>
 </ul>
