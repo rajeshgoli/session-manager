@@ -136,7 +136,11 @@ impl GitHubReviewPoster for StubPoster {
         Ok(GitHubReviewComment {
             comment_id: Some(1),
             comment_url: Some("https://github.com/acme/widgets/pull/9#issuecomment-1".into()),
-            posted_at: "2026-09-24T00:00:00Z".into(),
+            // The request's TTL runs from here; a fixed past date expires it
+            // as soon as its watcher first runs.
+            posted_at: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
         })
     }
 
