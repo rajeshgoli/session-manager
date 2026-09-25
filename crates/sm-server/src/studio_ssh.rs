@@ -10,12 +10,11 @@
 //! booting out an agent that is not loaded); those are treated as non-fatal.
 
 use std::{
-    io::Read,
     net::{SocketAddr, TcpStream},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::Command,
     sync::OnceLock,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use serde::Serialize;
@@ -271,58 +270,17 @@ fn describe(result: &LaunchctlResult) -> String {
 fn run_launchctl(args: &[&str]) -> LaunchctlResult {
     let mut command = Command::new("launchctl");
     command.args(args);
-    match run_command_with_timeout(command, LAUNCHCTL_TIMEOUT) {
-        Ok((success, stdout, stderr)) => LaunchctlResult {
-            success,
-            stdout,
-            stderr,
+    match crate::child_output::output_with_timeout(command, LAUNCHCTL_TIMEOUT) {
+        Ok(output) => LaunchctlResult {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         },
         Err(error) => LaunchctlResult {
             success: false,
             stdout: String::new(),
             stderr: error,
         },
-    }
-}
-
-/// Run a command with a wall-clock timeout, capturing stdout/stderr. Mirrors the
-/// `command_output_with_timeout` pattern used elsewhere in the crate.
-fn run_command_with_timeout(
-    mut command: Command,
-    timeout: Duration,
-) -> Result<(bool, String, String), String> {
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-                if let Some(mut handle) = child.stdout.take() {
-                    let _ = handle.read_to_string(&mut stdout);
-                }
-                if let Some(mut handle) = child.stderr.take() {
-                    let _ = handle.read_to_string(&mut stderr);
-                }
-                return Ok((status.success(), stdout, stderr));
-            }
-            Ok(None) => {}
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error.to_string());
-            }
-        }
-        if start.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!("timed out after {}s", timeout.as_secs()));
-        }
-        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
