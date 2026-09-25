@@ -134,6 +134,7 @@ struct Fixture {
     app: axum::Router,
     state: AppState,
     items: StubItems,
+    dir: PathBuf,
 }
 
 /// lead → eng1; other unrelated.
@@ -196,6 +197,7 @@ fn fixture() -> Fixture {
         app: router(state.clone()),
         state,
         items,
+        dir,
     }
 }
 
@@ -358,6 +360,26 @@ async fn history_filters_by_agent_repo_and_open() {
     }
     let (_, body) = get_json(&f.app, "/history?format=json&agent=nobody").await;
     assert_eq!(numbers(&body), Vec::<i64>::new());
+    // A purged agent, by an 8+ character prefix of its stored id.
+    let db = rusqlite::Connection::open(f.dir.join("message_queue.db")).unwrap();
+    db.execute(
+        "UPDATE work_claims SET session_id = 'purged00aa11' WHERE session_id = 'other001'",
+        [],
+    )
+    .unwrap();
+    let (_, body) = get_json(&f.app, "/history?format=json&agent=purged00").await;
+    assert_eq!(numbers(&body), vec![2]);
+    let (_, body) = get_json(&f.app, "/history?format=json&agent=purged0").await;
+    assert_eq!(
+        numbers(&body),
+        Vec::<i64>::new(),
+        "under 8 characters is not a prefix"
+    );
+    db.execute(
+        "UPDATE work_claims SET session_id = 'other001' WHERE session_id = 'purged00aa11'",
+        [],
+    )
+    .unwrap();
     let (_, body) = get_json(&f.app, "/history?format=json&repo=WIDGETS").await;
     assert_eq!(numbers(&body), vec![2, 1]);
     let (_, body) = get_json(&f.app, "/history?format=json&repo=gadgets").await;

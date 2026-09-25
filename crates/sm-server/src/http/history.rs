@@ -71,18 +71,24 @@ fn agent_ids(
             || record.friendly_name.as_deref() == Some(identifier)
             || record.name == identifier
     });
-    let prefix = || {
-        let mut matches = records
-            .iter()
-            .filter(|record| identifier.len() >= 8 && record.id.starts_with(identifier));
-        match (matches.next(), matches.next()) {
-            (Some(only), None) => Some(only),
-            _ => None,
-        }
-    };
-    if let Some(record) = live.or_else(prefix) {
+    if let Some(record) = live {
         ids.insert(record.id.clone());
-    } else if ids.is_empty() {
+        return Ok(ids);
+    }
+    // A unique id prefix of 8+ characters, among live sessions and the
+    // purged ones the stored rows still name.
+    if identifier.len() >= 8 {
+        let mut candidates: BTreeSet<&str> = records.iter().map(|r| r.id.as_str()).collect();
+        candidates.extend(data.stored_session_ids());
+        let mut matches = candidates
+            .into_iter()
+            .filter(|id| id.starts_with(identifier));
+        if let (Some(only), None) = (matches.next(), matches.next()) {
+            ids.insert(only.to_owned());
+            return Ok(ids);
+        }
+    }
+    if ids.is_empty() {
         // Registered roles (`maintainer`, …) are the last resort: the
         // lookup takes the session store's write lock.
         if let Some(session) = resolve_session_or_registry_role(state, identifier)? {

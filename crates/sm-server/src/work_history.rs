@@ -514,15 +514,23 @@ impl HistoryData {
 
     /// Whether any stored row names `session_id` (a purged session's id).
     pub fn knows_session(&self, session_id: &str) -> bool {
-        self.claims.iter().any(|c| c.session_id == session_id)
-            || self
-                .reviews
+        self.stored_session_ids().contains(session_id)
+    }
+
+    /// Every session id a claim, Codex review request or doc names,
+    /// including sessions since purged from the session store.
+    pub fn stored_session_ids(&self) -> BTreeSet<&str> {
+        let mut ids: BTreeSet<&str> = self.claims.iter().map(|c| c.session_id.as_str()).collect();
+        ids.extend(
+            self.reviews
                 .iter()
-                .any(|r| r.requester_session_id.as_deref() == Some(session_id))
-            || self.docs.iter().any(|d| {
-                d.summary.doc.author_session_id == session_id
-                    || d.publishes.iter().any(|p| p.session_id == session_id)
-            })
+                .filter_map(|r| r.requester_session_id.as_deref()),
+        );
+        for doc in &self.docs {
+            ids.insert(doc.summary.doc.author_session_id.as_str());
+            ids.extend(doc.publishes.iter().map(|p| p.session_id.as_str()));
+        }
+        ids
     }
 
     /// The list: one row per thread, newest activity first.
