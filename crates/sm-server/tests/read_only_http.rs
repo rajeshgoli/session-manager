@@ -22008,7 +22008,7 @@ fn runtime_app_with_codex_fork_initial_brief_provider(
         delay.as_str(),
         "printf '› '\nwhile IFS= read -r line; do\n  printf 'received:%s\\n' \"$line\"\n",
         acknowledgement,
-        "  case \"$line\" in\n    natural-child-prompt) exit 0 ;;\n    active-child-prompt) for i in 1 2 3 4 5 6 7 8; do printf 'runtime:heartbeat-%s\\n' \"$i\"; sleep 0.2; done; exit 0 ;;\n  esac\n  printf '› '\ndone\n",
+        "  case \"$line\" in\n    natural-child-prompt) sleep 0.5; exit 0 ;;\n    active-child-prompt) for i in 1 2 3 4 5 6 7 8; do printf 'runtime:heartbeat-%s\\n' \"$i\"; sleep 0.2; done; exit 0 ;;\n  esac\n  printf '› '\ndone\n",
     ]
     .concat();
     fs::write(&provider, script).unwrap();

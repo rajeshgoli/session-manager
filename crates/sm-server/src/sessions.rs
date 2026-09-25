@@ -9203,10 +9203,14 @@ where
     let mut directory_trust_accepted = false;
     let mut last_relevant_event = None;
     loop {
-        // Probe liveness before reading: a runtime found dead has finished
-        // writing, so a root thread it published before exiting is still
-        // accepted rather than reported as a startup failure.
-        let runtime_live = runtime_is_live()?;
+        if !runtime_is_live()? {
+            anyhow::bail!(
+                "codex-fork runtime disappeared before root startup acceptance after {}ms in {}{}",
+                started.elapsed().as_millis(),
+                event_stream_path.display(),
+                format_last_codex_fork_startup_event(last_relevant_event.as_deref()),
+            );
+        }
         if let Ok(chunk) = read_file_from_offset(event_stream_path, &mut offset) {
             for line in split_complete_event_lines(&mut buffer, &chunk) {
                 let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
@@ -9243,14 +9247,6 @@ where
                     last_relevant_event = Some(event_type);
                 }
             }
-        }
-        if !runtime_live {
-            anyhow::bail!(
-                "codex-fork runtime disappeared before root startup acceptance after {}ms in {}{}",
-                started.elapsed().as_millis(),
-                event_stream_path.display(),
-                format_last_codex_fork_startup_event(last_relevant_event.as_deref()),
-            );
         }
         if !directory_trust_accepted {
             directory_trust_accepted = handle_startup_prompt()?;
@@ -21949,28 +21945,27 @@ sleep 30
         .unwrap_err();
         assert!(error.to_string().contains("runtime disappeared"));
 
-        // A runtime that published its root thread and then exited started.
-        let exited_path = unique_temp_path("codex-create-acceptance-runtime-exited");
+        // A root thread published before a crash does not make a dead
+        // runtime acceptable: accepting it would leave a phantom agent.
+        let crashed_path = unique_temp_path("codex-create-acceptance-runtime-crashed");
         fs::write(
-            &exited_path,
-            "{\"event_type\":\"thread_started\",\"payload\":{\"thread\":{\"id\":\"exited-root\"}}}\n",
+            &crashed_path,
+            "{\"event_type\":\"thread_started\",\"payload\":{\"thread\":{\"id\":\"crashed-root\"}}}\n",
         )
         .unwrap();
-        assert_eq!(
-            wait_for_codex_fork_create_acceptance(
-                &exited_path,
-                0,
-                Duration::from_millis(100),
-                || Ok(false),
-                || Ok(false),
-            )
-            .unwrap(),
-            "exited-root"
-        );
+        let error = wait_for_codex_fork_create_acceptance(
+            &crashed_path,
+            0,
+            Duration::from_millis(100),
+            || Ok(false),
+            || Ok(false),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("runtime disappeared"));
 
         let _ = fs::remove_file(subagent_path);
         let _ = fs::remove_file(lost_path);
-        let _ = fs::remove_file(exited_path);
+        let _ = fs::remove_file(crashed_path);
     }
 
     #[test]
