@@ -1677,3 +1677,17 @@ chmod 755 "{target}/release/sm"
     assert result.returncode == 0, result.stderr
     assert f"--manifest-path {REPO_ROOT}/Cargo.toml" in log.read_text()
     assert (tmp_path / "installed" / "sm").exists()
+
+
+def test_cli_is_staged_even_when_the_install_dir_does_not_exist_yet(env, checkout):
+    """A fresh install: the server's install dir is created later in phase 1."""
+    target = env["tmp"] / "target"
+    _write(target / "release" / "sm", "#!/bin/bash\n", executable=True)
+    fresh = env["tmp"] / "fresh" / "bin" / "sm-server"
+    (env["state"] / "job_program").write_text(str(fresh))
+
+    result = checkout["run"](SM_TARGET_DIR=str(target), SM_BINARY=str(fresh))
+
+    assert result.returncode == 0, result.stderr
+    assert "install-sm-cli --source " in calls(env)
+    assert "no sm CLI" not in result.stderr

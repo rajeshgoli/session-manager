@@ -740,6 +740,7 @@ else
   # the CLI refresh at the end, never the server restart.
   if [[ -x "$SM_TARGET_DIR/release/sm" ]]; then
     SM_CLI_STAGING="$SM_BINARY.sm-cli.staging.$$"
+    mkdir -p "$(dirname "$SM_BINARY")" 2>/dev/null || true
     cp -p "$SM_TARGET_DIR/release/sm" "$SM_CLI_STAGING" || SM_CLI_STAGING=""
   fi
 fi
