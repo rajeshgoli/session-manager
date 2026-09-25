@@ -34,6 +34,23 @@ const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = ti
     "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z"
 );
 
+#[cfg(test)]
+thread_local! {
+    static WRITE_BATCH_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs between committed write batches, while this thread holds no write lock.
+/// Tests pause here to prove live writers get in mid-way (sm#1379).
+fn write_batch_committed() {
+    #[cfg(test)]
+    WRITE_BATCH_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageModelDefaults {
     pub claude: Option<String>,
@@ -1020,6 +1037,7 @@ impl UsageLedgerStore {
             if batch_lines >= LEDGER_WRITE_BATCH_SIZE {
                 save_scan_offset(&tx, &artifact.path, line_offset, mtime_ns)?;
                 tx.commit()?;
+                write_batch_committed();
                 thread::sleep(LEDGER_BATCH_PAUSE);
                 tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 ensure_codex_cursor_baselines(&tx, artifact)?;
@@ -1418,6 +1436,7 @@ impl UsageLedgerStore {
                 materialize_contribution_for_window(&tx, *msg_id, &contribution, &message_window)?;
             }
             tx.commit()?;
+            write_batch_committed();
             if index + 1 < ids.len().div_ceil(LEDGER_WRITE_BATCH_SIZE) {
                 thread::sleep(MATERIALIZATION_BATCH_PAUSE);
             }
@@ -3032,6 +3051,20 @@ mod tests {
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
+    /// Holds the calling thread at its first committed write batch: reports on
+    /// `paused`, then waits for `resume`. No write lock is held while it waits.
+    fn pause_after_first_write_batch(paused: mpsc::Sender<()>, resume: mpsc::Receiver<()>) {
+        let mut pending = Some((paused, resume));
+        WRITE_BATCH_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if let Some((paused, resume)) = pending.take() {
+                    paused.send(()).unwrap();
+                    resume.recv().unwrap();
+                }
+            }));
+        });
+    }
+
     struct TestDir(PathBuf);
 
     impl TestDir {
@@ -3644,16 +3677,18 @@ mod tests {
             "test-large-window",
         );
 
-        let (started_tx, started_rx) = mpsc::channel();
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
         let scanner = store.clone();
         let handle = thread::spawn(move || {
-            started_tx.send(()).unwrap();
+            pause_after_first_write_batch(paused_tx, resume_rx);
             scanner.materialize_pending_windows()
         });
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        // Measure progress, not wall time, so a loaded suite cannot fail it:
-        // start the live write once materialization is under way, and require
-        // it to finish before the whole window is materialized (sm#1432).
+        paused_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("materialization never committed a batch");
+        // Materialization is held between batches, one batch into the window, so
+        // the live write lands mid-way however loaded the suite is (sm#1379).
         let materialized = || -> i64 {
             Connection::open(&db_path)
                 .unwrap()
@@ -3664,20 +3699,12 @@ mod tests {
                 )
                 .unwrap()
         };
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while materialized() < LEDGER_WRITE_BATCH_SIZE as i64 {
-            assert!(Instant::now() < deadline, "materialization did not start");
-            thread::sleep(Duration::from_millis(1));
-        }
-
+        assert_eq!(materialized(), LEDGER_WRITE_BATCH_SIZE as i64);
         SeatSessionStore::new(&db_path)
             .append("live-seat", "claude", "live-session", None)
             .unwrap();
-        let written = materialized();
-        assert!(
-            written < 4096,
-            "live writer waited for the whole window materialization ({written} rows written)"
-        );
+        assert_eq!(materialized(), LEDGER_WRITE_BATCH_SIZE as i64);
+        resume_tx.send(()).unwrap();
         let summary = handle.join().unwrap().unwrap();
         assert_eq!(summary.messages_selected, 4096);
     }
@@ -3725,8 +3752,11 @@ mod tests {
             .append("seat-one", "claude", "session-one", transcript.to_str())
             .unwrap();
         let store = UsageLedgerStore::new(&db_path).unwrap();
+        let (paused_tx, paused_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
         let scanner = store.clone();
         let handle = thread::spawn(move || {
+            pause_after_first_write_batch(paused_tx, resume_rx);
             scanner.scan(&[UsageSeatMetadata {
                 seat_id: "seat-one".to_owned(),
                 friendly_name: None,
@@ -3740,36 +3770,25 @@ mod tests {
             }])
         });
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let count: i64 = Connection::open(&db_path)
+        paused_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("artifact scan never committed a batch");
+        // The scan is held between batches, one batch into the transcript, so the
+        // live write lands mid-way however loaded the suite is (sm#1379).
+        let ingested = || -> i64 {
+            Connection::open(&db_path)
                 .unwrap()
                 .query_row("SELECT COUNT(*) FROM message_ledger", [], |row| row.get(0))
-                .unwrap();
-            if count >= LEDGER_WRITE_BATCH_SIZE as i64 {
-                break;
-            }
-            assert!(Instant::now() < deadline, "artifact scan did not start");
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert!(
-            !handle.is_finished(),
-            "artifact scan finished before the writer probe"
-        );
+                .unwrap()
+        };
+        assert_eq!(ingested(), LEDGER_WRITE_BATCH_SIZE as i64);
         SeatSessionStore::new(&db_path)
             .append("live-seat", "claude", "live-session", None)
             .unwrap();
-        // Measure progress, not wall time, so a loaded suite cannot fail it: the
-        // writer waits for at most one batch, never the whole scan (sm#1432).
-        let written: i64 = Connection::open(&db_path)
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM message_ledger", [], |row| row.get(0))
-            .unwrap();
-        assert!(
-            written < 4096,
-            "live writer waited for the whole historical scan ({written} rows written)"
-        );
-        handle.join().unwrap().unwrap();
+        assert_eq!(ingested(), LEDGER_WRITE_BATCH_SIZE as i64);
+        resume_tx.send(()).unwrap();
+        let summary = handle.join().unwrap().unwrap();
+        assert_eq!(summary.messages_inserted, 4096);
     }
 
     #[test]
