@@ -28,6 +28,8 @@ const MATERIALIZATION_BATCH_PAUSE: Duration = Duration::from_millis(1);
 /// A thread's first booked row above this carries inherited history, not a turn.
 const INHERITED_CODEX_TURN_FLOOR: i64 = 1_000_000;
 const INHERITED_CODEX_TURN_REPAIR: &str = "1409-inherited-codex-turns";
+const INHERITED_BY_REPAIR: &str = "repair";
+const INHERITED_BY_SCAN: &str = "scan";
 const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
     "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z"
 );
@@ -312,8 +314,8 @@ impl UsageLedgerStore {
     /// Before #1409 the scanner booked a new thread's first cumulative total whole, and a forked
     /// or resumed thread starts from its parent's total. Each thread's first booked row above
     /// `INHERITED_CODEX_TURN_FLOOR` is that inheritance. Its own request is unknown without the
-    /// source events, so the row keeps its identity with zero tokens; the original buckets stay
-    /// in `codex_inherited_turn_repair`. Runs once, recorded in `usage_repairs`.
+    /// source events, so the row keeps its identity with zero tokens; the original buckets move
+    /// to `codex_inherited_totals`. Runs once, recorded in `usage_repairs`.
     fn repair_inherited_codex_turns(&self) -> Result<()> {
         let mut connection = self.open()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -325,17 +327,22 @@ impl UsageLedgerStore {
               rows       INTEGER NOT NULL,
               tokens     INTEGER NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS codex_inherited_turn_repair (
-              msg_id            INTEGER PRIMARY KEY,
+            -- Tokens in a Codex thread's cumulative total that no ledger row books: history
+            -- a forked or resumed thread inherited. A cursor rebuilt from the ledger adds these.
+            CREATE TABLE IF NOT EXISTS codex_inherited_totals (
+              message_id        TEXT PRIMARY KEY,
+              thread_id         TEXT NOT NULL,
+              source            TEXT NOT NULL,
               total_tokens      INTEGER NOT NULL,
               input_tokens      INTEGER NOT NULL,
+              cached_input      INTEGER NOT NULL,
+              cache_write       INTEGER NOT NULL,
               output_tokens     INTEGER NOT NULL,
               reasoning_tokens  INTEGER NOT NULL,
-              cache_write_5m    INTEGER NOT NULL,
-              cache_write_1h    INTEGER NOT NULL,
-              cache_read_tokens INTEGER NOT NULL,
-              repaired_at       TEXT NOT NULL
+              recorded_at       TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS idx_codex_inherited_totals_thread
+              ON codex_inherited_totals(thread_id);
             "#,
         )?;
         let applied = tx
@@ -371,24 +378,12 @@ impl UsageLedgerStore {
         let mut tokens_removed = 0;
         for msg_id in &ids {
             let incumbent = load_contribution(&tx, *msg_id)?;
-            tx.execute(
-                r#"
-                INSERT INTO codex_inherited_turn_repair (
-                  msg_id, total_tokens, input_tokens, output_tokens, reasoning_tokens,
-                  cache_write_5m, cache_write_1h, cache_read_tokens, repaired_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                "#,
-                params![
-                    msg_id,
-                    incumbent.total_tokens,
-                    incumbent.tokens.input,
-                    incumbent.tokens.output,
-                    incumbent.tokens.reasoning,
-                    incumbent.tokens.cache_write_5m,
-                    incumbent.tokens.cache_write_1h,
-                    incumbent.tokens.cache_read,
-                    repaired_at,
-                ],
+            record_codex_inheritance(
+                &tx,
+                &incumbent.message_id,
+                &incumbent.source_ref,
+                INHERITED_BY_REPAIR,
+                &CodexTotals::from_buckets(&incumbent.tokens),
             )?;
             tokens_removed += incumbent.total_tokens;
             let repaired = Contribution {
@@ -815,6 +810,11 @@ impl UsageLedgerStore {
         tx.execute("DELETE FROM scan_offsets", [])?;
         tx.execute("DELETE FROM codex_thread_cursor", [])?;
         tx.execute("DELETE FROM codex_thread_settings", [])?;
+        tx.execute("DELETE FROM codex_inherited_totals", [])?;
+        tx.execute(
+            "DELETE FROM usage_repairs WHERE name = ?1",
+            [INHERITED_CODEX_TURN_REPAIR],
+        )?;
         tx.commit()?;
         self.scan(seats)
     }
@@ -1213,10 +1213,13 @@ impl UsageLedgerStore {
                 {
                     return Ok(Some(IngestOutcome::Ignored));
                 }
-                let tokens = codex_turn_tokens(&totals, last.as_ref(), previous.as_ref())?;
+                let (tokens, inherited) =
+                    codex_turn_tokens(&totals, last.as_ref(), previous.as_ref())?;
                 let raw_provider = artifact.provider.as_str();
-                let seat_id = seat_by_source
-                    .get(&(raw_provider.to_owned(), thread_id.clone()))
+                let seat_id = artifact
+                    .seat_by_session
+                    .get(&thread_id)
+                    .or_else(|| seat_by_source.get(&(raw_provider.to_owned(), thread_id.clone())))
                     .or_else(|| {
                         artifact.provider_session_ids.iter().find_map(|source| {
                             seat_by_source.get(&(raw_provider.to_owned(), source.clone()))
@@ -1269,6 +1272,15 @@ impl UsageLedgerStore {
                     tokens,
                     credit_metered,
                 };
+                if let Some(inherited) = inherited {
+                    record_codex_inheritance(
+                        tx,
+                        &contribution.message_id,
+                        &thread_id,
+                        INHERITED_BY_SCAN,
+                        &inherited,
+                    )?;
+                }
                 let outcome = if contribution.total_tokens == 0 {
                     IngestOutcome::Ignored
                 } else {
@@ -1475,10 +1487,13 @@ struct Artifact {
     provider: String,
     path: PathBuf,
     provider_session_ids: BTreeSet<String>,
+    /// The seat bound to each provider session in this artifact. A resumed Codex thread can
+    /// continue in another seat's events file, so the thread id alone does not name the seat.
+    seat_by_session: BTreeMap<String, String>,
 }
 
 fn expand_artifacts(bindings: &[ArtifactBinding]) -> Vec<Artifact> {
-    let mut artifacts = BTreeMap::<(String, PathBuf), BTreeSet<String>>::new();
+    let mut artifacts = BTreeMap::<(String, PathBuf), BTreeMap<String, String>>::new();
     for binding in bindings {
         let mut paths = vec![binding.artifact_path.clone()];
         if binding.provider == "claude" {
@@ -1491,15 +1506,16 @@ fn expand_artifacts(bindings: &[ArtifactBinding]) -> Vec<Artifact> {
             artifacts
                 .entry((binding.provider.clone(), path))
                 .or_default()
-                .insert(binding.provider_session_id.clone());
+                .insert(binding.provider_session_id.clone(), binding.seat_id.clone());
         }
     }
     artifacts
         .into_iter()
-        .map(|((provider, path), provider_session_ids)| Artifact {
+        .map(|((provider, path), seat_by_session)| Artifact {
             provider,
             path,
-            provider_session_ids,
+            provider_session_ids: seat_by_session.keys().cloned().collect(),
+            seat_by_session,
         })
         .collect()
 }
@@ -1830,6 +1846,40 @@ struct CodexTotals {
 }
 
 impl CodexTotals {
+    fn from_cursor(cursor: &CodexCursor) -> Self {
+        Self {
+            input: cursor.last_input_tokens,
+            cached_input: cursor.last_cached_input,
+            cache_write: cursor.last_cache_write,
+            output: cursor.last_output_tokens,
+            reasoning: cursor.last_reasoning,
+            total: cursor.last_total_tokens,
+        }
+    }
+
+    fn from_buckets(tokens: &TokenBuckets) -> Self {
+        let cache_write = tokens.cache_write_5m + tokens.cache_write_1h;
+        Self {
+            input: tokens.input + tokens.cache_read + cache_write,
+            cached_input: tokens.cache_read,
+            cache_write,
+            output: tokens.output,
+            reasoning: tokens.reasoning,
+            total: tokens.total(),
+        }
+    }
+
+    fn minus(&self, other: &Self) -> Self {
+        Self {
+            input: self.input - other.input,
+            cached_input: self.cached_input - other.cached_input,
+            cache_write: self.cache_write - other.cache_write,
+            output: self.output - other.output,
+            reasoning: self.reasoning - other.reasoning,
+            total: self.total - other.total,
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         if [
             self.input,
@@ -1884,7 +1934,7 @@ impl CodexTotals {
     }
 }
 
-/// The tokens one Codex usage event books.
+/// The tokens one Codex usage event books, and the part of its total it inherited unbooked.
 ///
 /// With a cursor, the event books its increase over the thread's last booked total. Without one,
 /// the thread is new to the ledger, and a forked or resumed thread starts from its parent's
@@ -1893,13 +1943,53 @@ fn codex_turn_tokens(
     totals: &CodexTotals,
     last: Option<&CodexTotals>,
     previous: Option<&CodexCursor>,
-) -> Result<TokenBuckets> {
+) -> Result<(TokenBuckets, Option<CodexTotals>)> {
+    let booked_last = |last: &CodexTotals| -> Result<(TokenBuckets, Option<CodexTotals>)> {
+        let base = previous.map(CodexTotals::from_cursor).unwrap_or_default();
+        let inherited = totals.minus(&base).minus(last);
+        let inherited = (inherited.total > 0 && inherited.validate().is_ok()).then_some(inherited);
+        Ok((last.delta(None)?, inherited))
+    };
     match (previous, last) {
-        (Some(cursor), Some(last)) => totals.delta(Some(cursor)).or_else(|_| last.delta(None)),
-        (Some(cursor), None) => totals.delta(Some(cursor)),
-        (None, Some(last)) => last.delta(None),
-        (None, None) => totals.delta(None),
+        (Some(cursor), Some(last)) => match totals.delta(Some(cursor)) {
+            Ok(tokens) => Ok((tokens, None)),
+            Err(_) => booked_last(last),
+        },
+        (Some(cursor), None) => Ok((totals.delta(Some(cursor))?, None)),
+        (None, Some(last)) => booked_last(last),
+        (None, None) => Ok((totals.delta(None)?, None)),
     }
+}
+
+fn record_codex_inheritance(
+    tx: &Transaction<'_>,
+    message_id: &str,
+    thread_id: &str,
+    source: &str,
+    inherited: &CodexTotals,
+) -> Result<()> {
+    tx.execute(
+        r#"
+        INSERT INTO codex_inherited_totals (
+          message_id, thread_id, source, total_tokens, input_tokens, cached_input, cache_write,
+          output_tokens, reasoning_tokens, recorded_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(message_id) DO NOTHING
+        "#,
+        params![
+            message_id,
+            thread_id,
+            source,
+            inherited.total,
+            inherited.input,
+            inherited.cached_input,
+            inherited.cache_write,
+            inherited.output,
+            inherited.reasoning,
+            format_timestamp(OffsetDateTime::now_utc())?,
+        ],
+    )?;
+    Ok(())
 }
 
 fn parse_codex_line(
@@ -2552,7 +2642,7 @@ fn ensure_codex_cursor_baselines(tx: &Transaction<'_>, artifact: &Artifact) -> R
         let baseline = tx
             .query_row(
                 r#"
-                -- Rows zeroed by the #1409 repair still count toward the thread's cumulative total.
+                -- Inherited history no row books still counts toward the cumulative total.
                 SELECT MAX(source_seq), SUM(input_tokens + cache_read_tokens + cache_write_5m + cache_write_1h),
                        SUM(cache_read_tokens), SUM(cache_write_5m + cache_write_1h),
                        SUM(output_tokens), SUM(reasoning_tokens), SUM(total_tokens)
@@ -2562,12 +2652,10 @@ fn ensure_codex_cursor_baselines(tx: &Transaction<'_>, artifact: &Artifact) -> R
                   FROM message_ledger
                   WHERE source_ref = ?1 AND source_seq IS NOT NULL
                   UNION ALL
-                  SELECT NULL, repair.input_tokens, repair.cache_read_tokens, repair.cache_write_5m,
-                         repair.cache_write_1h, repair.output_tokens, repair.reasoning_tokens,
-                         repair.total_tokens
-                  FROM codex_inherited_turn_repair AS repair
-                  JOIN message_ledger AS ledger ON ledger.msg_id = repair.msg_id
-                  WHERE ledger.source_ref = ?1
+                  SELECT NULL, input_tokens - cached_input - cache_write, cached_input,
+                         cache_write, 0, output_tokens, reasoning_tokens, total_tokens
+                  FROM codex_inherited_totals
+                  WHERE thread_id = ?1
                 )
                 "#,
                 [thread_id],
@@ -4301,6 +4389,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cursor_total, 5_000_250);
+
+        // A cursor rebuilt from the ledger still counts the unbooked inheritance.
+        Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "DELETE FROM codex_thread_cursor WHERE thread_id = 'child'",
+                [],
+            )
+            .unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&artifact)
+            .unwrap()
+            .write_all(codex_usage_event(42, 3, "child", 5_000_550, None).as_bytes())
+            .unwrap();
+        UsageLedgerStore::new(&db_path)
+            .unwrap()
+            .scan(&[codex_seat("seat-one")])
+            .unwrap();
+        assert_eq!(ledger_totals(&db_path), vec![100, 250, 300]);
     }
 
     #[test]
@@ -4359,6 +4467,24 @@ mod tests {
             .unwrap();
 
         assert_eq!(ledger_totals(&db_path), vec![100, 200, 300, 400, 500]);
+        let seats = Connection::open(&db_path)
+            .unwrap()
+            .prepare("SELECT seat_id FROM message_ledger ORDER BY msg_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            seats,
+            [
+                "seat-first",
+                "seat-first",
+                "seat-first",
+                "seat-resumed",
+                "seat-resumed"
+            ]
+        );
     }
 
     #[test]
@@ -4405,7 +4531,7 @@ mod tests {
         assert_eq!(ledger_totals(&db_path), vec![500, 0, 100]);
         let audit: (i64, i64) = connection
             .query_row(
-                "SELECT COUNT(*), SUM(total_tokens) FROM codex_inherited_turn_repair",
+                "SELECT COUNT(*), SUM(total_tokens) FROM codex_inherited_totals WHERE source = 'repair'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
