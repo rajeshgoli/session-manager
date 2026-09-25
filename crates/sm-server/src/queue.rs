@@ -379,8 +379,8 @@ impl RetainedQueueStore {
             return Ok(());
         }
         let conn = Connection::open(db_path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         init_codex_review_requests_schema(&conn)
     }
 
@@ -527,8 +527,8 @@ impl RetainedQueueStore {
             return Ok(None);
         }
         let conn = Connection::open(db_path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         init_schema(&conn)?;
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
@@ -584,8 +584,8 @@ impl RetainedQueueStore {
         }
         let conn = Connection::open(db_path)
             .with_context(|| format!("failed to open message queue db {}", db_path.display()))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         init_codex_review_requests_schema(&conn)?;
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = create_codex_review_request_conn(&conn, request);
@@ -826,8 +826,8 @@ impl RetainedQueueStore {
             return Ok(None);
         }
         let conn = Connection::open(db_path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         init_schema(&conn)?;
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
@@ -891,8 +891,8 @@ impl RetainedQueueStore {
             return Ok(None);
         }
         let conn = Connection::open(db_path)?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         init_schema(&conn)?;
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
@@ -1032,8 +1032,8 @@ impl RetainedQueueStore {
         let db_path = state_dir.join("queue_runner.db");
         let conn = Connection::open(&db_path)
             .with_context(|| format!("failed to open queue runner db {}", db_path.display()))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         init_queue_jobs_schema(&conn)?;
         create_queue_job_conn(&conn, state_dir, request, max_wait_seconds)
     }
@@ -2199,8 +2199,8 @@ impl RetainedQueueStore {
         }
         let conn = Connection::open(&self.db_path)
             .with_context(|| format!("failed to open queue db {}", self.db_path.display()))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         init_schema(&conn)?;
         f(&conn)
     }
@@ -2994,8 +2994,8 @@ fn open_queue_jobs_connection(db_path: &Path) -> Result<Connection> {
     }
     let conn = Connection::open(db_path)
         .with_context(|| format!("failed to open queue runner db {}", db_path.display()))?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
     Ok(conn)
 }
 
@@ -3847,7 +3847,7 @@ fn monitor_queue_job_completion(
             Ok(status) => status,
             Err(_) => {
                 terminate_process_group_with_grace(pgid, cancel_grace_seconds);
-                let _ = finish_queue_job_in_state_dir_if_running(
+                finish_live_queue_job_until_recorded(
                     &state_dir,
                     &message_queue_db_path,
                     &job_id,
@@ -3870,7 +3870,7 @@ fn monitor_queue_job_completion(
                 } else {
                     "failed"
                 };
-                let _ = finish_queue_job_in_state_dir_if_running(
+                finish_live_queue_job_until_recorded(
                     &state_dir,
                     &message_queue_db_path,
                     &job_id,
@@ -3885,7 +3885,7 @@ fn monitor_queue_job_completion(
         if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
             terminate_child_process_group_with_grace(&mut child, pgid, cancel_grace_seconds);
             let exit_code = read_queue_job_exit_code_from_state_dir(&state_dir, &job_id);
-            let _ = finish_queue_job_in_state_dir_if_running(
+            finish_live_queue_job_until_recorded(
                 &state_dir,
                 &message_queue_db_path,
                 &job_id,
@@ -3919,7 +3919,7 @@ fn monitor_queue_job_completion(
             }
             terminate_child_process_group_with_grace(&mut child, pgid, cancel_grace_seconds);
             let exit_code = read_queue_job_exit_code_from_state_dir(&state_dir, &job_id);
-            let _ = finish_queue_job_in_state_dir_if_running(
+            finish_live_queue_job_until_recorded(
                 &state_dir,
                 &message_queue_db_path,
                 &job_id,
@@ -3931,6 +3931,31 @@ fn monitor_queue_job_completion(
             return;
         }
         thread::sleep(StdDuration::from_millis(100));
+    }
+}
+
+// The job's processes are already gone when this runs, and no other watcher will
+// record the outcome, so a transient database error is retried until it succeeds.
+fn finish_live_queue_job_until_recorded(
+    state_dir: &Path,
+    message_queue_db_path: &Path,
+    job_id: &str,
+    state: &str,
+    exit_code: Option<i64>,
+    cancel_grace_seconds: u64,
+    admission_policy: QueueAdmissionPolicy,
+) {
+    while let Err(error) = finish_queue_job_in_state_dir_if_running(
+        state_dir,
+        message_queue_db_path,
+        job_id,
+        state,
+        exit_code,
+        cancel_grace_seconds,
+        admission_policy,
+    ) {
+        eprintln!("queue job {job_id} could not record {state}; retrying: {error:#}");
+        thread::sleep(StdDuration::from_secs(1));
     }
 }
 
@@ -4149,7 +4174,11 @@ fn recover_running_queue_job_conn(
         )?;
         return Ok(RecoveredQueueJobAction::Finished(final_state));
     }
-    if queue_job_exit_code_path_exists(job) {
+    let group_alive = job
+        .process_group_id
+        .or(job.pid)
+        .is_some_and(process_group_exists);
+    if !group_alive && queue_job_exit_code_path_exists(job) {
         let exit_code = read_exit_code(job.exit_code_path.as_deref());
         let state = if exit_code == Some(0) {
             "succeeded"
@@ -4197,7 +4226,7 @@ fn recover_running_queue_job_conn(
         finish_queue_job_conn(conn, job, "failed", None, Some(message_queue_db_path))?;
         return Ok(RecoveredQueueJobAction::Finished("failed"));
     };
-    if !process_exists(pid) {
+    if !group_alive && !process_exists(pid) {
         finish_queue_job_conn(conn, job, "failed", None, Some(message_queue_db_path))?;
         return Ok(RecoveredQueueJobAction::Finished("failed"));
     }
@@ -4218,6 +4247,9 @@ fn recover_running_queue_job_conn(
     Ok(RecoveredQueueJobAction::Polling)
 }
 
+// A recovered job has no child handle, so this poller is the only thing that will
+// ever record its terminal state. Transient database errors (a lock held past the
+// busy timeout) must therefore be retried on the next tick, never end the poller.
 fn poll_recovered_queue_job(
     state_dir: PathBuf,
     message_queue_db_path: PathBuf,
@@ -4228,93 +4260,90 @@ fn poll_recovered_queue_job(
 ) {
     let mut next_memory_check = Instant::now();
     let mut failed_memory_samples = 0u8;
+    let db_path = state_dir.join("queue_runner.db");
+    let finish = |conn: &Connection, job: &QueueJobRuntimeRecord, state: &str, exit_code| {
+        if let Err(error) =
+            finish_queue_job_conn(conn, job, state, exit_code, Some(&message_queue_db_path))
+        {
+            eprintln!(
+                "queue recovered job {} could not record {state}; retrying: {error:#}",
+                job.id
+            );
+            return false;
+        }
+        let _ = admit_pending_queue_jobs_conn(
+            conn,
+            &state_dir,
+            &message_queue_db_path,
+            cancel_grace_seconds,
+            admission_policy,
+            true,
+        );
+        true
+    };
     loop {
         thread::sleep(StdDuration::from_millis(100));
-        let db_path = state_dir.join("queue_runner.db");
-        let Ok(conn) = open_queue_jobs_connection(&db_path) else {
-            return;
+        let conn = match open_queue_jobs_connection(&db_path) {
+            Ok(conn) => conn,
+            Err(error) => {
+                eprintln!(
+                    "queue recovered job {job_id} could not open queue db; retrying: {error:#}"
+                );
+                continue;
+            }
         };
         let _ = init_queue_jobs_schema(&conn);
-        let Ok(Some(job)) = get_queue_job_runtime_conn(&conn, &job_id) else {
-            return;
+        let job = match get_queue_job_runtime_conn(&conn, &job_id) {
+            Ok(Some(job)) => job,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("queue recovered job {job_id} could not be read; retrying: {error:#}");
+                continue;
+            }
         };
         if job.state != "running" {
             return;
         }
+        let pgid = job.process_group_id.unwrap_or(pid);
         if let Some(final_state) =
             forced_terminal_state_for_holding_reason(job.holding_reason.as_deref())
         {
-            if let Some(pgid) = job.process_group_id.or(job.pid) {
-                terminate_process_group_with_grace(pgid, cancel_grace_seconds);
-            }
+            terminate_process_group_with_grace(pgid, cancel_grace_seconds);
             let exit_code = read_exit_code(job.exit_code_path.as_deref());
-            let _ = finish_queue_job_conn(
-                &conn,
-                &job,
-                final_state,
-                exit_code,
-                Some(&message_queue_db_path),
-            );
-            let _ = admit_pending_queue_jobs_conn(
-                &conn,
-                &state_dir,
-                &message_queue_db_path,
-                cancel_grace_seconds,
-                admission_policy,
-                true,
-            );
-            return;
+            if finish(&conn, &job, final_state, exit_code) {
+                return;
+            }
+            continue;
         }
-        if queue_job_exit_code_path_exists(&job) {
+        // Like a live job, a recovered job is terminal only once its whole process
+        // group is gone (specs/1244_queue_process_group_accounting.md).
+        let group_alive = process_group_exists(pgid);
+        if !group_alive && queue_job_exit_code_path_exists(&job) {
             let exit_code = read_exit_code(job.exit_code_path.as_deref());
             let state = if exit_code == Some(0) {
                 "succeeded"
             } else {
                 "failed"
             };
-            let _ =
-                finish_queue_job_conn(&conn, &job, state, exit_code, Some(&message_queue_db_path));
-            let _ = admit_pending_queue_jobs_conn(
-                &conn,
-                &state_dir,
-                &message_queue_db_path,
-                cancel_grace_seconds,
-                admission_policy,
-                true,
-            );
-            return;
+            if finish(&conn, &job, state, exit_code) {
+                return;
+            }
+            continue;
         }
         if queue_job_timed_out(&job) {
-            if let Some(pgid) = job.process_group_id.or(job.pid) {
-                terminate_process_group_with_grace(pgid, cancel_grace_seconds);
-            }
+            terminate_process_group_with_grace(pgid, cancel_grace_seconds);
             let exit_code = read_exit_code(job.exit_code_path.as_deref());
-            let _ = finish_queue_job_conn(
-                &conn,
-                &job,
-                "timed_out",
-                exit_code,
-                Some(&message_queue_db_path),
-            );
-            let _ = admit_pending_queue_jobs_conn(
-                &conn,
-                &state_dir,
-                &message_queue_db_path,
-                cancel_grace_seconds,
-                admission_policy,
-                true,
-            );
-            return;
+            if finish(&conn, &job, "timed_out", exit_code) {
+                return;
+            }
+            continue;
         }
         let memory_trip = job.memory_bytes.and_then(|limit| {
             if Instant::now() < next_memory_check {
                 return None;
             }
             next_memory_check = Instant::now() + PERF_MEMORY_SAMPLE_INTERVAL;
-            let rss = job
-                .process_group_id
-                .or(job.pid)
-                .and_then(process_group_rss_bytes);
+            let rss = process_group_rss_bytes(pgid);
             let host = host_memory_capacity();
             perf_memory_sample_trip(
                 limit,
@@ -4331,9 +4360,7 @@ fn poll_recovered_queue_job(
                     job.id
                 );
             }
-            if let Some(pgid) = job.process_group_id.or(job.pid) {
-                terminate_process_group_with_grace(pgid, cancel_grace_seconds);
-            }
+            terminate_process_group_with_grace(pgid, cancel_grace_seconds);
             let exit_code = read_exit_code(job.exit_code_path.as_deref());
             let job = get_queue_job_runtime_conn(&conn, &job.id)
                 .ok()
@@ -4342,35 +4369,15 @@ fn poll_recovered_queue_job(
             let final_state =
                 forced_terminal_state_for_holding_reason(job.holding_reason.as_deref())
                     .unwrap_or("memory_exceeded");
-            let _ = finish_queue_job_conn(
-                &conn,
-                &job,
-                final_state,
-                exit_code,
-                Some(&message_queue_db_path),
-            );
-            let _ = admit_pending_queue_jobs_conn(
-                &conn,
-                &state_dir,
-                &message_queue_db_path,
-                cancel_grace_seconds,
-                admission_policy,
-                true,
-            );
-            return;
+            if finish(&conn, &job, final_state, exit_code) {
+                return;
+            }
+            continue;
         }
-        if !process_exists(pid) {
-            let _ =
-                finish_queue_job_conn(&conn, &job, "failed", None, Some(&message_queue_db_path));
-            let _ = admit_pending_queue_jobs_conn(
-                &conn,
-                &state_dir,
-                &message_queue_db_path,
-                cancel_grace_seconds,
-                admission_policy,
-                true,
-            );
-            return;
+        if !group_alive && !process_exists(pid) {
+            if finish(&conn, &job, "failed", None) {
+                return;
+            }
         }
     }
 }
