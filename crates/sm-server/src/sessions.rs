@@ -15576,6 +15576,15 @@ fn now_python_naive_iso() -> String {
 }
 
 fn claude_projects_roots(configured_transcript_root: Option<&str>) -> Vec<PathBuf> {
+    claude_projects_roots_with_env(configured_transcript_root, |key| env::var_os(key))
+}
+
+fn claude_projects_roots_with_env(
+    configured_transcript_root: Option<&str>,
+    env_var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let home = env_var("HOME");
+    let expand_home = |path: &str| expand_home_with(path, home.as_deref());
     let mut roots = Vec::new();
     let mut push = |path: PathBuf| {
         if !roots.contains(&path) {
@@ -15589,7 +15598,7 @@ fn claude_projects_roots(configured_transcript_root: Option<&str>) -> Vec<PathBu
     {
         push(expand_home(root));
     }
-    if let Some(config_dirs) = env::var_os("CLAUDE_CONFIG_DIR") {
+    if let Some(config_dirs) = env_var("CLAUDE_CONFIG_DIR") {
         for config_dir in config_dirs.to_string_lossy().split(',') {
             let config_dir = config_dir.trim();
             if !config_dir.is_empty() {
@@ -15597,7 +15606,7 @@ fn claude_projects_roots(configured_transcript_root: Option<&str>) -> Vec<PathBu
             }
         }
     }
-    if let Some(xdg_config_home) = env::var_os("XDG_CONFIG_HOME")
+    if let Some(xdg_config_home) = env_var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
     {
@@ -15610,16 +15619,20 @@ fn claude_projects_roots(configured_transcript_root: Option<&str>) -> Vec<PathBu
 }
 
 pub fn expand_home(path: &str) -> PathBuf {
+    expand_home_with(path, env::var_os("HOME").as_deref())
+}
+
+fn expand_home_with(path: &str, home: Option<&std::ffi::OsStr>) -> PathBuf {
     if path == "~" {
-        return env::var_os("HOME")
+        return home
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(path));
     }
     let Some(rest) = path.strip_prefix("~/") else {
         return PathBuf::from(path);
     };
-    match env::var_os("HOME") {
-        Some(home) => Path::new(&home).join(rest),
+    match home {
+        Some(home) => Path::new(home).join(rest),
         None => PathBuf::from(path),
     }
 }
@@ -18359,34 +18372,6 @@ sleep 30
         }
     }
 
-    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvVarRestore {
-        key: &'static str,
-        value: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarRestore {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            let previous = env::var_os(key);
-            env::set_var(key, value);
-            Self {
-                key,
-                value: previous,
-            }
-        }
-    }
-
-    impl Drop for EnvVarRestore {
-        fn drop(&mut self) {
-            if let Some(value) = self.value.as_ref() {
-                env::set_var(self.key, value);
-            } else {
-                env::remove_var(self.key);
-            }
-        }
-    }
-
     #[test]
     fn expand_home_handles_bare_home_and_home_relative_paths() {
         let Some(home) = env::var_os("HOME") else {
@@ -18478,22 +18463,27 @@ sleep 30
 
     #[test]
     fn claude_project_roots_include_config_environment_and_defaults() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        // Supply the environment rather than mutating the process-wide one,
+        // which concurrent tests read (sm#1432).
         let root = unique_temp_path("claude-project-roots");
         let home = root.join("home");
         let config_dir_a = root.join("claude-config-a");
         let config_dir_b = root.join("claude-config-b");
         let xdg_dir = root.join("xdg");
         let configured = root.join("configured-projects");
-        let _home = EnvVarRestore::set("HOME", &home);
-        let _config = EnvVarRestore::set(
-            "CLAUDE_CONFIG_DIR",
-            format!("{}, {}", config_dir_a.display(), config_dir_b.display()),
-        );
-        let _xdg = EnvVarRestore::set("XDG_CONFIG_HOME", &xdg_dir);
+        let environment = BTreeMap::from([
+            ("HOME", home.clone().into_os_string()),
+            (
+                "CLAUDE_CONFIG_DIR",
+                format!("{}, {}", config_dir_a.display(), config_dir_b.display()).into(),
+            ),
+            ("XDG_CONFIG_HOME", xdg_dir.clone().into_os_string()),
+        ]);
 
         assert_eq!(
-            claude_projects_roots(Some(configured.to_str().unwrap())),
+            claude_projects_roots_with_env(Some(configured.to_str().unwrap()), |key| {
+                environment.get(key).cloned()
+            }),
             vec![
                 configured,
                 config_dir_a.join("projects"),
@@ -23275,12 +23265,10 @@ sleep 30
 
     #[test]
     fn claude_restore_discovers_missing_transcript_path_from_project_history() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let temp_dir = unique_temp_path("claude-transcript-discovery");
         let home = temp_dir.join("home");
         let working_dir = temp_dir.join("repo");
         fs::create_dir_all(&working_dir).unwrap();
-        let _home_restore = EnvVarRestore::set("HOME", &home);
 
         let transcript_id = "49d072b4-4080-4702-9215-b6e7f04aa2c8";
         let project_dir = home

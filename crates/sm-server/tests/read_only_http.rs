@@ -6037,6 +6037,9 @@ async fn queue_runtime_perf_waits_for_tests_and_blocks_new_tests_through_cooldow
     let message_queue_db = state_file.with_extension("queue-perf-waits-tests-message-queue.db");
     let working_dir = unique_temp_path().with_extension("queue-cwd");
     fs::create_dir_all(&working_dir).unwrap();
+    // The first test holds until released, so the perf job is always submitted
+    // while it runs rather than racing a fixed sleep (sm#1432).
+    let release = working_dir.join("release-first-test");
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
@@ -6063,7 +6066,10 @@ async fn queue_runtime_perf_waits_for_tests_and_blocks_new_tests_through_cooldow
         json!({
             "type": "tests",
             "label": "running test before perf",
-            "script": "sleep 1; printf first-test",
+            "script": format!(
+                "while [ ! -f '{}' ]; do sleep 0.05; done; printf first-test",
+                release.display()
+            ),
             "cwd": working_dir.display().to_string(),
             "notify_target": "run12345",
             "requester_session_id": "run12345",
@@ -6116,6 +6122,7 @@ async fn queue_runtime_perf_waits_for_tests_and_blocks_new_tests_through_cooldow
     assert_eq!(second_test["holding_reason"], "awaiting_tests");
     let second_test_id = second_test["id"].as_str().unwrap().to_owned();
 
+    fs::write(&release, "").unwrap();
     wait_for_queue_job_state(app.clone(), &first_test_id, &["succeeded"]).await;
     let perf_running = wait_for_queue_job_state(app.clone(), &perf_id, &["running"]).await;
     assert_eq!(perf_running["state"], "running");
