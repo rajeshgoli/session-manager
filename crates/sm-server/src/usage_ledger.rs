@@ -16,6 +16,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     usage_burn::UsageBurnStore,
+    usage_db::{PooledConnection, UsageDbPool},
     usage_identity::{Provider, UsageIdentityStore},
 };
 
@@ -141,7 +142,7 @@ struct BurnWindow {
 
 #[derive(Debug, Clone)]
 pub struct UsageLedgerStore {
-    db_path: PathBuf,
+    db: UsageDbPool,
     identity_store: UsageIdentityStore,
     burn_store: UsageBurnStore,
     model_defaults: UsageModelDefaults,
@@ -160,7 +161,7 @@ impl UsageLedgerStore {
         let store = Self {
             identity_store: UsageIdentityStore::new(&db_path)?,
             burn_store: UsageBurnStore::new(&db_path)?,
-            db_path,
+            db: UsageDbPool::new(db_path, USAGE_DB_BUSY_TIMEOUT),
             model_defaults,
         };
         store.initialize()?;
@@ -566,22 +567,8 @@ impl UsageLedgerStore {
         Ok(())
     }
 
-    fn open(&self) -> Result<Connection> {
-        if let Some(parent) = self
-            .db_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create usage DB directory {}", parent.display())
-            })?;
-        }
-        let connection = Connection::open(&self.db_path)
-            .with_context(|| format!("failed to open usage DB {}", self.db_path.display()))?;
-        connection.busy_timeout(USAGE_DB_BUSY_TIMEOUT)?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.pragma_update(None, "foreign_keys", true)?;
-        Ok(connection)
+    fn open(&self) -> Result<PooledConnection> {
+        self.db.get()
     }
 
     pub fn scan(&self, seats: &[UsageSeatMetadata]) -> Result<ScanSummary> {

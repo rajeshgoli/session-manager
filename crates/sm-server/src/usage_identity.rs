@@ -3,15 +3,21 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
+    time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::usage_burn::UsageBurnStore;
+use crate::{
+    usage_burn::UsageBurnStore,
+    usage_db::{PooledConnection, UsageDbPool},
+};
+
+const USAGE_DB_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
     "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:9]Z"
@@ -82,20 +88,20 @@ pub enum ObservationOutcome {
 
 #[derive(Debug, Clone)]
 pub struct UsageIdentityStore {
-    db_path: PathBuf,
+    db: UsageDbPool,
 }
 
 impl UsageIdentityStore {
     pub fn new(db_path: impl Into<PathBuf>) -> Result<Self> {
         let store = Self {
-            db_path: db_path.into(),
+            db: UsageDbPool::new(db_path.into(), USAGE_DB_BUSY_TIMEOUT),
         };
         store.initialize()?;
         Ok(store)
     }
 
     pub fn db_path(&self) -> &Path {
-        &self.db_path
+        self.db.db_path()
     }
 
     fn initialize(&self) -> Result<()> {
@@ -155,22 +161,8 @@ impl UsageIdentityStore {
         Ok(())
     }
 
-    fn open(&self) -> Result<Connection> {
-        if let Some(parent) = self
-            .db_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create usage DB directory {}", parent.display())
-            })?;
-        }
-        let conn = Connection::open(&self.db_path)
-            .with_context(|| format!("failed to open usage DB {}", self.db_path.display()))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "busy_timeout", 5000_i64)?;
-        conn.pragma_update(None, "foreign_keys", true)?;
-        Ok(conn)
+    fn open(&self) -> Result<PooledConnection> {
+        self.db.get()
     }
 
     /// Persist one successful read of a provider's identity surface.
@@ -333,7 +325,7 @@ impl UsageIdentityStore {
         let conn = self.open()?;
         let message_ts = format_timestamp(message_at)?;
         let covering = conn
-            .query_row(
+            .prepare_cached(
                 r#"
                 SELECT account_key, is_assumed, from_ts, to_ts
                 FROM account_timeline
@@ -343,31 +335,31 @@ impl UsageIdentityStore {
                 ORDER BY from_ts DESC
                 LIMIT 1
                 "#,
-                params![provider.as_str(), message_ts],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, bool>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                    ))
-                },
-            )
+            )?
+            .query_row(params![provider.as_str(), message_ts], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, bool>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
             .optional()?;
         let Some((account_key, is_assumed, from_ts, to_ts)) = covering else {
             return Ok(None);
         };
 
         let uncertainty = if let Some(boundary) = to_ts.as_deref() {
-            conn.query_row(
+            conn.prepare_cached(
                 r#"
                 SELECT from_uncertain_ms
                 FROM account_timeline
                 WHERE provider = ?1 AND from_ts = ?2
                 "#,
-                params![provider.as_str(), boundary],
-                |row| row.get::<_, i64>(0),
-            )
+            )?
+            .query_row(params![provider.as_str(), boundary], |row| {
+                row.get::<_, i64>(0)
+            })
             .optional()?
             .unwrap_or(0)
         } else {
@@ -773,6 +765,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+    use rusqlite::Connection;
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
