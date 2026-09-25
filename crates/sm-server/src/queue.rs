@@ -5352,6 +5352,8 @@ fn list_queue_jobs_conn(
         if value == "done" {
             where_clauses
                 .push("state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded')");
+        } else if value == "active" {
+            where_clauses.push("state IN ('pending', 'running')");
         } else {
             where_clauses.push("state = ?");
             values.push(value.into());
