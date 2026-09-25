@@ -1,6 +1,6 @@
 {
   "accepted_messages": 4,
-  "message_ids": ["msg-parent", "msg-shared", "msg-resume", "codex:codex-thread-1:2"],
+  "message_ids": ["msg-parent", "msg-shared", "msg-resume", "codex:codex-thread-1:t150"],
   "aliases": {
     "exact": 5,
     "loose": 4,
