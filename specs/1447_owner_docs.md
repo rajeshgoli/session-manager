@@ -356,7 +356,13 @@ reader's navigation override re-sends it. Tokens never go in URLs.
 
 ### Review client (the injected script)
 
-Plain JS, no dependencies, about 30 KB. It must not break the doc's own scripts
+Plain JS, no dependencies, about 30 KB. Its floating controls (header bar, banners,
+comment button, sheets) are placed against the **visual** viewport, not the layout
+one: on a phone, a page wider than the screen widens the layout viewport, pinch zoom
+shows only part of it and the keyboard covers its bottom, so a control pinned to the
+layout viewport's edge can be off-screen. The client keeps one container at the
+visual viewport's offset and size, scaled by `1/scale` so controls keep their size,
+and positions every floating control inside it. It must not break the doc's own scripts
 (for example the memo dark-mode toggle): namespace everything under `window.__smDoc`
 and use a shadow DOM for its UI.
 
