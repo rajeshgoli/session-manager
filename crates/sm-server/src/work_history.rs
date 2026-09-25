@@ -990,15 +990,16 @@ impl HistoryData {
             .iter()
             .filter_map(|c| c.worktree_path.as_deref())
             .collect();
+        // Retire cleanup records the path with symlinks resolved.
         let left = paths.iter().any(|path| {
-            self.index
-                .worktree_latest
-                .get(*path)
-                .map(|&i| &self.events[i])
-                .is_some_and(|event| {
-                    event.kind == "worktree.left"
-                        && event.payload["reason"].as_str() != Some("absent")
-                })
+            let latest = self.index.worktree_latest.get(*path).or_else(|| {
+                self.index
+                    .worktree_latest
+                    .get(&crate::work_claims::worktrees::path_key(path))
+            });
+            latest.map(|&i| &self.events[i]).is_some_and(|event| {
+                event.kind == "worktree.left" && event.payload["reason"].as_str() != Some("absent")
+            })
         });
         if left {
             flags.push(Flag::WorktreeLeft);

@@ -321,8 +321,8 @@ pub enum GitHubPullRequestState {
 
 mod claims;
 mod docs;
-mod worktrees;
 mod history;
+mod worktrees;
 pub use docs::{
     DocFetchError, DocPullRequest, DocReviewOnGitHub, OwnerDocSource, SubmittedDocReview,
 };

@@ -283,7 +283,7 @@ fn retired_sessions(
 
 /// The key a path is deduplicated and recorded under: symlinks resolved
 /// when it exists, without a trailing slash.
-fn path_key(path: &str) -> String {
+pub(crate) fn path_key(path: &str) -> String {
     let trimmed = path.trim();
     let trimmed = if trimmed.len() > 1 {
         trimmed.trim_end_matches('/')
