@@ -5216,35 +5216,49 @@ fn codex_review_request_ttl_remaining(registration: &CodexReviewRequestRegistrat
     Duration::from_millis(remaining.whole_milliseconds().max(0) as u64)
 }
 
+/// A plain stop is not terminal: a crashed or relaunched seat is restored under
+/// the same id, and the review wake waits in its queue until then. Only a
+/// missing or retired seat ends the request early; the TTL bounds the rest. A
+/// failed state read is not evidence the seat is gone, so it keeps waiting.
 fn codex_review_request_local_terminal_reason(
     state: &AppState,
     registration: &CodexReviewRequestRegistration,
-) -> anyhow::Result<Option<(&'static str, String)>> {
+) -> Option<(&'static str, String)> {
     if codex_review_request_expired(registration) {
-        return Ok(Some((
+        return Some((
             "expired",
             format!(
                 "Codex review request exceeded its {} second TTL",
                 CODEX_REVIEW_REQUEST_TTL_SECONDS
             ),
-        )));
+        ));
     }
-    let notify_session = state
+    let notify_session = match state
         .session_store
-        .get_session(&registration.notify_session_id)?;
+        .get_session(&registration.notify_session_id)
+    {
+        Ok(notify_session) => notify_session,
+        Err(error) => {
+            eprintln!(
+                "Codex review request {} could not read notify session {}; keeping it active: {error:#}",
+                registration.id, registration.notify_session_id
+            );
+            return None;
+        }
+    };
     if notify_session
         .as_ref()
-        .is_none_or(SessionRecord::is_stopped)
+        .is_none_or(SessionRecord::is_retired)
     {
-        return Ok(Some((
+        return Some((
             "notify_inactive",
             format!(
-                "Notify session {} no longer exists or is stopped",
+                "Notify session {} no longer exists or is retired",
                 registration.notify_session_id
             ),
-        )));
+        ));
     }
-    Ok(None)
+    None
 }
 
 fn terminate_codex_review_request_for_local_condition(
@@ -5254,7 +5268,6 @@ fn terminate_codex_review_request_for_local_condition(
 ) -> Result<bool, String> {
     let Some((terminal_state, reason)) =
         codex_review_request_local_terminal_reason(state, registration)
-            .map_err(|error| error.to_string())?
     else {
         return Ok(false);
     };
@@ -5399,43 +5412,35 @@ fn recover_codex_review_request_watchers(state: Arc<AppState>) {
     match RetainedQueueStore::list_active_codex_review_requests_from_path(&queue_db_path) {
         Ok(registrations) => {
             for registration in registrations {
-                match codex_review_request_local_terminal_reason(&state, &registration) {
-                    Ok(Some((terminal_state, reason))) => {
-                        match terminate_codex_review_request_for_reason(
-                            &state,
-                            &queue_db_path,
-                            &registration,
-                            terminal_state,
-                            &reason,
-                            false,
-                        ) {
-                            Ok(Some(terminated)) => {
-                                // Nothing else drains ordinary queued messages
-                                // at startup, so deliver the expiry wake here,
-                                // on a blocking task to keep tmux off startup.
-                                let state = state.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    deliver_codex_review_wake_now(&state, &terminated)
-                                });
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                eprintln!(
-                                    "Codex review request recovery failed to terminate {}: {error:#}",
-                                    registration.id
-                                );
-                            }
+                if let Some((terminal_state, reason)) =
+                    codex_review_request_local_terminal_reason(&state, &registration)
+                {
+                    match terminate_codex_review_request_for_reason(
+                        &state,
+                        &queue_db_path,
+                        &registration,
+                        terminal_state,
+                        &reason,
+                        false,
+                    ) {
+                        Ok(Some(terminated)) => {
+                            // Nothing else drains ordinary queued messages
+                            // at startup, so deliver the expiry wake here,
+                            // on a blocking task to keep tmux off startup.
+                            let state = state.clone();
+                            tokio::task::spawn_blocking(move || {
+                                deliver_codex_review_wake_now(&state, &terminated)
+                            });
                         }
-                        continue;
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!(
+                                "Codex review request recovery failed to terminate {}: {error:#}",
+                                registration.id
+                            );
+                        }
                     }
-                    Ok(None) => {}
-                    Err(error) => {
-                        eprintln!(
-                            "Codex review request recovery failed to inspect {}: {error:#}",
-                            registration.id
-                        );
-                        continue;
-                    }
+                    continue;
                 }
                 spawn_codex_review_request_watcher(state.clone(), registration.id);
             }

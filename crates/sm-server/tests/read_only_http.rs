@@ -3575,7 +3575,7 @@ async fn codex_review_request_watcher_terminates_when_pr_closes() {
 }
 
 #[tokio::test]
-async fn codex_review_request_watcher_terminates_when_notify_session_stops() {
+async fn codex_review_request_watcher_waits_on_stopped_and_terminates_on_retired_notify_session() {
     let state_file = write_session_fixture();
     let queue_db = state_file.with_extension("codex-review-notify-stops.db");
     let poster = StubGitHubReviewPoster::successful();
@@ -3606,31 +3606,116 @@ async fn codex_review_request_watcher_terminates_when_notify_session_stops() {
     assert_eq!(status, StatusCode::OK);
     let request_id = payload["id"].as_str().unwrap().to_owned();
 
-    let mut state_payload: Value = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
-    state_payload["sessions"][0]["status"] = json!("stopped");
-    fs::write(&state_file, state_payload.to_string()).unwrap();
-
-    let mut row = None;
-    for _ in 0..30 {
-        let current: (String, i64, Option<String>) = Connection::open(&queue_db)
+    let read_row = || -> (String, i64, Option<String>) {
+        Connection::open(&queue_db)
             .unwrap()
             .query_row(
                 "SELECT state, is_active, last_error FROM codex_review_request_registrations WHERE id = ?1",
                 [&request_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .unwrap();
+            .unwrap()
+    };
+
+    // A plain stop (crash, provider exit) is restorable under the same id, so
+    // the request keeps waiting across several one-second reconcile ticks.
+    let mut state_payload: Value = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+    state_payload["sessions"][0]["status"] = json!("stopped");
+    fs::write(&state_file, state_payload.to_string()).unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let stopped_row = read_row();
+    assert_eq!(
+        stopped_row.1, 1,
+        "a stopped notify session must not end the request"
+    );
+    assert_ne!(stopped_row.0, "notify_inactive");
+
+    state_payload["sessions"][0]["completion_status"] = json!("retired");
+    fs::write(&state_file, state_payload.to_string()).unwrap();
+    let mut row = None;
+    for _ in 0..30 {
+        let current = read_row();
         if current.0 == "notify_inactive" {
             row = Some(current);
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let row = row.expect("stopped notify session should terminate its review watcher");
+    let row = row.expect("retired notify session should terminate its review watcher");
     assert_eq!(row.1, 0);
     assert!(row
         .2
-        .is_some_and(|reason| reason.contains("no longer exists or is stopped")));
+        .is_some_and(|reason| reason.contains("no longer exists or is retired")));
+}
+
+#[tokio::test]
+async fn codex_review_request_watcher_survives_unreadable_session_state() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("codex-review-unreadable-state.db");
+    let poster = StubGitHubReviewPoster::successful();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster)));
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 971,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "run12345",
+            "poll_interval_seconds": 1,
+            "retry_interval_seconds": 900
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let request_id = payload["id"].as_str().unwrap().to_owned();
+    let read_row = || -> (String, i64) {
+        Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state, is_active FROM codex_review_request_registrations WHERE id = ?1",
+                [&request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+
+    // A failed read is not evidence the notify session is gone.
+    let valid_state = fs::read(&state_file).unwrap();
+    fs::write(&state_file, "{ not json").unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let row = read_row();
+    assert_eq!(
+        row.1, 1,
+        "an unreadable state file must not end the request"
+    );
+    assert_ne!(row.0, "notify_inactive");
+
+    // The watcher is still running: once the state is readable again, it
+    // reacts to a retirement.
+    let mut state_payload: Value = serde_json::from_slice(&valid_state).unwrap();
+    state_payload["sessions"][0]["status"] = json!("stopped");
+    state_payload["sessions"][0]["completion_status"] = json!("retired");
+    fs::write(&state_file, state_payload.to_string()).unwrap();
+    let mut terminated = false;
+    for _ in 0..30 {
+        if read_row().0 == "notify_inactive" {
+            terminated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(terminated, "watcher should survive the failed read");
 }
 
 #[tokio::test]
@@ -3968,20 +4053,20 @@ async fn codex_review_request_recovery_terminates_missing_notify_session() {
     assert!(row
         .2
         .as_deref()
-        .is_some_and(|reason| reason.contains("no longer exists or is stopped")));
+        .is_some_and(|reason| reason.contains("no longer exists or is retired")));
 }
 
 #[tokio::test]
-async fn codex_review_request_recovery_terminates_stopped_notify_session() {
+async fn codex_review_request_recovery_terminates_retired_notify_session() {
     let state_file = unique_temp_path();
-    let queue_db = state_file.with_extension("codex-review-recover-stopped-notify.db");
+    let queue_db = state_file.with_extension("codex-review-recover-retired-notify.db");
     fs::write(
         &state_file,
         json!({
             "sessions": [{
                 "id": "notify-stopped", "name": "notify-stopped", "working_dir": "/repo/notify",
                 "tmux_session": "notify-stopped", "log_file": "/tmp/notify-stopped.log",
-                "status": "stopped", "created_at": "2026-06-01T00:00:00Z",
+                "status": "stopped", "completion_status": "retired", "created_at": "2026-06-01T00:00:00Z",
                 "last_activity": "2026-06-01T00:01:00Z"
             }]
         })
@@ -4010,6 +4095,51 @@ async fn codex_review_request_recovery_terminates_stopped_notify_session() {
         )
         .unwrap();
     assert_eq!(row, ("notify_inactive".to_owned(), 0));
+}
+
+#[tokio::test]
+async fn codex_review_request_recovery_keeps_stopped_notify_session_active() {
+    let state_file = unique_temp_path();
+    let queue_db = state_file.with_extension("codex-review-recover-stopped-notify.db");
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [{
+                "id": "notify-stopped", "name": "notify-stopped", "working_dir": "/repo/notify",
+                "tmux_session": "notify-stopped", "log_file": "/tmp/notify-stopped.log",
+                "status": "stopped", "created_at": "2026-06-01T00:00:00Z",
+                "last_activity": "2026-06-01T00:01:00Z"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    create_active_codex_review_request_fixture_db(&queue_db, "stopped-notify", "notify-stopped", 1);
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.runtime_enabled = true;
+    let _app = router(
+        AppState::new(config)
+            .with_github_review_poster(Arc::new(StubGitHubReviewPoster::successful())),
+    );
+
+    let row: (String, i64) = Connection::open(&queue_db)
+        .unwrap()
+        .query_row(
+            "SELECT state, is_active FROM codex_review_request_registrations WHERE id = 'stopped-notify'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_ne!(row.0, "notify_inactive");
+    assert_eq!(row.1, 1, "a restorable stopped session keeps its request");
 }
 
 #[tokio::test]

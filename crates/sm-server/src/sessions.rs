@@ -16802,6 +16802,13 @@ impl SessionRecord {
             || completion_status_is_retired(self.completion_status.as_deref())
     }
 
+    /// Retired or killed by an operator or the agent itself. Unlike a plain
+    /// stop (a crash, a provider exit, a codex-fork shutdown event), this is
+    /// the end of the seat's work, not a pause before `sm restore`.
+    pub(crate) fn is_retired(&self) -> bool {
+        completion_status_is_retired(self.completion_status.as_deref())
+    }
+
     fn is_live_for_registry(&self) -> bool {
         !self.is_stopped()
     }
