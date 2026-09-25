@@ -25,6 +25,8 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::owner_docs::{repo_name, validate_repo_slug};
 
+pub mod worktrees;
+
 /// At most this many aliases per GraphQL call (about 20 KB of output).
 pub const MAX_ALIASES_PER_QUERY: usize = 50;
 /// A spawn reservation older than this is settled at the next recovery.

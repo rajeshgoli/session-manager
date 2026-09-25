@@ -302,23 +302,33 @@ pub(super) async fn post_claim(
             taken,
             notes,
             warnings,
-        } => Ok((
-            StatusCode::CREATED,
-            Json(json!({
+        } => {
+            let mut body = json!({
                 "outcome": if taken { "taken" } else { "claimed" },
                 "claim": claim_json(&state, &claim.id)?,
                 "notes": notes,
                 "warnings": warnings,
-            })),
-        )
-            .into_response()),
-        ClaimOutcome::AlreadyHeld { claim, notes } => Ok(Json(json!({
-            "outcome": "already_held",
-            "claim": claim_json(&state, &claim.id)?,
-            "notes": notes,
-        }))
-        .into_response()),
+            });
+            add_worktree_naming(&state, kind, &claim.repo, &mut body);
+            Ok((StatusCode::CREATED, Json(body)).into_response())
+        }
+        ClaimOutcome::AlreadyHeld { claim, notes } => {
+            let mut body = json!({
+                "outcome": "already_held",
+                "claim": claim_json(&state, &claim.id)?,
+                "notes": notes,
+            });
+            add_worktree_naming(&state, kind, &claim.repo, &mut body);
+            Ok(Json(body).into_response())
+        }
         outcome => Err(claim_failure(outcome)),
+    }
+}
+
+/// Ticket claims tell `sm ticket --setup-worktree` where worktrees go.
+fn add_worktree_naming(state: &AppState, kind: WorkKind, repo: &str, body: &mut Value) {
+    if kind == WorkKind::Ticket {
+        body["worktree_naming"] = worktrees::worktree_naming(&state.config, repo);
     }
 }
 
@@ -580,8 +590,9 @@ fn idle_sessions(state: &AppState) -> anyhow::Result<Vec<IdleSession>> {
 
 /// Startup and every sync pass: backfill once, settle old spawn
 /// reservations, end claims of retired sessions, reconcile implicit claims,
-/// fetch the tracked set from GitHub (appendices B, D, E), then run the
-/// open-work checks: A, any Check B still due, and C (appendix F).
+/// fetch the tracked set from GitHub (appendices B, D, E), run the
+/// open-work checks: A, any Check B still due, and C (appendix F), then
+/// delete the worktrees retire left pending (appendix G).
 pub(super) fn run_sync_pass(state: &AppState) -> anyhow::Result<()> {
     let store = work_claim_store(state);
     if !expand_home(&state.config.sm_send.db_path).exists() {
@@ -622,6 +633,7 @@ pub(super) fn run_sync_pass(state: &AppState) -> anyhow::Result<()> {
     notified.sort();
     notified.dedup();
     deliver_claim_notices(state, &notified);
+    worktrees::run_cleanup_pass(state)?;
     Ok(())
 }
 

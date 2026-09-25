@@ -107,6 +107,8 @@ enum Command {
     Ticket(claims::TicketArgs),
     /// Claim the PR you work on; no number uses the current branch's PR
     Pr(claims::PrArgs),
+    /// Keep a worktree past your retirement
+    Worktree(claims::worktree::WorktreeArgs),
 }
 
 #[derive(Args)]
@@ -1081,6 +1083,9 @@ fn run() -> Result<()> {
                 )?
             };
             println!("{}", retire_response_status(&payload, &args.session_id)?);
+            for line in claims::worktree::retire_worktree_lines(&payload) {
+                println!("{line}");
+            }
         }
         Command::Reparent(args) => run_reparent(&client, args)?,
         Command::ReparentTree(args) => run_reparent_tree(&client, args)?,
@@ -1238,6 +1243,7 @@ fn run() -> Result<()> {
         Command::Doc(args) => doc::run_doc(&client, args)?,
         Command::Ticket(args) => claims::run_ticket(&client, args)?,
         Command::Pr(args) => claims::run_pr(&client, args)?,
+        Command::Worktree(args) => claims::worktree::run_worktree(&client, args)?,
         _ => bail!("this retained command is not implemented in the Rust core slice yet"),
     }
     Ok(())

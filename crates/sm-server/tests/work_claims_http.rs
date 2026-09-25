@@ -704,3 +704,174 @@ async fn the_sync_pass_runs_check_c_for_an_idle_holder_waiting_on_nothing() {
     f.state.run_work_claims_sync_pass().unwrap();
     assert_eq!(claim_texts(&f, "lead0001").len(), 1);
 }
+
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// A repo with one commit and a linked worktree on `branch`: (path, HEAD).
+fn git_worktree(dir: &std::path::Path, branch: &str) -> (String, String) {
+    let main = dir.join("main");
+    fs::create_dir_all(&main).unwrap();
+    git(&main, &["init", "-q", "-b", "main"]);
+    git(
+        &main,
+        &[
+            "-c",
+            "user.email=t@e",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    );
+    let path = dir.join(branch);
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            branch,
+            path.to_str().unwrap(),
+        ],
+    );
+    let path = fs::canonicalize(path).unwrap().display().to_string();
+    let head = git(std::path::Path::new(&path), &["rev-parse", "HEAD"]);
+    (path, head)
+}
+
+#[tokio::test]
+async fn setup_intent_keep_and_the_retire_response_worktrees() {
+    let f = fixture();
+    let (path, head) = git_worktree(&f.dir, "1-item-1");
+
+    // A ticket claim says where worktrees go.
+    let (status, body) = claim(&f, "eng00001", "ticket", 1, json!({"worktree_path": null})).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let home = std::env::var("HOME").unwrap();
+    assert_eq!(body["worktree_naming"]["root"], format!("{home}/worktrees"));
+    assert_eq!(body["worktree_naming"]["prefix"], "widgets");
+    let claim_id = body["claim"]["id"].as_str().unwrap().to_owned();
+
+    let worktree = |who: &str, id: &str, state: &str| {
+        json!({"requester_session_id": who, "claim_id": id, "state": state,
+               "worktree_path": path, "branch": "1-item-1", "base_sha": head})
+    };
+    for state in ["intent", "created"] {
+        let (status, body) = request(
+            &f.app,
+            "POST",
+            "/claims/worktree",
+            Some(worktree("eng00001", &claim_id, state)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["claim"]["managed_worktree"], true);
+        assert_eq!(body["claim"]["worktree_path"], path);
+        assert_eq!(body["claim"]["base_sha"], head);
+    }
+    // A rerun that reuses the worktree sends no base and keeps the recorded one.
+    let mut rerun = worktree("eng00001", &claim_id, "intent");
+    rerun["base_sha"] = Value::Null;
+    let (status, body) = request(&f.app, "POST", "/claims/worktree", Some(rerun)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["claim"]["base_sha"], head);
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/claims/worktree",
+        Some(worktree("eng00002", &claim_id, "intent")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "not the caller's claim");
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/claims/worktree",
+        Some(worktree("eng00001", &claim_id, "done")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Any managed session may keep it; the keep survives and holds it.
+    let keep = |off: bool| {
+        json!({"requester_session_id": "other001", "path": path, "reason": "server on :8421",
+               "off": off})
+    };
+    let (status, body) = request(&f.app, "POST", "/worktrees/keep", Some(keep(false))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({"path": path, "kept": true, "reason": "server on :8421"})
+    );
+    let (status, body) =
+        request(&f.app, "POST", "/sessions/eng00001/retire", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["worktrees"],
+        json!([{"path": path, "removed": false, "reason": "kept: server on :8421"}])
+    );
+    assert!(std::path::Path::new(&path).exists());
+
+    // Cleared: the next pass deletes it.
+    let (status, body) = request(&f.app, "POST", "/worktrees/keep", Some(keep(true))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["kept"], false);
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert!(!std::path::Path::new(&path).exists());
+    let kinds = f
+        .store()
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind.starts_with("worktree."))
+        .map(|event| (event.kind, event.payload["reason"].clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            ("worktree.left".to_owned(), json!("kept: server on :8421")),
+            ("worktree.removed".to_owned(), json!("no commits")),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn retire_deletes_a_managed_worktree_left_at_its_base() {
+    let f = fixture();
+    let (path, head) = git_worktree(&f.dir, "1-item-1");
+    let (_, body) = claim(&f, "eng00002", "ticket", 1, json!({"worktree_path": null})).await;
+    let claim_id = body["claim"]["id"].as_str().unwrap().to_owned();
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/claims/worktree",
+        Some(
+            json!({"requester_session_id": "eng00002", "claim_id": claim_id,
+                    "state": "intent", "worktree_path": path, "branch": "1-item-1",
+                    "base_sha": head}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) =
+        request(&f.app, "POST", "/sessions/eng00002/retire", Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["worktrees"],
+        json!([{"path": path, "removed": true, "reason": "no commits"}])
+    );
+    assert!(!std::path::Path::new(&path).exists());
+}

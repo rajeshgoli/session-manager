@@ -5,6 +5,8 @@
 use super::*;
 use crate::git_repo::{resolve_repo_slug, run_ok, DocTools, ProcessTools};
 
+pub(crate) mod worktree;
+
 /// A refused claim: another live agent holds the item.
 pub(crate) const EXIT_COLLISION: i32 = 3;
 
@@ -21,6 +23,20 @@ pub(crate) struct TicketArgs {
     /// End your claim on this ticket
     #[arg(long, value_name = "N", conflicts_with = "number")]
     release: Option<i64>,
+    /// Then create the ticket's worktree (optionally named by SLUG)
+    #[arg(
+        long = "setup-worktree",
+        value_name = "SLUG",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "",
+        requires = "number",
+        conflicts_with = "release"
+    )]
+    setup_worktree: Option<String>,
+    /// The commit the new branch starts from (default: origin's default branch)
+    #[arg(long, value_name = "REF", requires = "setup_worktree")]
+    base: Option<String>,
 }
 
 #[derive(Args)]
@@ -127,6 +143,17 @@ pub(crate) fn run_ticket(client: &ApiClient, args: TicketArgs) -> Result<()> {
         return list_claims(client, &session_id);
     };
     let target = resolve_claim_target(&ProcessTools, &cwd, args.repo.as_deref())?;
+    if let Some(slug) = args.setup_worktree.as_deref() {
+        return worktree::run_setup(
+            client,
+            &session_id,
+            number,
+            &target,
+            args.take,
+            slug,
+            args.base.as_deref(),
+        );
+    }
     claim(
         client,
         &session_id,
@@ -178,22 +205,33 @@ fn claim(
     let response = client.request(
         "POST",
         "/claims",
-        Some(json!({
-            "requester_session_id": session_id,
-            "kind": kind,
-            "repo": target.repo,
-            "number": number,
-            "take": take,
-            "worktree_path": target.worktree_path,
-            "branch": target.branch,
-            "tickets": tickets,
-        })),
+        Some(claim_body(session_id, kind, number, target, take, tickets)),
     )?;
     let body: Value = serde_json::from_str(&response.body).unwrap_or(Value::Null);
     let printed = claim_output(kind, number, response.status, &body, |path| {
         client.url_for(path)
     });
     finish(printed)
+}
+
+fn claim_body(
+    session_id: &str,
+    kind: &str,
+    number: i64,
+    target: &ClaimTarget,
+    take: bool,
+    tickets: &[i64],
+) -> Value {
+    json!({
+        "requester_session_id": session_id,
+        "kind": kind,
+        "repo": target.repo,
+        "number": number,
+        "take": take,
+        "worktree_path": target.worktree_path,
+        "branch": target.branch,
+        "tickets": tickets,
+    })
 }
 
 fn release(
@@ -415,7 +453,7 @@ pub(crate) fn coarse_age(timestamp: &str) -> String {
     }
 }
 
-fn home_relative(path: &str) -> String {
+pub(crate) fn home_relative(path: &str) -> String {
     match env::var("HOME") {
         Ok(home) if !home.is_empty() && path.starts_with(&format!("{home}/")) => {
             format!("~{}", &path[home.len()..])
