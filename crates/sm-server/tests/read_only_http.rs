@@ -17292,6 +17292,7 @@ async fn runtime_core_claude_spawn_brief_never_retries_an_unobserved_submission(
         &tmux_socket,
         false,
         false,
+        false,
     );
 
     let (status, payload) = post_json(
@@ -17346,6 +17347,7 @@ async fn runtime_core_claude_spawn_brief_accepts_matching_nested_transcript_user
         &tmux_socket,
         true,
         true,
+        true,
     );
 
     let (status, payload) = post_json(
@@ -17378,6 +17380,67 @@ async fn runtime_core_claude_spawn_brief_accepts_matching_nested_transcript_user
     );
     let logs = fs::read_to_string(launch["log_file"].as_str().unwrap()).unwrap_or_default();
     assert_eq!(logs.matches("received:CLAUDE_ACCEPTED_SENTINEL").count(), 1);
+}
+
+/// Regression for #1521: Claude 2.1.280 writes no transcript before the first
+/// turn, so waiting for one before submitting the brief deadlocked every spawn.
+#[tokio::test]
+async fn runtime_core_claude_spawn_brief_accepts_transcript_created_by_the_brief() {
+    if !tmux_available() {
+        return;
+    }
+    let state_file = unique_temp_path();
+    let log_dir = unique_temp_path();
+    let working_dir = unique_temp_path();
+    fs::create_dir_all(&working_dir).unwrap();
+    let tmux_socket = format!(
+        "sm-rust-test-claude-brief-lazy-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
+    let app = runtime_app_with_structured_claude_provider(
+        &state_file,
+        &log_dir,
+        &tmux_socket,
+        true,
+        false,
+        false,
+    );
+
+    let (status, payload) = post_json(
+        app,
+        "/sessions",
+        json!({
+            "id": "claudelazy",
+            "name": "claude-lazy",
+            "working_dir": working_dir.display().to_string(),
+            "provider": "claude",
+            "initial_message": "CLAUDE_LAZY_SENTINEL",
+            "spawn_prompt_source": {"kind": "positional"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let launch = &state["session_runtime_launches"][0];
+    assert_eq!(launch["status"], "applied");
+    let provider_session_id = launch["provider_resume_id"].as_str().unwrap();
+    assert_eq!(provider_session_id.len(), 36);
+    assert_eq!(provider_session_id.as_bytes()[14], b'4');
+    assert!(matches!(
+        provider_session_id.as_bytes()[19],
+        b'8' | b'9' | b'a' | b'b'
+    ));
+    assert_eq!(
+        state["sessions"][0]["provider_resume_id"],
+        provider_session_id
+    );
+    let logs = fs::read_to_string(launch["log_file"].as_str().unwrap()).unwrap_or_default();
+    assert_eq!(logs.matches("received:CLAUDE_LAZY_SENTINEL").count(), 1);
 }
 
 #[tokio::test]
@@ -22338,6 +22401,7 @@ fn runtime_app_with_structured_claude_provider(
     tmux_socket: &str,
     acknowledge: bool,
     nested_transcript: bool,
+    transcript_at_startup: bool,
 ) -> axum::Router {
     fs::create_dir_all(log_dir).unwrap();
     let transcript_root = state_file.with_extension("claude-projects");
@@ -22358,6 +22422,15 @@ fn runtime_app_with_structured_claude_provider(
 "#,
     )
     .unwrap_or_default();
+    // Claude 2.1.280 creates its transcript only when the first turn arrives.
+    let create_transcript = r#"mkdir -p "$(dirname "$transcript")"
+[ -f "$transcript" ] || printf '{"type":"mode","sessionId":"%s"}\n' "$session_id" > "$transcript"
+"#;
+    let (startup_transcript, first_turn_transcript) = if transcript_at_startup {
+        (create_transcript, "")
+    } else {
+        ("", create_transcript)
+    };
     fs::write(
         &provider,
         format!(
@@ -22370,16 +22443,13 @@ for argument in "$@"; do
 done
 project_dir=$(pwd -P | sed 's#/#-#g')
 {transcript_layout}
-mkdir -p "$(dirname "$transcript")"
-printf '{{"type":"mode","sessionId":"%s"}}\n' "$session_id" > "$transcript"
-printf 'renderer layout deliberately irrelevant\n❯'
+{startup_transcript}printf 'renderer layout deliberately irrelevant\n❯'
 while IFS= read -r line; do
   printf 'received:%s\n' "$line"
-{}
+{first_turn_transcript}{acknowledgement}
   printf 'renderer changed again\n❯'
 done
-"#,
-            acknowledgement
+"#
         ),
     )
     .unwrap();

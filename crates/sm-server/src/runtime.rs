@@ -1627,9 +1627,29 @@ impl TmuxRuntime {
                 if self.session_has_attached_clients(&spec.tmux_session)? {
                     bail!("refusing to submit the initial Claude spawn brief while a tmux client is attached");
                 }
-                let (transcript_path, transcript_offset) =
-                    self.wait_for_claude_initial_brief_transcript(spec)?;
+                let provider_session_id = spec.claude_session_id.as_deref().ok_or_else(|| {
+                    InitialBriefDeliveryError::ProviderAcknowledgementUnavailable {
+                        provider: "claude".to_owned(),
+                    }
+                })?;
+                if self.claude_projects_roots.is_empty() {
+                    return Err(
+                        InitialBriefDeliveryError::ProviderAcknowledgementUnavailable {
+                            provider: "claude".to_owned(),
+                        }
+                        .into(),
+                    );
+                }
                 self.wait_for_claude_initial_brief_composer(&spec.tmux_session)?;
+                // Claude 2.1.280 creates its transcript only when the first
+                // user turn is submitted, so the transcript cannot gate
+                // readiness. Record any transcript an older Claude already
+                // wrote so acceptance counts only turns appended after it.
+                let transcript = ClaudeInitialBriefTranscript::before_submission(
+                    &self.claude_projects_roots,
+                    &spec.working_dir,
+                    provider_session_id,
+                );
                 // The input lock coordinates session-manager writers, but a
                 // human tmux client can attach while waiting for Claude to
                 // finish startup. Check again at the send boundary so an
@@ -1640,11 +1660,7 @@ impl TmuxRuntime {
                 self.send_text_then_enter(&spec.tmux_session, prompt)?;
                 self.wait_for_claude_initial_brief_acceptance(
                     &spec.tmux_session,
-                    &transcript_path,
-                    transcript_offset,
-                    spec.claude_session_id
-                        .as_deref()
-                        .expect("verified Claude spawn briefs have a provider session ID"),
+                    &transcript,
                     prompt,
                 )
             }
@@ -1657,10 +1673,8 @@ impl TmuxRuntime {
         }
     }
 
-    /// Wait until Claude has both initialized its provider transcript and
-    /// exposed an empty composer at the live cursor. A transcript proves which
-    /// provider session will acknowledge the brief, but it can precede the
-    /// interactive UI while Claude shows startup or onboarding screens.
+    /// Wait until Claude exposes an empty composer at the live cursor. Startup
+    /// and onboarding screens precede the interactive UI.
     fn wait_for_claude_initial_brief_composer(&self, tmux_session: &str) -> Result<()> {
         let deadline = Instant::now() + self.initial_brief_ready_timeout;
         loop {
@@ -1804,26 +1818,24 @@ impl TmuxRuntime {
         }
     }
 
-    /// Claude has no structured event stream.  Its only provider-originated
-    /// acknowledgement is the composer leaving the verified empty state and
-    /// the main turn entering its active UI state.  We do not resend if that
-    /// transition is missing: the original Enter may already have been seen.
+    /// Claude has no structured event stream.  Its provider-originated
+    /// acknowledgement is the exact user turn it appends to the transcript for
+    /// the generated provider session.  We do not resend if that turn is
+    /// missing: the original Enter may already have been seen.
     fn wait_for_claude_initial_brief_acceptance(
         &self,
         tmux_session: &str,
-        transcript_path: &Path,
-        transcript_offset: u64,
-        provider_session_id: &str,
+        transcript: &ClaudeInitialBriefTranscript,
         prompt: &str,
     ) -> Result<()> {
         let deadline = Instant::now() + self.initial_brief_ack_timeout;
+        let mut next_nested_scan = Instant::now();
         loop {
-            if claude_transcript_has_matching_user_turn(
-                transcript_path,
-                transcript_offset,
-                provider_session_id,
-                prompt,
-            ) {
+            let scan_nested = Instant::now() >= next_nested_scan;
+            if scan_nested {
+                next_nested_scan = Instant::now() + Duration::from_millis(250);
+            }
+            if transcript.has_accepted(prompt, scan_nested) {
                 return Ok(());
             }
             if !self.session_exists(tmux_session)? {
@@ -1834,71 +1846,6 @@ impl TmuxRuntime {
             }
             if Instant::now() >= deadline {
                 return Err(InitialBriefDeliveryError::ProviderAcceptanceTimedOut {
-                    provider: "claude".to_owned(),
-                }
-                .into());
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// Wait for the uniquely named JSONL transcript Claude creates for the
-    /// caller-provided provider session UUID.  This is a provider-owned
-    /// startup signal, not a terminal-rendering heuristic.
-    fn wait_for_claude_initial_brief_transcript(
-        &self,
-        spec: &TmuxSessionSpec,
-    ) -> Result<(PathBuf, u64)> {
-        let provider_session_id = spec.claude_session_id.as_deref().ok_or_else(|| {
-            InitialBriefDeliveryError::ProviderAcknowledgementUnavailable {
-                provider: "claude".to_owned(),
-            }
-        })?;
-        if self.claude_projects_roots.is_empty() {
-            return Err(
-                InitialBriefDeliveryError::ProviderAcknowledgementUnavailable {
-                    provider: "claude".to_owned(),
-                }
-                .into(),
-            );
-        }
-        let deadline = Instant::now() + self.initial_brief_ready_timeout;
-        let direct_candidates = claude_transcript_candidates(
-            &self.claude_projects_roots,
-            &spec.working_dir,
-            provider_session_id,
-        );
-        let project_directories =
-            claude_transcript_project_directories(&self.claude_projects_roots, &spec.working_dir);
-        let mut next_nested_scan = Instant::now();
-        loop {
-            if !self.session_exists(&spec.tmux_session)? {
-                return Err(InitialBriefDeliveryError::SessionExited {
-                    provider: "claude".to_owned(),
-                }
-                .into());
-            }
-            for transcript_path in &direct_candidates {
-                let Ok(metadata) = fs::metadata(&transcript_path) else {
-                    continue;
-                };
-                if claude_transcript_declares_session(&transcript_path, provider_session_id) {
-                    return Ok((transcript_path.clone(), metadata.len()));
-                }
-            }
-            if Instant::now() >= next_nested_scan {
-                for transcript_path in claude_nested_transcript_candidates(&project_directories) {
-                    let Ok(metadata) = fs::metadata(&transcript_path) else {
-                        continue;
-                    };
-                    if claude_transcript_declares_session(&transcript_path, provider_session_id) {
-                        return Ok((transcript_path, metadata.len()));
-                    }
-                }
-                next_nested_scan = Instant::now() + Duration::from_millis(250);
-            }
-            if Instant::now() >= deadline {
-                return Err(InitialBriefDeliveryError::ProviderReadinessTimedOut {
                     provider: "claude".to_owned(),
                 }
                 .into());
@@ -2128,6 +2075,70 @@ fn pane_last_line(text: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// The JSONL transcript Claude writes for a caller-provided provider session
+/// UUID. Claude 2.1.280 creates it only when the first user turn is submitted;
+/// older releases created it at startup. Files that already exist when the
+/// brief is submitted are read only past their pre-submission length, so an
+/// earlier identical turn can never acknowledge this submission.
+struct ClaudeInitialBriefTranscript {
+    provider_session_id: String,
+    direct_candidates: Vec<PathBuf>,
+    project_directories: Vec<PathBuf>,
+    submission_offsets: HashMap<PathBuf, u64>,
+}
+
+impl ClaudeInitialBriefTranscript {
+    fn before_submission(
+        projects_roots: &[PathBuf],
+        working_dir: &str,
+        provider_session_id: &str,
+    ) -> Self {
+        let mut transcript = Self {
+            provider_session_id: provider_session_id.to_owned(),
+            direct_candidates: claude_transcript_candidates(
+                projects_roots,
+                working_dir,
+                provider_session_id,
+            ),
+            project_directories: claude_transcript_project_directories(projects_roots, working_dir),
+            submission_offsets: HashMap::new(),
+        };
+        transcript.submission_offsets = transcript
+            .candidates(true)
+            .into_iter()
+            .filter_map(|path| {
+                let length = fs::metadata(&path).ok()?.len();
+                Some((path, length))
+            })
+            .collect();
+        transcript
+    }
+
+    /// Claude normally writes `<project>/<session-id>.jsonl`; nested layouts
+    /// are rescanned only when `include_nested` is set, to bound directory
+    /// walks while polling.
+    fn candidates(&self, include_nested: bool) -> Vec<PathBuf> {
+        let mut candidates = self.direct_candidates.clone();
+        if include_nested {
+            candidates.extend(claude_nested_transcript_candidates(
+                &self.project_directories,
+            ));
+        }
+        candidates
+    }
+
+    fn has_accepted(&self, prompt: &str, include_nested: bool) -> bool {
+        self.candidates(include_nested).iter().any(|path| {
+            claude_transcript_has_matching_user_turn(
+                path,
+                self.submission_offsets.get(path).copied().unwrap_or(0),
+                &self.provider_session_id,
+                prompt,
+            )
+        })
+    }
+}
+
 fn claude_transcript_candidates(
     projects_roots: &[PathBuf],
     working_dir: &str,
@@ -2176,17 +2187,6 @@ fn claude_nested_transcript_candidates(project_directories: &[PathBuf]) -> Vec<P
     }
     files.sort();
     files
-}
-
-fn claude_transcript_declares_session(path: &Path, provider_session_id: &str) -> bool {
-    let Ok(file) = fs::File::open(path) else {
-        return false;
-    };
-    BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-        .any(|entry| entry.get("sessionId").and_then(Value::as_str) == Some(provider_session_id))
 }
 
 /// A transcript is acknowledgement only if it appends an exact user turn for
@@ -3341,10 +3341,6 @@ esac
         fs::write(&transcript, &startup).unwrap();
         let offset = startup.len() as u64;
 
-        assert!(claude_transcript_declares_session(
-            &transcript,
-            provider_session_id
-        ));
         assert!(!claude_transcript_has_matching_user_turn(
             &transcript,
             offset,
@@ -3387,6 +3383,99 @@ esac
             offset,
             provider_session_id,
             "exact immutable brief"
+        ));
+    }
+
+    #[test]
+    fn claude_initial_brief_transcript_created_by_the_submission_is_acceptance() {
+        let root = tempfile_path("claude-lazy-transcript-root");
+        let working_dir = tempfile_path("claude-lazy-transcript-working-dir");
+        fs::create_dir_all(&working_dir).unwrap();
+        let provider_session_id = "11111111-1111-4111-8111-111111111111";
+        let transcript = ClaudeInitialBriefTranscript::before_submission(
+            std::slice::from_ref(&root),
+            working_dir.to_str().unwrap(),
+            provider_session_id,
+        );
+        assert!(!transcript.has_accepted("exact immutable brief", true));
+
+        // Claude 2.1.280 writes no transcript until the first turn arrives.
+        let path = transcript.direct_candidates[0].clone();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let startup = serde_json::json!({"type":"mode", "sessionId": provider_session_id});
+        let accepted = serde_json::json!({
+            "type":"user", "sessionId":provider_session_id,
+            "message":{"content":"exact immutable brief"}
+        });
+        fs::write(&path, format!("{startup}\n{accepted}\n")).unwrap();
+        assert!(transcript.has_accepted("exact immutable brief", false));
+    }
+
+    #[test]
+    fn claude_initial_brief_transcript_ignores_turns_written_before_submission() {
+        let root = tempfile_path("claude-eager-transcript-root");
+        let working_dir = tempfile_path("claude-eager-transcript-working-dir");
+        fs::create_dir_all(&working_dir).unwrap();
+        let provider_session_id = "11111111-1111-4111-8111-111111111111";
+        let path = claude_transcript_candidates(
+            std::slice::from_ref(&root),
+            working_dir.to_str().unwrap(),
+            provider_session_id,
+        )[0]
+        .clone();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let earlier = serde_json::json!({
+            "type":"user", "sessionId":provider_session_id,
+            "message":{"content":"exact immutable brief"}
+        });
+        fs::write(&path, format!("{earlier}\n")).unwrap();
+
+        let transcript = ClaudeInitialBriefTranscript::before_submission(
+            std::slice::from_ref(&root),
+            working_dir.to_str().unwrap(),
+            provider_session_id,
+        );
+        assert!(!transcript.has_accepted("exact immutable brief", true));
+
+        fs::write(&path, format!("{earlier}\n{earlier}\n")).unwrap();
+        assert!(transcript.has_accepted("exact immutable brief", false));
+    }
+
+    /// A Claude 2.1.280 idle pane captured at tmux's detached 80x24 size.
+    #[test]
+    fn claude_2_1_280_idle_composer_is_an_empty_composer() {
+        let divider = "─".repeat(80);
+        let mut plain = vec![
+            String::new(),
+            " ▐▛███▛█   Claude Code v2.1.280".to_owned(),
+            "▝▜██████▀  Opus 5.5 (1M context) with high effort · Claude Max".to_owned(),
+            "  ▝▝ ▝▝    /…/probe".to_owned(),
+        ];
+        plain.extend(std::iter::repeat_n(String::new(), 15));
+        plain.extend([
+            divider.clone(),
+            "❯\u{a0}Try \"fix typecheck errors\"".to_owned(),
+            divider.clone(),
+            "  Opus 5.5 (1M context)".to_owned(),
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents".to_owned(),
+        ]);
+        let mut styled = plain[..19].to_vec();
+        styled.extend([
+            format!("\u{1b}[38;5;244m{divider}"),
+            "\u{1b}[39m❯\u{a0}\u{1b}[2mTry \"fix typecheck errors\"\u{1b}[0m".to_owned(),
+            format!("\u{1b}[38;5;244m{divider}"),
+            "\u{1b}[39m  \u{1b}[38;5;246mOpus 5.5 (1M context)\u{1b}[39m".to_owned(),
+            "  \u{1b}[38;5;220m⏵⏵ auto mode on\u{1b}[38;5;246m (shift+tab to cycle) · ← for agents\u{1b}[39m".to_owned(),
+        ]);
+        let plain = plain.join("\n");
+        let styled = styled.join("\n");
+
+        assert!(claude_composer_layout_is_candidate(&plain));
+        assert!(claude_empty_composer_cursor(&plain, 2, 20));
+        assert!(claude_capture_frames_match(&plain, &styled));
+        assert!(claude_styled_composer_has_dim_suggestion(
+            plain.lines().nth(20).unwrap(),
+            styled.lines().nth(20).unwrap()
         ));
     }
 
