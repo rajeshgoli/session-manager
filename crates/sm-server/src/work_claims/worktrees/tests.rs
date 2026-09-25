@@ -592,3 +592,88 @@ fn lsof_records_parse_into_pid_command_and_cwd() {
         Some((12, "-zsh".to_owned()))
     );
 }
+
+#[test]
+fn a_failed_process_check_keeps_the_worktree_and_retries() {
+    let repo = Repo::new();
+    let (path, head) = repo.worktree("wt", "5-feature");
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        5,
+        Some(&path),
+        Some("5-feature"),
+        Some(&head),
+    );
+    let sessions = [session("eng1", "/elsewhere", true)];
+    LSOF_PROGRAM.with(|program| program.set("sm-no-such-lsof"));
+    let outcomes = repo.pass(&sessions);
+    LSOF_PROGRAM.with(|program| program.set("lsof"));
+    assert_eq!(outcomes.len(), 1);
+    assert!(!outcomes[0].removed);
+    assert!(
+        outcomes[0]
+            .reason
+            .starts_with("process check failed: lsof could not run"),
+        "{}",
+        outcomes[0].reason
+    );
+    assert!(Path::new(&path).exists());
+    // Retryable: the next pass with a working lsof deletes it.
+    assert_eq!(
+        repo.pass(&sessions),
+        vec![outcome(&path, true, "no commits")]
+    );
+}
+
+#[test]
+fn a_keep_set_while_the_pass_runs_is_honoured() {
+    let repo = Repo::new();
+    let (path, head) = repo.worktree("wt", "5-feature");
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        5,
+        Some(&path),
+        Some("5-feature"),
+        Some(&head),
+    );
+    // A process inside holds the pass in its retire grace wait; meanwhile
+    // another session keeps the worktree, then the process exits.
+    let mut child = Command::new("sleep")
+        .arg("60")
+        .current_dir(&path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let store = repo.store.clone();
+    let keep_path = path.clone();
+    let keeper = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(1500));
+        store
+            .set_worktree_keep(&keep_path, "keeper01", "results not yet pushed")
+            .unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+    });
+    let sessions = [session("eng1", "/elsewhere", true)];
+    let outcomes = run_worktree_cleanup(
+        &repo.store,
+        CleanupRequest {
+            sessions: &sessions,
+            first: Some("eng1"),
+            progress: None,
+        },
+    )
+    .unwrap();
+    keeper.join().unwrap();
+    assert_eq!(
+        outcomes,
+        vec![outcome(&path, false, "kept: results not yet pushed")]
+    );
+    assert!(Path::new(&path).exists());
+}

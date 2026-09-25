@@ -498,14 +498,42 @@ fn processes_inside(root: &str, listing: &[(u32, String, String)]) -> Option<(u3
         .map(|(pid, command, _)| (*pid, command.clone()))
 }
 
-fn list_process_cwds() -> Vec<(u32, String, String)> {
-    let Ok(output) = Command::new("lsof")
+/// Every process's cwd, or why the listing could not be made. A failed
+/// listing must never read as "no processes".
+type ProcessListing = Result<Vec<(u32, String, String)>, String>;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests substitute a missing program to exercise the failure path.
+    static LSOF_PROGRAM: std::cell::Cell<&'static str> = const { std::cell::Cell::new("lsof") };
+}
+
+#[cfg(test)]
+fn lsof_program() -> &'static str {
+    LSOF_PROGRAM.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn lsof_program() -> &'static str {
+    "lsof"
+}
+
+fn list_process_cwds() -> ProcessListing {
+    let output = Command::new(lsof_program())
         .args(["-a", "-d", "cwd", "-Fpcn"])
         .output()
-    else {
-        return Vec::new();
-    };
-    parse_lsof(&String::from_utf8_lossy(&output.stdout))
+        .map_err(|error| format!("lsof could not run: {error}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    // lsof exits 1 when some process could not be read but still lists the
+    // rest; only an empty listing with a failure status is no listing at all.
+    if !output.status.success() && text.trim().is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "lsof failed: {}",
+            stderr.lines().next().unwrap_or("no output").trim()
+        ));
+    }
+    Ok(parse_lsof(&text))
 }
 
 /// `p<pid>`, `c<command>`, `n<path>` records.
@@ -538,7 +566,7 @@ fn decide(
     request: &CleanupRequest<'_>,
     retired: &BTreeMap<String, Option<OffsetDateTime>>,
     keeps: &BTreeMap<String, String>,
-    processes: &mut Option<Vec<(u32, String, String)>>,
+    processes: &mut Option<ProcessListing>,
     grace: bool,
 ) -> Result<Decision> {
     let path = Path::new(&candidate.path);
@@ -619,7 +647,10 @@ fn decide(
             Duration::ZERO
         };
     loop {
-        let listing = processes.get_or_insert_with(list_process_cwds);
+        let listing = match processes.get_or_insert_with(list_process_cwds) {
+            Ok(listing) => listing,
+            Err(error) => return retry_left(format!("process check failed: {error}")),
+        };
         let Some((pid, command)) = processes_inside(&candidate.path, listing) else {
             break;
         };
@@ -636,6 +667,11 @@ fn decide(
     let Some(removed_reason) = safe_head(conn, candidate, &head)? else {
         return final_left("commits not in a merged PR".to_owned());
     };
+    // A keep acknowledged while this pass was running wins: re-read it right
+    // before the removal instead of trusting the pass's first snapshot.
+    if let Some(reason) = load_keeps(conn)?.get(&candidate.path) {
+        return retry_left(format!("kept: {reason}"));
+    }
     // 6. git removes it, refusing modified or untracked files.
     let output = Command::new("git")
         .arg("--git-dir")
