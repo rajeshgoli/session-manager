@@ -23,6 +23,11 @@ use tokio::net::TcpListener;
 const STUDIO_SSH_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const QUEUE_COMPLETION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const REPARENT_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+/// The open-file soft limit sm-server raises itself to at startup. launchd
+/// starts it at 256, which every queue job, tmux server, and agent it spawns
+/// inherits; a parallel test suite run as a queue job exhausts that ("Too many
+/// open files", sm#1336). Matches scripts/test-rust-isolated.sh.
+const OPEN_FILE_SOFT_LIMIT_TARGET: u64 = 8192;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Rust Session Manager server scaffold")]
@@ -87,6 +92,7 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
+    raise_open_file_soft_limit();
     let listener = TcpListener::bind(address)
         .await
         .with_context(|| format!("failed to bind {address}"))?;
@@ -280,4 +286,65 @@ async fn main() -> Result<()> {
     )
     .await?;
     Ok(())
+}
+
+/// Raise this process's RLIMIT_NOFILE soft limit toward
+/// OPEN_FILE_SOFT_LIMIT_TARGET, never above the hard limit and never lowering
+/// it. Children inherit the result. A failure only leaves the old limit.
+fn raise_open_file_soft_limit() {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+    let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) else {
+        return;
+    };
+    let Some(raised) = raised_open_file_soft_limit(soft, hard, OPEN_FILE_SOFT_LIMIT_TARGET) else {
+        return;
+    };
+    match setrlimit(Resource::RLIMIT_NOFILE, raised, hard) {
+        Ok(()) => eprintln!("sm-server open-file soft limit raised from {soft} to {raised}"),
+        Err(error) => {
+            eprintln!("sm-server could not raise open-file soft limit from {soft}: {error}")
+        }
+    }
+}
+
+/// The soft limit to set, or None when the current one already meets the
+/// target. RLIM_INFINITY compares as the largest value, so an unlimited soft
+/// limit is left alone and an unlimited hard limit does not cap the target.
+fn raised_open_file_soft_limit(soft: u64, hard: u64, target: u64) -> Option<u64> {
+    let raised = target.min(hard);
+    (raised > soft).then_some(raised)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::raised_open_file_soft_limit;
+
+    const UNLIMITED: u64 = nix::libc::RLIM_INFINITY as u64;
+
+    #[test]
+    fn raises_launchd_default_to_target_under_unlimited_hard_limit() {
+        assert_eq!(
+            raised_open_file_soft_limit(256, UNLIMITED, 8192),
+            Some(8192)
+        );
+    }
+
+    #[test]
+    fn caps_raise_at_hard_limit() {
+        assert_eq!(raised_open_file_soft_limit(256, 4096, 8192), Some(4096));
+    }
+
+    #[test]
+    fn never_lowers_a_higher_or_unlimited_soft_limit() {
+        assert_eq!(raised_open_file_soft_limit(8192, UNLIMITED, 8192), None);
+        assert_eq!(
+            raised_open_file_soft_limit(1_048_576, UNLIMITED, 8192),
+            None
+        );
+        assert_eq!(
+            raised_open_file_soft_limit(UNLIMITED, UNLIMITED, 8192),
+            None
+        );
+        assert_eq!(raised_open_file_soft_limit(256, 256, 8192), None);
+    }
 }
