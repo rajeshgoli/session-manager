@@ -24704,6 +24704,15 @@ async fn owner_doc_reader_defaults_to_the_latest_publish_and_links_the_pr_head()
     assert_eq!(heads["pr_head_blob_differs"], false);
 }
 
+fn doc_file_token(secret: &str, doc_id: &str, expires_at: i64) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(format!("files|{doc_id}|{expires_at}").as_bytes());
+    format!(
+        "smdf_{doc_id}.{expires_at}.{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    )
+}
+
 fn doc_token(secret: &str, doc_id: &str, expires_at: i64) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(format!("{doc_id}|{expires_at}").as_bytes());
@@ -24984,7 +24993,7 @@ async fn owner_doc_page_cookie_opens_only_the_files_beside_that_doc() {
     assert_eq!(status, StatusCode::OK);
     let cookie = headers["set-cookie"].to_str().unwrap();
     assert!(
-        cookie.starts_with(&format!("sm_doc_{id}=smdt_{id}."))
+        cookie.starts_with(&format!("sm_doc_{id}=smdf_{id}."))
             && cookie.contains("; Path=/docs/widgets/docs/working/;")
             && cookie.contains("HttpOnly"),
         "{cookie}"
@@ -24993,7 +25002,7 @@ async fn owner_doc_page_cookie_opens_only_the_files_beside_that_doc() {
     let external = Some(SocketAddr::from(([203, 0, 113, 7], 443)));
     let valid = format!(
         "sm_doc_{id}={}",
-        doc_token(SECRET, &id, unix_timestamp() + 3600)
+        doc_file_token(SECRET, &id, unix_timestamp() + 3600)
     );
     let get = |uri: &'static str, cookie: String| {
         let app = app.clone();
@@ -25021,17 +25030,25 @@ async fn owner_doc_page_cookie_opens_only_the_files_beside_that_doc() {
             "/docs/widgets/docs/working/walk/chart.png",
             format!(
                 "sm_doc_{id}={}",
-                doc_token(SECRET, &id, unix_timestamp() - 1)
+                doc_file_token(SECRET, &id, unix_timestamp() - 1)
             ),
         ),
         (
             "/docs/widgets/docs/working/walk/chart.png",
             format!(
                 "sm_doc_{other}={}",
-                doc_token(SECRET, &other, unix_timestamp() + 3600)
+                doc_file_token(SECRET, &other, unix_timestamp() + 3600)
             ),
         ),
         ("/docs/widgets/docs/working/walk/chart.png", String::new()),
+        // The page token the page's scripts can read does not open files.
+        (
+            "/docs/widgets/docs/working/walk/chart.png",
+            format!(
+                "sm_doc_{id}={}",
+                doc_token(SECRET, &id, unix_timestamp() + 3600)
+            ),
+        ),
     ] {
         let (status, _, _) = get(uri, cookie.clone()).await;
         assert!(

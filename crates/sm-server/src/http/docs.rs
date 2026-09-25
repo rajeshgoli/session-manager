@@ -966,17 +966,54 @@ async fn doc_pull_request_async(
 const DOC_TOKEN_TTL_SECONDS: i64 = 24 * 60 * 60;
 pub(super) const DOC_TOKEN_HEADER: &str = "x-sm-doc-token";
 
-fn doc_token_signature(secret: &str, doc_id: &str, expires_at: i64) -> Option<String> {
+/// What a signed doc token opens. The page token is handed to the page's
+/// scripts; the file token lives only in an HttpOnly cookie, so a script
+/// that reads the page token cannot open the files beside the doc with it.
+#[derive(Clone, Copy)]
+enum DocTokenUse {
+    Page,
+    Files,
+}
+
+impl DocTokenUse {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Page => "smdt_",
+            Self::Files => "smdf_",
+        }
+    }
+
+    fn signed_message(self, doc_id: &str, expires_at: i64) -> String {
+        match self {
+            Self::Page => format!("{doc_id}|{expires_at}"),
+            Self::Files => format!("files|{doc_id}|{expires_at}"),
+        }
+    }
+}
+
+fn doc_token_signature(
+    secret: &str,
+    use_: DocTokenUse,
+    doc_id: &str,
+    expires_at: i64,
+) -> Option<String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
-    mac.update(format!("{doc_id}|{expires_at}").as_bytes());
+    mac.update(use_.signed_message(doc_id, expires_at).as_bytes());
     Some(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
 }
 
-fn issue_doc_token_at(config: &AppConfig, doc_id: &str, now: i64) -> Option<String> {
+fn issue_token_at(config: &AppConfig, use_: DocTokenUse, doc_id: &str, now: i64) -> Option<String> {
     let secret = trimmed(&config.google_auth.session_cookie_secret)?;
     let expires_at = now + DOC_TOKEN_TTL_SECONDS;
-    let signature = doc_token_signature(&secret, doc_id, expires_at)?;
-    Some(format!("smdt_{doc_id}.{expires_at}.{signature}"))
+    let signature = doc_token_signature(&secret, use_, doc_id, expires_at)?;
+    Some(format!(
+        "{}{doc_id}.{expires_at}.{signature}",
+        use_.prefix()
+    ))
+}
+
+fn issue_doc_token_at(config: &AppConfig, doc_id: &str, now: i64) -> Option<String> {
+    issue_token_at(config, DocTokenUse::Page, doc_id, now)
 }
 
 pub(super) fn issue_doc_token(config: &AppConfig, doc_id: &str) -> Option<String> {
@@ -984,12 +1021,16 @@ pub(super) fn issue_doc_token(config: &AppConfig, doc_id: &str) -> Option<String
 }
 
 pub(super) fn doc_token_valid(config: &AppConfig, doc_id: &str, token: &str) -> bool {
+    token_valid(config, DocTokenUse::Page, doc_id, token)
+}
+
+fn token_valid(config: &AppConfig, use_: DocTokenUse, doc_id: &str, token: &str) -> bool {
     let Some(secret) = trimmed(&config.google_auth.session_cookie_secret) else {
         return false;
     };
     let Some((token_doc, rest)) = token
         .trim()
-        .strip_prefix("smdt_")
+        .strip_prefix(use_.prefix())
         .and_then(|t| t.split_once('.'))
     else {
         return false;
@@ -1006,7 +1047,7 @@ pub(super) fn doc_token_valid(config: &AppConfig, doc_id: &str, token: &str) -> 
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
         return false;
     };
-    mac.update(format!("{token_doc}|{expires_at}").as_bytes());
+    mac.update(use_.signed_message(token_doc, expires_at).as_bytes());
     token_doc == doc_id
         && mac.verify_slice(&signature).is_ok()
         && expires_at > OffsetDateTime::now_utc().unix_timestamp()
@@ -1118,7 +1159,12 @@ async fn view_doc_response(
 /// load only, never on the requests the page makes, so without this the
 /// page renders with broken images there.
 fn doc_file_cookie(config: &AppConfig, doc: &OwnerDoc) -> Option<String> {
-    let token = issue_doc_token(config, &doc.id)?;
+    let token = issue_token_at(
+        config,
+        DocTokenUse::Files,
+        &doc.id,
+        OffsetDateTime::now_utc().unix_timestamp(),
+    )?;
     Some(format!(
         "{DOC_FILE_COOKIE_PREFIX}{}={token}; Path={}; Max-Age={DOC_TOKEN_TTL_SECONDS}; HttpOnly; Secure; SameSite=Strict",
         doc.id,
@@ -1179,15 +1225,29 @@ async fn doc_file_response(
     if validate_repo_path(path).is_err() {
         return Ok(None);
     }
-    let store = owner_doc_store(state);
-    let anchors = store.file_anchors(name, path)?;
-    let opened = owner
-        || anchors.iter().any(|(doc, _)| {
-            cookie_value(headers, &format!("{DOC_FILE_COOKIE_PREFIX}{}", doc.id))
-                .is_some_and(|token| doc_token_valid(&state.config, &doc.id, &token))
-        });
-    if !opened {
+    let has_file_cookie = || {
+        headers.get_all(COOKIE).iter().any(|value| {
+            value
+                .to_str()
+                .is_ok_and(|value| value.contains(DOC_FILE_COOKIE_PREFIX))
+        })
+    };
+    if !owner && !has_file_cookie() {
         return Ok(None);
+    }
+    let store = owner_doc_store(state);
+    let mut anchors = store.file_anchors(name, path)?;
+    if !owner {
+        // Only the docs whose cookie was presented, so a cookie for one repo
+        // never serves another repo that shares its name.
+        anchors.retain(|(doc, _)| {
+            cookie_value(headers, &format!("{DOC_FILE_COOKIE_PREFIX}{}", doc.id)).is_some_and(
+                |token| token_valid(&state.config, DocTokenUse::Files, &doc.id, &token),
+            )
+        });
+        if anchors.is_empty() {
+            return Ok(None);
+        }
     }
     let referred = match referring_doc(headers, name)
         .filter(|(doc_path, _)| anchors.iter().any(|(doc, _)| doc.path == *doc_path))
