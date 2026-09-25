@@ -136,6 +136,9 @@ def env(tmp_path, request):
         f"""#!/bin/bash
 {reg}
 echo "cargo $* [registered=$reg]" >> "{log}"
+echo "$PWD" > "{state}/cargo_cwd"
+# Lets a test act mid-build, as another agent working in the checkout would.
+[[ -x "{state}/cargo_hook" ]] && "{state}/cargo_hook"
 rc="$(cat "{state}/cargo_rc")"
 if [[ "$rc" == "0" ]]; then
   mkdir -p "$(dirname "{cargo_output}")"
@@ -378,9 +381,12 @@ def _make_runner(
             "SM_QUEUE_AUTHORITY_SOCKET": str(authority_socket_path),
             "SM_QUEUE_AUTHORITY_VERIFIER": str(authority_verifier),
         }
+        script = overrides.pop("_script", SCRIPT)
+        for name in overrides.pop("_unset", ()):
+            environ.pop(name, None)
         environ.update(overrides)
         return subprocess.run(
-            ["bash", str(SCRIPT), *args],
+            ["bash", str(script), *args],
             env=environ,
             capture_output=True,
             text=True,
@@ -1369,3 +1375,352 @@ def test_skip_build_reinstalls_the_installed_binary(env):
     assert "cargo build" not in text
     assert "codesign --force" in text
     assert "MARKER=ORIGINAL" in env["installed"].read_text()
+
+
+# --- the source tree the build reads (sm#1533) ------------------------------
+#
+# These run a copy of the script from a throwaway checkout with its own origin,
+# because --update fetches and fast-forwards whatever checkout the script is in.
+
+GIT_ENV = {
+    "GIT_AUTHOR_NAME": "t",
+    "GIT_AUTHOR_EMAIL": "t@example.com",
+    "GIT_COMMITTER_NAME": "t",
+    "GIT_COMMITTER_EMAIL": "t@example.com",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+}
+
+
+def git(cwd, *args) -> str:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        env={**os.environ, **GIT_ENV},
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def commit_file(repo, rel: str, body: str, message: str, executable: bool = False) -> str:
+    _write(repo / rel, body, executable=executable)
+    git(repo, "add", rel)
+    git(repo, "commit", "-q", "-m", message)
+    return git(repo, "rev-parse", "HEAD")
+
+
+@pytest.fixture
+def checkout(env):
+    """A deployed checkout on main, tracking a bare origin, plus a second clone
+    standing in for whoever lands the next commit on main."""
+    tmp = env["tmp"]
+    origin = tmp / "origin.git"
+    git(tmp, "init", "-q", "--bare", "-b", "main", str(origin))
+    seed = tmp / "seed"
+    git(tmp, "clone", "-q", str(origin), str(seed))
+    git(seed, "checkout", "-q", "-b", "main")
+    commit_file(seed, "scripts/restart-rust-server.sh", SCRIPT.read_text(), "script", True)
+    commit_file(
+        seed,
+        "scripts/install-sm-cli.sh",
+        f'#!/bin/bash\necho "install-sm-cli $* target=$SM_TARGET_DIR" >> "{env["log"]}"\n',
+        "cli stub",
+        True,
+    )
+    git(seed, "push", "-q", "origin", "main")
+    deployed = tmp / "deployed"
+    git(tmp, "clone", "-q", "-b", "main", str(origin), str(deployed))
+
+    def run(*args, **overrides):
+        # Same stubs and paths as env["run"], but the script copy in `deployed`.
+        environ = {**GIT_ENV, **overrides}
+        return env["run"](*args, _script=deployed / "scripts" / "restart-rust-server.sh", **environ)
+
+    return {"origin": origin, "upstream": seed, "deployed": deployed, "run": run}
+
+
+def land_on_main(checkout, rel="crates/new.rs", body="fn main() {}\n") -> str:
+    head = commit_file(checkout["upstream"], rel, body, f"land {rel}")
+    git(checkout["upstream"], "push", "-q", "origin", "main")
+    return head
+
+
+def test_update_fast_forwards_then_builds_the_fetched_commit(env, checkout):
+    before = git(checkout["deployed"], "rev-parse", "HEAD")
+    landed = land_on_main(checkout)
+
+    result = checkout["run"]("--update")
+
+    assert result.returncode == 0, result.stderr
+    assert git(checkout["deployed"], "rev-parse", "HEAD") == landed != before
+    text = calls(env)
+    assert f"--manifest-path {checkout['deployed']}/Cargo.toml" in text
+    # cargo reads .cargo/config.toml from its cwd, not from the manifest's dir.
+    assert (env["state"] / "cargo_cwd").read_text().strip() == str(checkout["deployed"])
+    assert "MARKER=REBUILT" in env["installed"].read_text()
+    assert not env["lock"].exists()
+
+
+def test_update_finishes_with_the_fetched_copy_of_the_script(env, checkout):
+    """The fast-forward can change this script; the restart must then run the
+    new logic, still holding the lock it took before fetching."""
+    script = checkout["upstream"] / "scripts" / "restart-rust-server.sh"
+    text = script.read_text().replace(
+        'echo "holding $SM_LOCK"\n',
+        'echo "holding $SM_LOCK"\necho "FETCHED SCRIPT pid=$$ lock=$(cat "$SM_LOCK/pid")"\n',
+        1,
+    )
+    commit_file(checkout["upstream"], "scripts/restart-rust-server.sh", text, "new script", True)
+    git(checkout["upstream"], "push", "-q", "origin", "main")
+
+    result = checkout["run"]("--update", "--allow-drop", "1")
+
+    assert result.returncode == 0, result.stderr
+    line = next(l for l in result.stdout.splitlines() if l.startswith("FETCHED SCRIPT"))
+    pid, lock_pid = (part.split("=")[1] for part in line.split()[2:])
+    assert pid == lock_pid
+    assert not env["lock"].exists()
+
+
+@pytest.mark.parametrize(
+    "setup, message",
+    [
+        ("dirty", "uncommitted changes to tracked files"),
+        ("branch", "is on 'feature'"),
+        ("ahead", "has commits origin/main"),
+        ("diverged", "cannot fast-forward"),
+    ],
+)
+def test_update_refuses_a_checkout_it_cannot_make_equal_to_main(env, checkout, setup, message):
+    deployed = checkout["deployed"]
+    if setup == "dirty":
+        (deployed / "scripts" / "install-sm-cli.sh").write_text("#!/bin/bash\n")
+    elif setup == "branch":
+        git(deployed, "checkout", "-q", "-b", "feature")
+    elif setup == "ahead":
+        commit_file(deployed, "local.txt", "x\n", "unpushed")
+    elif setup == "diverged":
+        commit_file(deployed, "local.txt", "x\n", "unpushed")
+        land_on_main(checkout)
+    before = git(deployed, "rev-parse", "HEAD")
+
+    result = checkout["run"]("--update")
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert git(deployed, "rev-parse", "HEAD") == before
+    assert "cargo build" not in calls(env)
+    assert_service_untouched(env)
+    assert not env["lock"].exists()
+
+
+def test_update_cannot_be_combined_with_a_prebuilt_deploy(env, checkout):
+    for flag in ("--skip-build", "--adopt"):
+        result = checkout["run"]("--update", flag)
+        assert result.returncode == 2
+        assert "cannot be combined" in result.stderr
+    assert_service_untouched(env)
+
+
+def test_source_moving_during_the_build_blocks_the_install(env, checkout):
+    """sm#1533: another agent pulls in the deployed checkout while cargo runs."""
+    land_on_main(checkout)
+    _write(
+        env["state"] / "cargo_hook",
+        f"#!/bin/bash\ngit -C {checkout['deployed']} pull -q --ff-only origin main\n",
+        executable=True,
+    )
+
+    result = checkout["run"]()
+
+    assert result.returncode != 0
+    assert "changed while this restart was building" in result.stderr
+    assert "cargo build" in calls(env)
+    assert_service_untouched(env)
+    assert not env["lock"].exists()
+
+
+def test_editing_tracked_files_during_the_build_blocks_the_install(env, checkout):
+    _write(
+        env["state"] / "cargo_hook",
+        f"#!/bin/bash\necho edit >> {checkout['deployed']}/scripts/install-sm-cli.sh\n",
+        executable=True,
+    )
+
+    result = checkout["run"]()
+
+    assert result.returncode != 0
+    assert "changed while this restart was building" in result.stderr
+    assert_service_untouched(env)
+
+
+def test_untracked_files_appearing_during_the_build_are_ignored(env, checkout):
+    _write(
+        env["state"] / "cargo_hook",
+        f"#!/bin/bash\necho x > {checkout['deployed']}/scratch.txt\n",
+        executable=True,
+    )
+
+    result = checkout["run"]()
+
+    assert result.returncode == 0, result.stderr
+    assert "source unchanged" in result.stdout
+
+
+def test_lock_handoff_is_refused_unless_this_process_holds_the_lock(env):
+    env["lock"].mkdir(parents=True)
+    (env["lock"] / "pid").write_text(str(os.getpid()))  # alive, but not the script
+
+    result = env["run"](SM_RESTART_LOCK_HANDOFF=str(env["lock"]))
+
+    assert result.returncode != 0
+    assert "is not held by this" in result.stderr
+    assert env["lock"].exists(), "a lock we do not own must not be removed"
+    assert_service_untouched(env)
+
+
+def test_default_lock_is_shared_across_different_tmpdirs(env, tmp_path):
+    """Agent sandboxes set their own TMPDIR; the lock must not depend on it."""
+    home = tmp_path / "home"
+    lock = home / ".local" / "share" / "claude-sessions" / f"sm-restart-{LABEL}.lock"
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(str(os.getpid()))
+
+    for tmpdir in (tmp_path / "tmp-a", tmp_path / "tmp-b"):
+        tmpdir.mkdir()
+        environ = {"HOME": str(home), "TMPDIR": str(tmpdir)}
+        result = env["run"](_unset=("SM_LOCK",), **environ)
+        assert result.returncode != 0
+        assert "already running" in result.stderr
+    assert_service_untouched(env)
+
+
+def test_cli_is_installed_from_the_server_build_not_rebuilt(env, checkout):
+    """sm#1536: `sm` comes out of the server's own build of the checked source,
+    copied aside before the source check. A build after that - here, one that
+    lands while the service restarts - must not change what gets installed."""
+    target = env["tmp"] / "target"
+    built_cli = target / "release" / "sm"
+    _write(built_cli, "#!/bin/bash\n# CLI=FROM-SERVER-BUILD\n", executable=True)
+    installer = checkout["deployed"] / "scripts" / "install-sm-cli.sh"
+    installer.write_text(
+        f"""#!/bin/bash
+echo "install-sm-cli $* $(sed -n 's/^# CLI=//p' "$2")" >> "{env['log']}"
+""")
+    git(checkout["deployed"], "commit", "-q", "-am", "installer that reports its source")
+    cutover = env["tmp"] / "cutover.sh"
+    cutover.write_text(cutover.read_text().replace(
+        "  start-rust)\n",
+        f"  start-rust)\n    printf '#!/bin/bash\\n# CLI=LATER-BUILD\\n' > {built_cli}\n",
+    ))
+
+    result = checkout["run"](SM_TARGET_DIR=str(target))
+
+    assert result.returncode == 0, result.stderr
+    line = next(l for l in calls(env).splitlines() if l.startswith("install-sm-cli"))
+    assert line.startswith("install-sm-cli --source ")
+    assert line.endswith(" FROM-SERVER-BUILD")
+    assert not list(env["installed"].parent.glob("*.sm-cli.staging.*"))
+
+
+def test_update_refuses_a_tracked_edit_made_while_fetching(env, checkout):
+    """A fast-forward keeps local edits to files it does not touch."""
+    land_on_main(checkout)
+    real_git = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+    _write(
+        env["tmp"] / "bin" / "git",
+        f"""#!/bin/bash
+if [[ " $* " == *" fetch "* ]]; then
+  echo edit >> {checkout['deployed']}/scripts/install-sm-cli.sh
+fi
+exec {real_git} "$@"
+""",
+        executable=True,
+    )
+
+    result = checkout["run"]("--update")
+
+    assert result.returncode != 0
+    assert "gained uncommitted changes to tracked files during the update" in result.stderr
+    assert "cargo build" not in calls(env)
+    assert_service_untouched(env)
+
+
+def test_cli_installer_builds_its_own_checkout_from_any_cwd(tmp_path):
+    """sm#1536: without --manifest-path, cargo builds whatever tree the caller
+    is standing in."""
+    log = tmp_path / "cargo.log"
+    target = tmp_path / "target"
+    _write(
+        tmp_path / "bin" / "cargo",
+        f"""#!/bin/bash
+echo "$* cwd=$PWD" > "{log}"
+mkdir -p "{target}/release"
+printf '#!/bin/bash\\necho sm-test\\n' > "{target}/release/sm"
+chmod 755 "{target}/release/sm"
+""",
+        executable=True,
+    )
+    elsewhere = tmp_path / "some-other-checkout"
+    elsewhere.mkdir()
+
+    result = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "install-sm-cli.sh")],
+        cwd=elsewhere,
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}",
+            "SM_TARGET_DIR": str(target),
+            "SM_CLI_BINARY": str(tmp_path / "installed" / "sm"),
+        },
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"--manifest-path {REPO_ROOT}/Cargo.toml" in log.read_text()
+    assert log.read_text().strip().endswith(f"cwd={REPO_ROOT}")
+    assert (tmp_path / "installed" / "sm").exists()
+
+
+def test_cli_is_staged_even_when_the_install_dir_does_not_exist_yet(env, checkout):
+    """A fresh install: the server's install dir is created later in phase 1."""
+    target = env["tmp"] / "target"
+    _write(target / "release" / "sm", "#!/bin/bash\n", executable=True)
+    fresh = env["tmp"] / "fresh" / "bin" / "sm-server"
+    (env["state"] / "job_program").write_text(str(fresh))
+
+    result = checkout["run"](SM_TARGET_DIR=str(target), SM_BINARY=str(fresh))
+
+    assert result.returncode == 0, result.stderr
+    assert "install-sm-cli --source " in calls(env)
+    assert "no sm CLI" not in result.stderr
+
+
+def test_update_refuses_a_head_that_moves_before_the_handoff(env, checkout):
+    """A clean commit or checkout between the last check and the exec must not
+    become the baseline the updated script builds."""
+    land_on_main(checkout)
+    real_git = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+    deployed = checkout["deployed"]
+    _write(
+        env["tmp"] / "bin" / "git",
+        f"""#!/bin/bash
+{real_git} "$@"; rc=$?
+if [[ " $* " == *" log -1 --format=checkout "* ]]; then
+  echo x > {deployed}/sneaked.txt
+  {real_git} -C {deployed} add sneaked.txt
+  {real_git} -C {deployed} commit -q -m sneaked
+fi
+exit $rc
+""",
+        executable=True,
+    )
+
+    result = checkout["run"]("--update")
+
+    assert result.returncode != 0
+    assert "moved away from the fetched" in result.stderr
+    assert "cargo build" not in calls(env)
+    assert_service_untouched(env)
+    assert not env["lock"].exists()

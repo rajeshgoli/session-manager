@@ -236,9 +236,15 @@ target/release/sm-server --host 127.0.0.1 --port 8420 --config config.yaml
 Or install/start the launchd-managed Rust service:
 
 ```bash
-./scripts/restart-rust-server.sh
+./scripts/restart-rust-server.sh --update
 ./scripts/rust-service-cutover.sh status
 ```
+
+Deploy with `--update`: it fast-forwards the checkout to `origin/main` under the
+restart lock and then builds what it fetched. Never `git pull` in the deployed
+checkout by hand; a pull while another restart is building moves the source
+under that build, and the restart refuses to install when it sees the source
+changed.
 
 `restart-rust-server.sh` builds, signs, installs, restarts, and verifies in the
 one safe order, and registers launchd against an installed copy at
