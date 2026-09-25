@@ -119,9 +119,9 @@ data class ReaderPage(
     val title: String,
     val subtitle: String,
     val path: String,
-    /** The doc's `browser_url`, which the copy-link button needs; owner pages have none. */
+    /** The doc's `browser_url`, the host the copy-link button shares; without one it shares the app host's URL. */
     val browserUrl: String? = null,
-    /** Owner pages show the loaded page's own title and path, since the owner moves between them. */
+    /** Owner pages show the loaded page's own title and path, since the owner moves between them, and have no copy-link button. */
     val followsPage: Boolean = false,
 )
 
@@ -260,7 +260,7 @@ fun DocReaderOverlay(
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
-                    if (readyAuth != null && page.browserUrl != null) {
+                    if (readyAuth != null && !page.followsPage) {
                         IconButton(onClick = {
                             val current = webViewRef?.url ?: history.lastOrNull() ?: readerUrl(readyAuth.serverUrl, page.path)
                             onCopyLink(shareUrl(current, page.browserUrl))
