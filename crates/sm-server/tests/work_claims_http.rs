@@ -552,7 +552,6 @@ async fn the_sync_pass_backfills_ends_claims_and_skips_closed_items() {
     assert_eq!(store.claims_for_item(REPO, 1).unwrap().len(), 1);
 }
 
-<<<<<<< HEAD
 /// `[sm claim]` messages queued to `target`; none when nothing was queued.
 fn claim_texts(f: &Fixture, target: &str) -> Vec<String> {
     let conn = rusqlite::Connection::open(f.dir.join("message_queue.db")).unwrap();
@@ -704,7 +703,8 @@ async fn the_sync_pass_runs_check_c_for_an_idle_holder_waiting_on_nothing() {
     // Once per idle stretch.
     f.state.run_work_claims_sync_pass().unwrap();
     assert_eq!(claim_texts(&f, "lead0001").len(), 1);
-=======
+}
+
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .arg("-C")
@@ -874,5 +874,4 @@ async fn retire_deletes_a_managed_worktree_left_at_its_base() {
         json!([{"path": path, "removed": true, "reason": "no commits"}])
     );
     assert!(!std::path::Path::new(&path).exists());
->>>>>>> bbba9f9 (Worktree lifecycle: sm ticket --setup-worktree, sm worktree keep, deletion at retire (#1487))
 }
