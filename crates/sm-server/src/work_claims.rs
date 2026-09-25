@@ -7,7 +7,7 @@
 //! until the item closes on GitHub, the holder is retired, or the claim is
 //! released or taken. Holder state (working, idle, stopped, retired) is
 //! derived from the session record at read time. See
-//! `docs/working/1452_sm_primitives.html`, appendices A–E.
+//! `specs/1452_sm_primitives.html`, appendices A–E.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
