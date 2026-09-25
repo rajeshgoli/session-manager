@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::config::{AppConfig, CodexReviewConfig, RustCoreConfig};
+use crate::config::{test_isolation_active, AppConfig, CodexReviewConfig, RustCoreConfig};
 
 const DEFAULT_SEND_KEYS_SETTLE_MS: f64 = 300.0;
 const DEFAULT_SEND_KEYS_SETTLE_MAX_MS: f64 = 900.0;
@@ -33,6 +33,7 @@ const CODEX_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_INITIAL_BRIEF_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_INITIAL_BRIEF_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVER_ANCHOR_SESSION: &str = "__sm_server_anchor";
+const DEFAULT_TMUX_BINARY: &str = "tmux";
 const SERVER_ANCHOR_COMMAND: &str = "sleep 315360000";
 static SESSION_INPUT_LOCKS: OnceLock<Mutex<HashMap<String, Weak<SessionInputLock>>>> =
     OnceLock::new();
@@ -207,6 +208,24 @@ impl std::fmt::Display for CodexModelValidationError {
 
 impl std::error::Error for CodexModelValidationError {}
 
+/// Production agents run on the default tmux socket, so a test that reaches it
+/// could probe, anchor, type into, or kill a live agent. Under test isolation
+/// the real tmux binary must be given a private socket. A fake tmux binary has
+/// no server to protect.
+pub(crate) fn refuse_default_tmux_socket_under_test_isolation(
+    tmux_binary: &str,
+    socket_name: Option<&str>,
+) -> Result<()> {
+    let has_private_socket = socket_name.is_some_and(|name| !name.trim().is_empty());
+    if !has_private_socket && tmux_binary == DEFAULT_TMUX_BINARY && test_isolation_active() {
+        bail!(
+            "test isolation refuses the default tmux socket; give the test session \
+             or rust_core config a tmux_socket_name"
+        );
+    }
+    Ok(())
+}
+
 impl TmuxRuntime {
     pub fn from_config(config: &RustCoreConfig) -> Self {
         Self {
@@ -216,7 +235,7 @@ impl TmuxRuntime {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned),
-            tmux_binary: "tmux".to_owned(),
+            tmux_binary: DEFAULT_TMUX_BINARY.to_owned(),
             custom_runtime_command: config
                 .runtime_command
                 .as_deref()
@@ -944,8 +963,7 @@ impl TmuxRuntime {
         let exact_target = format!("={tmux_session}");
         let output = match self
             .tmux_command(["has-session", "-t", exact_target.as_str()])
-            .stderr(Stdio::piped())
-            .output()
+            .and_then(|mut command| Ok(command.stderr(Stdio::piped()).output()?))
         {
             Ok(output) => output,
             Err(error) => {
@@ -984,7 +1002,7 @@ impl TmuxRuntime {
     pub(crate) fn ensure_recovery_server_anchor(&self) -> Result<()> {
         let exact_anchor = format!("={SERVER_ANCHOR_SESSION}");
         if self
-            .tmux_command(["has-session", "-t", exact_anchor.as_str()])
+            .tmux_command(["has-session", "-t", exact_anchor.as_str()])?
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -1014,7 +1032,7 @@ impl TmuxRuntime {
         // `new-session`. Verify the invariant instead of parsing localized
         // duplicate-session stderr.
         if self
-            .tmux_command(["has-session", "-t", exact_anchor.as_str()])
+            .tmux_command(["has-session", "-t", exact_anchor.as_str()])?
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
@@ -1043,7 +1061,7 @@ impl TmuxRuntime {
 
     pub fn session_exists(&self, tmux_session: &str) -> Result<bool> {
         let output = self
-            .tmux_command(["has-session", "-t", tmux_session])
+            .tmux_command(["has-session", "-t", tmux_session])?
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()
@@ -1109,10 +1127,14 @@ impl TmuxRuntime {
         }
         let current = self
             .tmux_command(["show-options", "-gqv", "terminal-overrides"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
             .ok()
+            .and_then(|mut command| {
+                command
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .output()
+                    .ok()
+            })
             .filter(|output| output.status.success())
             .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
             .unwrap_or_default();
@@ -1136,6 +1158,7 @@ impl TmuxRuntime {
                 tmux_session,
                 "#{pane_in_mode}",
             ])
+            .ok()?
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
@@ -1153,6 +1176,7 @@ impl TmuxRuntime {
     pub fn pane_title(&self, tmux_session: &str) -> Option<String> {
         let output = self
             .tmux_command(["display-message", "-p", "-t", tmux_session, "#{pane_title}"])
+            .ok()?
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
@@ -1247,10 +1271,12 @@ impl TmuxRuntime {
     fn codex_composer_is_ready(&self, tmux_session: &str, pre_reset_pane: Option<&str>) -> bool {
         let cursor = match self
             .tmux_command(["display-message", "-p", "-t", tmux_session, "#{cursor_y}"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-        {
+            .and_then(|mut command| {
+                Ok(command
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .output()?)
+            }) {
             Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
                 .trim()
                 .parse::<usize>()
@@ -1267,6 +1293,7 @@ impl TmuxRuntime {
     pub fn capture_pane_text(&self, tmux_session: &str) -> Option<String> {
         let output = self
             .tmux_command(["capture-pane", "-p", "-t", tmux_session])
+            .ok()?
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
@@ -1280,6 +1307,7 @@ impl TmuxRuntime {
     fn capture_pane_styled_text(&self, tmux_session: &str) -> Option<String> {
         let output = self
             .tmux_command(["capture-pane", "-p", "-e", "-t", tmux_session])
+            .ok()?
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
@@ -1314,7 +1342,7 @@ impl TmuxRuntime {
 
     pub fn session_has_attached_clients(&self, tmux_session: &str) -> Result<bool> {
         let output = self
-            .tmux_command(["list-clients", "-t", tmux_session, "-F", "#{client_name}"])
+            .tmux_command(["list-clients", "-t", tmux_session, "-F", "#{client_name}"])?
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
@@ -1339,6 +1367,7 @@ impl TmuxRuntime {
                 "-t",
                 tmux_session,
             ])
+            .ok()?
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
@@ -1367,7 +1396,7 @@ impl TmuxRuntime {
 
     pub fn list_buffer_ids(&self) -> Result<Vec<String>> {
         let output = self
-            .tmux_command(["list-buffers", "-F", "#{buffer_name}"])
+            .tmux_command(["list-buffers", "-F", "#{buffer_name}"])?
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -1389,7 +1418,7 @@ impl TmuxRuntime {
 
     pub fn read_buffer(&self, buffer_id: &str) -> Result<String> {
         let output = self
-            .tmux_command(["show-buffer", "-b", buffer_id])
+            .tmux_command(["show-buffer", "-b", buffer_id])?
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -1412,7 +1441,7 @@ impl TmuxRuntime {
 
     fn run_tmux<'a>(&self, args: impl IntoIterator<Item = &'a str>) -> Result<()> {
         let output = self
-            .tmux_command(args)
+            .tmux_command(args)?
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -1424,13 +1453,17 @@ impl TmuxRuntime {
         Ok(())
     }
 
-    fn tmux_command<'a>(&self, args: impl IntoIterator<Item = &'a str>) -> Command {
+    fn tmux_command<'a>(&self, args: impl IntoIterator<Item = &'a str>) -> Result<Command> {
+        refuse_default_tmux_socket_under_test_isolation(
+            &self.tmux_binary,
+            self.socket_name.as_deref(),
+        )?;
         let mut command = Command::new(&self.tmux_binary);
         if let Some(socket_name) = &self.socket_name {
             command.arg("-L").arg(socket_name);
         }
         command.args(args);
-        command
+        Ok(command)
     }
 
     fn launch_command(&self, spec: &TmuxSessionSpec, prompt_mode: &str) -> Result<String> {
@@ -1694,6 +1727,7 @@ impl TmuxRuntime {
                 tmux_session,
                 "#{cursor_x},#{cursor_y}",
             ])
+            .ok()?
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
@@ -3557,6 +3591,35 @@ esac
         }
     }
 
+    #[test]
+    fn test_isolation_refuses_the_default_tmux_socket() {
+        let default_socket = TmuxRuntime::from_config(&RustCoreConfig::default());
+        let error = default_socket.session_exists("sm-test").unwrap_err();
+        assert!(error.to_string().contains("tmux_socket_name"), "{error}");
+        assert!(default_socket.ensure_recovery_server_anchor().is_err());
+        assert!(matches!(
+            default_socket.probe_session_for_restore("sm-test"),
+            RestoreTmuxLivenessOutcome::Inconclusive { reason }
+                if reason.contains("tmux_socket_name")
+        ));
+
+        // A session record without its own socket clears the configured one.
+        let configured = TmuxRuntime::from_config(&RustCoreConfig {
+            tmux_socket_name: Some("sm-private".to_owned()),
+            ..RustCoreConfig::default()
+        });
+        assert!(configured
+            .for_socket_name(None)
+            .session_exists("sm-test")
+            .is_err());
+
+        assert!(
+            refuse_default_tmux_socket_under_test_isolation("tmux", Some("sm-private")).is_ok()
+        );
+        assert!(refuse_default_tmux_socket_under_test_isolation("tmux", Some(" ")).is_err());
+        assert!(refuse_default_tmux_socket_under_test_isolation("/tmp/fake-tmux", None).is_ok());
+    }
+
     #[cfg(unix)]
     #[test]
     fn real_tmux_missing_socket_is_inconclusive_both_cold_and_live() {
@@ -3587,6 +3650,7 @@ esac
 
         let created = runtime
             .tmux_command(["new-session", "-d", "-s", session_name.as_str(), "sleep 30"])
+            .unwrap()
             .output()
             .unwrap();
         assert!(
@@ -3602,6 +3666,7 @@ esac
                 session_name.as_str(),
                 "#{pid}",
             ])
+            .unwrap()
             .output()
             .unwrap();
         let server_pid = String::from_utf8(server_pid.stdout).unwrap();
@@ -3619,6 +3684,7 @@ esac
                 session_name.as_str(),
                 "#{socket_path}",
             ])
+            .unwrap()
             .output()
             .unwrap();
         let socket_path = PathBuf::from(String::from_utf8(socket_path.stdout).unwrap().trim());
@@ -3652,6 +3718,7 @@ esac
             .unwrap();
         let recovered = runtime
             .tmux_command(["has-session", "-t", session_name.as_str()])
+            .unwrap()
             .status()
             .unwrap();
         assert!(recovered.success());
@@ -3704,6 +3771,7 @@ esac
 
         let created = runtime
             .tmux_command(["new-session", "-d", "-s", session_name.as_str(), "sleep 30"])
+            .unwrap()
             .output()
             .unwrap();
         assert!(
@@ -3719,6 +3787,7 @@ esac
                 session_name.as_str(),
                 "#{pid}",
             ])
+            .unwrap()
             .output()
             .unwrap();
         let server_pid = String::from_utf8(server_pid.stdout)
@@ -3738,6 +3807,7 @@ esac
                 session_name.as_str(),
                 "#{socket_path}",
             ])
+            .unwrap()
             .output()
             .unwrap();
         let socket_path = PathBuf::from(String::from_utf8(socket_path.stdout).unwrap().trim());
@@ -3780,11 +3850,13 @@ esac
         });
         let created = runtime
             .tmux_command(["new-session", "-d", "-s", live_name.as_str(), "sleep 30"])
+            .unwrap()
             .output()
             .unwrap();
         assert!(created.status.success());
         let server_pid = runtime
             .tmux_command(["display-message", "-p", "-t", live_name.as_str(), "#{pid}"])
+            .unwrap()
             .output()
             .unwrap();
         let server_pid = String::from_utf8(server_pid.stdout)
@@ -3803,6 +3875,7 @@ esac
         );
         assert!(runtime
             .tmux_command(["has-session", "-t", format!("={live_name}").as_str()])
+            .unwrap()
             .status()
             .unwrap()
             .success());
@@ -4059,11 +4132,13 @@ esac
         let exact_anchor = format!("={SERVER_ANCHOR_SESSION}");
         assert!(runtime
             .tmux_command(["has-session", "-t", exact_anchor.as_str()])
+            .unwrap()
             .status()
             .unwrap()
             .success());
         let anchor_count = runtime
             .tmux_command(["list-sessions", "-F", "#{session_name}"])
+            .unwrap()
             .output()
             .unwrap();
         assert_eq!(
@@ -4082,6 +4157,7 @@ esac
                 exact_anchor.as_str(),
                 "#{pid}",
             ])
+            .unwrap()
             .output()
             .unwrap();
         let server_pid = String::from_utf8(server_pid.stdout)
@@ -4102,6 +4178,7 @@ esac
         assert!(runtime.kill_session(&agent_name).unwrap());
         assert!(runtime
             .tmux_command(["has-session", "-t", exact_anchor.as_str()])
+            .unwrap()
             .status()
             .unwrap()
             .success());

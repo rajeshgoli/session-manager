@@ -354,6 +354,16 @@ pub fn test_isolation_root_from_environment() -> Result<Option<PathBuf>> {
     Ok(Some(root))
 }
 
+/// True when this process runs under Rust test isolation: the launcher set
+/// the isolation root, or a Cargo test binary bypassed the launcher. Unlike
+/// `test_isolation_root_from_environment`, this never creates a directory.
+pub fn test_isolation_active() -> bool {
+    static ACTIVE: OnceLock<bool> = OnceLock::new();
+    *ACTIVE.get_or_init(|| {
+        env::var_os(TEST_ISOLATION_ROOT_ENV).is_some() || running_rust_test_binary()
+    })
+}
+
 fn running_rust_test_binary() -> bool {
     let Ok(executable) = env::current_exe() else {
         return false;
