@@ -46,6 +46,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Campaign
+import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.QuestionAnswer
 import androidx.compose.material.icons.rounded.Refresh
@@ -90,6 +91,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
@@ -107,6 +109,7 @@ import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
+import li.rajeshgo.sm.data.model.SessionClaim
 import li.rajeshgo.sm.data.model.SessionDoc
 import li.rajeshgo.sm.ui.navigation.AppBottomNav
 import li.rajeshgo.sm.ui.navigation.Routes
@@ -149,7 +152,7 @@ fun WatchScreen(
     var query by remember { mutableStateOf("") }
     var filter by remember { mutableStateOf("all") }
     var toast by remember { mutableStateOf<String?>(null) }
-    var openDoc by remember { mutableStateOf<SessionDoc?>(null) }
+    var openPage by remember { mutableStateOf<ReaderPage?>(null) }
 
     val sections = remember(state.sessions, filter, query) {
         filterSections(buildSections(state.sessions), filter, query)
@@ -251,6 +254,7 @@ fun WatchScreen(
                     },
                     onOpenSettings = onNavigateToSettings,
                     onNewSession = { cloneSource = null; createError = null; creating = true },
+                    onOpenHistory = { openPage = historyReaderPage },
                 )
             }
 
@@ -336,7 +340,7 @@ fun WatchScreen(
                                     toast = result.exceptionOrNull()?.message ?: "Retired ${session.id}"
                                 }
                             },
-                            onOpenDoc = { openDoc = it },
+                            onOpenPage = { openPage = it },
                         )
                     }
                 }
@@ -388,7 +392,7 @@ fun WatchScreen(
                                     toast = result.exceptionOrNull()?.message ?: "Retired ${session.id}"
                                 }
                             },
-                            onOpenDoc = { openDoc = it },
+                            onOpenPage = { openPage = it },
                         )
                     }
                 }
@@ -461,11 +465,11 @@ fun WatchScreen(
                 },
             )
         }
-        openDoc?.let { doc ->
+        openPage?.let { page ->
             DocReaderOverlay(
-                doc = doc,
+                page = page,
                 loadAuth = viewModel::docReaderAuth,
-                onClose = { openDoc = null },
+                onClose = { openPage = null },
                 onCopyLink = { link ->
                     val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
                     clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm doc", link))
@@ -1026,6 +1030,7 @@ private fun HeaderBar(
     onEnsureMaintainer: () -> Unit,
     onOpenSettings: () -> Unit,
     onNewSession: () -> Unit,
+    onOpenHistory: () -> Unit,
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
 
@@ -1059,6 +1064,9 @@ private fun HeaderBar(
                 )
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = onOpenHistory) {
+                    Icon(Icons.Rounded.History, contentDescription = "History", tint = TextSecondary)
+                }
                 Box {
                     IconButton(onClick = { menuExpanded = true }) {
                         Icon(
@@ -1204,7 +1212,7 @@ private fun WatchTree(
     onUpdateWhat: (ClientSession) -> Unit,
     onRegenerateWhat: (ClientSession) -> Unit,
     onKill: (ClientSession) -> Unit,
-    onOpenDoc: (SessionDoc) -> Unit,
+    onOpenPage: (ReaderPage) -> Unit,
 ) {
     if (!nodeMatchesSlice(node, slice)) {
         return
@@ -1228,7 +1236,7 @@ private fun WatchTree(
             onUpdateWhat = { onUpdateWhat(node.session) },
             onRegenerateWhat = { onRegenerateWhat(node.session) },
             onKill = { onKill(node.session) },
-            onOpenDoc = onOpenDoc,
+            onOpenPage = onOpenPage,
         )
     }
 
@@ -1237,7 +1245,7 @@ private fun WatchTree(
     node.sameRepoChildren
         .filter { nodeMatchesSlice(it, slice) }
         .forEach { child ->
-            WatchTree(child, childDepth, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill, onOpenDoc)
+            WatchTree(child, childDepth, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill, onOpenPage)
     }
 
     node.crossRepoGroups.forEach { group ->
@@ -1254,7 +1262,7 @@ private fun WatchTree(
             fontFamily = FontFamily.Monospace,
         )
         visibleChildren.forEach { child ->
-            WatchTree(child, groupDepth + 1, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill, onOpenDoc)
+            WatchTree(child, groupDepth + 1, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill, onOpenPage)
         }
     }
 }
@@ -1277,7 +1285,7 @@ private fun SessionRow(
     onUpdateWhat: () -> Unit,
     onRegenerateWhat: () -> Unit,
     onKill: () -> Unit,
-    onOpenDoc: (SessionDoc) -> Unit,
+    onOpenPage: (ReaderPage) -> Unit,
 ) {
     val attachSupported = session.mobileTerminal?.supported == true || session.termuxAttach?.supported == true
     val hasSummary = whatState?.entries?.isNotEmpty() == true
@@ -1402,7 +1410,7 @@ private fun SessionRow(
                             }
                         }
                     }
-                    AgentWorkSections(session, onOpenDoc)
+                    AgentWorkSections(session, onOpenPage)
                     if (hasSummary || whatState?.status?.let { it != "idle" } == true) {
                         AgentDisclosure("Summary", relativeSummaryAge(whatState?.entries?.lastOrNull()?.createdAt)) {
                             whatState?.let { WhatSummarySection(it, onUpdateWhat, onRegenerateWhat) }
@@ -1465,13 +1473,15 @@ private fun ActivityDetail(title: String, detail: String?, tint: Color) {
 }
 
 @Composable
-private fun AgentWorkSections(session: ClientSession, onOpenDoc: (SessionDoc) -> Unit) {
+private fun AgentWorkSections(session: ClientSession, onOpenPage: (ReaderPage) -> Unit) {
+    val claims = workClaims(session.obligations?.claims.orEmpty())
+    if (claims.isNotEmpty()) WorkLine(claims, onOpenPage)
     val docs = session.obligations?.docs.orEmpty()
     if (docs.isNotEmpty()) {
         Surface(color = Emerald.copy(alpha = 0.06f), shape = RoundedCornerShape(12.dp)) {
             Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                 Text("Docs", style = MaterialTheme.typography.titleSmall, color = Emerald, modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp))
-                docs.forEach { doc -> DocRow(doc, onClick = { onOpenDoc(doc) }) }
+                docs.forEach { doc -> DocRow(doc, onClick = { onOpenPage(docReaderPage(doc)) }) }
             }
         }
     }
@@ -1524,6 +1534,38 @@ private fun AgentWorkSections(session: ClientSession, onOpenDoc: (SessionDoc) ->
     val finished = session.jobs.filter { it.state !in listOf("pending", "running") }
     if (finished.isNotEmpty()) AgentDisclosure("Recent job history", "${finished.size} finished jobs") {
         finished.forEach { job -> ActivityDetail(job.label, jobSummary(job).removePrefix("${job.label} · "), if (job.exitCode == null || job.exitCode == 0) TextSecondary else Rose) }
+    }
+}
+
+/** "Work  Ticket #1452 · PR #1470": each claim opens its ticket page in the reader. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun WorkLine(claims: List<SessionClaim>, onOpenPage: (ReaderPage) -> Unit) {
+    val withRepo = claims.map { it.repo }.distinct().size > 1
+    Surface(color = Cyan.copy(alpha = 0.06f), shape = RoundedCornerShape(12.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text("Work", style = MaterialTheme.typography.titleSmall, color = Cyan)
+            FlowRow(verticalArrangement = Arrangement.Center) {
+                claims.forEachIndexed { index, claim ->
+                    if (index > 0) Text(" · ", style = MaterialTheme.typography.bodyMedium, color = TextMuted, modifier = Modifier.padding(vertical = 8.dp))
+                    val label = workClaimLabel(claim, withRepo)
+                    Text(
+                        text = label,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        fontFamily = FontFamily.Monospace,
+                        textDecoration = TextDecoration.Underline,
+                        modifier = Modifier
+                            .clickable { onOpenPage(ownerReaderPage(claim.title.ifBlank { label }, claimHistoryPath(claim))) }
+                            .padding(vertical = 8.dp),
+                    )
+                }
+            }
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 package li.rajeshgo.sm.ui.watch
 
 import kotlinx.serialization.json.Json
+import li.rajeshgo.sm.data.model.SessionClaim
 import li.rajeshgo.sm.data.model.SessionDoc
 import li.rajeshgo.sm.data.model.SessionObligationsResponse
 import org.junit.Assert.assertEquals
@@ -39,6 +40,47 @@ class DocReaderTest {
         val session = json.decodeFromString(SessionObligationsResponse.serializer(), body).sessions.single()
         assertEquals("abc12345", session.sessionId)
         assertTrue(session.docs.isEmpty())
+        val claim = session.claims.single()
+        assertEquals("ticket", claim.kind)
+        assertEquals(1452L, claim.number)
+        assertEquals("/t/session-manager/1452", claimHistoryPath(claim))
+    }
+
+    @Test fun obligationsWithoutClaimsStillParse() {
+        val body = """{"schema_version":2,"sessions":[{"session_id":"abc12345","waiting_on":[],"review_history":[],"docs":[]}]}"""
+        assertTrue(json.decodeFromString(SessionObligationsResponse.serializer(), body).sessions.single().claims.isEmpty())
+    }
+
+    @Test fun workLineListsTicketsBeforePrsAndOpensTicketPages() {
+        val pr = SessionClaim(kind = "pr", repo = "rajeshgoli/session-manager", number = 1470, historyPath = "/t/session-manager/1470")
+        val ticket = SessionClaim(kind = "ticket", repo = "rajeshgoli/session-manager", number = 1452)
+        val claims = workClaims(listOf(pr, ticket))
+        assertEquals(listOf("Ticket #1452", "PR #1470"), claims.map { workClaimLabel(it, withRepo = false) })
+        assertEquals("PR session-manager #1470", workClaimLabel(pr, withRepo = true))
+        // An older server sends no history_path; a non-ticket-page one is never used.
+        assertEquals("/t/session-manager/1452", claimHistoryPath(ticket))
+        assertEquals("/t/session-manager/1452", claimHistoryPath(ticket.copy(historyPath = "https://elsewhere/t/x/1")))
+        assertEquals("/t/session-manager/1470", claimHistoryPath(pr))
+        assertEquals("$server/t/session-manager/1470", readerUrl("$server/", claimHistoryPath(pr)))
+    }
+
+    @Test fun ownerPagesStayInTheReader() {
+        val current = "$server/history"
+        listOf(
+            "$server/history",
+            "$server/history?agent=1490-engineer&open=1",
+            "$server/t/session-manager/1452",
+            "$server/watch",
+            "$server/",
+            server,
+            "$server/docs/widgets/memo.md",
+        ).forEach { assertEquals(it, DocNavigation.Reload, docNavigation(server, current, it)) }
+        listOf(
+            "$server/historyx",
+            "$server/client/sessions",
+            "$server/session-obligations",
+            "https://sm.example.com/history",
+        ).forEach { assertEquals(it, DocNavigation.External, docNavigation(server, current, it)) }
     }
 
     @Test fun obligationsWithDocsParse() {
@@ -64,7 +106,7 @@ class DocReaderTest {
 
     @Test fun readerUsesTheServersReadablePath() {
         val path = "/docs/fractal-algo-rust/docs/working/ticket.html?version=856f0d6e1a2b"
-        assertEquals("$server$path", docReaderUrl("$server/", doc(readerPath = path)))
+        assertEquals("$server$path", readerUrl("$server/", docReaderPath(doc(readerPath = path))))
     }
 
     @Test fun readerBuildsTheReadablePathWhenAnOlderServerSendsNone() {
@@ -103,8 +145,8 @@ class DocReaderTest {
         val current = "$server/docs/widgets/memo.md?version=bbbbbbbbbbbb"
         assertEquals(
             "https://sm.example.com/docs/widgets/memo.md?version=bbbbbbbbbbbb",
-            docShareUrl(current, doc(browserUrl = "https://sm.example.com/docs/widgets/memo.md?version=aaaaaaaaaaaa")),
+            shareUrl(current, docReaderPage(doc(browserUrl = "https://sm.example.com/docs/widgets/memo.md?version=aaaaaaaaaaaa")).browserUrl),
         )
-        assertEquals(current, docShareUrl(current, doc()))
+        assertEquals(current, shareUrl(current, docReaderPage(doc()).browserUrl))
     }
 }

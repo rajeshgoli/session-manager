@@ -45,6 +45,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import java.net.URI
+import li.rajeshgo.sm.data.model.SessionClaim
 import li.rajeshgo.sm.data.model.SessionDoc
 import li.rajeshgo.sm.data.remote.DeviceClientCertificate
 import li.rajeshgo.sm.ui.theme.BorderStrong
@@ -53,7 +54,7 @@ import li.rajeshgo.sm.ui.theme.Panel
 import li.rajeshgo.sm.ui.theme.Rose
 import li.rajeshgo.sm.ui.theme.TextMuted
 
-/** What the doc reader needs to load `/docs/` pages as the app: the API base, the SM device bearer token and the Cloudflare device certificate. */
+/** What the reader needs to load owner pages (`/docs/`, `/history`, `/t/`) as the app: the API base, the SM device bearer token and the Cloudflare device certificate. */
 class DocReaderAuth(
     val serverUrl: String,
     val accessToken: String,
@@ -96,16 +97,53 @@ private fun percentEncodeSegment(segment: String): String = buildString {
     }
 }
 
-fun docReaderUrl(serverUrl: String, doc: SessionDoc): String =
-    serverUrl.trim().trimEnd('/') + docReaderPath(doc)
+fun readerUrl(serverUrl: String, path: String): String = serverUrl.trim().trimEnd('/') + path
+
+/** The claim's ticket page `/t/<repo-name>/<n>`, built locally when an older server sends no `history_path`. */
+fun claimHistoryPath(claim: SessionClaim): String =
+    claim.historyPath?.takeIf { it.startsWith("/t/") }
+        ?: "/t/${percentEncodeSegment(claim.repo.substringAfterLast('/'))}/${claim.number}"
+
+/** `Ticket #1452` or `PR #1470`; the repo name is added when a session holds work in more than one repo. */
+fun workClaimLabel(claim: SessionClaim, withRepo: Boolean): String {
+    val kind = if (claim.kind == "pr") "PR" else "Ticket"
+    val repo = if (withRepo) "${claim.repo.substringAfterLast('/')} " else ""
+    return "$kind $repo#${claim.number}"
+}
+
+/** The Work line's claims: tickets first, then PRs, each in claim order. */
+fun workClaims(claims: List<SessionClaim>): List<SessionClaim> = claims.sortedBy { if (it.kind == "pr") 1 else 0 }
+
+/** A page the reader opens: a doc, or an owner page such as `/history` or a ticket page. */
+data class ReaderPage(
+    val title: String,
+    val subtitle: String,
+    val path: String,
+    /** The doc's `browser_url`, the host the copy-link button shares; without one it shares the app host's URL. */
+    val browserUrl: String? = null,
+    /** Owner pages show the loaded page's own title and path, since the owner moves between them, and have no copy-link button. */
+    val followsPage: Boolean = false,
+)
+
+fun docReaderPage(doc: SessionDoc): ReaderPage = ReaderPage(
+    title = doc.title.ifBlank { docDisplayName(doc) },
+    subtitle = docDisplayName(doc),
+    path = docReaderPath(doc),
+    browserUrl = doc.browserUrl,
+)
+
+fun ownerReaderPage(title: String, path: String): ReaderPage =
+    ReaderPage(title = title, subtitle = path, path = path, followsPage = true)
+
+val historyReaderPage: ReaderPage get() = ownerReaderPage("History", "/history")
 
 /**
  * The link to share for the page on screen: the same path and query on the
  * owner's browser host (`browser_url`), so it opens in a laptop browser. The
  * app's own API host needs the device certificate, so it is only the fallback.
  */
-fun docShareUrl(currentUrl: String, doc: SessionDoc): String {
-    val browserOrigin = doc.browserUrl?.let(::originOf) ?: return currentUrl
+fun shareUrl(currentUrl: String, browserUrl: String?): String {
+    val browserOrigin = browserUrl?.let(::originOf) ?: return currentUrl
     val current = runCatching { URI(currentUrl) }.getOrNull() ?: return currentUrl
     val query = current.rawQuery?.let { "?$it" }.orEmpty()
     val fragment = current.rawFragment?.let { "#$it" }.orEmpty()
@@ -120,20 +158,20 @@ private fun originOf(url: String): String? {
 }
 
 enum class DocNavigation {
-    /** A same-origin `/docs/` page: reload it through `loadUrl` with the device auth headers. */
+    /** A same-origin owner page: reload it through `loadUrl` with the device auth headers. */
     Reload,
 
     /** A fragment jump inside the page on screen: let the WebView scroll. */
     InPage,
 
-    /** Anything else (the PR, external links): the system browser. */
+    /** Anything else (GitHub, external links, other sm routes): the system browser. */
     External,
 }
 
 fun docNavigation(serverUrl: String, currentUrl: String?, targetUrl: String): DocNavigation {
     val target = runCatching { URI(targetUrl) }.getOrNull() ?: return DocNavigation.External
     val server = runCatching { URI(serverUrl.trim()) }.getOrNull() ?: return DocNavigation.External
-    if (!sameOrigin(server, target) || target.rawPath?.startsWith("/docs/") != true) {
+    if (!sameOrigin(server, target) || !isOwnerPagePath(target.rawPath.orEmpty())) {
         return DocNavigation.External
     }
     val current = currentUrl?.let { runCatching { URI(it) }.getOrNull() }
@@ -142,6 +180,15 @@ fun docNavigation(serverUrl: String, currentUrl: String?, targetUrl: String): Do
     }
     return DocNavigation.Reload
 }
+
+/**
+ * The pages that stay in the reader: docs, History, ticket pages, and the web
+ * watch at `/` and `/watch`, so the page shell's Watch · History tabs never
+ * leave the authenticated web view.
+ */
+fun isOwnerPagePath(path: String): Boolean =
+    path.startsWith("/docs/") || path.startsWith("/t/") ||
+        path == "/history" || path == "/watch" || path == "/" || path.isEmpty()
 
 private fun sameOrigin(a: URI, b: URI): Boolean =
     a.scheme.equals(b.scheme, ignoreCase = true) &&
@@ -159,18 +206,22 @@ private fun withoutFragment(uri: URI): String = uri.toString().substringBefore('
 
 @Composable
 fun DocReaderOverlay(
-    doc: SessionDoc,
+    page: ReaderPage,
     loadAuth: suspend () -> DocReaderAuth?,
     onClose: () -> Unit,
     onCopyLink: (String) -> Unit,
 ) {
-    val auth by produceState<Result<DocReaderAuth?>?>(null, doc) { value = runCatching { loadAuth() } }
+    val auth by produceState<Result<DocReaderAuth?>?>(null, page) { value = runCatching { loadAuth() } }
     // Our own back stack: WebView history navigation would re-request pages
     // without the auth headers, so back reloads the previous URL with them.
-    val history = remember(doc) { mutableStateListOf<String>() }
+    val history = remember(page) { mutableStateListOf<String>() }
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var loading by remember { mutableStateOf(true) }
+    var loadedTitle by remember(page) { mutableStateOf<String?>(null) }
     val readyAuth = auth?.getOrNull()
+    val currentPath = history.lastOrNull()?.let { runCatching { URI(it).rawPath }.getOrNull() }
+    val title = if (page.followsPage) loadedTitle ?: page.title else page.title
+    val subtitle = if (page.followsPage) currentPath?.takeIf(String::isNotEmpty) ?: page.subtitle else page.subtitle
 
     BackHandler {
         val webView = webViewRef
@@ -194,14 +245,14 @@ fun DocReaderOverlay(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = doc.title.ifBlank { docDisplayName(doc) },
+                            text = title,
                             style = MaterialTheme.typography.titleMedium,
                             color = MaterialTheme.colorScheme.onSurface,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                         )
                         Text(
-                            text = docDisplayName(doc),
+                            text = subtitle,
                             style = MaterialTheme.typography.labelSmall,
                             color = TextMuted,
                             fontFamily = FontFamily.Monospace,
@@ -209,10 +260,10 @@ fun DocReaderOverlay(
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
-                    if (readyAuth != null) {
+                    if (readyAuth != null && !page.followsPage) {
                         IconButton(onClick = {
-                            val current = webViewRef?.url ?: history.lastOrNull() ?: docReaderUrl(readyAuth.serverUrl, doc)
-                            onCopyLink(docShareUrl(current, doc))
+                            val current = webViewRef?.url ?: history.lastOrNull() ?: readerUrl(readyAuth.serverUrl, page.path)
+                            onCopyLink(shareUrl(current, page.browserUrl))
                         }) {
                             Icon(Icons.Rounded.Link, contentDescription = "Copy doc link", tint = Cyan)
                         }
@@ -231,7 +282,7 @@ fun DocReaderOverlay(
                 }
                 readyAuth == null -> Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
                     Text(
-                        text = auth?.exceptionOrNull()?.message ?: "Sign in to read docs",
+                        text = auth?.exceptionOrNull()?.message ?: "Sign in to open this page",
                         color = Rose,
                         style = MaterialTheme.typography.bodyMedium,
                     )
@@ -240,10 +291,11 @@ fun DocReaderOverlay(
                     if (loading) LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Cyan)
                     DocReaderWebView(
                         auth = readyAuth,
-                        initialUrl = docReaderUrl(readyAuth.serverUrl, doc),
+                        initialUrl = readerUrl(readyAuth.serverUrl, page.path),
                         history = history,
                         onWebView = { webViewRef = it },
                         onLoading = { loading = it },
+                        onTitle = { loadedTitle = it },
                     )
                 }
             }
@@ -259,6 +311,7 @@ private fun DocReaderWebView(
     history: MutableList<String>,
     onWebView: (WebView?) -> Unit,
     onLoading: (Boolean) -> Unit,
+    onTitle: (String?) -> Unit,
 ) {
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     DisposableEffect(Unit) {
@@ -288,7 +341,7 @@ private fun DocReaderWebView(
                             DocNavigation.InPage -> false
                             DocNavigation.Reload -> {
                                 // WebView drops custom headers on page-initiated navigations and
-                                // redirects, so every /docs/ page is loaded again with them.
+                                // redirects, so every owner page is loaded again with them.
                                 if (request.isRedirect && history.isNotEmpty()) history[history.lastIndex] = target
                                 else history.add(target)
                                 view.loadUrl(target, auth.headers)
@@ -315,7 +368,11 @@ private fun DocReaderWebView(
 
                     override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) = onLoading(true)
 
-                    override fun onPageFinished(view: WebView, url: String?) = onLoading(false)
+                    override fun onPageFinished(view: WebView, url: String?) {
+                        onLoading(false)
+                        // WebView reports the URL as the title of a page without one.
+                        onTitle(view.title?.takeIf { it.isNotBlank() && it != url })
+                    }
                 }
                 history.clear()
                 history.add(initialUrl)
