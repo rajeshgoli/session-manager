@@ -18,6 +18,9 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -27,6 +30,7 @@ import yaml
 
 DEFAULT_AVD = "sm_mtls_api35"
 DEFAULT_SERVER_URL = "https://sm-app.rajeshgo.li"
+DEFAULT_LOCAL_SERVER_URL = "http://127.0.0.1:8420"
 DEFAULT_REPORT_FILE = "android-smoke-report.json"
 DEFAULT_CONFIG = Path("config.yaml")
 DEFAULT_APK = Path("android-app/app/build/outputs/apk/debug/app-debug.apk")
@@ -134,6 +138,7 @@ def run_android_emulator_smoke(args: argparse.Namespace) -> dict[str, Any]:
     emulator_process: subprocess.Popen[str] | None = None
     enrollment_process: subprocess.Popen[str] | None = None
     reversed_port: int | None = None
+    token: dict[str, Any] | None = None
     try:
         identity = load_mobile_smoke_identity(
             Path(args.config),
@@ -164,6 +169,7 @@ def run_android_emulator_smoke(args: argparse.Namespace) -> dict[str, Any]:
             _host_step(report, "start_emulator", "skipped", f"using existing serial={serial}")
         report["inputs"]["serial"] = serial
 
+        # -d: the AVD may hold a release-numbered build; app data is cleared next anyway.
         _run_checked([args.adb, "-s", serial, "install", "-r", "-d", str(apk_path)])
         _host_step(report, "install_debug_apk", "passed")
         _run_checked([args.adb, "-s", serial, "shell", "pm", "clear", args.app_id])
@@ -229,10 +235,92 @@ def run_android_emulator_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 enrollment_process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 enrollment_process.kill()
+                enrollment_process.wait()
+        if enrollment_process is not None:
+            enrolled_device_id = _enrolled_device_id(enrollment_process)
+            _revoke_smoke_device(args, report, token, enrolled_device_id)
+            report["summary"] = _summarize(report)
         if emulator_process and args.stop_started_emulator:
             subprocess.run([args.adb, "emu", "kill"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return report
+
+
+ENROLLED_DEVICE_MARKER = "Enrolled device:"
+
+
+def _enrolled_device_id(process: subprocess.Popen[str]) -> str | None:
+    """Read the device id `sm enroll-device` prints once pairing completes. The
+    server records the device even when the app's own enrollment step fails."""
+    if process.poll() is None or process.stdout is None:
+        return None
+    for line in process.stdout.read().splitlines():
+        if ENROLLED_DEVICE_MARKER in line:
+            device_id = line.split(ENROLLED_DEVICE_MARKER, 1)[1].split()[0].strip()
+            if device_id:
+                return device_id
+    return None
+
+
+def _smoke_device_id(android_report: dict[str, Any] | None) -> str | None:
+    for step in (android_report or {}).get("steps", []):
+        if step.get("id") == "enroll_device_certificate" and step.get("status") == "passed":
+            device_id = str((step.get("detail") or {}).get("device_id") or "").strip()
+            return device_id or None
+    return None
+
+
+def _revoke_smoke_device(
+    args: argparse.Namespace,
+    report: dict[str, Any],
+    token: dict[str, Any] | None,
+    enrolled_device_id: str | None = None,
+) -> None:
+    """Revoke the device this run enrolled so Cloudflare's device policy does not
+    accumulate one allowed certificate per smoke run.
+
+    Device removal requires an actor that is a mobile terminal user, so the call
+    carries the run's own device bearer to the local server rather than going
+    through `sm remove-device`, which acts as the anonymous local caller.
+    """
+    device_id = enrolled_device_id or _smoke_device_id(report["android_report"])
+    if device_id is None or token is None:
+        _host_step(
+            report,
+            "revoke_smoke_device",
+            "blocked",
+            "enrolled device id unknown; find it with `sm list-devices` and revoke it",
+        )
+        return
+    url = (
+        args.local_server_url.rstrip("/")
+        + "/client/mobile-terminal/devices/"
+        + urllib.parse.quote(device_id, safe="")
+    )
+    user_id = report["inputs"].get("user_id")
+    if user_id:
+        url += "?" + urllib.parse.urlencode({"user_id": user_id})
+    request = urllib.request.Request(
+        url,
+        method="DELETE",
+        headers={"Authorization": f"Bearer {token['access_token']}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            response.read()
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", "replace").strip()[-400:]
+        _host_step(
+            report,
+            "revoke_smoke_device",
+            "blocked",
+            f"device_id={device_id}: HTTP {error.code} {detail}",
+        )
+        return
+    except (urllib.error.URLError, OSError) as error:
+        _host_step(report, "revoke_smoke_device", "blocked", f"device_id={device_id}: {error}")
+        return
+    _host_step(report, "revoke_smoke_device", "passed", f"device_id={device_id}")
 
 
 def _start_emulator(args: argparse.Namespace) -> subprocess.Popen[str]:
@@ -533,6 +621,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--server-url", default=DEFAULT_SERVER_URL)
+    parser.add_argument("--local-server-url", default=DEFAULT_LOCAL_SERVER_URL)
     parser.add_argument("--user-id")
     parser.add_argument("--email")
     parser.add_argument("--name")

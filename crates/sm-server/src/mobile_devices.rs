@@ -559,6 +559,10 @@ async fn complete_device_enrollment(
         let _ = revoke_device(&state.db_path, &completed_registration.user_id, &device_id);
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
     }
+    println!(
+        "Enrolled device: {device_id} (user_id={})",
+        completed_registration.user_id
+    );
     state.shutdown.notify_waiters();
     Json(DeviceEnrollmentResponse {
         device_id,
