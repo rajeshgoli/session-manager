@@ -517,10 +517,12 @@ async fn implicit_claims_from_doc_publish_and_codex_review_and_the_feed() {
         json!([
             {"kind": "pr", "repo": REPO, "number": 9, "title": "Item 9", "state": "open",
              "claimed_at": eng["claims"][0]["claimed_at"], "source": "explicit",
-             "history_path": "/t/widgets/9"},
+             "history_path": "/t/widgets/9",
+             "url": format!("https://github.com/{REPO}/issues/9"), "worktree_path": "/wt"},
             {"kind": "ticket", "repo": REPO, "number": 1, "title": "Item 1", "state": "open",
              "claimed_at": eng["claims"][1]["claimed_at"], "source": "explicit",
-             "history_path": "/t/widgets/1"},
+             "history_path": "/t/widgets/1",
+             "url": format!("https://github.com/{REPO}/issues/1"), "worktree_path": "/wt"},
         ])
     );
 }

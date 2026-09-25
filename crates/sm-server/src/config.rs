@@ -56,6 +56,7 @@ pub struct AppConfig {
     pub rust_shadow: RustShadowConfig,
     pub rust_core: RustCoreConfig,
     pub work_claims: WorkClaimsConfig,
+    pub web_watch: WebWatchConfig,
 }
 
 impl Default for AppConfig {
@@ -102,6 +103,7 @@ impl Default for AppConfig {
             rust_shadow: RustShadowConfig::default(),
             rust_core: RustCoreConfig::default(),
             work_claims: WorkClaimsConfig::default(),
+            web_watch: WebWatchConfig::default(),
         }
     }
 }
@@ -1740,6 +1742,32 @@ fn default_work_claims_idle_nudge_minutes() -> u64 {
     30
 }
 
+/// `web_watch`: the browser watch at `/` and `/watch` (sm#1452).
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebWatchConfig {
+    /// Seconds between the page's refreshes of `/watch/state`; at least 2.
+    #[serde(default = "default_web_watch_refresh_seconds")]
+    pub refresh_seconds: u64,
+}
+
+impl Default for WebWatchConfig {
+    fn default() -> Self {
+        Self {
+            refresh_seconds: default_web_watch_refresh_seconds(),
+        }
+    }
+}
+
+impl WebWatchConfig {
+    pub fn refresh_seconds(&self) -> u64 {
+        self.refresh_seconds.max(2)
+    }
+}
+
+fn default_web_watch_refresh_seconds() -> u64 {
+    3
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RustShadowConfig {
     #[serde(default)]
@@ -1840,6 +1868,8 @@ struct RawConfig {
     rust_core: RustCoreConfig,
     #[serde(default)]
     work_claims: WorkClaimsConfig,
+    #[serde(default)]
+    web_watch: WebWatchConfig,
 }
 
 impl From<RawConfig> for AppConfig {
@@ -1946,6 +1976,7 @@ impl From<RawConfig> for AppConfig {
             rust_shadow: raw.rust_shadow,
             rust_core,
             work_claims: raw.work_claims,
+            web_watch: raw.web_watch,
         }
     }
 }

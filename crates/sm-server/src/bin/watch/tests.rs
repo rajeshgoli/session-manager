@@ -225,6 +225,36 @@ fn tree_groups_children_preserves_cycles_and_expands_jobs() {
     assert!(rows.iter().any(|r| r.text.contains("unit tests · running")));
     assert!(rows.iter().any(|r| r.text.contains("/other")));
 }
+/// The web watch (`/watch/state`) orders sessions with
+/// `sm_server::watch_view::tree_order`; the terminal must list them the same.
+#[test]
+fn tree_order_matches_the_terminal_view() {
+    let a = args();
+    let mut view = View::new(&a);
+    let sessions = vec![
+        session("Zeta", "", "/b"),
+        session("child-b", "alpha", "/a"),
+        session("alpha", "", "/a"),
+        session("child-a", "alpha", "/other"),
+        session("grand", "child-b", "/a"),
+        session("beta", "", "/a"),
+        session("loop1", "loop2", "/c"),
+        session("loop2", "loop1", "/c"),
+    ];
+    let snap = Snapshot {
+        sessions: sessions.clone(),
+        ..Default::default()
+    };
+    let expected: Vec<String> = sm_server::watch_view::tree_order(&sessions)
+        .iter()
+        .map(|entry| s(&sessions[entry.index], "id").to_owned())
+        .collect();
+    assert_eq!(ids(&view.rows(&snap, &a, 0)), expected);
+    assert_eq!(
+        expected,
+        ["alpha", "child-a", "child-b", "grand", "beta", "Zeta", "loop1", "loop2"]
+    );
+}
 #[test]
 fn restore_collapses_expands_hides_and_sorts_without_losing_headers() {
     let mut a = args();
@@ -852,15 +882,26 @@ fn docs_mark_the_session_row_and_list_reader_urls_when_expanded() {
     let a = args();
     let mut view = View::new(&a);
     view.base_url = "http://127.0.0.1:8420".into();
+    let now = stamp("2026-09-10T10:05:00Z").unwrap();
     let snap = Snapshot {
-        sessions: vec![session("a", "", "/repo"), session("b", "", "/repo")],
+        sessions: vec![
+            session("a", "", "/repo"),
+            session("b", "", "/repo"),
+            session("c", "", "/repo"),
+        ],
+        jobs: vec![job("j", "a", "running")],
         obligations: vec![
-            json!({"session_id":"a", "waiting_on":[], "review_history":[], "docs":[
-                {"id":"d0c00001","title":"Decision memo","state":"new","reader_path":"/docs/widgets/memo.html?version=aaaaaaaaaaaa"},
-                {"id":"d0c00002","title":"Readout","state":"updated","reader_path":"/docs/widgets/readout.md?version=aaaaaaaaaaaa"},
-                {"id":"d0c00003","title":"Old notes","state":"read","reader_path":"/docs/widgets/notes.txt?version=aaaaaaaaaaaa"}]}),
+            json!({"session_id":"a", "waiting_on":[],
+                "review_history":[{"repo":"acme/widgets","pr_number":42,"landed_count":1,"landed_requested_by_agent":1,"requested_by_agent":1}],
+                "docs":[
+                {"id":"d0c00001","title":"Decision memo","state":"new","published_at":"2026-09-10T10:00:00Z","reader_path":"/docs/widgets/memo.html?version=aaaaaaaaaaaa"},
+                {"id":"d0c00002","title":"Readout","state":"updated","published_at":"2026-09-10T09:00:00Z","reader_path":"/docs/widgets/readout.md?version=aaaaaaaaaaaa"},
+                {"id":"d0c00003","title":"Old notes","state":"read","published_at":"2026-09-08T10:00:00Z","reader_path":"/docs/widgets/notes.txt?version=aaaaaaaaaaaa"}]}),
             // An older server omits `docs`; the row stays unmarked.
             json!({"session_id":"b", "waiting_on":[], "review_history":[]}),
+            // Every doc read: the count alone.
+            json!({"session_id":"c", "waiting_on":[], "review_history":[], "docs":[
+                {"id":"d0c00004","title":"Plan","state":"reviewed","reader_path":"/docs/widgets/plan.md?version=aaaaaaaaaaaa"}]}),
         ],
         ..Default::default()
     };
@@ -871,19 +912,35 @@ fn docs_mark_the_session_row_and_list_reader_urls_when_expanded() {
             .text
             .clone()
     };
-    let rows = view.rows(&snap, &a, 0);
-    assert!(row(&rows, "a").ends_with(" [docs 2]"));
+    let rows = view.rows(&snap, &a, now);
+    assert!(
+        row(&rows, "a").ends_with(" [docs 3·2 new]"),
+        "{}",
+        row(&rows, "a")
+    );
     assert!(!row(&rows, "b").contains("[docs"));
+    assert!(row(&rows, "c").ends_with(" [docs 1]"));
     assert!(!rows.iter().any(|r| r.text.contains("Decision memo")));
 
     view.expanded.insert("a".into());
-    let rows = view.rows(&snap, &a, 0);
-    assert!(rows
+    let rows = view.rows(&snap, &a, now);
+    let at = |text: &str| rows.iter().position(|r| r.text == text);
+    let memo = at("   +- [doc] new  Decision memo  5m  http://127.0.0.1:8420/docs/widgets/memo.html?version=aaaaaaaaaaaa");
+    let notes = at("   +- [doc] read  Old notes  2d 0h  http://127.0.0.1:8420/docs/widgets/notes.txt?version=aaaaaaaaaaaa");
+    let job = rows
         .iter()
-        .any(|r| r.text == "   doc · Decision memo · new · http://127.0.0.1:8420/docs/widgets/memo.html?version=aaaaaaaaaaaa"));
-    assert!(rows.iter().any(|r| r.text.contains(
-        "Old notes · read · http://127.0.0.1:8420/docs/widgets/notes.txt?version=aaaaaaaaaaaa"
-    )));
+        .position(|r| r.text.contains("unit tests · running"));
+    let review = rows
+        .iter()
+        .position(|r| r.text.contains("[review] acme/widgets#42"));
+    // The Docs section sits after the jobs and immediately before Reviews.
+    assert!(
+        memo.is_some() && notes.is_some(),
+        "{:#?}",
+        rows.iter().map(|r| &r.text).collect::<Vec<_>>()
+    );
+    assert!(job < memo && notes < review);
+    assert_eq!(notes.unwrap() + 1, review.unwrap());
 }
 
 #[test]
@@ -907,10 +964,10 @@ fn doc_rows_prefer_the_browser_hostname_link_when_the_server_sends_one() {
     let rows = view.rows(&snap, &a, 0);
     assert!(rows
         .iter()
-        .any(|r| r.text == "   doc · Decision memo · new · https://sm.example.com/docs/widgets/memo.html?version=aaaaaaaaaaaa"));
+        .any(|r| r.text == "   +- [doc] new  Decision memo  ?  https://sm.example.com/docs/widgets/memo.html?version=aaaaaaaaaaaa"));
     assert!(rows
         .iter()
-        .any(|r| r.text == "   doc · Readout · new · http://127.0.0.1:8420/docs/widgets/notes/read%20out.md?version=cccccccccccc"));
+        .any(|r| r.text == "   +- [doc] new  Readout  ?  http://127.0.0.1:8420/docs/widgets/notes/read%20out.md?version=cccccccccccc"));
 }
 
 #[test]
@@ -936,7 +993,7 @@ fn owner_review_waits_are_named_and_undelivered_reviews_flagged() {
         ..Default::default()
     };
     assert!(view.rows(&snap, &a, 0).iter().any(|r| r.text
-        == "   doc · Decision memo · reviewed · review not delivered: author retired · http://127.0.0.1:8420/docs/widgets/memo.html?version=aaaaaaaaaaaa"));
+        == "   +- [doc] reviewed  Decision memo  ?  http://127.0.0.1:8420/docs/widgets/memo.html?version=aaaaaaaaaaaa  review not delivered: author retired"));
 }
 
 #[test]

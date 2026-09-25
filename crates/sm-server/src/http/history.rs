@@ -194,7 +194,7 @@ pub(super) async fn get_timeline(
     ))
 }
 
-fn html_response(status: StatusCode, html: String) -> Response {
+pub(super) fn html_response(status: StatusCode, html: String) -> Response {
     (
         status,
         [
