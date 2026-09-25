@@ -370,6 +370,9 @@ cutover_args=(
 
 # Staging lives beside the installed binary so the install is an atomic rename.
 SM_STAGING="$SM_BINARY.staging.$$"
+# The `sm` CLI from the same build, copied out before the source check so a later
+# build in the target dir cannot change what gets installed.
+SM_CLI_STAGING=""
 RENDERED_PLIST=""
 # A fixed path, not one under $TMPDIR: agent sandboxes give sessions their own
 # TMPDIR, and two restarts that compute different lock paths exclude nothing.
@@ -379,6 +382,7 @@ LOCK_OWNED=0
 cleanup() {
   local rc=$?
   rm -f "$SM_STAGING"
+  [[ -n "$SM_CLI_STAGING" ]] && rm -f "$SM_CLI_STAGING"
   [[ -n "$RENDERED_PLIST" ]] && rm -f "$RENDERED_PLIST" "$RENDERED_PLIST.diff"
   [[ "$LOCK_OWNED" -eq 1 ]] && rm -rf "$SM_LOCK"
   return $rc
@@ -559,6 +563,14 @@ update_checkout() {
     || fail "$REPO_ROOT is at $head, which has commits $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH
        ($remote_head) does not. Deploy only what is on $SM_DEPLOY_BRANCH. The running
        service was not touched."
+  # A fast-forward keeps local edits to files it does not touch, so an edit made
+  # while the fetch ran would otherwise ride along into the deploy.
+  git_repo update-index -q --refresh >/dev/null 2>&1 || true
+  git_repo diff --quiet HEAD \
+    || fail "$REPO_ROOT gained uncommitted changes to tracked files during the update;
+       --update deploys exactly $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH. Something is
+       editing the deployed checkout (git -C $REPO_ROOT status). The running
+       service was not touched."
   git_repo log -1 --format='checkout at %h %s' HEAD
 }
 
@@ -724,6 +736,12 @@ else
   [[ -x "$SM_CARGO_OUTPUT" ]] \
     || fail "build reported success but produced no executable at $SM_CARGO_OUTPUT - the running service was not touched"
   SOURCE_BINARY="$SM_CARGO_OUTPUT"
+  # The same package builds `sm`, from the same source. A missing one only costs
+  # the CLI refresh at the end, never the server restart.
+  if [[ -x "$SM_TARGET_DIR/release/sm" ]]; then
+    SM_CLI_STAGING="$SM_BINARY.sm-cli.staging.$$"
+    cp -p "$SM_TARGET_DIR/release/sm" "$SM_CLI_STAGING" || SM_CLI_STAGING=""
+  fi
 fi
 
 step "Staging and signing"
@@ -875,10 +893,12 @@ fi
 step "Refreshing the installed sm CLI"
 if [[ "$SKIP_BUILD" -eq 1 ]]; then
   echo "skipped (--skip-build): the installed CLI is whatever was there before"
-# The server build above also built `sm` (same package) from the fingerprinted
-# source. Install that one rather than rebuilding, which could read a tree that
-# has moved since.
-elif SM_TARGET_DIR="$SM_TARGET_DIR" "$REPO_ROOT/scripts/install-sm-cli.sh" --skip-build; then
+# Install the `sm` the server build produced from the fingerprinted source, as
+# staged in phase 1, rather than rebuilding from a tree that may have moved since.
+elif [[ -z "$SM_CLI_STAGING" ]]; then
+  echo "WARNING: the build produced no sm CLI at $SM_TARGET_DIR/release/sm, so it was" >&2
+  echo "         not reinstalled; $SM_LABEL itself is healthy." >&2
+elif "$REPO_ROOT/scripts/install-sm-cli.sh" --source "$SM_CLI_STAGING"; then
   :
 else
   echo "WARNING: the sm CLI was not reinstalled; $SM_LABEL itself is healthy." >&2

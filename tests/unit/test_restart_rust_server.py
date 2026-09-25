@@ -1593,14 +1593,54 @@ def test_default_lock_is_shared_across_different_tmpdirs(env, tmp_path):
 
 
 def test_cli_is_installed_from_the_server_build_not_rebuilt(env, checkout):
-    """sm#1536: `sm` comes out of the server's own build of the checked source;
-    rebuilding it at the end could read a tree that has moved since."""
+    """sm#1536: `sm` comes out of the server's own build of the checked source,
+    copied aside before the source check. A build after that - here, one that
+    lands while the service restarts - must not change what gets installed."""
     target = env["tmp"] / "target"
+    built_cli = target / "release" / "sm"
+    _write(built_cli, "#!/bin/bash\n# CLI=FROM-SERVER-BUILD\n", executable=True)
+    installer = checkout["deployed"] / "scripts" / "install-sm-cli.sh"
+    installer.write_text(
+        f"""#!/bin/bash
+echo "install-sm-cli $* $(sed -n 's/^# CLI=//p' "$2")" >> "{env['log']}"
+""")
+    git(checkout["deployed"], "commit", "-q", "-am", "installer that reports its source")
+    cutover = env["tmp"] / "cutover.sh"
+    cutover.write_text(cutover.read_text().replace(
+        "  start-rust)\n",
+        f"  start-rust)\n    printf '#!/bin/bash\\n# CLI=LATER-BUILD\\n' > {built_cli}\n",
+    ))
 
     result = checkout["run"](SM_TARGET_DIR=str(target))
 
     assert result.returncode == 0, result.stderr
-    assert f"install-sm-cli --skip-build target={target}" in calls(env)
+    line = next(l for l in calls(env).splitlines() if l.startswith("install-sm-cli"))
+    assert line.startswith("install-sm-cli --source ")
+    assert line.endswith(" FROM-SERVER-BUILD")
+    assert not list(env["installed"].parent.glob("*.sm-cli.staging.*"))
+
+
+def test_update_refuses_a_tracked_edit_made_while_fetching(env, checkout):
+    """A fast-forward keeps local edits to files it does not touch."""
+    land_on_main(checkout)
+    real_git = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+    _write(
+        env["tmp"] / "bin" / "git",
+        f"""#!/bin/bash
+if [[ " $* " == *" fetch "* ]]; then
+  echo edit >> {checkout['deployed']}/scripts/install-sm-cli.sh
+fi
+exec {real_git} "$@"
+""",
+        executable=True,
+    )
+
+    result = checkout["run"]("--update")
+
+    assert result.returncode != 0
+    assert "gained uncommitted changes to tracked files during the update" in result.stderr
+    assert "cargo build" not in calls(env)
+    assert_service_untouched(env)
 
 
 def test_cli_installer_builds_its_own_checkout_from_any_cwd(tmp_path):
