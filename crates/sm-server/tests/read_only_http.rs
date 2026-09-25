@@ -24854,3 +24854,61 @@ async fn owner_doc_review_retries_under_one_id_never_post_twice() {
     // Another revision has its own budget.
     add_draft(&app, &memo, &"b".repeat(40), json!(3), "Buy", "elsewhere").await;
 }
+
+#[tokio::test]
+async fn session_root_route_resolves_the_persisted_parent_chain() {
+    let state_file = unique_temp_path();
+    let session = |id: &str, parent: Option<&str>| {
+        json!({
+            "id": id,
+            "name": format!("claude-{id}"),
+            "working_dir": "/repo",
+            "tmux_session": format!("claude-{id}"),
+            "log_file": format!("/tmp/{id}.log"),
+            "status": "running",
+            "created_at": "2026-06-01T00:00:00",
+            "last_activity": "2026-06-01T00:01:00",
+            "parent_session_id": parent,
+        })
+    };
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                session("rootseat", None),
+                session("childset", Some("rootseat")),
+                session("grandset", Some("childset")),
+                session("orphanst", Some("missing1")),
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = router(AppState::new(config_with_state_file(&state_file)));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/grandset/root").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({
+            "session_id": "grandset",
+            "root_session_id": "rootseat",
+            "chain": ["grandset", "childset", "rootseat"],
+        })
+    );
+
+    let (status, payload) = get_json(app.clone(), "/sessions/rootseat/root").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["root_session_id"], "rootseat");
+
+    let (status, payload) = get_json(app.clone(), "/sessions/orphanst/root").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        payload["detail"],
+        "Cannot resolve /root: session orphanst names parent missing1, which has no record"
+    );
+
+    let (status, payload) = get_json(app, "/sessions/nobody01/root").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(payload["detail"], "Session not found");
+}

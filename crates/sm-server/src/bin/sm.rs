@@ -1049,7 +1049,11 @@ fn run() -> Result<()> {
                     .first()
                     .map(String::as_str)
                     .unwrap_or(args.session_id.as_str());
-                if let Some(session_id) = lookup_identifier_exact(&client, target)? {
+                let session_id = match resolve_virtual_send_target(&client, target)? {
+                    Some(session_id) => Some(session_id),
+                    None => lookup_identifier_exact(&client, target)?,
+                };
+                if let Some(session_id) = session_id {
                     let payload =
                         client.post_json(&format!("/sessions/{session_id}/input"), payload)?;
                     println!(
@@ -3028,6 +3032,8 @@ fn subagent_stop_summary(payload: &Value) -> Option<String> {
         .or_else(|| json_value_string(payload, "summary"))
 }
 
+const ROOT_SEND_TARGET: &str = "/root";
+
 fn split_send_targets(raw_value: &str) -> Vec<String> {
     let mut identifiers = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -3042,10 +3048,61 @@ fn split_send_targets(raw_value: &str) -> Vec<String> {
 }
 
 fn resolve_send_target(client: &ApiClient, identifier: &str) -> Result<String> {
+    if let Some(session_id) = resolve_virtual_send_target(client, identifier)? {
+        return Ok(session_id);
+    }
     match lookup_identifier(client, identifier)? {
         Some(session_id) => Ok(session_id),
         None => Ok(identifier.to_owned()),
     }
+}
+
+/// Send targets starting with `/` are virtual: they name a relationship, not a
+/// session or an email recipient, so they never fall through to either lookup.
+/// `/root` is the topmost session of the caller's persisted parent chain.
+fn resolve_virtual_send_target(client: &ApiClient, identifier: &str) -> Result<Option<String>> {
+    resolve_virtual_send_target_for(client, identifier, optional_current_session_id())
+}
+
+fn resolve_virtual_send_target_for(
+    client: &ApiClient,
+    identifier: &str,
+    caller: Option<String>,
+) -> Result<Option<String>> {
+    if !identifier.starts_with('/') {
+        return Ok(None);
+    }
+    if identifier != ROOT_SEND_TARGET {
+        bail!("Unknown send target '{identifier}': the only virtual target is {ROOT_SEND_TARGET}");
+    }
+    let caller = caller.ok_or_else(|| {
+        anyhow!(
+            "{ROOT_SEND_TARGET} requires a managed session: SESSION_MANAGER_ID is not set. \
+             Run it from an agent session, or send to a session ID or name."
+        )
+    })?;
+    let response = client.request(
+        "GET",
+        &format!("/sessions/{}/root", encode_path_segment(&caller)),
+        None,
+    )?;
+    if response.status == 404 {
+        bail!("Cannot resolve {ROOT_SEND_TARGET}: this session ({caller}) has no record in Session Manager");
+    }
+    if response.status == 409 {
+        let detail = serde_json::from_str::<Value>(&response.body)
+            .ok()
+            .and_then(|body| body["detail"].as_str().map(ToOwned::to_owned));
+        bail!("{}", detail.unwrap_or(response.body));
+    }
+    if !(200..300).contains(&response.status) {
+        return Err(response.into_status_error());
+    }
+    let payload = response.into_json()?;
+    payload["root_session_id"]
+        .as_str()
+        .map(|session_id| Some(session_id.to_owned()))
+        .ok_or_else(|| anyhow!("{ROOT_SEND_TARGET} response missing root_session_id"))
 }
 
 fn run_what(client: &ApiClient, args: WhatArgs) -> Result<()> {
@@ -6510,6 +6567,66 @@ mod tests {
                 "/sessions/playback-spec",
                 "/sessions"
             ]
+        );
+    }
+
+    #[test]
+    fn root_send_target_resolves_through_the_caller_hierarchy() {
+        let (client, server) = start_lookup_server([(
+            "/sessions/child123/root",
+            200,
+            r#"{"session_id":"child123","root_session_id":"root0001","chain":["child123","mid00001","root0001"]}"#,
+        )]);
+
+        assert_eq!(
+            resolve_virtual_send_target_for(&client, "/root", Some("child123".to_owned())).unwrap(),
+            Some("root0001".to_owned())
+        );
+        assert_eq!(server.join().unwrap(), vec!["/sessions/child123/root"]);
+    }
+
+    #[test]
+    fn root_send_target_reports_unresolvable_hierarchy_without_email_fallback() {
+        let (client, server) = start_lookup_server([(
+            "/sessions/child123/root",
+            409,
+            r#"{"detail":"Cannot resolve /root: session child123 names parent gone0001, which has no record"}"#,
+        )]);
+
+        let error = resolve_virtual_send_target_for(&client, "/root", Some("child123".to_owned()))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Cannot resolve /root: session child123 names parent gone0001, which has no record"
+        );
+        assert_eq!(server.join().unwrap(), vec!["/sessions/child123/root"]);
+    }
+
+    #[test]
+    fn virtual_send_targets_fail_locally_before_any_lookup() {
+        // Nothing listens here: any request would surface as a connection error.
+        let client = ApiClient::parse("http://127.0.0.1:1").unwrap();
+
+        let error = resolve_virtual_send_target_for(&client, "/root", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("/root requires a managed session"),
+            "{error}"
+        );
+
+        let error = resolve_send_target(&client, "/parent")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Unknown send target '/parent': the only virtual target is /root"
+        );
+
+        assert_eq!(
+            resolve_virtual_send_target_for(&client, "root", Some("child123".to_owned())).unwrap(),
+            None
         );
     }
 

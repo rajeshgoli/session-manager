@@ -131,14 +131,14 @@ use crate::sessions::{
     CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
     CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, CreateReparentRequest,
     CreateReparentTreeRequest, CredentialRotationOutcome, DecideReparentRequest, HandoffOutcome,
-    HandoffRequest, MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision,
-    ReparentMutationOutcome, ReparentRepairAction, RetireAuthority, RoleRegistrationRequest,
-    SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest, SendCoreInputRequest,
-    SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
-    SetMaintainerRequest, SpawnBriefBinding, SpawnBriefSource, SpawnReviewRequest,
-    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
-    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
-    UpdateSessionMetadataRequest,
+    HandoffRequest, HierarchyRootResolution, MaintainerMutationOutcome, RegistryMutationOutcome,
+    ReparentDecision, ReparentMutationOutcome, ReparentRepairAction, RetireAuthority,
+    RoleRegistrationRequest, SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest,
+    SendCoreInputRequest, SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore,
+    SessionsEnvelope, SetMaintainerRequest, SpawnBriefBinding, SpawnBriefSource,
+    SpawnReviewRequest, StartReviewRequest, SubagentStartOutcome, SubagentStartRequest,
+    SubagentStopOutcome, SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest,
+    TurnCompleteOutcome, UpdateSessionMetadataRequest,
 };
 
 use crate::studio_ssh::{self, StudioSshStatus};
@@ -1596,6 +1596,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/sessions/{parent_session_id}/children",
             get(list_children_sessions),
+        )
+        .route(
+            "/sessions/{session_id}/root",
+            get(get_session_hierarchy_root),
         )
         .route(
             "/sessions/{session_id}/attach-descriptor",
@@ -3866,6 +3870,22 @@ async fn list_children_sessions(
         "parent_session_id": parent_session_id,
         "children": children,
     })))
+}
+
+async fn get_session_hierarchy_root(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_session_read_allowed(&state, &request)?;
+    match state.session_store.resolve_hierarchy_root(&session_id)? {
+        HierarchyRootResolution::Resolved(root) => Ok(Json(serde_json::to_value(root)?)),
+        HierarchyRootResolution::CallerNotFound => Err(ApiError::NotFound("Session not found")),
+        HierarchyRootResolution::Unresolvable(reason) => Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: format!("Cannot resolve /root: {reason}"),
+        }),
+    }
 }
 
 async fn get_session_usage(
