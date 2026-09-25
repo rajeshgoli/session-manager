@@ -6750,14 +6750,124 @@ async fn queue_runtime_recovery_polls_live_running_job_to_completion() {
             .unwrap();
     assert_eq!(summary.recovered_running, 1);
     assert_eq!(summary.polling_running, 1);
+    let waiter = thread::spawn(move || child.wait());
     let final_payload = wait_for_queue_job_state(app, &job_id, &["succeeded"]).await;
     assert_eq!(final_payload["exit_code"], 0);
-    let _ = child.wait();
+    let _ = waiter.join();
     let notifications = queued_message_texts(&message_queue_db, "run12345");
     assert_eq!(notifications.len(), 1);
     assert!(notifications[0].contains(&format!("Log: {log_path}")));
     assert!(!notifications[0].contains("recovered-live"));
     assert!(!notifications[0].contains("log tail:"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn queue_runtime_recovery_poller_survives_transient_queue_database_error() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-recover-db-lock");
+    let message_queue_db = state_file.with_extension("queue-recover-db-lock-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let job_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "recover db lock",
+        "printf placeholder",
+        60,
+    )
+    .await;
+    let exit_code_path = queue_job_text_column(&queue_state_dir, &job_id, "exit_code_path");
+    let ready_path = queue_state_dir.join("recover-db-lock.ready");
+    let go_path = queue_state_dir.join("recover-db-lock.go");
+    let mut child = Command::new("/bin/zsh")
+        .arg("-lc")
+        .arg("printf ready > \"$READY_PATH\"; while [ ! -e \"$GO_PATH\" ]; do sleep 0.05; done; printf '0\\n' > \"$EXIT_CODE_PATH\"")
+        .env("READY_PATH", &ready_path)
+        .env("GO_PATH", &go_path)
+        .env("EXIT_CODE_PATH", &exit_code_path)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let _ready = wait_for_file_contains(&ready_path, "ready").await;
+    let pid = i64::from(child.id());
+    mark_queue_job_running(&queue_state_dir, &job_id, &test_now_rfc3339(), pid, pid);
+    let summary =
+        RetainedQueueStore::recover_queue_jobs_in_state_dir(&queue_state_dir, &message_queue_db, 0)
+            .unwrap();
+    assert_eq!(summary.polling_running, 1);
+
+    // Make the queue database unopenable for several poll ticks, standing in for a
+    // lock held past the busy timeout: the poller must retry, not give up.
+    let db_path = queue_state_dir.join("queue_runner.db");
+    let original_mode = fs::metadata(&db_path).unwrap().permissions().mode();
+    fs::set_permissions(&db_path, fs::Permissions::from_mode(0o000)).unwrap();
+    thread::sleep(Duration::from_secs(1));
+    fs::set_permissions(&db_path, fs::Permissions::from_mode(original_mode)).unwrap();
+
+    fs::write(&go_path, "go").unwrap();
+    let waiter = thread::spawn(move || child.wait());
+    let final_payload = wait_for_queue_job_state(app, &job_id, &["succeeded"]).await;
+    assert_eq!(final_payload["exit_code"], 0);
+    let _ = waiter.join();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn queue_runtime_recovery_waits_for_process_group_after_wrapper_exit() {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension("queue-runner-recover-group-linger");
+    let message_queue_db = state_file.with_extension("queue-recover-group-linger-message-queue.db");
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let app = queue_runtime_test_app(
+        &state_file,
+        &queue_state_dir,
+        &message_queue_db,
+        false,
+        true,
+    );
+    let job_id = create_pending_queue_job(
+        app.clone(),
+        &working_dir,
+        "recover group linger",
+        "printf placeholder",
+        60,
+    )
+    .await;
+    let exit_code_path = queue_job_text_column(&queue_state_dir, &job_id, "exit_code_path");
+    let marker_path = queue_state_dir.join("recover-group-linger.done");
+    let mut child = Command::new("/bin/zsh")
+        .arg("-lc")
+        .arg("(sleep 2; printf done > \"$MARKER_PATH\") & printf '0\\n' > \"$EXIT_CODE_PATH\"")
+        .env("MARKER_PATH", &marker_path)
+        .env("EXIT_CODE_PATH", &exit_code_path)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pid = i64::from(child.id());
+    child.wait().unwrap();
+    assert!(std::path::Path::new(&exit_code_path).exists());
+    mark_queue_job_running(&queue_state_dir, &job_id, &test_now_rfc3339(), pid, pid);
+
+    let summary =
+        RetainedQueueStore::recover_queue_jobs_in_state_dir(&queue_state_dir, &message_queue_db, 0)
+            .unwrap();
+    assert_eq!(summary.polling_running, 1);
+    assert_eq!(summary.finished_succeeded, 0);
+    let final_payload = wait_for_queue_job_state(app, &job_id, &["succeeded"]).await;
+    assert_eq!(final_payload["exit_code"], 0);
+    assert!(
+        marker_path.exists(),
+        "job finished while its process group was still running"
+    );
 }
 
 #[cfg(unix)]
