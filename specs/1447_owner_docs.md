@@ -101,6 +101,14 @@ Identity and republishing: a doc is keyed by `(repo, path, pr_number)`, or by
 publish carries the current title and note; each publish row records whether that
 publish requested a review.
 
+Authorship follows the agent working the doc. A republish by a different session
+keeps the recorded author while that author is live, so one agent can't take
+another's reviews. If the recorded author is retired or killed, or its session no
+longer exists, the republishing session becomes the author (`author_session_id` and
+`author_session_name`). Example: `1471-engineer` publishes the memo and is retired;
+`1452-spec-author` republishes it, and from then on the memo shows in
+`1452-spec-author`'s Docs row and the owner's review wakes `1452-spec-author`.
+
 ### Android app
 
 - **Session expansion** (`AgentWorkSections` in `WatchScreen.kt`): add a **Docs**
@@ -611,6 +619,9 @@ tests do (reuse that fixture pattern; don't invent a new one).
   another doc, when expired, or on `/view`.
 - CLI: with no `--pr`, the current branch's open PR is used (and `--no-pr` opts out),
   so republishing lands on the same doc.
+- Republish authorship: a different session's republish keeps a live author and
+  takes over from a retired, killed or unknown one; the author's own republish is
+  unchanged.
 - Reader default: the readable URL without `?version=` renders the latest published
   SHA, not the PR head, and `/docs/{id}` redirects to the readable URL;
   `/head` reports `pr_head_blob_differs` correctly.

@@ -484,7 +484,14 @@ impl OwnerDocStore {
     }
 
     /// Adds a publish event, creating the doc on first publish of its key.
-    pub fn publish(&self, request: PublishOwnerDoc) -> Result<PublishedOwnerDoc> {
+    /// A republish takes over authorship when `author_is_live` says the
+    /// recorded author is retired or gone, so owner reviews wake the agent
+    /// still working the doc; a live author keeps it.
+    pub fn publish(
+        &self,
+        request: PublishOwnerDoc,
+        author_is_live: impl FnOnce(&str) -> bool,
+    ) -> Result<PublishedOwnerDoc> {
         validate_repo_slug(&request.repo)?;
         validate_repo_path(&request.path)?;
         let mut conn = self.open_write()?;
@@ -511,6 +518,16 @@ impl OwnerDocStore {
                      WHERE id = ?1",
                     params![doc.id, request.title, request.note, now],
                 )?;
+                if doc.author_session_id != request.session_id
+                    && !author_is_live(&doc.author_session_id)
+                {
+                    tx.execute(
+                        "UPDATE owner_docs
+                         SET author_session_id = ?2, author_session_name = ?3
+                         WHERE id = ?1",
+                        params![doc.id, request.session_id, request.session_name],
+                    )?;
+                }
                 doc.id
             }
             None => {
@@ -1430,12 +1447,12 @@ mod tests {
     #[test]
     fn republishing_the_same_key_adds_a_publish_event_not_a_doc() {
         let (store, dir) = store();
-        let first = store.publish(publish(Some(7), "a", "1")).unwrap();
+        let first = store.publish(publish(Some(7), "a", "1"), |_| true).unwrap();
         assert!(first.created);
         let mut again = publish(Some(7), "b", "2");
         again.title = "Memo v2".into();
         again.note = Some("addressed comments".into());
-        let second = store.publish(again).unwrap();
+        let second = store.publish(again, |_| true).unwrap();
         assert!(!second.created);
         assert_eq!(second.doc.id, first.doc.id);
         assert_eq!(second.doc.title, "Memo v2");
@@ -1443,9 +1460,9 @@ mod tests {
         assert_eq!(store.publishes(&first.doc.id).unwrap().len(), 2);
 
         // A different PR, or no PR, for the same path is a different doc.
-        let other_pr = store.publish(publish(Some(8), "c", "3")).unwrap();
-        let no_pr = store.publish(publish(None, "d", "4")).unwrap();
-        let no_pr_again = store.publish(publish(None, "e", "4")).unwrap();
+        let other_pr = store.publish(publish(Some(8), "c", "3"), |_| true).unwrap();
+        let no_pr = store.publish(publish(None, "d", "4"), |_| true).unwrap();
+        let no_pr_again = store.publish(publish(None, "e", "4"), |_| true).unwrap();
         assert!(other_pr.created && no_pr.created && !no_pr_again.created);
         assert_ne!(other_pr.doc.id, first.doc.id);
         assert_ne!(no_pr.doc.id, other_pr.doc.id);
@@ -1461,17 +1478,65 @@ mod tests {
     }
 
     #[test]
+    fn republish_takes_authorship_only_from_a_gone_author() {
+        let (store, dir) = store();
+        let first = store.publish(publish(Some(7), "a", "1"), |_| true).unwrap();
+        let by = |session: &str, name: &str, commit: &str| {
+            let mut request = publish(Some(7), commit, "1");
+            request.session_id = session.into();
+            request.session_name = Some(name.into());
+            request
+        };
+
+        // A live author keeps the doc when another agent republishes it.
+        let kept = store
+            .publish(by("agent002", "helper", "b"), |author| {
+                assert_eq!(author, "agent001");
+                true
+            })
+            .unwrap();
+        assert_eq!(kept.doc.author_session_id, "agent001");
+        assert_eq!(kept.doc.author_session_name.as_deref(), Some("memo-writer"));
+
+        // A retired or unknown author hands it to the republishing session.
+        let moved = store
+            .publish(by("agent003", "memo-writer-2", "c"), |_| false)
+            .unwrap();
+        assert_eq!(moved.doc.id, first.doc.id);
+        assert_eq!(moved.doc.author_session_id, "agent003");
+        assert_eq!(
+            moved.doc.author_session_name.as_deref(),
+            Some("memo-writer-2")
+        );
+        let summaries = store
+            .summaries(Some(&["agent003".to_owned()].into()), false)
+            .unwrap();
+        assert_eq!(summaries.len(), 1);
+
+        // The author republishing its own doc never asks about liveness.
+        store
+            .publish(by("agent003", "memo-writer-2", "d"), |_| {
+                panic!("liveness checked for the author's own republish")
+            })
+            .unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn state_moves_new_read_updated_only_when_the_blob_changes() {
         let (store, dir) = store();
         let state = |id: &str| store.summary(id).unwrap().unwrap().state;
-        let doc = store.publish(publish(Some(7), "a", "1")).unwrap().doc;
+        let doc = store
+            .publish(publish(Some(7), "a", "1"), |_| true)
+            .unwrap()
+            .doc;
         assert_eq!(state(&doc.id), OwnerDocState::New);
         store.record_view(&doc.id, &"1".repeat(40)).unwrap();
         assert_eq!(state(&doc.id), OwnerDocState::Read);
         // A push that doesn't touch the file: new commit, same blob.
-        store.publish(publish(Some(7), "b", "1")).unwrap();
+        store.publish(publish(Some(7), "b", "1"), |_| true).unwrap();
         assert_eq!(state(&doc.id), OwnerDocState::Read);
-        store.publish(publish(Some(7), "c", "2")).unwrap();
+        store.publish(publish(Some(7), "c", "2"), |_| true).unwrap();
         assert_eq!(state(&doc.id), OwnerDocState::Updated);
         store.record_view(&doc.id, &"2".repeat(40)).unwrap();
         assert_eq!(state(&doc.id), OwnerDocState::Read);
@@ -1512,7 +1577,10 @@ mod tests {
     #[test]
     fn finishing_a_review_deletes_its_drafts_and_queues_one_wake() {
         let (store, dir) = store();
-        let doc = store.publish(publish(Some(7), "a", "1")).unwrap().doc;
+        let doc = store
+            .publish(publish(Some(7), "a", "1"), |_| true)
+            .unwrap()
+            .doc;
         let (sha, other_sha) = ("a".repeat(40), "b".repeat(40));
         let draft = store
             .create_draft(&doc.id, &sha, Some(3), "the quote", "fix this")
@@ -1630,12 +1698,15 @@ mod tests {
     #[test]
     fn retract_hides_until_republished() {
         let (store, dir) = store();
-        let doc = store.publish(publish(None, "a", "1")).unwrap().doc;
+        let doc = store
+            .publish(publish(None, "a", "1"), |_| true)
+            .unwrap()
+            .doc;
         let retracted = store.retract(&doc.id).unwrap().unwrap();
         assert!(retracted.retracted_at.is_some());
         assert!(store.summaries(None, false).unwrap().is_empty());
         assert_eq!(store.summaries(None, true).unwrap().len(), 1);
-        store.publish(publish(None, "b", "1")).unwrap();
+        store.publish(publish(None, "b", "1"), |_| true).unwrap();
         assert_eq!(store.summaries(None, false).unwrap().len(), 1);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -1643,10 +1714,10 @@ mod tests {
     #[test]
     fn summaries_filter_by_author() {
         let (store, dir) = store();
-        store.publish(publish(None, "a", "1")).unwrap();
+        store.publish(publish(None, "a", "1"), |_| true).unwrap();
         let mut other = publish(Some(3), "b", "2");
         other.session_id = "agent002".into();
-        store.publish(other).unwrap();
+        store.publish(other, |_| true).unwrap();
         let authors = BTreeSet::from(["agent002".to_owned()]);
         let mine = store.summaries(Some(&authors), false).unwrap();
         assert_eq!(mine.len(), 1);
