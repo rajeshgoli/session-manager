@@ -1294,6 +1294,8 @@ pub(super) async fn post_owner_doc_subpath(
     ensure_doc_write_allowed(&state, &headers, peer_addr, &doc_id, &rest)?;
     let doc = find_doc(&state, &doc_id)?;
     if rest == "drafts" {
+        // Drafts don't change under a review being submitted.
+        let _guard = state.owner_doc_review_lock.lock().await;
         return create_draft(&state, &doc, parse_json_body(&body)?).map(Json);
     }
     review::submit_owner_doc_review(&state, &doc, parse_json_body(&body)?)
@@ -1314,6 +1316,7 @@ pub(super) async fn patch_owner_doc_subpath(
     let doc = find_doc(&state, &doc_id)?;
     let payload: UpdateDraftRequest = parse_json_body(&body)?;
     let text = validated_draft_body(&payload.body)?;
+    let _guard = state.owner_doc_review_lock.lock().await;
     let draft = owner_doc_store(&state)
         .update_draft(&doc.id, draft_id, &text)?
         .ok_or(ApiError::NotFound("Draft not found"))?;
@@ -1330,6 +1333,7 @@ pub(super) async fn delete_owner_doc_subpath(
     ensure_doc_write_allowed(&state, &headers, peer_addr, &doc_id, &rest)?;
     let draft_id = draft_subroute(&rest)?;
     let doc = find_doc(&state, &doc_id)?;
+    let _guard = state.owner_doc_review_lock.lock().await;
     if !owner_doc_store(&state).delete_draft(&doc.id, draft_id)? {
         return Err(ApiError::NotFound("Draft not found"));
     }

@@ -376,13 +376,11 @@
           sheet.appendChild(el('div', { class: 'row' }, [el('button', { text: 'Close', onclick: closeSheet })]));
         })
         .catch(function (err) {
-          // A server answer means this submission is finished (failed or
-          // refused), so the next attempt is a new one. A network failure
-          // may have reached the server: retry with the same id.
-          if (err.status) S.submissionId = newId();
+          // Keep the id: the server reconciles a retry against GitHub, so
+          // resubmitting can never post the review twice.
           submit.disabled = false;
           msg.className = 'err';
-          msg.textContent = err.message + (err.status ? '' : ' (retrying is safe)');
+          msg.textContent = err.message + ' Submitting again is safe.';
         });
     } });
     [el('div', { class: 'row' }, radios), body, msg,

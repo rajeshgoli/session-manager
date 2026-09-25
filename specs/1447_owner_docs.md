@@ -378,10 +378,9 @@ and use a shadow DOM for its UI.
 - **Submit panel**: a "Review (N)" button opens the drafts for this revision (each
   with Edit), verdict radios (Approve / Request changes / Comment), an overall body
   textarea and Submit → `POST /docs/{id}/review`. On success it shows the GitHub
-  review link and clears the drafts. When the server answers with an error the
-  submission is finished (failed or refused), so the next Submit uses a new
-  `submission_id`; when the request never got an answer (network), the next Submit
-  reuses the same one.
+  review link and clears the drafts. The panel keeps one `submission_id` until the
+  review is posted: every retry, after any error, reuses it, and the server
+  reconciles it against GitHub, so resubmitting never posts twice.
 - **Drafts from another revision**: if drafts exist for a different SHA than the one
   being viewed, show "N draft comments on <sha7>", with actions *Submit them against
   <sha7>* (switches the view to that SHA) or *Discard*. Don't auto-migrate drafts
@@ -395,9 +394,10 @@ panel opens and reuses it on every retry of that submit.
 
 **Idempotency.** Before any GitHub call, insert the `owner_doc_reviews` row with
 `id = submission_id` and `status = submitting`. If the row already exists:
-`posted` → return the stored result without touching GitHub; `failed` → 409 (the
-drafts were kept; submit again with a new id); `submitting` → reconcile (below)
-instead of starting over. A `submission_id` from another doc is a 409. The review body ends with a hidden
+`posted` → return the stored result without touching GitHub; `failed` or
+`submitting` → set it `submitting` and reconcile (below) instead of starting over.
+A `submission_id` from another doc is a 409. Submits, reconciliation and draft
+writes are serialized, so drafts can't change under a review being posted. The review body ends with a hidden
 marker, `<!-- sm-review:<submission_id> -->`. To reconcile, list the PR's reviews by
 the viewer (GraphQL `pullRequest.reviews(author: <viewer login>)`, including
 `PENDING`) and look for the marker:
@@ -435,8 +435,15 @@ behaviour each step relies on was verified on PR #1448; see "GitHub API findings
       it if found. Otherwise delete the pending review (`deletePullRequestReview`) so
       no half-built pending review is left under the owner's account (a leftover
       pending review blocks creating the next one). Then mark the row `failed` and
-      keep the drafts. GraphQL mutations are not retried on transport errors, since
-      a retry after a lost response could add a second thread. The client retries with a new
+      keep the drafts. If the delete itself fails, the row stays `submitting`, so
+      a retry resumes that pending review. GraphQL mutations are not retried on
+      transport errors, since a retry after a lost response could add a second
+      thread; instead an error is treated as possibly applied:
+      - step 1 failing → look for a review carrying the marker; use it if found,
+        mark the row `failed` if GitHub confirms there is none, and leave it
+        `submitting` if GitHub can't be asked;
+      - a `LINE` thread erroring → check whether the pending review already holds
+        that comment before falling back to `FILE`. The client retries with a new
       `submission_id`. A crash, as opposed to an error, leaves the row `submitting`,
       and reconciliation handles it.
 3. **Every comment body quotes the selected text**, as `> <quote>\n\n<comment>`. A

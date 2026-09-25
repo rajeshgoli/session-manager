@@ -934,6 +934,18 @@ impl OwnerDocStore {
         Ok(())
     }
 
+    /// A retry of a `failed` submission: back to `submitting`, to be
+    /// reconciled against GitHub. Other states are returned unchanged.
+    pub fn reopen_review(&self, submission_id: &str) -> Result<OwnerDocReview> {
+        let conn = self.open_write()?;
+        conn.execute(
+            "UPDATE owner_doc_reviews SET status = 'submitting'
+             WHERE id = ?1 AND status = 'failed'",
+            params![submission_id],
+        )?;
+        get_review_conn(&conn, submission_id)?.context("review row vanished")
+    }
+
     /// `submitting` → `failed`; the drafts stay for a retry.
     pub fn fail_review(&self, submission_id: &str) -> Result<()> {
         let conn = self.open_write()?;

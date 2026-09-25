@@ -178,10 +178,13 @@ pub(super) async fn submit_owner_doc_review(
         return match existing.status.as_str() {
             _ if existing.doc_id != doc.id => Err(conflict("submission_id belongs to another doc")),
             "posted" => Ok(review_response(&existing)),
-            "failed" => Err(conflict(
-                "This submission failed and its drafts were kept; submit again",
-            )),
-            _ => run_blocking(state, existing, None).await,
+            // A retry of any unfinished submission reconciles against
+            // GitHub by its marker before doing anything else, so the
+            // client keeps one id until the review is posted.
+            _ => {
+                let existing = store.reopen_review(&existing.id)?;
+                run_blocking(state, existing, None).await
+            }
         };
     }
 
@@ -301,10 +304,22 @@ fn run_submission(
 
     let pending_id = match source.add_pending_review(&pr.node_id, &review.commit_sha, &body) {
         Ok(id) => id,
-        Err(error) => {
-            store.fail_review(&review.id)?;
-            return Err(github_error(format!("GitHub refused the review: {error}")));
-        }
+        // The review may exist even though the response was lost: look for
+        // it by marker before calling the attempt failed.
+        Err(error) => match source.viewer_reviews(&doc.repo, pr_number) {
+            Ok(on_github) => match on_github.iter().find(|r| r.body.contains(&marker)) {
+                Some(found) if found.state != "PENDING" => {
+                    return finish_from_github(state, &doc, &review, &drafts, found)
+                }
+                Some(found) => found.node_id.clone(),
+                None => {
+                    store.fail_review(&review.id)?;
+                    return Err(github_error(format!("GitHub refused the review: {error}")));
+                }
+            },
+            // Unknown: leave the row submitting; a retry reconciles it.
+            Err(_) => return Err(github_error(format!("GitHub refused the review: {error}"))),
+        },
     };
     store.set_pending_review_node_id(&review.id, Some(&pending_id))?;
     post_and_submit(
@@ -343,12 +358,28 @@ fn post_and_submit(
             }
             continue;
         }
-        // A null thread and an error both mean the line didn't take; the
-        // comment then goes on the file, still quoting its selection.
+        // A null thread means the line didn't take; the comment then goes
+        // on the file, still quoting its selection. An error may be a lost
+        // response, so check the pending review before falling back.
         if let Some(line) = draft.line {
-            if let Ok(true) = source.add_review_thread(pending_id, &doc.path, Some(line), &text) {
-                line_comments += 1;
-                continue;
+            match source.add_review_thread(pending_id, &doc.path, Some(line), &text) {
+                Ok(true) => {
+                    line_comments += 1;
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => match pending_thread(state, doc, pending_id, &text) {
+                    Ok(Some(true)) => {
+                        line_comments += 1;
+                        continue;
+                    }
+                    Ok(Some(false)) => {
+                        file_comments += 1;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(_) => return abort(state, doc, review, drafts, pending_id, error),
+                },
             }
         }
         match source.add_review_thread(pending_id, &doc.path, None, &text) {
@@ -381,10 +412,31 @@ fn post_and_submit(
     }
 }
 
+/// Whether the pending review already holds a thread with `text`, and if so
+/// whether it is on a line.
+fn pending_thread(
+    state: &AppState,
+    doc: &OwnerDoc,
+    pending_id: &str,
+    text: &str,
+) -> Result<Option<bool>, String> {
+    let pr_number = doc.pr_number.ok_or("doc has no PR")?;
+    let on_github = state
+        .owner_doc_source
+        .viewer_reviews(&doc.repo, pr_number)?;
+    Ok(on_github
+        .iter()
+        .find(|review| review.node_id == pending_id)
+        .and_then(|review| review.comments.iter().find(|(body, _)| body == text))
+        .map(|(_, has_line)| *has_line))
+}
+
 /// A GitHub error after the pending review exists. If the review was in
 /// fact submitted (the response was lost), finish from it; otherwise delete
 /// the pending review so none is left under the owner's account, and mark
-/// the row failed with the drafts kept.
+/// the row failed with the drafts kept. If the delete fails, the pending
+/// review may still be there, so the row stays `submitting` and a retry
+/// resumes it.
 fn abort(
     state: &AppState,
     doc: &OwnerDoc,
@@ -410,6 +462,10 @@ fn abort(
             "Owner doc review {}: could not delete pending review {pending_id}: {delete_error}",
             review.id
         );
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_GATEWAY,
+            detail: format!("GitHub refused the review: {error}. Submitting again resumes it."),
+        });
     }
     owner_doc_store(state).fail_review(&review.id)?;
     Err(ApiError::Status {

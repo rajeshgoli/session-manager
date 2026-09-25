@@ -22479,6 +22479,10 @@ struct FakeGitHub {
     error_lines: std::collections::BTreeSet<i64>,
     fail_file_threads: bool,
     fail_submit: bool,
+    /// The mutation takes effect but its response is lost.
+    lose_pending_response: bool,
+    lose_line_response: bool,
+    fail_delete: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -22587,7 +22591,11 @@ impl OwnerDocSource for StubDocSource {
         {
             return Err("User can only have one pending review per pull request".to_owned());
         }
-        Ok(github.add_review(commit_sha, "PENDING", body))
+        let node = github.add_review(commit_sha, "PENDING", body);
+        if github.lose_pending_response {
+            return Err("gh api graphql failed: timed out after 30s".to_owned());
+        }
+        Ok(node)
     }
 
     fn add_review_thread(
@@ -22610,10 +22618,14 @@ impl OwnerDocSource for StubDocSource {
             None if github.fail_file_threads => return Err("Something went wrong".to_owned()),
             _ => {}
         }
+        let lose = line.is_some() && github.lose_line_response;
         let review = github
             .review_mut(review_node_id)
             .ok_or_else(|| "no such review".to_owned())?;
         review.threads.push((line, body.to_owned()));
+        if lose {
+            return Err("gh api graphql failed: timed out after 30s".to_owned());
+        }
         Ok(true)
     }
 
@@ -22641,6 +22653,9 @@ impl OwnerDocSource for StubDocSource {
     fn delete_pending_review(&self, review_node_id: &str) -> Result<(), String> {
         let mut github = self.github.lock().unwrap();
         github.calls.push("delete".to_owned());
+        if github.fail_delete {
+            return Err("gh api graphql failed: timed out after 30s".to_owned());
+        }
         let before = github.reviews.len();
         github
             .reviews
@@ -23350,6 +23365,8 @@ async fn owner_doc_review_posts_one_github_review_and_wakes_the_author_once() {
                 "line_thread 4",
                 "file_thread",
                 "line_thread 5",
+                // An error may be a lost response: check before falling back.
+                "viewer_reviews",
                 "file_thread",
                 "file_thread",
                 "submit"
@@ -23470,16 +23487,9 @@ async fn owner_doc_review_failure_deletes_the_pending_review_and_keeps_drafts() 
             github.calls
         );
         drop(github);
-        // The drafts stay, and the failed submission is not retried as-is.
+        // The drafts stay.
         let (_, drafts) = get_json(app.clone(), &format!("/docs/{id}/drafts")).await;
         assert_eq!(drafts["drafts"].as_array().unwrap().len(), 2);
-        let (status, _) = post_json(
-            app.clone(),
-            &format!("/docs/{id}/review"),
-            json!({"submission_id": submission, "sha": c1, "verdict": "comment"}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CONFLICT);
     }
     assert!(queued_wakes(&dir, "[sm review]").is_empty());
 
@@ -23877,4 +23887,105 @@ async fn owner_doc_token_opens_the_json_endpoints_for_its_own_doc_only() {
         status,
         StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE
     ));
+}
+
+#[tokio::test]
+async fn owner_doc_review_retries_under_one_id_never_post_twice() {
+    let c1 = "a".repeat(40);
+    let source = review_memo_source(&c1);
+    let (app, dir) = owner_docs_app(source.clone());
+    let submit = |id: String, submission: &'static str| {
+        let app = app.clone();
+        let body =
+            json!({"submission_id": submission, "sha": "a".repeat(40), "verdict": "comment"});
+        async move { post_json(app, &format!("/docs/{id}/review"), body).await }
+    };
+    let doc = |path: &'static str| {
+        let app = app.clone();
+        async move {
+            let c1 = "a".repeat(40);
+            let id = publish_review_memo(&app, path, &c1, "author01", true).await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Why now?").await;
+            add_draft(&app, &id, &c1, Value::Null, "", "Overall.").await;
+            id
+        }
+    };
+    let take_only_review = |source: &StubDocSource| {
+        let mut github = source.github.lock().unwrap();
+        assert_eq!(github.reviews.len(), 1, "{:?}", github.reviews);
+        github.reviews.remove(0)
+    };
+
+    // A failed attempt is retried under the same id once GitHub recovers.
+    let id = doc("specs/memo.html").await;
+    source.github.lock().unwrap().fail_submit = true;
+    let (status, _) = submit(id.clone(), "sub-retry-failed").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    source.github.lock().unwrap().fail_submit = false;
+    let (status, review) = submit(id, "sub-retry-failed").await;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert_eq!(take_only_review(&source).threads.len(), 2);
+
+    // addPullRequestReview takes effect but its response is lost: the review
+    // found by its marker is used, not abandoned.
+    let id = doc("specs/a.html").await;
+    source.github.lock().unwrap().lose_pending_response = true;
+    let (status, review) = submit(id, "sub-lost-pending").await;
+    source.github.lock().unwrap().lose_pending_response = false;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    let posted = take_only_review(&source);
+    assert_eq!(posted.state, "COMMENTED");
+    assert_eq!(posted.threads.len(), 2);
+
+    // Submitting fails and so does deleting the pending review: the row
+    // stays recoverable, and the retry resumes that pending review without
+    // repeating its threads.
+    let id = doc("specs/b.html").await;
+    {
+        let mut github = source.github.lock().unwrap();
+        github.fail_submit = true;
+        github.fail_delete = true;
+    }
+    let (status, error) = submit(id.clone(), "sub-stuck-delete").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{error}");
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    assert_eq!(
+        store.review("sub-stuck-delete").unwrap().unwrap().status,
+        "submitting"
+    );
+    {
+        let mut github = source.github.lock().unwrap();
+        github.fail_submit = false;
+        github.fail_delete = false;
+        github.calls.clear();
+    }
+    let (status, review) = submit(id, "sub-stuck-delete").await;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert_eq!(
+        source.github.lock().unwrap().calls,
+        ["viewer_reviews", "submit"]
+    );
+    assert_eq!(take_only_review(&source).threads.len(), 2);
+
+    // A line thread that took but whose response was lost is not repeated
+    // as a file comment.
+    let (_, meta) = get_json(app.clone(), "/docs/widgets/specs/memo.html?format=json").await;
+    let memo = meta["id"].as_str().unwrap().to_owned();
+    add_draft(&app, &memo, &c1, json!(3), "Buy the dip.", "Again?").await;
+    source.github.lock().unwrap().lose_line_response = true;
+    let (status, review) = submit(memo, "sub-lost-line").await;
+    source.github.lock().unwrap().lose_line_response = false;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert_eq!(review["line_comment_count"], 1);
+    assert_eq!(review["file_comment_count"], 0);
+    assert_eq!(
+        take_only_review(&source).threads,
+        [(Some(3), "> Buy the dip.\n\nAgain?".to_owned())]
+    );
+
+    // One wake per posted review, however many attempts it took.
+    assert_eq!(queued_wakes(&dir, "[sm review]").len(), 4);
 }
