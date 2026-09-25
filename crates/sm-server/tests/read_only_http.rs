@@ -1343,13 +1343,16 @@ async fn client_analytics_summary_reports_live_metrics_from_state_queue_and_logs
     assert_eq!(payload["totals"]["track_reminders_24h"], 1);
     assert_eq!(payload["reliability"]["restart_count_24h"], 1);
     assert_eq!(payload["reliability"]["self_heal_count_24h"], 1);
+    // The distribution counts live activity, not the stored status: a
+    // codex-fork session with no pane or event stream projects as idle even
+    // though its stored status says "thinking".
     assert_eq!(
         payload["state_distribution"],
         json!([
             {"key": "working", "label": "working", "count": 1},
-            {"key": "thinking", "label": "thinking", "count": 1},
+            {"key": "thinking", "label": "thinking", "count": 0},
             {"key": "waiting", "label": "waiting", "count": 0},
-            {"key": "idle", "label": "idle", "count": 0}
+            {"key": "idle", "label": "idle", "count": 1}
         ])
     );
     assert_eq!(
@@ -12497,19 +12500,10 @@ async fn runtime_restart_preserves_live_tmux_child_until_attributed_retirement()
     );
     let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
     let tmux_session = "restart-provenance-child";
-    assert!(Command::new("tmux")
-        .args([
-            "-L",
-            &tmux_socket,
-            "new-session",
-            "-d",
-            "-s",
-            tmux_session,
-            "sleep 120",
-        ])
-        .status()
-        .unwrap()
-        .success());
+    start_test_tmux_session(&tmux_socket, tmux_session);
+    // The parent must be live too, or startup marks it stopped and it can no
+    // longer retire its child.
+    start_test_tmux_session(&tmux_socket, "restart-provenance-parent");
 
     fs::write(
         &state_file,
@@ -17403,7 +17397,20 @@ async fn runtime_core_does_not_queue_sends_to_terminal_sessions_with_status_drif
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["delivered"], false);
     assert_eq!(payload["status"], "stopped");
-    assert!(!queue_db_path_for_state_file(&state_file).exists());
+    // Startup may create the queue database, so check for a retained row
+    // rather than for the file.
+    let queue_db = queue_db_path_for_state_file(&state_file);
+    if queue_db.exists() {
+        let retained: i64 = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM message_queue WHERE target_session_id = 'runtimestopped'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, 0);
+    }
 }
 
 #[tokio::test]
@@ -22431,6 +22438,25 @@ impl Drop for TestTmuxSocket {
             .stderr(std::process::Stdio::null())
             .status();
     }
+}
+
+/// Starts a detached tmux session so a fixture session with this name is
+/// live. Without it, startup marks the fixture stopped because its runtime
+/// is missing.
+fn start_test_tmux_session(socket: &str, session: &str) {
+    assert!(Command::new("tmux")
+        .args([
+            "-L",
+            socket,
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "sleep 120"
+        ])
+        .status()
+        .unwrap()
+        .success());
 }
 
 fn device_access_token(secret: &str, email: &str, name: &str) -> String {

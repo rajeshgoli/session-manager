@@ -2052,8 +2052,11 @@ fn duration_from_seconds(seconds: f64) -> Duration {
 
 fn is_tmux_session_gone_error(error: &anyhow::Error) -> bool {
     let message = error.to_string();
+    // The server anchor keeps tmux alive after the session exits, so targeting
+    // the exited session's pane says "can't find pane" rather than "no server".
     message.contains("no server running")
         || message.contains("can't find session")
+        || message.contains("can't find pane")
         || message.contains("no current target")
         || message.contains("server exited unexpectedly")
 }
@@ -3420,6 +3423,12 @@ esac
     #[test]
     fn tmux_no_current_target_counts_as_session_gone() {
         let error = anyhow::anyhow!("tmux command failed: no current target");
+        assert!(is_tmux_session_gone_error(&error));
+    }
+
+    #[test]
+    fn tmux_missing_pane_counts_as_session_gone() {
+        let error = anyhow::anyhow!("tmux command failed: can't find pane: sm-rust-claude-x");
         assert!(is_tmux_session_gone_error(&error));
     }
 
