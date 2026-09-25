@@ -3748,6 +3748,9 @@ async fn codex_review_request_watcher_delivers_sequential_wake_to_runtime_sessio
 
 #[tokio::test]
 async fn codex_review_request_recovery_spawns_active_watchers() {
+    let Some(tmux) = live_notify_tmux("review-recover", "codex-fork-notify1") else {
+        return;
+    };
     let state_file = unique_temp_path();
     let queue_db = state_file.with_extension("codex-review-recover-watch.db");
     fs::write(
@@ -3759,6 +3762,7 @@ async fn codex_review_request_recovery_spawns_active_watchers() {
                     "name": "codex-fork-notify1",
                     "working_dir": "/repo/notify",
                     "tmux_session": "codex-fork-notify1",
+                    "tmux_socket_name": tmux.0,
                     "log_file": "/tmp/notify1.log",
                     "status": "running",
                     "created_at": "2026-06-01T00:00:00Z",
@@ -3834,6 +3838,9 @@ async fn codex_review_request_recovery_spawns_active_watchers() {
 
 #[tokio::test]
 async fn codex_review_request_recovery_backfills_missing_head_before_matching_review() {
+    let Some(tmux) = live_notify_tmux("review-backfill", "notify1") else {
+        return;
+    };
     let state_file = unique_temp_path();
     let queue_db = state_file.with_extension("codex-review-recover-missing-head.db");
     fs::write(
@@ -3841,7 +3848,8 @@ async fn codex_review_request_recovery_backfills_missing_head_before_matching_re
         json!({
             "sessions": [{
                 "id": "notify1", "name": "notify1", "working_dir": "/repo/notify",
-                "tmux_session": "notify1", "log_file": "/tmp/notify1.log", "status": "running",
+                "tmux_session": "notify1", "tmux_socket_name": tmux.0,
+                "log_file": "/tmp/notify1.log", "status": "running",
                 "created_at": "2026-06-01T00:00:00Z", "last_activity": "2026-06-01T00:01:00Z"
             }]
         })
@@ -4056,6 +4064,9 @@ async fn codex_review_request_recovery_expires_request_after_one_hour() {
 
 #[tokio::test]
 async fn codex_review_request_ttl_bounds_an_oversized_poll_interval() {
+    let Some(tmux) = live_notify_tmux("review-ttl", "notify1") else {
+        return;
+    };
     let state_file = unique_temp_path();
     let queue_db = state_file.with_extension("codex-review-bounded-ttl.db");
     fs::write(
@@ -4063,7 +4074,8 @@ async fn codex_review_request_ttl_bounds_an_oversized_poll_interval() {
         json!({
             "sessions": [{
                 "id": "notify1", "name": "notify1", "working_dir": "/repo/notify",
-                "tmux_session": "notify1", "log_file": "/tmp/notify1.log", "status": "running",
+                "tmux_session": "notify1", "tmux_socket_name": tmux.0,
+                "log_file": "/tmp/notify1.log", "status": "running",
                 "created_at": "2026-06-01T00:00:00Z", "last_activity": "2026-06-01T00:01:00Z"
             }]
         })
@@ -22374,6 +22386,37 @@ fn tmux_pane_current_path(socket: &str, session: &str) -> Option<PathBuf> {
     Some(PathBuf::from(
         String::from_utf8_lossy(&output.stdout).trim(),
     ))
+}
+
+/// Starts a live tmux session on a private socket so startup reconciliation
+/// keeps a fixture notify session running. None when tmux is unavailable.
+fn live_notify_tmux(label: &str, session: &str) -> Option<TestTmuxSocket> {
+    if !tmux_available() {
+        return None;
+    }
+    let socket = format!(
+        "sm-rust-{label}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let guard = TestTmuxSocket(socket);
+    let status = Command::new("tmux")
+        .args([
+            "-L",
+            &guard.0,
+            "new-session",
+            "-d",
+            "-s",
+            session,
+            "sleep 60",
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    Some(guard)
 }
 
 struct TestTmuxSocket(String);
