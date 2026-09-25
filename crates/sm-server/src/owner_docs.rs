@@ -1367,6 +1367,100 @@ img {{ max-width: 100%; }}
     )
 }
 
+/// The owner pages' shell (`/history`, `/t/…`, and the web watch): the sm
+/// Watch app's palette (`android-app/.../ui/theme/Color.kt`), cards with a
+/// colored left edge, sans for human text and mono for machine text, and
+/// the two-tab **Watch · History** top bar. `active_tab` is `"watch"`,
+/// `"history"`, or anything else for neither.
+pub fn page_shell(title: &str, active_tab: &str, body: &str) -> String {
+    let tab = |name: &str, href: &str, label: &str| {
+        let class = if name == active_tab { "tab on" } else { "tab" };
+        format!(r#"<a class="{class}" href="{href}">{label}</a>"#)
+    };
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+:root {{ color-scheme: dark;
+  --k0: #09090D; --k1: #121219; --k2: #181820; --k3: #1E1E28; --kl: #2B2B37;
+  --kt: #F5F7FA; --kt2: #ADB2C2; --kt3: #777C8B;
+  --kc: #5EE7FF; --kg: #4ADE80; --ka: #FBBF24; --kr: #FB7185; --kv: #A78BFA;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; background: var(--k0); color: var(--kt); font: 14px/1.45 var(--sans);
+  -webkit-text-size-adjust: 100%; }}
+a {{ color: inherit; text-decoration: none; }}
+.wrap {{ max-width: 60rem; margin: 0 auto; padding: 0 12px 48px; }}
+.top {{ position: sticky; top: 0; z-index: 1; background: var(--k0); display: flex;
+  align-items: center; gap: 16px; padding: 12px 4px 10px; margin-bottom: 12px;
+  border-bottom: 1px solid var(--kl); }}
+.brand {{ font: 700 15px var(--mono); color: var(--kc); }}
+.tab {{ color: var(--kt3); padding-bottom: 2px; }}
+.tab.on {{ color: var(--kt); border-bottom: 2px solid var(--kc); }}
+.sp {{ flex: 1; }}
+.m {{ font: 12px var(--mono); color: var(--kt3); letter-spacing: .01em; }}
+.mt {{ font: 12.5px var(--mono); color: var(--kt); }}
+.lk {{ text-decoration: underline dotted var(--kt3); text-underline-offset: 3px; }}
+.lk:hover {{ text-decoration-color: var(--kc); }}
+.big {{ font-size: 15px; font-weight: 600; }}
+.dim {{ color: var(--kt3); }}
+.row {{ display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }}
+.card {{ background: var(--k1); border-radius: 10px; padding: 9px 11px 9px 12px; margin: 0 0 8px;
+  border-left: 3px solid var(--kl); overflow-wrap: anywhere; }}
+.card.c {{ border-left-color: var(--kc); }} .card.a {{ border-left-color: var(--ka); }}
+.card.r {{ border-left-color: var(--kr); }} .card.g {{ border-left-color: var(--kg); }}
+.chip {{ font: 11px var(--mono); border-radius: 999px; padding: 0 7px; border: 1px solid var(--kl);
+  color: var(--kt2); white-space: nowrap; }}
+.chip.c {{ color: var(--kc); border-color: #143744; background: #0f2530; }}
+.chip.a {{ color: var(--ka); border-color: #4a3a12; background: #221b08; }}
+.chip.r {{ color: var(--kr); border-color: #4c2029; background: #22101a; }}
+.chip.g {{ color: var(--kg); border-color: #1d4a2e; background: #0d2016; }}
+.chip.v {{ color: var(--kv); border-color: #33295a; }}
+.dot {{ display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin: 0 4px 1px 0;
+  vertical-align: middle; background: var(--kt3); }}
+.dot.working {{ background: var(--kg); box-shadow: 0 0 6px var(--kg); }}
+.dot.stopped {{ background: none; border: 1px solid var(--kt3); }}
+.dot.retired {{ background: none; border: 1px dashed var(--kt3); }}
+.sec {{ margin: 8px 0 0; padding: 7px 0 0; border-top: 1px solid var(--k3); display: grid;
+  grid-template-columns: 64px 1fr; gap: 4px 8px; }}
+.lbl {{ font: 9.5px var(--mono); letter-spacing: .12em; color: var(--kt3); text-transform: uppercase;
+  padding-top: 3px; }}
+.strip {{ background: var(--k2); border-radius: 8px; padding: 8px 10px; margin: 8px 0 10px; }}
+.bar {{ display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 12px; }}
+.bar form {{ display: flex; gap: 6px; flex-wrap: wrap; }}
+.bar input {{ font: 12px var(--mono); color: var(--kt); background: var(--k1); border: 1px solid var(--kl);
+  border-radius: 6px; padding: 3px 7px; width: 9.5rem; }}
+.bar button {{ font: 12px var(--mono); color: var(--kc); background: var(--k2); border: 1px solid var(--kl);
+  border-radius: 6px; padding: 3px 9px; }}
+.tl {{ display: grid; grid-template-columns: max-content 1fr; gap: 5px 12px; margin: 6px 0 0 4px;
+  padding-left: 10px; border-left: 1px solid var(--kl); overflow-wrap: anywhere; }}
+.pager {{ display: flex; gap: 16px; margin-top: 14px; }}
+h2.lbl {{ margin: 18px 0 4px; font-weight: 400; }}
+@media (max-width: 480px) {{
+  .sec {{ grid-template-columns: 1fr; gap: 1px 0; }} .sec .lbl {{ padding-top: 5px; }}
+  .tl {{ grid-template-columns: 1fr; gap: 0; }} .tl > .m {{ margin-top: 6px; }}
+}}
+</style>
+</head>
+<body>
+<div class="wrap">
+<nav class="top"><a class="brand" href="/">sm</a>{watch}{history}<span class="sp"></span></nav>
+{body}
+</div>
+</body>
+</html>
+"#,
+        title = escape_html(title),
+        watch = tab("watch", "/", "Watch"),
+        history = tab("history", "/history", "History"),
+    )
+}
+
 pub fn escape_html(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {

@@ -755,7 +755,7 @@ pub(super) async fn list_owner_docs(
     Query(query): Query<ListOwnerDocsQuery>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_owner_doc_read_allowed(&state, &request)?;
+    ensure_owner_page_read_allowed(&state, &request)?;
     let authors = match query
         .session
         .as_deref()
@@ -806,7 +806,7 @@ pub(super) async fn get_owner_doc(
     Query(query): Query<GetOwnerDocQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    ensure_owner_doc_read_allowed(&state, &request)?;
+    ensure_owner_page_read_allowed(&state, &request)?;
     let doc = find_doc(&state, &doc_id)?;
     if query.format.as_deref() == Some("json") {
         return doc_metadata_response(&state, &doc, request.headers());
@@ -1209,7 +1209,7 @@ pub(super) async fn get_owner_doc_subpath(
     // The JSON endpoints also take the page's doc token; pages never do.
     if let Some(doc) = id_subroute(&state, &first, &rest, &["head", "drafts"])? {
         if !doc_token_presented(&state, request.headers(), &doc.id) {
-            ensure_owner_doc_read_allowed(&state, &request)?;
+            ensure_owner_page_read_allowed(&state, &request)?;
         }
         return if rest == "head" {
             doc_head_response(&state, &doc, query.sha.as_deref()).await
@@ -1217,7 +1217,7 @@ pub(super) async fn get_owner_doc_subpath(
             Ok(Json(json!({ "drafts": owner_doc_store(&state).drafts(&doc.id)? })).into_response())
         };
     }
-    ensure_owner_doc_read_allowed(&state, &request)?;
+    ensure_owner_page_read_allowed(&state, &request)?;
     if let Some(doc) = id_subroute(&state, &first, &rest, &["view", "raw"])? {
         let commit_sha = id_route_commit(&state, &doc, query.sha.as_deref())?;
         return if rest == "raw" {

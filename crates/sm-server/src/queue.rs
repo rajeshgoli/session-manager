@@ -5601,7 +5601,7 @@ fn parse_python_naive_datetime(value: &str) -> Option<PrimitiveDateTime> {
     .ok()
 }
 
-fn local_now_naive(now_utc: OffsetDateTime) -> Option<PrimitiveDateTime> {
+pub(crate) fn local_now_naive(now_utc: OffsetDateTime) -> Option<PrimitiveDateTime> {
     #[cfg(unix)]
     {
         let timestamp = nix::libc::time_t::try_from(now_utc.unix_timestamp()).ok()?;

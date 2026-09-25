@@ -2127,11 +2127,12 @@ fn has_any_claim(conn: &Connection, repo: &str, number: i64, session_id: &str) -
         .is_some())
 }
 
-const CLAIM_COLUMNS: &str = "id, repo, number, kind, session_id, session_name, parent_session_id, \
+pub(crate) const CLAIM_COLUMNS: &str =
+    "id, repo, number, kind, session_id, session_name, parent_session_id, \
      source, worktree_path, branch, claimed_at, ended_at, end_reason, ended_by_session_id, \
      nudged_idle_at, managed_worktree, base_sha, reserved_at, check_b_due_at";
 
-fn claim_from_row(row: &Row<'_>) -> rusqlite::Result<WorkClaim> {
+pub(crate) fn claim_from_row(row: &Row<'_>) -> rusqlite::Result<WorkClaim> {
     Ok(WorkClaim {
         id: row.get(0)?,
         repo: row.get(1)?,
@@ -2174,10 +2175,11 @@ fn get_claim(conn: &Connection, id: &str) -> Result<Option<WorkClaim>> {
         .next())
 }
 
-const ITEM_COLUMNS: &str = "repo, number, kind, title, state, state_reason, url, head_ref, \
+pub(crate) const ITEM_COLUMNS: &str =
+    "repo, number, kind, title, state, state_reason, url, head_ref, \
      head_sha, closed_at, merged_at, synced_at, merge_check, sync_error";
 
-fn item_from_row(row: &Row<'_>) -> rusqlite::Result<WorkItem> {
+pub(crate) fn item_from_row(row: &Row<'_>) -> rusqlite::Result<WorkItem> {
     Ok(WorkItem {
         repo: row.get(0)?,
         number: row.get(1)?,
