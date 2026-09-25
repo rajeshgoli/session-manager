@@ -7473,21 +7473,7 @@ async fn list_mobile_terminal_devices(
         access_context.as_ref(),
         &actor_email,
     )?;
-    let Some((actor_user_id, user_config)) =
-        mobile_terminal_visible_user(&state.config, &actor_email)
-    else {
-        return Err(ApiError::Status {
-            status: StatusCode::FORBIDDEN,
-            detail: "User is not allowed to manage mobile terminal devices".to_owned(),
-        });
-    };
-    if !user_config.interactive_shell_access {
-        return Err(ApiError::Status {
-            status: StatusCode::FORBIDDEN,
-            detail: "User is not allowed to manage mobile terminal devices".to_owned(),
-        });
-    }
-    let owner_view = mobile_terminal_user_can_disable(user_config);
+    let (actor_user_id, owner_view) = mobile_device_manager(&state.config, &actor_email)?;
     let revoked_keys = state
         .mobile_terminal_revoked_keys
         .lock()
@@ -7576,21 +7562,7 @@ async fn revoke_mobile_terminal_device(
         access_context.as_ref(),
         &actor_email,
     )?;
-    let Some((actor_user_id, user_config)) =
-        mobile_terminal_visible_user(&state.config, &actor_email)
-    else {
-        return Err(ApiError::Status {
-            status: StatusCode::FORBIDDEN,
-            detail: "User is not allowed to manage mobile terminal devices".to_owned(),
-        });
-    };
-    if !user_config.interactive_shell_access {
-        return Err(ApiError::Status {
-            status: StatusCode::FORBIDDEN,
-            detail: "User is not allowed to manage mobile terminal devices".to_owned(),
-        });
-    }
-    let owner_view = mobile_terminal_user_can_disable(user_config);
+    let (actor_user_id, owner_view) = mobile_device_manager(&state.config, &actor_email)?;
     let target_user_id = resolve_mobile_terminal_revoke_target(
         &state,
         actor_user_id,
@@ -12336,6 +12308,32 @@ fn revoke_mobile_terminal_device_in_state(
     Ok((already_revoked, pending_tickets_revoked, active_stops))
 }
 
+/// Resolves who may list and revoke mobile devices, as `(actor_user_id, owner_view)`.
+/// The local operator (`local_bypass`: a loopback request addressed to localhost,
+/// which is how `sm list-devices` and `sm remove-device` arrive) manages every
+/// user's devices, unless the config defines a `local_bypass` user, which then
+/// applies as configured.
+fn mobile_device_manager<'a>(
+    config: &'a AppConfig,
+    actor_email: &str,
+) -> Result<(&'a str, bool), ApiError> {
+    let forbidden = || ApiError::Status {
+        status: StatusCode::FORBIDDEN,
+        detail: "User is not allowed to manage mobile terminal devices".to_owned(),
+    };
+    let Some((actor_user_id, user_config)) = mobile_terminal_visible_user(config, actor_email)
+    else {
+        if actor_email == LOCAL_BYPASS_ACTOR {
+            return Ok(("", true));
+        }
+        return Err(forbidden());
+    };
+    if !user_config.interactive_shell_access {
+        return Err(forbidden());
+    }
+    Ok((actor_user_id, mobile_terminal_user_can_disable(user_config)))
+}
+
 fn mobile_terminal_user_can_disable(user_config: &MobileTerminalUserConfig) -> bool {
     user_config.mobile_terminal_owner
         || user_config.can_disable_mobile_terminal
@@ -14181,6 +14179,8 @@ fn issue_device_access_token(
     })
 }
 
+const LOCAL_BYPASS_ACTOR: &str = "local_bypass";
+
 fn request_actor_email_from_parts(
     config: &AppConfig,
     headers: &HeaderMap,
@@ -14190,7 +14190,7 @@ fn request_actor_email_from_parts(
         return Some(user.email.trim().to_ascii_lowercase());
     }
     if is_local_bypass_request(headers, peer_addr, config) {
-        return Some("local_bypass".to_owned());
+        return Some(LOCAL_BYPASS_ACTOR.to_owned());
     }
     None
 }
@@ -20559,6 +20559,67 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
         assert_eq!(device["enabled"], true);
         assert_eq!(device["revoked"], false);
         assert!(device.get("public_key").is_none());
+    }
+
+    #[tokio::test]
+    async fn local_operator_manages_devices_of_every_configured_user() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        let user = config
+            .mobile_terminal
+            .allowed_users
+            .remove("local_bypass")
+            .unwrap();
+        config
+            .mobile_terminal
+            .allowed_users
+            .insert("rajesh".to_owned(), user);
+        let state = AppState::new(config);
+        let app = router(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(local_request(
+                Method::GET,
+                "/client/mobile-terminal/devices",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["owner_view"], true);
+        assert_eq!(body["devices"][0]["user_id"], "rajesh");
+        assert_eq!(body["devices"][0]["device_key_id"], "test-device");
+
+        let response = app
+            .clone()
+            .oneshot(local_request(
+                Method::DELETE,
+                "/client/mobile-terminal/devices/test-device",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["user_id"], "rajesh");
+        assert!(state
+            .mobile_terminal_revoked_keys
+            .lock()
+            .unwrap()
+            .contains(&("rajesh".to_owned(), "test-device".to_owned())));
+
+        let response = app
+            .oneshot(public_request(
+                Method::GET,
+                "/client/mobile-terminal/devices",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     }
 
     #[tokio::test]
