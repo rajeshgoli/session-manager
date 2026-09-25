@@ -21945,8 +21945,27 @@ sleep 30
         .unwrap_err();
         assert!(error.to_string().contains("runtime disappeared"));
 
+        // A root thread published before a crash does not make a dead
+        // runtime acceptable: accepting it would leave a phantom agent.
+        let crashed_path = unique_temp_path("codex-create-acceptance-runtime-crashed");
+        fs::write(
+            &crashed_path,
+            "{\"event_type\":\"thread_started\",\"payload\":{\"thread\":{\"id\":\"crashed-root\"}}}\n",
+        )
+        .unwrap();
+        let error = wait_for_codex_fork_create_acceptance(
+            &crashed_path,
+            0,
+            Duration::from_millis(100),
+            || Ok(false),
+            || Ok(false),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("runtime disappeared"));
+
         let _ = fs::remove_file(subagent_path);
         let _ = fs::remove_file(lost_path);
+        let _ = fs::remove_file(crashed_path);
     }
 
     #[test]
