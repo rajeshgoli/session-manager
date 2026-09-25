@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -182,7 +183,9 @@ fun DocReaderOverlay(
     }
 
     Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-        Column(modifier = Modifier.fillMaxSize()) {
+        // Edge-to-edge windows don't resize for the keyboard: pad the reader
+        // so the page (and its comment box) ends above it.
+        Column(modifier = Modifier.fillMaxSize().imePadding()) {
             Surface(color = Panel, border = androidx.compose.foundation.BorderStroke(1.dp, BorderStrong)) {
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),

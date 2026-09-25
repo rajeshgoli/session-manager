@@ -92,9 +92,15 @@
     '.row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;align-items:center}',
     '.item{border:1px solid #e5e7eb;border-radius:6px;padding:8px;display:flex;flex-direction:column;gap:4px}',
     '.err{color:#b91c1c}.ok{color:#15803d}h3{margin:0;font-weight:600;font-size:15px}',
-    'label{display:flex;gap:6px;align-items:center}'
+    'label{display:flex;gap:6px;align-items:center}',
+    // Touch: 16px text (no zoom on focus) and finger-sized controls.
+    '.touch .sheet,.touch .sheet *{font-size:16px}',
+    '.touch .sheet{width:100vw;border-radius:12px 12px 0 0;padding:14px}',
+    '.touch .sheet button{padding:10px 16px}',
+    '.touch textarea{min-height:9em}',
+    '.touch .chip{font-size:16px;padding:10px 18px}'
   ].join('\n') }));
-  var ui = el('div');
+  var ui = el('div', { class: coarse ? 'touch' : '' });
   root.appendChild(ui);
   (document.body || document.documentElement).appendChild(host);
 
@@ -121,6 +127,18 @@
     banner.style.top = (collapsed ? 40 : h) + 'px';
   }
   window.addEventListener('resize', layout);
+
+  // The on-screen keyboard shrinks the visual viewport, not the layout one,
+  // so a sheet pinned to the layout bottom would sit under the keyboard.
+  // Pin it to the bottom of what is visible and cap it to that height.
+  var vv = window.visualViewport;
+  function placeSheet() {
+    if (!vv) return;
+    var hidden = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+    sheet.style.bottom = hidden + 'px';
+    sheet.style.maxHeight = Math.max(160, vv.height - 12) + 'px';
+  }
+  if (vv) { vv.addEventListener('resize', placeSheet); vv.addEventListener('scroll', placeSheet); }
 
   function stateText() {
     if (!CONFIG.prNumber) return ['Read-only: no PR', 'ro'];
@@ -217,21 +235,100 @@
     }).catch(function () { /* offline or signed out: keep what we have */ });
   }
 
-  // ---- draft markers ---------------------------------------------------
+  // ---- inline bubbles ---------------------------------------------------
+  // Like a GitHub review: the composer and each pending draft sit in the
+  // page, right under the paragraph they are about. Being in the flow, the
+  // composer scrolls into view above the on-screen keyboard. Each bubble is
+  // a host element with its own shadow root, so the doc's styles and text
+  // (textContent, selections) are untouched.
+  var BUBBLE = 'sm-doc-bubble';
+  var BUBBLE_CSS = [
+    ':host{all:initial;display:block;margin:10px 0}',
+    '[hidden]{display:none!important}',
+    '*{box-sizing:border-box;font:' + (coarse ? '16px' : '14px') + '/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
+    '.card{border:1px solid #d0d7de;border-left:4px solid #2563eb;border-radius:8px;background:#fff;color:#1f2328;padding:10px 12px;display:flex;flex-direction:column;gap:8px;box-shadow:0 1px 3px rgba(0,0,0,.12)}',
+    '.tag{font-size:12px;font-weight:600;color:#9a6700;background:#fff8c5;border-radius:10px;padding:1px 8px;align-self:flex-start}',
+    '.q{border-left:3px solid #d0d7de;padding-left:8px;color:#59636e;max-height:4.5em;overflow:hidden}',
+    '.b{white-space:pre-wrap;word-break:break-word}',
+    'textarea{width:100%;min-height:' + (coarse ? '7em' : '5em') + ';padding:8px;border:1px solid #d0d7de;border-radius:6px;resize:vertical;background:#fff;color:#1f2328}',
+    '.row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;align-items:center}',
+    'button{cursor:pointer;border:1px solid #d0d7de;border-radius:6px;padding:' + (coarse ? '9px 16px' : '5px 12px') + ';background:#f6f8fa;color:#1f2328}',
+    'button.p{background:#1f883d;border-color:#1f883d;color:#fff}button.d{color:#cf222e}button:disabled{opacity:.5}',
+    '.err{color:#cf222e}.m{color:#59636e;font-size:13px}'
+  ].join('\n');
   function blocksFor(line) { return document.querySelectorAll('[data-sm-line="' + line + '"]'); }
+  function blockForDraft(d) {
+    if (d.line == null) return null;
+    var blocks = blocksFor(d.line);
+    var probe = collapse(d.quote).slice(0, 40);
+    for (var i = blocks.length - 1; i >= 0; i--) if (probe && collapse(blocks[i].textContent).indexOf(probe) >= 0) return blocks[i];
+    return blocks[0] || null;
+  }
+  function inBubble(node) {
+    var e = node && (node.nodeType === 1 ? node : node.parentElement);
+    return !!(e && e.closest && e.closest(BUBBLE));
+  }
+  function bubble(block, kind) {
+    var h = document.createElement(BUBBLE);
+    h.setAttribute('data-kind', kind);
+    h.style.cssText = 'all:initial;display:block;margin:10px 0';
+    // A bubble can't sit between table rows: a row's goes in its last cell.
+    var into = block.tagName === 'TR' ? (block.lastElementChild || block) : block;
+    into.appendChild(h);
+    var r = h.attachShadow ? h.attachShadow({ mode: 'open' }) : h;
+    r.appendChild(el('style', { text: BUBBLE_CSS }));
+    return { host: h, root: r };
+  }
+  function removeBubbles(kind) {
+    Array.prototype.forEach.call(document.querySelectorAll(BUBBLE + '[data-kind="' + kind + '"]'), function (h) { h.remove(); });
+  }
+  // Keeps a bubble inside what is visible, below the bar and above the keyboard.
+  function ensureVisible(h) {
+    if (!h || !h.isConnected) return;
+    var r = h.getBoundingClientRect();
+    var top = collapsed ? 8 : bar.getBoundingClientRect().height + 8;
+    var bottom = (vv ? vv.height + vv.offsetTop : window.innerHeight) - 8;
+    // The buttons are at the bottom: if the bubble is taller than the
+    // visible space, keep its bottom in view and let the quote go under the bar.
+    if (r.bottom > bottom) window.scrollBy(0, r.bottom - bottom);
+    else if (r.top < top) window.scrollBy(0, Math.max(r.top - top, r.bottom - bottom));
+  }
+  var composer = null; // {host, draftId, block}
+  function keepComposerVisible() { if (composer) ensureVisible(composer.host); }
+  window.addEventListener('resize', keepComposerVisible);
+  if (vv) vv.addEventListener('resize', keepComposerVisible);
+
+  var deleteArmed = null;
   function markers() {
-    Array.prototype.forEach.call(document.querySelectorAll('[data-sm-drafts]'), function (b) { b.removeAttribute('data-sm-drafts'); });
-    var counts = new Map();
+    removeBubbles('draft');
+    var byBlock = new Map();
     currentDrafts().forEach(function (d) {
-      if (d.line == null) return;
-      var blocks = blocksFor(d.line);
-      var probe = collapse(d.quote).slice(0, 40);
-      var target = null;
-      for (var i = blocks.length - 1; i >= 0 && !target; i--) if (probe && collapse(blocks[i].textContent).indexOf(probe) >= 0) target = blocks[i];
-      target = target || blocks[0];
-      if (target) counts.set(target, (counts.get(target) || 0) + 1);
+      if (composer && composer.draftId === d.id) return;
+      var b = blockForDraft(d);
+      if (!b) return;
+      if (!byBlock.has(b)) byBlock.set(b, []);
+      byBlock.get(b).push(d);
     });
-    counts.forEach(function (n, b) { b.setAttribute('data-sm-drafts', String(n)); });
+    byBlock.forEach(function (list, block) {
+      var r = bubble(block, 'draft').root;
+      list.forEach(function (d) {
+        r.appendChild(el('div', { class: 'card' }, [
+          el('span', { class: 'tag', text: 'Pending' }),
+          el('div', { class: 'b', text: d.body }),
+          el('div', { class: 'row' }, [
+            el('button', { class: 'd', text: deleteArmed === d.id ? 'Tap again to delete' : 'Delete', onclick: function () {
+              if (deleteArmed !== d.id) { deleteArmed = d.id; markers(); return; }
+              deleteArmed = null;
+              api('DELETE', '/drafts/' + d.id).then(function () {
+                S.drafts = S.drafts.filter(function (x) { return x.id !== d.id; });
+                markers(); renderBar();
+              }, function (err) { alertBar(err.message); });
+            } }),
+            el('button', { text: 'Edit', onclick: function () { compose({ line: d.line, quote: d.quote, block: block }, d); } })
+          ])
+        ]));
+      });
+    });
   }
 
   // ---- selecting what to comment on -------------------------------------
@@ -259,7 +356,13 @@
     if (!S.canComment) return;
     anchor = a;
     chip.textContent = label;
-    chip.onclick = function (e) { e.stopPropagation(); var a2 = anchor; hideChip(); compose(a2); };
+    chip.onclick = function (e) {
+      e.stopPropagation();
+      var a2 = anchor;
+      var keep = selected;
+      chip.hidden = true; anchor = null; selected = null;
+      compose(a2, null, keep);
+    };
     placeChip();
   }
   function fromSelection() {
@@ -267,13 +370,15 @@
     if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
     var range = sel.getRangeAt(0);
     var text = sel.toString().trim();
-    if (!text || host.contains(range.commonAncestorContainer)) return false;
+    if (!text || host.contains(range.commonAncestorContainer) || inBubble(range.commonAncestorContainer)) return false;
     unselect();
-    offer({ line: lineOf(range.startContainer), quote: text, rect: function () { return range.getBoundingClientRect(); } }, 'Comment');
+    var start = range.startContainer.nodeType === 1 ? range.startContainer : range.startContainer.parentElement;
+    offer({ line: lineOf(range.startContainer), quote: text, block: start && start.closest ? start.closest(BLOCK) : null,
+      rect: function () { return range.getBoundingClientRect(); } }, 'Comment');
     return true;
   }
   document.addEventListener('mouseup', function (e) {
-    if (e.target === host) return;
+    if (e.target === host || inBubble(e.target)) return;
     setTimeout(function () { if (!fromSelection() && !coarse) hideChip(); }, 0);
   });
   var selTimer = null;
@@ -283,19 +388,20 @@
     selTimer = setTimeout(fromSelection, 350);
   });
   document.addEventListener('click', function (e) {
-    if (!coarse || e.target === host) return;
+    if (!coarse || e.target === host || inBubble(e.target)) return;
     var sel = window.getSelection && window.getSelection();
     if (sel && !sel.isCollapsed) return;
     var t = e.target;
     if (!t.closest || t.closest(INTERACTIVE)) return;
     var block = t.closest(BLOCK);
-    if (!block || block === selected) { hideChip(); return; }
+    if (!block || block === selected || (composer && composer.block === block)) { hideChip(); return; }
     unselect();
     selected = block;
     block.setAttribute('data-sm-selected', '');
     offer({
       line: parseInt(block.getAttribute('data-sm-line'), 10),
       quote: collapse(block.textContent).slice(0, 300),
+      block: block,
       rect: function () { return block.getBoundingClientRect(); }
     }, 'Comment on this');
   });
@@ -303,7 +409,52 @@
 
   // ---- composer ----------------------------------------------------------
   function closeSheet() { sheet.hidden = true; clear(sheet); }
-  function compose(a, draft) {
+  function closeComposer() {
+    if (!composer) return;
+    composer.host.remove();
+    if (composer.highlight) composer.highlight.removeAttribute('data-sm-selected');
+    composer = null;
+    markers();
+  }
+  function saveDraft(a, draft, body) {
+    return draft
+      ? api('PATCH', '/drafts/' + draft.id, { body: body }).then(function (d) { S.drafts = S.drafts.map(function (x) { return x.id === d.id ? d : x; }); })
+      : api('POST', '/drafts', { sha: CONFIG.sha, line: a.line, quote: a.quote, body: body }).then(function (d) { S.drafts.push(d); });
+  }
+  // New comment (a = {line, quote, block}) or edit (draft). Inline under the
+  // block when there is one; a comment with no line uses the sheet.
+  function compose(a, draft, highlight) {
+    closeComposer();
+    closeSheet();
+    var block = (a && a.block) || (draft && blockForDraft(draft));
+    if (!block) return composeSheet(a, draft);
+    var quote = draft ? draft.quote : a.quote;
+    composer = { draftId: draft ? draft.id : null, block: block, highlight: highlight || null };
+    markers();
+    var b = bubble(block, 'composer');
+    composer.host = b.host;
+    var box = el('textarea', { placeholder: draft ? '' : 'Leave a comment' });
+    if (draft) box.value = draft.body;
+    var msg = el('div', { class: 'err' });
+    var save = el('button', { class: 'p', text: draft ? 'Update comment' : 'Add draft', onclick: function () {
+      var body = box.value.trim();
+      if (!body) { msg.textContent = 'Write a comment first.'; return; }
+      save.disabled = true;
+      saveDraft(a, draft, body).then(function () { closeComposer(); renderBar(); })
+        .catch(function (err) { save.disabled = false; msg.textContent = err.message; });
+    } });
+    b.root.appendChild(el('div', { class: 'card' }, [
+      quote ? el('div', { class: 'q', text: quote.length > 160 ? quote.slice(0, 160) + '…' : quote }) : null,
+      box,
+      msg,
+      el('div', { class: 'row' }, [el('button', { text: 'Cancel', onclick: closeComposer }), save])
+    ]));
+    box.focus({ preventScroll: true });
+    ensureVisible(b.host);
+    // Again once the keyboard has finished opening.
+    setTimeout(keepComposerVisible, 350);
+  }
+  function composeSheet(a, draft) {
     clear(sheet);
     var box = el('textarea', { placeholder: 'Comment' });
     if (draft) box.value = draft.body;
@@ -312,17 +463,13 @@
       var body = box.value.trim();
       if (!body) { msg.textContent = 'Write a comment first.'; return; }
       save.disabled = true;
-      var done = draft
-        ? api('PATCH', '/drafts/' + draft.id, { body: body }).then(function (d) { S.drafts = S.drafts.map(function (x) { return x.id === d.id ? d : x; }); })
-        : api('POST', '/drafts', { sha: CONFIG.sha, line: a.line, quote: a.quote, body: body }).then(function (d) { S.drafts.push(d); });
-      done.then(function () { closeSheet(); markers(); renderBar(); }).catch(function (err) { save.disabled = false; msg.textContent = err.message; });
+      saveDraft(a, draft, body).then(function () { closeSheet(); markers(); renderBar(); })
+        .catch(function (err) { save.disabled = false; msg.textContent = err.message; });
     } });
     var quote = draft ? draft.quote : a.quote;
+    // Buttons first: on a phone the keyboard takes the bottom of the screen.
     [
       el('h3', { text: draft ? 'Edit comment' : 'New comment' }),
-      quote ? el('div', { class: 'q', text: quote }) : null,
-      (draft ? draft.line : a.line) == null ? el('div', { class: 'muted', text: 'Not tied to a line: posts as a comment on the file.' }) : null,
-      box, msg,
       el('div', { class: 'row' }, [
         draft ? el('button', { class: 'd', text: 'Delete', onclick: function () {
           api('DELETE', '/drafts/' + draft.id).then(function () {
@@ -332,10 +479,19 @@
         } }) : null,
         el('button', { text: 'Cancel', onclick: closeSheet }),
         save
-      ])
+      ]),
+      msg,
+      quote ? el('div', { class: 'q', text: quote }) : null,
+      el('div', { class: 'muted', text: 'Not tied to a line: posts as a comment on the file.' }),
+      box
     ].forEach(function (c) { if (c) sheet.appendChild(c); });
     sheet.hidden = false;
+    placeSheet();
     box.focus();
+  }
+  function alertBar(text) {
+    banner.hidden = false;
+    banner.appendChild(el('div', { class: 'err', text: text }));
   }
 
   // ---- review panel ------------------------------------------------------
@@ -367,8 +523,8 @@
         d.quote ? el('div', { class: 'q', text: d.quote.length > 160 ? d.quote.slice(0, 160) + '…' : d.quote }) : null,
         el('div', { text: d.body }),
         el('div', { class: 'row' }, [
-          d.line != null ? el('button', { text: 'Show', onclick: function () { var b = blocksFor(d.line)[0]; if (b) { closeSheet(); b.scrollIntoView({ block: 'center' }); } } }) : null,
-          el('button', { text: 'Edit', onclick: function () { compose(null, d); } })
+          d.line != null ? el('button', { text: 'Show', onclick: function () { var b = blockForDraft(d); if (b) { closeSheet(); b.scrollIntoView({ block: 'center' }); } } }) : null,
+          el('button', { text: 'Edit', onclick: function () { closeSheet(); compose(null, d); } })
         ])
       ]));
     });
@@ -418,15 +574,18 @@
         renderReview(err.message + ' Submitting again is safe.');
       });
     } });
-    [el('div', { class: 'row' }, radios), body,
-      attempt ? el('div', { class: 'muted', text: 'Retrying your earlier submission with its verdict and text.' }) : null,
+    // Actions above the overall comment, clear of the on-screen keyboard.
+    [el('div', { class: 'row' }, radios),
+      el('div', { class: 'row' }, [el('button', { text: 'Cancel', onclick: closeSheet }), submit]),
       msg,
-      el('div', { class: 'row' }, [el('button', { text: 'Cancel', onclick: closeSheet }), submit])
+      attempt ? el('div', { class: 'muted', text: 'Retrying your earlier submission with its verdict and text.' }) : null,
+      body
     ].forEach(function (c) { if (c) sheet.appendChild(c); });
     sheet.hidden = false;
+    placeSheet();
   }
 
-  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { closeSheet(); hideChip(); } });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { closeSheet(); closeComposer(); hideChip(); } });
   renderBar();
   renderBanner();
   markers();

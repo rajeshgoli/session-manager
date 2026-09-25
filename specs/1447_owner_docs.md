@@ -128,7 +128,9 @@ longer exists, the republishing session becomes the author (`author_session_id` 
   `loadUrl(url, deviceAuthHeaders)`. Other URLs (the PR link, external links in the doc)
   open in the system browser. All review UI lives inside the served page (below), so
   Android needs no native comment UI; one implementation serves every client. Enable
-  JavaScript and DOM storage, and handle back navigation.
+  JavaScript and DOM storage, and handle back navigation. The app draws edge-to-edge,
+  so the reader pads itself above the on-screen keyboard (`imePadding`); otherwise the
+  WebView keeps its full height and the keyboard covers the page's comment box.
 
 ### Web (laptop / studio browser)
 
@@ -354,7 +356,7 @@ reader's navigation override re-sends it. Tokens never go in URLs.
 
 ### Review client (the injected script)
 
-Plain JS, no dependencies, under ~20 KB. It must not break the doc's own scripts
+Plain JS, no dependencies, about 30 KB. It must not break the doc's own scripts
 (for example the memo dark-mode toggle): namespace everything under `window.__smDoc`
 and use a shadow DOM for its UI.
 
@@ -381,9 +383,18 @@ and use a shadow DOM for its UI.
   - Anchor: `line` = the `data-sm-line` of the closest ancestor with one;
     `quote` = the selected text, or the block's `textContent` (trimmed, capped at 300
     chars) on a tap.
-- **Composer**: textarea → `POST /docs/{id}/drafts`. A revision holds at most 100
-  drafts (a 400 beyond that), the page size reconciliation reads back from GitHub. Drafts show as margin markers
-  (desktop) or inline badges (mobile) on their block; tap to edit or delete.
+- **Composer**: like a GitHub review, an inline bubble opens right under the block
+  being commented on (in a table row, inside its last cell): the quoted selection, a
+  textarea, then Cancel and *Add draft* → `POST /docs/{id}/drafts`. Being part of the
+  page, it scrolls into view above the on-screen keyboard; the client also keeps it
+  inside `window.visualViewport`. A revision holds at most 100 drafts (a 400 beyond
+  that), the page size reconciliation reads back from GitHub. Each draft then shows as
+  a *Pending* bubble under its block with Edit (reopens the composer in place) and
+  Delete (tap twice). Bubbles are host elements with their own shadow root, so the
+  doc's styles, `textContent` and selections are unaffected. A comment with no line
+  (or whose block can't be found) uses a sheet instead, with its buttons above the
+  textarea for the same keyboard reason; the submit panel likewise puts Submit above
+  the overall comment.
 - **Submit panel**: a "Review (N)" button opens the drafts for this revision (each
   with Edit), verdict radios (Approve / Request changes / Comment), an overall body
   textarea and Submit → `POST /docs/{id}/review`. On success it shows the GitHub
