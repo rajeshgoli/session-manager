@@ -6003,7 +6003,7 @@ async fn queue_runtime_memory_guard_records_cause_and_sample_before_termination(
         notifications.iter().any(|text| {
             queue_completion_matches(text, &perf_id, "memory_exceeded")
                 && text.contains("termination=memory_budget memory_guard: rss=")
-                && text.contains("limit=0.0 GiB")
+                && text.contains("limit=1B(0.0GiB)")
         }),
         "{notifications:?}"
     );
