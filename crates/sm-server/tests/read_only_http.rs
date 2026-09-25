@@ -23,8 +23,8 @@ use sm_server::{
         CodexObservabilityConfig, CodexRequestsConfig, CodexRolloutConfig, EmailConfig,
         ExternalAccessConfig, GoogleAuthConfig, MobileAnalyticsConfig, MobileTerminalConfig,
         MobileTerminalDeviceKeyConfig, MobileTerminalUserConfig, NodeConfig, PathsConfig,
-        ProviderLaunchConfig, QueueRunnerConfig, QueueRunnerTypeConfig, RustCoreConfig,
-        SmSendConfig, ToolLoggingConfig, UsageAccountConfig,
+        ProviderLaunchConfig, QueueRunnerConfig, QueueRunnerProcessesConfig, QueueRunnerTypeConfig,
+        RustCoreConfig, SmSendConfig, ToolLoggingConfig, UsageAccountConfig,
     },
     http::{
         router, AppState, DocFetchError, DocPullRequest, DocReviewOnGitHub, GitHubPullRequestState,
@@ -5699,6 +5699,110 @@ async fn queue_timeout_waits_for_process_group_cleanup_after_wrapper_exits() {
         .status()
         .unwrap();
     assert!(!group_probe.success());
+}
+
+fn process_guard_test_app(label: &str, job_max: i64) -> (axum::Router, PathBuf, PathBuf) {
+    let state_file = write_session_fixture();
+    let queue_state_dir = state_file.with_extension(format!("queue-runner-{label}"));
+    let message_queue_db = state_file.with_extension(format!("{label}-message-queue.db"));
+    let working_dir = unique_temp_path().with_extension("queue-cwd");
+    fs::create_dir_all(&working_dir).unwrap();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        queue_runner: QueueRunnerConfig {
+            state_dir: queue_state_dir.display().to_string(),
+            cancel_grace_seconds: 3,
+            processes: QueueRunnerProcessesConfig {
+                reserve: 1024,
+                job_max,
+            },
+            configured: true,
+            ..QueueRunnerConfig::default()
+        },
+        sm_send: SmSendConfig {
+            db_path: message_queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.runtime_enabled = true;
+    (router(AppState::new(config)), working_dir, message_queue_db)
+}
+
+#[tokio::test]
+async fn queue_job_that_outgrows_its_process_cap_is_stopped_alone() {
+    let (app, working_dir, message_queue_db) = process_guard_test_app("process-cap", 4);
+    let (status, created) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "tests",
+            "label": "fork runaway",
+            "script": "for i in 1 2 3 4 5 6; do sleep 60 & done; wait",
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345",
+            "timeout_seconds": 60
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let job_id = created["id"].as_str().unwrap().to_owned();
+
+    let job = wait_for_queue_job_state(app, &job_id, &["process_limit_exceeded"]).await;
+    assert_eq!(job["termination_reason"], "process_limit");
+    assert_eq!(job["process_limit"], 4);
+    assert_eq!(job["process_guard"]["process_limit"], 4);
+    let sampled = job["process_guard"]["process_count"].as_i64().unwrap();
+    assert!(sampled > 4, "{job}");
+    assert!(
+        job["peak_process_count"].as_i64().unwrap() >= sampled,
+        "{job}"
+    );
+    assert!(job["memory_guard"].is_null(), "{job}");
+    let pgid = job["process_group_id"].as_i64().unwrap();
+    let group_probe = Command::new("/bin/kill")
+        .args(["-0", &format!("-{pgid}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!group_probe.success(), "the whole group is stopped");
+    let texts = queued_message_texts(&message_queue_db, "run12345");
+    assert!(
+        texts.iter().any(|text| text.contains(
+            "completed: process_limit_exceeded termination=process_limit process_guard: processes="
+        ) && text.contains(" peak_processes=")),
+        "{texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn queue_job_records_its_peak_processes_and_its_cap() {
+    let (app, working_dir, _) = process_guard_test_app("process-peak", 2048);
+    let (status, created) = post_json(
+        app.clone(),
+        "/queue-jobs",
+        json!({
+            "type": "tests",
+            "label": "small fan-out",
+            "script": "sleep 1 & sleep 1 & sleep 1 & wait",
+            "cwd": working_dir.display().to_string(),
+            "notify_target": "run12345",
+            "requester_session_id": "run12345",
+            "timeout_seconds": 60
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let job_id = created["id"].as_str().unwrap().to_owned();
+
+    let job = wait_for_queue_job_state(app, &job_id, &["succeeded"]).await;
+    assert_eq!(job["process_limit"], 2048);
+    // The wrapper, the script's shell, and three sleeps.
+    assert!(job["peak_process_count"].as_i64().unwrap() >= 5, "{job}");
+    assert!(job["process_guard"].is_null(), "{job}");
 }
 
 #[tokio::test]

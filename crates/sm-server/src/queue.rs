@@ -170,8 +170,14 @@ pub struct QueueJobRecord {
     pub process_group_id: Option<i64>,
     pub exit_code: Option<i64>,
     pub log_path: Option<String>,
-    /// Memory-guard evidence recorded before a `memory_exceeded` termination.
+    /// Guard evidence recorded before a `memory_exceeded` or
+    /// `process_limit_exceeded` termination.
     pub termination_detail: Option<JsonValue>,
+    /// Per-job process cap in force when the job started; `None` for jobs
+    /// started before the cap existed or with it disabled.
+    pub process_limit: Option<i64>,
+    /// Most processes seen at once in the job's process group.
+    pub peak_process_count: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +190,10 @@ pub struct QueueAdmissionPolicy {
     pub service_max_concurrent: usize,
     pub memory_min_free_bytes: i64,
     pub resource_retry_interval_seconds: u64,
+    /// Process slots below the user's ceiling that queue jobs may not take (#1516).
+    pub process_reserve: i64,
+    /// Processes one job's process group may hold before it is stopped; 0 disables.
+    pub job_process_limit: i64,
 }
 
 impl Default for QueueAdmissionPolicy {
@@ -197,6 +207,8 @@ impl Default for QueueAdmissionPolicy {
             service_max_concurrent: 0,
             memory_min_free_bytes: 8 * 1024 * 1024 * 1024,
             resource_retry_interval_seconds: 10,
+            process_reserve: 1024,
+            job_process_limit: 2048,
         }
     }
 }
@@ -242,6 +254,8 @@ struct QueueJobRuntimeRecord {
     completion_notified_at: Option<String>,
     termination_detail_json: Option<String>,
     revived_at: Option<String>,
+    process_limit: Option<i64>,
+    peak_process_count: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1076,7 +1090,8 @@ impl RetainedQueueStore {
         if job.state != "pending" {
             return get_queue_job_conn(&conn, job_id);
         }
-        let child = match spawn_queue_job_process(&job) {
+        let process_ceiling = queue_job_process_ceiling(admission_policy.process_reserve);
+        let child = match spawn_queue_job_process(&job, process_ceiling) {
             Ok(child) => child,
             Err(error) => {
                 finish_queue_job_conn(&conn, &job, "failed", None, Some(message_queue_db_path))?;
@@ -1084,6 +1099,8 @@ impl RetainedQueueStore {
             }
         };
         let pid = i64::from(child.id());
+        let process_limit =
+            (admission_policy.job_process_limit > 0).then_some(admission_policy.job_process_limit);
         conn.execute(
             r#"
             UPDATE queue_jobs
@@ -1091,10 +1108,11 @@ impl RetainedQueueStore {
                 holding_reason = NULL,
                 started_at = ?2,
                 pid = ?3,
-                process_group_id = ?3
+                process_group_id = ?3,
+                process_limit = ?4
             WHERE id = ?1 AND state = 'pending'
             "#,
-            params![job_id, now_rfc3339(), pid],
+            params![job_id, now_rfc3339(), pid, process_limit],
         )?;
         let monitor_state_dir = state_dir.to_path_buf();
         let monitor_message_queue_db_path = message_queue_db_path.to_path_buf();
@@ -1109,6 +1127,7 @@ impl RetainedQueueStore {
                 child,
                 timeout_seconds,
                 memory_bytes,
+                process_limit,
                 cancel_grace_seconds,
                 admission_policy,
             );
@@ -2811,6 +2830,8 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
     ensure_column(conn, "queue_jobs", "memory_bytes", "INTEGER")?;
     ensure_column(conn, "queue_jobs", "termination_detail_json", "TEXT")?;
     ensure_column(conn, "queue_jobs", "revived_at", "TEXT")?;
+    ensure_column(conn, "queue_jobs", "process_limit", "INTEGER")?;
+    ensure_column(conn, "queue_jobs", "peak_process_count", "INTEGER")?;
     ensure_column(
         conn,
         "queue_jobs",
@@ -3046,7 +3067,7 @@ fn get_queue_job_runtime_conn(
                max_wait_seconds,
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
                exit_code, completion_notified_at, label, termination_detail_json,
-               revived_at
+               revived_at, process_limit, peak_process_count
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -3086,6 +3107,8 @@ fn get_queue_job_runtime_conn(
                 label: row.get(20)?,
                 termination_detail_json: row.get(21)?,
                 revived_at: row.get(22)?,
+                process_limit: row.get(23)?,
+                peak_process_count: row.get(24)?,
             })
         })
         .optional()
@@ -3100,7 +3123,7 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                max_wait_seconds,
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
                exit_code, completion_notified_at, label, termination_detail_json,
-               revived_at
+               revived_at, process_limit, peak_process_count
         FROM queue_jobs
         ORDER BY queued_at, id
         "#,
@@ -3131,6 +3154,8 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                 label: row.get(20)?,
                 termination_detail_json: row.get(21)?,
                 revived_at: row.get(22)?,
+                process_limit: row.get(23)?,
+                peak_process_count: row.get(24)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3827,7 +3852,10 @@ fn perf_blocked_by_tests_after_perf(jobs: &[QueueJobRuntimeRecord]) -> bool {
         })
 }
 
-fn spawn_queue_job_process(job: &QueueJobRuntimeRecord) -> Result<Child> {
+fn spawn_queue_job_process(
+    job: &QueueJobRuntimeRecord,
+    process_ceiling: Option<u64>,
+) -> Result<Child> {
     let wrapper_path = job
         .wrapper_path
         .as_deref()
@@ -3861,6 +3889,21 @@ fn spawn_queue_job_process(job: &QueueJobRuntimeRecord) -> Result<Child> {
     #[cfg(unix)]
     {
         command.process_group(0);
+        if let Some(ceiling) = process_ceiling {
+            // SAFETY: setrlimit(2) is async-signal-safe and touches no parent
+            // state. Lowering a limit cannot fail for a value at or below the
+            // current soft limit, so an error only leaves the job uncapped.
+            let limit = libc::rlimit {
+                rlim_cur: ceiling,
+                rlim_max: ceiling,
+            };
+            unsafe {
+                command.pre_exec(move || {
+                    libc::setrlimit(libc::RLIMIT_NPROC, &limit);
+                    Ok(())
+                });
+            }
+        }
     }
     command
         .spawn()
@@ -3874,10 +3917,12 @@ fn monitor_queue_job_completion(
     mut child: Child,
     timeout_seconds: i64,
     memory_bytes: Option<i64>,
+    process_limit: Option<i64>,
     cancel_grace_seconds: u64,
     admission_policy: QueueAdmissionPolicy,
 ) {
     let started = Instant::now();
+    let mut process_guard = ProcessGuard::new(process_limit);
     let timeout = (timeout_seconds > 0).then(|| StdDuration::from_secs(timeout_seconds as u64));
     let pgid = i64::from(child.id());
     let mut next_memory_check = Instant::now();
@@ -3893,6 +3938,7 @@ fn monitor_queue_job_completion(
                     &job_id,
                     "failed",
                     None,
+                    process_guard.peak(),
                     cancel_grace_seconds,
                     admission_policy,
                 );
@@ -3916,6 +3962,7 @@ fn monitor_queue_job_completion(
                     &job_id,
                     state,
                     exit_code,
+                    process_guard.peak(),
                     cancel_grace_seconds,
                     admission_policy,
                 );
@@ -3931,11 +3978,35 @@ fn monitor_queue_job_completion(
                 &job_id,
                 "timed_out",
                 exit_code,
+                process_guard.peak(),
                 cancel_grace_seconds,
                 admission_policy,
             );
             return;
         }
+        if let Some(trip) = process_guard.sample(pgid) {
+            if let Err(error) =
+                mark_queue_job_process_limit_terminating_in_state_dir(&state_dir, &job_id, &trip)
+            {
+                eprintln!("queue process guard could not record {job_id}: {error:#}");
+            }
+            terminate_child_process_group_with_grace(&mut child, pgid, cancel_grace_seconds);
+            let exit_code = read_queue_job_exit_code_from_state_dir(&state_dir, &job_id);
+            finish_live_queue_job_until_recorded(
+                &state_dir,
+                &message_queue_db_path,
+                &job_id,
+                "process_limit_exceeded",
+                exit_code,
+                process_guard.peak(),
+                cancel_grace_seconds,
+                admission_policy,
+            );
+            return;
+        }
+        process_guard.persist_peak(|peak| {
+            record_queue_job_peak_processes_in_state_dir(&state_dir, &job_id, peak)
+        });
         let memory_trip = memory_bytes.and_then(|limit| {
             if Instant::now() < next_memory_check {
                 return None;
@@ -3965,6 +4036,7 @@ fn monitor_queue_job_completion(
                 &job_id,
                 "memory_exceeded",
                 exit_code,
+                process_guard.peak(),
                 cancel_grace_seconds,
                 admission_policy,
             );
@@ -3982,9 +4054,17 @@ fn finish_live_queue_job_until_recorded(
     job_id: &str,
     state: &str,
     exit_code: Option<i64>,
+    peak_process_count: Option<i64>,
     cancel_grace_seconds: u64,
     admission_policy: QueueAdmissionPolicy,
 ) {
+    // Best effort: the completion notice reads the peak from the row, and a
+    // missed write only leaves the last throttled peak there.
+    if let Some(peak) = peak_process_count {
+        if let Err(error) = record_queue_job_peak_processes_in_state_dir(state_dir, job_id, peak) {
+            eprintln!("queue job {job_id} could not record its peak process count: {error:#}");
+        }
+    }
     while let Err(error) = finish_queue_job_in_state_dir_if_running(
         state_dir,
         message_queue_db_path,
@@ -4160,6 +4240,7 @@ pub fn queue_job_termination_reason(
             .and_then(|detail| detail.get("cause"))
             .and_then(JsonValue::as_str)
             .unwrap_or(MEMORY_GUARD_CAUSE_UNRECORDED),
+        "process_limit_exceeded" => PROCESS_GUARD_CAUSE,
         _ => return None,
     };
     Some(reason.to_owned())
@@ -4352,6 +4433,243 @@ fn process_arguments(_pid: i64) -> Option<Vec<u8>> {
     None
 }
 
+/// Termination cause recorded when a job's process group outgrows its cap.
+const PROCESS_GUARD_CAUSE: &str = "process_limit";
+/// Peak writes are throttled; the final peak is written as the job finishes.
+const PEAK_PROCESS_WRITE_INTERVAL: StdDuration = StdDuration::from_secs(1);
+
+/// Per-job process accounting (#1516). Every process a job forks counts toward
+/// the user's one process ceiling, so a runaway job once starved every agent on
+/// the host. The watcher counts the job's process group on each tick, remembers
+/// the peak, and stops the job when the count exceeds its cap.
+struct ProcessGuard {
+    limit: Option<i64>,
+    peak: Option<i64>,
+    persisted_peak: Option<i64>,
+    next_write: Instant,
+}
+
+/// The sample that made the process guard stop a job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessGuardTrip {
+    sampled_at: String,
+    process_count: i64,
+    process_limit: i64,
+}
+
+impl ProcessGuardTrip {
+    fn to_json(&self) -> JsonValue {
+        serde_json::json!({
+            "cause": PROCESS_GUARD_CAUSE,
+            "sampled_at": self.sampled_at,
+            "process_count": self.process_count,
+            "process_limit": self.process_limit,
+        })
+    }
+}
+
+impl ProcessGuard {
+    fn new(limit: Option<i64>) -> Self {
+        Self {
+            limit,
+            peak: None,
+            persisted_peak: None,
+            next_write: Instant::now(),
+        }
+    }
+
+    fn peak(&self) -> Option<i64> {
+        self.peak
+    }
+
+    /// Counts the group once. A failed count never trips the guard.
+    fn sample(&mut self, pgid: i64) -> Option<ProcessGuardTrip> {
+        self.observe(process_group_process_count(pgid)?)
+    }
+
+    fn observe(&mut self, count: i64) -> Option<ProcessGuardTrip> {
+        self.peak = self.peak.max(Some(count));
+        let limit = self.limit.filter(|limit| *limit > 0)?;
+        (count > limit).then(|| ProcessGuardTrip {
+            sampled_at: now_rfc3339(),
+            process_count: count,
+            process_limit: limit,
+        })
+    }
+
+    /// Writes the peak when it grew, at most once per interval.
+    fn persist_peak(&mut self, write: impl FnOnce(i64) -> Result<()>) {
+        let Some(peak) = self.peak else {
+            return;
+        };
+        if self.persisted_peak >= Some(peak) || Instant::now() < self.next_write {
+            return;
+        }
+        self.next_write = Instant::now() + PEAK_PROCESS_WRITE_INTERVAL;
+        if write(peak).is_ok() {
+            self.persisted_peak = Some(peak);
+        }
+    }
+}
+
+/// Live and zombie processes in a process group, counted with proc_listpids(2)
+/// rather than a spawned `ps`, which fails exactly when slots are exhausted.
+#[cfg(target_os = "macos")]
+fn process_group_process_count(pgid: i64) -> Option<i64> {
+    // <sys/proc_info.h>; the libc crate does not export it.
+    const PROC_PGRP_ONLY: u32 = 2;
+    let pgid = u32::try_from(pgid).ok().filter(|pgid| *pgid > 0)?;
+    let pid_size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: a null buffer only asks for the size of every process's pid.
+    let needed = unsafe { libc::proc_listpids(PROC_PGRP_ONLY, pgid, std::ptr::null_mut(), 0) };
+    let capacity = usize::try_from(needed).ok().filter(|needed| *needed > 0)? / pid_size;
+    let mut pids = vec![0 as libc::c_int; capacity];
+    let buffer_size = libc::c_int::try_from(pids.len() * pid_size).ok()?;
+    // SAFETY: pids is writable for buffer_size bytes; the kernel writes at most that.
+    let filled =
+        unsafe { libc::proc_listpids(PROC_PGRP_ONLY, pgid, pids.as_mut_ptr().cast(), buffer_size) };
+    let filled = usize::try_from(filled).ok()? / pid_size;
+    i64::try_from(pids.iter().take(filled).filter(|pid| **pid > 0).count()).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn process_group_process_count(pgid: i64) -> Option<i64> {
+    let mut count = 0i64;
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // Fields after the parenthesized command name: state, ppid, pgrp.
+        let pgrp = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(2))
+            .and_then(|field| field.parse::<i64>().ok());
+        if pgrp == Some(pgid) {
+            count += 1;
+        }
+    }
+    Some(count)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_group_process_count(_pgid: i64) -> Option<i64> {
+    None
+}
+
+/// The RLIMIT_NPROC a queue job starts under: the user's process ceiling less
+/// the reserve. The kernel compares this limit with the user's *total* process
+/// count, not the job's, so it cannot give a job its own quota; what it does is
+/// keep the last `reserve` slots for agents and sm-server when a job runs away.
+/// None when the reserve is disabled or the ceiling is unknown or unlimited.
+fn queue_job_process_ceiling(reserve: i64) -> Option<u64> {
+    let reserve = u64::try_from(reserve).ok().filter(|reserve| *reserve > 0)?;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limit is a valid rlimit for the kernel to fill.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut limit) } != 0 {
+        return None;
+    }
+    let soft = limit.rlim_cur;
+    #[cfg(target_os = "macos")]
+    let soft = soft.min(macos_max_processes_per_uid().unwrap_or(soft));
+    if soft == libc::RLIM_INFINITY {
+        return None;
+    }
+    soft.checked_sub(reserve).filter(|ceiling| *ceiling > 0)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_max_processes_per_uid() -> Option<u64> {
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the name is NUL-terminated and value is a c_int of the given size.
+    let status = unsafe {
+        libc::sysctlbyname(
+            c"kern.maxprocperuid".as_ptr(),
+            (&mut value as *mut libc::c_int).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (status == 0).then(|| u64::try_from(value).ok()).flatten()
+}
+
+fn record_queue_job_peak_processes_conn(conn: &Connection, job_id: &str, peak: i64) -> Result<()> {
+    conn.execute(
+        r#"
+        UPDATE queue_jobs
+        SET peak_process_count = MAX(COALESCE(peak_process_count, 0), ?2)
+        WHERE id = ?1
+        "#,
+        params![job_id, peak],
+    )?;
+    Ok(())
+}
+
+fn record_queue_job_peak_processes_in_state_dir(
+    state_dir: &Path,
+    job_id: &str,
+    peak: i64,
+) -> Result<()> {
+    let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))?;
+    init_queue_jobs_schema(&conn)?;
+    record_queue_job_peak_processes_conn(&conn, job_id, peak)
+}
+
+/// Records the trip and marks the job so recovery after a restart still
+/// finishes it as `process_limit_exceeded`. A cancel, displacement, or memory
+/// stop already in progress keeps precedence.
+fn mark_queue_job_process_limit_terminating_conn(
+    conn: &Connection,
+    job_id: &str,
+    trip: &ProcessGuardTrip,
+) -> Result<()> {
+    eprintln!("queue process guard stopping {job_id}: {}", trip.to_json());
+    conn.execute(
+        r#"
+        UPDATE queue_jobs
+        SET holding_reason = 'process_limit_terminating',
+            termination_detail_json = ?2,
+            peak_process_count = MAX(COALESCE(peak_process_count, 0), ?3)
+        WHERE id = ?1 AND state = 'running'
+          AND COALESCE(holding_reason, 'process_limit_terminating') = 'process_limit_terminating'
+        "#,
+        params![job_id, trip.to_json().to_string(), trip.process_count],
+    )?;
+    Ok(())
+}
+
+fn mark_queue_job_process_limit_terminating_in_state_dir(
+    state_dir: &Path,
+    job_id: &str,
+    trip: &ProcessGuardTrip,
+) -> Result<()> {
+    let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))?;
+    init_queue_jobs_schema(&conn)?;
+    mark_queue_job_process_limit_terminating_conn(&conn, job_id, trip)
+}
+
+fn process_guard_detail_text(detail: &JsonValue) -> String {
+    let number = |key: &str| {
+        detail
+            .get(key)
+            .and_then(JsonValue::as_i64)
+            .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+    };
+    format!(
+        " process_guard: processes={} limit={} sampled_at={}",
+        number("process_count"),
+        number("process_limit"),
+        detail
+            .get("sampled_at")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("unknown"),
+    )
+}
+
 fn recover_running_queue_job_conn(
     conn: &Connection,
     state_dir: &Path,
@@ -4462,8 +4780,22 @@ fn poll_recovered_queue_job(
 ) {
     let mut next_memory_check = Instant::now();
     let mut failed_memory_samples = 0u8;
+    // The cap is the one recorded when the job started; a job started before
+    // the cap existed has none and is only measured.
+    let mut process_guard = ProcessGuard::new(None);
     let db_path = state_dir.join("queue_runner.db");
-    let finish = |conn: &Connection, job: &QueueJobRuntimeRecord, state: &str, exit_code| {
+    let finish = |conn: &Connection,
+                  job: &QueueJobRuntimeRecord,
+                  state: &str,
+                  exit_code,
+                  peak: Option<i64>| {
+        let mut job = job.clone();
+        if let Some(peak) = peak {
+            // Best effort, like a live job: the notice below reads this peak.
+            let _ = record_queue_job_peak_processes_conn(conn, &job.id, peak);
+            job.peak_process_count = job.peak_process_count.max(Some(peak));
+        }
+        let job = &job;
         if let Err(error) =
             finish_queue_job_conn(conn, job, state, exit_code, Some(&message_queue_db_path))
         {
@@ -4507,12 +4839,13 @@ fn poll_recovered_queue_job(
             return;
         }
         let pgid = job.process_group_id.unwrap_or(pid);
+        process_guard.limit = job.process_limit;
         if let Some(final_state) =
             forced_terminal_state_for_holding_reason(job.holding_reason.as_deref())
         {
             terminate_process_group_with_grace(pgid, cancel_grace_seconds);
             let exit_code = read_exit_code(job.exit_code_path.as_deref());
-            if finish(&conn, &job, final_state, exit_code) {
+            if finish(&conn, &job, final_state, exit_code, process_guard.peak()) {
                 return;
             }
             continue;
@@ -4527,7 +4860,7 @@ fn poll_recovered_queue_job(
             } else {
                 "failed"
             };
-            if finish(&conn, &job, state, exit_code) {
+            if finish(&conn, &job, state, exit_code, process_guard.peak()) {
                 return;
             }
             continue;
@@ -4535,11 +4868,32 @@ fn poll_recovered_queue_job(
         if queue_job_timed_out(&job) {
             terminate_process_group_with_grace(pgid, cancel_grace_seconds);
             let exit_code = read_exit_code(job.exit_code_path.as_deref());
-            if finish(&conn, &job, "timed_out", exit_code) {
+            if finish(&conn, &job, "timed_out", exit_code, process_guard.peak()) {
                 return;
             }
             continue;
         }
+        if let Some(trip) = process_guard.sample(pgid) {
+            if let Err(error) = mark_queue_job_process_limit_terminating_conn(&conn, &job.id, &trip)
+            {
+                eprintln!("queue process guard could not record {}: {error:#}", job.id);
+            }
+            terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+            let exit_code = read_exit_code(job.exit_code_path.as_deref());
+            let job = get_queue_job_runtime_conn(&conn, &job.id)
+                .ok()
+                .flatten()
+                .unwrap_or(job);
+            let final_state =
+                forced_terminal_state_for_holding_reason(job.holding_reason.as_deref())
+                    .unwrap_or("process_limit_exceeded");
+            if finish(&conn, &job, final_state, exit_code, process_guard.peak()) {
+                return;
+            }
+            continue;
+        }
+        process_guard
+            .persist_peak(|peak| record_queue_job_peak_processes_conn(&conn, &job.id, peak));
         let memory_trip = job.memory_bytes.and_then(|limit| {
             if Instant::now() < next_memory_check {
                 return None;
@@ -4571,13 +4925,13 @@ fn poll_recovered_queue_job(
             let final_state =
                 forced_terminal_state_for_holding_reason(job.holding_reason.as_deref())
                     .unwrap_or("memory_exceeded");
-            if finish(&conn, &job, final_state, exit_code) {
+            if finish(&conn, &job, final_state, exit_code, process_guard.peak()) {
                 return;
             }
             continue;
         }
         if !group_alive && !process_exists(pid) {
-            if finish(&conn, &job, "failed", None) {
+            if finish(&conn, &job, "failed", None, process_guard.peak()) {
                 return;
             }
         }
@@ -4653,6 +5007,7 @@ fn forced_terminal_state_for_holding_reason(holding_reason: Option<&str>) -> Opt
         Some("cancelling") => Some("cancelled"),
         Some("displacing") => Some("displaced"),
         Some("memory_terminating") => Some("memory_exceeded"),
+        Some("process_limit_terminating") => Some("process_limit_exceeded"),
         _ => None,
     }
 }
@@ -4720,13 +5075,13 @@ fn finish_queue_job_conn_with_policy(
         SET state = ?2,
             holding_reason = CASE WHEN ?2 = 'wait_expired' THEN holding_reason ELSE NULL END,
             termination_detail_json = CASE
-                WHEN ?2 = 'memory_exceeded' THEN termination_detail_json
+                WHEN ?2 IN ('memory_exceeded', 'process_limit_exceeded') THEN termination_detail_json
                 ELSE NULL
             END,
             finished_at = ?3,
             exit_code = ?4,
             completion_notification_required = 1
-        WHERE id = ?1 AND state NOT IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded')
+        WHERE id = ?1 AND state NOT IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded')
         "#,
         params![job.id, state, finished_at, exit_code],
     )?;
@@ -4754,7 +5109,7 @@ fn retry_unnotified_queue_job_completions_conn(
         r#"
         SELECT id
         FROM queue_jobs
-        WHERE state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded')
+        WHERE state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded')
           AND completion_notification_required = 1
           AND completion_notified_at IS NULL
         ORDER BY finished_at, id
@@ -5037,19 +5392,26 @@ fn queue_job_completion_text_with_policy(
     let runtime = queue_duration_text(job.started_at.as_deref(), Some(finished_at));
     let queue_end = job.started_at.as_deref().unwrap_or(finished_at);
     let queued = queue_duration_text(Some(&job.queued_at), Some(queue_end));
-    let termination_detail = (state == "memory_exceeded")
+    let termination_detail = matches!(state, "memory_exceeded" | "process_limit_exceeded")
         .then(|| job.termination_detail_json.as_deref())
         .flatten()
         .and_then(|raw| serde_json::from_str::<JsonValue>(raw).ok());
     let mut termination_text = queue_job_termination_reason(state, termination_detail.as_ref())
         .map_or_else(String::new, |reason| format!(" termination={reason}"));
     if let Some(detail) = &termination_detail {
-        termination_text.push_str(&memory_guard_detail_text(detail));
+        termination_text.push_str(&if state == "process_limit_exceeded" {
+            process_guard_detail_text(detail)
+        } else {
+            memory_guard_detail_text(detail)
+        });
     }
-    let exit_text = exit_code.map_or_else(
+    let mut exit_text = exit_code.map_or_else(
         || " exit=unknown (no exit receipt; output is partial/non-evidence)".to_owned(),
         |code| format!(" exit={code}"),
     );
+    if let Some(peak) = job.peak_process_count {
+        exit_text.push_str(&format!(" peak_processes={peak}"));
+    }
     let budget_text = if job.job_type == "perf" {
         format!(
             " budget=cpu:{}% gpu:{}% memory:{}B time:{}s",
@@ -5235,6 +5597,7 @@ fn is_terminal_queue_state(state: &str) -> bool {
             | "cancelled"
             | "displaced"
             | "memory_exceeded"
+            | "process_limit_exceeded"
     )
 }
 
@@ -5547,7 +5910,7 @@ fn list_queue_jobs_conn(
     if let Some(value) = filters.state {
         if value == "done" {
             where_clauses
-                .push("state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded')");
+                .push("state IN ('succeeded', 'failed', 'timed_out', 'wait_expired', 'cancelled', 'displaced', 'memory_exceeded', 'process_limit_exceeded')");
         } else if value == "active" {
             where_clauses.push("state IN ('pending', 'running')");
         } else {
@@ -5629,13 +5992,19 @@ fn queue_job_columns(conn: &Connection) -> Result<BTreeSet<String>> {
 }
 
 fn queue_job_detail_projection(conn: &Connection) -> Result<&'static str> {
-    Ok(
-        if queue_job_columns(conn)?.contains("termination_detail_json") {
-            "termination_detail_json"
-        } else {
-            "NULL AS termination_detail_json"
-        },
-    )
+    let columns = queue_job_columns(conn)?;
+    let detail = columns.contains("termination_detail_json");
+    let processes = columns.contains("process_limit") && columns.contains("peak_process_count");
+    Ok(match (detail, processes) {
+        (true, true) => "termination_detail_json, process_limit, peak_process_count",
+        (true, false) => {
+            "termination_detail_json, NULL AS process_limit, NULL AS peak_process_count"
+        }
+        (false, true) => "NULL AS termination_detail_json, process_limit, peak_process_count",
+        (false, false) => {
+            "NULL AS termination_detail_json, NULL AS process_limit, NULL AS peak_process_count"
+        }
+    })
 }
 
 fn queue_job_resource_projection(conn: &Connection) -> Result<&'static str> {
@@ -5702,6 +6071,8 @@ fn queue_job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJ
         termination_detail: row
             .get::<_, Option<String>>(22)?
             .and_then(|raw| serde_json::from_str(&raw).ok()),
+        process_limit: row.get(23)?,
+        peak_process_count: row.get(24)?,
     })
 }
 
@@ -6385,6 +6756,234 @@ mod tests {
     }
 
     #[test]
+    fn process_limit_termination_is_persisted_before_kill_and_named_in_the_completion() {
+        let state_dir = unique_temp_path("process-guard-trip");
+        let message_queue_db = state_dir.join("messages.db");
+        let (conn, job) = running_perf_job_for_memory_guard(&state_dir);
+        record_queue_job_peak_processes_conn(&conn, &job.id, 40).unwrap();
+        let trip = ProcessGuardTrip {
+            sampled_at: "2026-09-25T04:33:00Z".into(),
+            process_count: 2049,
+            process_limit: 2048,
+        };
+        mark_queue_job_process_limit_terminating_conn(&conn, &job.id, &trip).unwrap();
+
+        // The evidence and the peak are durable while the job is still being stopped.
+        let stopping = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(stopping.state, "running");
+        assert_eq!(
+            stopping.holding_reason.as_deref(),
+            Some("process_limit_terminating")
+        );
+        assert_eq!(stopping.termination_detail, Some(trip.to_json()));
+        assert_eq!(stopping.peak_process_count, Some(2049));
+
+        // A restart mid-termination still finishes the job as process_limit_exceeded.
+        let runtime = get_queue_job_runtime_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(
+            recover_running_queue_job_conn(
+                &conn,
+                &state_dir,
+                &message_queue_db,
+                &runtime,
+                0,
+                QueueAdmissionPolicy::default(),
+            )
+            .unwrap(),
+            RecoveredQueueJobAction::Finished("process_limit_exceeded")
+        );
+        let finished = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(finished.state, "process_limit_exceeded");
+        assert_eq!(finished.termination_detail, Some(trip.to_json()));
+        assert_eq!(
+            queue_job_termination_reason(&finished.state, finished.termination_detail.as_ref())
+                .as_deref(),
+            Some("process_limit")
+        );
+        let notifications = RetainedQueueStore::new(message_queue_db)
+            .pending_messages_for_target_by_category("notify", "queue-completion", 10)
+            .unwrap();
+        assert_eq!(notifications.len(), 1);
+        let text = &notifications[0].text;
+        assert!(text.contains("completed: process_limit_exceeded termination=process_limit process_guard: processes=2049 limit=2048 sampled_at=2026-09-25T04:33:00Z exit=unknown"), "{text}");
+        assert!(text.contains(" peak_processes=2049 "), "{text}");
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn peak_process_count_only_grows() {
+        let state_dir = unique_temp_path("process-peak-monotonic");
+        let (conn, job) = running_perf_job_for_memory_guard(&state_dir);
+        record_queue_job_peak_processes_conn(&conn, &job.id, 12).unwrap();
+        record_queue_job_peak_processes_conn(&conn, &job.id, 5).unwrap();
+        let record = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(record.peak_process_count, Some(12));
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn process_guard_tracks_the_peak_and_trips_only_above_its_cap() {
+        let mut guard = ProcessGuard::new(Some(3));
+        assert_eq!(guard.observe(2), None);
+        assert_eq!(guard.observe(3), None);
+        let trip = guard.observe(4).unwrap();
+        assert_eq!((trip.process_count, trip.process_limit), (4, 3));
+        guard.observe(1);
+        assert_eq!(guard.peak(), Some(4));
+
+        // No cap, or a disabled cap, only measures.
+        for limit in [None, Some(0)] {
+            let mut guard = ProcessGuard::new(limit);
+            assert_eq!(guard.observe(10_000), None);
+            assert_eq!(guard.peak(), Some(10_000));
+        }
+    }
+
+    #[test]
+    fn process_guard_writes_a_grown_peak_at_most_once_per_interval() {
+        let mut guard = ProcessGuard::new(None);
+        let mut writes = Vec::new();
+        let mut persist = |guard: &mut ProcessGuard| {
+            guard.persist_peak(|peak| {
+                writes.push(peak);
+                Ok(())
+            })
+        };
+        persist(&mut guard);
+        guard.observe(5);
+        persist(&mut guard);
+        guard.observe(7);
+        persist(&mut guard);
+        guard.next_write = Instant::now();
+        persist(&mut guard);
+        guard.next_write = Instant::now();
+        persist(&mut guard);
+        // Nothing before the first sample, 7 held back inside the interval,
+        // and an unchanged peak never rewritten.
+        assert_eq!(writes, [5, 7]);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn process_group_count_includes_every_member_without_spawning() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 30 & sleep 30 & wait"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = i64::from(child.id());
+        let deadline = Instant::now() + StdDuration::from_secs(5);
+        let mut count = process_group_process_count(pgid);
+        while count != Some(3) && Instant::now() < deadline {
+            thread::sleep(StdDuration::from_millis(20));
+            count = process_group_process_count(pgid);
+        }
+        terminate_process_group(pgid, true);
+        let _ = child.wait();
+        assert_eq!(count, Some(3), "sh and its two sleeps");
+        // The sleeps are zombies until init reaps them, and zombies still hold slots.
+        let deadline = Instant::now() + StdDuration::from_secs(5);
+        while process_group_process_count(pgid) != Some(0) && Instant::now() < deadline {
+            thread::sleep(StdDuration::from_millis(20));
+        }
+        assert_eq!(process_group_process_count(pgid), Some(0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn process_ceiling_leaves_the_reserve_below_the_user_ceiling() {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut limit) },
+            0
+        );
+        let user_ceiling = limit.rlim_cur.min(macos_max_processes_per_uid().unwrap());
+        assert_eq!(queue_job_process_ceiling(1024), Some(user_ceiling - 1024));
+        assert_eq!(queue_job_process_ceiling(0), None, "0 disables the reserve");
+        assert_eq!(queue_job_process_ceiling(-1), None);
+        let whole = i64::try_from(user_ceiling).unwrap();
+        assert_eq!(
+            queue_job_process_ceiling(whole),
+            None,
+            "no slots left to run in"
+        );
+    }
+
+    #[test]
+    fn queue_job_starts_under_the_process_ceiling() {
+        let job_dir = unique_temp_path("process-ceiling-spawn");
+        fs::create_dir_all(&job_dir).unwrap();
+        let wrapper_path = job_dir.join("run.zsh");
+        let exit_code_path = job_dir.join("exit.code");
+        let log_path = job_dir.join("job.log");
+        write_queue_job_wrapper(
+            &wrapper_path,
+            "/tmp",
+            Some(&[
+                "/bin/zsh".to_owned(),
+                "-c".to_owned(),
+                "ulimit -u; ulimit -H -u".to_owned(),
+            ]),
+            None,
+            &BTreeMap::new(),
+            &exit_code_path,
+        )
+        .unwrap();
+        let job = QueueJobRuntimeRecord {
+            label: "ceiling".into(),
+            id: "job-process-ceiling".to_owned(),
+            job_type: "tests".to_owned(),
+            state: "pending".to_owned(),
+            notify_session_id: None,
+            queued_at: now_rfc3339(),
+            started_at: None,
+            finished_at: None,
+            holding_reason: None,
+            wrapper_path: Some(wrapper_path.display().to_string()),
+            log_path: Some(log_path.display().to_string()),
+            exit_code_path: Some(exit_code_path.display().to_string()),
+            timeout_seconds: 60,
+            max_wait_seconds: DEFAULT_QUEUE_MAX_WAIT_SECONDS,
+            cpu_percent: None,
+            gpu_percent: None,
+            memory_bytes: None,
+            pid: None,
+            process_group_id: None,
+            exit_code: None,
+            completion_notified_at: None,
+            termination_detail_json: None,
+            revived_at: None,
+            process_limit: None,
+            peak_process_count: None,
+        };
+        // The limit counts every process the user runs, so it must sit above
+        // the current total or the job could not fork at all.
+        let Some(ceiling) = queue_job_process_ceiling(7) else {
+            return;
+        };
+        let status = spawn_queue_job_process(&job, Some(ceiling))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(
+            status.success(),
+            "{}",
+            fs::read_to_string(&log_path).unwrap()
+        );
+        // Soft and hard limits both, so the job cannot raise itself back.
+        assert_eq!(
+            fs::read_to_string(&log_path).unwrap(),
+            format!("{ceiling}\n{ceiling}\n")
+        );
+        fs::remove_dir_all(job_dir).unwrap();
+    }
+
+    #[test]
     fn cancel_in_progress_keeps_precedence_over_memory_guard() {
         let state_dir = unique_temp_path("memory-guard-cancel");
         let message_queue_db = state_dir.join("messages.db");
@@ -6492,6 +7091,8 @@ mod tests {
             exit_code: None,
             log_path: None,
             termination_detail: None,
+            process_limit: None,
+            peak_process_count: None,
         };
         let pending = record("new-tests", "tests", "pending", Some("awaiting_tests"));
         let running = record("running-tests", "tests", "running", None);
@@ -6657,6 +7258,8 @@ mod tests {
             completion_notified_at: None,
             termination_detail_json: None,
             revived_at: None,
+            process_limit: None,
+            peak_process_count: None,
         };
 
         let failed = queue_job_completion_text_with_policy(
@@ -6709,6 +7312,8 @@ mod tests {
             completion_notified_at: None,
             termination_detail_json: None,
             revived_at: None,
+            process_limit: None,
+            peak_process_count: None,
         };
 
         let completion = queue_job_completion_text_with_policy(
@@ -6767,9 +7372,11 @@ mod tests {
             completion_notified_at: None,
             termination_detail_json: None,
             revived_at: None,
+            process_limit: None,
+            peak_process_count: None,
         };
 
-        let status = spawn_queue_job_process(&job).unwrap().wait().unwrap();
+        let status = spawn_queue_job_process(&job, None).unwrap().wait().unwrap();
         let log = fs::read_to_string(&log_path).unwrap();
         assert_eq!(status.code(), Some(127));
         assert!(log.contains("command not found: sm-command-that-does-not-exist"));
@@ -6829,9 +7436,11 @@ mod tests {
             completion_notified_at: None,
             termination_detail_json: None,
             revived_at: None,
+            process_limit: None,
+            peak_process_count: None,
         };
 
-        let status = spawn_queue_job_process(&job).unwrap().wait().unwrap();
+        let status = spawn_queue_job_process(&job, None).unwrap().wait().unwrap();
         let log = fs::read_to_string(&log_path).unwrap();
         assert_eq!(status.code(), Some(127));
         assert!(log.contains("command not found: sm-script-command-that-does-not-exist"));
@@ -6867,6 +7476,8 @@ mod tests {
             completion_notified_at: None,
             termination_detail_json: None,
             revived_at: None,
+            process_limit: None,
+            peak_process_count: None,
         };
         let much_later = OffsetDateTime::parse("2026-08-17T20:00:01Z", &Rfc3339).unwrap();
         assert!(!queue_job_timed_out_at(&job, much_later));
@@ -7931,6 +8542,8 @@ mod tests {
             completion_notified_at: None,
             termination_detail_json: None,
             revived_at: None,
+            process_limit: None,
+            peak_process_count: None,
         };
 
         assert!(!queue_job_timed_out_at(&job, now_utc));

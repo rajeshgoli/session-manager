@@ -1417,6 +1417,8 @@ pub struct QueueRunnerConfig {
     #[serde(default)]
     pub memory: QueueRunnerMemoryConfig,
     #[serde(default)]
+    pub processes: QueueRunnerProcessesConfig,
+    #[serde(default)]
     pub types: QueueRunnerTypesConfig,
     #[serde(skip)]
     pub configured: bool,
@@ -1473,6 +1475,27 @@ impl Default for QueueRunnerMemoryConfig {
         Self {
             min_free_bytes: default_queue_runner_memory_min_free_bytes(),
             retry_interval_seconds: default_queue_runner_memory_retry_interval_seconds(),
+        }
+    }
+}
+
+/// Process-slot protection for queue jobs (#1516). 0 disables either guard.
+#[derive(Debug, Clone, Deserialize)]
+pub struct QueueRunnerProcessesConfig {
+    /// Process slots below the user's ceiling that queue jobs can never take,
+    /// so agents and sm-server can still start processes when a job runs away.
+    #[serde(default = "default_queue_runner_processes_reserve")]
+    pub reserve: i64,
+    /// Processes one job's process group may hold before the queue stops it.
+    #[serde(default = "default_queue_runner_processes_job_max")]
+    pub job_max: i64,
+}
+
+impl Default for QueueRunnerProcessesConfig {
+    fn default() -> Self {
+        Self {
+            reserve: default_queue_runner_processes_reserve(),
+            job_max: default_queue_runner_processes_job_max(),
         }
     }
 }
@@ -1551,6 +1574,7 @@ impl Default for QueueRunnerConfig {
             max_running_jobs: default_queue_runner_max_running_jobs(),
             perf_cooldown_seconds: default_queue_runner_perf_cooldown_seconds(),
             memory: QueueRunnerMemoryConfig::default(),
+            processes: QueueRunnerProcessesConfig::default(),
             types: QueueRunnerTypesConfig::default(),
             configured: false,
         }
@@ -1575,6 +1599,14 @@ fn default_queue_runner_perf_cooldown_seconds() -> i64 {
 
 fn default_queue_runner_memory_min_free_bytes() -> i64 {
     8 * 1024 * 1024 * 1024
+}
+
+fn default_queue_runner_processes_reserve() -> i64 {
+    1024
+}
+
+fn default_queue_runner_processes_job_max() -> i64 {
+    2048
 }
 
 fn default_queue_runner_memory_retry_interval_seconds() -> u64 {
@@ -1621,6 +1653,7 @@ fn queue_runner_config_for_state_file(state_file: &str) -> QueueRunnerConfig {
         max_running_jobs: default_queue_runner_max_running_jobs(),
         perf_cooldown_seconds: default_queue_runner_perf_cooldown_seconds(),
         memory: QueueRunnerMemoryConfig::default(),
+        processes: QueueRunnerProcessesConfig::default(),
         types: QueueRunnerTypesConfig::default(),
         configured: false,
     }

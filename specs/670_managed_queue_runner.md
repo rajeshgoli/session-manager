@@ -77,7 +77,7 @@ Add one command group:
 sm queue run [options] -- COMMAND [ARG...]
 sm queue run [options] --script-file PATH
 sm queue run [options] --script-file -
-sm queue list [--type TYPE] [--state pending|running|succeeded|failed|cancelled|timed_out|displaced|memory_exceeded|done] [--all] [--json]
+sm queue list [--type TYPE] [--state pending|running|succeeded|failed|cancelled|timed_out|displaced|memory_exceeded|process_limit_exceeded|done] [--all] [--json]
 sm queue status <job-id> [--json]
 sm queue cancel <job-id>
 ```
@@ -176,7 +176,7 @@ Displacement behavior:
 
 V1 does not automatically resubmit displaced jobs. Manual resubmission is clearer and avoids surprising repeated resource churn from work that may not be safe to restart.
 
-Completion notifications name scheduler-controlled termination (`timeout`, `cancelled`, `perf_displacement`, or, for `memory_exceeded`, the memory-guard cause described under perf memory enforcement). If the wrapper did not persist an exit receipt, the notification reports `exit=unknown` and labels the captured output partial/non-evidence; lines in that log must not be treated as a completed test result.
+Completion notifications name scheduler-controlled termination (`timeout`, `cancelled`, `perf_displacement`, or, for `memory_exceeded`, the memory-guard cause described under perf memory enforcement, or `process_limit` for `process_limit_exceeded`). Every completion notification whose job was sampled carries `peak_processes=N`, the most processes its process group held at once. If the wrapper did not persist an exit receipt, the notification reports `exit=unknown` and labels the captured output partial/non-evidence; lines in that log must not be treated as a completed test result.
 
 ## Exclusive Perf Resource Gates
 
@@ -214,6 +214,29 @@ While a perf job runs, SM samples aggregate RSS for its full process group and c
 
 When several conditions hold at once, the job's own overrun wins, then host pressure, then unavailable telemetry. The recorded sample (`memory_guard` in `GET /queue-jobs/{id}`, and a `memory_guard:` suffix on the completion notification) carries `cause`, `sampled_at`, `process_group_rss_bytes`, `memory_limit_bytes`, `host_available_bytes`, `effective_reserve_bytes`, and `failed_host_samples`; a measurement that could not be taken is `null` (`unknown` in text). The job is marked `memory_terminating` while it is being stopped, so a server restart mid-termination still finishes it as `memory_exceeded` with the recorded cause. A cancel or perf displacement already in progress keeps precedence, and any terminal state other than `memory_exceeded` clears the recorded sample. If process inspection is restricted, the host-pressure backstop remains active even though the declared per-job RSS ceiling cannot be measured directly. CPU/GPU declarations are reported and reserved for the exclusive window but do not cause termination. The explicit wall-time budget continues to terminate as `timed_out`.
 
+### Process-slot protection
+
+Every process on the host counts toward one per-user ceiling (`kern.maxprocperuid` on macOS, 10,666 on the Studio). When a job forks past it, every process start for the user fails with `EAGAIN`, including agents' shells, other jobs, and sm-server itself (#1516). Two guards apply to every job type:
+
+```yaml
+queue_runner:
+  processes:
+    reserve: 1024   # slots queue jobs can never take; 0 disables
+    job_max: 2048   # processes one job's process group may hold; 0 disables
+```
+
+1. **Reserve.** A job starts with `RLIMIT_NPROC`, soft and hard, set to the user's ceiling (the lower of sm-server's own soft limit and `kern.maxprocperuid`) minus `reserve`. The kernel compares this limit with the user's *total* process count, not the job's, so it is not a per-job quota: once the user holds more than ceiling − reserve processes, any queue job's fork fails while agents and sm-server keep the last `reserve` slots. No limit is set when the ceiling is unlimited or not above the reserve.
+2. **Per-job cap.** The job's watcher counts its process group every tick (100 ms) with `proc_listpids(PROC_PGRP_ONLY)` on macOS and `/proc/*/stat` on Linux; zombies count because they still hold slots. A count above the cap stops the job's whole group as `process_limit_exceeded` with termination reason `process_limit`. The cap is fixed when the job starts and stored as `process_limit`; a job started before the cap existed has none and is only measured. A failed count never stops a job.
+3. **Peak.** The watcher keeps the highest count as `peak_process_count`, written at most once a second and again when the watcher itself finishes the job. A job finished by `sm queue cancel` keeps the last written peak, which can miss up to one second of growth.
+
+The trip is persisted before termination, like the memory guard: the job is marked `process_limit_terminating`, so a restart mid-termination still finishes it as `process_limit_exceeded`, and a cancel, displacement, or memory stop already in progress keeps precedence. `GET /queue-jobs/{id}` returns `process_limit`, `peak_process_count`, and, for `process_limit_exceeded`, `process_guard` with `cause`, `sampled_at`, `process_count`, and `process_limit`; `memory_guard` is present only for `memory_exceeded`. `sm queue status` prints `Processes: peak=N limit=M` and, when the guard fired, `Process guard: processes=N limit=M sampled_at=T`. Example completion:
+
+```text
+[sm queue] 1432-tests completed: process_limit_exceeded termination=process_limit process_guard: processes=2051 limit=2048 sampled_at=2026-09-25T04:33:02Z exit=unknown (no exit receipt; output is partial/non-evidence) peak_processes=2051 runtime=41s queue=0s. Log: ... ID: job_...
+```
+
+Processes that leave the job's process group (for example with `setsid`, or a tmux server) are not counted; the reserve still bounds them. A job that forks faster than one tick can pass the cap before it is stopped; the reserve bounds that too.
+
 Perf cooldown protects measurement quality:
 
 ```yaml
@@ -250,6 +273,7 @@ accepted -> pending -> running -> succeeded
                             \-> timed_out
                             \-> cancelled
                             \-> memory_exceeded
+                            \-> process_limit_exceeded
                             \-> displaced
 ```
 
@@ -262,6 +286,8 @@ Terminal state mapping:
 3. `timed_out`: SM terminated the process group after timeout.
 4. `cancelled`: user cancelled the job.
 5. `displaced`: SM preempted a `background` job for a `perf` job.
+6. `memory_exceeded`: the perf memory guard stopped the job.
+7. `process_limit_exceeded`: the job's process group held more processes than its `process_limit`.
 
 ## Notifications
 

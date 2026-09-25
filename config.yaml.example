@@ -435,6 +435,13 @@ queue_runner:
     # Exclusive perf admission/runtime reserve. macOS always keeps at least 8 GiB.
     min_free_bytes: 8589934592
     retry_interval_seconds: 10
+  processes:
+    # Process slots below the user's ceiling (kern.maxprocperuid) that queue
+    # jobs can never take, so agents and sm keep working if a job runs away.
+    reserve: 1024
+    # A job whose process group holds more processes than this is stopped as
+    # process_limit_exceeded. 0 disables either setting.
+    job_max: 2048
   resource_sampling:
     enabled: true
     interval_seconds: 15
