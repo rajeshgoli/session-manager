@@ -1780,6 +1780,33 @@ fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
                 .unwrap_or("unknown"),
         );
     }
+    if let Some(guard) = payload["process_guard"].as_object() {
+        let number = |key: &str| {
+            guard
+                .get(key)
+                .and_then(Value::as_i64)
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+        };
+        println!(
+            "Process guard: processes={} limit={} sampled_at={}",
+            number("process_count"),
+            number("process_limit"),
+            guard
+                .get("sampled_at")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+        );
+    }
+    let optional_count = |key: &str| {
+        payload[key]
+            .as_i64()
+            .map_or_else(|| "-".to_owned(), |value| value.to_string())
+    };
+    println!(
+        "Processes: peak={} limit={}",
+        optional_count("peak_process_count"),
+        optional_count("process_limit"),
+    );
     println!(
         "Log: {}",
         payload["readable_log_path"]

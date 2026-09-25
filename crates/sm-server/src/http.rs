@@ -6969,6 +6969,8 @@ fn queue_admission_policy(config: &AppConfig) -> QueueAdmissionPolicy {
             .map_or(0, |service| service.max_concurrent),
         memory_min_free_bytes: config.queue_runner.memory.min_free_bytes,
         resource_retry_interval_seconds: config.queue_runner.memory.retry_interval_seconds,
+        process_reserve: config.queue_runner.processes.reserve,
+        job_process_limit: config.queue_runner.processes.job_max,
     }
 }
 
@@ -15205,6 +15207,7 @@ fn queue_job_response_with_names(
             | "cancelled"
             | "displaced"
             | "memory_exceeded"
+            | "process_limit_exceeded"
     ) {
         "missing_partial_output"
     } else {
@@ -15237,7 +15240,10 @@ fn queue_job_response_with_names(
         "exit_code": job.exit_code,
         "exit_evidence": exit_evidence,
         "termination_reason": termination_reason,
-        "memory_guard": job.termination_detail,
+        "memory_guard": job.termination_detail.as_ref().filter(|_| job.state == "memory_exceeded"),
+        "process_guard": job.termination_detail.as_ref().filter(|_| job.state == "process_limit_exceeded"),
+        "process_limit": job.process_limit,
+        "peak_process_count": job.peak_process_count,
         "readable_log_path": job.log_path.as_deref().and_then(|p| std::path::Path::new(p).parent()).map(|p| p.join(crate::queue::queue_log_filename(&job.label, &job.id)).display().to_string()).filter(|p| std::path::Path::new(p).exists()),
         "log_path": job.log_path,
     }))
@@ -15468,6 +15474,8 @@ mod tests {
             exit_code: None,
             log_path: None,
             termination_detail: None,
+            process_limit: None,
+            peak_process_count: None,
         };
         let mut completed = review.clone();
         completed.id = "r2".into();
