@@ -3209,6 +3209,11 @@ fn admit_pending_queue_jobs_conn(
         requeued,
         ..QueueAdmissionSummary::default()
     };
+    // Every pass must make progress. A candidate that was already tried in this
+    // pass and is still eligible did not start (for example, its record vanished
+    // from the connection `start` opens); retrying it would spin while holding
+    // the process-wide admission lock until the job's wait expired (sm#1432).
+    let mut attempted_candidates = BTreeSet::new();
     loop {
         let jobs = list_queue_job_runtime_records_conn(conn)?;
         if expire_pending_queue_jobs_conn(conn, &jobs, message_queue_db_path, admission_policy)? > 0
@@ -3265,6 +3270,9 @@ fn admit_pending_queue_jobs_conn(
         else {
             break;
         };
+        if !attempted_candidates.insert(candidate_id.clone()) {
+            break;
+        }
         let Some(candidate) = get_queue_job_runtime_conn(conn, &candidate_id)? else {
             continue;
         };
@@ -6594,6 +6602,73 @@ mod tests {
         // The admitted job's monitor thread may still be writing its log and
         // final state here, so cleanup is best-effort (sm#1432).
         let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn admission_stops_when_a_candidate_cannot_start_instead_of_spinning() {
+        // `start` reopens the database under `state_dir`. When that copy no
+        // longer holds the candidate (here: a different, empty state dir), the
+        // pass must end rather than retry the same job until its wait expires
+        // while holding the process-wide admission lock (sm#1432).
+        let listing_dir = unique_temp_path("queue-admission-listing");
+        let starting_dir = unique_temp_path("queue-admission-starting");
+        fs::create_dir_all(&starting_dir).unwrap();
+        let pending = RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
+            &listing_dir,
+            CreateQueueJob {
+                job_type: "background".into(),
+                label: "diverged".into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: String::new(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["true".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 60,
+                cpu_percent: None,
+                gpu_percent: None,
+                memory_bytes: None,
+            },
+            300,
+        )
+        .unwrap();
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let admission_listing_dir = listing_dir.clone();
+        let admission_starting_dir = starting_dir.clone();
+        thread::spawn(move || {
+            let conn =
+                open_queue_jobs_connection(&admission_listing_dir.join("queue_runner.db")).unwrap();
+            let summary = admit_pending_queue_jobs_conn(
+                &conn,
+                &admission_starting_dir,
+                &admission_starting_dir.join("message-queue.db"),
+                0,
+                QueueAdmissionPolicy::default(),
+                true,
+            )
+            .map(|summary| summary.started);
+            let _ = sender.send(summary);
+        });
+        let started = receiver
+            .recv_timeout(StdDuration::from_secs(10))
+            .expect("admission kept retrying a candidate that could not start")
+            .unwrap();
+
+        assert_eq!(started, 0);
+        let conn = open_queue_jobs_connection(&listing_dir.join("queue_runner.db")).unwrap();
+        assert_eq!(
+            get_queue_job_conn(&conn, &pending.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "pending"
+        );
+        release_queue_admission_retry(&listing_dir);
+        release_queue_admission_retry(&starting_dir);
+        drop(conn);
+        let _ = fs::remove_dir_all(listing_dir);
+        let _ = fs::remove_dir_all(starting_dir);
     }
 
     #[test]

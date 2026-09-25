@@ -208,6 +208,34 @@ impl std::fmt::Display for CodexModelValidationError {
 
 impl std::error::Error for CodexModelValidationError {}
 
+/// A tmux client that starts a server daemonizes into that long-lived server.
+/// macOS has no `pipe2`, so a pipe another thread is creating can be inherited
+/// before it is marked close-on-exec; the server would then hold its write end
+/// forever and that thread would wait for EOF indefinitely (sm#1432). Close
+/// every inherited non-close-on-exec descriptor above stdio in the child.
+/// Close-on-exec descriptors, including std's exec-error pipe, stay open.
+fn close_inherited_descriptors_before_exec(command: &mut Command) {
+    const MAX_SCANNED_DESCRIPTORS: u64 = 65_536;
+    let scan_limit = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
+        .map(|(soft, _)| soft)
+        .unwrap_or(4_096)
+        .min(MAX_SCANNED_DESCRIPTORS) as i32;
+    // SAFETY: the hook runs between fork and exec and calls only fcntl and
+    // close, which are async-signal-safe; it allocates nothing.
+    unsafe {
+        command.pre_exec(move || {
+            for descriptor in 3..scan_limit {
+                if let Ok(flags) = nix::fcntl::fcntl(descriptor, nix::fcntl::FcntlArg::F_GETFD) {
+                    if flags & nix::libc::FD_CLOEXEC == 0 {
+                        let _ = nix::unistd::close(descriptor);
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Production agents run on the default tmux socket, so a test that reaches it
 /// could probe, anchor, type into, or kill a live agent. Under test isolation
 /// the real tmux binary must be given a private socket. A fake tmux binary has
@@ -1462,9 +1490,16 @@ impl TmuxRuntime {
             &self.tmux_binary,
             self.socket_name.as_deref(),
         )?;
+        let args = args.into_iter().collect::<Vec<_>>();
         let mut command = Command::new(&self.tmux_binary);
         if let Some(socket_name) = &self.socket_name {
             command.arg("-L").arg(socket_name);
+        }
+        if args
+            .first()
+            .is_some_and(|verb| matches!(*verb, "new-session" | "start-server"))
+        {
+            close_inherited_descriptors_before_exec(&mut command);
         }
         command.args(args);
         Ok(command)
@@ -4203,6 +4238,70 @@ esac
         assert!(!log.contains("terminal-overrides ,*:smcup@:rmcup@"));
         assert!(!log.contains("-L session-manager"));
         assert!(!log.contains(SERVER_ANCHOR_SESSION));
+    }
+
+    #[test]
+    fn real_tmux_server_start_does_not_inherit_a_racing_threads_pipe() {
+        // A pipe another thread has just created is not yet close-on-exec on
+        // macOS. A tmux client that daemonizes into the server must not carry
+        // it, or that thread waits for EOF forever (sm#1432).
+        if !Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+            || !Command::new("lsof")
+                .arg("-v")
+                .output()
+                .is_ok_and(|output| output.status.success() || !output.stderr.is_empty())
+        {
+            return;
+        }
+        let (read_end, write_end) = nix::unistd::pipe().unwrap();
+        // A high descriptor number (below any soft limit) keeps tmux from reusing
+        // it for its own pipes.
+        let write_descriptor = nix::fcntl::fcntl(
+            std::os::fd::AsRawFd::as_raw_fd(&write_end),
+            nix::fcntl::FcntlArg::F_DUPFD(100),
+        )
+        .unwrap();
+        let flags = nix::fcntl::fcntl(write_descriptor, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert_eq!(flags & nix::libc::FD_CLOEXEC, 0);
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let runtime = TmuxRuntime::from_config(&RustCoreConfig {
+            tmux_socket_name: Some(format!("sm-inherit-{}-{unique}", std::process::id())),
+            ..RustCoreConfig::default()
+        });
+        struct ServerGuard(TmuxRuntime);
+        impl Drop for ServerGuard {
+            fn drop(&mut self) {
+                let _ = self.0.run_tmux(["kill-server"]);
+            }
+        }
+        let _server_guard = ServerGuard(runtime.clone());
+        runtime.ensure_server_anchor().unwrap();
+        let server_pid = runtime
+            .tmux_command(["display-message", "-p", "-t", "=__sm_server_anchor", "#{pid}"])
+            .unwrap()
+            .output()
+            .unwrap();
+        let server_pid = String::from_utf8(server_pid.stdout).unwrap().trim().to_owned();
+        assert!(!server_pid.is_empty());
+
+        let held = Command::new("lsof")
+            .args(["-a", "-p", &server_pid, "-d", &write_descriptor.to_string()])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&held.stdout).trim().is_empty(),
+            "tmux server {server_pid} inherited descriptor {write_descriptor}:\n{}",
+            String::from_utf8_lossy(&held.stdout)
+        );
+        let _ = nix::unistd::close(write_descriptor);
+        drop((read_end, write_end));
     }
 
     #[cfg(unix)]

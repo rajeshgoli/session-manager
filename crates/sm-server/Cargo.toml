@@ -14,7 +14,7 @@ futures-util = { workspace = true }
 hmac = { workspace = true }
 jsonwebtoken = { workspace = true }
 libc = { workspace = true }
-nix = { workspace = true, features = ["fs", "poll", "signal", "term"] }
+nix = { workspace = true, features = ["fs", "poll", "resource", "signal", "term"] }
 p256 = { workspace = true, features = ["ecdsa", "pem"] }
 pulldown-cmark = { workspace = true }
 qrcode = { workspace = true }

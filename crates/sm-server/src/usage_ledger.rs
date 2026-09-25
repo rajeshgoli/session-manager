@@ -3369,7 +3369,7 @@ mod tests {
         let store = UsageLedgerStore::new(&db_path).unwrap();
         let mut connection = Connection::open(&db_path).unwrap();
         let tx = connection.transaction().unwrap();
-        for index in 0..512 {
+        for index in 0..4096 {
             ingest_contribution(
                 &tx,
                 &contribution_at(
@@ -3397,15 +3397,35 @@ mod tests {
             scanner.materialize_pending_windows()
         });
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        thread::sleep(Duration::from_millis(5));
+        // Measure progress, not wall time, so a loaded suite cannot fail it:
+        // start the live write once materialization is under way, and require
+        // it to finish before the whole window is materialized (sm#1432).
+        let materialized = || -> i64 {
+            Connection::open(&db_path)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM message_window WHERE window_kind = 'weekly_all'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while materialized() < LEDGER_WRITE_BATCH_SIZE as i64 {
+            assert!(Instant::now() < deadline, "materialization did not start");
+            thread::sleep(Duration::from_millis(1));
+        }
 
-        let started_at = Instant::now();
         SeatSessionStore::new(&db_path)
             .append("live-seat", "claude", "live-session", None)
             .unwrap();
-        assert!(started_at.elapsed() < Duration::from_millis(250));
+        let written = materialized();
+        assert!(
+            written < 4096,
+            "live writer waited for the whole window materialization ({written} rows written)"
+        );
         let summary = handle.join().unwrap().unwrap();
-        assert_eq!(summary.messages_selected, 512);
+        assert_eq!(summary.messages_selected, 4096);
     }
 
     #[test]
@@ -3482,11 +3502,19 @@ mod tests {
             !handle.is_finished(),
             "artifact scan finished before the writer probe"
         );
-        let started_at = Instant::now();
         SeatSessionStore::new(&db_path)
             .append("live-seat", "claude", "live-session", None)
             .unwrap();
-        assert!(started_at.elapsed() < Duration::from_millis(250));
+        // Measure progress, not wall time, so a loaded suite cannot fail it: the
+        // writer waits for at most one batch, never the whole scan (sm#1432).
+        let written: i64 = Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM message_ledger", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            written < 4096,
+            "live writer waited for the whole historical scan ({written} rows written)"
+        );
         handle.join().unwrap().unwrap();
     }
 
