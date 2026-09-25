@@ -124,7 +124,7 @@
 </style>
 
 <h1>1452 — Agent work claims and the history page</h1>
-<p class="sans"><small>Author: sm-1452-spec-author <code>b1f9510b</code> · Ticket #1452 · Revision 1 · 2026-09-24</small></p>
+<p class="sans"><small>Author: sm-1452-spec-author <code>b1f9510b</code> · Ticket #1452 · Revision 2 · 2026-09-24</small></p>
 
 <h2>Memo</h2>
 
@@ -157,7 +157,7 @@
 <thead><tr><th style="width:34%">Symptom</th><th>Evidence</th></tr></thead>
 <tbody>
 <tr><td>A ticket stays open after its work merged.</td><td>PR #1460 merged at 21:22 and says "Implements #1449". GitHub only auto-closes on "Closes #N", so #1449 is still open. Nothing prompted the agent to notice.</td></tr>
-<tr><td>Branches and worktrees outlive their PRs.</td><td>The branch <code>1449-owner-docs</code> is still on GitHub after #1460 merged; GitHub's "delete head branch on merge" setting is off. The worktree <code>~/worktrees/sm-agents-md-repo-reference</code> is still on disk after its PR #1462 merged. There are 34 branches on GitHub.</td></tr>
+<tr><td>Branches and worktrees outlive their PRs.</td><td>Merged PRs left 32 branches on GitHub, <code>1449-owner-docs</code> among them, because GitHub's "delete head branch on merge" setting was off. The worktree <code>~/worktrees/sm-agents-md-repo-reference</code> is still on disk after its PR #1462 merged.</td></tr>
 <tr><td>You cannot see who did what.</td><td>sm knows each session's docs and Codex review requests, but has no record of tickets at all, and nothing that joins a ticket to its PRs, agents and docs. Once an agent is retired, the only trace is its name in PR comments.</td></tr>
 <tr><td>Two agents on one ticket go unnoticed.</td><td>Nothing stops a second engineer on #1451 while the first is working. The collision shows up at merge.</td></tr>
 </tbody>
@@ -224,7 +224,7 @@
 <tr><td>3. What happens on a collision?</td><td><b>sm refuses the second explicit claim</b> and names the holder and its state. The agent must ask you; <code>--take</code> moves the claim and tells the old holder, and agents are told to use it only on your word. Same-line claims (parent and child on one ticket) are allowed. Implicit claims never block a command; they record the collision and flag it red on the page.</td><td>Refusing at claim time is when the collision is cheapest to fix; blocking a review request would only strand work.</td></tr>
 <tr><td>4. When does a claim end?</td><td><b>When the ticket closes or the PR merges or closes on GitHub, when the holder is retired, or on <code>--release</code> or <code>--take</code>.</b> Not at task-complete, not at <code>sm handoff</code>. A stopped but restorable holder's claim does not block anyone; if another agent claims, the old one ends and the restored agent is told.</td><td>A claim should mean "someone is on this", and stay true across feedback rounds.</td></tr>
 <tr><td>5. Should sm merge PRs on task-complete?</td><td><b>No.</b> The agent keeps merging, as step 6 of the workflow says. Check A and C nudge an agent that stops short of merging.</td><td>Only the agent knows whether the review loop is clean; sm cannot see P1 classifications.</td></tr>
-<tr><td>6. Branch cleanup on GitHub</td><td><b>Turn on GitHub's "Automatically delete head branches"</b> for this repo and your primary repo. No sm code. I can flip it with one <code>gh api</code> call per repo on your word.</td><td>GitHub already does this well; today it is off and 34 branches accumulate.</td></tr>
+<tr><td>6. Branch cleanup on GitHub</td><td><b>Decided and done:</b> GitHub's "Automatically delete head branches" is on for this repo and your primary repo. No sm code.</td><td>GitHub already does this well.</td></tr>
 <tr><td>7. Worktree cleanup</td><td><b>sm removes the agent's worktree when the agent is retired</b>, only if the PR merged, the worktree's commit is exactly the merged PR head, and git's own safe remove succeeds (it refuses any modified or untracked file; build output that git ignores goes with it). Otherwise sm leaves it, lists it in the retire output, and flags it on the page.</td><td>Retire is when the agent is certainly gone; git's refusal is the safety net, so nothing unmerged is lost.</td></tr>
 <tr><td>8. How do docs fit the lifecycle?</td><td><b>A doc joins the PR it was published on, and through it the PR's tickets.</b> A doc published without a PR joins the tickets its author held at that moment. Publishing on a PR also claims it (implicit claim).</td><td>No new flag for agents to remember; the join falls out of records sm already has.</td></tr>
 <tr><td>9. Where does the history page live?</td><td><b>A plain server page at <code>/history</code></b>, behind the same login as the doc reader: your Cloudflare login on the laptop, the app's device login on the phone (the app opens it like a doc). Plus <code>sm history</code> in the terminal. The session expansion in the app gains a Work line, "Ticket #1452 · PR #1470", that opens the ticket's timeline.</td><td>One implementation serves every screen, exactly as the doc reader does.</td></tr>
@@ -274,7 +274,7 @@ still open when you look finished: do what it says.</pre>
 </table>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p>This is revision 1. Nothing to re-read.</p>
+<p>Revision 2 corrects implementation details in the appendices after code review: a PR is linked only to the tickets it names (or the single ticket its agent holds), a merge check deferred by GitHub's delay is stored rather than dropped, backfilled records are fetched from GitHub, a stopped agent's worktree is never removed, and backfill counts every doc publish. The memo's decisions are unchanged, except row 6: branch auto-delete is on for both repos, as you approved.</p>
 
 <hr class="appendix-divider">
 <h2>Appendices</h2>
@@ -312,7 +312,8 @@ still open when you look finished: do what it says.</pre>
   head_sha TEXT,                   -- PRs: head commit (frozen at merge)
   closed_at TEXT,
   merged_at TEXT,
-  synced_at TEXT NOT NULL,
+  synced_at TEXT,                  -- NULL = never fetched; the next sync fetches it
+  merge_check TEXT,                -- PRs: NULL | pending | done  (Check A bookkeeping, appendix F)
   sync_error TEXT,                 -- last sync failure for this item, NULL when fine
   PRIMARY KEY (repo, number)
 );
@@ -381,13 +382,14 @@ CREATE INDEX IF NOT EXISTS work_events_session ON work_events(session_id, at);</
 <pre><code>sm ticket &lt;N&gt; [--repo R] [--take]      # claim ticket N
 sm ticket --release &lt;N&gt; [--repo R]     # end your claim (end_reason released)
 sm ticket                              # list your active claims (tickets and PRs)
-sm pr [N] [--repo R] [--take]          # claim PR N; no N = the current branch's open PR
+sm pr [N] [--repo R] [--take] [--ticket T]...   # claim PR N; no N = the current branch's open PR
 sm pr --release &lt;N&gt; [--repo R]
 sm history [--agent A] [--repo R] [--item N] [--open] [--json] [--limit 50]</code></pre>
 <ul>
 <li><code>--repo R</code> takes <code>owner/name</code> or a bare <code>name</code>. A bare name takes its owner from the cwd's repo slug; outside a repo, a bare name is an error ("pass owner/name").</li>
 <li>Without <code>--repo</code>, the repo is the cwd's; outside a git repo the command fails with "run this from the repo's checkout, or pass --repo owner/name".</li>
 <li><code>sm pr</code> with no number runs <code>gh pr view --json number,state</code> in the cwd, as <code>resolve_doc_publish</code> does (<code>bin/doc/mod.rs:340-351</code>). No open PR → "No open PR for branch &lt;b&gt;. Open one first (gh pr create) or pass the PR number."</li>
+<li><code>--ticket T</code> (repeatable) names the tickets the PR is for; each must be an open ticket in the same repo, else the claim fails with the ticket errors of the table below. It links; it does not claim the ticket.</li>
 <li>The CLI sends <code>worktree_path</code> = <code>git rev-parse --show-toplevel</code> and <code>branch</code> = <code>git branch --show-current</code> (empty → NULL) when the cwd is inside the claimed repo; otherwise both NULL.</li>
 <li><code>--release</code> and <code>--take</code> together is a usage error.</li>
 </ul>
@@ -428,7 +430,7 @@ sm history [--agent A] [--repo R] [--item N] [--open] [--json] [--limit 50]</cod
   <li>explicit claim with <code>--take</code> → end every collision holder's claim with <code>taken</code>, enqueue to each: <code>[sm claim] &lt;C name&gt; took &lt;ticket|PR&gt; #N from you. Stop working on it, and tell your parent or Rajesh the state you left it in.</code>, then insert C's claim;</li>
   <li>implicit claim → insert C's claim, write <code>collision_recorded</code>, return a warning the calling command prints: <code>Warning: PR #N is also held by &lt;H name&gt; (&lt;H id&gt;), working. Two agents on one PR collide at merge; tell Rajesh.</code></li>
   </ul></li>
-<li><b>Insert</b> C's claim and a <code>claimed</code> event. For a PR claim, insert a <code>work_links</code> row (<code>source = claim</code>) to every ticket in the same repo that C holds actively at this moment.</li>
+<li><b>Insert</b> C's claim and a <code>claimed</code> event. For an explicit PR claim, insert <code>work_links</code> rows (<code>source = claim</code>): to each <code>--ticket</code> given; if none is given and C actively holds exactly one ticket in the same repo, to that ticket; if C holds several and names none, to none, and print <code>You hold tickets #a, #b; this PR is linked to neither. Link it with sm pr &lt;P&gt; --ticket &lt;N&gt;, or put "Closes #N" in the PR body.</code> Implicit claims never create <code>claim</code> links. GitHub closing references add links independently (appendix D). A wrong link would misfile the PR on the page and make Check A ask about an unrelated ticket, so ambiguity links nothing.</li>
 </ol>
 <p><b>Ending claims.</b></p>
 <table>
@@ -459,9 +461,10 @@ fragment F on IssueOrPullRequest {
 PR <code>state</code> is <code>OPEN | CLOSED | MERGED</code>; map to <code>open | closed | merged</code>. Ticket <code>state</code> is <code>OPEN | CLOSED</code>.</li>
 <li><b>Partial failures.</b> <code>gh api graphql</code> exits 1 when any alias fails but still prints <code>data</code> for the rest (appendix K). Parse stdout whenever it is valid JSON, whatever the exit code. A <code>null</code> alias with a <code>NOT_FOUND</code> error → set that item's <code>sync_error = "not found"</code> and leave its state. Invalid JSON or a transport error → set <code>sync_error</code> on every item in the batch; keep states.</li>
 <li><b>Claim-time fetch</b>: the same query with one alias; the result is upserted into <code>work_items</code> before the claim rules run. Transport failure → the "GitHub unreachable" error; nothing recorded.</li>
-<li><b>Periodic sync</b>: a background task every 300 s (config <code>work_claims.sync_interval_seconds</code>, default 300, minimum 60). Tracked set: every <code>work_items</code> row whose <code>state = open</code> and which has an active claim or a <code>work_links</code> row to an item with an active claim; plus tickets linked from any open tracked PR. Closed items are never re-polled.</li>
+<li><b>Periodic sync</b>: a background task every 300 s (config <code>work_claims.sync_interval_seconds</code>, default 300, minimum 60). Tracked set: every <code>work_items</code> row with <code>synced_at</code> NULL (never fetched: new link targets and backfill stubs, whatever their claims); plus every row whose <code>state = open</code> and which has an active claim or a <code>work_links</code> row to an item with an active claim; plus tickets linked from any open tracked PR or from any PR with <code>merge_check = pending</code>. Closed and merged items are otherwise never re-polled.</li>
 <li><b>On each item</b>: upsert; if <code>state</code> changed, write <code>state_changed</code> and apply the claim-ending rules; for PRs, insert <code>work_links</code> rows (<code>source = closing_ref</code>) for each <code>closingIssuesReferences</code> node whose <code>nameWithOwner</code> equals the PR's repo, and upsert those tickets into <code>work_items</code> (fetched in the same or next sync).</li>
-<li>After a sync pass, run Check A for PRs that turned merged in it (appendix F), then Check C.</li>
+<li>A <b>transition</b> is a change of <code>state</code> between two fetches of an item that had a non-NULL <code>synced_at</code> before the fetch. The first fetch of an item never counts as a transition, so it never triggers a message.</li>
+<li>After a sync pass, run Check A for every PR with <code>merge_check = pending</code> (appendix F), then Check C.</li>
 <li>Output size: a 50-alias response is about 20 KB. <code>gh_command_output</code> deadlocks on output over 64 KB until #1471 is fixed; keep the 50-alias cap either way.</li>
 <li>Rate: one call per repo per 5 minutes is ~12 GraphQL points an hour per repo, against 5,000 (appendix K).</li>
 <li>The history page, <code>/session-obligations</code> and <code>sm ticket</code> listing read stored rows only and never call <code>gh</code> (same rule as the docs spec's list projection).</li>
@@ -482,9 +485,9 @@ PR <code>state</code> is <code>OPEN | CLOSED | MERGED</code>; map to <code>open 
 </ul>
 <p><b>Backfill</b>, once, guarded by a row in a <code>work_claims_meta(key TEXT PRIMARY KEY, value TEXT)</code> table (<code>backfill_done_at</code>):</p>
 <ol>
-<li>For each distinct <code>(repo, pr_number, requester_session_id)</code> in <code>codex_review_request_registrations</code> with a non-null requester, and each distinct <code>(repo, pr_number, author_session_id)</code> in <code>owner_docs</code> with a PR: insert a claim, <code>source = backfill</code>, <code>claimed_at</code> = the earliest <code>requested_at</code> / <code>created_at</code>. If that session is retired or unknown, set <code>ended_at</code> = its <code>stopped_at</code> (or <code>claimed_at</code> if unknown) and <code>end_reason = retired</code>. Skip collision rules; backfill may produce two active claims.</li>
-<li>Insert <code>work_items</code> stubs (<code>state = open</code>, <code>title = ""</code>) so the first sync fetches them. The first sync ends claims on PRs it finds merged.</li>
-<li>No open-work check fires for any item whose first-ever sync is the one that sees it closed or merged: Check A needs an observed open→merged transition.</li>
+<li>For each distinct <code>(repo, pr_number, requester_session_id)</code> in <code>codex_review_request_registrations</code> with a non-null requester, and each distinct <code>(repo, pr_number, session_id)</code> from <code>owner_doc_publishes</code> joined to <code>owner_docs</code> with a PR (every publisher, not only the doc's first author): insert one claim per <code>(repo, pr_number, session)</code>, <code>source = backfill</code>, <code>claimed_at</code> = the earliest <code>requested_at</code> / <code>published_at</code> for that session. If that session is retired or unknown, set <code>ended_at</code> = its <code>stopped_at</code> (or <code>claimed_at</code> if unknown) and <code>end_reason = retired</code>. Skip collision rules; backfill may produce two active claims.</li>
+<li>Insert <code>work_items</code> stubs (<code>state = open</code>, <code>title = ""</code>, <code>synced_at</code> NULL). The tracked-set rule fetches every never-fetched row, active claim or not, so the first sync fills titles and states, ends claims on PRs it finds merged or closed, and adds closing-reference links (whose tickets are themselves new stubs, fetched the pass after).</li>
+<li>No open-work check fires for backfilled history: a first fetch is never a transition (appendix D), so <code>merge_check</code> stays NULL on PRs first seen merged.</li>
 </ol>
 
 <h3>F. Open-work checks</h3>
@@ -492,8 +495,8 @@ PR <code>state</code> is <code>OPEN | CLOSED | MERGED</code>; map to <code>open 
 
 <h4>Check A — merged, ticket still open</h4>
 <ul>
-<li>When: sync records a PR open→merged transition. If <code>merged_at</code> is less than 60 s before the fetch, defer this PR's check to the next pass (GitHub closes linked tickets asynchronously).</li>
-<li>Tickets considered: every ticket linked to the PR (<code>work_links</code>, either source), freshly fetched in that pass; keep those still open.</li>
+<li>When: sync records a PR open→merged transition → set <code>merge_check = pending</code> in the same write. After each pass, for every pending PR whose <code>merged_at</code> is at least 60 s before now (GitHub closes linked tickets asynchronously), run the check and set <code>merge_check = done</code> in the same transaction that enqueues the messages. A pending PR younger than 60 s stays pending for the next pass; a restart keeps it pending.</li>
+<li>Tickets considered: every ticket linked to the PR (<code>work_links</code>, either source). The tracked-set rule fetched them in this pass; a ticket whose fetch failed in this pass leaves the PR pending. Keep those still open.</li>
 <li>Recipients: the live-or-dormant holders of each open ticket, plus the PR's holders whose claim just ended <code>merged</code>. Deduplicate by session; one message per session naming all its tickets. Retired recipients are skipped; if no one remains, the <code>nudge</code> event is written with <code>message_id = null</code> and the page shows <span class="chip warn">Open after merge</span>.</li>
 <li>Text (one ticket): as in the memo. Several tickets: <code>[sm claim] PR #&lt;P&gt; merged, but tickets #a ("…"), #b ("…") are still open. If the PR finished them, close each: gh issue close &lt;n&gt; --repo &lt;repo&gt; --comment "Done in #&lt;P&gt;". If work remains, comment on the ticket what remains. Then carry on.</code></li>
 </ul>
@@ -518,7 +521,7 @@ PR <code>state</code> is <code>OPEN | CLOSED | MERGED</code>; map to <code>open 
 </ul>
 
 <h4><code>sm pr</code> closing-keyword warning</h4>
-<p>After a successful explicit or implicit PR claim, if C actively holds tickets in the same repo that are not in the PR's <code>closingIssuesReferences</code>, print: <code>Note: PR #1470 doesn't close ticket #1452. If it finishes the ticket, add "Closes #1452" to the PR body (gh pr edit 1470 --body ...).</code> One line per ticket. A warning only; the claim stands.</p>
+<p>After a successful explicit PR claim, for each ticket linked to the PR with <code>source = claim</code> that is not in the PR's <code>closingIssuesReferences</code>, print: <code>Note: PR #1470 doesn't close ticket #1452. If it finishes the ticket, add "Closes #1452" to the PR body (gh pr edit 1470 --body ...).</code> One line per ticket. A warning only; the claim stands.</p>
 
 <h3>G. Worktree cleanup at retire</h3>
 <p>Runs in a spawned task after the claims end at retire. Candidates: each distinct <code>worktree_path</code> on the session's PR claims (any end reason), plus the session's <code>working_dir</code> if its current branch equals the <code>head_ref</code> of a merged PR the session claimed. Sessions on remote nodes are skipped (the path is not local). For each candidate, all must hold, else write <code>worktree_left</code> with the first failing reason:</p>
@@ -526,19 +529,19 @@ PR <code>state</code> is <code>OPEN | CLOSED | MERGED</code>; map to <code>open 
 <thead><tr><th style="width:6%">#</th><th>Condition</th><th style="width:26%">Reason when it fails</th></tr></thead>
 <tbody>
 <tr><td>1</td><td>The path exists and is a linked worktree: <code>git rev-parse --git-dir</code> ≠ <code>--git-common-dir</code>.</td><td><code>not a linked worktree</code></td></tr>
-<tr><td>2</td><td>No other non-stopped session's <code>working_dir</code> equals or is inside the path.</td><td><code>in use by &lt;name&gt;</code></td></tr>
+<tr><td>2</td><td>No other non-retired session (working, idle, or stopped but restorable) has a <code>working_dir</code> equal to or inside the path; removing it would break that session's restore.</td><td><code>in use by &lt;name&gt;</code></td></tr>
 <tr><td>3</td><td>A PR the session claimed in this repo is merged, and <code>git -C path rev-parse HEAD</code> equals that PR's frozen <code>head_sha</code>.</td><td><code>no merged PR at this commit</code></td></tr>
 <tr><td>4</td><td><code>git -C &lt;common repo&gt; worktree remove &lt;path&gt;</code>, <b>without</b> <code>--force</code>, exits 0. Git refuses modified or untracked files and removes ignored ones (appendix K).</td><td><code>git refused: &lt;stderr first line&gt;</code></td></tr>
 </tbody>
 </table>
 <p>After a removal, delete the local branch with <code>git branch -D &lt;branch&gt;</code> only if <code>branch</code> is set and its tip still equals the PR's <code>head_sha</code> (<code>-D</code> is needed because a squash merge never makes the branch an ancestor of main). Write <code>worktree_removed</code>. The retire response gains <code>worktrees: [{path, removed: bool, reason}]</code>; <code>sm retire</code> prints one line each: <code>Removed worktree ~/worktrees/sm-1449-owner-docs (PR #1460 merged).</code> or <code>Left worktree ~/worktrees/x: git refused: contains modified or untracked files.</code> Because cleanup runs asynchronously, the response reports results available within 10 s and says <code>cleanup pending</code> otherwise; the page always shows the final event.</p>
-<p>Remote branches are not touched; that is GitHub's "Automatically delete head branches" setting (memo row 6): <code>gh api -X PATCH repos/rajeshgoli/&lt;repo&gt; -F delete_branch_on_merge=true</code>. It is off for this repo today (appendix K).</p>
+<p>Remote branches are not touched; that is GitHub's "Automatically delete head branches" setting (memo row 6): <code>gh api -X PATCH repos/rajeshgoli/&lt;repo&gt; -F delete_branch_on_merge=true</code>. It is on for <code>session-manager</code> and <code>fractal-algo-rust</code> since 2026-09-24.</p>
 
 <h3>H. Server endpoints</h3>
 <table>
 <thead><tr><th style="width:8%">Method</th><th style="width:30%">Path</th><th>Purpose and auth</th></tr></thead>
 <tbody>
-<tr><td>POST</td><td><code>/claims</code></td><td>Body <code>{requester_session_id, kind, repo, number, take, worktree_path?, branch?}</code>. Self-directed like task-complete (the requester is the claimant); <code>ensure_core_writes_enabled</code>. Responses: 201 <code>{outcome: "claimed"|"taken", claim, notes[]}</code>; 200 <code>{outcome: "already_held", claim}</code>; 409 <code>{outcome: "collision", holders: [{session_id, name, state, claimed_at, worktree_path}]}</code>; 422 wrong kind / closed / merged / not found with <code>detail</code> = the CLI text; 502 GitHub unreachable.</td></tr>
+<tr><td>POST</td><td><code>/claims</code></td><td>Body <code>{requester_session_id, kind, repo, number, take, worktree_path?, branch?, tickets?: [int]}</code> (<code>tickets</code> = <code>--ticket</code>, PR claims only). Self-directed like task-complete (the requester is the claimant); <code>ensure_core_writes_enabled</code>. Responses: 201 <code>{outcome: "claimed"|"taken", claim, notes[]}</code>; 200 <code>{outcome: "already_held", claim}</code>; 409 <code>{outcome: "collision", holders: [{session_id, name, state, claimed_at, worktree_path}]}</code>; 422 wrong kind / closed / merged / not found with <code>detail</code> = the CLI text; 502 GitHub unreachable.</td></tr>
 <tr><td>POST</td><td><code>/claims/release</code></td><td>Body <code>{requester_session_id, kind, repo, number}</code>. 200 or 404.</td></tr>
 <tr><td>GET</td><td><code>/claims?session=&lt;id&gt;&amp;active=true</code></td><td>JSON <code>{claims: [...]}</code>, each claim row plus <code>title</code>, <code>state</code>, <code>history_path</code>. Read auth.</td></tr>
 <tr><td>GET</td><td><code>/history</code></td><td>HTML page (appendix I); <code>?format=json</code> for the CLI. Query: <code>agent</code> (session id, id prefix ≥ 8, or name; resolved via <code>resolve_session_or_registry_role</code>, falling back to matching <code>session_name</code> snapshots), <code>repo</code> (repo name, case-insensitive), <code>open=1</code>, <code>before=&lt;cursor&gt;</code>.</td></tr>
@@ -588,7 +591,7 @@ PR <code>state</code> is <code>OPEN | CLOSED | MERGED</code>; map to <code>open 
 <tr><td>G2</td><td>GraphQL <code>issueOrPullRequest</code> with aliases, including a missing number</td><td>Existing numbers return data; the missing one is <code>null</code> with a <code>NOT_FOUND</code> error; <code>gh</code> <b>exits 1</b> but prints the full JSON on stdout.</td></tr>
 <tr><td>G3</td><td><code>closingIssuesReferences</code> on merged PR #1467 ("Closes #1450")</td><td><code>[1450]</code>; available after merge. Issue #1450 closed, <code>closedByPullRequestsReferences = [1467]</code>.</td></tr>
 <tr><td>G4</td><td>Same on merged PR #1460 ("Implements #1449")</td><td><code>[]</code>; #1449 is still open. This is the Check A case.</td></tr>
-<tr><td>G5</td><td><code>repos/rajeshgoli/session-manager</code> settings</td><td><code>delete_branch_on_merge: false</code>; 34 branches on origin; <code>1449-owner-docs</code> remains after its PR merged.</td></tr>
+<tr><td>G5</td><td><code>repos/rajeshgoli/session-manager</code> settings</td><td><code>delete_branch_on_merge: false</code> at the time (turned on after the owner's approval); 35 branches on origin, 32 of them from merged PRs; <code>1449-owner-docs</code> remains after its PR merged.</td></tr>
 <tr><td>G6</td><td>GraphQL rate limit</td><td>5,000 points per hour; a small aliased query costs 1.</td></tr>
 <tr><td>G7</td><td><code>git worktree remove</code> (no <code>--force</code>) on a scratch repo</td><td>Removes a worktree whose only extra files are gitignored (<code>target/</code>); refuses one with an untracked file: <code>contains modified or untracked files, use --force to delete it</code>.</td></tr>
 </tbody>
@@ -600,13 +603,13 @@ PR <code>state</code> is <code>OPEN | CLOSED | MERGED</code>; map to <code>open 
 <li><b>Claim rules</b> (unit, <code>work_claims.rs</code>): claim; already held; wrong kind both ways; closed ticket; merged PR; not found; unrelated live holder refused (exit 3, <code>collision_refused</code>, nothing else written); <code>--take</code> ends holder with <code>taken</code> and enqueues exact text; same-line parent and child both active; siblings collide; dormant holder superseded with queued message; retired holder never blocks; implicit claim records collision and returns the warning; release; the unique active index.</li>
 <li><b>Ending</b>: sync closed ticket → <code>closed</code>; merged PR → <code>merged</code> and <code>head_sha</code> frozen; retire and kill both end claims <code>retired</code>; handoff, rename, task-complete, fork leave claims.</li>
 <li><b>Sync parsing</b>: aliases across 50+ numbers split into batches; exit 1 with valid JSON parsed; <code>NOT_FOUND</code> alias sets <code>sync_error</code> only for that item; invalid JSON marks the batch; closing refs from another repo ignored; closed items not re-polled.</li>
-<li><b>Check A</b>: open→merged with an open linked ticket messages the ticket holder and PR holder once (deduplicated); ticket closed in the same fetch → no message; merged under 60 s → deferred one pass; backfilled first-sight merged → no message; no live recipient → event with null message id and the flag.</li>
+<li><b>Check A</b>: open→merged with an open linked ticket messages the ticket holder and PR holder once (deduplicated); ticket closed in the same fetch → no message; merged under 60 s → stays <code>pending</code> and fires on a later pass, including after a server restart; fires exactly once (<code>done</code>); backfilled first-sight merged → no message; no live recipient → event with null message id and the flag.</li>
 <li><b>Check B</b>: task-complete with open ticket and PR → one message with both clauses; nothing open → no message; GitHub failure → no message, task-complete unaffected; parent notification unchanged.</li>
 <li><b>Check C</b>: fires at 30 min idle with empty <code>waiting_on</code>; not at 29; not with a queue job, Codex review or <code>owner_review</code> in <code>waiting_on</code>; not twice in one stretch; not re-armed by the nudge's own turn; re-armed by a turn 31 min later.</li>
-<li><b>Closing-keyword warning</b> printed for a held ticket not in <code>closingIssuesReferences</code>; absent when it is.</li>
-<li><b>Worktree cleanup</b> (real git in a temp dir): removed when merged, HEAD = frozen head, only ignored files; kept with untracked file (reason from git); kept when HEAD ≠ head; kept when another live session's <code>working_dir</code> is inside; main checkout never removed; local branch deleted only when its tip = head.</li>
+<li><b>Links and the closing-keyword warning</b>: one held ticket → linked; several held and none named → no link and the note; <code>--ticket</code> links exactly the named ones; implicit claims add no <code>claim</code> links; the warning is printed for a <code>claim</code>-linked ticket not in <code>closingIssuesReferences</code> and absent when it is.</li>
+<li><b>Worktree cleanup</b> (real git in a temp dir): removed when merged, HEAD = frozen head, only ignored files; kept with untracked file (reason from git); kept when HEAD ≠ head; kept when another non-retired session's <code>working_dir</code> is inside, including a stopped one; main checkout never removed; local branch deleted only when its tip = head.</li>
 <li><b>Implicit claims</b>: Codex review request and doc publish on a PR create claims; neither host command fails when claim recording fails; <code>claim_warning</code> surfaces.</li>
-<li><b>Backfill</b>: idempotent (second start does nothing); retired requesters get ended claims; runs no checks.</li>
+<li><b>Backfill</b>: idempotent (second start does nothing); retired requesters get ended claims; a doc republished by a second session backfills a claim for each publisher; stubs whose only claims are ended are fetched on the first sync and their closing-reference tickets on the next; runs no checks.</li>
 <li><b>CLI</b> (<code>bin/claims</code>): repo resolution SSH/HTTPS/bare name/<code>--repo</code>; <code>sm pr</code> with no number uses the branch PR and errors without one; worktree and branch sent; each output row of appendix B and its exit code.</li>
 <li><b>HTTP</b>: <code>/claims</code> status codes; history HTML and JSON shapes; filters (agent by id, prefix, name, retired snapshot; repo; open); cursor paging; timeline merges review requests and doc publishes; flags; Cloudflare browser login accepted on <code>/history</code> and still rejected on other routes; <code>read_only_http</code> inventory.</li>
 <li><b>Feed</b>: <code>claims</code> in <code>/session-obligations</code>, <code>schema_version</code> 3; Android parses old and new responses; <code>sm watch</code> marker and expanded rows.</li>
