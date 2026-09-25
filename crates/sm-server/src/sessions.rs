@@ -11647,6 +11647,7 @@ fn pending_message_from_metadata(
             .response_relay_source
             .clone()
             .or_else(|| metadata.from_sm_send.then(|| "sm-send".to_owned())),
+        queued_at: None,
     }
 }
 
@@ -12507,6 +12508,7 @@ fn drain_pending_runtime_messages_raw(
             let control_predecessor = require_ready_fence
                 && (message.message_category.as_deref() == Some("native_rename")
                     || normalized_delivery_mode(&message.delivery_mode) == "urgent");
+            let delivery_text = message.delivery_text(OffsetDateTime::now_utc());
             let (next_status, delivered) = if message.message_category.as_deref()
                 == Some("native_rename")
             {
@@ -12520,7 +12522,7 @@ fn drain_pending_runtime_messages_raw(
                 deliver_urgent_runtime_text_to_session_raw(
                     state,
                     session_id,
-                    &message.text,
+                    &delivery_text,
                     runtime,
                 )?
             } else {
@@ -12528,11 +12530,11 @@ fn drain_pending_runtime_messages_raw(
                     deliver_runtime_background_text_to_session_raw(
                         state,
                         session_id,
-                        &message.text,
+                        &delivery_text,
                         runtime,
                     )?
                 } else {
-                    deliver_runtime_text_to_session_raw(state, session_id, &message.text, runtime)?
+                    deliver_runtime_text_to_session_raw(state, session_id, &delivery_text, runtime)?
                 }
             };
             status = next_status;
