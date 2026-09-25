@@ -321,6 +321,7 @@ pub enum GitHubPullRequestState {
 
 mod claims;
 mod docs;
+mod worktrees;
 pub use docs::{
     DocFetchError, DocPullRequest, DocReviewOnGitHub, OwnerDocSource, SubmittedDocReview,
 };
@@ -1438,6 +1439,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/claims", get(claims::list_claims).post(claims::post_claim))
         .route("/claims/release", post(claims::release_claim))
+        .route("/claims/worktree", post(worktrees::post_claim_worktree))
+        .route("/worktrees/keep", post(worktrees::post_worktree_keep))
         .route("/docs/{doc_id}", get(docs::get_owner_doc))
         // `/docs/{id}/view|raw|retract` (internal API) and the readable
         // reader `/docs/<repo-name>/<path in repo>` share one pattern.
@@ -9508,7 +9511,10 @@ async fn retire_session(
             if let Err(error) = teardown_btw_requests_for_session(&state, &session_id) {
                 eprintln!("retired session {session_id} but BTW teardown failed: {error:#}");
             }
-            Ok(Json(serde_json::to_value(result)?))
+            let mut response = serde_json::to_value(result)?;
+            response["worktrees"] =
+                serde_json::to_value(worktrees::cleanup_after_retire(&state, &session_id).await)?;
+            Ok(Json(response))
         }
         CoreRetireOutcome::NotFound => Ok(Json(json!({
             "error": format!("Session {session_id} not found")

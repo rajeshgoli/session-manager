@@ -1684,6 +1684,12 @@ pub struct WorkClaimsConfig {
     /// open work is told so; also the re-arm gap. At least 1.
     #[serde(default = "default_work_claims_idle_nudge_minutes")]
     pub idle_nudge_minutes: u64,
+    /// Where `sm ticket --setup-worktree` creates worktrees.
+    #[serde(default = "default_work_claims_worktree_root")]
+    pub worktree_root: String,
+    /// Worktree name prefix per `owner/name`; the repo name when absent.
+    #[serde(default)]
+    pub worktree_prefixes: BTreeMap<String, String>,
 }
 
 impl Default for WorkClaimsConfig {
@@ -1691,6 +1697,8 @@ impl Default for WorkClaimsConfig {
         Self {
             sync_interval_seconds: default_work_claims_sync_interval_seconds(),
             idle_nudge_minutes: default_work_claims_idle_nudge_minutes(),
+            worktree_root: default_work_claims_worktree_root(),
+            worktree_prefixes: BTreeMap::new(),
         }
     }
 }
@@ -1703,6 +1711,25 @@ impl WorkClaimsConfig {
     pub fn idle_nudge(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.idle_nudge_minutes.max(1) * 60)
     }
+
+    /// The worktree name prefix for `repo` (`owner/name`, any case).
+    pub fn worktree_prefix(&self, repo: &str) -> String {
+        self.worktree_prefixes
+            .iter()
+            .find(|(key, _)| key.trim().eq_ignore_ascii_case(repo.trim()))
+            .map(|(_, prefix)| prefix.trim().to_owned())
+            .filter(|prefix| !prefix.is_empty())
+            .unwrap_or_else(|| repo.rsplit('/').next().unwrap_or(repo).to_owned())
+    }
+
+    /// `worktree_root` with `~` expanded.
+    pub fn worktree_root_path(&self) -> PathBuf {
+        expand_home_for_path_match(self.worktree_root.trim())
+    }
+}
+
+fn default_work_claims_worktree_root() -> String {
+    "~/worktrees".to_owned()
 }
 
 fn default_work_claims_sync_interval_seconds() -> u64 {

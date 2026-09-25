@@ -88,10 +88,13 @@ If I explicitly asked you to be a `maintainer`, register as maintainer, sm maint
 
 **Worktrees.** Every agent works in its own worktree under `~/worktrees/sm-<ticket>-<slug>`, build outputs inside. If you're maintainer, use a stable `~/worktrees/sm-maintainer` worktree where possible. You may use a ticket specific worktree where needed, but you should ensure it's deleted when it's no longer useful.
 
-**Claim your work.** Start a ticket with `sm ticket <N>`. When you open
+**Claim your work.** Start a ticket with `sm ticket <N> --setup-worktree` and work in
+the worktree it prints (plain `sm ticket <N>` if you already have one). When you open
 a PR, or take over someone else's, run `sm pr` from its branch. Put `Closes #<N>` in
 the PR body for each ticket the PR finishes; "Implements #N" does not close it.
-Reviewers and scouts don't claim.
+Reviewers and scouts don't claim. When you are retired, sm deletes your worktree if
+nothing would be lost; if something there must outlive you (a running server,
+results not yet pushed), run `sm worktree keep --reason "<why>"`.
 
 `[sm claim]` messages state facts. Act on them like this:
 - Your claim is refused because another live agent holds it: stop and tell me.
