@@ -90,6 +90,21 @@ async fn main() -> Result<()> {
                 "MISSING - auth overrides not applied"
             }
         );
+        // Same trap as the overlay: the email bridge file is addressed relative
+        // to the config file and a missing one only surfaces as a 503 on send.
+        let bridge_path = &config.email.bridge_config;
+        match sm_server::email::EmailBridge::load(&config) {
+            Ok(bridge) if bridge.bridge_is_available() => {
+                println!("email bridge: {bridge_path} (ready)");
+            }
+            Ok(bridge) => println!(
+                "email bridge: {bridge_path} (UNAVAILABLE - sm email will fail: {})",
+                bridge.availability_error_detail()
+            ),
+            Err(error) => println!(
+                "email bridge: {bridge_path} (UNAVAILABLE - sm email will fail: {error:#})"
+            ),
+        }
         return Ok(());
     }
     raise_open_file_soft_limit();
