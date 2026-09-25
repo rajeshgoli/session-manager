@@ -17899,14 +17899,23 @@ esac
     #[cfg(unix)]
     impl CodexForkRestoreRootFixture {
         fn new(label: &str, provider_script: &str) -> Option<Self> {
-            Self::new_with_settle(label, provider_script, None)
+            Self::build(label, provider_script, None)
         }
 
-        fn new_with_settle(
-            label: &str,
-            provider_script: &str,
-            settle_ms: Option<u64>,
-        ) -> Option<Self> {
+        /// Hold the fake provider's next step until restore has accepted its
+        /// root thread, so the test does not race wall-clock sleeps (#1505).
+        ///
+        /// The provider script waits for `@GATE_DIR@/go` after writing its
+        /// `thread_started` event. A tmux wrapper creates `go` when the exact
+        /// `has-session -t =codex-fork-restore01` succeeds. Only the settle
+        /// window's liveness probe uses that exact target, and restore runs
+        /// it only after accepting the root. Session creation's own
+        /// `has-session` calls use other targets and leave the gate shut.
+        fn new_with_exit_gate(label: &str, provider_script: &str, settle_ms: u64) -> Option<Self> {
+            Self::build(label, provider_script, Some(settle_ms))
+        }
+
+        fn build(label: &str, provider_script: &str, gated_settle_ms: Option<u64>) -> Option<Self> {
             if !Command::new("tmux")
                 .arg("-V")
                 .output()
@@ -17919,11 +17928,36 @@ esac
             let state_file = unique_temp_path(&format!("codex-restore-root-{label}"));
             let fixture_dir = state_file.with_extension("dir");
             fs::create_dir_all(&fixture_dir).ok()?;
+            let gate_dir = fixture_dir.display().to_string();
             let command_path = fixture_dir.join("fake-codex-fork");
-            fs::write(&command_path, provider_script).ok()?;
+            fs::write(
+                &command_path,
+                provider_script.replace("@GATE_DIR@", &gate_dir),
+            )
+            .ok()?;
             let mut permissions = fs::metadata(&command_path).ok()?.permissions();
             permissions.set_mode(0o700);
             fs::set_permissions(&command_path, permissions).ok()?;
+            let gate_tmux = fixture_dir.join("tmux-gate");
+            fs::write(
+                &gate_tmux,
+                format!(
+                    r#"#!/bin/sh
+tmux "$@"
+status=$?
+case " $* " in
+  *" has-session -t =codex-fork-restore01 "*)
+    if [ "$status" -eq 0 ]; then
+      : > '{gate_dir}/go'
+    fi
+    ;;
+esac
+exit "$status"
+"#
+                ),
+            )
+            .ok()?;
+            fs::set_permissions(&gate_tmux, fs::Permissions::from_mode(0o700)).ok()?;
 
             let tmux_socket = format!(
                 "sm-1363-{}-{}",
@@ -17964,10 +17998,13 @@ esac
 
             let mut config = AppConfig::default();
             config.rust_core.tmux_socket_name = Some(tmux_socket.clone());
-            config.rust_core.runtime_start_settle_ms = settle_ms;
+            config.rust_core.runtime_start_settle_ms = gated_settle_ms;
             config.codex_fork.command = command_path.display().to_string();
             config.codex_fork.args = Vec::new();
-            let runtime = TmuxRuntime::from_app_config(&config);
+            let mut runtime = TmuxRuntime::from_app_config(&config);
+            if gated_settle_ms.is_some() {
+                runtime = runtime.with_tmux_binary_for_test(gate_tmux.display().to_string());
+            }
             let log_file = fixture_dir.join("restore01.log");
             fs::write(
                 &state_file,
@@ -18113,7 +18150,7 @@ sleep 30
     #[cfg(unix)]
     #[test]
     fn codex_fork_restore_rejects_runtime_that_exits_during_settle() {
-        let Some(fixture) = CodexForkRestoreRootFixture::new_with_settle(
+        let Some(fixture) = CodexForkRestoreRootFixture::new_with_exit_gate(
             "settle-exit",
             r#"#!/bin/sh
 event_stream=''
@@ -18126,9 +18163,9 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 printf '{"event_type":"thread_started","payload":{"thread":{"id":"%s"}}}\n' "$resume_id" >> "$event_stream"
-sleep 1
+while [ ! -e '@GATE_DIR@/go' ]; do sleep 0.05; done
 "#,
-            Some(3_000),
+            30_000,
         ) else {
             return;
         };
@@ -18151,7 +18188,7 @@ sleep 1
     #[cfg(unix)]
     #[test]
     fn codex_fork_restore_fences_transport_ambiguity_during_settle() {
-        let Some(fixture) = CodexForkRestoreRootFixture::new_with_settle(
+        let Some(fixture) = CodexForkRestoreRootFixture::new_with_exit_gate(
             "settle-unlinked",
             r#"#!/bin/sh
 event_stream=''
@@ -18164,12 +18201,12 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 printf '{"event_type":"thread_started","payload":{"thread":{"id":"%s"}}}\n' "$resume_id" >> "$event_stream"
-sleep 1
+while [ ! -e '@GATE_DIR@/go' ]; do sleep 0.05; done
 socket_path=${TMUX%%,*}
 rm -f "$socket_path"
 sleep 30
 "#,
-            Some(3_000),
+            30_000,
         ) else {
             return;
         };
