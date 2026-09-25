@@ -4789,6 +4789,16 @@ async fn queue_jobs_lists_rows_with_filters_and_session_names() {
         .collect::<Vec<_>>();
     assert_eq!(done_ids, vec!["job-succeeded", "job-failed"]);
 
+    let (status, payload) = get_json(app.clone(), "/queue-jobs?state=active").await;
+    assert_eq!(status, StatusCode::OK);
+    let active_ids = payload["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(active_ids, vec!["job-pending", "job-running"]);
+
     let (status, payload) = get_json(app.clone(), "/queue-jobs?state=succeeded").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["jobs"].as_array().unwrap().len(), 1);

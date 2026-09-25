@@ -564,7 +564,12 @@ struct QueueListArgs {
     all: bool,
     #[arg(long = "type", value_parser = ["tests", "perf", "background", "service"])]
     job_type: Option<String>,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Filter by job state: a single state such as running, or active (pending and \
+                running) or done (any finished state). --all --state active lists active jobs \
+                across every notify target"
+    )]
     state: Option<String>,
     #[arg(long)]
     json: bool,
@@ -722,12 +727,15 @@ struct WatchArgs {
     all_nodes: bool,
 }
 
+#[derive(Clone)]
 struct ApiClient {
     scheme: String,
     authority: String,
     host: String,
     port: u16,
     path_prefix: String,
+    /// Whole-response deadline; `None` waits for as long as the server takes.
+    timeout: Option<Duration>,
 }
 
 struct ApiResponse {
@@ -1582,6 +1590,9 @@ fn queue_environment_from(
         .collect()
 }
 
+/// A listing that has not answered by now is reported instead of hanging (#1410).
+const QUEUE_LIST_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn run_queue_list(client: &ApiClient, args: QueueListArgs) -> Result<()> {
     let mut query = Vec::new();
     let explicit_notify = args
@@ -1627,7 +1638,13 @@ fn run_queue_list(client: &ApiClient, args: QueueListArgs) -> Result<()> {
     } else {
         format!("/queue-jobs?{}", query.join("&"))
     };
-    let payload = client.get_json(&path)?;
+    let payload = client
+        .with_timeout(QUEUE_LIST_TIMEOUT)
+        .get_json(&path)
+        .context(
+            "queue listing did not complete; narrow it with --state active (pending and running \
+             jobs only) or --notify <target>",
+        )?;
     let jobs = payload["jobs"].as_array().cloned().unwrap_or_default();
     if args.json {
         println!("{}", serde_json::to_string_pretty(&jobs)?);
@@ -1671,6 +1688,9 @@ fn queue_list_scope_text(
         (Some(notify), false, true, None) => format!(
             "Queue scope: all jobs, including terminal history, for notify target {notify}. Use --all with no --notify for history across notify targets."
         ),
+        (None, _, true, Some("active")) => {
+            "Queue scope: active pending and running jobs across notify targets.".to_owned()
+        }
         (None, _, true, Some(state)) => format!(
             "Queue scope: all notify targets, filtered to state {state}."
         ),
@@ -4855,7 +4875,15 @@ impl ApiClient {
             } else {
                 format!("/{path_prefix}")
             },
+            timeout: None,
         })
+    }
+
+    fn with_timeout(&self, timeout: Duration) -> Self {
+        Self {
+            timeout: Some(timeout),
+            ..self.clone()
+        }
     }
 
     /// Absolute URL for a server path, as this client reaches the server.
@@ -4953,10 +4981,35 @@ impl ApiClient {
             request.push_str(&format!("{name}: {value}\r\n"));
         }
         request.push_str("\r\n");
+        let deadline = self.timeout.map(|timeout| Instant::now() + timeout);
+        stream.set_write_timeout(self.timeout)?;
         stream.write_all(request.as_bytes())?;
         stream.write_all(&body_bytes)?;
         let mut raw = Vec::new();
-        stream.read_to_end(&mut raw)?;
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(api_timeout_error(self.timeout));
+                }
+                stream.set_read_timeout(Some(remaining))?;
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => raw.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(api_timeout_error(self.timeout));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
         parse_response(&raw)
     }
 
@@ -4977,6 +5030,7 @@ impl ApiClient {
         );
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .timeout_global(self.timeout)
             .build()
             .into();
         let mut response = match method {
@@ -5038,6 +5092,13 @@ impl ApiClient {
         let body = response.body_mut().read_to_string()?;
         Ok(ApiResponse { status, body })
     }
+}
+
+fn api_timeout_error(timeout: Option<Duration>) -> anyhow::Error {
+    anyhow!(
+        "sm-server did not finish responding within {:?}",
+        timeout.unwrap_or_default()
+    )
 }
 
 impl ApiResponse {
@@ -6642,6 +6703,31 @@ mod tests {
             queue_list_scope_text(None, false, true, Some("done")),
             "Queue scope: all notify targets, filtered to state done."
         );
+        assert_eq!(
+            queue_list_scope_text(None, false, true, Some("active")),
+            "Queue scope: active pending and running jobs across notify targets."
+        );
+    }
+
+    #[test]
+    fn api_client_timeout_reports_a_server_that_never_answers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(1500));
+            drop(stream);
+        });
+        let client = ApiClient::parse(&format!("http://{address}"))
+            .unwrap()
+            .with_timeout(Duration::from_millis(200));
+
+        let started = Instant::now();
+        let error = client.get_json("/queue-jobs").unwrap_err().to_string();
+
+        assert!(started.elapsed() < Duration::from_millis(1200), "{error}");
+        assert_eq!(error, "sm-server did not finish responding within 200ms");
+        server.join().unwrap();
     }
 
     #[test]
