@@ -4,6 +4,12 @@ set -euo pipefail
 # Every Rust test must run through this launcher. AppState uses this root before
 # opening durable stores, so default config can never resolve the live session
 # registry, queue, usage databases, or reparent-apply lock.
+# The isolation root must be absolute, and tests build fixture paths from the
+# temp dir, so resolve a relative TMPDIR before anything derives from it.
+case "${TMPDIR:-/tmp}" in
+  /*) ;;
+  *) TMPDIR="$(cd -- "$TMPDIR" && pwd)"; export TMPDIR ;;
+esac
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/sm-rust-test.XXXXXX")"
 cleanup() {
   rm -rf -- "$test_root"
