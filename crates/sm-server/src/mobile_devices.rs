@@ -315,6 +315,7 @@ pub fn run_enroll_device(options: EnrollDeviceOptions) -> Result<()> {
         .clone()
         .unwrap_or_else(|| expand_home(&config.mobile_terminal.device_ca_key_path));
     ensure_device_ca(&ca_cert_path, &ca_key_path)?;
+    ensure_device_policy_sync_configured(&config.cloudflare_access)?;
     ensure_cloudflare_mobile_device_ca(&config.cloudflare_access, &ca_cert_path)?;
     let registration = create_pairing_registration(
         &db_path,
@@ -919,9 +920,39 @@ pub fn sync_device_common_name(
     action: DevicePolicyAction,
 ) -> Result<()> {
     let Some(request) = DevicePolicyRequest::from_config(config, common_name, action) else {
+        // A revoke still lands in sm-server's own device store, which the server
+        // checks on every request, so only an allow must reach Cloudflare.
+        if action == DevicePolicyAction::Allow {
+            ensure_device_policy_sync_configured(config)?;
+        }
         return Ok(());
     };
     request.execute()
+}
+
+/// A configured mobile device policy means Cloudflare Access admits only the
+/// common names listed in it. Enrolling without the credentials to add the new
+/// device would succeed locally and then be refused at the edge on every request.
+fn ensure_device_policy_sync_configured(config: &CloudflareAccessConfig) -> Result<()> {
+    if trimmed(&config.mobile_device_policy_id).is_none() {
+        return Ok(());
+    }
+    let missing: Vec<&str> = [
+        ("cloudflare_access.account_id", &config.account_id),
+        ("cloudflare_access.api_token", &config.api_token),
+    ]
+    .into_iter()
+    .filter(|(_, value)| trimmed(value).is_none())
+    .map(|(key, _)| key)
+    .collect();
+    if !missing.is_empty() {
+        bail!(
+            "cloudflare_access.mobile_device_policy_id is set but {} is missing; \
+             Cloudflare Access would refuse the enrolled device",
+            missing.join(" and ")
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1808,6 +1839,32 @@ mod tests {
             fs::read_to_string(&public_key_path).context("failed to read generated public key")?;
         let _ = fs::remove_dir_all(temp_dir);
         Ok(public_key)
+    }
+
+    #[test]
+    fn cloudflare_policy_allow_without_api_token_fails_instead_of_skipping() {
+        let config = CloudflareAccessConfig {
+            account_id: Some("account".to_owned()),
+            mobile_device_policy_id: Some("policy".to_owned()),
+            ..CloudflareAccessConfig::default()
+        };
+
+        let error = sync_device_common_name(&config, "android-new", DevicePolicyAction::Allow)
+            .expect_err("allow without token must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("cloudflare_access.api_token is missing"),
+            "{error}"
+        );
+        sync_device_common_name(&config, "android-old", DevicePolicyAction::Revoke)
+            .expect("revoke without token keeps skipping Cloudflare");
+        sync_device_common_name(
+            &CloudflareAccessConfig::default(),
+            "android-new",
+            DevicePolicyAction::Allow,
+        )
+        .expect("no device policy configured means nothing to sync");
     }
 
     #[test]
