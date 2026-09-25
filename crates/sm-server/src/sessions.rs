@@ -1805,6 +1805,13 @@ impl SessionStore {
         Ok(children)
     }
 
+    /// Resolves the `/root` send target: the topmost record of `session_id`'s
+    /// persisted parent chain. The caller is matched by exact ID only.
+    pub fn resolve_hierarchy_root(&self, session_id: &str) -> Result<HierarchyRootResolution> {
+        let sessions = self.load_snapshot()?.into_sessions();
+        Ok(resolve_hierarchy_root(&sessions, session_id))
+    }
+
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let session_id = session_id.trim();
         if session_id.is_empty() {
@@ -13297,6 +13304,73 @@ fn collect_descendants_preorder(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HierarchyRoot {
+    pub session_id: String,
+    pub root_session_id: String,
+    /// The caller first, the root last.
+    pub chain: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HierarchyRootResolution {
+    Resolved(HierarchyRoot),
+    CallerNotFound,
+    /// A missing parent, a cycle, a malformed link, or a stopped root. Never
+    /// resolved to the last readable node.
+    Unresolvable(String),
+}
+
+fn resolve_hierarchy_root(sessions: &[SessionRecord], session_id: &str) -> HierarchyRootResolution {
+    let by_id = sessions
+        .iter()
+        .map(|session| (session.id.as_str(), session))
+        .collect::<BTreeMap<_, _>>();
+    let Some(mut current) = by_id.get(session_id.trim()).copied() else {
+        return HierarchyRootResolution::CallerNotFound;
+    };
+    let mut chain = vec![current.id.clone()];
+    let mut visited = BTreeSet::from([current.id.as_str()]);
+    while let Some(parent_id) = current.parent_session_id.as_deref() {
+        if parent_id.trim().is_empty() || parent_id.trim() != parent_id {
+            return HierarchyRootResolution::Unresolvable(format!(
+                "session {} has a malformed parent link {parent_id:?}",
+                current.id
+            ));
+        }
+        if !visited.insert(parent_id) {
+            return HierarchyRootResolution::Unresolvable(format!(
+                "the parent chain of {} cycles back to {parent_id}",
+                chain[0]
+            ));
+        }
+        let Some(parent) = by_id.get(parent_id).copied() else {
+            return HierarchyRootResolution::Unresolvable(format!(
+                "session {} names parent {parent_id}, which has no record",
+                current.id
+            ));
+        };
+        chain.push(parent.id.clone());
+        current = parent;
+    }
+    if current.is_stopped() {
+        return HierarchyRootResolution::Unresolvable(format!(
+            "the hierarchy root {} is {}, not live",
+            current.id,
+            if completion_status_is_retired(current.completion_status.as_deref()) {
+                "retired"
+            } else {
+                "stopped"
+            }
+        ));
+    }
+    HierarchyRootResolution::Resolved(HierarchyRoot {
+        session_id: chain[0].clone(),
+        root_session_id: current.id.clone(),
+        chain,
+    })
+}
+
 fn reset_session_after_clear(session: &mut Map<String, Value>, now: &str) {
     // A clear starts a new accumulation cycle. Claude also reports this through
     // its SessionStart(clear) hook, but codex has no equivalent hook, so without
@@ -19748,6 +19822,126 @@ sleep 30
         assert_eq!(requests[1]["command"], "submit_btw");
         assert_eq!(requests[1]["request_id"], "btw-recovery");
         let _ = fs::remove_file(socket_path);
+    }
+
+    fn hierarchy_record(id: &str, parent: Option<&str>) -> SessionRecord {
+        let mut record = session_record("running");
+        record.id = id.to_owned();
+        record.name = format!("claude-{id}");
+        record.friendly_name = Some(format!("{id}-name"));
+        record.parent_session_id = parent.map(ToOwned::to_owned);
+        record
+    }
+
+    fn resolved_root(sessions: &[SessionRecord], caller: &str) -> (String, Vec<String>) {
+        match resolve_hierarchy_root(sessions, caller) {
+            HierarchyRootResolution::Resolved(root) => {
+                assert_eq!(root.session_id, caller);
+                (root.root_session_id, root.chain)
+            }
+            other => panic!("expected {caller} to resolve, got {other:?}"),
+        }
+    }
+
+    fn unresolvable_reason(sessions: &[SessionRecord], caller: &str) -> String {
+        match resolve_hierarchy_root(sessions, caller) {
+            HierarchyRootResolution::Unresolvable(reason) => reason,
+            other => panic!("expected {caller} to be unresolvable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hierarchy_root_follows_parent_links_to_the_topmost_record() {
+        let mut sessions = vec![
+            hierarchy_record("root0001", None),
+            hierarchy_record("child001", Some("root0001")),
+            hierarchy_record("grand001", Some("child001")),
+            hierarchy_record("root0002", None),
+        ];
+
+        assert_eq!(
+            resolved_root(&sessions, "root0001"),
+            ("root0001".to_owned(), vec!["root0001".to_owned()])
+        );
+        assert_eq!(resolved_root(&sessions, "child001").0, "root0001");
+        assert_eq!(
+            resolved_root(&sessions, "grand001"),
+            (
+                "root0001".to_owned(),
+                vec![
+                    "grand001".to_owned(),
+                    "child001".to_owned(),
+                    "root0001".to_owned()
+                ]
+            )
+        );
+
+        // Reparenting moves the persisted link, and /root follows it.
+        sessions[1].parent_session_id = Some("root0002".to_owned());
+        assert_eq!(resolved_root(&sessions, "grand001").0, "root0002");
+
+        // A stopped intermediate is still lineage; only the root must be live.
+        sessions[1].status = "stopped".to_owned();
+        assert_eq!(resolved_root(&sessions, "grand001").0, "root0002");
+    }
+
+    #[test]
+    fn hierarchy_root_matches_the_caller_by_exact_id_only() {
+        let sessions = vec![hierarchy_record("root0001", None)];
+
+        assert_eq!(
+            resolve_hierarchy_root(&sessions, "root0001-name"),
+            HierarchyRootResolution::CallerNotFound
+        );
+        assert_eq!(
+            resolve_hierarchy_root(&sessions, "root"),
+            HierarchyRootResolution::CallerNotFound
+        );
+    }
+
+    #[test]
+    fn hierarchy_root_fails_closed_on_broken_chains() {
+        let mut stopped_root = hierarchy_record("deadroot", None);
+        stopped_root.status = "stopped".to_owned();
+        let mut retired_root = hierarchy_record("retroot1", None);
+        retired_root.status = "idle".to_owned();
+        retired_root.completion_status = Some("retired".to_owned());
+        let sessions = vec![
+            hierarchy_record("orphan01", Some("gone0001")),
+            hierarchy_record("cyclea01", Some("cycleb01")),
+            hierarchy_record("cycleb01", Some("cyclea01")),
+            hierarchy_record("selfloop", Some("selfloop")),
+            hierarchy_record("blank001", Some("")),
+            stopped_root,
+            hierarchy_record("deadkid1", Some("deadroot")),
+            retired_root,
+            hierarchy_record("retkid01", Some("retroot1")),
+        ];
+
+        assert_eq!(
+            unresolvable_reason(&sessions, "orphan01"),
+            "session orphan01 names parent gone0001, which has no record"
+        );
+        assert_eq!(
+            unresolvable_reason(&sessions, "cyclea01"),
+            "the parent chain of cyclea01 cycles back to cyclea01"
+        );
+        assert_eq!(
+            unresolvable_reason(&sessions, "selfloop"),
+            "the parent chain of selfloop cycles back to selfloop"
+        );
+        assert_eq!(
+            unresolvable_reason(&sessions, "blank001"),
+            "session blank001 has a malformed parent link \"\""
+        );
+        assert_eq!(
+            unresolvable_reason(&sessions, "deadkid1"),
+            "the hierarchy root deadroot is stopped, not live"
+        );
+        assert_eq!(
+            unresolvable_reason(&sessions, "retkid01"),
+            "the hierarchy root retroot1 is retired, not live"
+        );
     }
 
     fn session_record(status: &str) -> SessionRecord {
