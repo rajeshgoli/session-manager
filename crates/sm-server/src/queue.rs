@@ -4266,7 +4266,10 @@ fn revive_live_unreceipted_failed_queue_jobs_conn(
             job.log_path.as_deref().unwrap_or("-"),
             job.id
         );
-        RetainedQueueStore::new(message_queue_db_path.to_path_buf())
+        // The row is running again, so recovery must go on to poll it even if
+        // this notice cannot be queued; the real completion also names the
+        // earlier notice as false.
+        if let Err(error) = RetainedQueueStore::new(message_queue_db_path.to_path_buf())
             .enqueue_message_once_with_metadata(
                 &format!("queue-revived-{}-{revived_at}", job.id),
                 target_session_id,
@@ -4276,20 +4279,77 @@ fn revive_live_unreceipted_failed_queue_jobs_conn(
                     message_category: Some("queue-completion".to_owned()),
                     ..QueueMessageMetadata::default()
                 },
-            )?;
+            )
+        {
+            eprintln!(
+                "queue job {} revival notice could not be queued: {error:#}",
+                job.id
+            );
+        }
     }
     Ok(revived)
 }
 
+/// Reads the argument vector without spawning a process, because revival matters
+/// most after process-slot exhaustion, when a spawned `ps` would fail too.
 fn process_command_mentions(pid: i64, needle: &str) -> bool {
-    Command::new("/bin/ps")
-        .args(["-o", "command=", "-p", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .is_ok_and(|output| {
-            output.status.success() && String::from_utf8_lossy(&output.stdout).contains(needle)
-        })
+    process_arguments(pid).is_some_and(|args| {
+        args.split(|byte| *byte == 0)
+            .any(|arg| arg == needle.as_bytes())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn process_arguments(pid: i64) -> Option<Vec<u8>> {
+    let pid = libc::c_int::try_from(pid).ok().filter(|pid| *pid > 0)?;
+    let mut arg_max: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    // SAFETY: mib names a c_int value and size is that value's size.
+    let status = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            (&mut arg_max as *mut libc::c_int).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 || arg_max <= 0 {
+        return None;
+    }
+    let mut buffer = vec![0u8; usize::try_from(arg_max).ok()?];
+    let mut size = buffer.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: buffer is writable for size bytes; the kernel writes at most that.
+    let status = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    buffer.truncate(size);
+    // KERN_PROCARGS2 leads with argc, then the executable path and the arguments,
+    // all NUL-separated.
+    Some(buffer.split_off(std::mem::size_of::<libc::c_int>().min(buffer.len())))
+}
+
+#[cfg(target_os = "linux")]
+fn process_arguments(pid: i64) -> Option<Vec<u8>> {
+    fs::read(format!("/proc/{pid}/cmdline")).ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_arguments(_pid: i64) -> Option<Vec<u8>> {
+    None
 }
 
 fn recover_running_queue_job_conn(
@@ -6554,6 +6614,17 @@ mod tests {
         assert!(!process_group_exists(child_pid));
         assert!(!process_exists(0));
         assert!(!process_group_exists(-1));
+    }
+
+    #[test]
+    fn wrapper_match_reads_arguments_without_spawning() {
+        let mut child = Command::new("/bin/sleep").arg("30.5").spawn().unwrap();
+        let pid = i64::from(child.id());
+        assert!(process_command_mentions(pid, "30.5"));
+        assert!(!process_command_mentions(pid, "30"));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!process_command_mentions(pid, "30.5"));
     }
 
     #[test]

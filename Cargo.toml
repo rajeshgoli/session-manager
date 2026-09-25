@@ -15,6 +15,7 @@ clap = "4.5"
 hmac = "0.12"
 futures-util = "0.3"
 jsonwebtoken = "9.3"
+libc = "0.2"
 nix = "0.29"
 p256 = "0.13"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
