@@ -253,6 +253,15 @@ impl AppConfig {
             &default_message_queue_db_path(),
             &instance,
         )?;
+        // The default log is the live server's, so analytics read from it would
+        // vary with production dispatch and restart events.
+        self.mobile_analytics.server_log_file = isolate_path_from_protected_root(
+            &self.mobile_analytics.server_log_file,
+            &default_server_log_file(),
+            &instance,
+            Path::new("session-manager.log"),
+            Path::new(&default_server_log_file()),
+        )?;
         self.tool_logging.db_path = isolate_default_data_path(
             &self.tool_logging.db_path,
             &default_tool_usage_db_path(),
@@ -2601,6 +2610,7 @@ mod tests {
             &config.paths.state_file,
             &config.sm_send.db_path,
             &config.mobile_analytics.message_queue_db,
+            &config.mobile_analytics.server_log_file,
             &config.tool_logging.db_path,
             &config.usage.db_path,
             &config.codex_events.db_path,
@@ -2735,6 +2745,16 @@ mod tests {
             .display()
             .to_string();
         let error = unsafe_app_artifact_config
+            .isolate_test_paths(&root)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("refuses explicit production path"));
+
+        let mut unsafe_server_log_config = AppConfig::default();
+        unsafe_server_log_config.mobile_analytics.server_log_file =
+            "/tmp/./session-manager.log".to_owned();
+        let error = unsafe_server_log_config
             .isolate_test_paths(&root)
             .unwrap_err();
         assert!(error
