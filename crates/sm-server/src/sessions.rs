@@ -20202,6 +20202,7 @@ sleep 30
                     "name": "codex-busy1",
                     "working_dir": "/repo",
                     "tmux_session": "codex-busy1",
+                    "tmux_socket_name": format!("sm-busy-target-{}", std::process::id()),
                     "provider": "codex-fork",
                     "status": "running",
                     "created_at": "2026-06-01T00:00:00Z",

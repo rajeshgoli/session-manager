@@ -115,7 +115,10 @@ use crate::queue::{
     QueueJobRecord, QueueMessageMetadata, RetainedQueueStore, RetryCodexReviewRequest,
     ScheduledReminder,
 };
-use crate::runtime::{CodexModelValidationError, InitialBriefDeliveryError, TmuxRuntime};
+use crate::runtime::{
+    refuse_default_tmux_socket_under_test_isolation, CodexModelValidationError,
+    InitialBriefDeliveryError, TmuxRuntime,
+};
 #[cfg(test)]
 use crate::sessions::codex_fork_legacy_event_stream_path_from_log_file;
 use crate::sessions::{
@@ -8148,7 +8151,7 @@ fn start_mobile_terminal_attach_client(
     let stdout_fd = unsafe { OwnedFd::from_raw_fd(dup(pty.slave.as_raw_fd())?) };
     let stderr_fd = unsafe { OwnedFd::from_raw_fd(dup(pty.slave.as_raw_fd())?) };
     let mut command =
-        mobile_terminal_tmux_command(ticket, &["attach-session", "-t", &ticket.tmux_session]);
+        mobile_terminal_tmux_command(ticket, &["attach-session", "-t", &ticket.tmux_session])?;
     command
         .stdin(Stdio::from(fs::File::from(pty.slave)))
         .stdout(Stdio::from(fs::File::from(stdout_fd)))
@@ -8295,6 +8298,7 @@ fn capture_mobile_terminal_scrollback(
             &ticket.tmux_session,
         ],
     )
+    .ok()?
     .output()
     .ok()?;
     if !output.status.success() || output.stdout.iter().all(|byte| byte.is_ascii_whitespace()) {
@@ -8313,11 +8317,15 @@ fn normalize_mobile_terminal_scrollback(output: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn mobile_terminal_tmux_command(ticket: &MobileTerminalTicket, args: &[&str]) -> Command {
+fn mobile_terminal_tmux_command(
+    ticket: &MobileTerminalTicket,
+    args: &[&str],
+) -> anyhow::Result<Command> {
     let argv = mobile_terminal_tmux_argv(ticket, args);
+    refuse_default_tmux_socket_under_test_isolation(&argv[0], ticket.tmux_socket_name.as_deref())?;
     let mut command = Command::new(&argv[0]);
     command.args(&argv[1..]);
-    command
+    Ok(command)
 }
 
 fn mobile_terminal_tmux_argv(ticket: &MobileTerminalTicket, args: &[&str]) -> Vec<String> {
