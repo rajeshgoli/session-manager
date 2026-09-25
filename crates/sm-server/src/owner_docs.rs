@@ -340,6 +340,26 @@ pub fn doc_readable_path(repo: &str, path: &str, commit_sha: &str) -> String {
     format!("/docs/{encoded}?version={version}")
 }
 
+/// The directory holding a doc, as a prefix ending in `/` (empty at the repo
+/// root). Files the doc references are served only from under it.
+pub fn doc_dir_prefix(path: &str) -> &str {
+    path.rfind('/').map_or("", |slash| &path[..=slash])
+}
+
+/// The reader path covering a doc's directory, `/docs/<repo-name>/<dir>/`,
+/// encoded as `doc_readable_path` encodes it.
+pub fn doc_dir_reader_prefix(repo: &str, path: &str) -> String {
+    let dir = doc_dir_prefix(path).trim_end_matches('/');
+    let mut prefix = format!("/docs/{}/", percent_encode_segment(repo_name(repo)));
+    if !dir.is_empty() {
+        for segment in dir.split('/') {
+            prefix.push_str(&percent_encode_segment(segment));
+            prefix.push('/');
+        }
+    }
+    prefix
+}
+
 fn percent_encode_segment(segment: &str) -> String {
     segment
         .bytes()
@@ -788,6 +808,38 @@ impl OwnerDocStore {
             }));
         };
         Ok(Ok((docs[&publish.doc_id].clone(), publish.commit_sha)))
+    }
+
+    /// The docs in the repo named `name` whose directory holds `file_path`,
+    /// each with its newest publish.
+    pub fn file_anchors(
+        &self,
+        name: &str,
+        file_path: &str,
+    ) -> Result<Vec<(OwnerDoc, OwnerDocPublish)>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let docs = {
+            let mut statement =
+                conn.prepare(&format!("SELECT {DOC_COLUMNS} FROM owner_docs ORDER BY id"))?;
+            let rows = statement
+                .query_map([], doc_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut anchors = Vec::new();
+        for doc in docs {
+            if !repo_name(&doc.repo).eq_ignore_ascii_case(name)
+                || !file_path.starts_with(doc_dir_prefix(&doc.path))
+            {
+                continue;
+            }
+            if let Some(publish) = self.publishes(&doc.id)?.pop() {
+                anchors.push((doc, publish));
+            }
+        }
+        Ok(anchors)
     }
 
     pub fn summary(&self, doc_id: &str) -> Result<Option<OwnerDocSummary>> {

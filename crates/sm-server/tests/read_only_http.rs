@@ -24834,6 +24834,216 @@ async fn owner_doc_token_opens_the_json_endpoints_for_its_own_doc_only() {
     ));
 }
 
+async fn get_with_headers(
+    app: &axum::Router,
+    uri: &str,
+    headers: &[(&str, &str)],
+    peer: Option<SocketAddr>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut request = Request::builder().uri(uri);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let mut request = request.body(Body::empty()).unwrap();
+    if let Some(peer) = peer {
+        request.extensions_mut().insert(ConnectInfo(peer));
+    }
+    let response = app.clone().oneshot(request).await.unwrap();
+    let (status, headers) = (response.status(), response.headers().clone());
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, headers, body.to_vec())
+}
+
+/// `docs/working/walk.html` references `walk/chart.png`; the image changed
+/// between the two publishes.
+fn walkthrough_source(c1: &str, c2: &str) -> StubDocSource {
+    let source = StubDocSource::default();
+    let page = b"<html><body>\n<img src=\"walk/chart.png\">\n</body></html>\n";
+    for (sha, image) in [(c1, &b"png-v1"[..]), (c2, &b"png-v2"[..])] {
+        source.put("acme/widgets", "docs/working/walk.html", sha, page);
+        source.put("acme/widgets", "docs/working/walk/chart.png", sha, image);
+        source.put(
+            "acme/widgets",
+            "docs/working/walk/notes.html",
+            sha,
+            b"<p>x</p>",
+        );
+        source.put("acme/widgets", "other/chart.png", sha, b"elsewhere");
+    }
+    source
+}
+
+#[tokio::test]
+async fn owner_doc_reader_serves_the_files_beside_a_doc_at_the_revision_read() {
+    let (c1, c2) = ("a".repeat(40), "c".repeat(40));
+    let (app, _dir) = owner_docs_app(walkthrough_source(&c1, &c2));
+    for sha in [&c1, &c2] {
+        let (status, doc) = post_json(
+            app.clone(),
+            "/docs",
+            json!({"repo": "acme/widgets", "path": "docs/working/walk.html",
+                   "commit_sha": sha, "session_id": "author01"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{doc}");
+    }
+    let image = "/docs/widgets/docs/working/walk/chart.png";
+
+    // Without a Referer, the newest publish.
+    let (status, headers, body) = get_response(app.clone(), image).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"png-v2");
+    assert_eq!(headers["content-type"], "image/png");
+    assert_eq!(headers["x-content-type-options"], "nosniff");
+    let etag = headers["etag"].to_str().unwrap().to_owned();
+
+    // The revision the page shows, named by the Referer.
+    let (status, _, body) = get_with_headers(
+        &app,
+        image,
+        &[(
+            "referer",
+            "https://sm.example.com/docs/widgets/docs/working/walk.html?version=aaaaaaaaaaaa",
+        )],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, b"png-v1");
+
+    // Unchanged since the last read.
+    let (status, _, body) =
+        get_with_headers(&app, image, &[("if-none-match", etag.as_str())], None).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert!(body.is_empty());
+
+    // Outside the doc's directory, not a static file type, or not in git.
+    for (uri, detail) in [
+        ("/docs/widgets/other/chart.png", "Doc not found"),
+        (
+            "/docs/widgets/docs/working/walk/notes.html",
+            "Doc not found",
+        ),
+        ("/docs/gadgets/docs/working/walk/chart.png", "Doc not found"),
+        (
+            "/docs/widgets/docs/working/walk/absent.png",
+            "docs/working/walk/absent.png does not exist at ccccccc",
+        ),
+    ] {
+        let (status, body) = get_json(app.clone(), uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+        assert_eq!(body["detail"], detail, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn owner_doc_page_cookie_opens_only_the_files_beside_that_doc() {
+    const SECRET: &str = "doc-file-cookie-secret";
+    let (c1, c2) = ("a".repeat(40), "c".repeat(40));
+    let (app, dir) = owner_docs_app_with(walkthrough_source(&c1, &c2), |config| {
+        config.google_auth = GoogleAuthConfig {
+            enabled: true,
+            public_host: Some("sm.example.com".to_owned()),
+            session_cookie_secret: Some(SECRET.to_owned()),
+            ..GoogleAuthConfig::default()
+        };
+    });
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    let publish = |path: &str| sm_server::owner_docs::PublishOwnerDoc {
+        repo: "acme/widgets".into(),
+        path: path.into(),
+        pr_number: None,
+        session_id: "author01".into(),
+        session_name: None,
+        title: "Walkthrough".into(),
+        note: None,
+        commit_sha: c1.clone(),
+        blob_sha: "0".repeat(40),
+        review_requested: false,
+    };
+    let id = store
+        .publish(publish("docs/working/walk.html"), |_| true)
+        .unwrap()
+        .doc
+        .id;
+    let other = store
+        .publish(publish("other/memo.html"), |_| true)
+        .unwrap()
+        .doc
+        .id;
+
+    // The page sets the cookie, scoped to its directory. (A local read skips
+    // owner auth, the way the Android reader's device token passes it.)
+    let (status, headers, _) = get_with_headers(
+        &app,
+        "/docs/widgets/docs/working/walk.html",
+        &[("host", "localhost")],
+        Some(SocketAddr::from(([127, 0, 0, 1], 49152))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cookie = headers["set-cookie"].to_str().unwrap();
+    assert!(
+        cookie.starts_with(&format!("sm_doc_{id}=smdt_{id}."))
+            && cookie.contains("; Path=/docs/widgets/docs/working/;")
+            && cookie.contains("HttpOnly"),
+        "{cookie}"
+    );
+
+    let external = Some(SocketAddr::from(([203, 0, 113, 7], 443)));
+    let valid = format!(
+        "sm_doc_{id}={}",
+        doc_token(SECRET, &id, unix_timestamp() + 3600)
+    );
+    let get = |uri: &'static str, cookie: String| {
+        let app = app.clone();
+        async move {
+            get_with_headers(
+                &app,
+                uri,
+                &[("host", "sm.example.com"), ("cookie", cookie.as_str())],
+                external,
+            )
+            .await
+        }
+    };
+    let (status, headers, body) =
+        get("/docs/widgets/docs/working/walk/chart.png", valid.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["content-type"], "image/png");
+    assert_eq!(body, b"png-v1");
+
+    // Not the page, not another doc's files, not an expired or foreign cookie.
+    for (uri, cookie) in [
+        ("/docs/widgets/docs/working/walk.html", valid.clone()),
+        ("/docs/widgets/other/chart.png", valid.clone()),
+        (
+            "/docs/widgets/docs/working/walk/chart.png",
+            format!(
+                "sm_doc_{id}={}",
+                doc_token(SECRET, &id, unix_timestamp() - 1)
+            ),
+        ),
+        (
+            "/docs/widgets/docs/working/walk/chart.png",
+            format!(
+                "sm_doc_{other}={}",
+                doc_token(SECRET, &other, unix_timestamp() + 3600)
+            ),
+        ),
+        ("/docs/widgets/docs/working/walk/chart.png", String::new()),
+    ] {
+        let (status, _, _) = get(uri, cookie.clone()).await;
+        assert!(
+            matches!(
+                status,
+                StatusCode::UNAUTHORIZED | StatusCode::SERVICE_UNAVAILABLE
+            ),
+            "{uri} {cookie}: {status}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn owner_doc_review_a_newer_submission_from_another_device_takes_over() {
     let c1 = "a".repeat(40);
