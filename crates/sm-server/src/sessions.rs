@@ -22289,18 +22289,29 @@ sleep 30
             Some(fixture.handoff_path.to_str().unwrap())
         );
         assert_eq!(session.provider_resume_id.as_deref(), Some("new-thread"));
-        let connection =
-            rusqlite::Connection::open(fixture.state_file.with_extension("usage.db")).unwrap();
-        let provider_session_ids = connection
-            .prepare(
-                "SELECT provider_session_id FROM seat_sessions WHERE seat_id = 'codex001' ORDER BY provider_session_id",
-            )
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .unwrap();
-        assert_eq!(provider_session_ids, vec!["new-thread", "old-thread"]);
+        // The handoff records seat sessions after it commits
+        // `last_handoff_path` and releases the state lock, so poll (#1401).
+        let usage_db = fixture.state_file.with_extension("usage.db");
+        let read_provider_session_ids = || -> rusqlite::Result<Vec<String>> {
+            rusqlite::Connection::open(&usage_db)?
+                .prepare(
+                    "SELECT provider_session_id FROM seat_sessions WHERE seat_id = 'codex001' ORDER BY provider_session_id",
+                )?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let provider_session_ids = loop {
+            let ids = read_provider_session_ids();
+            if ids.as_ref().is_ok_and(|ids| ids.len() >= 2) || Instant::now() >= deadline {
+                break ids;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(
+            provider_session_ids.unwrap(),
+            vec!["new-thread", "old-thread"]
+        );
         let state = store.load_raw_json_value().unwrap();
         let session = raw_session_object(&state, "codex001").unwrap();
         assert!(json_text(session.get("pending_handoff_path")).is_none());
@@ -22620,8 +22631,15 @@ sleep 30
             .unwrap();
         }
 
+        /// Wait as long as the product itself may take (#1401). An idle
+        /// machine completes this fixture's handoff in about 6s: 3s for the
+        /// Escape prompt wait (the fixture draws `›`, not `>`) plus 2s before
+        /// the unconfirmed-prompt Enter retry. A fixed 8s deadline flaked
+        /// under full-suite load; the product allows 30s to confirm the
+        /// prompt and `CODEX_FORK_THREAD_STARTED_TIMEOUT` for the new thread.
         fn wait_for_handoff(&self, store: &SessionStore) {
-            let deadline = Instant::now() + Duration::from_secs(8);
+            let deadline =
+                Instant::now() + Duration::from_secs(5 + 30) + CODEX_FORK_THREAD_STARTED_TIMEOUT;
             loop {
                 if store
                     .get_session("codex001")
