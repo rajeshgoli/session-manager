@@ -103,6 +103,9 @@ SM_HEALTH_TIMEOUT="${SM_HEALTH_TIMEOUT:-60}"
 SM_PID_SETTLE_SECONDS="${SM_PID_SETTLE_SECONDS:-20}"
 SM_UNLOAD_TIMEOUT="${SM_UNLOAD_TIMEOUT:-10}"
 SM_ALLOW_SESSION_DROP="${SM_ALLOW_SESSION_DROP:-0}"
+# What --update fast-forwards the checkout to.
+SM_DEPLOY_REMOTE="${SM_DEPLOY_REMOTE:-origin}"
+SM_DEPLOY_BRANCH="${SM_DEPLOY_BRANCH:-main}"
 DOMAIN="gui/$(id -u)"
 
 usage() {
@@ -119,6 +122,13 @@ first run after adopting this script rewrites the plist to point at the
 installed path and therefore needs --allow-plist-change once.
 
 Options:
+  --update              Fast-forward this checkout to $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH under the
+                        restart lock, then build and restart what that fetched.
+                        This is how to deploy: never pull or merge in the
+                        deployed checkout by hand, because a hand-run pull moves
+                        the source tree under another agent's build. Refuses a
+                        checkout that is not on $SM_DEPLOY_BRANCH, has uncommitted changes to
+                        tracked files, or has commits $SM_DEPLOY_REMOTE does not.
   --allow-drop N        Tolerate N fewer sessions after the restart (default: 0).
                         Sessions can retire on their own between the before and
                         after samples; raise this only if that is expected.
@@ -141,7 +151,11 @@ SM_CUTOVER, SM_CONFIG, SM_LOCAL_ENV, SM_LOG_DIR, SM_PLIST, SM_HOST, SM_PORT,
 SM_PYTHON_LABELS (extra labels), SM_SIGN_IDENTIFIER, SM_HEALTH_TIMEOUT,
 SM_SIGN_IDENTITY, SM_SIGN_DESIGNATED_REQUIREMENT, SM_SIGNING_CONFIG,
 SM_QUEUE_AUTHORITY_SOCKET, SM_QUEUE_AUTHORITY_VERIFIER, SM_PID_SETTLE_SECONDS,
-SM_UNLOAD_TIMEOUT, SM_ALLOW_SESSION_DROP, SM_LOCK.
+SM_UNLOAD_TIMEOUT, SM_ALLOW_SESSION_DROP, SM_LOCK, SM_DEPLOY_REMOTE,
+SM_DEPLOY_BRANCH.
+
+Whatever the options, the restart refuses to stop the service if the checkout's
+commit or tracked contents changed while it was building.
 
 The default identity is the sole `SM_SIGN_IDENTITY=...` line in the tracked,
 non-secret $SM_SIGNING_CONFIG. Planned certificate rotation explicitly overrides
@@ -162,22 +176,33 @@ EOF
 SKIP_BUILD=0
 ALLOW_PLIST_CHANGE=0
 ADOPT=0
+UPDATE=0
+# Everything but --update, for handing to the updated copy of this script.
+PASSTHROUGH_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --adopt)
       ADOPT=1
+      PASSTHROUGH_ARGS+=("$1")
       shift
       ;;
     --allow-drop)
       SM_ALLOW_SESSION_DROP="${2:?missing --allow-drop value}"
+      PASSTHROUGH_ARGS+=("$1" "$2")
       shift 2
       ;;
     --allow-plist-change)
       ALLOW_PLIST_CHANGE=1
+      PASSTHROUGH_ARGS+=("$1")
       shift
       ;;
     --skip-build)
       SKIP_BUILD=1
+      PASSTHROUGH_ARGS+=("$1")
+      shift
+      ;;
+    --update)
+      UPDATE=1
       shift
       ;;
     -h|--help)
@@ -220,6 +245,12 @@ SM_UNLOAD_TIMEOUT=$((10#$SM_UNLOAD_TIMEOUT))
 
 if [[ "$ADOPT" -eq 1 && "$SKIP_BUILD" -eq 1 ]]; then
   echo "--adopt and --skip-build take their source from different places; pick one" >&2
+  exit 2
+fi
+if [[ "$UPDATE" -eq 1 && ( "$SKIP_BUILD" -eq 1 || "$ADOPT" -eq 1 ) ]]; then
+  # Both deploy a binary that already exists, so the fetched source would never
+  # be built and the restart would claim a deploy it did not do.
+  echo "--update builds what it fetches; it cannot be combined with --skip-build or --adopt" >&2
   exit 2
 fi
 [[ "$ADOPT" -eq 1 ]] && SKIP_BUILD=1
@@ -340,7 +371,9 @@ cutover_args=(
 # Staging lives beside the installed binary so the install is an atomic rename.
 SM_STAGING="$SM_BINARY.staging.$$"
 RENDERED_PLIST=""
-SM_LOCK="${SM_LOCK:-${TMPDIR:-/tmp}/sm-restart-$SM_LABEL.lock}"
+# A fixed path, not one under $TMPDIR: agent sandboxes give sessions their own
+# TMPDIR, and two restarts that compute different lock paths exclude nothing.
+SM_LOCK="${SM_LOCK:-$HOME/.local/share/claude-sessions/sm-restart-$SM_LABEL.lock}"
 LOCK_OWNED=0
 
 cleanup() {
@@ -359,6 +392,21 @@ trap cleanup EXIT
 # has no flock(1). Held for the whole run, verification included.
 acquire_lock() {
   local holder
+  # --update re-execs the freshly fetched copy of this script while holding the
+  # lock. exec keeps the pid, so the lock's recorded holder is already this
+  # process; that match is what makes the handoff safe to accept.
+  if [[ -n "${SM_RESTART_LOCK_HANDOFF:-}" ]]; then
+    holder="$(cat "$SM_LOCK/pid" 2>/dev/null || true)"
+    [[ "$SM_RESTART_LOCK_HANDOFF" == "$SM_LOCK" && "$holder" == "$$" ]] \
+      || fail "SM_RESTART_LOCK_HANDOFF is set but $SM_LOCK is not held by this
+       process (holder: ${holder:-none}). It is only for the handoff --update
+       makes to the updated script; unset it and re-run. The running service was
+       not touched."
+    LOCK_OWNED=1
+    unset SM_RESTART_LOCK_HANDOFF
+    return 0
+  fi
+  mkdir -p "$(dirname "$SM_LOCK")" 2>/dev/null || true
   if mkdir "$SM_LOCK" 2>/dev/null; then
     LOCK_OWNED=1
     echo $$ > "$SM_LOCK/pid"
@@ -471,6 +519,49 @@ launchctl_field() {
         '!found && $0 ~ "^[[:space:]]*" key " = " { print $2; found = 1 }'
 }
 
+git_repo() { git -C "$REPO_ROOT" "$@"; }
+
+# The commit plus the tracked working-tree contents the build compiles. Untracked
+# files are left out: a checkout routinely has some, and a pull does not create
+# them. Empty when this is not a git checkout.
+source_fingerprint() {
+  local head
+  head="$(git_repo rev-parse HEAD 2>/dev/null)" || return 0
+  git_repo update-index -q --refresh >/dev/null 2>&1 || true
+  printf '%s %s\n' "$head" "$(git_repo diff HEAD --binary | git_repo hash-object --stdin)"
+}
+
+# Runs under the lock, before anything reads the source tree.
+update_checkout() {
+  local branch head remote_head
+  git_repo rev-parse --git-dir >/dev/null 2>&1 \
+    || fail "--update needs a git checkout, and $REPO_ROOT is not one. The running
+       service was not touched."
+  branch="$(git_repo symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  [[ "$branch" == "$SM_DEPLOY_BRANCH" ]] \
+    || fail "--update deploys $SM_DEPLOY_BRANCH, but $REPO_ROOT is on '${branch:-a detached HEAD}'.
+       The running service was not touched."
+  git_repo update-index -q --refresh >/dev/null 2>&1 || true
+  git_repo diff --quiet HEAD \
+    || fail "$REPO_ROOT has uncommitted changes to tracked files; --update deploys
+       exactly $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH. Commit or discard them first
+       (git -C $REPO_ROOT status). The running service was not touched."
+  git_repo fetch --quiet "$SM_DEPLOY_REMOTE" "$SM_DEPLOY_BRANCH" \
+    || fail "could not fetch $SM_DEPLOY_REMOTE $SM_DEPLOY_BRANCH. The running service was not touched."
+  remote_head="$(git_repo rev-parse FETCH_HEAD)"
+  git_repo merge --quiet --ff-only "$remote_head" \
+    || fail "$REPO_ROOT cannot fast-forward to $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH
+       ($remote_head). The running service was not touched."
+  head="$(git_repo rev-parse HEAD)"
+  # merge --ff-only is a no-op when the checkout is ahead, which would deploy
+  # commits that are on no reviewed branch.
+  [[ "$head" == "$remote_head" ]] \
+    || fail "$REPO_ROOT is at $head, which has commits $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH
+       ($remote_head) does not. Deploy only what is on $SM_DEPLOY_BRANCH. The running
+       service was not touched."
+  git_repo log -1 --format='checkout at %h %s' HEAD
+}
+
 # ---------------------------------------------------------------------------
 # Phase 1: everything that can fail without consequence.
 # Nothing below this line may touch the running service, and nothing may write
@@ -480,6 +571,21 @@ launchctl_field() {
 step "Taking the restart lock"
 acquire_lock
 echo "holding $SM_LOCK"
+
+if [[ "$UPDATE" -eq 1 ]]; then
+  step "Fast-forwarding $REPO_ROOT to $SM_DEPLOY_REMOTE/$SM_DEPLOY_BRANCH (--update)"
+  update_checkout
+  # The fast-forward may have changed this script. Finish with the new copy, so
+  # the restart logic matches the code it deploys; it keeps the lock (see
+  # acquire_lock). exec does not run the EXIT trap, so the lock survives.
+  export SM_LOCK SM_RESTART_LOCK_HANDOFF="$SM_LOCK"
+  exec bash "$REPO_ROOT/scripts/restart-rust-server.sh" ${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}
+fi
+
+# Taken under the lock, so any change to the source from here on is somebody
+# working in this checkout outside it.
+SOURCE_AT_START="$(source_fingerprint)"
+[[ -n "$SOURCE_AT_START" ]] && echo "source: ${SOURCE_AT_START%% *}"
 
 step "Recording pre-restart state"
 BEFORE_HEALTHY=0
@@ -613,7 +719,7 @@ elif [[ "$SKIP_BUILD" -eq 1 ]]; then
   SOURCE_BINARY="$SM_BINARY"
 else
   step "Building sm-server (service still running)"
-  cargo build --release -p sm-server --target-dir "$SM_TARGET_DIR" \
+  cargo build --release -p sm-server --manifest-path "$REPO_ROOT/Cargo.toml" --target-dir "$SM_TARGET_DIR" \
     || fail "build failed - the running service was not touched"
   [[ -x "$SM_CARGO_OUTPUT" ]] \
     || fail "build reported success but produced no executable at $SM_CARGO_OUTPUT - the running service was not touched"
@@ -660,6 +766,17 @@ else
   # --skip-build/--adopt can be deploying a build from before the flag existed.
   echo "WARNING: this binary has no --check-config, so the configuration was not validated" >&2
 fi
+
+step "Confirming the source did not move during the build"
+# A pull or merge in this checkout while cargo ran can produce a binary that
+# matches no commit. Only --update moves the checkout under the lock.
+if [[ "$(source_fingerprint)" != "$SOURCE_AT_START" ]]; then
+  fail "$REPO_ROOT changed while this restart was building (was: ${SOURCE_AT_START:-not a git checkout}).
+       Something pulled, merged, or edited files in it outside the restart lock,
+       so the build may match no commit. Re-run with --update; do not pull in the
+       deployed checkout by hand. The running service was not touched."
+fi
+echo "source unchanged"
 
 # ---------------------------------------------------------------------------
 # Phase 2: from here on the service is affected.
@@ -758,6 +875,9 @@ fi
 step "Refreshing the installed sm CLI"
 if [[ "$SKIP_BUILD" -eq 1 ]]; then
   echo "skipped (--skip-build): the installed CLI is whatever was there before"
+elif [[ "$(source_fingerprint)" != "$SOURCE_AT_START" ]]; then
+  echo "WARNING: $REPO_ROOT changed after the server build, so the sm CLI was not" >&2
+  echo "         rebuilt from it; $SM_LABEL itself is healthy. Re-run with --update." >&2
 elif "$REPO_ROOT/scripts/install-sm-cli.sh"; then
   :
 else

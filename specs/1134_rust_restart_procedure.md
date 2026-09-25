@@ -92,6 +92,10 @@ nothing in it touches the service.
 
 ```
 Phase 1 (service untouched on any failure; nothing writes the registered path)
+  take the restart lock (fixed path under ~/.local/share/claude-sessions)
+  --update only: fast-forward the checkout to origin/main, then exec the
+         updated script, which keeps the lock (sm#1533)
+  fingerprint the source: HEAD plus tracked working-tree contents
   record /health and session count (a healthy server must yield a baseline)
   preflight: cutover executable, config readable, local-env readable,
              no lingering Python label, registered path is NOT cargo's output,
@@ -104,6 +108,7 @@ Phase 1 (service untouched on any failure; nothing writes the registered path)
   codesign --verify --strict <staging>
   verify staged Identifier, non-ad-hoc certificate Authority, and exact
          configured certificate-anchored designated requirement
+  refuse if the source fingerprint changed since the lock was taken
 Phase 2
   cutover stop-rust                     <- bootout
   confirm the job is really unloaded    <- the cutover swallows bootout failures
@@ -113,6 +118,27 @@ Phase 2
   require state=running and an unchanged pid for 20s
   require session count not to have dropped
 ```
+
+### Updating the checkout is part of the locked operation
+
+The lock stops two restarts overlapping, but agents used to update the deployed
+checkout themselves with `git pull`, outside the lock. One agent's pull could
+then move the source under another agent's build: on 2026-09-24 a pull landed
+a new module mid-build and the build failed on code it was never meant to
+compile; a luckier interleaving would have installed a binary that matches no
+commit (sm#1533). So `--update` fetches and fast-forwards under the lock, and is
+the only way to deploy. It refuses a checkout that is not on `main`, has
+uncommitted tracked changes, or has commits `origin/main` does not. Because the
+fast-forward can change the script itself, it then `exec`s the updated copy;
+`exec` keeps the pid, so the lock's recorded holder is still the running process
+and the new copy adopts the lock instead of taking a fresh one.
+
+Anyone who still pulls by hand is caught before the service is touched: the
+script records `HEAD` and a hash of the tracked working-tree contents when it
+takes the lock, and refuses to stop the service if either has changed by the
+end of phase 1. The lock is at a fixed path under the home directory, not under
+`$TMPDIR`, because agent sandboxes give sessions their own `TMPDIR`, and two
+restarts with different lock paths exclude nothing.
 
 ### The service must not run out of the build directory
 
