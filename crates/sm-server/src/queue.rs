@@ -4102,10 +4102,11 @@ pub fn queue_job_termination_reason(
 
 fn memory_guard_detail_text(detail: &JsonValue) -> String {
     let bytes = |key: &str| {
-        detail
-            .get(key)
-            .and_then(JsonValue::as_i64)
-            .map_or_else(|| "unknown".to_owned(), memory_amount_text)
+        detail.get(key).and_then(JsonValue::as_i64).map_or_else(
+            || "unknown".to_owned(),
+            // Exact bytes so small budgets stay comparable; GiB for scale.
+            |value| format!("{value}B({})", memory_amount_text(value).replace(' ', "")),
+        )
     };
     format!(
         " memory_guard: rss={} limit={} host_available={} reserve={} failed_host_samples={} sampled_at={}",
@@ -6136,7 +6137,7 @@ mod tests {
             .unwrap();
         assert_eq!(notifications.len(), 1);
         let text = &notifications[0].text;
-        assert!(text.contains("completed: memory_exceeded termination=host_memory_pressure memory_guard: rss=20.0 GiB limit=240.0 GiB host_available=5.0 GiB reserve=8.0 GiB failed_host_samples=0 sampled_at=2026-09-12T09:45:52Z"), "{text}");
+        assert!(text.contains("completed: memory_exceeded termination=host_memory_pressure memory_guard: rss=21474836480B(20.0GiB) limit=257698037760B(240.0GiB) host_available=5368709120B(5.0GiB) reserve=8589934592B(8.0GiB) failed_host_samples=0 sampled_at=2026-09-12T09:45:52Z"), "{text}");
         assert!(!text.contains("termination=memory_budget"), "{text}");
         drop(conn);
         fs::remove_dir_all(state_dir).unwrap();
