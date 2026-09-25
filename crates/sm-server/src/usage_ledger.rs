@@ -303,9 +303,11 @@ impl UsageLedgerStore {
                     account_key, window_kind, window_scope, window_start, resets_at
                   )
                 );
-                CREATE INDEX IF NOT EXISTS idx_burn_window_materialization_source
+                DROP INDEX IF EXISTS idx_burn_window_materialization_source;
+                CREATE INDEX IF NOT EXISTS idx_burn_window_observed
                   ON burn_samples(
-                    account_key, window_kind, window_scope, window_start, resets_at
+                    account_key, window_kind, window_scope, window_start, resets_at,
+                    observed_at
                   );
 
                 CREATE TABLE IF NOT EXISTS message_alias (
@@ -403,6 +405,7 @@ impl UsageLedgerStore {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let repaired_at = format_timestamp(OffsetDateTime::now_utc())?;
         let mut tokens_removed = 0;
+        let mut windows = BurnWindows::default();
         for msg_id in &ids {
             let incumbent = load_contribution(&tx, *msg_id)?;
             record_codex_inheritance(
@@ -420,7 +423,7 @@ impl UsageLedgerStore {
             };
             reverse_contribution(&tx, *msg_id, &incumbent)?;
             overwrite_contribution(&tx, *msg_id, &repaired)?;
-            materialize_contribution(&tx, *msg_id, &repaired)?;
+            materialize_contribution(&tx, &mut windows, *msg_id, &repaired)?;
         }
         tx.execute(
             "INSERT INTO usage_repairs (name, applied_at, rows, tokens) VALUES (?1, ?2, ?3, ?4)",
@@ -592,8 +595,9 @@ impl UsageLedgerStore {
             .iter()
             .map(|seat| (seat.seat_id.clone(), seat.clone()))
             .collect::<BTreeMap<_, _>>();
-        self.rebind_provisional_messages(&bindings, &seat_meta)?;
-        self.reconcile_unknown_models(&seat_meta)?;
+        let mut windows = BurnWindows::default();
+        self.rebind_provisional_messages(&bindings, &seat_meta, &mut windows)?;
+        self.reconcile_unknown_models(&seat_meta, &mut windows)?;
         let mut artifacts = expand_artifacts(&bindings);
         // Oldest first: a resumed Codex thread continues in a newer events file, and its cursor
         // only accepts totals above what it has booked.
@@ -605,14 +609,14 @@ impl UsageLedgerStore {
         let mut summary = ScanSummary::default();
         let mut errors = Vec::new();
         for artifact in artifacts {
-            let artifact_summary = match self.scan_artifact(&artifact, &seat_by_source, &seat_meta)
-            {
-                Ok(summary) => summary,
-                Err(error) => {
-                    errors.push(format!("{}: {error:#}", artifact.path.display()));
-                    continue;
-                }
-            };
+            let artifact_summary =
+                match self.scan_artifact(&artifact, &seat_by_source, &seat_meta, &mut windows) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        errors.push(format!("{}: {error:#}", artifact.path.display()));
+                        continue;
+                    }
+                };
             summary.artifacts_scanned += artifact_summary.artifacts_scanned;
             summary.messages_inserted += artifact_summary.messages_inserted;
             summary.messages_replaced += artifact_summary.messages_replaced;
@@ -704,6 +708,7 @@ impl UsageLedgerStore {
         &self,
         bindings: &[ArtifactBinding],
         seat_meta: &BTreeMap<String, UsageSeatMetadata>,
+        windows: &mut BurnWindows,
     ) -> Result<()> {
         let mut connection = self.open()?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -747,7 +752,7 @@ impl UsageLedgerStore {
                         .unwrap_or(rebound.model);
                 }
                 overwrite_contribution(&tx, msg_id, &rebound)?;
-                materialize_contribution(&tx, msg_id, &rebound)?;
+                materialize_contribution(&tx, windows, msg_id, &rebound)?;
             }
         }
         tx.commit()?;
@@ -757,6 +762,7 @@ impl UsageLedgerStore {
     fn reconcile_unknown_models(
         &self,
         seat_meta: &BTreeMap<String, UsageSeatMetadata>,
+        windows: &mut BurnWindows,
     ) -> Result<()> {
         let connection = self.open()?;
         // Only rows whose seat can resolve a model are rewritten; filtering here keeps
@@ -796,7 +802,7 @@ impl UsageLedgerStore {
                 let mut reconciled = incumbent;
                 reconciled.model = model;
                 overwrite_contribution(&tx, *msg_id, &reconciled)?;
-                materialize_contribution(&tx, *msg_id, &reconciled)?;
+                materialize_contribution(&tx, windows, *msg_id, &reconciled)?;
             }
             tx.commit()?;
             if index + 1 < ids.len().div_ceil(LEDGER_WRITE_BATCH_SIZE) {
@@ -816,9 +822,10 @@ impl UsageLedgerStore {
             .prepare("SELECT msg_id FROM message_ledger ORDER BY msg_id")?
             .query_map([], |row| row.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut windows = BurnWindows::default();
         for msg_id in ids {
             let contribution = load_contribution(&tx, msg_id)?;
-            materialize_contribution(&tx, msg_id, &contribution)?;
+            materialize_contribution(&tx, &mut windows, msg_id, &contribution)?;
         }
         tx.commit()?;
         Ok(())
@@ -940,6 +947,7 @@ impl UsageLedgerStore {
         artifact: &Artifact,
         seat_by_source: &BTreeMap<(String, String), String>,
         seat_meta: &BTreeMap<String, UsageSeatMetadata>,
+        windows: &mut BurnWindows,
     ) -> Result<ScanSummary> {
         let metadata = match fs::metadata(&artifact.path) {
             Ok(metadata) if metadata.is_file() => metadata,
@@ -1004,6 +1012,7 @@ impl UsageLedgerStore {
                             .map(|parsed| {
                                 self.resolve_claude_contribution(
                                     &tx,
+                                    windows,
                                     parsed,
                                     seat_by_source,
                                     seat_meta,
@@ -1024,6 +1033,7 @@ impl UsageLedgerStore {
                 .map(|event| {
                     self.process_codex_event(
                         &tx,
+                        windows,
                         artifact,
                         event,
                         seat_by_source,
@@ -1150,6 +1160,7 @@ impl UsageLedgerStore {
     fn resolve_claude_contribution(
         &self,
         tx: &Transaction<'_>,
+        windows: &mut BurnWindows,
         parsed: ParsedMessage,
         seat_by_source: &BTreeMap<(String, String), String>,
         seat_meta: &BTreeMap<String, UsageSeatMetadata>,
@@ -1171,7 +1182,8 @@ impl UsageLedgerStore {
             .get(&seat_id)
             .map(|seat| seat.project_key.clone())
             .unwrap_or_else(|| UsageSeatMetadata::resolve_project_key(&parsed.cwd));
-        let credit_metered = credit_metered(tx, &account_key, &parsed.model, parsed.timestamp)?;
+        let credit_metered =
+            credit_metered(tx, windows, &account_key, &parsed.model, parsed.timestamp)?;
         let contribution = Contribution {
             message_id: parsed.message_id,
             request_id: parsed.request_id,
@@ -1190,12 +1202,14 @@ impl UsageLedgerStore {
             tokens: parsed.tokens,
             credit_metered,
         };
-        Ok(Some(ingest_contribution(tx, &contribution)?))
+        Ok(Some(ingest_contribution(tx, windows, &contribution)?))
     }
 
+    #[allow(clippy::too_many_arguments)] // the scan threads its per-artifact state through each event
     fn process_codex_event(
         &self,
         tx: &Transaction<'_>,
+        windows: &mut BurnWindows,
         artifact: &Artifact,
         event: CodexEvent,
         seat_by_source: &BTreeMap<(String, String), String>,
@@ -1277,7 +1291,7 @@ impl UsageLedgerStore {
                     .map(|seat| seat.project_key.clone())
                     .or_else(|| artifact_project_key.map(ToOwned::to_owned))
                     .unwrap_or_else(|| "unassigned".to_owned());
-                let credit_metered = credit_metered(tx, &account_key, &model, timestamp)?;
+                let credit_metered = credit_metered(tx, windows, &account_key, &model, timestamp)?;
                 let contribution = Contribution {
                     // Keyed by the cumulative total, which is unique per booked event within a
                     // thread; `seq` repeats across the artifacts of a resumed thread.
@@ -1310,7 +1324,7 @@ impl UsageLedgerStore {
                 let outcome = if contribution.total_tokens == 0 {
                     IngestOutcome::Ignored
                 } else {
-                    ingest_contribution(tx, &contribution)?
+                    ingest_contribution(tx, windows, &contribution)?
                 };
                 save_codex_cursor(tx, &thread_id, &artifact.path, source_seq, &totals)?;
                 Ok(Some(outcome))
@@ -2179,7 +2193,11 @@ enum IngestOutcome {
     Ignored,
 }
 
-fn ingest_contribution(tx: &Transaction<'_>, candidate: &Contribution) -> Result<IngestOutcome> {
+fn ingest_contribution(
+    tx: &Transaction<'_>,
+    windows: &mut BurnWindows,
+    candidate: &Contribution,
+) -> Result<IngestOutcome> {
     let exact_key = alias_key(
         "exact",
         &candidate.message_id,
@@ -2205,14 +2223,14 @@ fn ingest_contribution(tx: &Transaction<'_>, candidate: &Contribution) -> Result
         if should_replace(candidate, &incumbent) {
             reverse_contribution(tx, msg_id, &incumbent)?;
             overwrite_contribution(tx, msg_id, candidate)?;
-            materialize_contribution(tx, msg_id, candidate)?;
+            materialize_contribution(tx, windows, msg_id, candidate)?;
             (msg_id, IngestOutcome::Replaced)
         } else {
             (msg_id, IngestOutcome::Ignored)
         }
     } else {
         let msg_id = insert_contribution(tx, candidate)?;
-        materialize_contribution(tx, msg_id, candidate)?;
+        materialize_contribution(tx, windows, msg_id, candidate)?;
         (msg_id, IngestOutcome::Inserted)
     };
     upsert_alias(tx, &exact_key, "exact", msg_id)?;
@@ -2402,8 +2420,13 @@ fn load_contribution(tx: &Transaction<'_>, msg_id: i64) -> Result<Contribution> 
     )
 }
 
-fn materialize_contribution(tx: &Transaction<'_>, msg_id: i64, value: &Contribution) -> Result<()> {
-    for window in windows_for(tx, value)? {
+fn materialize_contribution(
+    tx: &Transaction<'_>,
+    windows: &mut BurnWindows,
+    msg_id: i64,
+    value: &Contribution,
+) -> Result<()> {
+    for window in windows_for(tx, windows, value)? {
         materialize_contribution_for_window(tx, msg_id, value, &window)?;
     }
     Ok(())
@@ -2452,35 +2475,110 @@ struct MessageWindow {
     start: String,
 }
 
-fn windows_for(tx: &Transaction<'_>, value: &Contribution) -> Result<Vec<MessageWindow>> {
+fn windows_for(
+    tx: &Transaction<'_>,
+    windows: &mut BurnWindows,
+    value: &Contribution,
+) -> Result<Vec<MessageWindow>> {
     let timestamp = format_timestamp(value.timestamp)?;
-    let rows = tx
-        .prepare(
-            r#"
-            SELECT DISTINCT window_kind, window_start, window_scope
-            FROM burn_samples
-            WHERE account_key = ?1 AND window_start <= ?2 AND ?2 < resets_at
-            ORDER BY window_kind, window_start
-            "#,
-        )?
-        .query_map(params![value.account_key, timestamp], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows
+    let mut rows = windows
+        .containing(tx, &value.account_key, &timestamp)?
         .into_iter()
-        .filter(|(kind, _, scope)| {
-            kind != "weekly_scoped"
-                || scope
+        .filter(|window| {
+            window.kind != "weekly_scoped"
+                || window
+                    .scope
                     .as_deref()
                     .is_some_and(|scope| model_matches_scope(&value.model, scope))
         })
-        .map(|(kind, start, _)| MessageWindow { kind, start })
-        .collect())
+        .map(|window| MessageWindow {
+            kind: window.kind.clone(),
+            start: window.start.clone(),
+        })
+        .collect::<Vec<_>>();
+    rows.dedup_by(|a, b| a.kind == b.kind && a.start == b.start);
+    Ok(rows)
+}
+
+/// The distinct windows of `burn_samples`, per account.
+///
+/// A message belongs to the window of every sample with `window_start <= ts < resets_at`.
+/// Asking SQLite per message walks every sample of the account: hundreds of thousands of rows,
+/// against a few thousand distinct windows. `burn_samples` is append-only, so the cache catches
+/// up by id and reloads from scratch only if the table ever shrinks. Every read happens inside
+/// the caller's transaction, so it sees the same rows a direct query would.
+#[derive(Debug, Default)]
+struct BurnWindows {
+    max_id: i64,
+    by_account: BTreeMap<String, BTreeSet<SampleWindow>>,
+}
+
+/// Ordered like the SQL it replaces: by kind, then start.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SampleWindow {
+    kind: String,
+    start: String,
+    scope: Option<String>,
+    resets_at: String,
+}
+
+impl BurnWindows {
+    fn containing(
+        &mut self,
+        tx: &Transaction<'_>,
+        account_key: &str,
+        timestamp: &str,
+    ) -> Result<Vec<&SampleWindow>> {
+        self.refresh(tx)?;
+        Ok(self
+            .by_account
+            .get(account_key)
+            .into_iter()
+            .flatten()
+            .filter(|window| {
+                window.start.as_str() <= timestamp && timestamp < window.resets_at.as_str()
+            })
+            .collect())
+    }
+
+    fn refresh(&mut self, tx: &Transaction<'_>) -> Result<()> {
+        let max_id = tx.query_row("SELECT COALESCE(MAX(id), 0) FROM burn_samples", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        if max_id == self.max_id {
+            return Ok(());
+        }
+        if max_id < self.max_id {
+            *self = Self::default();
+        }
+        let mut statement = tx.prepare_cached(
+            r#"
+            SELECT DISTINCT account_key, window_kind, window_start, window_scope, resets_at
+            FROM burn_samples
+            WHERE id > ?1 AND id <= ?2
+            "#,
+        )?;
+        let rows = statement.query_map(params![self.max_id, max_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                SampleWindow {
+                    kind: row.get(1)?,
+                    start: row.get(2)?,
+                    scope: row.get(3)?,
+                    resets_at: row.get(4)?,
+                },
+            ))
+        })?;
+        for row in rows {
+            let (account_key, window) = row?;
+            self.by_account
+                .entry(account_key)
+                .or_default()
+                .insert(window);
+        }
+        self.max_id = max_id;
+        Ok(())
+    }
 }
 
 fn apply_rollup(
@@ -2775,6 +2873,7 @@ fn predates_first_account_interval(
 
 fn credit_metered(
     tx: &Transaction<'_>,
+    windows: &mut BurnWindows,
     account_key: &str,
     model: &str,
     timestamp: OffsetDateTime,
@@ -2798,36 +2897,58 @@ fn credit_metered(
     if excluded_premium {
         return Ok(true);
     }
+    if !extra_usage_enabled.unwrap_or(false) {
+        return Ok(false);
+    }
+    // The latest sample observed by `timestamp` of each (kind, scope) whose window contains it.
     let timestamp = format_timestamp(timestamp)?;
-    let samples = tx
-        .prepare(
-            r#"
-            SELECT window_kind, window_scope, percent
-            FROM burn_samples
-            WHERE account_key = ?1 AND observed_at <= ?2
-              AND window_start <= ?2 AND ?2 < resets_at
-            ORDER BY observed_at DESC, id DESC
-            "#,
-        )?
-        .query_map(params![account_key, timestamp], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, f64>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut seen = BTreeSet::new();
-    let exhausted = samples.into_iter().any(|(kind, scope, percent)| {
-        let key = (kind.clone(), scope.clone());
-        seen.insert(key)
-            && (kind != "weekly_scoped"
-                || scope
-                    .as_deref()
-                    .is_some_and(|scope| model_matches_scope(model, scope)))
+    let mut latest = BTreeMap::<(&str, Option<&str>), (String, i64, f64)>::new();
+    for window in windows.containing(tx, account_key, &timestamp)? {
+        let sample = tx
+            .prepare_cached(
+                r#"
+                SELECT observed_at, id, percent
+                FROM burn_samples
+                WHERE account_key = ?1 AND window_kind = ?2 AND window_scope IS ?3
+                  AND window_start = ?4 AND resets_at = ?5 AND observed_at <= ?6
+                ORDER BY observed_at DESC, id DESC
+                LIMIT 1
+                "#,
+            )?
+            .query_row(
+                params![
+                    account_key,
+                    window.kind,
+                    window.scope,
+                    window.start,
+                    window.resets_at,
+                    timestamp
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, f64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(sample) = sample else {
+            continue;
+        };
+        let key = (window.kind.as_str(), window.scope.as_deref());
+        if latest
+            .get(&key)
+            .is_none_or(|(observed_at, id, _)| (&sample.0, sample.1) > (observed_at, *id))
+        {
+            latest.insert(key, sample);
+        }
+    }
+    let exhausted = latest.into_iter().any(|((kind, scope), (_, _, percent))| {
+        (kind != "weekly_scoped" || scope.is_some_and(|scope| model_matches_scope(model, scope)))
             && percent >= 100.0
     });
-    Ok(exhausted && extra_usage_enabled.unwrap_or(false))
+    Ok(exhausted)
 }
 
 fn account_metadata_at(
@@ -3255,7 +3376,7 @@ mod tests {
         let mut value = contribution_at("codex-visible", "turn-one", "2026-08-17T16:02:00Z");
         value.account_key = "codex:account-one".to_owned();
         value.model = "gpt-5.6-terra".to_owned();
-        ingest_contribution(&tx, &value).unwrap();
+        ingest_contribution(&tx, &mut BurnWindows::default(), &value).unwrap();
         tx.commit().unwrap();
 
         // Codex advances this boundary with every scan while the same bucket remains visible.
@@ -3337,6 +3458,282 @@ mod tests {
             baseline.contains("idx_ledger_source_seq"),
             "codex cursor baseline lookup must not scan the ledger: {baseline}"
         );
+        let latest_sample = plan(
+            "SELECT observed_at, id, percent FROM burn_samples              WHERE account_key = 'a' AND window_kind = 'k' AND window_scope IS NULL              AND window_start = 's' AND resets_at = 'r' AND observed_at <= 't'              ORDER BY observed_at DESC, id DESC LIMIT 1",
+        );
+        assert!(
+            latest_sample.contains("idx_burn_window_observed")
+                && !latest_sample.contains("TEMP B-TREE"),
+            "credit metering must read one sample per window: {latest_sample}"
+        );
+    }
+
+    /// Inserts one `burn_samples` row; `resets_at` fixes `window_start` as the writers do.
+    #[allow(clippy::too_many_arguments)] // each argument is a distinct column of the sample
+    fn insert_burn_sample(
+        connection: &Connection,
+        account_key: &str,
+        kind: &str,
+        scope: Option<&str>,
+        duration_minutes: i64,
+        resets_at: OffsetDateTime,
+        percent: f64,
+        observed_at: OffsetDateTime,
+    ) {
+        connection
+            .execute(
+                r#"
+                INSERT INTO burn_samples (
+                  account_key, window_kind, window_scope, window_start, percent, resets_at,
+                  severity, is_active, source, observed_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 1, 'test', ?7)
+                "#,
+                params![
+                    account_key,
+                    kind,
+                    scope,
+                    format_timestamp(derive_window_start(resets_at, duration_minutes).unwrap())
+                        .unwrap(),
+                    percent,
+                    format_timestamp(resets_at).unwrap(),
+                    format_timestamp(observed_at).unwrap(),
+                ],
+            )
+            .unwrap();
+    }
+
+    /// `windows_for` and `credit_metered` as single SQL queries over every sample, before #1196.
+    fn windows_and_exhaustion_by_sql(
+        tx: &Transaction<'_>,
+        account_key: &str,
+        model: &str,
+        timestamp: OffsetDateTime,
+    ) -> (Vec<(String, String)>, bool) {
+        let timestamp = format_timestamp(timestamp).unwrap();
+        let mut windows = tx
+            .prepare(
+                r#"
+                SELECT DISTINCT window_kind, window_start, window_scope
+                FROM burn_samples
+                WHERE account_key = ?1 AND window_start <= ?2 AND ?2 < resets_at
+                ORDER BY window_kind, window_start
+                "#,
+            )
+            .unwrap()
+            .query_map(params![account_key, timestamp], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .into_iter()
+            .filter(|(kind, _, scope)| {
+                kind != "weekly_scoped"
+                    || scope
+                        .as_deref()
+                        .is_some_and(|scope| model_matches_scope(model, scope))
+            })
+            .map(|(kind, start, _)| (kind, start))
+            .collect::<Vec<_>>();
+        windows.dedup();
+        let samples = tx
+            .prepare(
+                r#"
+                SELECT window_kind, window_scope, percent
+                FROM burn_samples
+                WHERE account_key = ?1 AND observed_at <= ?2
+                  AND window_start <= ?2 AND ?2 < resets_at
+                ORDER BY observed_at DESC, id DESC
+                "#,
+            )
+            .unwrap()
+            .query_map(params![account_key, timestamp], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let mut seen = BTreeSet::new();
+        let exhausted = samples.into_iter().any(|(kind, scope, percent)| {
+            seen.insert((kind.clone(), scope.clone()))
+                && (kind != "weekly_scoped"
+                    || scope
+                        .as_deref()
+                        .is_some_and(|scope| model_matches_scope(model, scope)))
+                && percent >= 100.0
+        });
+        (windows, exhausted)
+    }
+
+    #[test]
+    fn cached_burn_windows_match_per_message_sql() {
+        let dir = TestDir::new("cached-burn-windows");
+        let db_path = dir.0.join("usage.db");
+        UsageLedgerStore::new(&db_path).unwrap();
+        let mut connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO accounts (
+                  account_key, provider, external_id, plan_tier, extra_usage_enabled,
+                  first_seen, last_seen
+                ) VALUES
+                  ('claude:one', 'claude', 'one', 'max', 1, '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z'),
+                  ('claude:two', 'claude', 'two', 'max', 1, '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+        // Deterministic samples over three weeks: a Codex-style start that drifts by seconds
+        // between samples, windows that overlap, scoped windows, samples observed after the
+        // message, and percentages on both sides of exhaustion.
+        let origin = at("2026-08-01T00:00:00Z");
+        let mut seed = 0x1196_u64;
+        let mut next = |bound: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % bound
+        };
+        let kinds = [
+            ("session_5h", None, 300),
+            ("weekly_all", None, 10_080),
+            ("weekly_scoped", Some("opus"), 10_080),
+            ("weekly_scoped", Some("sonnet"), 10_080),
+            ("codex_10080", None, 10_080),
+        ];
+        for _ in 0..3_000 {
+            let account = if next(4) == 0 {
+                "claude:two"
+            } else {
+                "claude:one"
+            };
+            let (kind, scope, duration) = kinds[next(kinds.len() as u64) as usize];
+            let period = time::Duration::minutes(duration);
+            let resets_at = origin
+                + period * (next(21 * 24 * 60 / duration as u64 + 2) as i32)
+                + time::Duration::seconds(next(4) as i64);
+            let observed_at =
+                resets_at - period + time::Duration::minutes(next(duration as u64 + 60) as i64);
+            let percent = [10.0, 99.5, 100.0, 120.0][next(4) as usize];
+            insert_burn_sample(
+                &connection,
+                account,
+                kind,
+                scope,
+                duration,
+                resets_at,
+                percent,
+                observed_at,
+            );
+        }
+        let tx = connection.transaction().unwrap();
+        let mut windows = BurnWindows::default();
+        let mut exhausted_messages = 0;
+        for step in 0..2_000 {
+            let timestamp = origin + time::Duration::minutes(step * 17);
+            for (account, model) in [
+                ("claude:one", "claude-opus-4"),
+                ("claude:one", "claude-sonnet-4"),
+                ("claude:two", "claude-opus-4"),
+                ("claude:none", "claude-opus-4"),
+            ] {
+                let mut value = contribution("message", "request", false, false, 1);
+                value.account_key = account.to_owned();
+                value.model = model.to_owned();
+                value.timestamp = timestamp;
+                let cached = windows_for(&tx, &mut windows, &value)
+                    .unwrap()
+                    .into_iter()
+                    .map(|window| (window.kind, window.start))
+                    .collect::<Vec<_>>();
+                let metered = credit_metered(&tx, &mut windows, account, model, timestamp).unwrap();
+                let expected = windows_and_exhaustion_by_sql(&tx, account, model, timestamp);
+                assert_eq!(
+                    (cached, metered),
+                    expected,
+                    "{account} {model} at {timestamp}"
+                );
+                exhausted_messages += usize::from(metered);
+            }
+        }
+        assert!(exhausted_messages > 100, "fixture must exercise exhaustion");
+    }
+
+    #[test]
+    fn cached_burn_windows_follow_samples_appended_between_transactions() {
+        let dir = TestDir::new("cached-burn-windows-append");
+        let db_path = dir.0.join("usage.db");
+        UsageLedgerStore::new(&db_path).unwrap();
+        let mut connection = Connection::open(&db_path).unwrap();
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute(
+                "INSERT INTO accounts (account_key, provider, external_id, first_seen, last_seen) \
+                 VALUES ('claude:one', 'claude', 'one', '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let resets_at = at("2026-08-10T21:00:00Z");
+        let inside = format_timestamp(at("2026-08-10T18:00:00Z")).unwrap();
+        let starts = |connection: &mut Connection, windows: &mut BurnWindows| {
+            let tx = connection.transaction().unwrap();
+            let starts = windows
+                .containing(&tx, "claude:one", &inside)
+                .unwrap()
+                .into_iter()
+                .map(|window| window.start.clone())
+                .collect::<Vec<_>>();
+            tx.commit().unwrap();
+            starts
+        };
+        let mut windows = BurnWindows::default();
+        assert!(starts(&mut connection, &mut windows).is_empty());
+
+        let observed_at = at("2026-08-10T16:00:00Z");
+        insert_burn_sample(
+            &writer,
+            "claude:one",
+            "session_5h",
+            None,
+            300,
+            resets_at,
+            1.0,
+            observed_at,
+        );
+        assert_eq!(
+            starts(&mut connection, &mut windows),
+            ["2026-08-10T16:00:00.000000000Z"]
+        );
+
+        let drifted = resets_at + time::Duration::seconds(1);
+        insert_burn_sample(
+            &writer,
+            "claude:one",
+            "session_5h",
+            None,
+            300,
+            drifted,
+            1.0,
+            observed_at,
+        );
+        assert_eq!(
+            starts(&mut connection, &mut windows),
+            [
+                "2026-08-10T16:00:00.000000000Z",
+                "2026-08-10T16:00:01.000000000Z"
+            ]
+        );
+
+        writer.execute("DELETE FROM burn_samples", []).unwrap();
+        assert!(starts(&mut connection, &mut windows).is_empty());
     }
 
     #[test]
@@ -3488,6 +3885,7 @@ mod tests {
         let tx = connection.transaction().unwrap();
         ingest_contribution(
             &tx,
+            &mut BurnWindows::default(),
             &contribution_at("subminute", "subminute-request", "2026-08-10T16:05:45Z"),
         )
         .unwrap();
@@ -3522,6 +3920,7 @@ mod tests {
         for index in 0..64 {
             ingest_contribution(
                 &tx,
+                &mut BurnWindows::default(),
                 &contribution_at(
                     &format!("message-{index}"),
                     &format!("request-{index}"),
@@ -3578,11 +3977,13 @@ mod tests {
         let tx = connection.transaction().unwrap();
         ingest_contribution(
             &tx,
+            &mut BurnWindows::default(),
             &contribution_at("eligible", "eligible-request", "2026-08-10T16:00:00Z"),
         )
         .unwrap();
         ingest_contribution(
             &tx,
+            &mut BurnWindows::default(),
             &contribution_at("outside", "outside-request", "2026-08-10T19:00:00Z"),
         )
         .unwrap();
@@ -3645,6 +4046,7 @@ mod tests {
         let tx = connection.transaction().unwrap();
         ingest_contribution(
             &tx,
+            &mut BurnWindows::default(),
             &contribution_at("eligible", "eligible-request", "2026-08-10T16:00:00Z"),
         )
         .unwrap();
@@ -3709,6 +4111,7 @@ mod tests {
         for index in 0..4096 {
             ingest_contribution(
                 &tx,
+                &mut BurnWindows::default(),
                 &contribution_at(
                     &format!("message-{index}"),
                     &format!("request-{index}"),
@@ -3858,6 +4261,7 @@ mod tests {
         let tx = connection.transaction().unwrap();
         ingest_contribution(
             &tx,
+            &mut BurnWindows::default(),
             &contribution_at("eligible", "eligible-request", "2026-08-10T16:00:00Z"),
         )
         .unwrap();
@@ -4053,35 +4457,35 @@ mod tests {
 
         let replay = contribution("shared", "replay-request", true, false, 800);
         assert_eq!(
-            ingest_contribution(&tx, &replay).unwrap(),
+            ingest_contribution(&tx, &mut BurnWindows::default(), &replay).unwrap(),
             IngestOutcome::Inserted
         );
         let parent = contribution("shared", "parent-request", false, false, 80);
         assert_eq!(
-            ingest_contribution(&tx, &parent).unwrap(),
+            ingest_contribution(&tx, &mut BurnWindows::default(), &parent).unwrap(),
             IngestOutcome::Replaced
         );
 
         let mut streamed = contribution("streamed", "stream-request", false, false, 1);
         assert_eq!(
-            ingest_contribution(&tx, &streamed).unwrap(),
+            ingest_contribution(&tx, &mut BurnWindows::default(), &streamed).unwrap(),
             IngestOutcome::Inserted
         );
         streamed.tokens.output += 10;
         streamed.total_tokens = streamed.tokens.total();
         assert_eq!(
-            ingest_contribution(&tx, &streamed).unwrap(),
+            ingest_contribution(&tx, &mut BurnWindows::default(), &streamed).unwrap(),
             IngestOutcome::Replaced
         );
 
         let mut speed = contribution("speed", "speed-request", false, false, 1);
         assert_eq!(
-            ingest_contribution(&tx, &speed).unwrap(),
+            ingest_contribution(&tx, &mut BurnWindows::default(), &speed).unwrap(),
             IngestOutcome::Inserted
         );
         speed.has_speed = true;
         assert_eq!(
-            ingest_contribution(&tx, &speed).unwrap(),
+            ingest_contribution(&tx, &mut BurnWindows::default(), &speed).unwrap(),
             IngestOutcome::Replaced
         );
 
@@ -5523,6 +5927,7 @@ mod tests {
         let tx = connection.transaction().unwrap();
         assert!(credit_metered(
             &tx,
+            &mut BurnWindows::default(),
             "claude:account-one",
             "claude-sonnet-5",
             at("2026-08-10T16:00:00Z")
@@ -5530,10 +5935,10 @@ mod tests {
         .unwrap());
 
         let quota = contribution("quota", "quota-request", false, false, 10);
-        ingest_contribution(&tx, &quota).unwrap();
+        ingest_contribution(&tx, &mut BurnWindows::default(), &quota).unwrap();
         let mut credits = contribution("credits", "credits-request", false, false, 10);
         credits.credit_metered = true;
-        ingest_contribution(&tx, &credits).unwrap();
+        ingest_contribution(&tx, &mut BurnWindows::default(), &credits).unwrap();
         let dimensions = tx
             .prepare(
                 "SELECT credit_metered, SUM(message_count), COUNT(*) FROM seat_tokens GROUP BY credit_metered ORDER BY credit_metered",
@@ -5623,6 +6028,7 @@ mod tests {
 
         assert!(!credit_metered(
             &tx,
+            &mut BurnWindows::default(),
             "claude:account-one",
             "claude-fable-5",
             at("2026-08-10T16:30:00Z")
@@ -5630,6 +6036,7 @@ mod tests {
         .unwrap());
         assert!(credit_metered(
             &tx,
+            &mut BurnWindows::default(),
             "claude:account-one",
             "claude-fable-5",
             at("2026-08-10T17:30:00Z")
@@ -5637,6 +6044,7 @@ mod tests {
         .unwrap());
         assert!(!credit_metered(
             &tx,
+            &mut BurnWindows::default(),
             "claude:account-one",
             "claude-sonnet-5",
             at("2026-08-10T17:30:00Z")
@@ -5644,6 +6052,7 @@ mod tests {
         .unwrap());
         assert!(credit_metered(
             &tx,
+            &mut BurnWindows::default(),
             "claude:account-one",
             "claude-sonnet-5",
             at("2026-08-10T18:30:00Z")
@@ -5686,6 +6095,7 @@ mod tests {
 
         assert!(credit_metered(
             &tx,
+            &mut BurnWindows::default(),
             "claude:account-one",
             "claude-sonnet-5",
             at("2026-08-10T15:45:00Z")
@@ -5693,6 +6103,7 @@ mod tests {
         .unwrap());
         assert!(!credit_metered(
             &tx,
+            &mut BurnWindows::default(),
             "claude:account-one",
             "claude-sonnet-5",
             at("2026-08-10T16:30:00Z")
