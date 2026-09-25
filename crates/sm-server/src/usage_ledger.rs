@@ -272,12 +272,15 @@ impl UsageLedgerStore {
                   ON message_ledger(account_key, bucket_ts);
                 CREATE INDEX IF NOT EXISTS idx_ledger_window_materialization
                   ON message_ledger(account_key, recorded_at);
-                -- Every scan looks up provisional and unknown-model rows; without these
-                -- partial indexes each lookup walks the whole ledger (#1524).
+                -- Every scan looks up provisional and unknown-model rows and codex
+                -- cursor baselines; without these indexes each lookup walks the
+                -- whole ledger (#1524).
                 CREATE INDEX IF NOT EXISTS idx_ledger_unassigned_source
                   ON message_ledger(source_ref, msg_id) WHERE seat_id = 'unassigned';
                 CREATE INDEX IF NOT EXISTS idx_ledger_unknown_model
                   ON message_ledger(msg_id, seat_id) WHERE model = 'unknown';
+                CREATE INDEX IF NOT EXISTS idx_ledger_source_seq
+                  ON message_ledger(source_ref, source_seq);
 
                 CREATE TABLE IF NOT EXISTS message_window (
                   msg_id       INTEGER NOT NULL REFERENCES message_ledger(msg_id) ON DELETE CASCADE,
@@ -3338,6 +3341,14 @@ mod tests {
         assert!(
             unknown.contains("idx_ledger_unknown_model"),
             "unknown-model lookup must not scan the ledger: {unknown}"
+        );
+        let baseline = plan(
+            "SELECT MAX(source_seq) FROM message_ledger \
+             WHERE source_ref = 'thread' AND source_seq IS NOT NULL",
+        );
+        assert!(
+            baseline.contains("idx_ledger_source_seq"),
+            "codex cursor baseline lookup must not scan the ledger: {baseline}"
         );
     }
 
