@@ -25,6 +25,7 @@ pub mod usage_burn;
 pub mod usage_identity;
 pub mod usage_ledger;
 pub mod usage_report;
+pub mod watch_view;
 pub mod work_claims;
 pub mod work_history;
 

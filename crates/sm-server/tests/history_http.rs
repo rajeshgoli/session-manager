@@ -1,5 +1,7 @@
-//! History pages over HTTP (sm#1452, ticket #1488): `/history` and
-//! `/t/<repo-name>/<n>`, HTML and JSON, filters, paging and the timeline.
+//! Owner pages over HTTP (sm#1452): the history pages (ticket #1488,
+//! `/history` and `/t/<repo-name>/<n>`, HTML and JSON, filters, paging and
+//! the timeline) and the web watch (ticket #1489, `/`, `/watch` and
+//! `/watch/state`), on one claims fixture.
 
 use axum::{
     body::{to_bytes, Body},
@@ -137,7 +139,7 @@ struct Fixture {
     dir: PathBuf,
 }
 
-/// lead → eng1; other unrelated.
+/// lead → eng1; other unrelated; gone stopped.
 fn fixture() -> Fixture {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
@@ -166,6 +168,7 @@ fn fixture() -> Fixture {
             session("lead0001", None, "idle"),
             session("eng00001", Some("lead0001"), "running"),
             session("other001", None, "running"),
+            session("gone0001", None, "stopped"),
         ]})
         .to_string(),
     )
@@ -488,4 +491,201 @@ async fn timeline_of_an_untracked_item_is_404_not_tracked() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(content_type, "text/html; charset=utf-8");
     assert!(html.contains("Not tracked"));
+}
+
+// ---- web watch (#1489) -----------------------------------------------------
+
+async fn watch_state(app: &axum::Router, query: &str) -> Value {
+    let (status, body) = get_json(app, &format!("/watch/state{query}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+fn listed(state: &Value) -> Vec<String> {
+    state["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// `/watch/state` against what `sm watch` reads and computes from
+/// `/sessions` and `/session-obligations` for the same fixture.
+#[tokio::test]
+async fn watch_state_matches_what_sm_watch_shows() {
+    use sm_server::watch_view::{display_state, filter_sessions, tree_order};
+    let f = seeded().await;
+    let (_, sessions) = get_json(&f.app, "/sessions").await;
+    let (_, feed) = get_json(&f.app, "/session-obligations").await;
+    let state = watch_state(&f.app, "").await;
+    assert_eq!(state["schema_version"], 1);
+    assert!(state["generated_at"].is_string());
+
+    let sessions = filter_sessions(sessions["sessions"].as_array().unwrap(), None, None, "");
+    let order = tree_order(&sessions);
+    let watched = state["sessions"].as_array().unwrap();
+    assert_eq!(watched.len(), order.len());
+    for (entry, web) in order.iter().zip(watched) {
+        let tui = &sessions[entry.index];
+        let id = tui["id"].as_str().unwrap();
+        assert_eq!(web["id"], id);
+        assert_eq!(web["depth"], entry.depth);
+        assert_eq!(web["group"], json!(entry.group));
+        let obligation = feed["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["session_id"] == id);
+        let expected = match display_state(tui, obligation) {
+            "working" => "working",
+            "waiting" => "waiting",
+            "stopped" => "stopped",
+            _ => "idle",
+        };
+        assert_eq!(web["state"], expected, "{id}");
+        for key in ["claims", "docs", "waiting_on", "review_history"] {
+            assert_eq!(
+                web[key],
+                obligation.map_or(json!([]), |o| o[key].clone()),
+                "{id} {key}"
+            );
+        }
+    }
+    // lead → eng (child), then other; the stopped session is left out.
+    assert_eq!(listed(&state), ["lead0001", "eng00001", "other001"]);
+    let eng = &state["sessions"][1];
+    assert_eq!(eng["name"], "eng00001-agent");
+    assert_eq!(eng["parent_session_id"], "lead0001");
+    assert_eq!(eng["state"], "waiting");
+    assert_eq!(eng["repo"], "/repo");
+    assert_eq!(eng["attach"], "sm attach eng00001-agent");
+    assert_eq!(eng["collision"], false);
+    assert_eq!(eng["jobs"], json!([]));
+    assert_eq!(eng["claims"][0]["worktree_path"], "/wt");
+    assert_eq!(
+        eng["claims"][0]["url"],
+        "https://github.com/acme/widgets/issues/1"
+    );
+    assert_eq!(state["counts"], json!({"live": 3, "waiting_on_owner": 1}));
+}
+
+#[tokio::test]
+async fn watch_state_filters_mirror_sm_watch_flags() {
+    let f = seeded().await;
+    assert_eq!(
+        listed(&watch_state(&f.app, "?stopped=1").await),
+        ["gone0001", "lead0001", "eng00001", "other001"]
+    );
+    let stopped = watch_state(&f.app, "?stopped=1").await;
+    assert_eq!(stopped["sessions"][0]["state"], "stopped");
+    assert_eq!(stopped["counts"]["live"], 3);
+    assert_eq!(
+        listed(&watch_state(&f.app, "?top_level=1").await),
+        ["lead0001", "other001"]
+    );
+    assert_eq!(listed(&watch_state(&f.app, "?repo=/repo").await).len(), 3);
+    assert!(listed(&watch_state(&f.app, "?repo=/elsewhere").await).is_empty());
+    assert_eq!(listed(&watch_state(&f.app, "?node=primary").await).len(), 3);
+    assert!(listed(&watch_state(&f.app, "?node=studio").await).is_empty());
+    assert!(listed(&watch_state(&f.app, "?role=reviewer").await).is_empty());
+}
+
+fn watch_cards(html: &str) -> &str {
+    let start = html.find(r#"<div id="w""#).expect("cards");
+    let end = html[start..].find("<script>").expect("script") + start;
+    &html[start..end]
+}
+
+#[tokio::test]
+async fn watch_page_paints_cards_without_scripts() {
+    let f = seeded().await;
+    let (status, content_type, root) = send(&f.app, "GET", "/", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(content_type, "text/html; charset=utf-8");
+    let (status, _, watch) = send(&f.app, "GET", "/watch", None).await;
+    assert_eq!(status, StatusCode::OK);
+    // One page at both addresses.
+    let ids = |html: &str| -> Vec<String> {
+        html.split(r#"data-id=""#)
+            .skip(1)
+            .map(|rest| rest[..rest.find('"').unwrap()].to_owned())
+            .collect()
+    };
+    assert_eq!(
+        ids(watch_cards(&root)),
+        ["lead0001", "eng00001", "other001"]
+    );
+    assert_eq!(ids(watch_cards(&root)), ids(watch_cards(&watch)));
+    assert!(root.contains(r#"<a class="tab on" href="/">Watch</a>"#));
+    assert!(root.contains(r#"<span class="m" id="ws">3 live · 1 waiting on you</span>"#));
+
+    let cards = watch_cards(&root);
+    let eng = &cards[cards.find(r#"data-id="eng00001""#).unwrap()..];
+    let eng = &eng[..eng.find("</details>").unwrap()];
+    // Collapsed line: amber edge for the owner's review, indented child,
+    // claim and docs chips.
+    assert!(cards.contains(r#"<div class="grp">/repo</div>"#));
+    assert!(
+        cards.contains(r#"<details class="card a" data-id="eng00001" style="margin-left:14px">"#)
+    );
+    assert!(eng
+        .contains(r#"<span class="dot waiting"></span><span class="mt nm">eng00001-agent</span>"#));
+    assert!(eng.contains(r#"<span class="chip c">#1 +1</span>"#));
+    assert!(eng.contains(r#"<span class="chip v">docs 1 · review requested</span>"#));
+    assert!(eng.contains(r#"<span class="chip a">waiting on you</span>"#));
+    // Expanded rows: Work, Docs, Reviews, Attach.
+    assert!(eng.contains(
+        r#"<a class="mt lk" href="/t/widgets/1">ticket #1</a> <span class="chip c">open</span>"#
+    ));
+    assert!(eng.contains(r#"<a class="mt lk" href="https://github.com/acme/widgets/pull/9">PR #9 ↗</a> <span class="chip c">open</span> <span class="m">1 Codex</span>"#));
+    assert!(eng.contains(r#"<span class="m">worktree /wt</span>"#));
+    assert!(eng.contains(r#"<a class="lk" href="/docs/widgets/specs/memo.html?version=cccccccccccc">Memo &lt;draft&gt;</a> <span class="chip a">review requested</span>"#));
+    assert!(eng.contains(r#"<span class="amb">Owner review · Memo &lt;draft&gt;</span>"#));
+    assert!(eng.contains(
+        r#"<span class="mt">widgets#9</span> <span class="m">0 landed · 1 requested</span>"#
+    ));
+    assert!(eng.contains(r#"$ sm attach eng00001-agent ⧉</code>"#));
+    let labels: Vec<&str> = eng
+        .split(r#"<span class="lbl">"#)
+        .skip(1)
+        .map(|rest| &rest[..rest.find('<').unwrap()])
+        .collect();
+    assert_eq!(labels, ["Work", "Docs", "Reviews", "Attach"]);
+
+    // The refresh script is inline, under 10 KB, and reads /watch/state.
+    let script = &root[root.find("<script>").unwrap() + 8..root.find("</script>").unwrap()];
+    assert!(script.len() < 10 * 1024, "{} bytes", script.len());
+    assert!(script.contains("'/watch/state'"));
+    assert!(root.contains(r#"<div id="w" data-refresh="3">"#));
+}
+
+#[tokio::test]
+async fn watch_flags_a_collision_on_both_cards() {
+    let f = seeded().await;
+    // other001 publishes a doc on eng00001's PR: an implicit claim by an
+    // agent outside eng00001's line.
+    post(
+        &f.app,
+        "/docs",
+        json!({"repo": REPO, "path": "specs/notes.md", "commit_sha": "d".repeat(40),
+               "pr_number": 9, "session_id": "other001", "title": "Notes"}),
+    )
+    .await;
+    let state = watch_state(&f.app, "").await;
+    let collision = |id: &str| {
+        state["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == id)
+            .unwrap()["collision"]
+            .clone()
+    };
+    assert_eq!(collision("eng00001"), true);
+    assert_eq!(collision("other001"), true);
+    assert_eq!(collision("lead0001"), false);
+    let (_, _, html) = send(&f.app, "GET", "/watch", None).await;
+    assert!(html.contains(r#"<details class="card r" data-id="other001""#));
+    assert!(html.contains(r#"<span class="chip r">2 agents</span>"#));
 }

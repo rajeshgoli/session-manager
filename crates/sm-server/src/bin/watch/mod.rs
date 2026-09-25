@@ -7,6 +7,7 @@ use nix::{
     sys::termios::{self, SetArg, Termios},
 };
 use serde_json::{json, Value};
+use sm_server::watch_view::{array, display_state, docs_marker, lead_claim, name, repo, s};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, IsTerminal, Write},
@@ -23,19 +24,6 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 #[cfg(test)]
 mod tests;
 
-fn s<'a>(v: &'a Value, key: &str) -> &'a str {
-    v[key].as_str().unwrap_or("")
-}
-fn name(v: &Value) -> &str {
-    ["friendly_name", "name", "id"]
-        .into_iter()
-        .map(|k| s(v, k))
-        .find(|v| !v.is_empty())
-        .unwrap_or("?")
-}
-fn array(v: &Value, key: &str) -> Vec<Value> {
-    v[key].as_array().cloned().unwrap_or_default()
-}
 fn stamp(v: &str) -> Option<i64> {
     OffsetDateTime::parse(v, &Rfc3339)
         .ok()
@@ -186,27 +174,14 @@ fn obligation_context(
     lines
 }
 
-/// Docs the owner hasn't read yet, or that await the owner's review.
-fn unread_doc_count(obligation: &Value) -> usize {
-    array(obligation, "docs")
-        .iter()
-        .filter(|doc| matches!(s(doc, "state"), "new" | "updated" | "review_requested"))
-        .count()
-}
-
 /// Collapsed row marker for active claims: `[#1452]`, or `[#1452 +2]` with
 /// more. The earliest ticket leads; a PR only when no ticket is held.
 fn claim_marker(obligation: &Value) -> String {
-    let claims = array(obligation, "claims");
-    let lead = claims
-        .iter()
-        .find(|claim| s(claim, "kind") == "ticket")
-        .or_else(|| claims.first());
-    match lead {
+    match lead_claim(obligation) {
         None => String::new(),
-        Some(lead) => {
+        Some((lead, more)) => {
             let number = lead["number"].as_i64().unwrap_or_default();
-            match claims.len() - 1 {
+            match more {
                 0 => format!(" [#{number}]"),
                 more => format!(" [#{number} +{more}]"),
             }
@@ -235,8 +210,9 @@ fn claim_rows(obligation: &Value, prefix: &str, base_url: &str) -> Vec<Row> {
         .collect()
 }
 
-/// Expanded view: one line per doc with its reader URL.
-fn doc_rows(obligation: &Value, prefix: &str, base_url: &str) -> Vec<Row> {
+/// Expanded view's Docs section, just before the review rows: one row per
+/// doc, `<state>  <title>  <age>  <url>`.
+fn doc_rows(obligation: &Value, prefix: &str, base_url: &str, now: i64) -> Vec<Row> {
     array(obligation, "docs")
         .iter()
         .map(|doc| {
@@ -252,12 +228,18 @@ fn doc_rows(obligation: &Value, prefix: &str, base_url: &str) -> Vec<Row> {
                 ),
                 (_, path) => format!("{base_url}{path}"),
             };
-            let mut state = s(doc, "state").replace('_', " ");
-            if doc["review_undelivered"].as_bool() == Some(true) {
-                state.push_str(" · review not delivered: author retired");
-            }
+            let undelivered = if doc["review_undelivered"].as_bool() == Some(true) {
+                "  review not delivered: author retired"
+            } else {
+                ""
+            };
             Row {
-                text: format!("{prefix}   doc · {} · {state} · {url}", s(doc, "title")),
+                text: format!(
+                    "{prefix}   +- [doc] {}  {}  {}  {url}{undelivered}",
+                    s(doc, "state").replace('_', " "),
+                    s(doc, "title"),
+                    age(s(doc, "published_at"), now),
+                ),
                 target: None,
                 style: if matches!(s(doc, "state"), "read" | "reviewed") {
                     ""
@@ -818,14 +800,6 @@ impl Row {
         }
     }
 }
-fn repo(v: &Value) -> &str {
-    let path = s(v, "working_dir");
-    if path.is_empty() {
-        "unknown"
-    } else {
-        path
-    }
-}
 fn retired_at(v: &Value) -> &str {
     ["stopped_at", "completed_at", "retired_at", "last_activity"]
         .into_iter()
@@ -834,65 +808,16 @@ fn retired_at(v: &Value) -> &str {
         .unwrap_or("")
 }
 fn filtered(sessions: &[Value], args: &WatchArgs, query: &str) -> Vec<Value> {
-    let by_id: BTreeMap<_, _> = sessions.iter().map(|v| (s(v, "id"), v)).collect();
-    let mut ids: BTreeSet<String> = sessions
-        .iter()
-        .filter(|v| {
-            args.repo.as_ref().is_none_or(|r| {
-                repo(v) == r || repo(v).starts_with(&format!("{}/", r.trim_end_matches('/')))
-            }) && args
-                .role
-                .as_ref()
-                .is_none_or(|r| s(v, "role").eq_ignore_ascii_case(r))
-                && (query.is_empty()
-                    || format!(
-                        "{} {}",
-                        v,
-                        by_id
-                            .get(s(v, "parent_session_id"))
-                            .map(|p| name(p))
-                            .unwrap_or("")
-                    )
-                    .to_lowercase()
-                    .contains(&query.to_lowercase()))
-        })
-        .map(|v| s(v, "id").to_owned())
-        .collect();
-    if args.repo.is_some() && args.role.is_none() && query.is_empty() {
-        let matched = ids.clone();
-        for id in &matched {
-            let mut parent = by_id
-                .get(id.as_str())
-                .map(|v| s(v, "parent_session_id"))
-                .unwrap_or("");
-            let mut seen = BTreeSet::new();
-            while let Some(v) = by_id.get(parent) {
-                if !seen.insert(parent) {
-                    break;
-                }
-                ids.insert(parent.into());
-                parent = s(v, "parent_session_id");
-            }
-        }
-        let mut descendants = matched;
-        loop {
-            let before = descendants.len();
-            for v in sessions {
-                if descendants.contains(s(v, "parent_session_id")) {
-                    descendants.insert(s(v, "id").into());
-                }
-            }
-            if before == descendants.len() {
-                break;
-            }
-        }
-        ids.extend(descendants);
+    let mut kept = sm_server::watch_view::filter_sessions(
+        sessions,
+        args.repo.as_deref(),
+        args.role.as_deref(),
+        query,
+    );
+    if args.restore {
+        kept.retain(|v| s(v, "status") == "stopped");
     }
-    sessions
-        .iter()
-        .filter(|v| ids.contains(s(v, "id")) && (!args.restore || s(v, "status") == "stopped"))
-        .cloned()
-        .collect()
+    kept
 }
 
 struct View {
@@ -1118,15 +1043,12 @@ impl View {
         }
         let prefix = "  ".repeat(depth.min(20));
         let obligation = snap.obligations.iter().find(|o| s(o, "session_id") == id);
-        let waiting = obligation.is_some_and(|o| !array(o, "waiting_on").is_empty());
-        let state = if !args.restore && s(v, "activity_state") == "idle" && waiting {
-            "waiting"
-        } else if args.restore {
+        let state = if args.restore {
             s(v, "status")
         } else {
-            s(v, "activity_state")
+            display_state(v, obligation)
         };
-        let unread_docs = obligation.map_or(0, unread_doc_count);
+        let docs = obligation.map(docs_marker).unwrap_or_default();
         let claims = obligation.map(claim_marker).unwrap_or_default();
         rows.push(Row {
             text: format!(
@@ -1139,10 +1061,10 @@ impl View {
                 s(v, "provider"),
                 s(v, "role"),
                 s(v, "node"),
-                if unread_docs > 0 {
-                    format!(" [docs {unread_docs}]")
+                if docs.is_empty() {
+                    docs
                 } else {
-                    String::new()
+                    format!(" {docs}")
                 }
             ),
             target: Some(Target::Session(id.into())),
@@ -1237,7 +1159,6 @@ impl View {
                     .unwrap_or("");
                 if let Some(obligation) = obligation {
                     rows.extend(claim_rows(obligation, &prefix, &self.base_url));
-                    rows.extend(doc_rows(obligation, &prefix, &self.base_url));
                 }
                 rows.push(Row::plain(format!(
                     "{prefix}   thinking duration: {}",
@@ -1293,6 +1214,9 @@ impl View {
                 }
             }
             if let Some(obligation) = obligation {
+                if self.expanded.contains(id) {
+                    rows.extend(doc_rows(obligation, &prefix, &self.base_url, now));
+                }
                 rows.extend(review_rows(
                     obligation,
                     id,

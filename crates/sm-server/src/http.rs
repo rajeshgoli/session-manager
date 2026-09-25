@@ -322,6 +322,7 @@ pub enum GitHubPullRequestState {
 mod claims;
 mod docs;
 mod history;
+mod watch;
 mod worktrees;
 pub use docs::{
     DocFetchError, DocPullRequest, DocReviewOnGitHub, OwnerDocSource, SubmittedDocReview,
@@ -1508,6 +1509,9 @@ pub fn router(state: AppState) -> Router {
         .route("/worktrees/keep", post(worktrees::post_worktree_keep))
         .route("/history", get(history::get_history))
         .route("/t/{repo}/{number}", get(history::get_timeline))
+        .route("/", get(watch::get_watch_page))
+        .route("/watch", get(watch::get_watch_page))
+        .route("/watch/state", get(watch::get_watch_state))
         .route("/docs/{doc_id}", get(docs::get_owner_doc))
         // `/docs/{id}/view|raw|retract` (internal API) and the readable
         // reader `/docs/<repo-name>/<path in repo>` share one pattern.
@@ -6507,6 +6511,7 @@ fn project_session_obligations(
             "kind": view.claim.kind, "repo": view.claim.repo, "number": view.claim.number,
             "title": view.title, "state": view.state, "claimed_at": view.claim.claimed_at,
             "source": view.claim.source, "history_path": view.history_path,
+            "url": view.url, "worktree_path": view.claim.worktree_path,
         }));
     }
     for (id, entry) in &mut sessions {
@@ -13662,6 +13667,9 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/claims"
         || path == "/history"
         || path.starts_with("/t/")
+        || path == "/"
+        || path == "/watch"
+        || path == "/watch/state"
         || path == "/docs"
         || path.starts_with("/docs/")
         || path == "/queue-jobs"
@@ -13929,7 +13937,8 @@ fn ensure_core_runtime_node_supported(node: &str) -> Result<(), ApiError> {
 
 /// Owner pages: docs, history and watch; reads only. Doc reads (`/docs`,
 /// `/docs/{id}`, `/view`, `/raw`, the readable `/docs/<repo-name>/<path>`),
-/// `/history` and `/t/<repo-name>/<n>` also accept the owner's interactive
+/// `/history`, `/t/<repo-name>/<n>`, and the web watch (`/`, `/watch`,
+/// `/watch/state`) also accept the owner's interactive
 /// Cloudflare Access login on the browser hostname. Every other route there
 /// still needs the SM Google session (spec 945).
 /// A present assertion must verify; a verified non-owner email falls through
@@ -18380,6 +18389,111 @@ mod tests {
                 let (status, _) = browser_host_get(&app, uri, assertion).await;
                 assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_watch_pages_accept_owner_cloudflare_browser_login() {
+        let app = owner_doc_browser_access_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let (status, body) = browser_host_get(&app, "/watch/state", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["schema_version"], 1);
+        assert!(body["sessions"].is_array(), "{body}");
+        for uri in ["/", "/watch"] {
+            let mut request =
+                public_request_with_host(Method::GET, uri, Body::empty(), "sm.example.com");
+            request
+                .headers_mut()
+                .insert("cf-access-jwt-assertion", owner.parse().unwrap());
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
+        }
+
+        let expired =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 1_700_000_100);
+        let stranger =
+            test_browser_access_assertion("sm-browser-aud", "stranger@example.com", 4_102_444_800);
+        for uri in ["/", "/watch", "/watch/state"] {
+            let (status, _) = browser_host_get(&app, uri, Some(&expired)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+            for assertion in [Some(stranger.as_str()), None] {
+                let (status, _) = browser_host_get(&app, uri, assertion).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
+            }
+        }
+    }
+
+    /// The owner's browser login opens the read-only owner pages and
+    /// nothing that writes.
+    #[tokio::test]
+    async fn owner_browser_login_is_refused_on_write_routes() {
+        let app = owner_doc_browser_access_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        for (method, uri) in [
+            (Method::POST, "/sessions"),
+            (Method::POST, "/sessions/abc12345/input"),
+            (Method::POST, "/sessions/abc12345/kill"),
+            (Method::POST, "/sessions/abc12345/restore"),
+            (Method::DELETE, "/sessions/abc12345"),
+            (Method::POST, "/claims"),
+            (Method::POST, "/claims/release"),
+            (Method::POST, "/claims/worktree"),
+            (Method::POST, "/worktrees/keep"),
+            (Method::POST, "/queue-jobs"),
+            (Method::POST, "/codex-review-requests"),
+            (Method::POST, "/docs"),
+            (Method::POST, "/docs/zzzzzzzz/reviews"),
+            (
+                Method::POST,
+                "/scheduler/remind?session_id=abc12345&delay_seconds=60&message=hi",
+            ),
+            (Method::POST, "/email/send"),
+            (Method::POST, "/watch"),
+            (Method::POST, "/"),
+        ] {
+            // A body each route accepts, so auth is what refuses it.
+            let body = match uri {
+                "/sessions/abc12345/input" => json!({"text": "hello"}),
+                "/claims" | "/claims/release" => json!({
+                    "requester_session_id": "abc12345", "kind": "ticket",
+                    "repo": "acme/widgets", "number": 1, "take": false, "tickets": []}),
+                "/claims/worktree" => json!({
+                    "requester_session_id": "abc12345", "claim_id": "c1", "state": "created",
+                    "worktree_path": "/wt", "branch": "b", "base_sha": "a"}),
+                "/worktrees/keep" => {
+                    json!({"requester_session_id": "abc12345", "path": "/wt", "off": false})
+                }
+                "/queue-jobs" => json!({"type": "tests", "job_type": "tests", "label": "x",
+                    "cwd": "/tmp", "argv": ["true"], "env": {}}),
+                "/codex-review-requests" => json!({"pr_number": 1, "repo": "acme/widgets",
+                    "poll_interval_seconds": 60, "retry_interval_seconds": 60}),
+                "/docs" => json!({"repo": "acme/widgets", "path": "a.md",
+                    "commit_sha": "c".repeat(40), "session_id": "abc12345", "review": false}),
+                "/email/send" => json!({"recipients": ["rajesh"], "cc": [], "subject": "s",
+                    "body": "b", "body_markdown": false, "auto_subject": false}),
+                _ => json!({}),
+            }
+            .to_string();
+            let mut request =
+                public_request_with_host(method.clone(), uri, Body::from(body), "sm.example.com");
+            request
+                .headers_mut()
+                .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+            request
+                .headers_mut()
+                .insert("cf-access-jwt-assertion", owner.parse().unwrap());
+            let status = app.clone().oneshot(request).await.unwrap().status();
+            assert!(
+                matches!(
+                    status,
+                    StatusCode::UNAUTHORIZED | StatusCode::METHOD_NOT_ALLOWED
+                ),
+                "{method} {uri}: {status}"
+            );
         }
     }
 

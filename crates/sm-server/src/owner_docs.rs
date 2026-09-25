@@ -1373,6 +1373,11 @@ img {{ max-width: 100%; }}
 /// the two-tab **Watch · History** top bar. `active_tab` is `"watch"`,
 /// `"history"`, or anything else for neither.
 pub fn page_shell(title: &str, active_tab: &str, body: &str) -> String {
+    page_shell_with_status(title, active_tab, "", body)
+}
+
+/// [`page_shell`] with `status` (HTML) at the right end of the top bar.
+pub fn page_shell_with_status(title: &str, active_tab: &str, status: &str, body: &str) -> String {
     let tab = |name: &str, href: &str, label: &str| {
         let class = if name == active_tab { "tab on" } else { "tab" };
         format!(r#"<a class="{class}" href="{href}">{label}</a>"#)
@@ -1449,7 +1454,7 @@ h2.lbl {{ margin: 18px 0 4px; font-weight: 400; }}
 </head>
 <body>
 <div class="wrap">
-<nav class="top"><a class="brand" href="/">sm</a>{watch}{history}<span class="sp"></span></nav>
+<nav class="top"><a class="brand" href="/">sm</a>{watch}{history}<span class="sp"></span>{status}</nav>
 {body}
 </div>
 </body>
