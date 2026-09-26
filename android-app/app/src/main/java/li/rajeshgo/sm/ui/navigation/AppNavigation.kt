@@ -56,6 +56,18 @@ fun AppNavigation() {
         }
     }
 
+    // An opened sm link opens in the watch screen's reader when signed in.
+    val pendingReaderLink = ReaderLinkRequests.pending
+    LaunchedEffect(pendingReaderLink, isLoggedIn) {
+        if (pendingReaderLink != null && isLoggedIn == true &&
+            navController.currentDestination?.route != Routes.WATCH
+        ) {
+            navController.navigate(Routes.WATCH) {
+                launchSingleTop = true
+            }
+        }
+    }
+
     NavHost(navController = navController, startDestination = startDestination) {
         composable(Routes.SETTINGS) {
             SettingsScreen(

@@ -138,6 +138,30 @@ fun ownerReaderPage(title: String, path: String): ReaderPage =
 val historyReaderPage: ReaderPage get() = ownerReaderPage("History", "/history")
 
 /**
+ * The reader page for an opened sm link on the owner's browser host
+ * (`https://<linkHost>/docs/…`, `/t/…` or `/history`), or null when the link
+ * is not one. The reader loads the same path and query from the app's server;
+ * a doc's link stays the page's shared link.
+ */
+fun readerPageForLink(url: String, linkHost: String): ReaderPage? {
+    val uri = runCatching { URI(url) }.getOrNull() ?: return null
+    if (linkHost.isBlank() || !uri.scheme.equals("https", ignoreCase = true) ||
+        !uri.host.equals(linkHost.trim(), ignoreCase = true)
+    ) return null
+    val rawPath = uri.rawPath.orEmpty()
+    val path = rawPath + uri.rawQuery?.let { "?$it" }.orEmpty() + uri.rawFragment?.let { "#$it" }.orEmpty()
+    return when {
+        rawPath.startsWith("/docs/") && rawPath.length > "/docs/".length -> {
+            val name = uri.path.removePrefix("/docs/")
+            ReaderPage(title = "", subtitle = name, path = path, browserUrl = url)
+        }
+        rawPath.startsWith("/t/") -> ownerReaderPage("Ticket", path)
+        rawPath == "/history" -> ownerReaderPage("History", path)
+        else -> null
+    }
+}
+
+/**
  * The link to share for the page on screen: the same path and query on the
  * owner's browser host (`browser_url`), so it opens in a laptop browser. The
  * app's own API host needs the device certificate, so it is only the fallback.
@@ -220,7 +244,8 @@ fun DocReaderOverlay(
     var loadedTitle by remember(page) { mutableStateOf<String?>(null) }
     val readyAuth = auth?.getOrNull()
     val currentPath = history.lastOrNull()?.let { runCatching { URI(it).rawPath }.getOrNull() }
-    val title = if (page.followsPage) loadedTitle ?: page.title else page.title
+    // A doc opened from a link has no known title until the page loads.
+    val title = if (page.followsPage || page.title.isBlank()) loadedTitle ?: page.title.ifBlank { page.subtitle } else page.title
     val subtitle = if (page.followsPage) currentPath?.takeIf(String::isNotEmpty) ?: page.subtitle else page.subtitle
 
     BackHandler {

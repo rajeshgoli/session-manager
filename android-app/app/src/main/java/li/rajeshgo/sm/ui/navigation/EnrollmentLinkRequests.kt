@@ -3,6 +3,7 @@ package li.rajeshgo.sm.ui.navigation
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import li.rajeshgo.sm.ui.watch.ReaderPage
 
 /**
  * An opened `sm-enroll://enroll?url=…` link waiting for the Settings screen.
@@ -13,4 +14,9 @@ import androidx.compose.runtime.setValue
  */
 object EnrollmentLinkRequests {
     var pending by mutableStateOf<String?>(null)
+}
+
+/** An opened sm link (a doc, ticket page or History) waiting for the watch screen's reader. */
+object ReaderLinkRequests {
+    var pending by mutableStateOf<ReaderPage?>(null)
 }

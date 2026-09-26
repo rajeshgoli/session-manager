@@ -9,7 +9,9 @@ import li.rajeshgo.sm.push.FollowOpen
 import li.rajeshgo.sm.push.FollowOpenRequests
 import li.rajeshgo.sm.ui.navigation.AppNavigation
 import li.rajeshgo.sm.ui.navigation.EnrollmentLinkRequests
+import li.rajeshgo.sm.ui.navigation.ReaderLinkRequests
 import li.rajeshgo.sm.ui.theme.SessionManagerTheme
+import li.rajeshgo.sm.ui.watch.readerPageForLink
 
 class MainActivity : ComponentActivity() {
 
@@ -19,7 +21,9 @@ class MainActivity : ComponentActivity() {
         // an abandoned notification tap or link (the process can outlive the activity).
         FollowOpenRequests.pending = null
         EnrollmentLinkRequests.pending = null
+        ReaderLinkRequests.pending = null
         takeEnrollmentLink(intent)
+        takeReaderLink(intent)
         takeFollowOpen(intent)
         enableEdgeToEdge(
             statusBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
@@ -38,6 +42,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         takeEnrollmentLink(intent)
+        takeReaderLink(intent)
         takeFollowOpen(intent)
     }
 
@@ -53,6 +58,15 @@ class MainActivity : ComponentActivity() {
     private fun takeFollowOpen(intent: Intent?) {
         val open = FollowOpen.fromIntent(intent) ?: return
         FollowOpenRequests.pending = open
+        setIntent(Intent(this, MainActivity::class.java))
+    }
+
+    /** Hands an opened sm link (doc, ticket page, History) to the watch screen's reader, once. */
+    private fun takeReaderLink(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_VIEW) return
+        val url = intent.dataString ?: return
+        val page = readerPageForLink(url, BuildConfig.SM_LINK_HOST) ?: return
+        ReaderLinkRequests.pending = page
         setIntent(Intent(this, MainActivity::class.java))
     }
 

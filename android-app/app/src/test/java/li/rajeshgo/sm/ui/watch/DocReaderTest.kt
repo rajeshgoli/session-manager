@@ -149,4 +149,29 @@ class DocReaderTest {
         )
         assertEquals(current, shareUrl(current, docReaderPage(doc()).browserUrl))
     }
+
+    @Test fun browserHostLinksOpenInTheReader() {
+        val host = "sm.example.com"
+        val docLink = "https://sm.example.com/docs/fractal-algo-rust/docs/working/my%20memo%231.html?version=856f0d6e1a2b"
+        val doc = readerPageForLink(docLink, host)!!
+        assertEquals("/docs/fractal-algo-rust/docs/working/my%20memo%231.html?version=856f0d6e1a2b", doc.path)
+        assertEquals("fractal-algo-rust/docs/working/my memo#1.html", doc.subtitle)
+        assertEquals(docLink, doc.browserUrl)
+        assertEquals(false, doc.followsPage)
+
+        val ticket = readerPageForLink("https://SM.example.com/t/session-manager/1575", host)!!
+        assertEquals("/t/session-manager/1575", ticket.path)
+        assertTrue(ticket.followsPage)
+        assertEquals("/history", readerPageForLink("https://sm.example.com/history", host)!!.path)
+    }
+
+    @Test fun otherLinksAreNotReaderLinks() {
+        val host = "sm.example.com"
+        assertNull(readerPageForLink("https://sm.example.com/watch", host))
+        assertNull(readerPageForLink("https://sm.example.com/docs/", host))
+        assertNull(readerPageForLink("http://sm.example.com/docs/widgets/memo.md", host))
+        assertNull(readerPageForLink("https://evil.example.com/docs/widgets/memo.md", host))
+        assertNull(readerPageForLink("https://sm.example.com/docs/widgets/memo.md", ""))
+        assertNull(readerPageForLink("sm-enroll://enroll?url=x", host))
+    }
 }
