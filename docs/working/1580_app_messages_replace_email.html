@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1580 — Agents message you in the sm app</title>
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>1580 — Agents message you in the sm app instead of by email</h1>
+<p class="sans"><small>Author: sm-1580-spec-author <code>45bbc8a4</code> · Ticket #1580 · Revision 1</small></p>
+
+<h2>Memo</h2>
+
+<p>An agent that needs you runs <code>sm send rajesh</code> with markdown, exactly as it messages another agent. Your phone buzzes with the agent's name and the message title. Tapping it opens the message in the sm app, rendered the way memos render today. You reply in a box at the bottom, or select a sentence and comment on it, or both, and press <b>Send</b>. The agent receives your reply as an ordinary message, the same way it receives an <code>sm send</code> from another agent, and answers you with another <code>sm send rajesh</code>. A doc works the same way: <code>sm doc publish --notify</code> buzzes your phone and opens the doc. If the doc is on an open pull request, your reply is a review and reaches the agent as <code>[sm review]</code>, as it does today. If it isn't, your reply reaches the agent as a message, like a reply to <code>sm send</code>.</p>
+
+<p>Email stops being the channel and becomes the safety net. Today <code>sm send rajesh</code> quietly sends email, because email is the only way the server can reach you.<sup>1</sup> After this change it goes to the app. The server emails you the same message only if your phone does not confirm it showed the notification within 15 minutes, or if phone notifications are not set up. This is the rule the follow-an-agent feature already uses. <code>sm email rajesh</code> stays available for the times you ask for email.</p>
+
+<p>Nearly everything reuses pieces that already ship: the phone notification sender and its email fallback from following agents, the memo renderer and the select-and-comment reader from doc reviews, and the email path for the fallback. What is new: a stored message with its own reader page, a reply that goes to the agent instead of to GitHub, and a <b>Messages</b> list on each agent's card.</p>
+
+<div class="vocab">
+<dl>
+<dt>Message</dt>
+<dd>What <code>sm send rajesh</code> creates: markdown text from one agent to you, with a title, stored on the sm server (not in git). It has its own page in the app and on sm web.</dd>
+<dt>Reply</dt>
+<dd>What you send back from a message page or a doc page: your overall text plus any comments on selected passages, sent together with one <b>Send</b>. The agent receives it as one message.</dd>
+<dt>Blocking message</dt>
+<dd>A message the agent marks with <code>--blocking</code> because it cannot continue without you. The notification says "needs you", and the agent shows "Waiting for Rajesh" on its card until you reply or tap <b>Handled</b>.</dd>
+<dt>Notification</dt>
+<dd>The Android notification Google delivers to your phone while the app is closed. It carries only the agent name, the title and a link. The app fetches the message itself from the sm server when you tap.</dd>
+<dt>Confirmation</dt>
+<dd>The phone telling the sm server "I showed this notification". No confirmation within 15 minutes means the phone is off, notifications are muted, or the app is out of date, and the server sends email instead.</dd>
+</dl>
+</div>
+
+<h3>How it works</h3>
+
+<figure>
+<svg viewBox="0 0 760 330" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Helvetica, Arial, sans-serif" font-size="12">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#52514e"/></marker>
+    <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#008300"/></marker>
+    <marker id="ao" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#eb6834"/></marker>
+  </defs>
+  <rect x="10" y="40" width="150" height="90" rx="8" fill="#f4f3f0" stroke="#8a8880"/>
+  <text x="85" y="62" text-anchor="middle" font-weight="700">Agent</text>
+  <text x="85" y="84" text-anchor="middle" font-family="Menlo, monospace" font-size="10.5">sm send rajesh</text>
+  <text x="85" y="100" text-anchor="middle" font-family="Menlo, monospace" font-size="10.5">sm doc publish</text>
+  <text x="85" y="114" text-anchor="middle" font-family="Menlo, monospace" font-size="10.5">  --notify / --review</text>
+  <rect x="300" y="40" width="160" height="90" rx="8" fill="#f4f3f0" stroke="#8a8880"/>
+  <text x="380" y="62" text-anchor="middle" font-weight="700">sm server (your Mac)</text>
+  <text x="380" y="82" text-anchor="middle">stores the message,</text>
+  <text x="380" y="97" text-anchor="middle">renders its page,</text>
+  <text x="380" y="112" text-anchor="middle">routes your reply</text>
+  <rect x="600" y="40" width="150" height="90" rx="8" fill="#f4f3f0" stroke="#8a8880"/>
+  <text x="675" y="62" text-anchor="middle" font-weight="700">Your phone</text>
+  <text x="675" y="82" text-anchor="middle">notification →</text>
+  <text x="675" y="97" text-anchor="middle">message page →</text>
+  <text x="675" y="112" text-anchor="middle">Send reply</text>
+  <line x1="160" y1="70" x2="298" y2="70" stroke="#52514e" stroke-width="1.6" marker-end="url(#a)"/>
+  <text x="229" y="62" text-anchor="middle">1 markdown</text>
+  <line x1="460" y1="70" x2="598" y2="70" stroke="#52514e" stroke-width="1.6" marker-end="url(#a)"/>
+  <text x="529" y="62" text-anchor="middle">2 push via Google</text>
+  <text x="529" y="84" text-anchor="middle" fill="#52514e" font-size="10.5">name + title + link only</text>
+  <line x1="598" y1="118" x2="462" y2="118" stroke="#008300" stroke-width="1.6" marker-end="url(#ag)"/>
+  <text x="529" y="136" text-anchor="middle" fill="#008300">3 confirmation, then reply</text>
+  <line x1="298" y1="118" x2="162" y2="118" stroke="#008300" stroke-width="1.6" marker-end="url(#ag)"/>
+  <text x="229" y="136" text-anchor="middle" fill="#008300">4 reply as a message</text>
+  <text x="229" y="151" text-anchor="middle" fill="#008300" font-size="10.5">or [sm review] on a PR doc</text>
+  <rect x="300" y="215" width="160" height="60" rx="8" fill="#fcfcfb" stroke="#eb6834" stroke-dasharray="5 3"/>
+  <text x="380" y="238" text-anchor="middle" font-weight="700" fill="#eb6834">Email fallback</text>
+  <text x="380" y="256" text-anchor="middle">full message + link</text>
+  <line x1="380" y1="130" x2="380" y2="213" stroke="#eb6834" stroke-width="1.4" stroke-dasharray="5 3" marker-end="url(#ao)"/>
+  <text x="392" y="178" fill="#eb6834">no confirmation in 15 min,</text>
+  <text x="392" y="193" fill="#eb6834">or push not set up</text>
+  <line x1="460" y1="245" x2="675" y2="245" stroke="#eb6834" stroke-width="1.4" stroke-dasharray="5 3"/>
+  <line x1="675" y1="245" x2="675" y2="132" stroke="#eb6834" stroke-width="1.4" stroke-dasharray="5 3" marker-end="url(#ao)"/>
+  <text x="600" y="265" text-anchor="middle" fill="#52514e" font-size="10.5">a reply to the email still reaches</text>
+  <text x="600" y="279" text-anchor="middle" fill="#52514e" font-size="10.5">the agent, as it does today</text>
+</svg>
+<figcaption>Figure 1. The round trip. Steps 1–4 take seconds when the phone is on. The dashed path fires only when the phone never confirms, and the email carries the whole message, so nothing depends on the phone.</figcaption>
+</figure>
+
+<h3>An example round trip</h3>
+<p>The agent runs:</p>
+<pre><code>sm send rajesh --blocking &lt;&lt;'EOF'
+# Keep the old fills table or drop it?
+The migration copies every row into `fills_v2`. I recommend dropping `fills`
+after one week of both tables agreeing. Confirm?
+
+Nothing reads `fills` after the cutover.
+EOF
+# prints: Sent to rajesh in the sm app (blocking) → https://sm.rajeshgo.li/messages/msg_3f9a2c1d</code></pre>
+<p>You comment on the last sentence and type "Otherwise yes, drop it." The agent receives:</p>
+<pre><code>[Input from: Rajesh via sm app] Re: "Keep the old fills table or drop it?" (msg_3f9a2c1d)
+Otherwise yes, drop it.
+
+&gt; Nothing reads `fills` after the cutover.
+The month-end recon does. Check it first.</code></pre>
+<p>The first line has the same shape as the header an agent sees on a message from another agent (<code>[Input from: &lt;name&gt; (&lt;id&gt;) via sm send]</code>),<sup>2</sup> so the agent treats it as conversation and answers with <code>sm send rajesh</code>. Your comments carry the passage they refer to, as review comments do.</p>
+
+<h3>What you see</h3>
+
+<figure>
+<svg viewBox="0 0 760 470" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Helvetica, Arial, sans-serif" font-size="12">
+  <rect x="20" y="10" width="330" height="120" rx="16" fill="#f4f3f0" stroke="#8a8880"/>
+  <text x="40" y="36" font-size="11" fill="#52514e">sm · now</text>
+  <text x="40" y="60" font-weight="700" font-size="14">sm-1679-engineer needs you</text>
+  <text x="40" y="82" font-size="13">Keep the old fills table or drop it?</text>
+  <text x="40" y="112" font-size="11" fill="#8a8880">Tap to open. More messages from this agent</text>
+  <text x="40" y="125" font-size="11" fill="#8a8880">update this notification without buzzing again.</text>
+  <rect x="400" y="10" width="340" height="450" rx="16" fill="#fcfcfb" stroke="#8a8880"/>
+  <rect x="400" y="10" width="340" height="40" rx="16" fill="#f4f3f0"/>
+  <text x="418" y="35" font-size="12" font-weight="700">sm-1679-engineer · needs you · 2m ago</text>
+  <text x="418" y="80" font-family="Georgia, serif" font-size="17" font-weight="700">Keep the old fills table or drop it?</text>
+  <text x="418" y="108" font-family="Georgia, serif" font-size="13">The migration copies every row into fills_v2.</text>
+  <text x="418" y="126" font-family="Georgia, serif" font-size="13">I recommend dropping fills after one week</text>
+  <text x="418" y="144" font-family="Georgia, serif" font-size="13">of both tables agreeing. Confirm?</text>
+  <rect x="412" y="160" width="316" height="24" fill="#2a78d6" fill-opacity="0.12"/>
+  <text x="418" y="177" font-family="Georgia, serif" font-size="13">Nothing reads fills after the cutover.</text>
+  <rect x="424" y="192" width="300" height="70" rx="8" fill="#f4f3f0" stroke="#2a78d6"/>
+  <text x="436" y="211" font-size="11" fill="#52514e">&gt; Nothing reads fills after the cutover.</text>
+  <text x="436" y="231" font-size="12">The month-end recon does. Check it first.</text>
+  <text x="436" y="252" font-size="11" fill="#2a78d6">Pending · Edit · Delete</text>
+  <line x1="412" y1="285" x2="728" y2="285" stroke="#e2e1dc"/>
+  <text x="418" y="306" font-size="11" fill="#52514e" font-weight="700">YOUR REPLIES</text>
+  <text x="418" y="325" font-size="12" fill="#52514e">none yet</text>
+  <rect x="412" y="345" width="316" height="62" rx="8" fill="#fff" stroke="#8a8880"/>
+  <text x="424" y="368" font-size="12" fill="#8a8880">Reply to sm-1679-engineer…</text>
+  <rect x="412" y="418" width="96" height="30" rx="15" fill="#f4f3f0" stroke="#8a8880"/>
+  <text x="460" y="438" text-anchor="middle" font-size="12">Handled</text>
+  <rect x="612" y="418" width="116" height="30" rx="15" fill="#2a78d6"/>
+  <text x="670" y="438" text-anchor="middle" font-size="12" fill="#fff" font-weight="700">Send (1 comment)</text>
+  <text x="20" y="175" font-size="12.5" font-weight="700">Left: the notification.</text>
+  <text x="20" y="195" font-size="12.5">Title = agent name, plus "needs you"</text>
+  <text x="20" y="212" font-size="12.5">when the agent marked it blocking.</text>
+  <text x="20" y="229" font-size="12.5">Body = the message title.</text>
+  <text x="20" y="265" font-size="12.5" font-weight="700">Right: the message page.</text>
+  <text x="20" y="285" font-size="12.5">Tap a paragraph (or select text) to</text>
+  <text x="20" y="302" font-size="12.5">comment on it, exactly as in a memo</text>
+  <text x="20" y="319" font-size="12.5">review. Type in the reply box. Send</text>
+  <text x="20" y="336" font-size="12.5">delivers the comments and the reply</text>
+  <text x="20" y="353" font-size="12.5">to the agent as one message.</text>
+  <text x="20" y="389" font-size="12.5"><tspan font-weight="700">Handled</tspan> clears "Waiting for Rajesh"</text>
+  <text x="20" y="406" font-size="12.5">without sending anything, for when you</text>
+  <text x="20" y="423" font-size="12.5">dealt with it another way.</text>
+</svg>
+<figcaption>Figure 2. The notification and the message page. The page is the memo reader you already review docs in, with a reply box added at the bottom.</figcaption>
+</figure>
+
+<h3>Where you find messages later</h3>
+<p>Each agent's card in the app gets a <b>Messages</b> list above <b>Docs</b>: one row per message, newest first, with the title, a state (<b>New</b>, <b>Read</b>, <b>Replied</b>, or <b>Needs you</b> for an unanswered blocking message) and its age. A blocking message you have not answered also shows in the card's existing "Waiting for" line as <i>Waiting for Rajesh · &lt;title&gt;</i>, the way a review request shows <i>Waiting for owner review</i> today. The message page lists your earlier replies under the message, so you can see what you already said. On a laptop, every link in the fallback email and in <code>sm send</code>'s output opens the same page on sm web.</p>
+
+<h3>Behaviour in the cases that matter</h3>
+<table>
+<thead><tr><th style="width:38%">Case</th><th>What happens</th></tr></thead>
+<tbody>
+<tr><td>An agent sends three messages in ten minutes</td><td>One notification, updated in place. It buzzes once, shows the newest title and says "+2 more". All three are on the agent's card. After you dismiss it, the next message buzzes again.</td></tr>
+<tr><td>An agent loops and keeps sending</td><td>The server refuses an agent's sixth unread message and tells the agent "Rajesh has 5 unread messages from you; wait for him to read them." Opening any one of them lets it send again.</td></tr>
+<tr><td>Your phone is off, or notifications are muted for sm</td><td>No confirmation within 15 minutes, so the server emails you the full message with a link to its page. Replying to that email reaches the agent, as email replies do today.</td></tr>
+<tr><td>You reply after the agent was retired</td><td>The reply goes to the agent's parent, the same rule a doc review uses. With no live parent, the page says "Not delivered: agent retired" and keeps your text.</td></tr>
+<tr><td>The agent is mid-task when you reply</td><td>Your reply waits for its current turn to end, like any <code>sm send</code> without <code>--urgent</code>. It is never lost if the agent is stopped: it arrives when the agent is restored.</td></tr>
+<tr><td>You tap Send twice, or the network drops mid-send</td><td>The agent receives the reply once. The page retries with the same submission id and the server recognises it.</td></tr>
+<tr><td>An agent publishes a doc with <code>--review</code></td><td>You're notified, "sm-1580-spec-author asks for your review", and the tap opens the doc. Your review lands on GitHub and wakes the agent with <code>[sm review]</code>, unchanged.</td></tr>
+<tr><td>An agent publishes a readout with <code>--notify</code> and no pull request</td><td>You're notified, and the doc page has the same reply box. Your reply reaches the agent as a message, naming the doc and revision.</td></tr>
+<tr><td>A message is over 64 KB</td><td>Refused, with "too long for a message; publish a doc with <code>sm doc publish --notify</code>".</td></tr>
+</tbody>
+</table>
+
+<h3>Decision surface</h3>
+<table>
+<thead>
+<tr><th style="width:20%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
+</thead>
+<tbody>
+<tr><td>1. Where <code>sm send rajesh</code> goes</td><td><b>The app, with email only as the fallback.</b> Email goes out when the phone does not confirm within 15 minutes, or immediately when phone notifications are not set up. <code>sm email rajesh</code> is unchanged for when you ask for email.</td><td>It is the ticket's goal, and the fallback is the rule that already protects follow notifications.</td></tr>
+<tr><td>2. How your reply reaches the agent</td><td><b>As a message headed <code>[Input from: Rajesh via sm app]</code></b>, delivered when the agent's turn ends. The header names the message title and id.</td><td>Agents already answer that header with <code>sm send</code>; a system marker like <code>[sm review]</code> reads as an instruction, not a conversation.</td></tr>
+<tr><td>3. Shape of a reply</td><td><b>One Send carries your overall text and every passage comment together</b>, like a review. There is no per-comment sending.</td><td>The agent gets one coherent message instead of a trickle that it starts acting on halfway through.</td></tr>
+<tr><td>4. Blocking messages</td><td><b>Agents mark them with <code>--blocking</code>.</b> The notification says "needs you", the card says "Waiting for Rajesh" until you reply or tap Handled. Unmarked messages are for your information.</td><td>It replaces "say in the subject if it blocks" with something the app can show and sort on.</td></tr>
+<tr><td>5. Noise control</td><td><b>One notification per agent, buzzing once until you dismiss it, and at most 5 unread messages per agent.</b></td><td>A chatty or looping agent can cost you one buzz, not fifty.</td></tr>
+<tr><td>6. Doc notifications</td><td><b>Add <code>sm doc publish --notify</code>, and make <code>--review</code> notify on its own.</b> A plain publish still does not notify.</td><td>A review request is exactly when an agent needs your attention; readouts only when the agent says so.</td></tr>
+<tr><td>7. Replying to docs without a pull request</td><td><b>Allow it.</b> The reply box appears on every doc whose PR is not open, and the reply reaches the author as a message. Docs on an open PR keep the review flow.</td><td>Otherwise a readout pushed to your phone has no way to answer it except the terminal.</td></tr>
+<tr><td>8. Where messages live</td><td><b>In the sm server's database, kept indefinitely.</b> Not in git.</td><td>A message is conversation, not a document; a year of them is a few megabytes.</td></tr>
+<tr><td>9. Your standing instructions</td><td><b>The implementing agent edits CLAUDE.md and AGENTS.md with the wording in Appendix H</b>: "reach me with <code>sm send rajesh</code>" replaces "email me", under the same conditions (your standing ask, an event you named, about 17 minutes of silence).</td><td>Agents follow the file, so the file has to say the new thing on the day it ships.</td></tr>
+<tr><td>10. Build order</td><td><b>Three tickets, in order:</b> (a) messages on the server and <code>sm send rajesh</code>, with pages and replies on sm web, each message also emailed until (b) lands; (b) notifications and fallback for messages and docs, <code>--notify</code>, doc replies; (c) the Android app. Each is mid tier.</td><td>Each fits one agent without running out of context, and (a) is usable from a laptop before the phone work lands.</td></tr>
+</tbody>
+</table>
+
+<h3>Out of scope</h3>
+<p>Starting a conversation from the app (you message an agent first, rather than replying); the attached-terminal "Message agent" box already covers that. Browser notifications on sm web. Messages to anyone other than you. Showing the agent's later messages threaded under your reply: each message is its own page, and the agent card lists them in order.</p>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p>This is the first revision.</p>
+
+<p class="sans"><small>
+<sup>1</sup> <code>sm send</code> falls back to email when the target is not a session: <code>crates/sm-server/src/bin/sm.rs:1044-1075</code>, <code>send_registered_email_fallback</code> at <code>sm.rs:3863</code>. <code>sm lookup rajesh</code> reports "Default delivery: email".<br>
+<sup>2</sup> <code>crates/sm-server/src/sessions.rs:11554</code>.
+</small></p>
+
+<!-- memo-print-scope keys on this divider: everything after it is hidden when printing
+     "memo only". Keep it immediately before the appendices, or the toggle prints everything. -->
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<div class="toc">
+<div><a href="#a">A. Message lifecycle and states</a></div>
+<div><a href="#b">B. CLI</a></div>
+<div><a href="#c">C. Persisted shapes</a></div>
+<div><a href="#d">D. Server HTTP interface</a></div>
+<div><a href="#e">E. Rendering and the reply client</a></div>
+<div><a href="#f">F. Notifications and email fallback</a></div>
+<div><a href="#g">G. Android app</a></div>
+<div><a href="#h">H. Agent contract text</a></div>
+<div><a href="#i">I. Tickets and tests</a></div>
+<div><a href="#z">Z. FAQ</a></div>
+</div>
+
+<h3 id="a">A. Message lifecycle and states</h3>
+
+<p>A message's owner-facing state is derived from its columns (Appendix C); there is no state column. First match wins.</p>
+<table>
+<thead><tr><th>State</th><th>Condition</th><th>Shown as</th></tr></thead>
+<tbody>
+<tr><td><code>replied</code></td><td>A reply row with <code>status = 'delivered'</code> or <code>'undelivered'</code> exists for the message</td><td>Replied</td></tr>
+<tr><td><code>handled</code></td><td><code>handled_at</code> set</td><td>Handled</td></tr>
+<tr><td><code>needs_you</code></td><td><code>blocking = 1</code>, and the sender session is not retired</td><td>Needs you</td></tr>
+<tr><td><code>read</code></td><td><code>first_viewed_at</code> set</td><td>Read</td></tr>
+<tr><td><code>new</code></td><td>otherwise</td><td>New</td></tr>
+</tbody>
+</table>
+<p><b>Unread</b> (for the 5-message cap, Appendix D) means <code>first_viewed_at IS NULL</code>, regardless of state. <b>Viewed</b> means the message page was served to the owner (<code>GET /messages/{id}</code> as HTML, not <code>?format=json</code>) or the owner replied or tapped Handled, all of which set <code>first_viewed_at</code> if null.</p>
+<p><b>Waiting entry.</b> A message in state <code>needs_you</code> adds to its sender's <code>waiting_on</code> in <code>project_session_obligations</code><sup>3</sup>: <code>{kind: "owner_message", id, label: "Rajesh · &lt;title&gt;", since: created_at}</code>. Retirement removes it because the state rule excludes retired senders.</p>
+
+<h3 id="b">B. CLI</h3>
+
+<h4>B1. <code>sm send &lt;human&gt;</code></h4>
+<pre><code>sm send &lt;human&gt; [--title "..."] [--blocking] [text...]      # or markdown on stdin / "-"</code></pre>
+<ul>
+<li><b>Target resolution.</b> Unchanged order up to the fallback: virtual target, then <code>lookup_identifier_exact</code>. Where the CLI today calls <code>send_registered_email_fallback</code>, it first asks <code>GET /humans/{target}</code>. A human match posts <code>POST /humans/{canonical}/messages</code> (Appendix D). No match keeps today's registered-user email fallback (<code>POST /email/send</code>) unchanged. <code>rajesh</code>, <code>rajeshgoli</code>, <code>user</code> and <code>operator</code> all resolve through the existing human aliases.</li>
+<li><b>Body.</b> <code>read_send_text</code> as today: positional text, <code>-</code>, or piped stdin. The text is markdown.</li>
+<li><b>Title.</b> <code>--title</code> if given (trimmed, 1–120 characters, else error). Otherwise the server derives it (Appendix D2).</li>
+<li><b>Flags.</b> <code>--title</code> and <code>--blocking</code> are errors when the resolved target is not a human: <code>--title/--blocking only apply to a message to a person</code>. <code>--urgent</code> and <code>--wait</code> with a human target are errors: <code>--urgent/--wait do not apply to a message to a person; use --blocking</code>.</li>
+<li><b>Sender.</b> Requires <code>CLAUDE_SESSION_MANAGER_ID</code>; without it: <code>sm send to a person needs a managed session, so the reply has somewhere to go</code>.</li>
+<li><b>Multiple targets.</b> A human inside a comma list (<code>sm send rajesh,maintainer</code>) is an error before anything is sent: <code>send to rajesh on its own, not in a list</code>. <code>resolve_send_target</code> checks <code>GET /humans/{t}</code> for each target first.</li>
+<li><b>Output.</b> <code>Sent to &lt;canonical&gt; in the sm app → &lt;reader_url&gt;</code>, with <code>(blocking)</code> after the app when set. A 429 prints the server's <code>detail</code> and exits 1.</li>
+</ul>
+
+<h4>B2. <code>sm doc publish</code></h4>
+<ul>
+<li>New flag <code>--notify</code>. The payload to <code>POST /docs</code> gains <code>notify: bool</code>, true when <code>--notify</code> or <code>--review</code> is given. It combines with every other flag, including <code>--no-pr</code> and <code>--commit</code>.</li>
+<li>Output gains a second line when a notification was queued: <code>Notified rajesh in the sm app</code>.</li>
+</ul>
+
+<h4>B3. <code>sm lookup &lt;human&gt;</code></h4>
+<p>Output changes to:</p>
+<pre><code>Human recipient: rajesh
+Aliases: rajeshgoli, user, operator
+Default delivery: sm app (email if the phone does not confirm within 15 minutes)
+Explicit email: sm email rajesh
+Send markdown with: sm send rajesh [--blocking] &lt;&lt;'EOF' … EOF</code></pre>
+
+<h4>B4. Unchanged</h4>
+<p><code>sm email</code>, <code>POST /humans/{id}/email</code>, <code>POST /email/send</code> and the inbound email webhook behave exactly as today.</p>
+
+<h3 id="c">C. Persisted shapes</h3>
+
+<h4>C1. Retained queue database</h4>
+<p>The database at <code>sm_send.db_path</code>, where <code>owner_docs</code> lives<sup>4</sup>. Add these tables with the same migration pattern.</p>
+<pre><code>CREATE TABLE owner_messages (
+  id                   TEXT PRIMARY KEY,     -- "msg_" + 8 lowercase hex
+  human                TEXT NOT NULL,        -- canonical human recipient, e.g. "rajesh"
+  sender_session_id    TEXT NOT NULL,
+  sender_session_name  TEXT NOT NULL,        -- display name at send time
+  title                TEXT NOT NULL,
+  body_markdown        TEXT NOT NULL,        -- at most 65536 bytes
+  blocking             INTEGER NOT NULL DEFAULT 0,
+  created_at           TEXT NOT NULL,        -- RFC3339 UTC
+  first_viewed_at      TEXT,
+  handled_at           TEXT
+);
+CREATE INDEX owner_messages_sender ON owner_messages(sender_session_id, created_at);
+
+CREATE TABLE owner_message_drafts (      -- passage comments not yet sent
+  id          TEXT PRIMARY KEY,          -- same id scheme as owner_doc_drafts
+  message_id  TEXT NOT NULL REFERENCES owner_messages(id),
+  line        INTEGER,                   -- source line of the markdown; NULL = not placeable
+  quote       TEXT NOT NULL,
+  body        TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE owner_replies (
+  id                       TEXT PRIMARY KEY,  -- the client's submission_id
+  target_kind              TEXT NOT NULL,     -- 'message' | 'doc'
+  target_id                TEXT NOT NULL,     -- owner_messages.id or owner_docs.id
+  commit_sha               TEXT,              -- doc replies: the revision replied to
+  body                     TEXT NOT NULL,     -- the owner's overall text, trimmed (may be empty)
+  comments_json            TEXT NOT NULL,     -- [{line, quote, body}] in delivered order
+  delivered_text           TEXT NOT NULL,     -- exactly what the agent received
+  status                   TEXT NOT NULL,     -- 'delivered' | 'undelivered'
+  delivered_to_session_id  TEXT,
+  created_at               TEXT NOT NULL
+);
+CREATE INDEX owner_replies_target ON owner_replies(target_kind, target_id, created_at);</code></pre>
+<p>Doc replies reuse <code>owner_doc_drafts</code>, which is already keyed by doc and commit. Nothing is ever deleted from <code>owner_messages</code> or <code>owner_replies</code>. Drafts are deleted in the transaction that inserts the reply.</p>
+
+<h4>C2. Owner push database</h4>
+<p>The database at <code>push.db_path</code> (<code>owner_push.db</code>)<sup>5</sup>. Add:</p>
+<pre><code>CREATE TABLE owner_notices (
+  id               TEXT PRIMARY KEY,   -- "not_" + 12 lowercase base32, like follow ids
+  user_id          TEXT NOT NULL,      -- same identity push_tokens uses (Appendix F1)
+  kind             TEXT NOT NULL,      -- 'message' | 'doc_published' | 'review_requested'
+  session_id       TEXT NOT NULL,      -- the agent the notice is about
+  session_name     TEXT NOT NULL,
+  subject_id       TEXT NOT NULL,      -- owner_messages.id or owner_docs.id
+  title            TEXT NOT NULL,      -- notification title (Appendix F3)
+  body             TEXT NOT NULL,      -- notification body
+  reader_path      TEXT NOT NULL,      -- /messages/msg_… or the doc's readable path with ?version=
+  blocking         INTEGER NOT NULL DEFAULT 0,
+  created_at       TEXT NOT NULL,
+  notify_after     TEXT NOT NULL,      -- = created_at, then the retry schedule
+  push_attempts    INTEGER NOT NULL DEFAULT 0,
+  last_push_error  TEXT,
+  notified_at      TEXT,
+  notified_via     TEXT,               -- 'push' | 'email'
+  acked_at         TEXT,
+  email_sent_at    TEXT
+);
+CREATE INDEX owner_notices_pending ON owner_notices(notified_at, notify_after);</code></pre>
+<p>The delivery columns mean exactly what they mean on <code>owner_follows</code>. A notice is created in the same request that creates the message or the doc publish. It is never cancelled.</p>
+
+<h3 id="d">D. Server HTTP interface</h3>
+
+<h4>D1. Routes</h4>
+<table>
+<thead><tr><th style="width:34%">Route</th><th>Behaviour</th></tr></thead>
+<tbody>
+<tr><td><code>POST /humans/{identifier}/messages</code><br><code>{sender_session_id, text, title?, blocking?}</code></td><td>CLI write auth, as <code>POST /humans/{id}/email</code>. 404 if no human matches. 400 for a blank text, text over 65536 bytes (<code>too long for a message; publish a doc with sm doc publish --notify</code>), or a title outside 1–120 characters. 409 if <code>sender_session_id</code> is not a known session. 429 when the sender already has 5 messages to this human with <code>first_viewed_at IS NULL</code>: <code>{"detail": "Rajesh has 5 unread messages from you; wait for him to read them"}</code>. Otherwise inserts the message and its notice in one transaction per database (message first; a notice insert failure is logged and the message still stands, and the delivery worker's repair pass (F2) creates the missing notice). Returns 201 <code>{id, title, reader_path, reader_url, blocking}</code>.</td></tr>
+<tr><td><code>GET /messages/{id}</code></td><td>Same auth as the doc readable routes. HTML: the message page (Appendix E), and sets <code>first_viewed_at</code> if null. <code>?format=json</code>: <code>{id, human, sender_session_id, sender_session_name, title, body_markdown, blocking, created_at, first_viewed_at, handled_at, state, replies:[{id, body, comments, delivered_text, status, delivered_to_session_id, created_at}]}</code>, without marking viewed. 404 <code>Message not found</code>.</td></tr>
+<tr><td><code>GET/POST /messages/{id}/drafts</code><br><code>PATCH/DELETE /messages/{id}/drafts/{draft_id}</code></td><td>As the doc draft routes, without <code>sha</code>. At most 100 drafts per message.</td></tr>
+<tr><td><code>POST /messages/{id}/reply</code><br><code>{submission_id, body}</code></td><td>Appendix D3. Returns 200 <code>{status, delivered_to_session_id, delivered_text}</code>.</td></tr>
+<tr><td><code>POST /messages/{id}/handled</code></td><td>Sets <code>handled_at</code> and <code>first_viewed_at</code> if null. Sends nothing to the agent. 204.</td></tr>
+<tr><td><code>POST /docs/{id}/reply</code><br><code>{submission_id, sha, body}</code></td><td>Appendix D3 with the doc's drafts for <code>(doc, sha)</code>. 409 <code>This doc is on an open PR; submit a review instead</code> when the doc's PR is open (PR state from the same cached lookup <code>/head</code> uses; <code>unknown</code> counts as open, so the client falls back to review when GitHub can't be asked).</td></tr>
+<tr><td><code>POST /docs</code></td><td>Accepts <code>notify: bool</code> (default false). When true, after the publish row is written, creates a notice: kind <code>review_requested</code> if this publish has <code>review_requested</code>, else <code>doc_published</code>; <code>subject_id</code> = doc id; <code>reader_path</code> = the latest publish's readable path; <code>user_id</code> per F1. The response gains <code>notified: bool</code>.</td></tr>
+<tr><td><code>POST /client/notices/{id}/ack</code></td><td>Owner guard as <code>POST /client/follows/{id}/ack</code><sup>6</sup>. Sets <code>acked_at</code> if null. 204; 404 if the notice doesn't belong to <code>user_id</code>.</td></tr>
+<tr><td><code>GET /client/notices</code></td><td>Owner guard. Notices from the last 7 days, newest first, every column except <code>user_id</code>. For debugging and the app's settings screen.</td></tr>
+</tbody>
+</table>
+<p>The message JSON routes (<code>drafts</code>, <code>reply</code>, <code>handled</code>) accept normal auth or an <code>X-SM-Doc-Token</code> minted for the message id, exactly as doc routes do<sup>7</sup>; the token's signed subject is the message id. Add every route to <code>tests/read_only_http.rs</code> where applicable.</p>
+
+<h4>D2. Title derivation</h4>
+<p>When <code>title</code> is absent: the text of the first ATX or setext heading in the markdown if it is within the first 10 non-blank lines; otherwise the first non-blank line with leading markdown markers (<code>#</code>, <code>&gt;</code>, <code>-</code>, <code>*</code>, digits followed by <code>.</code>) and inline markup characters (<code>*</code>, <code>_</code>, <code>`</code>) removed. Whitespace collapsed; cut at 120 characters on a character boundary with <code>…</code> appended when cut.</p>
+<table>
+<thead><tr><th>Text starts with</th><th>Title</th></tr></thead>
+<tbody>
+<tr><td><code># Keep the old fills table?</code></td><td>Keep the old fills table?</td></tr>
+<tr><td><code>**Done:** stage 2 is green.</code></td><td>Done: stage 2 is green.</td></tr>
+<tr><td><code>- one\n- two</code></td><td>one</td></tr>
+</tbody>
+</table>
+
+<h4>D3. Submitting a reply</h4>
+<ol>
+<li><b>Idempotency.</b> If a reply row with <code>id = submission_id</code> exists: same target → return it unchanged; different target → 409. Replies are serialized per target with the draft writes, as doc review submissions are.</li>
+<li><b>Content.</b> Load the drafts (message: all of the message's drafts; doc: those for <code>(doc, sha)</code>), ordered by <code>line</code> ascending with NULL last, then <code>created_at</code>. Trim <code>body</code>. If both are empty: 400 <code>Nothing to send</code>.</li>
+<li><b>Recipient.</b> Message: the sender session; doc: the author session. Apply the review wake rule<sup>8</sup>: that session if it exists and is not retired or killed, else its parent if that exists and is not retired, else none.</li>
+<li><b>Text.</b> Build <code>delivered_text</code> (D4).</li>
+<li><b>Deliver and record, in one transaction</b> on the retained queue database: insert the reply row, delete the drafts, set <code>first_viewed_at</code> if null, and enqueue the text for the recipient on <code>message_queue</code> with <code>delivery_mode = 'sequential'</code>, <code>from_sm_send = false</code>, no sender session (so no second header is added). With no recipient, the row is <code>undelivered</code> and nothing is enqueued. After commit, if the runtime is enabled, drain that session's pending messages, as the review wake does. A stopped recipient gets the message on restore.</li>
+</ol>
+
+<h4>D4. Delivered text</h4>
+<pre><code>[Input from: Rajesh via sm app] Re: "&lt;title&gt;" (&lt;message id&gt;)          -- message reply
+[Input from: Rajesh via sm app] Re: doc "&lt;title&gt;" (&lt;repo-name&gt;/&lt;path&gt; @ &lt;sha7&gt;)   -- doc reply
+&lt;overall body, if non-empty&gt;
+
+&gt; &lt;quote line 1&gt;
+&gt; &lt;quote line 2&gt;
+&lt;comment body&gt;
+
+&gt; &lt;next quote&gt;
+&lt;next comment body&gt;</code></pre>
+<p>Rules: one blank line between the overall body and the first comment, and between comments; no blank line after the header. Each quote is trimmed, capped at 300 characters (<code>…</code> appended when cut) and prefixed <code>&gt; </code> per line. "Rajesh" is the same literal the <code>[sm review]</code> wake uses. The doc title is the doc's current title. There is no length cap on the delivered text beyond the 100-draft limit.</p>
+
+<h3 id="e">E. Rendering and the reply client</h3>
+<h4>E1. Message page</h4>
+<ol>
+<li>Render <code>body_markdown</code> with <code>render_markdown_with_lines</code> inside <code>doc_shell</code>, the same path a <code>.md</code> doc takes<sup>9</sup>, with <code>title</code> as the page title. Line numbers are source lines of the markdown, so tap-to-comment anchors work unchanged.</li>
+<li>Above the body, a line in the shell's meta style: <code>&lt;sender_session_name&gt; · &lt;relative time&gt;</code>, plus <code>· needs you</code> when state is <code>needs_you</code>.</li>
+<li>Inject the review client (<code>review_client_injection</code><sup>10</sup>) with the config in E2.</li>
+</ol>
+
+<h4>E2. Client changes (<code>http/doc_client.js</code>)</h4>
+<ul>
+<li>The config gains <code>mode</code>: <code>"review"</code> (today's behaviour), <code>"reply"</code>, or <code>"read"</code>; and <code>apiBase</code>: <code>"/docs/&lt;id&gt;"</code> or <code>"/messages/&lt;id&gt;"</code>. <code>api()</code> builds URLs from <code>apiBase</code> instead of the hard-coded <code>/docs/</code>.</li>
+<li>Mode is chosen by the server. Message page: <code>reply</code>. Doc with an open PR: <code>review</code> (<code>canComment</code> true). Doc with <code>prState</code> <code>unknown</code>: <code>review</code> with commenting off until <code>/head</code> answers, as today. Any other doc (no PR, closed, merged): <code>reply</code>.</li>
+<li><b>Reply mode</b> keeps drafts, the composer and pending bubbles exactly as review mode, and replaces the review panel with a panel fixed at the bottom of the visual viewport: a textarea (placeholder <code>Reply to &lt;agent name&gt;…</code>, auto-grows to 6 lines), <b>Handled</b> (messages only, shown only while state is <code>needs_you</code>) and <b>Send</b>, labelled <code>Send (N comments)</code> when drafts exist. Send reloads drafts first; if they changed, it shows the new count and asks again (the review panel's rule). It keeps one <code>submission_id</code> until success, reused on every retry. On success it shows <code>Sent to &lt;session name&gt;</code> (or <code>Not delivered: agent retired</code>), clears the textarea and appends the reply to the replies list.</li>
+<li><b>Replies list</b> (reply mode): under the body, heading <code>Your replies</code>, each reply's overall body and comment quotes with its time; <code>none yet</code> when empty. Filled from config <code>replies</code> (message: all replies to it; doc: all doc replies to this doc, any revision, newest last).</li>
+<li>The doc header bar's read-only label changes from <code>Read-only: no PR</code> / <code>PR closed</code> to <code>Reply goes to &lt;author&gt;</code> in reply mode.</li>
+<li>Reply mode on a doc sends <code>sha</code> (the viewed revision) and uses the doc's drafts for that revision; drafts from another revision show the existing "N draft comments on &lt;sha7&gt;" prompt.</li>
+</ul>
+
+<h3 id="f">F. Notifications and email fallback</h3>
+<h4>F1. Who is notified</h4>
+<p><code>user_id</code> must be the identity the app's push tokens are registered under, which is the owner's signed-in Google email. So: the human recipient's email channel address, lowercased, when it equals (case-insensitively) a <code>google_auth.allowlist_emails</code> entry; else the first <code>google_auth.allowlist_emails</code> entry; else <code>local_bypass</code>, which is what a local follow uses without sign-in. The lookup of valid tokens is then unchanged. For doc notices the human is the only configured human; with several humans, the first in config order.</p>
+
+<h4>F2. Delivery</h4>
+<p>Extend the follow delivery worker (<code>owner_push::deliver</code><sup>5</sup>) to process <code>owner_notices</code> in the same pass, after follows, with the same rules: push to every valid token; success on any token sets <code>notified_at</code>/<code>notified_via='push'</code>; retryable failures back off 30 s, 1, 2, 5, 10 minutes, then email; an invalid token is marked and not retried; no push configured or no valid token → email immediately; a push with no ack within 15 minutes → one fallback email; transient email failures retry every 5 minutes for an hour. Notices have no report grace. A repair pass, every third worker pass, creates a notice for any <code>owner_messages</code> row younger than 24 hours that has none (lookup by <code>subject_id</code>). Runs only when <code>rust_core.runtime_enabled</code>, like follows.</p>
+
+<h4>F3. Notification text and payload</h4>
+<table>
+<thead><tr><th>Kind</th><th>Title</th><th>Body</th></tr></thead>
+<tbody>
+<tr><td><code>message</code></td><td><code>{session_name}</code>, or <code>{session_name} needs you</code> when blocking</td><td><code>{message title}</code></td></tr>
+<tr><td><code>doc_published</code></td><td><code>{session_name} published a doc</code></td><td><code>{doc title}</code></td></tr>
+<tr><td><code>review_requested</code></td><td><code>{session_name} asks for your review</code></td><td><code>{doc title}</code></td></tr>
+</tbody>
+</table>
+<p>FCM data (all strings): <code>kind</code>, <code>notice_id</code>, <code>session_id</code>, <code>title</code>, <code>body</code>, <code>reader_path</code>, <code>blocking</code> (<code>"1"</code>/<code>"0"</code>), and <code>unread_count</code>: for <code>message</code>, the number of that sender's messages to this human with <code>first_viewed_at IS NULL</code> at send time; <code>"0"</code> for doc kinds. Same sender, priority HIGH and TTL 86400 s as follows.</p>
+
+<h4>F4. Email</h4>
+<p>Sent through the existing email bridge as the agent (<code>send_agent_email</code>), so a reply to it routes to the agent through the existing inbound webhook. Subject: the notification title followed by <code>: </code> and the body (<code>sm-1679-engineer needs you: Keep the old fills table or drop it?</code>). Message notices: the email body is the message markdown (<code>markdown: true</code>), then a blank line and <code>Open in sm: {public base URL}{reader_path}</code>. Doc notices: <code>{body}\n\nOpen in sm: …</code>. The email bridge's routing footer is appended as for every agent email.</p>
+
+<h3 id="g">G. Android app</h3>
+<ul>
+<li><b>Channel.</b> New channel <code>agent_messages</code>, "Messages from agents", high importance. Follow notifications keep <code>agent_follow</code>.</li>
+<li><b>Receive.</b> <code>FollowMessagingService.onMessageReceived</code> dispatches on <code>kind</code>: <code>message</code>, <code>doc_published</code>, <code>review_requested</code> go to a new <code>NoticePush.show</code>; other kinds keep today's path. Notification id: <code>("agent:" + session_id).hashCode()</code>, so one agent has one notification. <code>setOnlyAlertOnce(true)</code>, so an update to a showing notification does not buzz. When <code>unread_count &gt; 1</code>, the body gets <code> (+{unread_count − 1} more)</code>. The ack (<code>POST /client/notices/{notice_id}/ack</code>) follows the follow rules: only when the notification was actually shown (notifications enabled, channel not muted, posting succeeded); a push while signed out is dropped.</li>
+<li><b>Tap.</b> A PendingIntent to <code>MainActivity</code> with <code>reader_path</code> and <code>session_id</code>, handled like a follow tap: open <code>DocReaderOverlay</code> on <code>reader_path</code>.</li>
+<li><b>Reader.</b> <code>DocReader.kt</code> treats <code>/messages/</code> paths as it treats <code>/docs/</code>: loaded with device auth headers, and same-origin navigations under <code>/messages/</code> re-sent with them in <code>shouldOverrideUrlLoading</code><sup>11</sup>. The app's link opener (the <code>/docs/</code> and <code>/t/</code> list at <code>DocReader.kt:214</code>) adds <code>/messages/</code>.</li>
+<li><b>Agent card.</b> <code>AgentWorkSections</code><sup>12</sup> gets a <b>Messages</b> section above <b>Docs</b>, from a new optional <code>messages</code> field in the obligations projection: <code>[{id, title, state, blocking, created_at, reader_path}]</code>, the sender's messages from the last 30 days, newest first, at most 20. Row: title, state chip, relative time; tap opens the reader. The <code>owner_message</code> waiting entry renders through the existing waiting-on line. <code>ApiModels.kt</code> gets <code>messages</code> as an optional field defaulting to empty; bump <code>schema_version</code>.</li>
+<li><b>Settings.</b> The Notifications group's test button is unchanged. No new settings.</li>
+</ul>
+
+<h3 id="h">H. Agent contract text</h3>
+<p>Ticket (b) replaces, in <code>CLAUDE.md</code> §1 and the matching paragraph of <code>AGENTS.md</code>, the sentence beginning "Email (<code>sm email rajesh</code>) only on my standing ask" with:</p>
+<pre><code>Message me with `sm send rajesh` (markdown on stdin; add `--blocking` when you
+cannot continue without me) only on my standing ask, at an event I named such as
+convergence, or after roughly seventeen minutes of silence, which signals I stepped
+away. Batch your questions into one message. My reply arrives as
+`[Input from: Rajesh via sm app]`; answer it with another `sm send rajesh`. Use
+`sm email rajesh` only when I ask for email.</code></pre>
+<p>And in the "Use sm doc publish" paragraph, after the first sentence:</p>
+<pre><code>Add `--notify` when I should look at it now; `--review` notifies me on its own.</code></pre>
+
+<h3 id="i">I. Tickets and tests</h3>
+<p>Run tests with <code>scripts/test-rust-isolated.sh</code>. Stub FCM and the email bridge with the fakes <code>owner_push.rs</code> tests already use.</p>
+<p><b>Ticket (a), server messages, mid tier.</b> Appendices B1, C1, D1 (message routes), D2–D4, E. Until ticket (b) lands there are no notices, so ticket (a) emails each message the moment it is created, in the F4 message shape (subject, markdown body, <code>Open in sm</code> link), through <code>send_agent_email</code>; an email failure is logged and does not fail the send. Ticket (b) removes that immediate email when it adds notices. On completion you get every message by email with a link to its page on sm web, where you can reply.</p>
+<table>
+<thead><tr><th>Behaviour</th><th>Test</th></tr></thead>
+<tbody>
+<tr><td>Human target creates a message; non-human target keeps email fallback; flags rejected on non-human; list containing a human rejected; no managed session rejected</td><td><code>sm.rs</code> unit: <code>send_to_human_posts_message</code>, <code>send_to_non_human_keeps_email_fallback</code>, <code>title_and_blocking_need_a_human</code>, <code>human_in_target_list_is_refused</code></td></tr>
+<tr><td>Size, blank, title bounds, unknown sender, 5-unread cap and its reset on view</td><td><code>tests/owner_message_http.rs::create_validates_input</code>, <code>::unread_cap_refuses_sixth_and_resets_on_view</code></td></tr>
+<tr><td>Title derivation table (D2)</td><td><code>owner_messages.rs</code> unit <code>derived_titles</code></td></tr>
+<tr><td>Page render marks viewed; JSON does not; line annotation present</td><td><code>::page_marks_viewed_json_does_not</code></td></tr>
+<tr><td>Reply: delivered text format (D4) byte for byte; ordering; idempotent resubmit delivers once; 409 on cross-target id; nothing to send</td><td><code>owner_messages.rs</code> unit <code>delivered_text_format</code>; <code>::reply_is_idempotent_and_delivers_once</code></td></tr>
+<tr><td>Reply routing: live sender, retired sender → parent, none → undelivered</td><td><code>::reply_routes_like_review_wakes</code></td></tr>
+<tr><td>States and waiting entry (A); Handled clears it; retirement clears it</td><td><code>owner_messages.rs</code> unit <code>derived_states</code>; <code>tests/owner_message_http.rs::blocking_message_waits_until_reply_or_handled</code></td></tr>
+<tr><td>Client: <code>apiBase</code> routing, reply panel, Handled visibility</td><td><code>http/docs.rs</code> unit asserting the injected config per mode; manual check on sm web</td></tr>
+<tr><td>Immediate email per message until (b)</td><td><code>tests/owner_message_http.rs::create_emails_the_message</code> (fake bridge), deleted by ticket (b)</td></tr>
+</tbody>
+</table>
+<p><b>Ticket (b), notifications and doc replies, mid tier.</b> Appendices B2, B3, C2, D1 (<code>/docs</code> notify, <code>/docs/{id}/reply</code>, notice routes), F, H, and the doc half of E2: ticket (a) builds reply mode for messages, and (b) switches docs whose PR is not open from read-only to reply mode.</p>
+<table>
+<thead><tr><th>Behaviour</th><th>Test</th></tr></thead>
+<tbody>
+<tr><td>Message create writes a notice; repair pass fills a missing one</td><td><code>owner_push.rs</code> unit <code>message_creates_notice</code>, <code>repair_pass_creates_missing_notice</code></td></tr>
+<tr><td>Notice push, retry, invalid token, email after 6 attempts, ack fallback once, transient email retry</td><td><code>owner_push.rs</code> unit <code>notice_delivery_follows_follow_rules</code> (table-driven over the follow cases)</td></tr>
+<tr><td>Notification text and data (F3), including <code>unread_count</code> and blocking title</td><td><code>owner_push.rs</code> unit <code>notice_text_and_payload</code></td></tr>
+<tr><td>Email subject/body (F4)</td><td><code>http/follows.rs</code> unit <code>notice_email_shape</code></td></tr>
+<tr><td><code>--notify</code> / <code>--review</code> set <code>notify</code>; publish without either creates no notice; kind chosen by review flag</td><td><code>bin/doc</code> unit <code>notify_flag_payload</code>; <code>tests/owner_doc_http.rs::publish_notify_creates_notice</code></td></tr>
+<tr><td>Doc reply: refused on open PR and unknown state; accepted on no-PR, closed, merged; routed to author rule</td><td><code>tests/owner_doc_http.rs::doc_reply_modes</code></td></tr>
+<tr><td><code>sm lookup</code> text (B3)</td><td><code>sm.rs</code> unit <code>lookup_human_describes_app_delivery</code></td></tr>
+<tr><td>Ack route ownership</td><td><code>tests/owner_follow_http.rs::notice_ack_is_owner_scoped</code></td></tr>
+</tbody>
+</table>
+<p><b>Ticket (c), Android, mid tier.</b> Appendix G. Unit tests: <code>push/NoticeMessageTest</code> (payload parsing, per-agent notification id, "+N more" body), <code>SessionManagerRepositoryTest.noticeAckUsesSpecRoute</code>, projection parsing with and without <code>messages</code>. The live check: a scratch agent sends one blocking and two plain messages; the phone buzzes once, shows "+2 more", opens the page, a comment and reply reach the agent, and the card's waiting line clears. That needs your phone, so it is handed to you as a two-minute test.</p>
+
+<h3 id="z">Z. FAQ</h3>
+<p><b>Why not store messages in git, like docs?</b> Docs are artifacts with revisions and reviews; git gives them history and GitHub gives them review. A message is one turn of a conversation. Committing each one would put chat into repos and require a push before every question.</p>
+<p><b>Why is the reply not a <code>[sm …]</code> system marker, when follows and reviews are?</b> Those come from sm on your behalf and tell the agent what to do next. A reply is you talking; the agent should treat it as conversation and answer. Using the <code>sm send</code> header shape gets that behaviour from every existing agent without new instructions.</p>
+<p><b>Why not deliver replies as <code>urgent</code>?</b> Urgent interrupts the agent mid-turn. Your reply is usually the answer the agent is idle waiting for, so sequential delivery arrives immediately in that case and never corrupts a turn in progress in the other.</p>
+<p><b>Why cap unread messages instead of rate-limiting per minute?</b> A time rate limit punishes a legitimate burst (three quick findings) and still lets a slow loop through overnight. The unread cap measures what matters: messages you have not seen. It resets the moment you open one.</p>
+<p><b>What if you read the fallback email instead of the page?</b> Email reading does not mark the message viewed, so a long email-only stretch could hit the cap. The email's link opens the page and resets it. Phone-off stretches long enough to hit 5 unread from one agent are rare; widening the cap is a config-free constant change if it bites.</p>
+<p><b>Why does <code>--review</code> notify, but a plain publish doesn't?</b> Agents republish docs for many reasons (fixing a typo, pinning a revision). Only a review request or an explicit <code>--notify</code> asks for your attention now.</p>
+<p><b>What does an old app build do with a message notification?</b> Today's service knows only follow acks, so it never acks a notice, whether or not it shows it. The server then emails after 15 minutes. Tickets (b) and (c) ship together, so this only affects a phone that has not updated.</p>
+<p><b>Why a separate notices table rather than rows in <code>owner_follows</code>?</b> A follow has a target, a trigger and a report grace; a notice has none of those and is born already fired. Sharing the delivery code, not the table, keeps both shapes honest.</p>
+
+<p class="sans"><small>
+<sup>3</sup> <code>crates/sm-server/src/http.rs:6495</code>; the <code>owner_review</code> entry at <code>http.rs:6586</code>.<br>
+<sup>4</sup> <code>crates/sm-server/src/owner_docs.rs:393-459</code>.<br>
+<sup>5</sup> <code>crates/sm-server/src/owner_push.rs</code>; <code>deliver</code> at line 923; spec <code>specs/1569_follow_agent_notifications.html</code> appendices B and D.<br>
+<sup>6</sup> <code>crates/sm-server/src/http/follows.rs</code>: <code>owner_guard</code> 25-63, <code>ack_follow</code> 414-427.<br>
+<sup>7</sup> <code>crates/sm-server/src/http/docs.rs:994-1058</code>.<br>
+<sup>8</sup> <code>review_wake_recipient</code>, <code>crates/sm-server/src/http/docs/review.rs:132-149</code>.<br>
+<sup>9</sup> <code>render_doc_page</code> and <code>doc_shell</code>, <code>crates/sm-server/src/owner_docs.rs:1410-1465</code>; <code>crates/sm-server/src/owner_doc_render.rs</code>.<br>
+<sup>10</sup> <code>crates/sm-server/src/http/docs.rs:1080</code>; client <code>http/doc_client.js</code>, whose <code>api()</code> hard-codes <code>/docs/</code> at line 46.<br>
+<sup>11</sup> <code>android-app/app/src/main/java/li/rajeshgo/sm/ui/watch/DocReader.kt:154, 214, 362</code>.<br>
+<sup>12</sup> <code>android-app/app/src/main/java/li/rajeshgo/sm/ui/watch/WatchScreen.kt:1627</code>.
+</small></p>
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
