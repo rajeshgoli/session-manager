@@ -69,16 +69,55 @@ pub(super) fn render_owner_review_wake(
     if file_comments > 0 {
         counts.push(plural(file_comments, "file comment"));
     }
+    let overall = review
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|body| !body.is_empty());
     if counts.is_empty() {
-        counts.push("no comments".to_owned());
+        counts.push(
+            if overall.is_some() {
+                "no line or file comments"
+            } else {
+                "no comments"
+            }
+            .to_owned(),
+        );
     }
-    format!(
+    let mut wake = format!(
         "[sm review] {OWNER_NAME}'s review of \"{}\" (PR #{} @ {}) is here: {review_url}\nVerdict: {verdict} · {}",
         doc.title,
         doc.pr_number.unwrap_or_default(),
         &review.commit_sha[..review.commit_sha.len().min(7)],
         counts.join(" · ")
-    )
+    );
+    // The overall text carries instructions the verdict alone does not
+    // (sm#1578), so it rides in the wake instead of only behind the link.
+    if let Some(overall) = overall {
+        wake.push_str(&format!("\n{OWNER_NAME} wrote:\n"));
+        wake.push_str(&quote_overall(overall));
+    }
+    wake
+}
+
+/// Longest overall text a wake quotes in full; past it the wake points at
+/// the review for the rest.
+const WAKE_OVERALL_MAX_CHARS: usize = 4000;
+
+fn quote_overall(overall: &str) -> String {
+    let (text, truncated) = match overall.char_indices().nth(WAKE_OVERALL_MAX_CHARS) {
+        Some((cut, _)) => (&overall[..cut], true),
+        None => (overall, false),
+    };
+    let mut quoted = text
+        .lines()
+        .map(|line| format!("> {line}").trim_end().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if truncated {
+        quoted.push_str("\n> … (truncated; read the rest at the link above)");
+    }
+    quoted
 }
 
 pub(super) fn is_retired(session: &SessionRecord) -> bool {
@@ -669,6 +708,33 @@ mod tests {
             render_owner_review_wake(&doc("M"), &review("comment"), "u", 1, 0)
                 .ends_with("Verdict: comments · 1 line comment")
         );
+    }
+
+    #[test]
+    fn wake_quotes_the_overall_text() {
+        let mut approved = review("approve");
+        approved.body = Some(
+            "  Decisions look good.\n\nMerge after 2 Codex rounds. File only tickets that can start now.\n"
+                .into(),
+        );
+        assert_eq!(
+            render_owner_review_wake(&doc("M"), &approved, "u", 0, 0),
+            "[sm review] Rajesh's review of \"M\" (PR #12 @ abcdef0) is here: u\nVerdict: approved · no line or file comments\nRajesh wrote:\n> Decisions look good.\n>\n> Merge after 2 Codex rounds. File only tickets that can start now."
+        );
+
+        let mut blank = review("approve");
+        blank.body = Some(" \n ".into());
+        assert!(render_owner_review_wake(&doc("M"), &blank, "u", 0, 0)
+            .ends_with("Verdict: approved · no comments"));
+
+        let mut long = review("comment");
+        long.body = Some("é".repeat(WAKE_OVERALL_MAX_CHARS + 1));
+        let wake = render_owner_review_wake(&doc("M"), &long, "u", 1, 0);
+        assert!(wake.contains("Verdict: comments · 1 line comment\nRajesh wrote:\n> é"));
+        assert!(wake.ends_with(&format!(
+            "{}\n> … (truncated; read the rest at the link above)",
+            "é".repeat(WAKE_OVERALL_MAX_CHARS)
+        )));
     }
 
     #[test]
