@@ -498,6 +498,8 @@ behaviour each step relies on was verified on PR #1448; see "GitHub API findings
    ```
    [sm review] Rajesh's review of "<title>" (PR #<n> @ <sha7>) is here: <review_url>
    Verdict: changes requested · 5 line comments · 1 file comment
+   Rajesh wrote:
+   > Tighten §2 before merging.
    ```
    Recipient: the author session if it exists (stopped sessions get the queued
    message on restore, as with other sends). If the author has been retired, send to
@@ -505,7 +507,13 @@ behaviour each step relies on was verified on PR #1448; see "GitHub API findings
    `delivered_to_session_id` NULL and show "Review not delivered: author retired" on
    the doc row (Android, `sm watch`) and in `sm doc show`; doc projections carry
    `review_undelivered` for the latest posted review. Don't fail the submit.
-   Zero counts are left out of the second line ("no comments" when both are zero).
+   Zero counts are left out of the second line ("no comments" when both are zero,
+   "no line or file comments" when the review has overall text). The owner's
+   overall text follows, trimmed and quoted line by line under "Rajesh wrote:", so
+   instructions in it reach the agent without a trip to GitHub (sm#1578); past
+   4,000 characters it is cut and ends with
+   "> … (truncated; read the rest at the link above)". Blank overall text adds
+   nothing.
 
 When does a comment fall back to file level? Only when the file is **modified** by
 the PR (it existed on the base branch) and the selected block is outside the diff

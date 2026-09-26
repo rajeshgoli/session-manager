@@ -24336,7 +24336,7 @@ async fn owner_doc_review_posts_one_github_review_and_wakes_the_author_once() {
         [(
             "author01".to_owned(),
             format!(
-                "[sm review] Rajesh's review of \"Decision memo\" (PR #12 @ aaaaaaa) is here: {url}\nVerdict: changes requested · 1 line comment · 3 file comments"
+                "[sm review] Rajesh's review of \"Decision memo\" (PR #12 @ aaaaaaa) is here: {url}\nVerdict: changes requested · 1 line comment · 3 file comments\nRajesh wrote:\n> Tighten it."
             )
         )]
     );
