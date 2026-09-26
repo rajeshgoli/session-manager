@@ -11261,7 +11261,18 @@ fn client_session_value(
     );
     value["mobile_terminal"] = mobile_terminal.clone();
     value["primary_action"] = mobile_primary_action(&mobile_terminal, &attach_descriptor);
+    value["remote_control"] = remote_control_payload(&session);
     value
+}
+
+fn remote_control_payload(session: &SessionRecord) -> Value {
+    if session.is_stopped() {
+        return Value::Null;
+    }
+    match crate::claude_remote_control::remote_control_url(&session.tmux_session) {
+        Some(url) => json!({ "provider": "claude", "url": url }),
+        None => Value::Null,
+    }
 }
 
 fn mobile_primary_action(mobile_terminal: &Value, attach_descriptor: &Value) -> Value {
