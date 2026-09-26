@@ -465,6 +465,83 @@ fn the_branch_is_deleted_only_when_its_tip_is_the_checked_head() {
 }
 
 #[test]
+fn the_checked_out_branch_is_deleted_when_the_agent_renamed_setups_branch() {
+    // sm#1567: setup made `5-feature`, the agent renamed it to the repo's
+    // `ticket/5-feature` convention and its PR merged from that.
+    let repo = Repo::new();
+    let (path, base) = repo.worktree("wt", "5-feature");
+    run_git(Path::new(&path), &["branch", "-m", "ticket/5-feature"]);
+    run_git(
+        Path::new(&path),
+        &["commit", "-q", "--allow-empty", "-m", "work"],
+    );
+    let head = run_git(Path::new(&path), &["rev-parse", "HEAD"]);
+    repo.merged_pr(6, "ticket/5-feature", &head);
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        5,
+        Some(&path),
+        Some("5-feature"),
+        Some(&base),
+    );
+    repo.claim(
+        "c2",
+        "eng1",
+        "pr",
+        6,
+        Some(&path),
+        Some("ticket/5-feature"),
+        None,
+    );
+    assert_eq!(
+        repo.pass(&[session("eng1", &path, true)]),
+        vec![outcome(&path, true, "PR #6 merged")]
+    );
+    assert!(!repo.branch_exists("ticket/5-feature"));
+    let events = repo.worktree_events();
+    assert_eq!(events[0].1["branch"], "ticket/5-feature");
+}
+
+#[test]
+fn a_detached_head_deletes_any_recorded_branch_at_that_head() {
+    let repo = Repo::new();
+    let (path, base) = repo.worktree("wt", "5-feature");
+    run_git(Path::new(&path), &["branch", "-m", "ticket/5-feature"]);
+    run_git(
+        Path::new(&path),
+        &["commit", "-q", "--allow-empty", "-m", "work"],
+    );
+    let head = run_git(Path::new(&path), &["rev-parse", "HEAD"]);
+    run_git(Path::new(&path), &["checkout", "-q", "--detach", &head]);
+    repo.merged_pr(6, "ticket/5-feature", &head);
+    repo.claim(
+        "c1",
+        "eng1",
+        "ticket",
+        5,
+        Some(&path),
+        Some("5-feature"),
+        Some(&base),
+    );
+    repo.claim(
+        "c2",
+        "eng1",
+        "pr",
+        6,
+        Some(&path),
+        Some("ticket/5-feature"),
+        None,
+    );
+    assert_eq!(
+        repo.pass(&[session("eng1", "/elsewhere", true)]),
+        vec![outcome(&path, true, "PR #6 merged")]
+    );
+    assert!(!repo.branch_exists("ticket/5-feature"));
+}
+
+#[test]
 fn the_working_dir_on_a_merged_pr_branch_is_a_candidate() {
     let repo = Repo::new();
     let (path, head) = repo.worktree("wt", "9-fix");

@@ -162,8 +162,15 @@ struct PathEvent {
 }
 
 enum Decision {
-    Removed { reason: String },
-    Left { reason: String, retryable: bool },
+    /// `branch` is the branch the worktree had checked out, when it had one.
+    Removed {
+        reason: String,
+        branch: Option<String>,
+    },
+    Left {
+        reason: String,
+        retryable: bool,
+    },
 }
 
 fn cleanup_lock() -> &'static Mutex<()> {
@@ -672,6 +679,9 @@ fn decide(
     if let Some(reason) = load_keeps(conn)?.get(&candidate.path) {
         return retry_left(format!("kept: {reason}"));
     }
+    // The branch to delete afterwards is the one checked out: agents may
+    // rename the branch setup made (sm#1567).
+    let checked_out = git(path, &["branch", "--show-current"]).filter(|b| !b.is_empty());
     // 6. git removes it, refusing modified or untracked files.
     let output = Command::new("git")
         .arg("--git-dir")
@@ -694,8 +704,13 @@ fn decide(
         Err(error) => return final_left(format!("git refused: {error}")),
     }
     // Squash merges never make the branch an ancestor of main: -D, but only
-    // when its tip is still the HEAD that was checked.
-    if let Some(branch) = candidate_branch(candidate) {
+    // when its tip is still the HEAD that was checked. A detached HEAD falls
+    // back to the branches the claims recorded.
+    let branches = match &checked_out {
+        Some(branch) => vec![branch.as_str()],
+        None => recorded_branches(candidate),
+    };
+    for branch in branches {
         let tip = Command::new("git")
             .arg("--git-dir")
             .arg(common_dir)
@@ -715,6 +730,7 @@ fn decide(
     }
     Ok(Decision::Removed {
         reason: removed_reason,
+        branch: checked_out,
     })
 }
 
@@ -754,12 +770,24 @@ fn safe_head(conn: &Connection, candidate: &Candidate, head: &str) -> Result<Opt
 
 /// The branch recorded for the path: a managed claim's first, else any.
 fn candidate_branch(candidate: &Candidate) -> Option<&str> {
-    candidate
+    recorded_branches(candidate).into_iter().next()
+}
+
+/// Every branch the claims recorded for the path, a managed claim's first.
+fn recorded_branches(candidate: &Candidate) -> Vec<&str> {
+    let mut branches = Vec::new();
+    for branch in candidate
         .sources
         .iter()
         .filter(|source| source.managed_base.is_some())
         .chain(candidate.sources.iter())
-        .find_map(|source| source.branch.as_deref().filter(|b| !b.is_empty()))
+        .filter_map(|source| source.branch.as_deref().filter(|b| !b.is_empty()))
+    {
+        if !branches.contains(&branch) {
+            branches.push(branch);
+        }
+    }
+    branches
 }
 
 /// The source that keys the event: a ticket claim before a PR claim.
@@ -781,17 +809,17 @@ fn record(
 ) -> Result<WorktreeOutcome> {
     let source = event_source(candidate);
     let (ticket, pr) = item_keys(conn, &source.repo, source.kind, source.number)?;
-    let branch = candidate_branch(candidate);
+    let recorded = candidate_branch(candidate);
     let now = now_rfc3339();
     let (kind, reason, removed, payload) = match decision {
-        Decision::Removed { reason } => (
+        Decision::Removed { reason, branch } => (
             REMOVED,
             reason.clone(),
             true,
-            json!({"path": candidate.path, "branch": branch, "reason": reason}),
+            json!({"path": candidate.path, "branch": branch.as_deref().or(recorded), "reason": reason}),
         ),
         Decision::Left { reason, retryable } => {
-            let mut payload = json!({"path": candidate.path, "branch": branch, "reason": reason});
+            let mut payload = json!({"path": candidate.path, "branch": recorded, "reason": reason});
             if retryable {
                 payload["retryable"] = json!(true);
             }
