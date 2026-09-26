@@ -321,6 +321,7 @@ pub enum GitHubPullRequestState {
 
 mod claims;
 mod docs;
+mod follows;
 mod history;
 mod watch;
 mod worktrees;
@@ -479,6 +480,9 @@ pub struct AppState {
     mobile_terminal_runtime_disabled: Arc<AtomicBool>,
     studio_ssh_enabled: Arc<AtomicBool>,
     mobile_terminal_secret: [u8; 32],
+    /// FCM sender for owner follows; `None` when push is not configured
+    /// (sm#1569), and follows then notify by email.
+    push_sender: Option<Arc<dyn crate::owner_push::PushSender>>,
 }
 
 impl AppState {
@@ -543,6 +547,8 @@ impl AppState {
                 );
             session_store = session_store.with_usage_report_store(report_store);
         }
+        session_store =
+            session_store.with_owner_push_db_path(crate::owner_push::push_db_path(&config));
         session_store
             .recover_session_runtime_launches()
             .context("session runtime launch recovery failed")?;
@@ -567,6 +573,15 @@ impl AppState {
         if let Err(error) = session_store.recover_codex_fork_event_monitors() {
             eprintln!("codex-fork event monitor recovery failed: {error:#}");
         }
+        let push_sender: Option<Arc<dyn crate::owner_push::PushSender>> =
+            match crate::push_fcm::FcmSender::from_config(&config) {
+                Some(Ok(sender)) => Some(Arc::new(sender)),
+                Some(Err(error)) => {
+                    eprintln!("push sender unavailable, follows will email: {error:#}");
+                    None
+                }
+                None => None,
+            };
         let mut mobile_terminal_secret = [0u8; 32];
         OsRng.fill_bytes(&mut mobile_terminal_secret);
         let (tmux_client_event_tx, _) = broadcast::channel(128);
@@ -593,6 +608,7 @@ impl AppState {
             mobile_terminal_runtime_disabled: Arc::new(AtomicBool::new(false)),
             studio_ssh_enabled: Arc::new(AtomicBool::new(studio_ssh_enabled)),
             mobile_terminal_secret,
+            push_sender,
         })
     }
 
@@ -1453,6 +1469,21 @@ pub fn router(state: AppState) -> Router {
         .route("/client/host-status", get(client_host_status))
         .route("/client/analytics/summary", get(client_analytics_summary))
         .route("/client/request-status", post(client_request_status))
+        .route(
+            "/client/push-token",
+            put(follows::put_push_token).delete(follows::delete_push_token),
+        )
+        .route("/client/push/test", post(follows::send_test_push))
+        .route("/client/follows", get(follows::list_follows))
+        .route("/client/follows/{follow_id}/ack", post(follows::ack_follow))
+        .route(
+            "/sessions/{session_id}/follow",
+            post(follows::follow_session).delete(follows::unfollow_session),
+        )
+        .route(
+            "/queue-jobs/{job_id}/follow",
+            post(follows::follow_queue_job).delete(follows::unfollow_queue_job),
+        )
         .route("/client/bug-reports", post(submit_client_bug_report))
         .route("/client/terminal", get(mobile_terminal_endpoint))
         .route(
@@ -7613,6 +7644,9 @@ async fn revoke_mobile_terminal_device(
         &target_user_id,
         &device_key_id,
     )?;
+    if let Err(error) = follows::push_store(&state).delete_device_tokens(&device_key_id) {
+        eprintln!("push token cleanup for revoked device {device_key_id} failed: {error:#}");
+    }
     let (already_revoked, pending_tickets_revoked, active_stops) =
         revoke_mobile_terminal_device_in_state(&state, &target_user_id, &device_key_id)?;
     for stop in &active_stops {

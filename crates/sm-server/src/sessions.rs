@@ -113,6 +113,8 @@ pub struct SessionStore {
     usage_project_keys: Arc<Mutex<BTreeMap<String, (String, String)>>>,
     /// The last parse of the state file, reused until the file changes (#1530).
     parsed_state: Arc<Mutex<Option<CachedParsedState>>>,
+    /// Owner follows fired by `sm task-complete` (sm#1569).
+    owner_push_db_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -236,6 +238,7 @@ impl SessionStore {
             usage_report_store: None,
             usage_project_keys: Arc::new(Mutex::new(BTreeMap::new())),
             parsed_state: Arc::new(Mutex::new(None)),
+            owner_push_db_path: None,
         }
     }
 
@@ -305,6 +308,25 @@ impl SessionStore {
         store.queue_store = Some(RetainedQueueStore::new(queue_db_path));
         let _ = store.cancel_unsupported_context_alerts();
         store
+    }
+
+    pub fn with_owner_push_db_path(mut self, db_path: PathBuf) -> Self {
+        self.owner_push_db_path = Some(db_path);
+        self
+    }
+
+    /// Fires the owner's follows of a session that ran `sm task-complete`.
+    /// A local SQLite write; a failure is logged and the worker's sweep
+    /// catches the completion instead.
+    fn fire_owner_follows(&self, session_id: &str, completed_at: &str) {
+        let Some(path) = &self.owner_push_db_path else {
+            return;
+        };
+        if let Err(error) = crate::owner_push::OwnerPushStore::new(path.clone())
+            .fire_task_complete(session_id, completed_at)
+        {
+            eprintln!("owner follow fire for {session_id} failed: {error:#}");
+        }
     }
 
     pub fn with_usage_db_path(mut self, db_path: PathBuf) -> Self {
@@ -1724,6 +1746,7 @@ impl SessionStore {
             usage_report_store: None,
             usage_project_keys: Arc::new(Mutex::new(BTreeMap::new())),
             parsed_state: Arc::new(Mutex::new(None)),
+            owner_push_db_path: None,
         }
     }
 
@@ -8483,6 +8506,7 @@ impl SessionStore {
             }
             store_reparent_request_records(&mut state, &records)?;
             self.write_raw_json_value(&state)?;
+            self.fire_owner_follows(session_id, &completed_at);
             return Ok(TaskCompleteOutcome::Completed(TaskCompleteResult {
                 status: "completed".to_owned(),
                 session_id: session_id.to_owned(),
@@ -8563,6 +8587,7 @@ impl SessionStore {
         }
 
         self.write_raw_json_value(&state)?;
+        self.fire_owner_follows(session_id, &completed_at);
         Ok(TaskCompleteOutcome::Completed(TaskCompleteResult {
             status: "completed".to_owned(),
             session_id: session_id.to_owned(),
@@ -27205,6 +27230,82 @@ sleep 30
         assert!(state["reparent_apply_lease"].is_null());
 
         let _ = fs::remove_file(state_file);
+    }
+
+    fn owner_session_follow(store: &crate::owner_push::OwnerPushStore, session_id: &str) -> String {
+        store
+            .create_follow(
+                "owner@example.com",
+                &crate::owner_push::FollowTarget::Session {
+                    session_id: session_id.to_owned(),
+                    session_name: session_id.to_owned(),
+                },
+                None,
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap()
+            .0
+            .id
+    }
+
+    #[test]
+    fn task_complete_fires_owner_follows() {
+        let state_file = unique_temp_path("follow-task-complete");
+        fs::write(
+            &state_file,
+            json!({"sessions": [reparent_test_session("solo0001", None, "solo-secret")]})
+                .to_string(),
+        )
+        .unwrap();
+        let push_db = state_file.with_extension("push.db");
+        let store = SessionStore::new(state_file.clone()).with_owner_push_db_path(push_db.clone());
+        let follows = crate::owner_push::OwnerPushStore::new(push_db.clone());
+        let follow_id = owner_session_follow(&follows, "solo0001");
+
+        store
+            .task_complete(
+                "solo0001",
+                TaskCompleteRequest {
+                    requester_session_id: "solo0001".to_owned(),
+                },
+                None,
+            )
+            .unwrap();
+        let follow = follows.get(&follow_id).unwrap().unwrap();
+        assert_eq!(follow.fire_reason.as_deref(), Some("task_complete"));
+        assert!(follow.fired_at.is_some());
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(push_db);
+    }
+
+    #[test]
+    fn task_complete_during_reparent_fires_owner_follows() {
+        let (store, _queue, state_file, queue_db, request_id) =
+            prepared_reparent_transaction("reparent-follow-task-complete");
+        let push_db = state_file.with_extension("push.db");
+        let store = store.with_owner_push_db_path(push_db.clone());
+        let follows = crate::owner_push::OwnerPushStore::new(push_db.clone());
+        let follow_id = owner_session_follow(&follows, "child001");
+        store.acquire_reparent_apply_lease().unwrap();
+        store.quiesce_reparent_json_routing(&request_id).unwrap();
+        store.quiesce_reparent_queue_routing(&request_id).unwrap();
+
+        store
+            .task_complete(
+                "child001",
+                TaskCompleteRequest {
+                    requester_session_id: "child001".to_owned(),
+                },
+                None,
+            )
+            .unwrap();
+        let follow = follows.get(&follow_id).unwrap().unwrap();
+        assert_eq!(follow.fire_reason.as_deref(), Some("task_complete"));
+
+        let _ = fs::remove_file(state_file);
+        let _ = fs::remove_file(queue_db);
+        let _ = fs::remove_file(push_db);
     }
 
     #[test]

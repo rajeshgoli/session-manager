@@ -620,6 +620,51 @@ impl OwnerDocStore {
         Ok(rows)
     }
 
+    /// Publishes made by `session_id`, newest first, with their unretracted
+    /// docs. A follow's completion report is the first whose `published_at`
+    /// is not before the follow (sm#1569); callers compare parsed times.
+    pub fn publishes_by_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(OwnerDoc, OwnerDocPublish)>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let prefixed = |columns: &str, alias: &str| {
+            columns
+                .split(", ")
+                .map(|column| format!("{alias}.{column}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut statement = conn.prepare(&format!(
+            "SELECT {}, {} FROM owner_doc_publishes p \
+             JOIN owner_docs d ON d.id = p.doc_id \
+             WHERE p.session_id = ?1 AND d.retracted_at IS NULL \
+             ORDER BY p.id DESC LIMIT ?2",
+            prefixed(DOC_COLUMNS, "d"),
+            prefixed(PUBLISH_COLUMNS, "p"),
+        ))?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = statement
+            .query_map(params![session_id, limit], |row| {
+                let doc = doc_from_row(row)?;
+                let publish = OwnerDocPublish {
+                    id: row.get(11)?,
+                    doc_id: row.get(12)?,
+                    commit_sha: row.get(13)?,
+                    blob_sha: row.get(14)?,
+                    session_id: row.get(15)?,
+                    review_requested: row.get::<_, i64>(16)? != 0,
+                    published_at: row.get(17)?,
+                };
+                Ok((doc, publish))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn record_view(&self, doc_id: &str, blob_sha: &str) -> Result<()> {
         let conn = self.open_write()?;
         conn.execute(

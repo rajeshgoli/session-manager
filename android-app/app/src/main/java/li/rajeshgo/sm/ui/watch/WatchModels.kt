@@ -538,3 +538,13 @@ fun summaryAgeLabel(timestamp: String?, now: OffsetDateTime = OffsetDateTime.now
         else -> "${minutes / 1440} day${if (minutes / 1440 == 1L) "" else "s"} ago"
     }
 }
+
+/** Prefilled message the Follow dialog sends the agent; sm adds the `[sm follow]` marker (sm#1569). */
+const val DEFAULT_FOLLOW_MESSAGE =
+    "Rajesh is following you from the sm app. When your task is done, commit a completion report " +
+        "(conclusion first, written for Rajesh), publish it with `sm doc publish <path>`, then run " +
+        "`sm task-complete`. Publish before task-complete: the notification links to the newest doc you published."
+
+const val NOTIFICATIONS_OFF_MESSAGE = "Notifications off — you'll be emailed instead"
+
+fun isStoppedSession(session: ClientSession): Boolean = session.status == "stopped"

@@ -686,3 +686,56 @@ data class HostStatus(
     @SerialName("cpu_percent") val cpuPercent: Double? = null,
     @SerialName("gpu_percent") val gpuPercent: Double? = null,
 )
+
+/** Body of `POST /sessions/{id}/follow`; a null or blank message follows silently. */
+@Serializable
+data class FollowSessionRequest(
+    val message: String?,
+)
+
+/** An owner follow of an agent or a queue job (sm#1569). */
+@Serializable
+data class OwnerFollow(
+    val id: String,
+    @SerialName("target_kind") val targetKind: String = "session",
+    @SerialName("session_id") val sessionId: String = "",
+    @SerialName("session_name") val sessionName: String = "",
+    @SerialName("job_id") val jobId: String? = null,
+    @SerialName("job_label") val jobLabel: String? = null,
+    val state: String = "",
+    @SerialName("fire_reason") val fireReason: String? = null,
+    @SerialName("report_reader_path") val reportReaderPath: String? = null,
+) {
+    val isActive: Boolean get() = state == "active"
+}
+
+@Serializable
+data class FollowsResponse(
+    @SerialName("push_configured") val pushConfigured: Boolean = false,
+    val follows: List<OwnerFollow> = emptyList(),
+)
+
+@Serializable
+data class PushTokenRequest(
+    val token: String,
+    @SerialName("device_id") val deviceId: String? = null,
+    @SerialName("device_name") val deviceName: String,
+    @SerialName("app_version") val appVersion: String,
+)
+
+@Serializable
+data class DeletePushTokenRequest(
+    val token: String,
+)
+
+@Serializable
+data class TestPushFailure(
+    @SerialName("device_name") val deviceName: String = "",
+    val error: String = "",
+)
+
+@Serializable
+data class TestPushResponse(
+    val sent: Int = 0,
+    val failed: List<TestPushFailure> = emptyList(),
+)

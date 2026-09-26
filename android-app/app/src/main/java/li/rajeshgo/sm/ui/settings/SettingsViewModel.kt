@@ -14,6 +14,7 @@ import li.rajeshgo.sm.data.repository.AvailableAppUpdate
 import li.rajeshgo.sm.data.repository.DeviceEnrollmentRepository
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
+import li.rajeshgo.sm.push.FollowPush
 import li.rajeshgo.sm.data.security.CloudflareDeviceCredentialManager
 import li.rajeshgo.sm.data.security.DeviceKeyManager
 
@@ -44,6 +45,9 @@ data class SettingsUiState(
     val updateInstalling: Boolean = false,
     val updateError: String? = null,
     val error: String? = null,
+    /** Follow notifications (sm#1569): result of the last test push. */
+    val notificationTestBusy: Boolean = false,
+    val notificationTestStatus: String? = null,
 )
 
 class SettingsViewModel(application: Application) : AndroidViewModel(application) {
@@ -270,6 +274,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                     error = null,
                 )
                 refreshUpdate()
+                launch { FollowPush.registerToken(getApplication()) }
                 onSuccess()
             }.onFailure { error ->
                 _uiState.value = _uiState.value.copy(
@@ -285,10 +290,41 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         _uiState.value = _uiState.value.copy(error = message, loading = false)
     }
 
+    /** Asks sm to push a test notification to this account's phones. */
+    fun sendTestNotification() {
+        viewModelScope.launch {
+            val serverUrl = settingsRepository.serverUrl.first()
+            val accessToken = settingsRepository.accessToken.first()
+            if (serverUrl.isBlank() || accessToken.isBlank()) return@launch
+            _uiState.value = _uiState.value.copy(notificationTestBusy = true, notificationTestStatus = null)
+            // Make sure this phone's token is on file before asking for the push.
+            FollowPush.registerToken(getApplication())
+            val status = sessionRepository.sendTestPush(serverUrl, accessToken).fold(
+                onSuccess = { response ->
+                    when {
+                        response.sent > 0 && response.failed.isEmpty() -> "Sent to ${response.sent} phone${if (response.sent == 1) "" else "s"}"
+                        response.sent > 0 -> "Sent to ${response.sent}; failed: ${response.failed.joinToString { it.deviceName }}"
+                        response.failed.isNotEmpty() -> "Failed: ${response.failed.first().error}"
+                        else -> "No phone registered for notifications"
+                    }
+                },
+                onFailure = { error -> error.message ?: "Test notification failed" },
+            )
+            _uiState.value = _uiState.value.copy(notificationTestBusy = false, notificationTestStatus = status)
+        }
+    }
+
     fun finishLogout() {
         connectionSaveJob?.cancel()
         invalidateConnectionStatus()
         viewModelScope.launch {
+            runCatching {
+                FollowPush.unregisterToken(
+                    getApplication(),
+                    settingsRepository.serverUrl.first(),
+                    settingsRepository.accessToken.first(),
+                )
+            }
             settingsRepository.clearAuth()
             _uiState.value = _uiState.value.copy(
                 isLoggedIn = false,

@@ -24,9 +24,12 @@ import li.rajeshgo.sm.data.model.ToolCallsResponse
 import li.rajeshgo.sm.data.model.WhatRequestBody
 import li.rajeshgo.sm.data.model.WhatRequestRecord
 import retrofit2.http.Body
+import retrofit2.http.DELETE
 import retrofit2.http.GET
+import retrofit2.http.HTTP
 import retrofit2.http.Header
 import retrofit2.http.POST
+import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Query
 
@@ -131,4 +134,34 @@ interface ApiService {
     suspend fun getWhatRequest(
         @Path("request_id") requestId: String,
     ): WhatRequestRecord
+
+    @GET("client/follows")
+    suspend fun getFollows(): li.rajeshgo.sm.data.model.FollowsResponse
+
+    @POST("sessions/{session_id}/follow")
+    suspend fun followSession(
+        @Path("session_id") sessionId: String,
+        @Body request: li.rajeshgo.sm.data.model.FollowSessionRequest,
+    ): li.rajeshgo.sm.data.model.OwnerFollow
+
+    @DELETE("sessions/{session_id}/follow")
+    suspend fun unfollowSession(@Path("session_id") sessionId: String)
+
+    @POST("queue-jobs/{job_id}/follow")
+    suspend fun followJob(@Path("job_id") jobId: String): li.rajeshgo.sm.data.model.OwnerFollow
+
+    @DELETE("queue-jobs/{job_id}/follow")
+    suspend fun unfollowJob(@Path("job_id") jobId: String)
+
+    @POST("client/follows/{follow_id}/ack")
+    suspend fun ackFollow(@Path("follow_id") followId: String)
+
+    @PUT("client/push-token")
+    suspend fun registerPushToken(@Body request: li.rajeshgo.sm.data.model.PushTokenRequest)
+
+    @HTTP(method = "DELETE", path = "client/push-token", hasBody = true)
+    suspend fun deletePushToken(@Body request: li.rajeshgo.sm.data.model.DeletePushTokenRequest)
+
+    @POST("client/push/test")
+    suspend fun sendTestPush(): li.rajeshgo.sm.data.model.TestPushResponse
 }

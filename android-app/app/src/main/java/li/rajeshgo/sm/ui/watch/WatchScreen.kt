@@ -48,6 +48,9 @@ import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Campaign
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Notifications
+import androidx.compose.material.icons.rounded.NotificationsActive
+import androidx.compose.material.icons.rounded.NotificationsNone
 import androidx.compose.material.icons.rounded.QuestionAnswer
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.RestartAlt
@@ -56,6 +59,9 @@ import androidx.compose.material.icons.rounded.SupportAgent
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.UnfoldLess
 import androidx.compose.material.icons.rounded.UnfoldMore
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
@@ -111,6 +117,7 @@ import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.data.model.SessionClaim
 import li.rajeshgo.sm.data.model.SessionDoc
+import li.rajeshgo.sm.data.model.SessionJob
 import li.rajeshgo.sm.ui.navigation.AppBottomNav
 import li.rajeshgo.sm.ui.navigation.Routes
 import li.rajeshgo.sm.ui.theme.Amber
@@ -140,6 +147,8 @@ private const val WATCH_TOAST_MS = 3500L
 fun WatchScreen(
     onNavigateToSettings: () -> Unit,
     onNavigateToAnalytics: () -> Unit,
+    pendingFollowOpen: li.rajeshgo.sm.push.FollowOpen? = null,
+    onFollowOpenConsumed: () -> Unit = {},
     viewModel: WatchViewModel = viewModel(),
     updateViewModel: UpdateAvailabilityViewModel = viewModel(),
 ) {
@@ -153,6 +162,8 @@ fun WatchScreen(
     var filter by remember { mutableStateOf("all") }
     var toast by remember { mutableStateOf<String?>(null) }
     var openPage by remember { mutableStateOf<ReaderPage?>(null) }
+    var followDialogSession by remember { mutableStateOf<ClientSession?>(null) }
+    var pendingNotificationAction by remember { mutableStateOf<(() -> Unit)?>(null) }
 
     val sections = remember(state.sessions, filter, query) {
         filterSections(buildSections(state.sessions), filter, query)
@@ -164,6 +175,55 @@ fun WatchScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     var isResumed by remember {
         mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+    }
+    val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (!granted) toast = NOTIFICATIONS_OFF_MESSAGE
+        pendingNotificationAction?.invoke()
+        pendingNotificationAction = null
+    }
+    // Android 13+ needs permission to show notifications; ask on the first follow and follow either way.
+    val withNotificationPermission: (() -> Unit) -> Unit = { action ->
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingNotificationAction = action
+            notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            action()
+        }
+    }
+    val follow = FollowUi(
+        followedSessionIds = state.followedSessionIds,
+        followedJobIds = state.followedJobIds,
+        onFollow = { session -> followDialogSession = session },
+        onUnfollow = { session ->
+            viewModel.unfollowSession(session) { result -> toast = result.exceptionOrNull()?.message ?: result.getOrNull() }
+        },
+        onToggleJob = { job ->
+            val toggle = {
+                viewModel.toggleJobFollow(job) { result -> toast = result.exceptionOrNull()?.message ?: result.getOrNull() }
+            }
+            if (job.id in state.followedJobIds) toggle() else withNotificationPermission(toggle)
+        },
+    )
+    // A tapped follow notification: open the report, else expand the agent's card.
+    LaunchedEffect(pendingFollowOpen, state.sessions) {
+        val open = pendingFollowOpen ?: return@LaunchedEffect
+        val readerPath = open.readerPath
+        if (readerPath != null) {
+            openPage = ReaderPage(title = open.title.ifBlank { "Completion report" }, subtitle = readerPath, path = readerPath)
+            onFollowOpenConsumed()
+            return@LaunchedEffect
+        }
+        if (state.sessions.isEmpty() && state.loading) return@LaunchedEffect
+        val session = state.sessions.firstOrNull { it.id == open.sessionId }
+        if (session != null) {
+            viewModel.expandSession(session)
+        } else {
+            toast = open.title.ifBlank { "That agent is no longer listed" }
+        }
+        onFollowOpenConsumed()
     }
     val openAttach: (ClientSession) -> Unit = { session ->
         if (session.mobileTerminal?.supported == true) {
@@ -341,6 +401,7 @@ fun WatchScreen(
                                 }
                             },
                             onOpenPage = { openPage = it },
+                            follow = follow,
                         )
                     }
                 }
@@ -393,6 +454,7 @@ fun WatchScreen(
                                 }
                             },
                             onOpenPage = { openPage = it },
+                            follow = follow,
                         )
                     }
                 }
@@ -462,6 +524,20 @@ fun WatchScreen(
                     val copiedText = selectedText.ifBlank { terminal.copyBuffer }
                     clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm terminal", copiedText))
                     toast = "Terminal output copied"
+                },
+            )
+        }
+        followDialogSession?.let { session ->
+            FollowDialog(
+                session = session,
+                onDismiss = { followDialogSession = null },
+                onFollow = { message ->
+                    followDialogSession = null
+                    withNotificationPermission {
+                        viewModel.followSession(session, message) { result ->
+                            toast = result.exceptionOrNull()?.message ?: result.getOrNull()
+                        }
+                    }
                 },
             )
         }
@@ -1213,6 +1289,7 @@ private fun WatchTree(
     onRegenerateWhat: (ClientSession) -> Unit,
     onKill: (ClientSession) -> Unit,
     onOpenPage: (ReaderPage) -> Unit,
+    follow: FollowUi,
 ) {
     if (!nodeMatchesSlice(node, slice)) {
         return
@@ -1237,6 +1314,7 @@ private fun WatchTree(
             onRegenerateWhat = { onRegenerateWhat(node.session) },
             onKill = { onKill(node.session) },
             onOpenPage = onOpenPage,
+            follow = follow,
         )
     }
 
@@ -1245,7 +1323,7 @@ private fun WatchTree(
     node.sameRepoChildren
         .filter { nodeMatchesSlice(it, slice) }
         .forEach { child ->
-            WatchTree(child, childDepth, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill, onOpenPage)
+            WatchTree(child, childDepth, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill, onOpenPage, follow)
     }
 
     node.crossRepoGroups.forEach { group ->
@@ -1262,7 +1340,7 @@ private fun WatchTree(
             fontFamily = FontFamily.Monospace,
         )
         visibleChildren.forEach { child ->
-            WatchTree(child, groupDepth + 1, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill, onOpenPage)
+            WatchTree(child, groupDepth + 1, slice, sessionsById, expandedSessionIds, detailsById, whatById, onToggleExpanded, onOpenAttach, onClone, onCopyAttach, onOpenTelegram, onWhat, onUpdateWhat, onRegenerateWhat, onKill, onOpenPage, follow)
         }
     }
 }
@@ -1286,7 +1364,9 @@ private fun SessionRow(
     onRegenerateWhat: () -> Unit,
     onKill: () -> Unit,
     onOpenPage: (ReaderPage) -> Unit,
+    follow: FollowUi,
 ) {
+    val followed = session.id in follow.followedSessionIds
     val attachSupported = session.mobileTerminal?.supported == true || session.termuxAttach?.supported == true
     val hasSummary = whatState?.entries?.isNotEmpty() == true
     Surface(
@@ -1319,6 +1399,10 @@ private fun SessionRow(
                             if (session.isMaintainer) {
                                 Spacer(Modifier.width(8.dp))
                                 InlineBadge("maintainer", Cyan)
+                            }
+                            if (followed) {
+                                Spacer(Modifier.width(6.dp))
+                                Icon(Icons.Rounded.NotificationsActive, contentDescription = "Following", tint = Amber, modifier = Modifier.size(16.dp))
                             }
                         }
                         Spacer(Modifier.height(3.dp))
@@ -1406,11 +1490,16 @@ private fun SessionRow(
                             DropdownMenu(actionsExpanded, { actionsExpanded = false }) {
                                 if (attachSupported) DropdownMenuItem(text = { Text("Copy attach command") }, onClick = { actionsExpanded = false; onCopyAttach() })
                                 if (telegramLink(session) != null) DropdownMenuItem(text = { Text("Open in Telegram") }, onClick = { actionsExpanded = false; onOpenTelegram() })
+                                if (followed) {
+                                    DropdownMenuItem(text = { Text("Unfollow") }, onClick = { actionsExpanded = false; follow.onUnfollow(session) })
+                                } else {
+                                    DropdownMenuItem(text = { Text("Follow") }, enabled = !isStoppedSession(session), onClick = { actionsExpanded = false; follow.onFollow(session) })
+                                }
                                 DropdownMenuItem(text = { Text("Retire session", color = Rose) }, onClick = { actionsExpanded = false; onKill() })
                             }
                         }
                     }
-                    AgentWorkSections(session, onOpenPage)
+                    AgentWorkSections(session, onOpenPage, follow)
                     if (hasSummary || whatState?.status?.let { it != "idle" } == true) {
                         AgentDisclosure("Summary", relativeSummaryAge(whatState?.entries?.lastOrNull()?.createdAt)) {
                             whatState?.let { WhatSummarySection(it, onUpdateWhat, onRegenerateWhat) }
@@ -1461,6 +1550,61 @@ private fun AgentDisclosure(title: String, subtitle: String, content: @Composabl
     }
 }
 
+/** Follow state and actions for agents and queue jobs (sm#1569). */
+private class FollowUi(
+    val followedSessionIds: Set<String>,
+    val followedJobIds: Set<String>,
+    val onFollow: (ClientSession) -> Unit,
+    val onUnfollow: (ClientSession) -> Unit,
+    val onToggleJob: (SessionJob) -> Unit,
+)
+
+/** A queued or running job with a bell: outline when not followed, filled when followed. */
+@Composable
+private fun FollowableJobDetail(job: SessionJob, detail: String?, follow: FollowUi) {
+    val followed = job.id in follow.followedJobIds
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.weight(1f)) {
+            ActivityDetail(job.label, detail, if (job.state == "running") Emerald else Amber)
+        }
+        IconButton(onClick = { follow.onToggleJob(job) }) {
+            Icon(
+                if (followed) Icons.Rounded.Notifications else Icons.Rounded.NotificationsNone,
+                contentDescription = if (followed) "Unfollow ${job.label}" else "Follow ${job.label}",
+                tint = if (followed) Amber else TextMuted,
+            )
+        }
+    }
+}
+
+@Composable
+private fun FollowDialog(session: ClientSession, onDismiss: () -> Unit, onFollow: (String) -> Unit) {
+    var message by remember(session.id) { mutableStateOf(DEFAULT_FOLLOW_MESSAGE) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Follow ${sessionDisplayName(session)}") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = message,
+                    onValueChange = { message = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    minLines = 5,
+                    maxLines = 10,
+                    label = { Text("Message to the agent") },
+                )
+                Text(
+                    "Clear the message to follow without telling the agent",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextMuted,
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = { onFollow(message) }) { Text("Follow") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
 @Composable
 private fun ActivityDetail(title: String, detail: String?, tint: Color) {
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1473,7 +1617,7 @@ private fun ActivityDetail(title: String, detail: String?, tint: Color) {
 }
 
 @Composable
-private fun AgentWorkSections(session: ClientSession, onOpenPage: (ReaderPage) -> Unit) {
+private fun AgentWorkSections(session: ClientSession, onOpenPage: (ReaderPage) -> Unit, follow: FollowUi) {
     val claims = workClaims(session.obligations?.claims.orEmpty())
     if (claims.isNotEmpty()) WorkLine(claims, onOpenPage)
     val docs = session.obligations?.docs.orEmpty()
@@ -1513,12 +1657,12 @@ private fun AgentWorkSections(session: ClientSession, onOpenPage: (ReaderPage) -
             Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text(if (isWaitingForResult(session)) "Waiting for results" else "In progress", style = MaterialTheme.typography.titleSmall, color = Cyan)
                 activeJobs.take(2).forEach { job ->
-                    ActivityDetail(job.label, jobSummary(job).removePrefix("${job.label} · "), if (job.state == "running") Emerald else Amber)
+                    FollowableJobDetail(job, jobSummary(job).removePrefix("${job.label} · "), follow)
                 }
                 if (activeJobs.size > 2 || activeJobs.any { it.holding?.detail != null }) {
                     AgentDisclosure(if (activeJobs.size > 2) "All ${activeJobs.size} jobs" else "Queue details", "${activeJobs.count { it.state == "running" }} running · ${activeJobs.count { it.state == "pending" }} queued") {
                         activeJobs.forEach { job ->
-                            ActivityDetail(job.label, listOfNotNull(jobSummary(job).removePrefix("${job.label} · "), job.holding?.detail).distinct().joinToString("\n"), if (job.state == "running") Emerald else Amber)
+                            FollowableJobDetail(job, listOfNotNull(jobSummary(job).removePrefix("${job.label} · "), job.holding?.detail).distinct().joinToString("\n"), follow)
                         }
                     }
                 }

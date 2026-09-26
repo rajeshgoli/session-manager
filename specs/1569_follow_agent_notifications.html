@@ -107,7 +107,7 @@
 </style>
 
 <h1>1569 — Follow agents and queue jobs from the sm app</h1>
-<p class="sans"><small>Author: sm-app-notifications <code>a8d3f4e9</code> · Ticket #1569 · Revision 2</small></p>
+<p class="sans"><small>Author: sm-app-notifications <code>a8d3f4e9</code> · Ticket #1569 · Revision 3</small></p>
 
 <h2>Memo</h2>
 
@@ -236,6 +236,7 @@ task-complete: the notification links to the newest doc you published.</pre>
 <li><b>Only the newest doc is linked, but every doc stays on the agent's card.</b> The app already lists all of an agent's docs there, and the notification link is a shortcut to the newest.</li>
 <li>Everything else is unchanged.</li>
 </ul>
+<p><b>Revision 3, with the implementation.</b> The appendices now describe the shipped code. The owner's decisions are unchanged. The appendix changes that matter: the agent message uses the same delivery path as the app's status request (C); a device id on a push token is stored as given rather than checked (B, C); jobs that end by running out of memory, hitting their process limit or expiring in the queue also notify (D1, D5); and scratch servers never deliver follows (D3).</p>
 
 <hr class="appendix-divider">
 <h2>Appendices</h2>
@@ -314,19 +315,19 @@ CREATE UNIQUE INDEX owner_follows_one_active_job
   ON owner_follows(user_id, job_id)
   WHERE target_kind = 'queue_job' AND fired_at IS NULL AND cancelled_at IS NULL;
 CREATE INDEX owner_follows_pending ON owner_follows(fired_at, notified_at);</code></pre>
-<p>Revoking a mobile device (<code>sm remove-device</code>, <code>DELETE /client/mobile-terminal/devices/{id}</code>) deletes <code>push_tokens</code> rows with that <code>device_id</code>.</p>
+<p>Revoking a mobile device (<code>sm remove-device</code>, <code>DELETE /client/mobile-terminal/devices/{id}</code>) deletes <code>push_tokens</code> rows with that <code>device_id</code>. The app sends its device key id (<code>DeviceKeyManager.deviceKeyId()</code>), the same id the device registry uses.</p>
 
 <h3 id="c">C. Server HTTP interface</h3>
-<p>Every route below uses the same guard chain as <code>POST /client/request-status</code><sup>2</sup>: Cloudflare Access, public edge assertion, and owner bearer or local. <code>user_id</code> is the lowercase email from the bearer token, or the configured owner email for local calls. JSON bodies, and RFC3339 UTC timestamps.</p>
+<p>Every route below uses the same guard chain as <code>POST /client/request-status</code><sup>2</sup>: Cloudflare Access, public edge assertion, and owner bearer or local. <code>user_id</code> is the lowercase email from the bearer token. For a local call without one, it is the first <code>google_auth.allowlist_emails</code> entry, or <code>local_bypass</code> when none is configured. JSON bodies, and RFC3339 UTC timestamps.</p>
 <table>
 <thead><tr><th style="width:34%">Route</th><th>Behaviour</th></tr></thead>
 <tbody>
-<tr><td><code>PUT /client/push-token</code><br><code>{token, device_id?, device_name, app_version}</code></td><td>Upserts the <code>push_tokens</code> row, clears <code>invalid_at</code> and <code>last_error</code>, sets <code>updated_at</code>. If <code>device_id</code> is given, it must be an unrevoked enrollment of <code>user_id</code>, else 400. Returns 204.</td></tr>
+<tr><td><code>PUT /client/push-token</code><br><code>{token, device_id?, device_name, app_version}</code></td><td>Upserts the <code>push_tokens</code> row, clears <code>invalid_at</code> and <code>last_error</code>, sets <code>updated_at</code>. <code>device_id</code> is stored as given. A blank <code>device_name</code> becomes <code>phone</code>. 400 for a blank token, a token over 4096 characters, or a device field over 200. Returns 204.</td></tr>
 <tr><td><code>DELETE /client/push-token</code><br><code>{token}</code></td><td>Deletes the row. Returns 204, including when the row is missing.</td></tr>
 <tr><td><code>POST /client/push/test</code></td><td>Sends a <code>kind=test</code> push to every valid token of <code>user_id</code>. 200 <code>{sent, failed:[{device_name,error}]}</code>. 503 <code>{detail:"push not configured"}</code> when the sender is unconfigured.</td></tr>
-<tr><td><code>POST /sessions/{id}/follow</code><br><code>{message: string|null}</code></td><td>404 if the session is unknown, 409 <code>{detail:"session stopped"}</code> if it is stopped. If an active follow exists: 200 with that follow; no second message is sent and the new text is ignored. Otherwise it inserts the row (<code>target_kind='session'</code>). If <code>message</code> is non-empty after trimming, it delivers <code>"[sm follow] " + message</code> as a system message: <code>enqueue_message</code> with delivery mode <code>important</code> and category <code>follow</code>, followed by the same live drain and <code>push_retained_message_raw</code> that the task-complete notice uses<sup>3</sup>. It is not <code>send_core_input</code>, and it has no sender session. If the message already starts with <code>[sm follow]</code>, the prefix is not doubled. Returns 201 with the follow. If message delivery fails, it deletes the row and returns the delivery error, so a follow never exists whose agent was never told.</td></tr>
+<tr><td><code>POST /sessions/{id}/follow</code><br><code>{message: string|null}</code></td><td><code>{id}</code> is a session id or friendly name. 404 if the session is unknown, 409 <code>{detail:"session stopped"}</code> if it is stopped. If an active follow exists: 200 with that follow; no second message is sent and the new text is ignored. Otherwise it inserts the row (<code>target_kind='session'</code>). If <code>message</code> is non-empty after trimming, it delivers <code>"[sm follow] " + message</code> the way <code>POST /client/request-status</code> delivers its prompt<sup>3</sup>: <code>send_core_input</code> with delivery mode <code>important</code>, <code>from_sm_send=false</code> and no sender session, so the agent sees the marked text and no <code>sm send</code> sender header. It goes through the tmux runtime when that is enabled and the session is on the primary node, and is queued otherwise. If the message already starts with <code>[sm follow]</code>, the prefix is not doubled. A message over 8000 characters is 400. Returns 201 with the follow. If message delivery fails, it deletes the row and returns the delivery error, so a follow never exists whose agent was never told.</td></tr>
 <tr><td><code>DELETE /sessions/{id}/follow</code></td><td>Sets <code>cancelled_at</code> on the active agent follow. Returns 204, including when there's none. Sends nothing to the agent.</td></tr>
-<tr><td><code>POST /queue-jobs/{job_id}/follow</code><br>no body</td><td>404 if the job is unknown. 409 <code>{detail:"job finished"}</code> if its state is not <code>pending</code> or <code>running</code>. 200 with the existing active follow if there is one. Otherwise it inserts the row with <code>target_kind='queue_job'</code>, <code>session_id</code> = the job's submitting session and <code>job_label</code>, and returns 201. Sends nothing to any agent.</td></tr>
+<tr><td><code>POST /queue-jobs/{job_id}/follow</code><br>no body</td><td><code>{job_id}</code> is a job id or label. 404 if the job is unknown. 409 <code>{detail:"job finished"}</code> if its state is not <code>pending</code> or <code>running</code>. 200 with the existing active follow if there is one. Otherwise it inserts the row with <code>target_kind='queue_job'</code>, <code>session_id</code> = the job's <code>requester_session_id</code> (else <code>notify_session_id</code>), <code>session_name</code> = that session's display name (else its id), and <code>job_label</code> = the label (else the job id). Returns 201. Sends nothing to any agent.</td></tr>
 <tr><td><code>DELETE /queue-jobs/{job_id}/follow</code></td><td>Cancels the active job follow. Returns 204, including when there's none.</td></tr>
 <tr><td><code>GET /client/follows</code></td><td><code>{push_configured: bool, follows:[…]}</code>: active follows plus follows fired in the last 7 days, newest first. Each follow object carries every <code>owner_follows</code> column except <code>user_id</code> and <code>message_text</code>, plus <code>state</code> from Appendix A.</td></tr>
 <tr><td><code>POST /client/follows/{follow_id}/ack</code></td><td>Sets <code>acked_at</code> if null. Returns 204. 404 if the follow doesn't belong to <code>user_id</code>.</td></tr>
@@ -342,7 +343,7 @@ CREATE INDEX owner_follows_pending ON owner_follows(fired_at, notified_at);</cod
   <ul>
   <li>If the session's <code>agent_task_completed_at</code> is later than <code>created_at</code>, fire with <code>task_complete</code>. This catches a missed hook, but not one cleared by later activity; the hook above is primary.</li>
   <li>Else, if the session is absent from state or <code>raw_session_is_stopped</code><sup>6</sup>, fire with <code>session_ended</code>. The two rules above apply to <code>target_kind='session'</code> only. The stopped state is terminal, so the sweep sees every death path: retire, kill, crash reconciliation and the other stop transitions<sup>7</sup>. None of those sites is modified.</li>
-  <li><b>Job follows:</b> if the job's state is terminal (<code>succeeded</code>, <code>failed</code>, <code>timed_out</code>, <code>cancelled</code>, <code>displaced</code>)<sup>11</sup>, fire with <code>job_finished</code>. Copy <code>job_state</code>, <code>job_exit_code</code>, <code>job_started_at</code> and <code>job_finished_at</code>, and set <code>notify_after = fired_at</code>. If the job no longer exists, fire with <code>job_state='unknown'</code>. Job states never leave terminal, so the sweep alone is sufficient and the queue code is not modified.</li>
+  <li><b>Job follows:</b> if the job's state is terminal (<code>succeeded</code>, <code>failed</code>, <code>timed_out</code>, <code>cancelled</code>, <code>displaced</code>, <code>memory_exceeded</code>, <code>process_limit_exceeded</code>, <code>wait_expired</code>)<sup>11</sup>, fire with <code>job_finished</code>. Copy <code>job_state</code>, <code>job_exit_code</code>, <code>job_started_at</code> and <code>job_finished_at</code>, and set <code>notify_after = fired_at</code>. If the job no longer exists, fire with <code>job_state='unknown'</code>. Job states never leave terminal, so the sweep alone is sufficient and the queue code is not modified.</li>
   </ul></li>
 </ul>
 <h4>D2. Report lookup</h4>
@@ -354,15 +355,15 @@ WHERE p.session_id = :session_id AND p.published_at &gt;= :follow_created_at
 ORDER BY p.published_at DESC LIMIT 1;</code></pre>
 <p>The query matches on <code>owner_doc_publishes.session_id</code> (the session that published), not <code>owner_docs.author_session_id</code><sup>8</sup>. <code>report_reader_path</code> is the same reader path the watch payload already gives the app for that doc and version. <b>Report grace:</b> if the lookup is empty and <code>now &lt; fired_at + 120s</code>, the worker sets <code>notify_after = fired_at + 120s</code> and waits. After that it sends without a report.</p>
 <h4>D3. Delivery worker</h4>
-<p>Runs every 5 seconds over follows with <code>fired_at</code> set, <code>notified_at</code> null and <code>notify_after &lt;= now</code>:</p>
+<p>Runs only on a server with <code>rust_core.runtime_enabled</code>, so a scratch server on copied state never sends. It runs every 5 seconds, sweeping (D1) on every third pass, over follows with <code>fired_at</code> set, <code>notified_at</code> null and <code>notify_after &lt;= now</code>:</p>
 <ol>
 <li>Refresh <code>session_name</code> and run the report lookup.</li>
 <li>If push isn't configured, or <code>user_id</code> has no valid token, send the email (D4) and set <code>notified_at</code> and <code>notified_via='email'</code>.</li>
-<li>Otherwise, send the push (Appendix F) to every valid token. If at least one succeeds: <code>notified_at=now</code>, <code>notified_via='push'</code>. If all fail with retryable errors: increment <code>push_attempts</code> and set <code>notify_after</code> to now plus 30 seconds, 1, 2, 5, 10 or 10 minutes for attempts 1–6. After attempt 6, fall back to email. An <code>UNREGISTERED</code> or invalid-token error sets that token's <code>invalid_at</code> and doesn't count as retryable.</li>
+<li>Otherwise, send the push (Appendix F) to every valid token. If at least one succeeds: <code>notified_at=now</code>, <code>notified_via='push'</code>. If all fail with retryable errors: increment <code>push_attempts</code> and set <code>notify_after</code> to now plus 30 seconds, 1, 2, 5 or 10 minutes after attempts 1–5. When attempt 6 fails too, fall back to email. An <code>UNREGISTERED</code> or invalid-token error sets that token's <code>invalid_at</code> and doesn't count as retryable.</li>
 </ol>
 <p><b>Ack fallback:</b> a follow with <code>notified_via='push'</code>, <code>acked_at</code> null and <code>notified_at + 15 min &lt;= now</code> gets one email, which sets <code>email_sent_at</code>. The email is sent at most once per follow.</p>
 <h4>D4. Email</h4>
-<p>It goes through the existing email bridge<sup>4</sup> to the owner address <code>sm email rajesh</code> resolves to. The subject and first body line match the notification title and body (table below). The body adds the sm web reader URL (<code>{public base URL}{report_reader_path}</code>) when there's a report, and the agent's name and id. If the email bridge isn't configured either, the worker logs a warning and sets <code>notified_at</code> with <code>notified_via='email'</code> and <code>last_push_error='no channel'</code>, so it doesn't loop.</p>
+<p>It goes through the existing email bridge<sup>4</sup>, sent as the followed agent so a reply routes to it. The recipient is the configured human whose email channel address equals <code>user_id</code>. When <code>user_id</code> is not an email, it is the only human with an email address. The subject and first body line match the notification title and body (table below). The body adds the sm web reader URL (<code>{public base URL}{report_reader_path}</code>) when there's a report, and the agent's name and id. If the email bridge isn't configured either, the worker logs a warning and sets <code>notified_at</code> with <code>notified_via='email'</code> and <code>last_push_error='no channel'</code>, so it doesn't loop.</p>
 <h4>D5. Notification text (push and email)</h4>
 <table>
 <thead><tr><th>Case</th><th>Title</th><th>Body</th></tr></thead>
@@ -373,6 +374,7 @@ ORDER BY p.published_at DESC LIMIT 1;</code></pre>
 <tr><td>job_finished, succeeded</td><td><code>{job_label} succeeded</code></td><td><code>{session_name} · ran {duration}</code></td></tr>
 <tr><td>job_finished, failed</td><td><code>{job_label} failed (exit {job_exit_code})</code>, or <code>{job_label} failed</code> when there's no exit code</td><td>same</td></tr>
 <tr><td>job_finished, timed_out / cancelled / displaced / unknown</td><td><code>{job_label} timed out</code> / <code>was cancelled</code> / <code>was displaced</code> / <code>ended</code></td><td>same</td></tr>
+<tr><td>job_finished, any other terminal state</td><td><code>{job_label} ended ({state, underscores as spaces})</code>, e.g. <code>ended (memory exceeded)</code></td><td>same</td></tr>
 <tr><td>test</td><td><code>sm notifications work</code></td><td><code>Sent from {hostname}</code></td></tr>
 </tbody>
 </table>
@@ -418,7 +420,7 @@ The message is data-only, so the app always builds the notification itself and t
 <li><b>Menu:</b> in the agent actions menu<sup>10</sup>, add Follow or Unfollow above "Retire session". It's disabled when the session is stopped. Follow opens a dialog: a multi-line text field prefilled with the memo's message text, verbatim; a hint line saying "Clear the message to follow without telling the agent"; and buttons Cancel and Follow. On first use on Android 13 or later, it requests <code>POST_NOTIFICATIONS</code> before sending. If you deny it, the follow still proceeds, with a toast: "Notifications off — you'll be emailed instead".</li>
 <li><b>Bell:</b> the watch refresh also calls <code>GET /client/follows</code>, and cards of sessions with an active follow show a bell icon next to the status.</li>
 <li><b>Job bells:</b> every <code>pending</code> or <code>running</code> job row on the agent card (the "In progress" rows and the "All jobs" disclosure<sup>12</sup>) shows a bell toggle at its right edge. It is an outline when not followed and filled when followed. Tapping it calls the job follow <code>POST</code> or <code>DELETE</code>, with no dialog. The first job follow requests <code>POST_NOTIFICATIONS</code> exactly as for agents. Finished jobs show no bell.</li>
-<li><b>Settings:</b> a "Notifications" row showing push status (<code>push_configured</code> from the server, and whether this phone has a token), plus a "Send test notification" button that calls <code>POST /client/push/test</code>.</li>
+<li><b>Settings:</b> a "Notifications" group, shown when signed in. It says whether this build has push, and has a "Send test notification" button. The button re-registers the token, calls <code>POST /client/push/test</code>, and shows "Sent to N phone(s)", the failure, or "No phone registered for notifications". Sign-out deletes the phone's token before clearing the session.</li>
 </ul>
 
 <h3 id="h">H. Tickets and tests</h3>
@@ -426,20 +428,23 @@ The message is data-only, so the app always builds the notification itself and t
 <table>
 <thead><tr><th>Behaviour</th><th>Test</th></tr></thead>
 <tbody>
-<tr><td>Follow create is idempotent, 409 on stopped, and message delivered as important</td><td><code>tests/owner_follow_http.rs::follow_is_idempotent_and_messages_once</code>, <code>::follow_refuses_stopped_session</code></td></tr>
-<tr><td>Agent message carries the <code>[sm follow]</code> marker exactly once and is not attributed to a sender session</td><td><code>::follow_message_is_marked_sm_follow</code></td></tr>
+<tr><td>Follow create is idempotent, 409 on stopped, 404 on unknown, message marked and delivered once, silent follow sends nothing</td><td><code>tests/owner_follow_http.rs::follow_is_idempotent_and_messages_once</code>, <code>::follow_refuses_stopped_and_unknown_sessions</code>, <code>::follow_without_message_tells_the_agent_nothing</code></td></tr>
+<tr><td>Agent message carries the <code>[sm follow]</code> marker exactly once</td><td><code>owner_push.rs</code> unit <code>follow_message_marker_is_added_once</code>; the HTTP test above checks the queued text</td></tr>
 <tr><td>Job follow: 409 on a finished job, idempotent, no agent message; fires on each terminal state with the right text</td><td><code>::job_follow_rules</code>; <code>owner_push.rs</code> unit <code>sweep_fires_job_finished_each_state</code>, <code>job_notification_text</code></td></tr>
-<tr><td>Message delivery failure leaves no follow</td><td><code>::follow_rolls_back_when_message_fails</code></td></tr>
-<tr><td>Task-complete fires on normal and reparent paths</td><td><code>sessions.rs</code> unit tests <code>task_complete_fires_follow</code>, <code>task_complete_during_reparent_fires_follow</code></td></tr>
+<tr><td>Message delivery failure leaves no follow</td><td><code>http/follows.rs::follow_session</code> deletes the row on a delivery error (code location)</td></tr>
+<tr><td>Task-complete fires on normal and reparent paths; a fired agent follow waits out the report grace</td><td><code>sessions.rs</code> unit tests <code>task_complete_fires_owner_follows</code>, <code>task_complete_during_reparent_fires_owner_follows</code>; <code>owner_follow_http.rs::task_complete_fires_an_agent_follow_that_waits_for_a_report</code></td></tr>
 <tr><td>Sweep fires on stopped or missing session, and on a missed task-complete</td><td><code>owner_push.rs</code> unit <code>sweep_fires_session_ended</code>, <code>sweep_catches_missed_task_complete</code></td></tr>
 <tr><td>Report lookup: newest, by publishing session, since follow, retracted excluded; 120s grace</td><td><code>owner_push.rs</code> unit <code>report_lookup_*</code>, <code>report_grace_waits_then_sends_without</code></td></tr>
 <tr><td>Retry schedule, invalid token marking, email after 6 attempts</td><td><code>owner_push.rs</code> unit with a fake sender: <code>push_retry_schedule</code>, <code>unregistered_token_invalidated</code></td></tr>
 <tr><td>Ack fallback email once at 15 min; no channel does not loop</td><td><code>ack_fallback_emails_once</code>, <code>no_channel_marks_notified</code></td></tr>
 <tr><td>JWT claims and FCM request body shape</td><td><code>fcm.rs</code> unit <code>jwt_claims_shape</code>, <code>send_body_shape</code> against a local HTTP stub</td></tr>
-<tr><td>Device revoke deletes its tokens</td><td><code>mobile_devices.rs</code> unit <code>revoke_deletes_push_tokens</code></td></tr>
+<tr><td>Device revoke deletes its tokens</td><td><code>owner_push.rs</code> unit <code>revoking_a_device_deletes_its_tokens</code>; the hook is in <code>revoke_mobile_terminal_device</code></td></tr>
+<tr><td>Job follow end to end: sweep fires, worker pushes the right payload</td><td><code>owner_follow_http.rs::worker_pass_fires_and_pushes_a_finished_job</code></td></tr>
+<tr><td>Push token routes and the test push</td><td><code>owner_follow_http.rs::push_token_and_test_push_routes</code>, <code>owner_push.rs</code> unit <code>test_push_reports_failures_and_invalidates_dead_tokens</code></td></tr>
+<tr><td>Access token cached across sends; error classification</td><td><code>push_fcm/tests.rs::send_body_shape_and_access_token_reuse</code>, <code>::send_errors_classify_by_token_validity</code></td></tr>
 </tbody>
 </table>
-<p><b>Ticket B (Android)</b>, Mid tier. Covers Appendices E(4) and G. Unit tests go in <code>SessionManagerRepositoryTest</code> for the new API calls and for intent-extra routing. The live check: a follow on a scratch agent that runs <code>sm doc publish</code> then <code>sm task-complete</code>, with the notification opening the report. That needs your phone, so it's handed to you as a two-minute test.</p>
+<p><b>Ticket B (Android)</b>, Mid tier. Covers Appendices E(4) and G. Unit tests: <code>SessionManagerRepositoryTest.followRequestsUseTheSpecRoutesAndBodies</code> (every route and body) and <code>push/FollowMessageTest</code> (payload parsing, notification id, default message). The live check: a follow on a scratch agent that runs <code>sm doc publish</code> then <code>sm task-complete</code>, with the notification opening the report. That needs your phone, so it's handed to you as a two-minute test.</p>
 
 <h3 id="z">Z. FAQ</h3>
 <p><b>Why a sweep for session end instead of hooking every stop site?</b> The code has at least nine places that set a session to stopped<sup>7</sup>. A 15-second sweep over a handful of active follows is one code path that can't miss a new stop site added later. Task-complete gets a direct hook because <code>agent_task_completed_at</code> is cleared by later activity, and a sweep could miss a fast re-task.</p>
@@ -452,7 +457,7 @@ The message is data-only, so the app always builds the notification itself and t
 <p class="sans"><small>
 <sup>1</sup> <code>crates/sm-server/src/mobile_devices.rs:106</code>. &nbsp;
 <sup>2</sup> <code>crates/sm-server/src/http.rs:2550-2570</code>. &nbsp;
-<sup>3</sup> The task-complete notice path, <code>sessions.rs:8520-8561</code>. &nbsp;
+<sup>3</sup> <code>client_request_status</code>, <code>crates/sm-server/src/http.rs</code>; the follow handlers are in <code>crates/sm-server/src/http/follows.rs</code>, the engine in <code>owner_push.rs</code>, the sender in <code>push_fcm.rs</code>. &nbsp;
 <sup>4</sup> <code>crates/sm-server/src/email.rs</code>; the readiness line is from #1562. &nbsp;
 <sup>5</sup> <code>crates/sm-server/src/sessions.rs:8415</code>. &nbsp;
 <sup>6</sup> <code>sessions.rs:17244</code>. &nbsp;

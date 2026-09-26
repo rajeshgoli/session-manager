@@ -18,6 +18,7 @@ import java.util.UUID
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
+import li.rajeshgo.sm.data.model.SessionJob
 import li.rajeshgo.sm.data.remote.HttpClientFactory
 import li.rajeshgo.sm.data.repository.SessionManagerAuthException
 import li.rajeshgo.sm.data.repository.SessionManagerBackendUnavailableException
@@ -25,6 +26,7 @@ import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SessionManagerTransientException
 import li.rajeshgo.sm.data.repository.SettingsRepository
 import li.rajeshgo.sm.data.security.DeviceKeyManager
+import li.rajeshgo.sm.push.FollowPush
 
 data class TerminalUiState(
     val sessionId: String,
@@ -88,6 +90,10 @@ data class WatchUiState(
     val terminal: TerminalUiState? = null,
     val lastSync: String? = null,
     val error: String? = null,
+    /** Agents and queue jobs the owner follows (sm#1569). */
+    val followedSessionIds: Set<String> = emptySet(),
+    val followedJobIds: Set<String> = emptySet(),
+    val pushConfigured: Boolean = false,
 )
 
 class WatchViewModel(application: Application, private val savedState: androidx.lifecycle.SavedStateHandle) : AndroidViewModel(application) {
@@ -139,6 +145,70 @@ class WatchViewModel(application: Application, private val savedState: androidx.
             val bootstrap = runCatching { sessionRepository.fetchBootstrap(serverUrl) }.getOrNull()
             _uiState.value = _uiState.value.copy(serverUrl = serverUrl, userEmail = userEmail, bootstrap = bootstrap)
             refresh(initial = true)
+            // Every start re-sends the push token: Firebase may have rotated it while the app was closed.
+            launch { FollowPush.registerToken(getApplication()) }
+        }
+    }
+
+    private suspend fun refreshFollows(serverUrl: String, accessToken: String) {
+        runCatching { sessionRepository.fetchFollows(serverUrl, accessToken) }
+            .onSuccess { response ->
+                val active = response.follows.filter { it.isActive }
+                _uiState.value = _uiState.value.copy(
+                    followedSessionIds = active.filter { it.targetKind == "session" }.map { it.sessionId }.toSet(),
+                    followedJobIds = active.mapNotNull { it.jobId }.toSet(),
+                    pushConfigured = response.pushConfigured,
+                )
+            }
+    }
+
+    private suspend fun signedInOrNull(): Pair<String, String>? {
+        val serverUrl = settingsRepository.serverUrl.first()
+        val accessToken = settingsRepository.accessToken.first()
+        return if (serverUrl.isBlank() || accessToken.isBlank()) null else serverUrl to accessToken
+    }
+
+    /** Follows the agent; a non-blank message goes to it as `[sm follow]`. */
+    fun followSession(session: ClientSession, message: String, onComplete: (Result<String>) -> Unit) {
+        viewModelScope.launch {
+            val (serverUrl, accessToken) = signedInOrNull()
+                ?: return@launch onComplete(Result.failure(IllegalStateException("Sign in to follow agents")))
+            val result = sessionRepository.followSession(serverUrl, accessToken, session.id, message)
+            result.onSuccess {
+                _uiState.value = _uiState.value.copy(followedSessionIds = _uiState.value.followedSessionIds + session.id)
+            }
+            onComplete(result.map { "Following ${sessionDisplayName(session)}" })
+        }
+    }
+
+    fun unfollowSession(session: ClientSession, onComplete: (Result<String>) -> Unit) {
+        viewModelScope.launch {
+            val (serverUrl, accessToken) = signedInOrNull()
+                ?: return@launch onComplete(Result.failure(IllegalStateException("Sign in to follow agents")))
+            val result = sessionRepository.unfollowSession(serverUrl, accessToken, session.id)
+            result.onSuccess {
+                _uiState.value = _uiState.value.copy(followedSessionIds = _uiState.value.followedSessionIds - session.id)
+            }
+            onComplete(result.map { "Stopped following ${sessionDisplayName(session)}" })
+        }
+    }
+
+    fun toggleJobFollow(job: SessionJob, onComplete: (Result<String>) -> Unit) {
+        viewModelScope.launch {
+            val (serverUrl, accessToken) = signedInOrNull()
+                ?: return@launch onComplete(Result.failure(IllegalStateException("Sign in to follow jobs")))
+            val label = job.label.ifBlank { job.id }
+            val followed = job.id in _uiState.value.followedJobIds
+            val result = if (followed) {
+                sessionRepository.unfollowJob(serverUrl, accessToken, job.id).map { "Stopped following $label" }
+            } else {
+                sessionRepository.followJob(serverUrl, accessToken, job.id).map { "Following $label" }
+            }
+            result.onSuccess {
+                val ids = _uiState.value.followedJobIds
+                _uiState.value = _uiState.value.copy(followedJobIds = if (followed) ids - job.id else ids + job.id)
+            }
+            onComplete(result)
         }
     }
 
@@ -197,6 +267,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                         sessions
                             .filter { it.id in expandedSessionIds && it.id !in preservedDetails }
                             .forEach { loadDetail(it) }
+                        refreshFollows(serverUrl, accessToken)
                     }
                     .onFailure { error ->
                         when (error) {
@@ -244,6 +315,12 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                 refreshJob = null
             }
         }
+    }
+
+    /** Expands the card without toggling; a follow notification for the agent opens it. */
+    fun expandSession(session: ClientSession) {
+        if (session.id in _uiState.value.expandedSessionIds) return
+        toggleExpanded(session)
     }
 
     fun toggleExpanded(session: ClientSession) {

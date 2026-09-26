@@ -71,6 +71,17 @@ fun SettingsScreen(
             }
             state.error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = Rose); TextButton(onClick = viewModel::refreshBootstrap) { Text("Retry connection") } }
         }
+        if (state.isLoggedIn) SettingsGroup("Notifications") {
+            Text(
+                if (li.rajeshgo.sm.push.FollowPush.isConfigured) "Followed agents and jobs notify this phone" else "Push is not set up in this build; follows arrive by email",
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextSecondary,
+            )
+            TextButton(onClick = viewModel::sendTestNotification, enabled = !state.notificationTestBusy) {
+                Text(if (state.notificationTestBusy) "Sending…" else "Send test notification")
+            }
+            state.notificationTestStatus?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextMuted) }
+        }
         ConnectionSettings(state, viewModel, pendingEnrollmentUrl, onEnrollmentDeepLinkConsumed)
         SettingsGroup("App updates") {
             Text("Version ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})", style = MaterialTheme.typography.bodyMedium, color = TextSecondary)

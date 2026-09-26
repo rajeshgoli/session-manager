@@ -57,6 +57,7 @@ pub struct AppConfig {
     pub rust_core: RustCoreConfig,
     pub work_claims: WorkClaimsConfig,
     pub web_watch: WebWatchConfig,
+    pub push: PushConfig,
 }
 
 impl Default for AppConfig {
@@ -104,6 +105,7 @@ impl Default for AppConfig {
             rust_core: RustCoreConfig::default(),
             work_claims: WorkClaimsConfig::default(),
             web_watch: WebWatchConfig::default(),
+            push: PushConfig::default(),
         }
     }
 }
@@ -300,6 +302,10 @@ impl AppConfig {
             &default_mobile_terminal_device_enrollment_db_path(),
             &instance,
         )?;
+        self.push.db_path =
+            isolate_default_data_path(&self.push.db_path, &default_push_db_path(), &instance)?;
+        // Tests never send real pushes with the live key.
+        self.push.fcm.service_account_path = None;
         self.bug_reports.db_path = isolate_path_from_protected_root(
             &self.bug_reports.db_path,
             &default_bug_reports_db_path(),
@@ -1810,6 +1816,38 @@ fn default_web_watch_refresh_seconds() -> u64 {
     3
 }
 
+/// `push`: owner follows and phone notifications (sm#1569).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PushConfig {
+    /// Follows and push tokens.
+    #[serde(default = "default_push_db_path")]
+    pub db_path: String,
+    #[serde(default)]
+    pub fcm: FcmConfig,
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            db_path: default_push_db_path(),
+            fcm: FcmConfig::default(),
+        }
+    }
+}
+
+/// Firebase Cloud Messaging sender credentials. Push is off without them;
+/// follows then notify by email.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FcmConfig {
+    /// Google service account key JSON allowed to send FCM messages.
+    #[serde(default)]
+    pub service_account_path: Option<String>,
+}
+
+fn default_push_db_path() -> String {
+    "~/.local/share/claude-sessions/owner_push.db".to_owned()
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RustShadowConfig {
     #[serde(default)]
@@ -1912,6 +1950,8 @@ struct RawConfig {
     work_claims: WorkClaimsConfig,
     #[serde(default)]
     web_watch: WebWatchConfig,
+    #[serde(default)]
+    push: PushConfig,
 }
 
 impl From<RawConfig> for AppConfig {
@@ -2019,6 +2059,7 @@ impl From<RawConfig> for AppConfig {
             rust_core,
             work_claims: raw.work_claims,
             web_watch: raw.web_watch,
+            push: raw.push,
         }
     }
 }

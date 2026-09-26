@@ -33,6 +33,57 @@ class SessionManagerRepositoryTest {
     }
 
     @Test
+    fun followRequestsUseTheSpecRoutesAndBodies() = kotlinx.coroutines.runBlocking {
+        val seen = mutableListOf<String>()
+        val client = okhttp3.OkHttpClient.Builder().addInterceptor { chain ->
+            val request = chain.request()
+            val buffer = okio.Buffer()
+            request.body?.writeTo(buffer)
+            seen += "${request.method} ${request.url.encodedPath} ${buffer.readUtf8()}"
+            val body = when {
+                request.url.encodedPath == "/client/follows" ->
+                    """{"push_configured":true,"follows":[{"id":"fol_a","target_kind":"queue_job","session_id":"s1","job_id":"job_1","state":"active"}]}"""
+                request.method == "POST" && request.url.encodedPath.endsWith("/follow") ->
+                    """{"id":"fol_b","target_kind":"session","session_id":"s1","state":"active"}"""
+                else -> ""
+            }
+            okhttp3.Response.Builder().request(request).protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(if (body.isEmpty()) 204 else 200).message("OK")
+                .body(body.toResponseBody("application/json".toMediaType())).build()
+        }.build()
+        val service = retrofit2.Retrofit.Builder().baseUrl("https://example.com/").client(client)
+            .addConverterFactory(kotlinx.serialization.json.Json { ignoreUnknownKeys = true }.asConverterFactory("application/json".toMediaType()))
+            .build().create(li.rajeshgo.sm.data.remote.ApiService::class.java)
+
+        val follows = service.getFollows()
+        assertTrue(follows.pushConfigured)
+        assertEquals("job_1", follows.follows.single().jobId)
+        assertTrue(follows.follows.single().isActive)
+        assertEquals("fol_b", service.followSession("s1", li.rajeshgo.sm.data.model.FollowSessionRequest("report please")).id)
+        service.followSession("s1", li.rajeshgo.sm.data.model.FollowSessionRequest(null))
+        service.unfollowSession("s1")
+        service.followJob("job_1")
+        service.unfollowJob("job_1")
+        service.ackFollow("fol_a")
+        service.registerPushToken(li.rajeshgo.sm.data.model.PushTokenRequest("tok", "android-1", "Pixel", "abc"))
+        service.deletePushToken(li.rajeshgo.sm.data.model.DeletePushTokenRequest("tok"))
+        assertEquals(
+            listOf(
+                "GET /client/follows ",
+                """POST /sessions/s1/follow {"message":"report please"}""",
+                """POST /sessions/s1/follow {"message":null}""",
+                "DELETE /sessions/s1/follow ",
+                "POST /queue-jobs/job_1/follow ",
+                "DELETE /queue-jobs/job_1/follow ",
+                "POST /client/follows/fol_a/ack ",
+                """PUT /client/push-token {"token":"tok","device_id":"android-1","device_name":"Pixel","app_version":"abc"}""",
+                """DELETE /client/push-token {"token":"tok"}""",
+            ),
+            seen,
+        )
+    }
+
+    @Test
     fun attachTicketLimitIsRetryableButAuthenticationIsNot() {
         val repository = SessionManagerRepository()
         fun failure(code: Int): Throwable = repository.classifyWriteFailure(

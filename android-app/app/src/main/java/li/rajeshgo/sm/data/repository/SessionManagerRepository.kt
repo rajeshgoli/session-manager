@@ -398,6 +398,44 @@ class SessionManagerRepository(
         return message.orEmpty().contains("Expected HTTP 101 response", ignoreCase = true)
     }
 
+    suspend fun fetchFollows(baseUrl: String, token: String): li.rajeshgo.sm.data.model.FollowsResponse = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getFollows() }
+    }
+
+    suspend fun followSession(baseUrl: String, token: String, sessionId: String, message: String?): Result<li.rajeshgo.sm.data.model.OwnerFollow> = withContext(Dispatchers.IO) {
+        runCatching {
+            api(baseUrl, token).followSession(sessionId, li.rajeshgo.sm.data.model.FollowSessionRequest(message?.trim()?.takeIf { it.isNotEmpty() }))
+        }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun unfollowSession(baseUrl: String, token: String, sessionId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).unfollowSession(sessionId) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun followJob(baseUrl: String, token: String, jobId: String): Result<li.rajeshgo.sm.data.model.OwnerFollow> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).followJob(jobId) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun unfollowJob(baseUrl: String, token: String, jobId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).unfollowJob(jobId) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun ackFollow(baseUrl: String, token: String, followId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).ackFollow(followId) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun registerPushToken(baseUrl: String, token: String, request: li.rajeshgo.sm.data.model.PushTokenRequest): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).registerPushToken(request) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun deletePushToken(baseUrl: String, token: String, pushToken: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).deletePushToken(li.rajeshgo.sm.data.model.DeletePushTokenRequest(pushToken)) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun sendTestPush(baseUrl: String, token: String): Result<li.rajeshgo.sm.data.model.TestPushResponse> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).sendTestPush() }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun requestStatus(baseUrl: String, token: String): Result<RequestStatusResponse> = withContext(Dispatchers.IO) {
         runCatching {
             api(baseUrl, token).requestStatus()
