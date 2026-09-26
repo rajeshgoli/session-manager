@@ -413,7 +413,7 @@ CREATE INDEX owner_message_replies_message ON owner_message_replies(message_id, 
   kind             TEXT NOT NULL,      -- 'message' | 'review_requested'
   session_id       TEXT NOT NULL,      -- the agent the notice is about
   session_name     TEXT NOT NULL,
-  subject_id       TEXT NOT NULL,      -- owner_messages.id or owner_docs.id
+  subject_id       TEXT NOT NULL,      -- owner_messages.id, or owner_doc_publishes.id for review_requested
   title            TEXT NOT NULL,      -- notification title (F3)
   body             TEXT NOT NULL,      -- notification body
   reader_path      TEXT NOT NULL,      -- /messages/msg_… or the doc's readable path with ?version=
@@ -427,8 +427,9 @@ CREATE INDEX owner_message_replies_message ON owner_message_replies(message_id, 
   acked_at         TEXT,
   email_sent_at    TEXT
 );
-CREATE INDEX owner_notices_pending ON owner_notices(notified_at, notify_after);</code></pre>
-<p>The delivery columns mean exactly what they mean on <code>owner_follows</code>. A notice is created in the request that creates the message or the publish, and is never cancelled.</p>
+CREATE INDEX owner_notices_pending ON owner_notices(notified_at, notify_after);
+CREATE UNIQUE INDEX owner_notices_subject ON owner_notices(kind, subject_id);</code></pre>
+<p>The delivery columns mean exactly what they mean on <code>owner_follows</code>. A notice is created in the request that creates the message or the review-requesting publish, and by the repair pass (F2). Both use <code>INSERT … ON CONFLICT(kind, subject_id) DO NOTHING</code>, so a subject has at most one notice however the two race. A review request's subject is its publish row, so each <code>--review</code> publish gets its own notice.</p>
 
 <h3 id="d">D. Server HTTP interface</h3>
 
@@ -441,7 +442,7 @@ CREATE INDEX owner_notices_pending ON owner_notices(notified_at, notify_after);<
 <tr><td><code>GET/POST /messages/{id}/drafts</code><br><code>PATCH/DELETE /messages/{id}/drafts/{draft_id}</code></td><td>As the doc draft routes, without <code>sha</code>. At most 100 drafts per message.</td></tr>
 <tr><td><code>POST /messages/{id}/reply</code><br><code>{submission_id, body}</code></td><td>D3. 200 <code>{delivered_to_session_id, delivered_text}</code>.</td></tr>
 <tr><td><code>POST /messages/{id}/handled</code></td><td>409 unless the message is blocking. Sets <code>handled_at</code>, and <code>first_viewed_at</code> if null. Sends nothing to the agent. 204.</td></tr>
-<tr><td><code>POST /docs</code></td><td>Stores <code>checkout_root</code> on the publish row when given. When <code>review</code> is true (still refused without an open PR), also creates a notice: kind <code>review_requested</code>, <code>subject_id</code> = doc id, <code>reader_path</code> = the publish's readable path. A publish without <code>review</code> creates no notice. The response gains <code>owner_name</code>.</td></tr>
+<tr><td><code>POST /docs</code></td><td>Stores <code>checkout_root</code> on the publish row when given. When <code>review</code> is true (still refused without an open PR), also creates a notice: kind <code>review_requested</code>, <code>subject_id</code> = the new <code>owner_doc_publishes.id</code>, <code>reader_path</code> = the publish's readable path. A publish without <code>review</code> creates no notice. The response gains <code>owner_name</code>.</td></tr>
 <tr><td><code>POST /docs/{id}/dismiss-review</code></td><td>409 unless the doc's state is <code>review_requested</code>. Sets <code>review_dismissed_at</code> on the latest publish. Sends nothing to the agent. 204.</td></tr>
 <tr><td><code>POST /docs/{id}/assign</code><br><code>{review_id}</code></td><td>D5. 201 <code>{session_id, name}</code>.</td></tr>
 <tr><td><code>POST /docs/{id}/review</code></td><td>Unchanged, except the response gains <code>delivered_to_session_id</code> (null when the wake had no recipient), for the assign banner (E2).</td></tr>
@@ -486,7 +487,7 @@ CREATE INDEX owner_notices_pending ON owner_notices(notified_at, notify_after);<
 
 <h4>D5. Assigning a GitHub review to a new agent</h4>
 <ol>
-<li><b>Eligibility.</b> <code>review_id</code> names a row in <code>owner_doc_reviews</code> for this doc with <code>status = 'posted'</code> and <code>delivered_to_session_id</code> null (today's <code>review_undelivered</code>). Otherwise 409: <code>Review is already with &lt;session name&gt;</code> when delivered, <code>Review not found</code> when it isn't this doc's.</li>
+<li><b>Eligibility, checked at assign time, not from the page.</b> <code>review_id</code> names a row in <code>owner_doc_reviews</code> for this doc with <code>status = 'posted'</code> and <code>delivered_to_session_id</code> null (today's <code>review_undelivered</code>), and it is the doc's latest posted review. And the review wake rule<sup>13</sup> applied to the doc's current author finds no recipient. Otherwise 409: <code>Review not found</code> when it isn't this doc's; <code>Review is already with &lt;session name&gt;</code> when delivered; <code>A newer review exists; reload</code> when it isn't the latest; <code>The doc has an agent again: &lt;session name&gt;</code> when the wake rule now finds one (another agent took over and republished). A stale page therefore cannot start a second agent.</li>
 <li><b>Where.</b> <code>working_dir</code> = the <code>checkout_root</code> of the doc's newest publish that has one and whose directory exists. None → 409 <code>No local checkout is known for &lt;repo-name&gt;; start the agent yourself</code>.</li>
 <li><b>What.</b> Provider, model and reasoning effort copied from the doc's recorded author session (the one that ended); a value the record lacks is left to the provider default. No parent, no name (the agent names itself per its repo's instructions).</li>
 <li><b>Task.</b> <code>initial_message</code>, created through the same path as <code>POST /sessions</code> so the task is accepted durably with the session:
@@ -521,7 +522,9 @@ Check out the PR branch in your own worktree, run `sm pr` from it to claim the P
 <p><code>user_id</code> must be the identity the app's push tokens are registered under, the owner's signed-in Google email. So: the human's email channel address, lowercased, when it equals (case-insensitively) a <code>google_auth.allowlist_emails</code> entry; else the first allowlist entry; else <code>local_bypass</code>. For doc notices the human is the only configured human, or the first in config order.</p>
 
 <h4>F2. Delivery</h4>
-<p>Extend the follow delivery worker (<code>owner_push::deliver</code><sup>10</sup>) to process <code>owner_notices</code> in the same pass, after follows, with the same rules: push to every valid token; success on any token sets <code>notified_at</code> and <code>notified_via='push'</code>; retryable failures back off 30 s, 1, 2, 5, 10 minutes, then email; an invalid token is marked and not retried; no push configured or no valid token → email at once; a push without an ack within 15 minutes → one fallback email; transient email failures retry every 5 minutes for an hour. Notices have no report grace. A repair pass, every third worker pass, creates a notice for any <code>owner_messages</code> row younger than 24 hours that has none. Runs only when <code>rust_core.runtime_enabled</code>, like follows.</p>
+<p>Extend the follow delivery worker (<code>owner_push::deliver</code><sup>10</sup>) to process <code>owner_notices</code> in the same pass, after follows, with the same rules: push to every valid token; success on any token sets <code>notified_at</code> and <code>notified_via='push'</code>; retryable failures back off 30 s, 1, 2, 5, 10 minutes, then email; an invalid token is marked and not retried; no push configured or no valid token → email at once; a push without an ack within 15 minutes → one fallback email; transient email failures retry every 5 minutes for an hour. Notices have no report grace. Runs only when <code>rust_core.runtime_enabled</code>, like follows.</p>
+<p><b>Still wanted?</b> Immediately before every push or email for a notice, including retries and the 15-minute fallback email, the worker re-reads its subject. A <code>message</code> notice is still wanted while the message's state is <code>new</code>, <code>read</code> or <code>needs_you</code> (A). A <code>review_requested</code> notice is still wanted while its publish is the doc's latest publish and the doc's state is <code>review_requested</code>. A notice no longer wanted is closed without sending: <code>notified_at</code> = now (if null), <code>notified_via</code> = <code>'resolved'</code>, and no fallback email follows. So a reply, Handled or No review needed made while a push is retrying stops it.</p>
+<p><b>Repair pass.</b> Every third worker pass, for the last 24 hours: every <code>owner_messages</code> row, and every <code>owner_doc_publishes</code> row with <code>review_requested = 1</code>, that has no notice gets one, by the same conflict-safe insert. A subject no longer wanted still gets its row, which the check above closes at once without sending. This covers a notice insert that failed after the message or publish committed, since those live in a different database from the notices.</p>
 
 <h4>F3. Notification text and payload</h4>
 <table>
@@ -568,12 +571,13 @@ Check out the PR branch in your own worktree, run `sm pr` from it to claim the P
 <table>
 <thead><tr><th>Behaviour</th><th>Test</th></tr></thead>
 <tbody>
-<tr><td>Message creates a notice; repair pass fills a missing one</td><td><code>owner_push.rs</code> unit <code>message_creates_notice</code>, <code>repair_pass_creates_missing_notice</code></td></tr>
+<tr><td>Message and review publish create one notice each; repair pass fills a missing one for both kinds; a racing create and repair leave one row</td><td><code>owner_push.rs</code> unit <code>message_creates_notice</code>, <code>repair_pass_creates_missing_notices</code>, <code>create_and_repair_race_leaves_one_notice</code></td></tr>
+<tr><td>A notice whose subject was replied to, handled, dismissed or superseded is closed as <code>resolved</code> before any push, retry or fallback email</td><td><code>owner_push.rs</code> unit <code>resolved_subject_closes_notice_without_sending</code></td></tr>
 <tr><td>Notice push, retry, invalid token, email after 6 attempts, ack fallback once, transient email retry</td><td><code>owner_push.rs</code> unit <code>notice_delivery_follows_follow_rules</code> (table-driven over the follow cases)</td></tr>
 <tr><td>Notification text and data (F3) including <code>unread_count</code> and blocking title; email subject and body (F4)</td><td><code>owner_push.rs</code> unit <code>notice_text_and_payload</code>; <code>http/follows.rs</code> unit <code>notice_email_shape</code></td></tr>
 <tr><td><code>--review</code> still needs an open PR, sends <code>checkout_root</code> (main checkout from a linked worktree) and creates a notice; plain publish creates none</td><td><code>bin/doc</code> unit <code>checkout_root_is_the_main_checkout</code>; <code>tests/owner_doc_http.rs::review_request_creates_notice</code></td></tr>
 <tr><td>No review needed clears Review requested and the waiting entry; a retired author's request is omitted from waiting</td><td><code>owner_docs.rs</code> unit <code>dismissed_request_is_not_review_requested</code>; <code>tests/owner_doc_http.rs::dismiss_review_clears_waiting</code></td></tr>
-<tr><td>Assign: eligibility and 409s, working dir from the newest existing checkout, provider/model/effort copied, task text, review marked delivered, second tap 409; review submit reports <code>delivered_to_session_id</code></td><td><code>tests/owner_doc_http.rs::assign_undelivered_review_spawns_agent</code>, <code>::assign_refuses_delivered_or_unknown_checkout</code></td></tr>
+<tr><td>Assign: eligibility and 409s (including not-latest review and an author that has a recipient again), working dir from the newest existing checkout, provider/model/effort copied, task text, review marked delivered, second tap 409; review submit reports <code>delivered_to_session_id</code></td><td><code>tests/owner_doc_http.rs::assign_undelivered_review_spawns_agent</code>, <code>::assign_refuses_delivered_or_unknown_checkout</code></td></tr>
 <tr><td>Ack route ownership; <code>owner_name</code> on <code>GET /client/follows</code></td><td><code>tests/owner_follow_http.rs::notice_ack_is_owner_scoped</code>, <code>::follows_carry_owner_name</code></td></tr>
 </tbody>
 </table>
