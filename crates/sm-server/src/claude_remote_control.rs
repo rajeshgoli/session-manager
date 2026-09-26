@@ -19,6 +19,7 @@ use nix::sys::signal::kill;
 use nix::unistd::Pid;
 use serde::Deserialize;
 
+use crate::config::test_isolation_root_from_environment;
 use crate::sessions::expand_home;
 
 const REMOTE_CONTROL_URL_PREFIX: &str = "https://claude.ai/code/";
@@ -61,6 +62,10 @@ fn links() -> Arc<LinkMap> {
 }
 
 fn claude_session_dirs() -> Vec<PathBuf> {
+    // A test process must never read the developer's live Claude sessions.
+    if let Ok(Some(root)) = test_isolation_root_from_environment() {
+        return vec![root.join("claude").join("sessions")];
+    }
     let mut dirs = Vec::new();
     if let Some(config_dirs) = env::var_os("CLAUDE_CONFIG_DIR") {
         for config_dir in config_dirs.to_string_lossy().split(',') {
@@ -209,6 +214,13 @@ mod tests {
         let dir = TempDir::new();
         let links = scan_session_dirs(&[dir.path().join("absent")], |_| true);
         assert!(links.is_empty());
+    }
+
+    #[test]
+    fn test_processes_scan_only_the_isolation_root() {
+        let dirs = claude_session_dirs();
+        assert_eq!(dirs.len(), 1);
+        assert!(!dirs[0].starts_with(expand_home("~/.claude")));
     }
 
     #[test]
