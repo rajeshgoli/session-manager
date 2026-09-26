@@ -6,6 +6,9 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import com.google.firebase.FirebaseApp
@@ -183,6 +186,16 @@ data class FollowMessage(
             )
         }
     }
+}
+
+/**
+ * A tapped follow notification waiting for the watch screen. Process-wide
+ * Compose state, read directly by the screens: a value handed through the
+ * NavHost builder is captured when the graph is built, so a tap while the
+ * app is already running would never reach the watch screen.
+ */
+object FollowOpenRequests {
+    var pending by mutableStateOf<FollowOpen?>(null)
 }
 
 /** What tapping a follow notification opens: the report, else the agent's card. */

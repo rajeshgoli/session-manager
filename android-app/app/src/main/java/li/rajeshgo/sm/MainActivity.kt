@@ -7,17 +7,17 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.mutableStateOf
 import li.rajeshgo.sm.push.FollowOpen
+import li.rajeshgo.sm.push.FollowOpenRequests
 import li.rajeshgo.sm.ui.navigation.AppNavigation
 import li.rajeshgo.sm.ui.theme.SessionManagerTheme
 
 class MainActivity : ComponentActivity() {
     private val pendingEnrollmentUrl = mutableStateOf<String?>(null)
-    private val pendingFollowOpen = mutableStateOf<FollowOpen?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         pendingEnrollmentUrl.value = enrollmentUrlFromIntent(intent)
-        pendingFollowOpen.value = FollowOpen.fromIntent(intent)
+        takeFollowOpen(intent)
         enableEdgeToEdge(
             statusBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
             navigationBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
@@ -28,8 +28,6 @@ class MainActivity : ComponentActivity() {
                     AppNavigation(
                         pendingEnrollmentUrl = pendingEnrollmentUrl.value,
                         onEnrollmentDeepLinkConsumed = ::clearEnrollmentDeepLink,
-                        pendingFollowOpen = pendingFollowOpen.value,
-                        onFollowOpenConsumed = ::clearFollowOpen,
                     )
                 }
             }
@@ -40,7 +38,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         pendingEnrollmentUrl.value = enrollmentUrlFromIntent(intent)
-        FollowOpen.fromIntent(intent)?.let { pendingFollowOpen.value = it }
+        takeFollowOpen(intent)
     }
 
     private fun enrollmentUrlFromIntent(intent: Intent?): String? {
@@ -51,8 +49,10 @@ class MainActivity : ComponentActivity() {
         return uri.getQueryParameter("url")?.trim()?.takeIf { it.isNotBlank() }
     }
 
-    private fun clearFollowOpen() {
-        pendingFollowOpen.value = null
+    /** Hands a tapped follow notification to the watch screen, once. */
+    private fun takeFollowOpen(intent: Intent?) {
+        val open = FollowOpen.fromIntent(intent) ?: return
+        FollowOpenRequests.pending = open
         setIntent(Intent(this, MainActivity::class.java))
     }
 
