@@ -95,11 +95,20 @@ object FollowPush {
         )
     }
 
-    /** Removes this phone's push token from sm before signing out. */
+    /**
+     * Stops pushes to this phone before signing out: removes the token from sm,
+     * then deletes it at Firebase. The second step covers a failed first one:
+     * Google then reports the token unregistered and sm stops using it.
+     */
     suspend fun unregisterToken(context: Context, serverUrl: String, accessToken: String) {
-        if (serverUrl.isBlank() || accessToken.isBlank()) return
-        val pushToken = currentToken() ?: return
-        SessionManagerRepository(SettingsRepository(context)).deletePushToken(serverUrl, accessToken, pushToken)
+        if (!isConfigured) return
+        val pushToken = currentToken()
+        if (pushToken != null && serverUrl.isNotBlank() && accessToken.isNotBlank()) {
+            SessionManagerRepository(SettingsRepository(context)).deletePushToken(serverUrl, accessToken, pushToken)
+        }
+        suspendCancellableCoroutine { continuation ->
+            FirebaseMessaging.getInstance().deleteToken().addOnCompleteListener { continuation.resume(Unit) }
+        }
     }
 
     /**

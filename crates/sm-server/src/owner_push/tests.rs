@@ -1037,3 +1037,35 @@ fn transient_fallback_email_failure_retries_on_its_own_schedule() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn concurrent_follows_of_one_target_all_return_the_same_follow() {
+    let (store, dir) = temp_store();
+    let path = dir.join("owner_push.db");
+    store.valid_tokens(OWNER).unwrap(); // creates the schema
+    let ids = std::thread::scope(|scope| {
+        let handles = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                scope.spawn(move || {
+                    OwnerPushStore::new(path)
+                        .create_follow(
+                            OWNER,
+                            &session_target("agent1"),
+                            None,
+                            at("2026-09-25T10:00:00Z"),
+                        )
+                        .unwrap()
+                        .0
+                        .id
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert!(ids.iter().all(|id| id == &ids[0]), "{ids:?}");
+    fs::remove_dir_all(dir).unwrap();
+}

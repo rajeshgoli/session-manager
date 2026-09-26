@@ -7,6 +7,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
 
@@ -20,18 +21,20 @@ class FollowMessagingService : FirebaseMessagingService() {
 
     override fun onMessageReceived(message: RemoteMessage) {
         val followMessage = FollowMessage.fromData(message.data) ?: return
+        // Firebase calls this on a background thread; the settings read is local.
+        val settings = SettingsRepository(applicationContext)
+        val (serverUrl, accessToken) = runBlocking {
+            settings.serverUrl.first().trim() to settings.accessToken.first().trim()
+        }
+        // A signed-out phone shows nothing, even if its token outlived sign-out.
+        if (serverUrl.isBlank() || accessToken.isBlank()) return
         val shown = FollowPush.show(applicationContext, followMessage)
         val followId = followMessage.followId
         // The ack tells sm the phone showed it, so no fallback email is sent;
         // a notification Android suppressed is never acknowledged.
         if (!shown || followMessage.isTest || followId == null) return
         scope.launch {
-            val settings = SettingsRepository(applicationContext)
-            val serverUrl = settings.serverUrl.first().trim()
-            val accessToken = settings.accessToken.first().trim()
-            if (serverUrl.isNotBlank() && accessToken.isNotBlank()) {
-                SessionManagerRepository(settings).ackFollow(serverUrl, accessToken, followId)
-            }
+            SessionManagerRepository(settings).ackFollow(serverUrl, accessToken, followId)
         }
     }
 }

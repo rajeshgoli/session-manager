@@ -11,7 +11,7 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 
 use anyhow::{Context, Result};
 use rand_core::{OsRng, RngCore};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde::Serialize;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
@@ -298,7 +298,9 @@ impl OwnerPushStore {
         now: OffsetDateTime,
     ) -> Result<(Follow, bool)> {
         let mut conn = self.open()?;
-        let tx = conn.transaction()?;
+        // IMMEDIATE takes the write lock before the check, so two overlapping
+        // follows of one target serialize and the second returns the first.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(existing) = active_follow_conn(&tx, user_id, target)? {
             return Ok((existing, false));
         }
