@@ -1375,6 +1375,13 @@ private fun SessionRow(
 ) {
     val followed = session.id in follow.followedSessionIds
     val attachSupported = session.mobileTerminal?.supported == true || session.termuxAttach?.supported == true
+    val context = LocalContext.current
+    val remoteControlUrl = remoteControlUrl(session)
+    val openAgent: () -> Unit = {
+        val opened = remoteControlUrl != null && openRemoteControl(context, remoteControlUrl)
+        if (!opened) onOpenAttach()
+    }
+    val canOpenAgent = remoteControlUrl != null || attachSupported
     val hasSummary = whatState?.entries?.isNotEmpty() == true
     Surface(
         modifier = Modifier.padding(start = (depth * 14).dp),
@@ -1386,7 +1393,7 @@ private fun SessionRow(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { if (attachSupported) onOpenAttach() else onToggleExpanded() }
+                    .clickable { if (canOpenAgent) openAgent() else onToggleExpanded() }
                     .padding(14.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
@@ -1455,7 +1462,11 @@ private fun SessionRow(
                 }
                 Spacer(Modifier.width(10.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (attachSupported) {
+                    if (remoteControlUrl != null) {
+                        IconButton(onClick = openAgent) {
+                            Icon(Icons.AutoMirrored.Rounded.OpenInNew, contentDescription = "Open in Claude", tint = Emerald)
+                        }
+                    } else if (attachSupported) {
                         IconButton(onClick = onOpenAttach) {
                             Icon(Icons.Rounded.Terminal, contentDescription = "Attach", tint = Emerald)
                         }
@@ -1490,7 +1501,8 @@ private fun SessionRow(
                     }
                     var actionsExpanded by remember { mutableStateOf(false) }
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (attachSupported) ActionPill(label = "Open terminal", icon = Icons.Rounded.Terminal, onClick = onOpenAttach, tint = Emerald)
+                        if (remoteControlUrl != null) ActionPill(label = "Open in Claude", icon = Icons.AutoMirrored.Rounded.OpenInNew, onClick = openAgent, tint = Emerald)
+                        if (attachSupported) ActionPill(label = "Open terminal", icon = Icons.Rounded.Terminal, onClick = onOpenAttach, tint = if (remoteControlUrl != null) TextSecondary else Emerald)
                         if (supportsSessionCloning(session.provider)) ActionPill(label = "Clone", icon = Icons.Rounded.ContentCopy, onClick = onClone)
                         Box {
                             IconButton(onClick = { actionsExpanded = true }) { Icon(Icons.Rounded.MoreVert, "Agent actions", tint = TextSecondary) }
@@ -2003,3 +2015,15 @@ private fun relativeSummaryAge(timestamp: String?): String {
     }
     return summaryAgeLabel(timestamp, now)
 }
+
+/** Claude Remote Control link for a live session, or null when the terminal is the only way in. */
+internal fun remoteControlUrl(session: ClientSession): String? =
+    session.remoteControl?.url?.takeIf { it.startsWith("https://claude.ai/code/") }
+
+/** Opens the link (Android hands claude.ai links to the Claude app); false if nothing could open it. */
+private fun openRemoteControl(context: android.content.Context, url: String): Boolean =
+    runCatching {
+        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        })
+    }.isSuccess

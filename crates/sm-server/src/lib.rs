@@ -2,6 +2,7 @@ pub mod app_artifacts;
 pub mod btw;
 pub mod bug_reports;
 pub mod child_output;
+pub mod claude_remote_control;
 pub mod cloudflare_access;
 pub mod codex_activity;
 pub mod codex_events;

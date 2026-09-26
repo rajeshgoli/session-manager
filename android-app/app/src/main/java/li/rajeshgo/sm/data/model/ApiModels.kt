@@ -251,6 +251,8 @@ data class ClientSession(
     val mobileTerminal: MobileTerminalMetadata? = null,
     @SerialName("primary_action")
     val primaryAction: PrimaryAction? = null,
+    @SerialName("remote_control")
+    val remoteControl: RemoteControlLink? = null,
 )
 
 @Serializable
@@ -332,6 +334,13 @@ data class MobileAttachTicketResponse(
     val wsUrl: String,
     @SerialName("expires_at")
     val expiresAt: String,
+)
+
+/** Link that opens the session in its provider's own app (Claude Remote Control). */
+@Serializable
+data class RemoteControlLink(
+    val provider: String? = null,
+    val url: String? = null,
 )
 
 @Serializable
