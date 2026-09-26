@@ -56,6 +56,12 @@ android {
         buildConfigField("String", "SM_FIREBASE_SENDER_ID", project.stringProp("SM_FIREBASE_SENDER_ID").toBuildConfigString())
         buildConfigField("String", "SM_FIREBASE_APP_ID", project.stringProp("SM_FIREBASE_APP_ID").toBuildConfigString())
         buildConfigField("String", "SM_FIREBASE_API_KEY", project.stringProp("SM_FIREBASE_API_KEY").toBuildConfigString())
+        // The owner's browser host (`cloudflare_access.browser.hostname`): the app
+        // claims its /docs/, /t/ and /history links. Blank claims no host.
+        val linkHost = project.stringProp("SM_LINK_HOST")
+        buildConfigField("String", "SM_LINK_HOST", linkHost.toBuildConfigString())
+        // An intent filter without a host would match every https URL.
+        manifestPlaceholders["smLinkHost"] = linkHost.ifBlank { "sm-links.invalid" }
     }
 
     buildTypes {

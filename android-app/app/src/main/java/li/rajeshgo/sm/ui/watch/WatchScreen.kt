@@ -225,6 +225,13 @@ fun WatchScreen(
         }
         onFollowOpenConsumed()
     }
+    // An opened sm link: show it in the reader.
+    val pendingReaderLink = li.rajeshgo.sm.ui.navigation.ReaderLinkRequests.pending
+    LaunchedEffect(pendingReaderLink) {
+        val page = pendingReaderLink ?: return@LaunchedEffect
+        openPage = page
+        li.rajeshgo.sm.ui.navigation.ReaderLinkRequests.pending = null
+    }
     val openAttach: (ClientSession) -> Unit = { session ->
         if (session.mobileTerminal?.supported == true) {
             viewModel.openMobileTerminal(session) { result ->

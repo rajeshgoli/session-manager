@@ -10,3 +10,7 @@ SM_FIREBASE_PROJECT_ID=
 SM_FIREBASE_SENDER_ID=
 SM_FIREBASE_APP_ID=
 SM_FIREBASE_API_KEY=
+# The browser host sm links use (cloudflare_access.browser.hostname). The app
+# opens its /docs/, /t/ and /history links; enable them once in Android
+# Settings > Apps > SM > Open by default.
+SM_LINK_HOST=sm.example.com

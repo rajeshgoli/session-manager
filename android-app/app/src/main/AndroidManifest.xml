@@ -42,6 +42,19 @@
                     android:scheme="sm-enroll"
                     android:host="enroll" />
             </intent-filter>
+            <!-- sm links on the owner's browser host open in the in-app reader. -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="https" />
+                <data android:host="${smLinkHost}" />
+                <data android:pathPrefix="/docs/" />
+                <data android:pathPrefix="/t/" />
+                <data android:path="/history" />
+            </intent-filter>
         </activity>
         <service
             android:name=".push.FollowMessagingService"
