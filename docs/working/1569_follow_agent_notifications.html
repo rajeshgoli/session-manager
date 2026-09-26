@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>1569 — Follow an agent</title>
+<title>1569 — Follow agents and jobs</title>
 <!--
   House format for owner-facing design documents.
 
@@ -106,18 +106,19 @@
   }
 </style>
 
-<h1>1569 — Follow an agent from the sm app</h1>
-<p class="sans"><small>Author: sm-app-notifications <code>a8d3f4e9</code> · Ticket #1569 · Revision 1</small></p>
+<h1>1569 — Follow agents and queue jobs from the sm app</h1>
+<p class="sans"><small>Author: sm-app-notifications <code>a8d3f4e9</code> · Ticket #1569 · Revision 2</small></p>
 
 <h2>Memo</h2>
 
-<p><b>You tap Follow on an agent in the sm app. When that agent finishes, your phone shows a notification, and tapping it opens the agent's completion report.</b> This replaces asking an agent to email you when it's done. The server, not the agent, keeps the promise. The agent's only job is to publish a report and run <code>sm task-complete</code>, which it should do anyway. The server notices, finds the report and pushes the notification. It also tells you if the agent dies before finishing, so silence never has to be read as "still working".</p>
+<p><b>You tap Follow on an agent in the sm app. When that agent finishes, your phone shows a notification, and tapping it opens the agent's completion report.</b> You can follow a queue job the same way: tap the bell on a running job, and you're notified when it succeeds, fails, times out or is cancelled. This replaces asking an agent to email you when it's done. The server, not the agent, keeps the promise. The agent's only job is to publish a report and run <code>sm task-complete</code>, which it should do anyway. The server notices, finds the report and pushes the notification. It also tells you if the agent dies before finishing, so silence never has to be read as "still working".</p>
 
 <p>Delivery uses Firebase Cloud Messaging, Google's free push service for Android. It's the only channel that reaches a sleeping phone within seconds without a second app. It costs nothing. It needs about fifteen minutes of setup from you in Google Cloud, in the project that already holds the app's Google sign-in. That setup is the only part I can't do for you.</p>
 
 <div class="vocab">
 <dl>
-<dt>Follow</dt><dd>A record on the sm server saying "Rajesh wants to know when agent X finishes". It fires once and then ends.</dd>
+<dt>Follow</dt><dd>A record on the sm server saying "Rajesh wants to know when agent X finishes" or "when queue job Y ends". It fires once and then ends.</dd>
+<dt>Queue job</dt><dd>A command an agent submitted with <code>sm queue run</code>, such as <code>1679-stage1-prepare-2</code>. The app already lists them on the submitting agent's card.</dd>
 <dt>Push</dt><dd>A notification Google delivers to your phone even while the sm app is closed. The sm server asks Google to send it; Google hands it to your phone.</dd>
 <dt>Push token</dt><dd>The address Google gives your phone's copy of the sm app. The app sends it to the sm server so the server knows where to push.</dd>
 <dt>Completion report</dt><dd>The newest doc the agent published with <code>sm doc publish</code> after you followed it, meaning the same docs you already read in the app.</dd>
@@ -161,20 +162,23 @@
 </figure>
 
 <h3>What you see</h3>
-<p><b>Following.</b> The agent's three-dot menu gains <b>Follow</b>. Tapping it opens a dialog with this message already filled in. You can edit it, or clear it to follow silently:</p>
-<pre>Rajesh is following you from the sm app. When your task is done, commit a
+<p><b>Following an agent.</b> The agent's three-dot menu gains <b>Follow</b>. Tapping it opens a dialog with this message already filled in. You can edit it, or clear it to follow silently. The agent receives it as a system message marked <code>[sm follow]</code>, the same way it receives <code>[sm task-complete]</code> and <code>[sm review]</code>, because it comes from sm on your behalf and not from another agent:</p>
+<pre>[sm follow] Rajesh is following you from the sm app. When your task is done, commit a
 completion report (conclusion first, written for Rajesh), publish it with
 `sm doc publish &lt;path&gt;`, then run `sm task-complete`. Publish before
 task-complete: the notification links to the newest doc you published.</pre>
-<p>The message goes to the agent like an <code>sm send --important</code>: it waits for the agent's current turn to end rather than interrupting it. A followed agent shows a bell on its card, and its menu says <b>Unfollow</b>. The first time you follow, Android asks once for permission to show notifications.</p>
+<p>The message waits for the agent's current turn to end rather than interrupting it. A followed agent shows a bell on its card, and its menu says <b>Unfollow</b>. The first time you follow, Android asks once for permission to show notifications.</p>
+<p><b>Following a queue job.</b> Each queued or running job on an agent's card gets a bell. Tap it to follow; tap again to unfollow. The job's agent receives no message, because there's nothing for it to do.</p>
 
-<p><b>Being notified.</b> Exactly one notification per follow:</p>
+<p><b>Being notified.</b> Exactly one notification per follow. The job examples use the <code>1679-stage1-prepare-2</code> job you mentioned:</p>
 <table>
 <thead><tr><th>What happened</th><th>Notification</th><th>Tapping it opens</th></tr></thead>
 <tbody>
 <tr><td>Agent ran <code>sm task-complete</code> and had published a report</td><td><b>sm-1569-engineer finished</b><br>Report: Follow an agent — completion</td><td>The report, in the app's doc reader</td></tr>
 <tr><td>Agent ran <code>sm task-complete</code> with no report</td><td><b>sm-1569-engineer finished</b><br>No completion report published</td><td>The agent's card</td></tr>
 <tr><td>Agent's session ended (retired, killed, crashed) before <code>sm task-complete</code></td><td><b>sm-1569-engineer ended without completing</b><br>Session stopped before sm task-complete</td><td>The report if one exists, else the agent's card</td></tr>
+<tr><td>Followed job succeeded</td><td><b>1679-stage1-prepare-2 succeeded</b><br>1679-engineer · ran 2h 14m</td><td>The submitting agent's card, where the job sits in its job history</td></tr>
+<tr><td>Followed job failed, timed out, was cancelled or was displaced by a perf run</td><td><b>1679-stage1-prepare-2 failed (exit 1)</b><br>1679-engineer · ran 41m</td><td>Same</td></tr>
 </tbody>
 </table>
 <p>The agent's parent still gets its usual <code>[sm task-complete]</code> message. Following adds to that and changes nothing about it.</p>
@@ -185,9 +189,10 @@ task-complete: the notification links to the newest doc you published.</pre>
 <tbody>
 <tr><td>Agent runs <code>sm task-complete</code> first and publishes the report 40 seconds later</td><td>The server waits up to 2 minutes for a report before saying "no report". You get the version with the report.</td></tr>
 <tr><td>Agent finishes, its parent hands it a new task, and it finishes again</td><td>You're notified on the first finish only. Follow again for the next one.</td></tr>
-<tr><td>Agent publishes three docs during the task</td><td>The notification links the newest one.</td></tr>
+<tr><td>Agent publishes three docs during the task</td><td>The notification links the newest one. All three are still listed on the agent's card, as today, so the link is only a shortcut.</td></tr>
 <tr><td>You tap Follow twice on the same agent</td><td>Nothing new happens: still one follow, and the agent gets one message.</td></tr>
-<tr><td>Agent is already stopped</td><td>Follow is greyed out.</td></tr>
+<tr><td>Agent is already stopped, or job already finished</td><td>Follow is greyed out, or the job shows no bell.</td></tr>
+<tr><td>You follow an agent and one of its jobs</td><td>Two independent follows, so you get two notifications.</td></tr>
 <tr><td>Phone is off, or its push token went stale</td><td>With no confirmation from the phone within 15 minutes, the server sends one email with the same content and a link to the report on sm web. The push may still arrive later; Google holds it for 24 hours.</td></tr>
 <tr><td>Google push isn't set up yet</td><td>Follow still works. The notification goes out as email straight away.</td></tr>
 </tbody>
@@ -211,19 +216,26 @@ task-complete: the notification links to the newest doc you published.</pre>
 <tr><td>1. Push channel</td><td><b>Firebase Cloud Messaging.</b> <i>You already agreed to this.</i></td><td>It's free, it arrives within seconds while the phone sleeps, and it notifies as the sm app itself.</td></tr>
 <tr><td>2. What triggers a notification</td><td><b><code>sm task-complete</code>, or the session ending first.</b> A "stalled" alert (idle for 30 minutes with no task-complete) comes later, as its own ticket.</td><td>Death is the case "email me when done" silently misses. Stall detection needs its own thresholds, so it waits.</td></tr>
 <tr><td>3. How long a follow lasts</td><td><b>It fires once, then ends.</b></td><td>It matches "tell me when this is done". Re-following is one tap.</td></tr>
-<tr><td>4. How the message reaches the agent</td><td><b>Like <code>sm send --important</code>:</b> after the agent's current turn, with no interruption.</td><td>An interruption would cost the agent's train of thought for a message that isn't urgent.</td></tr>
+<tr><td>4. How the message reaches the agent</td><td><b>As an sm system message marked <code>[sm follow]</code></b>, after the agent's current turn, with no interruption. <i>From your review.</i></td><td>It comes from sm on your behalf, not from an agent, so it must not look like an <code>sm send</code>.</td></tr>
 <tr><td>5. What passes through Google</td><td><b>Agent name, report title and a link path. Never report content.</b> The app fetches the report from sm on tap.</td><td>Titles are enough to decide whether to open it. Content stays between your phone and your Mac.</td></tr>
 <tr><td>6. Email if the phone doesn't confirm</td><td><b>Yes, one email after 15 minutes without confirmation.</b> Also sent immediately when push isn't set up.</td><td>A notification you never receive is the failure this feature exists to prevent.</td></tr>
 <tr><td>7. Follow from sm web (browser)</td><td><b>Not now.</b> The app only.</td><td>Browser notifications are a separate build, and you asked for mobile.</td></tr>
-<tr><td>8. Build order</td><td><b>Two tickets, in order:</b> (a) server: follows, triggers, Google sender, email fallback; (b) app: Follow menu, notifications, opening the report.</td><td>Each fits one agent without running out of context, and the app ticket builds against the finished server.</td></tr>
+<tr><td>8. Following queue jobs</td><td><b>Include it in this feature</b>: a bell on each queued or running job, one notification when the job ends, and no message to the agent.</td><td>It reuses the same record, delivery and email fallback, so it adds about a day to the server ticket and a bell to the app.</td></tr>
+<tr><td>9. Build order</td><td><b>Two tickets, in order:</b> (a) server: agent and job follows, triggers, Google sender, email fallback; (b) app: Follow menu, job bells, notifications, opening the report.</td><td>Each fits one agent without running out of context, and the app ticket builds against the finished server.</td></tr>
 </tbody>
 </table>
 
 <h3>Out of scope</h3>
-<p>Following from the command line or sm web. Notifications about anything other than a followed agent finishing (queue jobs, reviews, stalls). Following several agents as a group. Each can reuse this push channel later.</p>
+<p>Following from the command line or sm web. Notifications about anything other than a followed agent or job ending (reviews, stalls). Following several agents as a group. Each can reuse this push channel later.</p>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p>This is the first revision, so there's nothing to re-read.</p>
+<p><b>Revision 2, after your review of revision 1.</b></p>
+<ul>
+<li><b>You can follow queue jobs.</b> See "Following a queue job", the two job rows in the notification table, and decision 8. Build order is now decision 9.</li>
+<li><b>The agent message is marked <code>[sm follow]</code></b> and delivered as an sm system message rather than looking like an <code>sm send</code> (decision 4).</li>
+<li><b>Only the newest doc is linked, but every doc stays on the agent's card.</b> The app already lists all of an agent's docs there, and the notification link is a shortcut to the newest.</li>
+<li>Everything else is unchanged.</li>
+</ul>
 
 <hr class="appendix-divider">
 <h2>Appendices</h2>
@@ -251,7 +263,7 @@ task-complete: the notification links to the newest doc you published.</pre>
 <tr><td><b>acked</b></td><td><code>acked_at</code> set</td><td>terminal</td></tr>
 </tbody>
 </table>
-<p>At most one active follow exists per (owner, session). Cancelling after <code>fired_at</code> is set does nothing and returns 204, because the notification is already committed.</p>
+<p>At most one active follow exists per (owner, session) for agent follows, and per (owner, job) for job follows. Cancelling after <code>fired_at</code> is set does nothing and returns 204, because the notification is already committed.</p>
 
 <h3 id="b">B. Persisted shapes</h3>
 <p>New SQLite database. Config key <code>push.db_path</code>, default <code>~/.local/share/claude-sessions/owner_push.db</code>, resolved with <code>expand_home</code> like <code>mobile_device_db_path</code><sup>1</sup>. The server creates the schema on open.</p>
@@ -270,13 +282,20 @@ task-complete: the notification links to the newest doc you published.</pre>
 CREATE TABLE owner_follows (
   id                  TEXT PRIMARY KEY,   -- "fol_" + 12 lowercase base32 chars
   user_id             TEXT NOT NULL,
-  session_id          TEXT NOT NULL,
+  target_kind         TEXT NOT NULL,      -- 'session' | 'queue_job'
+  session_id          TEXT NOT NULL,      -- followed session, or the job's submitting session
   session_name        TEXT NOT NULL,      -- display name at follow time; refreshed at fire time
+  job_id              TEXT,               -- queue_jobs.id when target_kind = 'queue_job'
+  job_label           TEXT,               -- job label at follow time
+  job_state           TEXT,               -- terminal state at fire time
+  job_exit_code       INTEGER,
+  job_started_at      TEXT,
+  job_finished_at     TEXT,
   message_text        TEXT,               -- null when followed silently
   created_at          TEXT NOT NULL,
   cancelled_at        TEXT,
   fired_at            TEXT,
-  fire_reason         TEXT,               -- 'task_complete' | 'session_ended'
+  fire_reason         TEXT,               -- 'task_complete' | 'session_ended' | 'job_finished'
   report_doc_id       TEXT,               -- owner_docs.id
   report_title        TEXT,
   report_reader_path  TEXT,               -- e.g. /docs/session-manager/docs/working/x.html?version=abc123
@@ -288,8 +307,12 @@ CREATE TABLE owner_follows (
   acked_at            TEXT,
   email_sent_at       TEXT
 );
-CREATE UNIQUE INDEX owner_follows_one_active
-  ON owner_follows(user_id, session_id) WHERE fired_at IS NULL AND cancelled_at IS NULL;
+CREATE UNIQUE INDEX owner_follows_one_active_session
+  ON owner_follows(user_id, session_id)
+  WHERE target_kind = 'session' AND fired_at IS NULL AND cancelled_at IS NULL;
+CREATE UNIQUE INDEX owner_follows_one_active_job
+  ON owner_follows(user_id, job_id)
+  WHERE target_kind = 'queue_job' AND fired_at IS NULL AND cancelled_at IS NULL;
 CREATE INDEX owner_follows_pending ON owner_follows(fired_at, notified_at);</code></pre>
 <p>Revoking a mobile device (<code>sm remove-device</code>, <code>DELETE /client/mobile-terminal/devices/{id}</code>) deletes <code>push_tokens</code> rows with that <code>device_id</code>.</p>
 
@@ -301,8 +324,10 @@ CREATE INDEX owner_follows_pending ON owner_follows(fired_at, notified_at);</cod
 <tr><td><code>PUT /client/push-token</code><br><code>{token, device_id?, device_name, app_version}</code></td><td>Upserts the <code>push_tokens</code> row, clears <code>invalid_at</code> and <code>last_error</code>, sets <code>updated_at</code>. If <code>device_id</code> is given, it must be an unrevoked enrollment of <code>user_id</code>, else 400. Returns 204.</td></tr>
 <tr><td><code>DELETE /client/push-token</code><br><code>{token}</code></td><td>Deletes the row. Returns 204, including when the row is missing.</td></tr>
 <tr><td><code>POST /client/push/test</code></td><td>Sends a <code>kind=test</code> push to every valid token of <code>user_id</code>. 200 <code>{sent, failed:[{device_name,error}]}</code>. 503 <code>{detail:"push not configured"}</code> when the sender is unconfigured.</td></tr>
-<tr><td><code>POST /sessions/{id}/follow</code><br><code>{message: string|null}</code></td><td>404 if the session is unknown, 409 <code>{detail:"session stopped"}</code> if it is stopped. If an active follow exists: 200 with that follow; no second message is sent and the new text is ignored. Otherwise it inserts the row, and if <code>message</code> is non-empty after trimming, delivers it as <code>send_core_input</code> with <code>delivery_mode="important"</code> and no sender session<sup>3</sup>. Returns 201 with the follow. If message delivery fails, it deletes the row and returns the delivery error, so a follow never exists whose agent was never told.</td></tr>
-<tr><td><code>DELETE /sessions/{id}/follow</code></td><td>Sets <code>cancelled_at</code> on the active follow. Returns 204, including when there's none. Sends nothing to the agent.</td></tr>
+<tr><td><code>POST /sessions/{id}/follow</code><br><code>{message: string|null}</code></td><td>404 if the session is unknown, 409 <code>{detail:"session stopped"}</code> if it is stopped. If an active follow exists: 200 with that follow; no second message is sent and the new text is ignored. Otherwise it inserts the row (<code>target_kind='session'</code>). If <code>message</code> is non-empty after trimming, it delivers <code>"[sm follow] " + message</code> as a system message: <code>enqueue_message</code> with delivery mode <code>important</code> and category <code>follow</code>, followed by the same live drain and <code>push_retained_message_raw</code> that the task-complete notice uses<sup>3</sup>. It is not <code>send_core_input</code>, and it has no sender session. If the message already starts with <code>[sm follow]</code>, the prefix is not doubled. Returns 201 with the follow. If message delivery fails, it deletes the row and returns the delivery error, so a follow never exists whose agent was never told.</td></tr>
+<tr><td><code>DELETE /sessions/{id}/follow</code></td><td>Sets <code>cancelled_at</code> on the active agent follow. Returns 204, including when there's none. Sends nothing to the agent.</td></tr>
+<tr><td><code>POST /queue-jobs/{job_id}/follow</code><br>no body</td><td>404 if the job is unknown. 409 <code>{detail:"job finished"}</code> if its state is not <code>pending</code> or <code>running</code>. 200 with the existing active follow if there is one. Otherwise it inserts the row with <code>target_kind='queue_job'</code>, <code>session_id</code> = the job's submitting session and <code>job_label</code>, and returns 201. Sends nothing to any agent.</td></tr>
+<tr><td><code>DELETE /queue-jobs/{job_id}/follow</code></td><td>Cancels the active job follow. Returns 204, including when there's none.</td></tr>
 <tr><td><code>GET /client/follows</code></td><td><code>{push_configured: bool, follows:[…]}</code>: active follows plus follows fired in the last 7 days, newest first. Each follow object carries every <code>owner_follows</code> column except <code>user_id</code> and <code>message_text</code>, plus <code>state</code> from Appendix A.</td></tr>
 <tr><td><code>POST /client/follows/{follow_id}/ack</code></td><td>Sets <code>acked_at</code> if null. Returns 204. 404 if the follow doesn't belong to <code>user_id</code>.</td></tr>
 </tbody>
@@ -312,15 +337,16 @@ CREATE INDEX owner_follows_pending ON owner_follows(fired_at, notified_at);</cod
 <h3 id="d">D. Triggers, report lookup, delivery</h3>
 <h4>D1. Firing</h4>
 <ul>
-<li><b>Task-complete.</b> Inside <code>SessionStore::task_complete</code><sup>5</sup>, on <i>both</i> the normal path and the reparent path, after <code>agent_task_completed_at</code> is written: <code>UPDATE owner_follows SET fired_at=:completed_at, fire_reason='task_complete', notify_after=:completed_at WHERE session_id=:id AND fired_at IS NULL AND cancelled_at IS NULL</code>. This is a local SQLite write only. No network I/O happens under the state write guard. A failure is logged and never fails <code>sm task-complete</code>, because the sweep in D2 catches it.</li>
+<li><b>Task-complete.</b> Inside <code>SessionStore::task_complete</code><sup>5</sup>, on <i>both</i> the normal path and the reparent path, after <code>agent_task_completed_at</code> is written: <code>UPDATE owner_follows SET fired_at=:completed_at, fire_reason='task_complete', notify_after=:completed_at WHERE target_kind='session' AND session_id=:id AND fired_at IS NULL AND cancelled_at IS NULL</code>. This is a local SQLite write only. No network I/O happens under the state write guard. A failure is logged and never fails <code>sm task-complete</code>, because the sweep in D2 catches it.</li>
 <li><b>Sweep</b> (every 15 seconds, on the server's background runtime). For each active follow:
   <ul>
   <li>If the session's <code>agent_task_completed_at</code> is later than <code>created_at</code>, fire with <code>task_complete</code>. This catches a missed hook, but not one cleared by later activity; the hook above is primary.</li>
-  <li>Else, if the session is absent from state or <code>raw_session_is_stopped</code><sup>6</sup>, fire with <code>session_ended</code>. The stopped state is terminal, so the sweep sees every death path: retire, kill, crash reconciliation and the other stop transitions<sup>7</sup>. None of those sites is modified.</li>
+  <li>Else, if the session is absent from state or <code>raw_session_is_stopped</code><sup>6</sup>, fire with <code>session_ended</code>. The two rules above apply to <code>target_kind='session'</code> only. The stopped state is terminal, so the sweep sees every death path: retire, kill, crash reconciliation and the other stop transitions<sup>7</sup>. None of those sites is modified.</li>
+  <li><b>Job follows:</b> if the job's state is terminal (<code>succeeded</code>, <code>failed</code>, <code>timed_out</code>, <code>cancelled</code>, <code>displaced</code>)<sup>11</sup>, fire with <code>job_finished</code>. Copy <code>job_state</code>, <code>job_exit_code</code>, <code>job_started_at</code> and <code>job_finished_at</code>, and set <code>notify_after = fired_at</code>. If the job no longer exists, fire with <code>job_state='unknown'</code>. Job states never leave terminal, so the sweep alone is sufficient and the queue code is not modified.</li>
   </ul></li>
 </ul>
 <h4>D2. Report lookup</h4>
-<p>Run at delivery time, not at fire time:</p>
+<p>For agent follows only. Job follows carry no report. Run at delivery time, not at fire time:</p>
 <pre><code>SELECT d.id, d.title, d.repo, d.path, p.commit_sha, p.published_at
 FROM owner_doc_publishes p JOIN owner_docs d ON d.id = p.doc_id
 WHERE p.session_id = :session_id AND p.published_at &gt;= :follow_created_at
@@ -344,9 +370,13 @@ ORDER BY p.published_at DESC LIMIT 1;</code></pre>
 <tr><td>task_complete, report found</td><td><code>{session_name} finished</code></td><td><code>Report: {report_title}</code></td></tr>
 <tr><td>task_complete, no report</td><td><code>{session_name} finished</code></td><td><code>No completion report published</code></td></tr>
 <tr><td>session_ended</td><td><code>{session_name} ended without completing</code></td><td><code>Report: {report_title}</code> if found, else <code>Session stopped before sm task-complete</code></td></tr>
+<tr><td>job_finished, succeeded</td><td><code>{job_label} succeeded</code></td><td><code>{session_name} · ran {duration}</code></td></tr>
+<tr><td>job_finished, failed</td><td><code>{job_label} failed (exit {job_exit_code})</code>, or <code>{job_label} failed</code> when there's no exit code</td><td>same</td></tr>
+<tr><td>job_finished, timed_out / cancelled / displaced / unknown</td><td><code>{job_label} timed out</code> / <code>was cancelled</code> / <code>was displaced</code> / <code>ended</code></td><td>same</td></tr>
 <tr><td>test</td><td><code>sm notifications work</code></td><td><code>Sent from {hostname}</code></td></tr>
 </tbody>
 </table>
+<p><code>{duration}</code> is <code>job_finished_at − job_started_at</code>, formatted as <code>2h 14m</code>, <code>41m</code> or <code>35s</code> (largest two units, no zero units). When the job never started, the body is just <code>{session_name}</code>.</p>
 
 <h3 id="e">E. Google Cloud setup (owner steps)</h3>
 <ol>
@@ -371,10 +401,10 @@ The console route also works: Project settings → Service accounts → Generate
 <li><b>Send:</b> <code>POST https://fcm.googleapis.com/v1/projects/{project_id}/messages:send</code>, bearer access token, 10-second timeout, run off the async runtime (<code>spawn_blocking</code>) like the email bridge:
 <pre><code>{"message": {"token": "&lt;fcm_token&gt;",
   "android": {"priority": "HIGH", "ttl": "86400s"},
-  "data": {"kind": "task_complete|session_ended|test", "follow_id": "fol_…",
-           "session_id": "…", "title": "…", "body": "…",
+  "data": {"kind": "task_complete|session_ended|job_finished|test", "follow_id": "fol_…",
+           "session_id": "…", "job_id": "…", "title": "…", "body": "…",
            "reader_path": "/docs/…" }}}</code></pre>
-The message is data-only, so the app always builds the notification itself and tap handling is identical whether the app is open or closed. <code>reader_path</code> is omitted when there's no report. All values are strings.</li>
+The message is data-only, so the app always builds the notification itself and tap handling is identical whether the app is open or closed. <code>reader_path</code> is omitted when there's no report, and <code>job_id</code> for agent follows. All values are strings.</li>
 <li><b>Errors:</b> 404 or <code>UNREGISTERED</code>, or 400 <code>INVALID_ARGUMENT</code> naming the token → invalid token. 429 and 5xx → retryable. 401 and 403 → retryable, and logged as a configuration error once per hour.</li>
 </ul>
 
@@ -384,9 +414,10 @@ The message is data-only, so the app always builds the notification itself and t
 <li><b>Manifest:</b> <code>POST_NOTIFICATIONS</code> permission. A <code>FirebaseMessagingService</code> subclass, not exported, with the <code>com.google.firebase.MESSAGING_EVENT</code> intent filter. Notification channel <code>agent_follow</code>, named "Agents you follow", with high importance.</li>
 <li><b>Token:</b> after sign-in, at every app start, and in <code>onNewToken</code>, call <code>PUT /client/push-token</code> with <code>device_name=Build.MODEL</code>, <code>app_version=SM_APK_HASH</code> and the enrolled device id when one exists. Sign-out calls <code>DELETE</code>.</li>
 <li><b>Receive:</b> <code>onMessageReceived</code> posts a notification from <code>data.title</code> and <code>data.body</code>, with notification id = <code>follow_id.hashCode()</code>, so a duplicate replaces rather than stacks. It then calls <code>POST /client/follows/{follow_id}/ack</code>, fire-and-forget, except for <code>kind=test</code>.</li>
-<li><b>Tap:</b> a PendingIntent to <code>MainActivity</code> with extras <code>follow_id</code>, <code>session_id</code> and <code>reader_path</code>. <code>MainActivity</code> handles them in <code>onCreate</code> and <code>onNewIntent</code>, following the <code>sm-enroll</code> pattern<sup>9</sup>. With <code>reader_path</code>, it opens <code>DocReaderOverlay</code> on it; without, it opens Watch with that session's card expanded.</li>
+<li><b>Tap:</b> a PendingIntent to <code>MainActivity</code> with extras <code>follow_id</code>, <code>session_id</code> and <code>reader_path</code>. <code>MainActivity</code> handles them in <code>onCreate</code> and <code>onNewIntent</code>, following the <code>sm-enroll</code> pattern<sup>9</sup>. With <code>reader_path</code>, it opens <code>DocReaderOverlay</code> on it; without, it opens Watch with that session's card expanded. That covers job notifications, whose <code>session_id</code> is the submitting agent.</li>
 <li><b>Menu:</b> in the agent actions menu<sup>10</sup>, add Follow or Unfollow above "Retire session". It's disabled when the session is stopped. Follow opens a dialog: a multi-line text field prefilled with the memo's message text, verbatim; a hint line saying "Clear the message to follow without telling the agent"; and buttons Cancel and Follow. On first use on Android 13 or later, it requests <code>POST_NOTIFICATIONS</code> before sending. If you deny it, the follow still proceeds, with a toast: "Notifications off — you'll be emailed instead".</li>
 <li><b>Bell:</b> the watch refresh also calls <code>GET /client/follows</code>, and cards of sessions with an active follow show a bell icon next to the status.</li>
+<li><b>Job bells:</b> every <code>pending</code> or <code>running</code> job row on the agent card (the "In progress" rows and the "All jobs" disclosure<sup>12</sup>) shows a bell toggle at its right edge. It is an outline when not followed and filled when followed. Tapping it calls the job follow <code>POST</code> or <code>DELETE</code>, with no dialog. The first job follow requests <code>POST_NOTIFICATIONS</code> exactly as for agents. Finished jobs show no bell.</li>
 <li><b>Settings:</b> a "Notifications" row showing push status (<code>push_configured</code> from the server, and whether this phone has a token), plus a "Send test notification" button that calls <code>POST /client/push/test</code>.</li>
 </ul>
 
@@ -396,6 +427,8 @@ The message is data-only, so the app always builds the notification itself and t
 <thead><tr><th>Behaviour</th><th>Test</th></tr></thead>
 <tbody>
 <tr><td>Follow create is idempotent, 409 on stopped, and message delivered as important</td><td><code>tests/owner_follow_http.rs::follow_is_idempotent_and_messages_once</code>, <code>::follow_refuses_stopped_session</code></td></tr>
+<tr><td>Agent message carries the <code>[sm follow]</code> marker exactly once and is not attributed to a sender session</td><td><code>::follow_message_is_marked_sm_follow</code></td></tr>
+<tr><td>Job follow: 409 on a finished job, idempotent, no agent message; fires on each terminal state with the right text</td><td><code>::job_follow_rules</code>; <code>owner_push.rs</code> unit <code>sweep_fires_job_finished_each_state</code>, <code>job_notification_text</code></td></tr>
 <tr><td>Message delivery failure leaves no follow</td><td><code>::follow_rolls_back_when_message_fails</code></td></tr>
 <tr><td>Task-complete fires on normal and reparent paths</td><td><code>sessions.rs</code> unit tests <code>task_complete_fires_follow</code>, <code>task_complete_during_reparent_fires_follow</code></td></tr>
 <tr><td>Sweep fires on stopped or missing session, and on a missed task-complete</td><td><code>owner_push.rs</code> unit <code>sweep_fires_session_ended</code>, <code>sweep_catches_missed_task_complete</code></td></tr>
@@ -410,6 +443,8 @@ The message is data-only, so the app always builds the notification itself and t
 
 <h3 id="z">Z. FAQ</h3>
 <p><b>Why a sweep for session end instead of hooking every stop site?</b> The code has at least nine places that set a session to stopped<sup>7</sup>. A 15-second sweep over a handful of active follows is one code path that can't miss a new stop site added later. Task-complete gets a direct hook because <code>agent_task_completed_at</code> is cleared by later activity, and a sweep could miss a fast re-task.</p>
+<p><b>Why is the agent message not an <code>sm send</code>?</b> An <code>sm send</code> reads as coming from another agent, and an agent may reply to its sender. <code>[sm follow]</code> comes from sm on the owner's behalf, like <code>[sm task-complete]</code> and <code>[sm review]</code>, so the agent treats it as an instruction about how to finish, not a conversation.</p>
+<p><b>Why does a job notification open the agent card and not the job log?</b> The app has no log viewer today, and the card already shows the finished job with its exit state in "Recent job history". A log viewer would be its own ticket.</p>
 <p><b>Why data-only pushes?</b> With a "notification" push, Android draws the notification itself while the app is in the background and hands the app the tap without the data, so tap routing would differ between foreground and background. With data-only and high priority, the app's service runs in both cases.</p>
 <p><b>Why no <code>google-services</code> plugin?</b> The plugin requires <code>google-services.json</code> in the source tree, and the repo is public. Initialising Firebase from <code>BuildConfig</code> fields matches how the app already takes <code>SM_GOOGLE_SERVER_CLIENT_ID</code>.</p>
 <p><b>Why ack plus email instead of trusting Google?</b> Google accepting a push only means Google has it. A phone that's off, uninstalled or on a stale token never shows it, and the server can't tell. The ack is the only proof the notification was shown.</p>
@@ -417,14 +452,16 @@ The message is data-only, so the app always builds the notification itself and t
 <p class="sans"><small>
 <sup>1</sup> <code>crates/sm-server/src/mobile_devices.rs:106</code>. &nbsp;
 <sup>2</sup> <code>crates/sm-server/src/http.rs:2550-2570</code>. &nbsp;
-<sup>3</sup> <code>send_session_input</code>, <code>http.rs:8585</code>; the CLI payload is in <code>bin/sm.rs:3850</code>. &nbsp;
+<sup>3</sup> The task-complete notice path, <code>sessions.rs:8520-8561</code>. &nbsp;
 <sup>4</sup> <code>crates/sm-server/src/email.rs</code>; the readiness line is from #1562. &nbsp;
 <sup>5</sup> <code>crates/sm-server/src/sessions.rs:8415</code>. &nbsp;
 <sup>6</sup> <code>sessions.rs:17244</code>. &nbsp;
 <sup>7</sup> <code>sessions.rs</code> lines 917, 1124, 1568, 8221, 8320, 15274 and 15377, and <code>http.rs:15151</code>. &nbsp;
 <sup>8</sup> <code>crates/sm-server/src/owner_docs.rs:396-423, 510-601</code>. &nbsp;
 <sup>9</sup> <code>android-app/app/src/main/AndroidManifest.xml:29-38</code>, <code>MainActivity.kt:34-48</code>. &nbsp;
-<sup>10</sup> <code>android-app/.../ui/watch/WatchScreen.kt:1404-1411</code>.
+<sup>10</sup> <code>android-app/.../ui/watch/WatchScreen.kt:1404-1411</code>. &nbsp;
+<sup>11</sup> Terminal job states: <code>crates/sm-server/src/queue.rs:1370-1380</code>; the job finish write is <code>finish_queue_job_conn</code>, <code>queue.rs:5133</code>. &nbsp;
+<sup>12</sup> <code>WatchScreen.kt:1510-1531</code>.
 </small></p>
 
 <!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
