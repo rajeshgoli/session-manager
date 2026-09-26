@@ -296,6 +296,13 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             val serverUrl = settingsRepository.serverUrl.first()
             val accessToken = settingsRepository.accessToken.first()
             if (serverUrl.isBlank() || accessToken.isBlank()) return@launch
+            if (!FollowPush.canNotify(getApplication())) {
+                // A push would arrive and be hidden; say so rather than report a send.
+                _uiState.value = _uiState.value.copy(
+                    notificationTestStatus = "Notifications are off for sm in Android settings; follows will arrive by email",
+                )
+                return@launch
+            }
             _uiState.value = _uiState.value.copy(notificationTestBusy = true, notificationTestStatus = null)
             // Make sure this phone's token is on file before asking for the push.
             FollowPush.registerToken(getApplication())

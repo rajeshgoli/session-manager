@@ -43,6 +43,20 @@ fun SettingsScreen(
     val context = LocalContext.current
     val signIn = remember(context) { GoogleSignInManager(context) }
     val scope = rememberCoroutineScope()
+    // Android 13+ hides notifications until the app may post them; ask before a test push.
+    val notificationPermission = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+    ) { viewModel.sendTestNotification() }
+    val sendTestNotification = {
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            viewModel.sendTestNotification()
+        }
+    }
     var advanced by rememberSaveable { mutableStateOf(false) }
     val clientId = state.bootstrap?.auth?.googleServerClientId?.takeIf { it.isNotBlank() } ?: LocalDefaults.googleServerClientId
     Column(
@@ -77,7 +91,7 @@ fun SettingsScreen(
                 style = MaterialTheme.typography.bodyMedium,
                 color = TextSecondary,
             )
-            TextButton(onClick = viewModel::sendTestNotification, enabled = !state.notificationTestBusy) {
+            TextButton(onClick = sendTestNotification, enabled = !state.notificationTestBusy) {
                 Text(if (state.notificationTestBusy) "Sending…" else "Send test notification")
             }
             state.notificationTestStatus?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextMuted) }
