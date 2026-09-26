@@ -23,6 +23,10 @@ use tokio::net::TcpListener;
 const STUDIO_SSH_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 const QUEUE_COMPLETION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const REPARENT_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+/// Owner follows deliver every 5s and sweep for finished targets every
+/// third pass (sm#1569).
+const FOLLOW_DELIVERY_INTERVAL: Duration = Duration::from_secs(5);
+const FOLLOW_SWEEP_EVERY_PASSES: u64 = 3;
 /// The open-file soft limit sm-server raises itself to at startup. launchd
 /// starts it at 256, which every queue job, tmux server, and agent it spawns
 /// inherits; a parallel test suite run as a queue job exhausts that ("Too many
@@ -105,6 +109,13 @@ async fn main() -> Result<()> {
                 "email bridge: {bridge_path} (UNAVAILABLE - sm email will fail: {error:#})"
             ),
         }
+        // Follows fall back to email without push, so a broken key file only
+        // shows up as notifications arriving by email instead of on the phone.
+        match sm_server::push_fcm::FcmSender::from_config(&config) {
+            Some(Ok(sender)) => println!("push: ready (project {})", sender.project_id()),
+            Some(Err(error)) => println!("push: broken: {error:#}"),
+            None => println!("push: not configured"),
+        }
         return Ok(());
     }
     raise_open_file_soft_limit();
@@ -183,6 +194,22 @@ async fn main() -> Result<()> {
         }
     });
     if state.config().rust_core.runtime_enabled {
+        let follow_state = state.clone();
+        thread::spawn(move || {
+            let mut pass: u64 = 0;
+            loop {
+                match follow_state.run_follow_pass(pass % FOLLOW_SWEEP_EVERY_PASSES == 0) {
+                    Ok(problems) => {
+                        for problem in problems {
+                            eprintln!("owner follow: {problem}");
+                        }
+                    }
+                    Err(error) => eprintln!("owner follow pass failed: {error:#}"),
+                }
+                pass = pass.wrapping_add(1);
+                thread::sleep(FOLLOW_DELIVERY_INTERVAL);
+            }
+        });
         let queue_delivery_state = state.clone();
         thread::spawn(move || loop {
             if let Err(error) = queue_delivery_state.drain_background_retry_wakes() {

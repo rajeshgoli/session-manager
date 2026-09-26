@@ -50,6 +50,12 @@ android {
         buildConfigField("String", "SM_DEFAULT_SERVER_URL", project.stringProp("SM_DEFAULT_SERVER_URL").toBuildConfigString())
         buildConfigField("String", "SM_GOOGLE_SERVER_CLIENT_ID", project.stringProp("SM_GOOGLE_SERVER_CLIENT_ID").toBuildConfigString())
         buildConfigField("String", "SM_APK_HASH", project.stringProp("SM_APK_HASH").toBuildConfigString())
+        // Firebase Cloud Messaging for follow notifications (sm#1569). Values
+        // come from the untracked local.defaults.properties; blank disables push.
+        buildConfigField("String", "SM_FIREBASE_PROJECT_ID", project.stringProp("SM_FIREBASE_PROJECT_ID").toBuildConfigString())
+        buildConfigField("String", "SM_FIREBASE_SENDER_ID", project.stringProp("SM_FIREBASE_SENDER_ID").toBuildConfigString())
+        buildConfigField("String", "SM_FIREBASE_APP_ID", project.stringProp("SM_FIREBASE_APP_ID").toBuildConfigString())
+        buildConfigField("String", "SM_FIREBASE_API_KEY", project.stringProp("SM_FIREBASE_API_KEY").toBuildConfigString())
     }
 
     buildTypes {
@@ -105,6 +111,8 @@ dependencies {
     implementation("io.noties.markwon:core:4.6.2")
 
     implementation("androidx.datastore:datastore-preferences:1.1.1")
+    implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
+    implementation("com.google.firebase:firebase-messaging")
     implementation("androidx.browser:browser:1.8.0")
 
     testImplementation("junit:junit:4.13.2")

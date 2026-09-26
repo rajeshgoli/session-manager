@@ -4,3 +4,9 @@
 # Cloudflare Access client certificate chain when that endpoint is enabled.
 SM_DEFAULT_SERVER_URL=https://sm.example.com
 SM_GOOGLE_SERVER_CLIENT_ID=your-web-client-id.apps.googleusercontent.com
+# Firebase Cloud Messaging for follow notifications. Copy these from the
+# google-services.json Firebase gives for li.rajeshgo.sm; blank disables push.
+SM_FIREBASE_PROJECT_ID=
+SM_FIREBASE_SENDER_ID=
+SM_FIREBASE_APP_ID=
+SM_FIREBASE_API_KEY=

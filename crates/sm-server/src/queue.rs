@@ -5667,7 +5667,7 @@ fn signal_probe_finds_target(result: nix::Result<()>) -> bool {
     !matches!(result, Err(Errno::ESRCH | Errno::EPERM))
 }
 
-fn is_terminal_queue_state(state: &str) -> bool {
+pub(crate) fn is_terminal_queue_state(state: &str) -> bool {
     matches!(
         state,
         "succeeded"

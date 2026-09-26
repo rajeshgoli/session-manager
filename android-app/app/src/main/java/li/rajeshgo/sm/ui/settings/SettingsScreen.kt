@@ -43,6 +43,20 @@ fun SettingsScreen(
     val context = LocalContext.current
     val signIn = remember(context) { GoogleSignInManager(context) }
     val scope = rememberCoroutineScope()
+    // Android 13+ hides notifications until the app may post them; ask before a test push.
+    val notificationPermission = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+    ) { viewModel.sendTestNotification() }
+    val sendTestNotification = {
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.POST_NOTIFICATIONS) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        } else {
+            viewModel.sendTestNotification()
+        }
+    }
     var advanced by rememberSaveable { mutableStateOf(false) }
     val clientId = state.bootstrap?.auth?.googleServerClientId?.takeIf { it.isNotBlank() } ?: LocalDefaults.googleServerClientId
     Column(
@@ -70,6 +84,17 @@ fun SettingsScreen(
                 }, enabled = !state.loading && state.serverUrl.isNotBlank()) { Text(if (state.loading) "Signing in…" else "Sign in with Google") }
             }
             state.error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = Rose); TextButton(onClick = viewModel::refreshBootstrap) { Text("Retry connection") } }
+        }
+        if (state.isLoggedIn) SettingsGroup("Notifications") {
+            Text(
+                if (li.rajeshgo.sm.push.FollowPush.isConfigured) "Followed agents and jobs notify this phone" else "Push is not set up in this build; follows arrive by email",
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextSecondary,
+            )
+            TextButton(onClick = sendTestNotification, enabled = !state.notificationTestBusy) {
+                Text(if (state.notificationTestBusy) "Sending…" else "Send test notification")
+            }
+            state.notificationTestStatus?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextMuted) }
         }
         ConnectionSettings(state, viewModel, pendingEnrollmentUrl, onEnrollmentDeepLinkConsumed)
         SettingsGroup("App updates") {
