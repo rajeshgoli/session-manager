@@ -102,7 +102,24 @@ object FollowPush {
         SessionManagerRepository(SettingsRepository(context)).deletePushToken(serverUrl, accessToken, pushToken)
     }
 
-    fun show(context: Context, message: FollowMessage) {
+    /**
+     * Whether a notification posted now would be seen: the app may notify
+     * and the follow channel is not muted. When it is off, the phone must not
+     * acknowledge, so sm falls back to email.
+     */
+    fun canNotify(context: Context): Boolean {
+        val manager = NotificationManagerCompat.from(context)
+        if (!manager.areNotificationsEnabled()) return false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = context.getSystemService(NotificationManager::class.java)?.getNotificationChannel(CHANNEL_ID)
+            if (channel != null && channel.importance == NotificationManager.IMPORTANCE_NONE) return false
+        }
+        return true
+    }
+
+    /** Posts the notification; returns whether it was shown. */
+    fun show(context: Context, message: FollowMessage): Boolean {
+        if (!canNotify(context)) return false
         val intent = Intent(context, MainActivity::class.java).apply {
             action = ACTION_OPEN_FOLLOW
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -126,7 +143,7 @@ object FollowPush {
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
             .build()
-        runCatching { NotificationManagerCompat.from(context).notify(message.notificationId, notification) }
+        return runCatching { NotificationManagerCompat.from(context).notify(message.notificationId, notification) }.isSuccess
     }
 }
 

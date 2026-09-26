@@ -26,6 +26,10 @@ pub const FOLLOW_MESSAGE_MARKER: &str = "[sm follow]";
 /// Delay after each failed push attempt; the attempt after the last falls
 /// back to email.
 const PUSH_RETRY_DELAYS_SECONDS: [i64; 5] = [30, 60, 120, 300, 600];
+/// A transient email failure is retried this often...
+const EMAIL_RETRY_DELAY: Duration = Duration::minutes(5);
+/// ...for this long after the email first became due.
+const EMAIL_RETRY_WINDOW: Duration = Duration::hours(1);
 /// Publishes scanned when looking for a follow's report.
 pub const REPORT_SCAN_LIMIT: usize = 50;
 
@@ -493,6 +497,12 @@ impl OwnerPushStore {
                     .as_deref()
                     .and_then(parse_ts)
                     .is_some_and(|notified_at| notified_at + ACK_FALLBACK <= now)
+                    // A fallback email that failed transiently waits for its retry time.
+                    && follow
+                        .notify_after
+                        .as_deref()
+                        .and_then(parse_ts)
+                        .is_none_or(|retry_at| retry_at <= now)
             })
             .collect())
     }
@@ -694,8 +704,25 @@ pub trait PushSender: Send + Sync {
     fn send(&self, token: &str, data: &BTreeMap<String, String>) -> Result<(), PushError>;
 }
 
+/// Why a follow email was not sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MailError {
+    /// Email is not set up (no bridge, no address): retrying cannot help.
+    Unavailable(String),
+    /// The send failed and may work later.
+    Transient(String),
+}
+
+impl std::fmt::Display for MailError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(detail) | Self::Transient(detail) => write!(formatter, "{detail}"),
+        }
+    }
+}
+
 pub trait FollowMailer {
-    fn send(&self, follow: &Follow, notification: &Notification) -> Result<()>;
+    fn send(&self, follow: &Follow, notification: &Notification) -> Result<(), MailError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -978,12 +1005,26 @@ pub fn deliver(
             }
         }
         if use_email {
-            if let Err(error) = mailer.send(&follow, &notification) {
-                problems.push(format!("follow {} email failed: {error:#}", follow.id));
-                follow.last_push_error = Some(match sender {
-                    None => "no channel".to_owned(),
-                    Some(_) => format!("email failed: {error:#}"),
-                });
+            let due_since = follow.fired_at.as_deref().and_then(parse_ts);
+            match mailer.send(&follow, &notification) {
+                Ok(()) => {}
+                Err(MailError::Transient(detail)) if within_email_retry(due_since, now) => {
+                    problems.push(format!(
+                        "follow {} email failed, retrying: {detail}",
+                        follow.id
+                    ));
+                    follow.last_push_error = Some(format!("email failed: {detail}"));
+                    follow.notify_after = Some(format_ts(now + EMAIL_RETRY_DELAY));
+                    store.save_delivery(&follow)?;
+                    continue;
+                }
+                Err(error) => {
+                    problems.push(format!("follow {} email failed: {error}", follow.id));
+                    follow.last_push_error = Some(match (&error, sender) {
+                        (MailError::Unavailable(_), None) => "no channel".to_owned(),
+                        _ => format!("email failed: {error}"),
+                    });
+                }
             }
             follow.notified_at = Some(format_ts(now));
             follow.notified_via = Some("email".to_owned());
@@ -993,17 +1034,40 @@ pub fn deliver(
     }
     for mut follow in store.ack_fallback_due(now)? {
         let notification = notification_for(&follow);
-        if let Err(error) = mailer.send(&follow, &notification) {
-            problems.push(format!(
-                "follow {} fallback email failed: {error:#}",
-                follow.id
-            ));
-            follow.last_push_error = Some(format!("email failed: {error:#}"));
+        let due_since = follow
+            .notified_at
+            .as_deref()
+            .and_then(parse_ts)
+            .map(|notified_at| notified_at + ACK_FALLBACK);
+        match mailer.send(&follow, &notification) {
+            Ok(()) => {}
+            Err(MailError::Transient(detail)) if within_email_retry(due_since, now) => {
+                problems.push(format!(
+                    "follow {} fallback email failed, retrying: {detail}",
+                    follow.id
+                ));
+                follow.last_push_error = Some(format!("email failed: {detail}"));
+                // Once notified, notify_after schedules the fallback retry.
+                follow.notify_after = Some(format_ts(now + EMAIL_RETRY_DELAY));
+                store.save_delivery(&follow)?;
+                continue;
+            }
+            Err(error) => {
+                problems.push(format!(
+                    "follow {} fallback email failed: {error}",
+                    follow.id
+                ));
+                follow.last_push_error = Some(format!("email failed: {error}"));
+            }
         }
         follow.email_sent_at = Some(format_ts(now));
         store.save_delivery(&follow)?;
     }
     Ok(problems)
+}
+
+fn within_email_retry(due_since: Option<OffsetDateTime>, now: OffsetDateTime) -> bool {
+    due_since.is_some_and(|due_since| now < due_since + EMAIL_RETRY_WINDOW)
 }
 
 fn find_report(world: &dyn FollowWorld, follow: &Follow) -> Result<Option<ReportView>> {

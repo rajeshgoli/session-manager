@@ -125,13 +125,21 @@ impl PushSender for FakeSender {
 #[derive(Default)]
 struct FakeMailer {
     sent: Mutex<Vec<(String, Notification)>>,
-    fail: bool,
+    /// Email not set up at all.
+    unavailable: bool,
+    /// Sends that fail transiently before one succeeds.
+    transient_failures: Mutex<usize>,
 }
 
 impl FollowMailer for FakeMailer {
-    fn send(&self, follow: &Follow, notification: &Notification) -> Result<()> {
-        if self.fail {
-            anyhow::bail!("bridge down");
+    fn send(&self, follow: &Follow, notification: &Notification) -> Result<(), MailError> {
+        if self.unavailable {
+            return Err(MailError::Unavailable("no bridge".to_owned()));
+        }
+        let mut failures = self.transient_failures.lock().unwrap();
+        if *failures > 0 {
+            *failures -= 1;
+            return Err(MailError::Transient("resend 503".to_owned()));
         }
         self.sent
             .lock()
@@ -646,7 +654,7 @@ fn all_tokens_invalid_or_absent_or_push_unconfigured_goes_to_email() {
 fn no_channel_marks_notified_instead_of_looping() {
     let (store, dir) = temp_store();
     let mailer = FakeMailer {
-        fail: true,
+        unavailable: true,
         ..Default::default()
     };
     let follow = fired_job(&store, "a");
@@ -925,5 +933,107 @@ fn test_push_reports_failures_and_invalidates_dead_tokens() {
     assert_eq!(sender.sent()[0].1["title"], "sm notifications work");
     assert_eq!(sender.sent()[0].1["body"], "Sent from mac");
     assert_eq!(store.valid_tokens(OWNER).unwrap().len(), 1);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn transient_email_failure_retries_within_the_hour() {
+    let (store, dir) = temp_store();
+    let world = FakeWorld::default();
+    let mailer = FakeMailer {
+        transient_failures: Mutex::new(2),
+        ..Default::default()
+    };
+    let follow = fired_job(&store, "a");
+    let problems = deliver(&store, &world, None, &mailer, at("2026-09-25T11:00:00Z")).unwrap();
+    assert_eq!(problems.len(), 1);
+    let waiting = store.get(&follow.id).unwrap().unwrap();
+    assert_eq!(waiting.state(), "fired");
+    assert_eq!(
+        waiting.notify_after.as_deref(),
+        Some("2026-09-25T11:05:00Z")
+    );
+    // Not retried before its time.
+    deliver(&store, &world, None, &mailer, at("2026-09-25T11:04:59Z")).unwrap();
+    assert_eq!(*mailer.transient_failures.lock().unwrap(), 1);
+    deliver(&store, &world, None, &mailer, at("2026-09-25T11:05:00Z")).unwrap();
+    deliver(&store, &world, None, &mailer, at("2026-09-25T11:10:00Z")).unwrap();
+    let sent = store.get(&follow.id).unwrap().unwrap();
+    assert_eq!(sent.notified_via.as_deref(), Some("email"));
+    assert_eq!(mailer.sent.lock().unwrap().len(), 1);
+
+    // Past the retry window the follow is closed out instead of retried forever.
+    let late = fired_job(&store, "b");
+    *mailer.transient_failures.lock().unwrap() = 1;
+    deliver(&store, &world, None, &mailer, at("2026-09-25T12:00:00Z")).unwrap();
+    let late = store.get(&late.id).unwrap().unwrap();
+    assert_eq!(late.state(), "notified");
+    assert_eq!(
+        late.last_push_error.as_deref(),
+        Some("email failed: resend 503")
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn transient_fallback_email_failure_retries_on_its_own_schedule() {
+    let (store, dir) = temp_store();
+    register(&store, "tok1", None);
+    let sender = FakeSender::default();
+    let world = FakeWorld::default();
+    let mailer = FakeMailer {
+        transient_failures: Mutex::new(1),
+        ..Default::default()
+    };
+    let follow = fired_job(&store, "a");
+    deliver(
+        &store,
+        &world,
+        Some(&sender),
+        &mailer,
+        at("2026-09-25T11:00:00Z"),
+    )
+    .unwrap();
+    deliver(
+        &store,
+        &world,
+        Some(&sender),
+        &mailer,
+        at("2026-09-25T11:15:00Z"),
+    )
+    .unwrap();
+    assert!(store
+        .get(&follow.id)
+        .unwrap()
+        .unwrap()
+        .email_sent_at
+        .is_none());
+    deliver(
+        &store,
+        &world,
+        Some(&sender),
+        &mailer,
+        at("2026-09-25T11:16:00Z"),
+    )
+    .unwrap();
+    assert!(mailer.sent.lock().unwrap().is_empty());
+    deliver(
+        &store,
+        &world,
+        Some(&sender),
+        &mailer,
+        at("2026-09-25T11:20:00Z"),
+    )
+    .unwrap();
+    assert_eq!(mailer.sent.lock().unwrap().len(), 1);
+    assert_eq!(
+        store
+            .get(&follow.id)
+            .unwrap()
+            .unwrap()
+            .email_sent_at
+            .as_deref(),
+        Some("2026-09-25T11:20:00Z")
+    );
     fs::remove_dir_all(dir).unwrap();
 }

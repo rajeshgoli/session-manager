@@ -20,10 +20,11 @@ class FollowMessagingService : FirebaseMessagingService() {
 
     override fun onMessageReceived(message: RemoteMessage) {
         val followMessage = FollowMessage.fromData(message.data) ?: return
-        FollowPush.show(applicationContext, followMessage)
+        val shown = FollowPush.show(applicationContext, followMessage)
         val followId = followMessage.followId
-        if (followMessage.isTest || followId == null) return
-        // The ack tells sm the phone showed it, so no fallback email is sent.
+        // The ack tells sm the phone showed it, so no fallback email is sent;
+        // a notification Android suppressed is never acknowledged.
+        if (!shown || followMessage.isTest || followId == null) return
         scope.launch {
             val settings = SettingsRepository(applicationContext)
             val serverUrl = settings.serverUrl.first().trim()

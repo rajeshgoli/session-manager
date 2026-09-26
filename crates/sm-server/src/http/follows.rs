@@ -6,7 +6,7 @@ use super::*;
 use crate::email::{EmailBridge, RegisteredEmailUser};
 use crate::owner_docs::{doc_readable_path, OwnerDocStore};
 use crate::owner_push::{
-    self, follow_message_text, Follow, FollowMailer, FollowTarget, FollowWorld, JobView,
+    self, follow_message_text, Follow, FollowMailer, FollowTarget, FollowWorld, JobView, MailError,
     Notification, OwnerPushStore, PushSender, PushTokenRegistration, ReportView, SessionView,
     TARGET_QUEUE_JOB, TARGET_SESSION,
 };
@@ -485,13 +485,21 @@ struct AppFollowMailer<'a> {
 }
 
 impl FollowMailer for AppFollowMailer<'_> {
-    fn send(&self, follow: &Follow, notification: &Notification) -> anyhow::Result<()> {
-        let bridge = EmailBridge::load(&self.state.config)?;
+    fn send(&self, follow: &Follow, notification: &Notification) -> Result<(), MailError> {
+        let unavailable = |detail: String| MailError::Unavailable(detail);
+        let bridge = EmailBridge::load(&self.state.config)
+            .map_err(|error| unavailable(format!("{error:#}")))?;
         if !bridge.bridge_is_available() {
-            anyhow::bail!("{}", bridge.availability_error_detail());
+            return Err(unavailable(bridge.availability_error_detail()));
         }
-        let recipient = owner_email_recipient(&bridge, &follow.user_id)?
-            .ok_or_else(|| anyhow::anyhow!("no email address configured for {}", follow.user_id))?;
+        let recipient = owner_email_recipient(&bridge, &follow.user_id)
+            .map_err(|error| unavailable(format!("{error:#}")))?
+            .ok_or_else(|| {
+                unavailable(format!(
+                    "no email address configured for {}",
+                    follow.user_id
+                ))
+            })?;
         let mut lines = vec![notification.body.clone(), String::new()];
         if let Some(reader_path) = &notification.reader_path {
             let base = docs::doc_browser_base_url(&self.state.config).unwrap_or_default();
@@ -512,18 +520,20 @@ impl FollowMailer for AppFollowMailer<'_> {
             .flatten()
             .map(|session| session.provider)
             .unwrap_or_else(|| "unknown".to_owned());
-        bridge.send_agent_email(SendAgentEmailRequest {
-            sender_session_id: follow.session_id.clone(),
-            sender_name: follow.session_name.clone(),
-            sender_provider: provider,
-            to_users: vec![recipient],
-            cc_users: Vec::new(),
-            subject: Some(notification.title.clone()),
-            body_text: lines.join("\n"),
-            body_html: String::new(),
-            body_markdown: false,
-            auto_subject: false,
-        })?;
+        bridge
+            .send_agent_email(SendAgentEmailRequest {
+                sender_session_id: follow.session_id.clone(),
+                sender_name: follow.session_name.clone(),
+                sender_provider: provider,
+                to_users: vec![recipient],
+                cc_users: Vec::new(),
+                subject: Some(notification.title.clone()),
+                body_text: lines.join("\n"),
+                body_html: String::new(),
+                body_markdown: false,
+                auto_subject: false,
+            })
+            .map_err(|error| MailError::Transient(format!("{error:#}")))?;
         Ok(())
     }
 }
