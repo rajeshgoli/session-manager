@@ -9,7 +9,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import li.rajeshgo.sm.data.repository.SettingsRepository
-import li.rajeshgo.sm.push.FollowOpen
+import li.rajeshgo.sm.push.FollowOpenRequests
 import li.rajeshgo.sm.ui.analytics.AnalyticsDetailScreen
 import li.rajeshgo.sm.ui.analytics.AnalyticsScreen
 import li.rajeshgo.sm.ui.settings.SettingsScreen
@@ -26,8 +26,6 @@ object Routes {
 fun AppNavigation(
     pendingEnrollmentUrl: String? = null,
     onEnrollmentDeepLinkConsumed: () -> Unit = {},
-    pendingFollowOpen: FollowOpen? = null,
-    onFollowOpenConsumed: () -> Unit = {},
 ) {
     val navController = rememberNavController()
     val context = LocalContext.current
@@ -49,8 +47,11 @@ fun AppNavigation(
     }
 
     // A tapped follow notification opens on the watch screen when signed in.
+    val pendingFollowOpen = FollowOpenRequests.pending
     LaunchedEffect(pendingFollowOpen, isLoggedIn) {
-        if (pendingFollowOpen != null && isLoggedIn == true) {
+        if (pendingFollowOpen != null && isLoggedIn == true &&
+            navController.currentDestination?.route != Routes.WATCH
+        ) {
             navController.navigate(Routes.WATCH) {
                 launchSingleTop = true
             }
@@ -79,8 +80,6 @@ fun AppNavigation(
                         launchSingleTop = true
                     }
                 },
-                pendingFollowOpen = pendingFollowOpen,
-                onFollowOpenConsumed = onFollowOpenConsumed,
             )
         }
         composable(Routes.ANALYTICS) {

@@ -147,8 +147,6 @@ private const val WATCH_TOAST_MS = 3500L
 fun WatchScreen(
     onNavigateToSettings: () -> Unit,
     onNavigateToAnalytics: () -> Unit,
-    pendingFollowOpen: li.rajeshgo.sm.push.FollowOpen? = null,
-    onFollowOpenConsumed: () -> Unit = {},
     viewModel: WatchViewModel = viewModel(),
     updateViewModel: UpdateAvailabilityViewModel = viewModel(),
 ) {
@@ -208,6 +206,8 @@ fun WatchScreen(
         },
     )
     // A tapped follow notification: open the report, else expand the agent's card.
+    val pendingFollowOpen = li.rajeshgo.sm.push.FollowOpenRequests.pending
+    val onFollowOpenConsumed = { li.rajeshgo.sm.push.FollowOpenRequests.pending = null }
     LaunchedEffect(pendingFollowOpen, state.sessions) {
         val open = pendingFollowOpen ?: return@LaunchedEffect
         val readerPath = open.readerPath
