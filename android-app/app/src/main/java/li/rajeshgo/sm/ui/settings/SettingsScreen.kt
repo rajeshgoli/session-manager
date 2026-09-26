@@ -29,8 +29,6 @@ import kotlinx.coroutines.launch
 @Composable
 fun SettingsScreen(
     onNavigateToWatch: () -> Unit,
-    pendingEnrollmentUrl: String? = null,
-    onEnrollmentDeepLinkConsumed: () -> Unit = {},
     viewModel: SettingsViewModel = viewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -96,7 +94,12 @@ fun SettingsScreen(
             }
             state.notificationTestStatus?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextMuted) }
         }
-        ConnectionSettings(state, viewModel, pendingEnrollmentUrl, onEnrollmentDeepLinkConsumed)
+        ConnectionSettings(
+            state,
+            viewModel,
+            li.rajeshgo.sm.ui.navigation.EnrollmentLinkRequests.pending,
+            onConsumed = { li.rajeshgo.sm.ui.navigation.EnrollmentLinkRequests.pending = null },
+        )
         SettingsGroup("App updates") {
             Text("Version ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})", style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
             val update = state.availableUpdate

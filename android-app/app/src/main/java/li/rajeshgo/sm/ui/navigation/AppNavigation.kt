@@ -23,10 +23,7 @@ object Routes {
 }
 
 @Composable
-fun AppNavigation(
-    pendingEnrollmentUrl: String? = null,
-    onEnrollmentDeepLinkConsumed: () -> Unit = {},
-) {
+fun AppNavigation() {
     val navController = rememberNavController()
     val context = LocalContext.current
     val settingsRepository = SettingsRepository(context)
@@ -38,8 +35,9 @@ fun AppNavigation(
         null -> return
     }
 
+    val pendingEnrollmentUrl = EnrollmentLinkRequests.pending
     LaunchedEffect(pendingEnrollmentUrl) {
-        if (!pendingEnrollmentUrl.isNullOrBlank()) {
+        if (!pendingEnrollmentUrl.isNullOrBlank() && navController.currentDestination?.route != Routes.SETTINGS) {
             navController.navigate(Routes.SETTINGS) {
                 launchSingleTop = true
             }
@@ -66,8 +64,6 @@ fun AppNavigation(
                         popUpTo(Routes.SETTINGS) { inclusive = true }
                     }
                 },
-                pendingEnrollmentUrl = pendingEnrollmentUrl,
-                onEnrollmentDeepLinkConsumed = onEnrollmentDeepLinkConsumed,
             )
         }
         composable(Routes.WATCH) {
