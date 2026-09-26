@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1569 — Follow an agent</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>1569 — Follow an agent from the sm app</h1>
+<p class="sans"><small>Author: sm-app-notifications <code>a8d3f4e9</code> · Ticket #1569 · Revision 1</small></p>
+
+<h2>Memo</h2>
+
+<p><b>You tap Follow on an agent in the sm app. When that agent finishes, your phone shows a notification, and tapping it opens the agent's completion report.</b> This replaces asking an agent to email you when it's done. The server, not the agent, keeps the promise. The agent's only job is to publish a report and run <code>sm task-complete</code>, which it should do anyway. The server notices, finds the report and pushes the notification. It also tells you if the agent dies before finishing, so silence never has to be read as "still working".</p>
+
+<p>Delivery uses Firebase Cloud Messaging, Google's free push service for Android. It's the only channel that reaches a sleeping phone within seconds without a second app. It costs nothing. It needs about fifteen minutes of setup from you in Google Cloud, in the project that already holds the app's Google sign-in. That setup is the only part I can't do for you.</p>
+
+<div class="vocab">
+<dl>
+<dt>Follow</dt><dd>A record on the sm server saying "Rajesh wants to know when agent X finishes". It fires once and then ends.</dd>
+<dt>Push</dt><dd>A notification Google delivers to your phone even while the sm app is closed. The sm server asks Google to send it; Google hands it to your phone.</dd>
+<dt>Push token</dt><dd>The address Google gives your phone's copy of the sm app. The app sends it to the sm server so the server knows where to push.</dd>
+<dt>Completion report</dt><dd>The newest doc the agent published with <code>sm doc publish</code> after you followed it, meaning the same docs you already read in the app.</dd>
+<dt>Service account key</dt><dd>A credential file that lets the sm server ask Google to send pushes. It lives in <code>~/.config/session-manager/</code>, outside every checkout.</dd>
+</dl>
+</div>
+
+<h3>How it works</h3>
+<figure>
+<svg viewBox="0 0 760 250" role="img" aria-label="Follow flow">
+  <defs><marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--ink-2)"/></marker></defs>
+  <g font-family="-apple-system, Helvetica, Arial, sans-serif" font-size="13" fill="var(--ink)">
+    <rect x="10" y="10" width="220" height="84" rx="8" fill="var(--surface-2)" stroke="var(--blue)" stroke-width="2"/>
+    <text x="22" y="34" font-weight="700" fill="var(--blue)">1 · You, in the app</text>
+    <text x="22" y="56">Agent menu → Follow.</text><text x="22" y="74">Edit the message, tap Follow.</text>
+    <rect x="270" y="10" width="220" height="84" rx="8" fill="var(--surface-2)" stroke="var(--violet)" stroke-width="2"/>
+    <text x="282" y="34" font-weight="700" fill="var(--violet)">2 · sm server</text>
+    <text x="282" y="56">Saves the follow. Sends your</text><text x="282" y="74">message to the agent.</text>
+    <rect x="530" y="10" width="220" height="84" rx="8" fill="var(--surface-2)" stroke="var(--green)" stroke-width="2"/>
+    <text x="542" y="34" font-weight="700" fill="var(--green)">3 · Agent</text>
+    <text x="542" y="56">Finishes, commits a report,</text><text x="542" y="74"><tspan font-family="Menlo, monospace" font-size="11.5">sm doc publish</tspan>, then</text><text x="542" y="90" font-family="Menlo, monospace" font-size="11.5">sm task-complete</text>
+    <rect x="530" y="150" width="220" height="84" rx="8" fill="var(--surface-2)" stroke="var(--violet)" stroke-width="2"/>
+    <text x="542" y="174" font-weight="700" fill="var(--violet)">4 · sm server</text>
+    <text x="542" y="196">Sees completion (or death),</text><text x="542" y="214">finds the newest report.</text>
+    <rect x="270" y="150" width="220" height="84" rx="8" fill="var(--surface-2)" stroke="var(--orange)" stroke-width="2"/>
+    <text x="282" y="174" font-weight="700" fill="var(--orange)">5 · Google push</text>
+    <text x="282" y="196">Carries agent name and</text><text x="282" y="214">report title. Never the report.</text>
+    <rect x="10" y="150" width="220" height="84" rx="8" fill="var(--surface-2)" stroke="var(--blue)" stroke-width="2"/>
+    <text x="22" y="174" font-weight="700" fill="var(--blue)">6 · Your phone</text>
+    <text x="22" y="196">"sm-1569-engineer finished".</text><text x="22" y="214">Tap → report opens in the app.</text>
+  </g>
+  <g stroke="var(--ink-2)" stroke-width="1.6" fill="none">
+    <line x1="232" y1="52" x2="266" y2="52" marker-end="url(#ar)"/>
+    <line x1="492" y1="52" x2="526" y2="52" marker-end="url(#ar)"/>
+    <line x1="640" y1="96" x2="640" y2="146" marker-end="url(#ar)"/>
+    <line x1="528" y1="192" x2="494" y2="192" marker-end="url(#ar)"/>
+    <line x1="268" y1="192" x2="234" y2="192" marker-end="url(#ar)"/>
+  </g>
+</svg>
+<figcaption>Steps 1–2 happen when you tap. Steps 3–6 happen whenever the agent finishes, whether that's minutes or hours later. If the phone doesn't confirm receipt within 15 minutes, the server emails you the same thing.</figcaption>
+</figure>
+
+<h3>What you see</h3>
+<p><b>Following.</b> The agent's three-dot menu gains <b>Follow</b>. Tapping it opens a dialog with this message already filled in. You can edit it, or clear it to follow silently:</p>
+<pre>Rajesh is following you from the sm app. When your task is done, commit a
+completion report (conclusion first, written for Rajesh), publish it with
+`sm doc publish &lt;path&gt;`, then run `sm task-complete`. Publish before
+task-complete: the notification links to the newest doc you published.</pre>
+<p>The message goes to the agent like an <code>sm send --important</code>: it waits for the agent's current turn to end rather than interrupting it. A followed agent shows a bell on its card, and its menu says <b>Unfollow</b>. The first time you follow, Android asks once for permission to show notifications.</p>
+
+<p><b>Being notified.</b> Exactly one notification per follow:</p>
+<table>
+<thead><tr><th>What happened</th><th>Notification</th><th>Tapping it opens</th></tr></thead>
+<tbody>
+<tr><td>Agent ran <code>sm task-complete</code> and had published a report</td><td><b>sm-1569-engineer finished</b><br>Report: Follow an agent — completion</td><td>The report, in the app's doc reader</td></tr>
+<tr><td>Agent ran <code>sm task-complete</code> with no report</td><td><b>sm-1569-engineer finished</b><br>No completion report published</td><td>The agent's card</td></tr>
+<tr><td>Agent's session ended (retired, killed, crashed) before <code>sm task-complete</code></td><td><b>sm-1569-engineer ended without completing</b><br>Session stopped before sm task-complete</td><td>The report if one exists, else the agent's card</td></tr>
+</tbody>
+</table>
+<p>The agent's parent still gets its usual <code>[sm task-complete]</code> message. Following adds to that and changes nothing about it.</p>
+
+<h3>Behaviour in the cases that matter</h3>
+<table>
+<thead><tr><th style="width:42%">Case</th><th>What happens</th></tr></thead>
+<tbody>
+<tr><td>Agent runs <code>sm task-complete</code> first and publishes the report 40 seconds later</td><td>The server waits up to 2 minutes for a report before saying "no report". You get the version with the report.</td></tr>
+<tr><td>Agent finishes, its parent hands it a new task, and it finishes again</td><td>You're notified on the first finish only. Follow again for the next one.</td></tr>
+<tr><td>Agent publishes three docs during the task</td><td>The notification links the newest one.</td></tr>
+<tr><td>You tap Follow twice on the same agent</td><td>Nothing new happens: still one follow, and the agent gets one message.</td></tr>
+<tr><td>Agent is already stopped</td><td>Follow is greyed out.</td></tr>
+<tr><td>Phone is off, or its push token went stale</td><td>With no confirmation from the phone within 15 minutes, the server sends one email with the same content and a link to the report on sm web. The push may still arrive later; Google holds it for 24 hours.</td></tr>
+<tr><td>Google push isn't set up yet</td><td>Follow still works. The notification goes out as email straight away.</td></tr>
+</tbody>
+</table>
+
+<h3>What you need to do in Google Cloud</h3>
+<p>About fifteen minutes, once. Appendix E has the exact clicks and commands. I'll walk you through them in-session when implementation reaches that point.</p>
+<ol>
+<li>In the Firebase console, add Firebase to your existing Google Cloud project (the one holding the app's Google sign-in). Skip Analytics.</li>
+<li>Register the Android app <code>li.rajeshgo.sm</code> and save the config file it offers to <code>~/.config/session-manager/firebase-android.json</code>. The repo is public, so this never enters git.</li>
+<li>Create a service account that may only send pushes, and save its key as <code>~/.config/session-manager/fcm-service-account.json</code>. That's four <code>gcloud</code> commands, or a few console clicks.</li>
+</ol>
+<p><b>Cost:</b> $0. Google doesn't charge for Firebase Cloud Messaging, and this uses nothing else billable.</p>
+
+<h3>Decision surface</h3>
+<table>
+<thead>
+<tr><th style="width:22%">Question</th><th>Recommendation</th><th style="width:32%">Why, in one line</th></tr>
+</thead>
+<tbody>
+<tr><td>1. Push channel</td><td><b>Firebase Cloud Messaging.</b> <i>You already agreed to this.</i></td><td>It's free, it arrives within seconds while the phone sleeps, and it notifies as the sm app itself.</td></tr>
+<tr><td>2. What triggers a notification</td><td><b><code>sm task-complete</code>, or the session ending first.</b> A "stalled" alert (idle for 30 minutes with no task-complete) comes later, as its own ticket.</td><td>Death is the case "email me when done" silently misses. Stall detection needs its own thresholds, so it waits.</td></tr>
+<tr><td>3. How long a follow lasts</td><td><b>It fires once, then ends.</b></td><td>It matches "tell me when this is done". Re-following is one tap.</td></tr>
+<tr><td>4. How the message reaches the agent</td><td><b>Like <code>sm send --important</code>:</b> after the agent's current turn, with no interruption.</td><td>An interruption would cost the agent's train of thought for a message that isn't urgent.</td></tr>
+<tr><td>5. What passes through Google</td><td><b>Agent name, report title and a link path. Never report content.</b> The app fetches the report from sm on tap.</td><td>Titles are enough to decide whether to open it. Content stays between your phone and your Mac.</td></tr>
+<tr><td>6. Email if the phone doesn't confirm</td><td><b>Yes, one email after 15 minutes without confirmation.</b> Also sent immediately when push isn't set up.</td><td>A notification you never receive is the failure this feature exists to prevent.</td></tr>
+<tr><td>7. Follow from sm web (browser)</td><td><b>Not now.</b> The app only.</td><td>Browser notifications are a separate build, and you asked for mobile.</td></tr>
+<tr><td>8. Build order</td><td><b>Two tickets, in order:</b> (a) server: follows, triggers, Google sender, email fallback; (b) app: Follow menu, notifications, opening the report.</td><td>Each fits one agent without running out of context, and the app ticket builds against the finished server.</td></tr>
+</tbody>
+</table>
+
+<h3>Out of scope</h3>
+<p>Following from the command line or sm web. Notifications about anything other than a followed agent finishing (queue jobs, reviews, stalls). Following several agents as a group. Each can reuse this push channel later.</p>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p>This is the first revision, so there's nothing to re-read.</p>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+<div class="toc">
+<div><a href="#a">A. Follow lifecycle</a></div>
+<div><a href="#b">B. Persisted shapes</a></div>
+<div><a href="#c">C. Server HTTP interface</a></div>
+<div><a href="#d">D. Triggers, report lookup, delivery</a></div>
+<div><a href="#e">E. Google Cloud setup</a></div>
+<div><a href="#f">F. Google push sender</a></div>
+<div><a href="#g">G. Android app</a></div>
+<div><a href="#h">H. Tickets and tests</a></div>
+<div><a href="#z">Z. FAQ</a></div>
+</div>
+
+<h3 id="a">A. Follow lifecycle</h3>
+<p>A follow moves through these states. Each is derived from the columns in Appendix B; there's no separate state column.</p>
+<table>
+<thead><tr><th>State</th><th>Condition</th><th>Next</th></tr></thead>
+<tbody>
+<tr><td><b>active</b></td><td><code>fired_at</code> and <code>cancelled_at</code> both null</td><td>fired (trigger), cancelled (Unfollow)</td></tr>
+<tr><td><b>cancelled</b></td><td><code>cancelled_at</code> set</td><td>terminal</td></tr>
+<tr><td><b>fired</b></td><td><code>fired_at</code> set, <code>notified_at</code> null</td><td>notified, when the push is accepted or the email is sent</td></tr>
+<tr><td><b>notified</b></td><td><code>notified_at</code> set</td><td>acked (phone confirms), or email fallback 15 minutes after the push</td></tr>
+<tr><td><b>acked</b></td><td><code>acked_at</code> set</td><td>terminal</td></tr>
+</tbody>
+</table>
+<p>At most one active follow exists per (owner, session). Cancelling after <code>fired_at</code> is set does nothing and returns 204, because the notification is already committed.</p>
+
+<h3 id="b">B. Persisted shapes</h3>
+<p>New SQLite database. Config key <code>push.db_path</code>, default <code>~/.local/share/claude-sessions/owner_push.db</code>, resolved with <code>expand_home</code> like <code>mobile_device_db_path</code><sup>1</sup>. The server creates the schema on open.</p>
+<pre><code>CREATE TABLE push_tokens (
+  user_id      TEXT NOT NULL,          -- owner email, lowercase (bearer identity)
+  fcm_token    TEXT NOT NULL,
+  device_id    TEXT,                   -- mobile_device_enrollments.device_id if the app is enrolled
+  device_name  TEXT NOT NULL,
+  app_version  TEXT NOT NULL,
+  created_at   TEXT NOT NULL,          -- RFC3339 UTC
+  updated_at   TEXT NOT NULL,
+  invalid_at   TEXT,                   -- set when Google reports the token unregistered
+  last_error   TEXT,
+  PRIMARY KEY (user_id, fcm_token)
+);
+CREATE TABLE owner_follows (
+  id                  TEXT PRIMARY KEY,   -- "fol_" + 12 lowercase base32 chars
+  user_id             TEXT NOT NULL,
+  session_id          TEXT NOT NULL,
+  session_name        TEXT NOT NULL,      -- display name at follow time; refreshed at fire time
+  message_text        TEXT,               -- null when followed silently
+  created_at          TEXT NOT NULL,
+  cancelled_at        TEXT,
+  fired_at            TEXT,
+  fire_reason         TEXT,               -- 'task_complete' | 'session_ended'
+  report_doc_id       TEXT,               -- owner_docs.id
+  report_title        TEXT,
+  report_reader_path  TEXT,               -- e.g. /docs/session-manager/docs/working/x.html?version=abc123
+  notify_after        TEXT,               -- earliest time delivery may run (report grace, retries)
+  push_attempts       INTEGER NOT NULL DEFAULT 0,
+  last_push_error     TEXT,
+  notified_at         TEXT,
+  notified_via        TEXT,               -- 'push' | 'email'
+  acked_at            TEXT,
+  email_sent_at       TEXT
+);
+CREATE UNIQUE INDEX owner_follows_one_active
+  ON owner_follows(user_id, session_id) WHERE fired_at IS NULL AND cancelled_at IS NULL;
+CREATE INDEX owner_follows_pending ON owner_follows(fired_at, notified_at);</code></pre>
+<p>Revoking a mobile device (<code>sm remove-device</code>, <code>DELETE /client/mobile-terminal/devices/{id}</code>) deletes <code>push_tokens</code> rows with that <code>device_id</code>.</p>
+
+<h3 id="c">C. Server HTTP interface</h3>
+<p>Every route below uses the same guard chain as <code>POST /client/request-status</code><sup>2</sup>: Cloudflare Access, public edge assertion, and owner bearer or local. <code>user_id</code> is the lowercase email from the bearer token, or the configured owner email for local calls. JSON bodies, and RFC3339 UTC timestamps.</p>
+<table>
+<thead><tr><th style="width:34%">Route</th><th>Behaviour</th></tr></thead>
+<tbody>
+<tr><td><code>PUT /client/push-token</code><br><code>{token, device_id?, device_name, app_version}</code></td><td>Upserts the <code>push_tokens</code> row, clears <code>invalid_at</code> and <code>last_error</code>, sets <code>updated_at</code>. If <code>device_id</code> is given, it must be an unrevoked enrollment of <code>user_id</code>, else 400. Returns 204.</td></tr>
+<tr><td><code>DELETE /client/push-token</code><br><code>{token}</code></td><td>Deletes the row. Returns 204, including when the row is missing.</td></tr>
+<tr><td><code>POST /client/push/test</code></td><td>Sends a <code>kind=test</code> push to every valid token of <code>user_id</code>. 200 <code>{sent, failed:[{device_name,error}]}</code>. 503 <code>{detail:"push not configured"}</code> when the sender is unconfigured.</td></tr>
+<tr><td><code>POST /sessions/{id}/follow</code><br><code>{message: string|null}</code></td><td>404 if the session is unknown, 409 <code>{detail:"session stopped"}</code> if it is stopped. If an active follow exists: 200 with that follow; no second message is sent and the new text is ignored. Otherwise it inserts the row, and if <code>message</code> is non-empty after trimming, delivers it as <code>send_core_input</code> with <code>delivery_mode="important"</code> and no sender session<sup>3</sup>. Returns 201 with the follow. If message delivery fails, it deletes the row and returns the delivery error, so a follow never exists whose agent was never told.</td></tr>
+<tr><td><code>DELETE /sessions/{id}/follow</code></td><td>Sets <code>cancelled_at</code> on the active follow. Returns 204, including when there's none. Sends nothing to the agent.</td></tr>
+<tr><td><code>GET /client/follows</code></td><td><code>{push_configured: bool, follows:[…]}</code>: active follows plus follows fired in the last 7 days, newest first. Each follow object carries every <code>owner_follows</code> column except <code>user_id</code> and <code>message_text</code>, plus <code>state</code> from Appendix A.</td></tr>
+<tr><td><code>POST /client/follows/{follow_id}/ack</code></td><td>Sets <code>acked_at</code> if null. Returns 204. 404 if the follow doesn't belong to <code>user_id</code>.</td></tr>
+</tbody>
+</table>
+<p><code>sm-server --check-config</code> adds a <code>push</code> line: <code>ready (project &lt;id&gt;)</code>, <code>not configured</code>, or <code>broken: &lt;reason&gt;</code> (unreadable key file or key without <code>private_key</code>). This mirrors the email bridge readiness line<sup>4</sup>.</p>
+
+<h3 id="d">D. Triggers, report lookup, delivery</h3>
+<h4>D1. Firing</h4>
+<ul>
+<li><b>Task-complete.</b> Inside <code>SessionStore::task_complete</code><sup>5</sup>, on <i>both</i> the normal path and the reparent path, after <code>agent_task_completed_at</code> is written: <code>UPDATE owner_follows SET fired_at=:completed_at, fire_reason='task_complete', notify_after=:completed_at WHERE session_id=:id AND fired_at IS NULL AND cancelled_at IS NULL</code>. This is a local SQLite write only. No network I/O happens under the state write guard. A failure is logged and never fails <code>sm task-complete</code>, because the sweep in D2 catches it.</li>
+<li><b>Sweep</b> (every 15 seconds, on the server's background runtime). For each active follow:
+  <ul>
+  <li>If the session's <code>agent_task_completed_at</code> is later than <code>created_at</code>, fire with <code>task_complete</code>. This catches a missed hook, but not one cleared by later activity; the hook above is primary.</li>
+  <li>Else, if the session is absent from state or <code>raw_session_is_stopped</code><sup>6</sup>, fire with <code>session_ended</code>. The stopped state is terminal, so the sweep sees every death path: retire, kill, crash reconciliation and the other stop transitions<sup>7</sup>. None of those sites is modified.</li>
+  </ul></li>
+</ul>
+<h4>D2. Report lookup</h4>
+<p>Run at delivery time, not at fire time:</p>
+<pre><code>SELECT d.id, d.title, d.repo, d.path, p.commit_sha, p.published_at
+FROM owner_doc_publishes p JOIN owner_docs d ON d.id = p.doc_id
+WHERE p.session_id = :session_id AND p.published_at &gt;= :follow_created_at
+  AND d.retracted_at IS NULL
+ORDER BY p.published_at DESC LIMIT 1;</code></pre>
+<p>The query matches on <code>owner_doc_publishes.session_id</code> (the session that published), not <code>owner_docs.author_session_id</code><sup>8</sup>. <code>report_reader_path</code> is the same reader path the watch payload already gives the app for that doc and version. <b>Report grace:</b> if the lookup is empty and <code>now &lt; fired_at + 120s</code>, the worker sets <code>notify_after = fired_at + 120s</code> and waits. After that it sends without a report.</p>
+<h4>D3. Delivery worker</h4>
+<p>Runs every 5 seconds over follows with <code>fired_at</code> set, <code>notified_at</code> null and <code>notify_after &lt;= now</code>:</p>
+<ol>
+<li>Refresh <code>session_name</code> and run the report lookup.</li>
+<li>If push isn't configured, or <code>user_id</code> has no valid token, send the email (D4) and set <code>notified_at</code> and <code>notified_via='email'</code>.</li>
+<li>Otherwise, send the push (Appendix F) to every valid token. If at least one succeeds: <code>notified_at=now</code>, <code>notified_via='push'</code>. If all fail with retryable errors: increment <code>push_attempts</code> and set <code>notify_after</code> to now plus 30 seconds, 1, 2, 5, 10 or 10 minutes for attempts 1–6. After attempt 6, fall back to email. An <code>UNREGISTERED</code> or invalid-token error sets that token's <code>invalid_at</code> and doesn't count as retryable.</li>
+</ol>
+<p><b>Ack fallback:</b> a follow with <code>notified_via='push'</code>, <code>acked_at</code> null and <code>notified_at + 15 min &lt;= now</code> gets one email, which sets <code>email_sent_at</code>. The email is sent at most once per follow.</p>
+<h4>D4. Email</h4>
+<p>It goes through the existing email bridge<sup>4</sup> to the owner address <code>sm email rajesh</code> resolves to. The subject and first body line match the notification title and body (table below). The body adds the sm web reader URL (<code>{public base URL}{report_reader_path}</code>) when there's a report, and the agent's name and id. If the email bridge isn't configured either, the worker logs a warning and sets <code>notified_at</code> with <code>notified_via='email'</code> and <code>last_push_error='no channel'</code>, so it doesn't loop.</p>
+<h4>D5. Notification text (push and email)</h4>
+<table>
+<thead><tr><th>Case</th><th>Title</th><th>Body</th></tr></thead>
+<tbody>
+<tr><td>task_complete, report found</td><td><code>{session_name} finished</code></td><td><code>Report: {report_title}</code></td></tr>
+<tr><td>task_complete, no report</td><td><code>{session_name} finished</code></td><td><code>No completion report published</code></td></tr>
+<tr><td>session_ended</td><td><code>{session_name} ended without completing</code></td><td><code>Report: {report_title}</code> if found, else <code>Session stopped before sm task-complete</code></td></tr>
+<tr><td>test</td><td><code>sm notifications work</code></td><td><code>Sent from {hostname}</code></td></tr>
+</tbody>
+</table>
+
+<h3 id="e">E. Google Cloud setup (owner steps)</h3>
+<ol>
+<li><b>Add Firebase.</b> Go to <a href="https://console.firebase.google.com">console.firebase.google.com</a>, choose Add project, and pick the existing Google Cloud project that owns the OAuth client in <code>SM_GOOGLE_SERVER_CLIENT_ID</code>. Disable Google Analytics.</li>
+<li><b>Register the app.</b> Go to Project settings → Your apps → Android. Package name <code>li.rajeshgo.sm</code>; no SHA-1 is needed for messaging. Download <code>google-services.json</code> to <code>~/.config/session-manager/firebase-android.json</code>.</li>
+<li><b>Sending credential.</b> Run these with <code>P</code> set to the project id:
+<pre><code>gcloud services enable fcm.googleapis.com --project "$P"
+gcloud iam service-accounts create sm-push --project "$P" --display-name "sm push sender"
+gcloud projects add-iam-policy-binding "$P" \
+  --member "serviceAccount:sm-push@$P.iam.gserviceaccount.com" \
+  --role roles/firebasecloudmessaging.admin
+gcloud iam service-accounts keys create ~/.config/session-manager/fcm-service-account.json \
+  --iam-account "sm-push@$P.iam.gserviceaccount.com"
+chmod 600 ~/.config/session-manager/fcm-service-account.json</code></pre>
+The console route also works: Project settings → Service accounts → Generate new private key. That key belongs to the Firebase Admin account, which has broader rights, so prefer the commands above.</li>
+<li><b>Config.</b> The implementing agent adds <code>push.fcm.service_account_path: ~/.config/session-manager/fcm-service-account.json</code> to the installed config, and copies four values from <code>firebase-android.json</code> into the untracked <code>android-app/local.defaults.properties</code>: <code>SM_FIREBASE_PROJECT_ID</code> (<code>project_info.project_id</code>), <code>SM_FIREBASE_SENDER_ID</code> (<code>project_info.project_number</code>), <code>SM_FIREBASE_APP_ID</code> (<code>client[0].client_info.mobilesdk_app_id</code>) and <code>SM_FIREBASE_API_KEY</code> (<code>client[0].api_key[0].current_key</code>). It also adds the four keys, blank, to <code>local.defaults.properties.example</code>.</li>
+</ol>
+
+<h3 id="f">F. Google push sender</h3>
+<ul>
+<li><b>Access token:</b> sign a JWT with RS256 using <code>jsonwebtoken</code> and the key file's <code>private_key</code>. Claims: <code>iss</code>=<code>client_email</code>, <code>scope</code>=<code>https://www.googleapis.com/auth/firebase.messaging</code>, <code>aud</code>=<code>https://oauth2.googleapis.com/token</code>, <code>iat</code>=now, <code>exp</code>=now+3600. POST form <code>grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&amp;assertion=…</code> to <code>https://oauth2.googleapis.com/token</code> via <code>ureq</code>, which is already a dependency. Cache the token until 5 minutes before <code>expires_in</code>.</li>
+<li><b>Send:</b> <code>POST https://fcm.googleapis.com/v1/projects/{project_id}/messages:send</code>, bearer access token, 10-second timeout, run off the async runtime (<code>spawn_blocking</code>) like the email bridge:
+<pre><code>{"message": {"token": "&lt;fcm_token&gt;",
+  "android": {"priority": "HIGH", "ttl": "86400s"},
+  "data": {"kind": "task_complete|session_ended|test", "follow_id": "fol_…",
+           "session_id": "…", "title": "…", "body": "…",
+           "reader_path": "/docs/…" }}}</code></pre>
+The message is data-only, so the app always builds the notification itself and tap handling is identical whether the app is open or closed. <code>reader_path</code> is omitted when there's no report. All values are strings.</li>
+<li><b>Errors:</b> 404 or <code>UNREGISTERED</code>, or 400 <code>INVALID_ARGUMENT</code> naming the token → invalid token. 429 and 5xx → retryable. 401 and 403 → retryable, and logged as a configuration error once per hour.</li>
+</ul>
+
+<h3 id="g">G. Android app</h3>
+<ul>
+<li><b>Dependencies:</b> Firebase BoM plus <code>com.google.firebase:firebase-messaging</code>, with no <code>google-services</code> Gradle plugin. <code>SessionManagerApp.onCreate</code> calls <code>FirebaseApp.initializeApp(context, FirebaseOptions)</code> built from the four <code>BuildConfig</code> fields (Appendix E). If any is blank, push is disabled in the app and Follow still works, relying on email.</li>
+<li><b>Manifest:</b> <code>POST_NOTIFICATIONS</code> permission. A <code>FirebaseMessagingService</code> subclass, not exported, with the <code>com.google.firebase.MESSAGING_EVENT</code> intent filter. Notification channel <code>agent_follow</code>, named "Agents you follow", with high importance.</li>
+<li><b>Token:</b> after sign-in, at every app start, and in <code>onNewToken</code>, call <code>PUT /client/push-token</code> with <code>device_name=Build.MODEL</code>, <code>app_version=SM_APK_HASH</code> and the enrolled device id when one exists. Sign-out calls <code>DELETE</code>.</li>
+<li><b>Receive:</b> <code>onMessageReceived</code> posts a notification from <code>data.title</code> and <code>data.body</code>, with notification id = <code>follow_id.hashCode()</code>, so a duplicate replaces rather than stacks. It then calls <code>POST /client/follows/{follow_id}/ack</code>, fire-and-forget, except for <code>kind=test</code>.</li>
+<li><b>Tap:</b> a PendingIntent to <code>MainActivity</code> with extras <code>follow_id</code>, <code>session_id</code> and <code>reader_path</code>. <code>MainActivity</code> handles them in <code>onCreate</code> and <code>onNewIntent</code>, following the <code>sm-enroll</code> pattern<sup>9</sup>. With <code>reader_path</code>, it opens <code>DocReaderOverlay</code> on it; without, it opens Watch with that session's card expanded.</li>
+<li><b>Menu:</b> in the agent actions menu<sup>10</sup>, add Follow or Unfollow above "Retire session". It's disabled when the session is stopped. Follow opens a dialog: a multi-line text field prefilled with the memo's message text, verbatim; a hint line saying "Clear the message to follow without telling the agent"; and buttons Cancel and Follow. On first use on Android 13 or later, it requests <code>POST_NOTIFICATIONS</code> before sending. If you deny it, the follow still proceeds, with a toast: "Notifications off — you'll be emailed instead".</li>
+<li><b>Bell:</b> the watch refresh also calls <code>GET /client/follows</code>, and cards of sessions with an active follow show a bell icon next to the status.</li>
+<li><b>Settings:</b> a "Notifications" row showing push status (<code>push_configured</code> from the server, and whether this phone has a token), plus a "Send test notification" button that calls <code>POST /client/push/test</code>.</li>
+</ul>
+
+<h3 id="h">H. Tickets and tests</h3>
+<p><b>Ticket A (server)</b>, Mid tier. Covers Appendices B, C, D and F, the <code>--check-config</code> line, and the config key. Test locations:</p>
+<table>
+<thead><tr><th>Behaviour</th><th>Test</th></tr></thead>
+<tbody>
+<tr><td>Follow create is idempotent, 409 on stopped, and message delivered as important</td><td><code>tests/owner_follow_http.rs::follow_is_idempotent_and_messages_once</code>, <code>::follow_refuses_stopped_session</code></td></tr>
+<tr><td>Message delivery failure leaves no follow</td><td><code>::follow_rolls_back_when_message_fails</code></td></tr>
+<tr><td>Task-complete fires on normal and reparent paths</td><td><code>sessions.rs</code> unit tests <code>task_complete_fires_follow</code>, <code>task_complete_during_reparent_fires_follow</code></td></tr>
+<tr><td>Sweep fires on stopped or missing session, and on a missed task-complete</td><td><code>owner_push.rs</code> unit <code>sweep_fires_session_ended</code>, <code>sweep_catches_missed_task_complete</code></td></tr>
+<tr><td>Report lookup: newest, by publishing session, since follow, retracted excluded; 120s grace</td><td><code>owner_push.rs</code> unit <code>report_lookup_*</code>, <code>report_grace_waits_then_sends_without</code></td></tr>
+<tr><td>Retry schedule, invalid token marking, email after 6 attempts</td><td><code>owner_push.rs</code> unit with a fake sender: <code>push_retry_schedule</code>, <code>unregistered_token_invalidated</code></td></tr>
+<tr><td>Ack fallback email once at 15 min; no channel does not loop</td><td><code>ack_fallback_emails_once</code>, <code>no_channel_marks_notified</code></td></tr>
+<tr><td>JWT claims and FCM request body shape</td><td><code>fcm.rs</code> unit <code>jwt_claims_shape</code>, <code>send_body_shape</code> against a local HTTP stub</td></tr>
+<tr><td>Device revoke deletes its tokens</td><td><code>mobile_devices.rs</code> unit <code>revoke_deletes_push_tokens</code></td></tr>
+</tbody>
+</table>
+<p><b>Ticket B (Android)</b>, Mid tier. Covers Appendices E(4) and G. Unit tests go in <code>SessionManagerRepositoryTest</code> for the new API calls and for intent-extra routing. The live check: a follow on a scratch agent that runs <code>sm doc publish</code> then <code>sm task-complete</code>, with the notification opening the report. That needs your phone, so it's handed to you as a two-minute test.</p>
+
+<h3 id="z">Z. FAQ</h3>
+<p><b>Why a sweep for session end instead of hooking every stop site?</b> The code has at least nine places that set a session to stopped<sup>7</sup>. A 15-second sweep over a handful of active follows is one code path that can't miss a new stop site added later. Task-complete gets a direct hook because <code>agent_task_completed_at</code> is cleared by later activity, and a sweep could miss a fast re-task.</p>
+<p><b>Why data-only pushes?</b> With a "notification" push, Android draws the notification itself while the app is in the background and hands the app the tap without the data, so tap routing would differ between foreground and background. With data-only and high priority, the app's service runs in both cases.</p>
+<p><b>Why no <code>google-services</code> plugin?</b> The plugin requires <code>google-services.json</code> in the source tree, and the repo is public. Initialising Firebase from <code>BuildConfig</code> fields matches how the app already takes <code>SM_GOOGLE_SERVER_CLIENT_ID</code>.</p>
+<p><b>Why ack plus email instead of trusting Google?</b> Google accepting a push only means Google has it. A phone that's off, uninstalled or on a stale token never shows it, and the server can't tell. The ack is the only proof the notification was shown.</p>
+
+<p class="sans"><small>
+<sup>1</sup> <code>crates/sm-server/src/mobile_devices.rs:106</code>. &nbsp;
+<sup>2</sup> <code>crates/sm-server/src/http.rs:2550-2570</code>. &nbsp;
+<sup>3</sup> <code>send_session_input</code>, <code>http.rs:8585</code>; the CLI payload is in <code>bin/sm.rs:3850</code>. &nbsp;
+<sup>4</sup> <code>crates/sm-server/src/email.rs</code>; the readiness line is from #1562. &nbsp;
+<sup>5</sup> <code>crates/sm-server/src/sessions.rs:8415</code>. &nbsp;
+<sup>6</sup> <code>sessions.rs:17244</code>. &nbsp;
+<sup>7</sup> <code>sessions.rs</code> lines 917, 1124, 1568, 8221, 8320, 15274 and 15377, and <code>http.rs:15151</code>. &nbsp;
+<sup>8</sup> <code>crates/sm-server/src/owner_docs.rs:396-423, 510-601</code>. &nbsp;
+<sup>9</sup> <code>android-app/app/src/main/AndroidManifest.xml:29-38</code>, <code>MainActivity.kt:34-48</code>. &nbsp;
+<sup>10</sup> <code>android-app/.../ui/watch/WatchScreen.kt:1404-1411</code>.
+</small></p>
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
