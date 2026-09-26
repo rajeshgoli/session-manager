@@ -17,6 +17,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         pendingEnrollmentUrl.value = enrollmentUrlFromIntent(intent)
+        // A fresh activity owns the request: a launcher start drops one left by
+        // an abandoned notification tap (the process can outlive the activity).
+        FollowOpenRequests.pending = null
         takeFollowOpen(intent)
         enableEdgeToEdge(
             statusBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
