@@ -5,21 +5,21 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.compose.runtime.mutableStateOf
 import li.rajeshgo.sm.push.FollowOpen
 import li.rajeshgo.sm.push.FollowOpenRequests
 import li.rajeshgo.sm.ui.navigation.AppNavigation
+import li.rajeshgo.sm.ui.navigation.EnrollmentLinkRequests
 import li.rajeshgo.sm.ui.theme.SessionManagerTheme
 
 class MainActivity : ComponentActivity() {
-    private val pendingEnrollmentUrl = mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        pendingEnrollmentUrl.value = enrollmentUrlFromIntent(intent)
-        // A fresh activity owns the request: a launcher start drops one left by
-        // an abandoned notification tap (the process can outlive the activity).
+        // A fresh activity owns the requests: a launcher start drops any left by
+        // an abandoned notification tap or link (the process can outlive the activity).
         FollowOpenRequests.pending = null
+        EnrollmentLinkRequests.pending = null
+        takeEnrollmentLink(intent)
         takeFollowOpen(intent)
         enableEdgeToEdge(
             statusBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
@@ -28,10 +28,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             SessionManagerTheme {
                 androidx.compose.material3.Surface(color = androidx.compose.material3.MaterialTheme.colorScheme.background) {
-                    AppNavigation(
-                        pendingEnrollmentUrl = pendingEnrollmentUrl.value,
-                        onEnrollmentDeepLinkConsumed = ::clearEnrollmentDeepLink,
-                    )
+                    AppNavigation()
                 }
             }
         }
@@ -40,7 +37,7 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        pendingEnrollmentUrl.value = enrollmentUrlFromIntent(intent)
+        takeEnrollmentLink(intent)
         takeFollowOpen(intent)
     }
 
@@ -59,8 +56,10 @@ class MainActivity : ComponentActivity() {
         setIntent(Intent(this, MainActivity::class.java))
     }
 
-    private fun clearEnrollmentDeepLink() {
-        pendingEnrollmentUrl.value = null
+    /** Hands an opened enrollment link to the Settings screen, once. */
+    private fun takeEnrollmentLink(intent: Intent?) {
+        val url = enrollmentUrlFromIntent(intent) ?: return
+        EnrollmentLinkRequests.pending = url
         setIntent(Intent(this, MainActivity::class.java))
     }
 }
