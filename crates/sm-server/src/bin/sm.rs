@@ -480,11 +480,14 @@ struct EmailArgs {
     message: Option<String>,
     #[arg(long)]
     subject: Option<String>,
+    /// Message body as literal text (same as the positional MESSAGE)
     #[arg(long)]
     body: Option<String>,
-    #[arg(long)]
+    /// Path to a text file for the body; a .md or .markdown file is rendered as Markdown
+    #[arg(long, value_name = "FILE")]
     text: Option<String>,
-    #[arg(long)]
+    /// Path to an HTML file for the body
+    #[arg(long, value_name = "FILE")]
     html: Option<String>,
     #[arg(long)]
     cc: Option<String>,
@@ -2771,7 +2774,12 @@ fn email_body_from_args(
     if let Some(text_file) = text_file {
         let path = Path::new(&text_file);
         let text = fs::read_to_string(path)
-            .with_context(|| format!("failed to read email text file {}", path.display()))?;
+            .with_context(|| {
+                format!(
+                    "failed to read email text file {} (--text takes a file path; use --body for literal text)",
+                    path.display()
+                )
+            })?;
         let markdown = path
             .extension()
             .and_then(|value| value.to_str())
