@@ -51,6 +51,13 @@ pub trait OwnerDocSource: Send + Sync {
         Err("this doc source cannot read pull requests".to_owned())
     }
 
+    /// Whether the PR's diff includes `path`. GitHub takes review comments,
+    /// line or file, only on files the PR changes. A source that cannot tell
+    /// answers yes and leaves GitHub to refuse.
+    fn pr_changes_path(&self, _repo: &str, _pr_number: i64, _path: &str) -> Result<bool, String> {
+        Ok(true)
+    }
+
     /// GraphQL `addPullRequestReview` with no event: a pending review pinned
     /// to `commit_sha`. Returns the review's node id.
     fn add_pending_review(
@@ -341,6 +348,27 @@ impl OwnerDocSource for GhCliDocSource {
         })
     }
 
+    fn pr_changes_path(&self, repo: &str, pr_number: i64, path: &str) -> Result<bool, String> {
+        let args = vec![
+            "api".to_owned(),
+            "--paginate".to_owned(),
+            format!("repos/{repo}/pulls/{pr_number}/files?per_page=100"),
+            "--jq".to_owned(),
+            ".[].filename".to_owned(),
+        ];
+        let output = gh_command_output(&args, Duration::from_secs(30))
+            .map_err(|error| format!("gh api pulls/files failed: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "could not list the files PR #{pr_number} changes: {}",
+                command_stderr(&output)
+            ));
+        }
+        let listed = String::from_utf8_lossy(&output.stdout);
+        // GitHub lists at most 3,000 files; past that, absence proves nothing.
+        Ok(listed.lines().any(|file| file == path) || listed.lines().count() >= 3000)
+    }
+
     fn add_pending_review(
         &self,
         pr_node_id: &str,
@@ -603,6 +631,13 @@ fn bad_request(detail: impl Into<String>) -> ApiError {
     }
 }
 
+/// Why the owner cannot comment on a doc whose PR doesn't change it.
+pub(super) fn doc_not_in_pr_diff(pr_number: i64, path: &str) -> String {
+    format!(
+        "PR #{pr_number} does not change {path}, and GitHub takes review comments only on files a PR changes."
+    )
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct PublishOwnerDocRequest {
     repo: String,
@@ -646,26 +681,62 @@ pub(super) async fn publish_owner_doc(
     let Some(author) = state.session_store.get_session(session_id)? else {
         return Err(bad_request(format!("Session {session_id} not found")));
     };
-    if payload.review {
+    if payload.review && payload.pr_number.is_none() {
         // A review lands as a GitHub PR review, so it needs an open PR.
-        let Some(pr_number) = payload.pr_number else {
-            return Err(bad_request("--review needs a PR: publish with --pr <N>"));
-        };
-        let (lookup_state, lookup_repo) = (state.clone(), repo.clone());
-        let pr = tokio::task::spawn_blocking(move || {
-            doc_pull_request(&lookup_state, &lookup_repo, pr_number, true)
+        return Err(bad_request("--review needs a PR: publish with --pr <N>"));
+    }
+    if let Some(pr_number) = payload.pr_number {
+        let (lookup_state, lookup_repo, lookup_path, lookup_sha) = (
+            state.clone(),
+            repo.clone(),
+            path.clone(),
+            commit_sha.clone(),
+        );
+        let lookup = tokio::task::spawn_blocking(move || {
+            let pr = doc_pull_request(&lookup_state, &lookup_repo, pr_number, true)?;
+            // Only a head revision is checked: GitHub resolves comments on
+            // an older one against the diff at that commit (spec F7).
+            let changes_doc = if pr.is_open() && pr.head_sha == lookup_sha {
+                Some(lookup_state.owner_doc_source.pr_changes_path(
+                    &lookup_repo,
+                    pr_number,
+                    &lookup_path,
+                )?)
+            } else {
+                None
+            };
+            Ok::<_, String>((pr, changes_doc))
         })
         .await
-        .map_err(|error| anyhow::anyhow!("PR lookup task failed: {error}"))?
-        .map_err(|error| ApiError::Status {
-            status: StatusCode::BAD_GATEWAY,
-            detail: error,
-        })?;
-        if !pr.is_open() {
-            return Err(ApiError::Status {
-                status: StatusCode::CONFLICT,
-                detail: format!("--review needs an open PR; PR #{pr_number} is {}", pr.state),
-            });
+        .map_err(|error| anyhow::anyhow!("PR lookup task failed: {error}"))?;
+        match lookup {
+            Ok((pr, _)) if payload.review && !pr.is_open() => {
+                return Err(ApiError::Status {
+                    status: StatusCode::CONFLICT,
+                    detail: format!("--review needs an open PR; PR #{pr_number} is {}", pr.state),
+                });
+            }
+            // An open PR that doesn't change the doc takes no comments on
+            // it, so the owner's review could never post (sm#1591).
+            Ok((_, Some(false))) => {
+                return Err(ApiError::Status {
+                    status: StatusCode::CONFLICT,
+                    detail: format!(
+                        "{} Push a change to {path} on the PR's branch, then publish again.",
+                        doc_not_in_pr_diff(pr_number, &path)
+                    ),
+                });
+            }
+            Ok(_) => {}
+            Err(error) if payload.review => {
+                return Err(ApiError::Status {
+                    status: StatusCode::BAD_GATEWAY,
+                    detail: error,
+                });
+            }
+            // Without --review, a doc publishes even when GitHub can't be
+            // asked about its PR.
+            Err(_) => {}
         }
     }
 
