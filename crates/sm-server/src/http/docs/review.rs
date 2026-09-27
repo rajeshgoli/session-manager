@@ -368,9 +368,12 @@ fn run_submission(
     };
 
     // GitHub takes comments only on files the PR changes. Say so rather
-    // than let every comment fail (sm#1591). A failed lookup leaves the
-    // answer to GitHub.
+    // than let every comment fail (sm#1591). Only the head revision is
+    // checked: an older one resolves against the diff at that commit, which
+    // may still hold the doc (spec F7). A failed lookup leaves the answer to
+    // GitHub.
     if !drafts.is_empty()
+        && review.commit_sha == pr.head_sha
         && matches!(
             source.pr_changes_path(&doc.repo, pr_number, &doc.path),
             Ok(false)

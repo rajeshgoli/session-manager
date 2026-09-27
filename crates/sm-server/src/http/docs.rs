@@ -686,10 +686,17 @@ pub(super) async fn publish_owner_doc(
         return Err(bad_request("--review needs a PR: publish with --pr <N>"));
     }
     if let Some(pr_number) = payload.pr_number {
-        let (lookup_state, lookup_repo, lookup_path) = (state.clone(), repo.clone(), path.clone());
+        let (lookup_state, lookup_repo, lookup_path, lookup_sha) = (
+            state.clone(),
+            repo.clone(),
+            path.clone(),
+            commit_sha.clone(),
+        );
         let lookup = tokio::task::spawn_blocking(move || {
             let pr = doc_pull_request(&lookup_state, &lookup_repo, pr_number, true)?;
-            let changes_doc = if pr.is_open() {
+            // Only a head revision is checked: GitHub resolves comments on
+            // an older one against the diff at that commit (spec F7).
+            let changes_doc = if pr.is_open() && pr.head_sha == lookup_sha {
                 Some(lookup_state.owner_doc_source.pr_changes_path(
                     &lookup_repo,
                     pr_number,

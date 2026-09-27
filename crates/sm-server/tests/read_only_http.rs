@@ -24462,8 +24462,14 @@ async fn owner_doc_on_a_pr_that_does_not_change_it_is_refused_at_publish_and_sub
         );
     }
 
-    // Once the PR changes the doc again, the same submission posts.
-    source.github.lock().unwrap().unchanged_paths.clear();
+    // Once the head moves on, the reviewed revision is an older one. GitHub
+    // resolves its comments against the diff at that commit (spec F7), so
+    // the head diff no longer decides and the same submission posts.
+    source
+        .github
+        .lock()
+        .unwrap()
+        .set_pr(12, "open", &"b".repeat(40));
     let (status, review) = post_json(
         app.clone(),
         &format!("/docs/{id}/review"),
