@@ -178,11 +178,19 @@ struct RecredentialArgs {
 struct SendArgs {
     session_id: String,
     /// Message text. Omit it, or pass `-`, to read the message from piped stdin.
+    /// To a person, the text is markdown shown in the sm app.
     text: Vec<String>,
     #[arg(long)]
     urgent: bool,
     #[arg(long, value_name = "SECONDS")]
     wait: Option<u64>,
+    /// A message to a person: its title (1-120 characters). Default: the
+    /// first heading or line of the text.
+    #[arg(long)]
+    title: Option<String>,
+    /// A message to a person: you cannot continue until they answer.
+    #[arg(long)]
+    blocking: bool,
 }
 
 #[derive(Args)]
@@ -1028,52 +1036,7 @@ fn run() -> Result<()> {
             args.working_dir,
             args.node,
         )?,
-        Command::Send(args) => {
-            let text = read_send_text(&args.text)?;
-            let delivery_mode = if args.urgent { "urgent" } else { "sequential" };
-            let targets = split_send_targets(&args.session_id);
-            let mut payload = send_input_payload(text.clone(), delivery_mode, args.wait);
-            if targets.len() > 1 {
-                let targets = targets
-                    .iter()
-                    .map(|target| resolve_send_target(&client, target))
-                    .collect::<Result<Vec<_>>>()?;
-                payload["recipients"] = json!(targets);
-                let payload = client.post_json("/sessions/input-batch", payload)?;
-                print_batch_send_result(&payload)?;
-                if payload["failure_count"].as_u64().unwrap_or(0) > 0 {
-                    bail!("one or more sends failed");
-                }
-            } else {
-                let target = targets
-                    .first()
-                    .map(String::as_str)
-                    .unwrap_or(args.session_id.as_str());
-                let session_id = match resolve_virtual_send_target(&client, target)? {
-                    Some(session_id) => Some(session_id),
-                    None => lookup_identifier_exact(&client, target)?,
-                };
-                if let Some(session_id) = session_id {
-                    let payload =
-                        client.post_json(&format!("/sessions/{session_id}/input"), payload)?;
-                    println!(
-                        "{}",
-                        if payload["delivered"].as_bool().unwrap_or(false) {
-                            "delivered"
-                        } else {
-                            "not delivered"
-                        }
-                    );
-                } else {
-                    if args.urgent || args.wait.is_some() {
-                        bail!(
-                            "email fallback only supports plain sequential sends without --wait/--urgent"
-                        );
-                    }
-                    send_registered_email_fallback(&client, target, &text)?;
-                }
-            }
-        }
+        Command::Send(args) => run_send(&client, args)?,
         Command::What(args) => run_what(&client, args)?,
         Command::Usage(args) => run_usage(&client, args)?,
         Command::Remind(args) => run_remind(&client, args)?,
@@ -1341,6 +1304,129 @@ fn retire_response_status(payload: &Value, target_session_id: &str) -> Result<&'
     }
 }
 
+const PERSON_FLAGS_ONLY: &str = "--title/--blocking only apply to a message to a person";
+
+fn run_send(client: &ApiClient, args: SendArgs) -> Result<()> {
+    let text = read_send_text(&args.text)?;
+    let person_flags = args.title.is_some() || args.blocking;
+    let delivery_mode = if args.urgent { "urgent" } else { "sequential" };
+    let targets = split_send_targets(&args.session_id);
+    let mut payload = send_input_payload(text.clone(), delivery_mode, args.wait);
+    if targets.len() > 1 {
+        // A message to a person has its own reply path; never mix it into
+        // a broadcast. Checked before anything is sent.
+        for target in &targets {
+            if !target.starts_with('/') && lookup_human(client, target)?.is_some() {
+                bail!("send to {target} on its own, not in a list");
+            }
+        }
+        if person_flags {
+            bail!(PERSON_FLAGS_ONLY);
+        }
+        let targets = targets
+            .iter()
+            .map(|target| resolve_send_target(client, target))
+            .collect::<Result<Vec<_>>>()?;
+        payload["recipients"] = json!(targets);
+        let payload = client.post_json("/sessions/input-batch", payload)?;
+        print_batch_send_result(&payload)?;
+        if payload["failure_count"].as_u64().unwrap_or(0) > 0 {
+            bail!("one or more sends failed");
+        }
+        return Ok(());
+    }
+    let target = targets
+        .first()
+        .map(String::as_str)
+        .unwrap_or(args.session_id.as_str());
+    let session_id = match resolve_virtual_send_target(client, target)? {
+        Some(session_id) => Some(session_id),
+        None => lookup_identifier_exact(client, target)?,
+    };
+    if let Some(session_id) = session_id {
+        if person_flags {
+            bail!(PERSON_FLAGS_ONLY);
+        }
+        let payload = client.post_json(&format!("/sessions/{session_id}/input"), payload)?;
+        println!(
+            "{}",
+            if payload["delivered"].as_bool().unwrap_or(false) {
+                "delivered"
+            } else {
+                "not delivered"
+            }
+        );
+        return Ok(());
+    }
+    if let Some(human) = lookup_human(client, target)? {
+        if args.urgent || args.wait.is_some() {
+            bail!("--urgent/--wait do not apply to a message to a person; use --blocking");
+        }
+        let canonical = human["recipient"].as_str().unwrap_or(target);
+        return send_message_to_human(
+            client,
+            canonical,
+            &text,
+            args.title.as_deref(),
+            args.blocking,
+        );
+    }
+    if person_flags {
+        bail!(PERSON_FLAGS_ONLY);
+    }
+    if args.urgent || args.wait.is_some() {
+        bail!("email fallback only supports plain sequential sends without --wait/--urgent");
+    }
+    send_registered_user_email(client, target, &text)
+}
+
+/// `sm send <person>` (sm#1580): the markdown becomes a message in the sm
+/// app, and the person's reply comes back to this session.
+fn send_message_to_human(
+    client: &ApiClient,
+    canonical: &str,
+    text: &str,
+    title: Option<&str>,
+    blocking: bool,
+) -> Result<()> {
+    let sender = optional_current_session_id().ok_or_else(|| {
+        anyhow!("sm send to a person needs a managed session, so the reply has somewhere to go")
+    })?;
+    let title = match title.map(str::trim) {
+        Some(title) if title.is_empty() || title.chars().count() > 120 => {
+            bail!("--title must be 1-120 characters")
+        }
+        other => other,
+    };
+    let response = client.request(
+        "POST",
+        &format!("/humans/{}/messages", encode_path_segment(canonical)),
+        Some(json!({
+            "sender_session_id": sender,
+            "text": text,
+            "title": title,
+            "blocking": blocking,
+        })),
+    )?;
+    if !(200..300).contains(&response.status) {
+        let detail = serde_json::from_str::<Value>(&response.body)
+            .ok()
+            .and_then(|body| body["detail"].as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| format!("HTTP {}: {}", response.status, response.body));
+        bail!("{detail}");
+    }
+    let payload = response.into_json()?;
+    println!(
+        "Sent to {canonical} in the sm app{} → {}",
+        if blocking { " (blocking)" } else { "" },
+        payload["reader_url"]
+            .as_str()
+            .or_else(|| payload["reader_path"].as_str())
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
 fn run_email(client: &ApiClient, args: EmailArgs) -> Result<()> {
     let requester_session_id = current_session_id()?;
     let recipient_raw = required_positional(args.recipient, "recipient")?;
@@ -1378,21 +1464,10 @@ fn run_email(client: &ApiClient, args: EmailArgs) -> Result<()> {
         if body.html.is_some() {
             bail!("sm email to human recipients supports plain text or markdown bodies only");
         }
+        // A person is reached in the sm app now; email is its fallback.
+        eprintln!("sm email to a person is deprecated; use sm send <person>");
         let canonical = human["recipient"].as_str().unwrap_or(&target);
-        let payload = client.post_json(
-            &format!("/humans/{}/email", encode_path_segment(canonical)),
-            json!({
-                "requester_session_id": requester_session_id,
-                "text": text,
-                "subject": subject,
-                "body_markdown": body.markdown,
-            }),
-        )?;
-        println!(
-            "Email sent to {}",
-            payload["recipient"].as_str().unwrap_or(canonical)
-        );
-        return Ok(());
+        return send_message_to_human(client, canonical, &text, subject.as_deref(), false);
     }
     let request_payload =
         registered_email_payload(requester_session_id, recipients, cc, subject, body)?;
@@ -3860,34 +3935,10 @@ fn send_input_payload(text: String, delivery_mode: &str, wait: Option<u64>) -> V
     payload
 }
 
-fn send_registered_email_fallback(client: &ApiClient, recipient: &str, text: &str) -> Result<()> {
+/// A target that is neither a session nor a person: a registered email user.
+fn send_registered_user_email(client: &ApiClient, recipient: &str, text: &str) -> Result<()> {
     let requester_session_id = optional_current_session_id()
         .ok_or_else(|| anyhow!("Managed sender session is required for email fallback"))?;
-    let human_response = client.request(
-        "GET",
-        &format!("/humans/{}", encode_path_segment(recipient)),
-        None,
-    )?;
-    if (200..300).contains(&human_response.status) {
-        let human = human_response.into_json()?;
-        let canonical = human["recipient"].as_str().unwrap_or(recipient);
-        let payload = client.post_json(
-            &format!("/humans/{}/email", encode_path_segment(canonical)),
-            json!({
-                "requester_session_id": requester_session_id,
-                "text": text,
-                "auto_subject": true
-            }),
-        )?;
-        println!(
-            "Email sent to {}",
-            payload["recipient"].as_str().unwrap_or(canonical)
-        );
-        return Ok(());
-    }
-    if human_response.status != 404 {
-        return Err(human_response.into_status_error());
-    }
     let payload = client.post_json(
         "/email/send",
         json!({
@@ -4642,6 +4693,10 @@ fn lookup_human(client: &ApiClient, identifier: &str) -> Result<Option<Value>> {
 }
 
 fn print_human_lookup(payload: &Value) {
+    println!("{}", human_lookup_text(payload));
+}
+
+fn human_lookup_text(payload: &Value) -> String {
     let recipient = payload["recipient"].as_str().unwrap_or("<unknown>");
     let aliases = payload["aliases"]
         .as_array()
@@ -4650,29 +4705,18 @@ fn print_human_lookup(payload: &Value) {
         .filter_map(Value::as_str)
         .filter(|alias| *alias != recipient)
         .collect::<Vec<_>>();
-    println!("Human recipient: {recipient}");
+    let mut lines = vec![format!("Human recipient: {recipient}")];
     if !aliases.is_empty() {
-        println!("Aliases: {}", aliases.join(", "));
+        lines.push(format!("Aliases: {}", aliases.join(", ")));
     }
-    println!(
-        "Default delivery: {}",
-        payload["default_channel"].as_str().unwrap_or("unknown")
+    lines.push(
+        "Default delivery: sm app (email if the phone does not confirm within 15 minutes)"
+            .to_owned(),
     );
-    let channels = payload["available_channels"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-    if !channels.is_empty() {
-        println!("Available delivery: {}", channels.join(", "));
-    }
-    if channels.contains(&"telegram") {
-        println!("Telegram delivery posts into the sending agent's SM-managed Telegram thread.");
-    }
-    if channels.contains(&"email") {
-        println!("Email is available as fallback/explicit only; use email sparingly.");
-    }
+    lines.push(format!(
+        "Send markdown with: sm send {recipient} [--blocking] <<'EOF' … EOF"
+    ));
+    lines.join("\n")
 }
 
 fn human_roster_row(entry: &Value) -> Vec<String> {
@@ -6350,102 +6394,312 @@ mod tests {
         assert_eq!(payload["sender_session_id"], "sender001");
     }
 
-    #[test]
-    fn send_registered_email_fallback_posts_auto_subject_payload() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
-        env::set_var("SESSION_MANAGER_ID", "sender001");
+    /// `(method, path, body)` of each request a scripted server saw.
+    type SeenRequests = Vec<(String, String, String)>;
 
+    /// A server answering `steps` in order, each `(method, path, status,
+    /// body)`. Returns every request's `(method, path, body)`.
+    fn scripted_server(
+        steps: Vec<(&'static str, &'static str, u16, &'static str)>,
+    ) -> (ApiClient, thread::JoinHandle<SeenRequests>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                .unwrap();
-            let (method, path, _) = read_test_request(&mut stream);
-            assert_eq!(method, "GET");
-            assert_eq!(path, "/humans/teammate");
-            let response_body = r#"{"detail":"Human recipient not configured"}"#;
-            let response = format!(
-                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                response_body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            drop(stream);
-
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                .unwrap();
-            let (method, path, body) = read_test_request(&mut stream);
-            assert_eq!(method, "POST");
-            assert_eq!(path, "/email/send");
-            let payload: Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(payload["requester_session_id"], "sender001");
-            assert_eq!(payload["recipients"], json!(["teammate"]));
-            assert_eq!(payload["cc"], json!([]));
-            assert_eq!(payload["body_text"], "hello via fallback");
-            assert_eq!(payload["auto_subject"], true);
-
-            let response_body =
-                r#"{"to":[{"username":"teammate","email":"teammate@example.test"}]}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                response_body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
+            let mut seen = Vec::new();
+            for (expected_method, expected_path, status, body) in steps {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let (method, path, request_body) = read_test_request(&mut stream);
+                assert_eq!(
+                    (method.as_str(), path.as_str()),
+                    (expected_method, expected_path)
+                );
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                seen.push((method, path, request_body));
+            }
+            seen
         });
-        let client = ApiClient::parse(&format!("http://{address}")).unwrap();
+        (
+            ApiClient::parse(&format!("http://{address}")).unwrap(),
+            server,
+        )
+    }
 
-        send_registered_email_fallback(&client, "teammate", "hello via fallback").unwrap();
+    fn send_args(target: &str, text: &str) -> SendArgs {
+        SendArgs {
+            session_id: target.to_owned(),
+            text: vec![text.to_owned()],
+            urgent: false,
+            wait: None,
+            title: None,
+            blocking: false,
+        }
+    }
 
+    const HUMAN: &str = r#"{"recipient":"rajesh","aliases":["rajesh","rajeshgoli"]}"#;
+    const NO_HUMAN: &str = r#"{"detail":"Human recipient not configured"}"#;
+
+    /// The requests `lookup_identifier_exact` makes for a target that is no
+    /// session.
+    fn no_session(
+        registry: &'static str,
+        session: &'static str,
+    ) -> Vec<(&'static str, &'static str, u16, &'static str)> {
+        vec![
+            ("GET", registry, 404, r#"{"detail":"Role not found"}"#),
+            ("GET", session, 404, r#"{"detail":"Session not found"}"#),
+            ("GET", "/sessions", 200, r#"{"sessions":[]}"#),
+        ]
+    }
+
+    #[test]
+    fn send_to_human_posts_message() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
+        env::set_var("SESSION_MANAGER_ID", "sender001");
+        let mut steps = no_session("/registry/rajeshgoli", "/sessions/rajeshgoli");
+        steps.push(("GET", "/humans/rajeshgoli", 200, HUMAN));
+        steps.push((
+            "POST",
+            "/humans/rajesh/messages",
+            201,
+            r#"{"id":"msg_3f9a2c1d","reader_url":"https://sm.example.com/messages/msg_3f9a2c1d"}"#,
+        ));
+        let (client, server) = scripted_server(steps);
+        let mut args = send_args("rajeshgoli", "# Keep it?\nBody");
+        args.title = Some("  Keep the table?  ".to_owned());
+        args.blocking = true;
+        run_send(&client, args).unwrap();
+        let seen = server.join().unwrap();
+        let payload: Value = serde_json::from_str(&seen[4].2).unwrap();
+        assert_eq!(
+            payload,
+            json!({"sender_session_id": "sender001", "text": "# Keep it?\nBody",
+                   "title": "Keep the table?", "blocking": true})
+        );
+
+        // A 429 fails with the server's detail.
+        let mut steps = no_session("/registry/rajesh", "/sessions/rajesh");
+        steps.push(("GET", "/humans/rajesh", 200, HUMAN));
+        steps.push((
+            "POST",
+            "/humans/rajesh/messages",
+            429,
+            r#"{"detail":"Rajesh has 5 unread messages from you; wait for them to be read"}"#,
+        ));
+        let (client, server) = scripted_server(steps);
+        let error = run_send(&client, send_args("rajesh", "again")).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Rajesh has 5 unread messages from you; wait for them to be read"
+        );
+        server.join().unwrap();
+
+        // --urgent and --wait don't apply; nor does a send without a session.
+        for (urgent, wait) in [(true, None), (false, Some(5))] {
+            let mut steps = no_session("/registry/rajesh", "/sessions/rajesh");
+            steps.push(("GET", "/humans/rajesh", 200, HUMAN));
+            let (client, server) = scripted_server(steps);
+            let mut args = send_args("rajesh", "x");
+            args.urgent = urgent;
+            args.wait = wait;
+            assert_eq!(
+                run_send(&client, args).unwrap_err().to_string(),
+                "--urgent/--wait do not apply to a message to a person; use --blocking"
+            );
+            server.join().unwrap();
+        }
+        env::remove_var("SESSION_MANAGER_ID");
+        let mut steps = no_session("/registry/rajesh", "/sessions/rajesh");
+        steps.push(("GET", "/humans/rajesh", 200, HUMAN));
+        let (client, server) = scripted_server(steps);
+        assert_eq!(
+            run_send(&client, send_args("rajesh", "x"))
+                .unwrap_err()
+                .to_string(),
+            "sm send to a person needs a managed session, so the reply has somewhere to go"
+        );
         server.join().unwrap();
     }
 
     #[test]
-    fn send_registered_email_fallback_uses_human_email_endpoint() {
+    fn send_to_non_human_keeps_email_fallback() {
         let _guard = ENV_LOCK.lock().unwrap();
         let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
         env::set_var("SESSION_MANAGER_ID", "sender001");
+        let mut steps = no_session("/registry/teammate", "/sessions/teammate");
+        steps.push(("GET", "/humans/teammate", 404, NO_HUMAN));
+        steps.push((
+            "POST",
+            "/email/send",
+            200,
+            r#"{"to":[{"username":"teammate","email":"teammate@example.test"}]}"#,
+        ));
+        let (client, server) = scripted_server(steps);
+        run_send(&client, send_args("teammate", "hello via fallback")).unwrap();
+        let seen = server.join().unwrap();
+        let payload: Value = serde_json::from_str(&seen[4].2).unwrap();
+        assert_eq!(payload["requester_session_id"], "sender001");
+        assert_eq!(payload["recipients"], json!(["teammate"]));
+        assert_eq!(payload["body_text"], "hello via fallback");
+        assert_eq!(payload["auto_subject"], true);
+    }
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let (method, path, _) = read_test_request(&mut stream);
-            assert_eq!(method, "GET");
-            assert_eq!(path, "/humans/rajeshgoli");
-            let response_body = r#"{"recipient":"rajesh"}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                response_body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            drop(stream);
-
-            let (mut stream, _) = listener.accept().unwrap();
-            let (method, path, body) = read_test_request(&mut stream);
-            assert_eq!(method, "POST");
-            assert_eq!(path, "/humans/rajesh/email");
-            let payload: Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(payload["requester_session_id"], "sender001");
-            assert_eq!(payload["text"], "hello human fallback");
-            assert_eq!(payload["auto_subject"], true);
-
-            let response_body = r#"{"recipient":"rajesh","status":"sent"}"#;
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                response_body.len()
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            drop(stream);
-        });
-        let client = ApiClient::parse(&format!("http://{address}")).unwrap();
-
-        send_registered_email_fallback(&client, "rajeshgoli", "hello human fallback").unwrap();
-
+    #[test]
+    fn title_and_blocking_need_a_human() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
+        env::set_var("SESSION_MANAGER_ID", "sender001");
+        // A session target.
+        let (client, server) = scripted_server(vec![(
+            "GET",
+            "/registry/worker",
+            200,
+            r#"{"session_id":"worker01"}"#,
+        )]);
+        let mut args = send_args("worker", "x");
+        args.blocking = true;
+        assert_eq!(
+            run_send(&client, args).unwrap_err().to_string(),
+            PERSON_FLAGS_ONLY
+        );
         server.join().unwrap();
+        // A registered email user.
+        let mut steps = no_session("/registry/teammate", "/sessions/teammate");
+        steps.push(("GET", "/humans/teammate", 404, NO_HUMAN));
+        let (client, server) = scripted_server(steps);
+        let mut args = send_args("teammate", "x");
+        args.title = Some("T".to_owned());
+        assert_eq!(
+            run_send(&client, args).unwrap_err().to_string(),
+            PERSON_FLAGS_ONLY
+        );
+        server.join().unwrap();
+        // A bad title is refused before anything is posted.
+        let mut steps = no_session("/registry/rajesh", "/sessions/rajesh");
+        steps.push(("GET", "/humans/rajesh", 200, HUMAN));
+        let (client, server) = scripted_server(steps);
+        let mut args = send_args("rajesh", "x");
+        args.title = Some(" ".to_owned());
+        assert_eq!(
+            run_send(&client, args).unwrap_err().to_string(),
+            "--title must be 1-120 characters"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn human_in_target_list_is_refused() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
+        env::set_var("SESSION_MANAGER_ID", "sender001");
+        let (client, server) = scripted_server(vec![
+            ("GET", "/humans/worker", 404, NO_HUMAN),
+            ("GET", "/humans/rajesh", 200, HUMAN),
+        ]);
+        assert_eq!(
+            run_send(&client, send_args("worker,rajesh", "x"))
+                .unwrap_err()
+                .to_string(),
+            "send to rajesh on its own, not in a list"
+        );
+        // Nothing was sent: only the two lookups reached the server.
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn email_to_human_is_a_deprecated_send() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
+        env::set_var("SESSION_MANAGER_ID", "sender001");
+        let (client, server) = scripted_server(vec![
+            ("GET", "/humans/rajeshgoli", 200, HUMAN),
+            (
+                "POST",
+                "/humans/rajesh/messages",
+                201,
+                r#"{"id":"msg_3f9a2c1d","reader_url":"https://sm.example.com/messages/msg_3f9a2c1d"}"#,
+            ),
+        ]);
+        run_email(
+            &client,
+            EmailArgs {
+                recipient: Some("rajeshgoli".to_owned()),
+                message: Some("Stage 2 is green.".to_owned()),
+                subject: Some("Status".to_owned()),
+                body: None,
+                text: None,
+                html: None,
+                cc: None,
+            },
+        )
+        .unwrap();
+        let seen = server.join().unwrap();
+        let payload: Value = serde_json::from_str(&seen[1].2).unwrap();
+        assert_eq!(payload["title"], "Status");
+        assert_eq!(payload["text"], "Stage 2 is green.");
+        assert_eq!(payload["blocking"], false);
+
+        // A person with --cc stays an error; a non-person keeps email.
+        let (client, server) = scripted_server(vec![("GET", "/humans/rajesh", 200, HUMAN)]);
+        assert!(run_email(
+            &client,
+            EmailArgs {
+                recipient: Some("rajesh".to_owned()),
+                message: Some("x".to_owned()),
+                subject: None,
+                body: None,
+                text: None,
+                html: None,
+                cc: Some("teammate".to_owned()),
+            },
+        )
+        .is_err());
+        server.join().unwrap();
+        let (client, server) = scripted_server(vec![
+            ("GET", "/humans/teammate", 404, NO_HUMAN),
+            (
+                "POST",
+                "/email/send",
+                200,
+                r#"{"to":[{"username":"teammate"}]}"#,
+            ),
+        ]);
+        run_email(
+            &client,
+            EmailArgs {
+                recipient: Some("teammate".to_owned()),
+                message: Some("x".to_owned()),
+                subject: Some("S".to_owned()),
+                body: None,
+                text: None,
+                html: None,
+                cc: None,
+            },
+        )
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn lookup_human_describes_app_delivery() {
+        assert_eq!(
+            human_lookup_text(&json!({
+                "recipient": "rajesh",
+                "aliases": ["rajesh", "rajeshgoli", "user", "operator"],
+                "default_channel": "email",
+            })),
+            "Human recipient: rajesh\n\
+             Aliases: rajeshgoli, user, operator\n\
+             Default delivery: sm app (email if the phone does not confirm within 15 minutes)\n\
+             Send markdown with: sm send rajesh [--blocking] <<'EOF' … EOF"
+        );
     }
 
     #[test]

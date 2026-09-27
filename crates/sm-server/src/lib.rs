@@ -15,6 +15,7 @@ pub mod mobile_analytics;
 pub mod mobile_devices;
 pub mod owner_doc_render;
 pub mod owner_docs;
+pub mod owner_messages;
 pub mod owner_push;
 pub mod push_fcm;
 pub mod queue;

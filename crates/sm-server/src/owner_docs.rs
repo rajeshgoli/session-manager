@@ -45,6 +45,11 @@ pub struct OwnerDocPublish {
     pub session_id: String,
     pub review_requested: bool,
     pub published_at: String,
+    /// The repo's main checkout on the owner's machine, as the publishing
+    /// CLI saw it (sm#1580): where Assign starts a new agent.
+    pub checkout_root: Option<String>,
+    /// Set by No review needed: the owner cleared this review request.
+    pub review_dismissed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -194,6 +199,7 @@ pub struct PublishOwnerDoc {
     pub commit_sha: String,
     pub blob_sha: String,
     pub review_requested: bool,
+    pub checkout_root: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,12 +220,14 @@ pub struct OwnerDocStateInputs<'a> {
     pub posted_reviews: Vec<(&'a str, &'a str)>,
 }
 
-/// Derived doc state; first match wins (spec "Storage").
+/// Derived doc state; first match wins (spec "Storage"). A review request
+/// the owner dismissed (No review needed) falls through to the next rule.
 pub fn derive_owner_doc_state(inputs: &OwnerDocStateInputs<'_>) -> OwnerDocState {
     let Some(latest) = inputs.publishes.last() else {
         return OwnerDocState::New;
     };
     if latest.review_requested
+        && latest.review_dismissed_at.is_none()
         && !inputs
             .posted_reviews
             .iter()
@@ -455,6 +463,17 @@ pub fn init_owner_docs_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    // Columns added after the table first shipped (sm#1580).
+    for column in ["checkout_root", "review_dismissed_at"] {
+        let present = conn
+            .prepare("SELECT 1 FROM pragma_table_info('owner_doc_publishes') WHERE name = ?1")?
+            .exists(params![column])?;
+        if !present {
+            conn.execute_batch(&format!(
+                "ALTER TABLE owner_doc_publishes ADD COLUMN {column} TEXT"
+            ))?;
+        }
+    }
     Ok(())
 }
 
@@ -574,15 +593,17 @@ impl OwnerDocStore {
         };
         tx.execute(
             "INSERT INTO owner_doc_publishes
-             (doc_id, commit_sha, blob_sha, session_id, review_requested, published_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (doc_id, commit_sha, blob_sha, session_id, review_requested, published_at,
+              checkout_root)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 doc_id,
                 request.commit_sha,
                 request.blob_sha,
                 request.session_id,
                 request.review_requested,
-                now
+                now,
+                request.checkout_root
             ],
         )?;
         let publish_id = tx.last_insert_rowid();
@@ -598,6 +619,68 @@ impl OwnerDocStore {
             publish,
             created,
         })
+    }
+
+    /// No review needed: clears the latest publish's open review request.
+    /// Returns whether a request was cleared.
+    pub fn dismiss_review(&self, doc_id: &str) -> Result<bool> {
+        let conn = self.open_write()?;
+        Ok(conn.execute(
+            "UPDATE owner_doc_publishes SET review_dismissed_at = ?2
+             WHERE id = (SELECT MAX(id) FROM owner_doc_publishes WHERE doc_id = ?1)
+               AND review_requested = 1 AND review_dismissed_at IS NULL",
+            params![doc_id, now_rfc3339()],
+        )? > 0)
+    }
+
+    /// Hands an undelivered review to `session_id` (Assign, sm#1580).
+    /// Returns false when another call already did.
+    pub fn assign_review(&self, submission_id: &str, session_id: &str) -> Result<bool> {
+        let conn = self.open_write()?;
+        Ok(conn.execute(
+            "UPDATE owner_doc_reviews SET delivered_to_session_id = ?2
+             WHERE id = ?1 AND status = 'posted' AND delivered_to_session_id IS NULL",
+            params![submission_id, session_id],
+        )? > 0)
+    }
+
+    /// Publishes with `review_requested`, newest first, since `since`: the
+    /// notice repair pass's candidates.
+    pub fn review_publishes_since(&self, since: &str) -> Result<Vec<(OwnerDoc, OwnerDocPublish)>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = conn.prepare(&format!(
+            "SELECT {PUBLISH_COLUMNS} FROM owner_doc_publishes
+             WHERE review_requested = 1 AND published_at >= ?1 ORDER BY id"
+        ))?;
+        let publishes = statement
+            .query_map(params![since], publish_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut rows = Vec::new();
+        for publish in publishes {
+            if let Some(doc) = get_doc_conn(&conn, &publish.doc_id)? {
+                rows.push((doc, publish));
+            }
+        }
+        Ok(rows)
+    }
+
+    pub fn publish_by_id(&self, publish_id: i64) -> Result<Option<(OwnerDoc, OwnerDocPublish)>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        let Some(publish) = conn
+            .query_row(
+                &format!("SELECT {PUBLISH_COLUMNS} FROM owner_doc_publishes WHERE id = ?1"),
+                params![publish_id],
+                publish_from_row,
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        Ok(get_doc_conn(&conn, &publish.doc_id)?.map(|doc| (doc, publish)))
     }
 
     pub fn get(&self, doc_id: &str) -> Result<Option<OwnerDoc>> {
@@ -658,6 +741,8 @@ impl OwnerDocStore {
                     session_id: row.get(15)?,
                     review_requested: row.get::<_, i64>(16)? != 0,
                     published_at: row.get(17)?,
+                    checkout_root: row.get(18)?,
+                    review_dismissed_at: row.get(19)?,
                 };
                 Ok((doc, publish))
             })?
@@ -1235,8 +1320,8 @@ fn random_hex(bytes: usize) -> String {
 
 const DOC_COLUMNS: &str = "id, repo, path, pr_number, author_session_id, author_session_name, \
      title, note, retracted_at, created_at, updated_at";
-const PUBLISH_COLUMNS: &str =
-    "id, doc_id, commit_sha, blob_sha, session_id, review_requested, published_at";
+const PUBLISH_COLUMNS: &str = "id, doc_id, commit_sha, blob_sha, session_id, review_requested, \
+     published_at, checkout_root, review_dismissed_at";
 
 fn doc_from_row(row: &Row<'_>) -> rusqlite::Result<OwnerDoc> {
     Ok(OwnerDoc {
@@ -1263,6 +1348,8 @@ fn publish_from_row(row: &Row<'_>) -> rusqlite::Result<OwnerDocPublish> {
         session_id: row.get(4)?,
         review_requested: row.get::<_, i64>(5)? != 0,
         published_at: row.get(6)?,
+        checkout_root: row.get(7)?,
+        review_dismissed_at: row.get(8)?,
     })
 }
 
@@ -1432,6 +1519,30 @@ pub fn render_doc_page(path: &str, title: &str, bytes: &[u8], injection: &str) -
     }
 }
 
+/// The owner message page (sm#1580): the markdown rendered as a `.md` doc
+/// is, under a meta line (`meta_html`, already escaped), with `injection`
+/// (the reader client) before `</body>`.
+pub fn render_message_page(
+    title: &str,
+    meta_html: &str,
+    markdown: &str,
+    injection: &str,
+) -> Vec<u8> {
+    use crate::owner_doc_render::{
+        find_body_end, inject_before_body_end, render_markdown_with_lines,
+    };
+    let page = doc_shell(
+        title,
+        &format!(
+            "<p class=\"sm-meta\">{meta_html}</p>\n<article>\n{}</article>",
+            render_markdown_with_lines(markdown)
+        ),
+    )
+    .into_bytes();
+    let body_end = find_body_end(&page);
+    inject_before_body_end(page, body_end, injection)
+}
+
 fn doc_shell(title: &str, body: &str) -> String {
     format!(
         r#"<!doctype html>
@@ -1453,6 +1564,7 @@ th, td {{ border: 1px solid color-mix(in srgb, currentColor 25%, transparent); p
 blockquote {{ margin-left: 0; padding-left: 1rem;
   border-left: 3px solid color-mix(in srgb, currentColor 25%, transparent); }}
 img {{ max-width: 100%; }}
+.sm-meta {{ margin: 0 0 1rem; font-size: 0.85em; opacity: 0.7; }}
 </style>
 </head>
 <body>
@@ -1645,6 +1757,7 @@ mod tests {
             commit_sha: commit.repeat(40),
             blob_sha: blob.repeat(40),
             review_requested: false,
+            checkout_root: None,
         }
     }
 
@@ -1757,6 +1870,8 @@ mod tests {
             session_id: "s".into(),
             review_requested,
             published_at: at.into(),
+            checkout_root: None,
+            review_dismissed_at: None,
         };
         let first = publish("b1", "2026-09-24T10:00:00Z", true);
         let mut inputs = OwnerDocStateInputs {
@@ -1776,6 +1891,62 @@ mod tests {
             derive_owner_doc_state(&inputs),
             OwnerDocState::ReviewRequested
         );
+    }
+
+    #[test]
+    fn dismissed_request_is_not_review_requested() {
+        let (store, dir) = store();
+        let mut request = publish(Some(7), "a", "1");
+        request.review_requested = true;
+        request.checkout_root = Some("/Users/owner/repo".into());
+        let published = store.publish(request, |_| true).unwrap();
+        let id = published.doc.id;
+        assert_eq!(
+            published.publish.checkout_root.as_deref(),
+            Some("/Users/owner/repo")
+        );
+        assert_eq!(
+            store.summary(&id).unwrap().unwrap().state,
+            OwnerDocState::ReviewRequested
+        );
+        assert!(store.dismiss_review(&id).unwrap());
+        assert!(!store.dismiss_review(&id).unwrap(), "only once");
+        // Falls through to the next rule: nobody has viewed it, so New.
+        assert_eq!(
+            store.summary(&id).unwrap().unwrap().state,
+            OwnerDocState::New
+        );
+        let latest = store.publishes(&id).unwrap().pop().unwrap();
+        assert!(latest.review_dismissed_at.is_some());
+        // A new --review publish asks again.
+        let mut again = publish(Some(7), "b", "2");
+        again.review_requested = true;
+        store.publish(again, |_| true).unwrap();
+        assert_eq!(
+            store.summary(&id).unwrap().unwrap().state,
+            OwnerDocState::ReviewRequested
+        );
+        // A plain publish has nothing to dismiss.
+        store.publish(publish(Some(7), "c", "3"), |_| true).unwrap();
+        assert!(!store.dismiss_review(&id).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn old_publish_tables_gain_the_new_columns() {
+        let (store, dir) = store();
+        let conn = Connection::open(dir.join("message_queue.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE owner_doc_publishes (id INTEGER PRIMARY KEY, doc_id TEXT NOT NULL,
+               commit_sha TEXT NOT NULL, blob_sha TEXT NOT NULL, session_id TEXT NOT NULL,
+               review_requested INTEGER NOT NULL DEFAULT 0, published_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        store.ensure_schema().unwrap();
+        store.ensure_schema().unwrap();
+        store.publish(publish(Some(7), "a", "1"), |_| true).unwrap();
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

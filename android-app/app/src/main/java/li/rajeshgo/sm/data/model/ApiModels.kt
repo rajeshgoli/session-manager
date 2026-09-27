@@ -589,6 +589,19 @@ data class SessionObligations(
     val docs: List<SessionDoc> = emptyList(),
     /** Active work claims (`sm ticket`, `sm pr`); schema 3 and later. */
     val claims: List<SessionClaim> = emptyList(),
+    /** Messages this agent sent the owner in the last 30 days, newest first; schema 4 and later (sm#1580). */
+    val messages: List<SessionMessage> = emptyList(),
+)
+
+/** A message an agent sent the owner with `sm send <person>` (sm#1580). */
+@Serializable
+data class SessionMessage(
+    val id: String = "",
+    val title: String = "",
+    /** `new`, `read`, `needs_you`, `replied` or `handled`. */
+    val state: String = "",
+    @SerialName("created_at") val createdAt: String? = null,
+    @SerialName("reader_path") val readerPath: String = "",
 )
 
 /** A ticket or PR this session holds. `history_path` is its ticket page, `/t/<repo-name>/<n>`. */
@@ -721,6 +734,8 @@ data class OwnerFollow(
 @Serializable
 data class FollowsResponse(
     @SerialName("push_configured") val pushConfigured: Boolean = false,
+    /** How sm names the owner (sm#1580); builds the Follow dialog's default message. */
+    @SerialName("owner_name") val ownerName: String? = null,
     val follows: List<OwnerFollow> = emptyList(),
 )
 

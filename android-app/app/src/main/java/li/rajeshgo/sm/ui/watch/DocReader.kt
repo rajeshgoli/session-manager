@@ -47,6 +47,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import java.net.URI
 import li.rajeshgo.sm.data.model.SessionClaim
 import li.rajeshgo.sm.data.model.SessionDoc
+import li.rajeshgo.sm.data.model.SessionMessage
 import li.rajeshgo.sm.data.remote.DeviceClientCertificate
 import li.rajeshgo.sm.ui.theme.BorderStrong
 import li.rajeshgo.sm.ui.theme.Cyan
@@ -125,6 +126,22 @@ data class ReaderPage(
     val followsPage: Boolean = false,
 )
 
+/** The reader page for an owner message (sm#1580): its page at `/messages/<id>`. */
+fun messageReaderPage(message: SessionMessage): ReaderPage = ReaderPage(
+    title = message.title,
+    subtitle = "Message",
+    path = message.readerPath.takeIf { it.startsWith("/messages/") } ?: "/messages/${message.id}",
+)
+
+fun messageStateLabel(state: String): String = when (state) {
+    "new" -> "New"
+    "read" -> "Read"
+    "needs_you" -> "Needs you"
+    "replied" -> "Replied"
+    "handled" -> "Handled"
+    else -> state.replace('_', ' ').replaceFirstChar { it.uppercaseChar() }
+}
+
 fun docReaderPage(doc: SessionDoc): ReaderPage = ReaderPage(
     title = doc.title.ifBlank { docDisplayName(doc) },
     subtitle = docDisplayName(doc),
@@ -139,7 +156,7 @@ val historyReaderPage: ReaderPage get() = ownerReaderPage("History", "/history")
 
 /**
  * The reader page for an opened sm link on the owner's browser host
- * (`https://<linkHost>/docs/…`, `/t/…` or `/history`), or null when the link
+ * (`https://<linkHost>/docs/…`, `/messages/…`, `/t/…` or `/history`), or null when the link
  * is not one. The reader loads the same path and query from the app's server;
  * a doc's link stays the page's shared link.
  */
@@ -155,6 +172,8 @@ fun readerPageForLink(url: String, linkHost: String): ReaderPage? {
             val name = uri.path.removePrefix("/docs/")
             ReaderPage(title = "", subtitle = name, path = path, browserUrl = url)
         }
+        rawPath.startsWith("/messages/") && rawPath.length > "/messages/".length ->
+            ReaderPage(title = "Message", subtitle = uri.path.removePrefix("/messages/"), path = path, browserUrl = url)
         rawPath.startsWith("/t/") -> ownerReaderPage("Ticket", path)
         rawPath == "/history" -> ownerReaderPage("History", path)
         else -> null
@@ -206,12 +225,12 @@ fun docNavigation(serverUrl: String, currentUrl: String?, targetUrl: String): Do
 }
 
 /**
- * The pages that stay in the reader: docs, History, ticket pages, and the web
+ * The pages that stay in the reader: docs, owner messages (sm#1580), History, ticket pages, and the web
  * watch at `/` and `/watch`, so the page shell's Watch · History tabs never
  * leave the authenticated web view.
  */
 fun isOwnerPagePath(path: String): Boolean =
-    path.startsWith("/docs/") || path.startsWith("/t/") ||
+    path.startsWith("/docs/") || path.startsWith("/messages/") || path.startsWith("/t/") ||
         path == "/history" || path == "/watch" || path == "/" || path.isEmpty()
 
 private fun sameOrigin(a: URI, b: URI): Boolean =

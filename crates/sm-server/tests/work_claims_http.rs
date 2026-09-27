@@ -509,7 +509,7 @@ async fn implicit_claims_from_doc_publish_and_codex_review_and_the_feed() {
     claim(&f, "eng00001", "ticket", 1, json!({})).await;
     let (status, feed) = request(&f.app, "GET", "/session-obligations", None).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(feed["schema_version"], 3);
+    assert_eq!(feed["schema_version"], 4);
     let eng = feed["sessions"]
         .as_array()
         .unwrap()

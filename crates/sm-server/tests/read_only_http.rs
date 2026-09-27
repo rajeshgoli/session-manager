@@ -5077,7 +5077,7 @@ async fn queue_job_log_reads_a_bounded_derived_tail() {
     assert_eq!(payload["text"], "two\nthree\n");
     let (status, payload) = get_json(app.clone(), "/session-obligations").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["schema_version"], 3);
+    assert_eq!(payload["schema_version"], 4);
     assert_eq!(payload["sessions"].as_array().unwrap().len(), 2);
     assert_eq!(payload["sessions"][0]["session_id"], "notify1");
     assert_eq!(
@@ -23674,6 +23674,7 @@ fn owner_docs_app_with(
         sm_send: SmSendConfig {
             db_path: dir.join("message_queue.db").display().to_string(),
         },
+        owner_name: "Rajesh".to_owned(),
         ..AppConfig::default()
     };
     config.rust_core.fixture_writes_enabled = true;
@@ -23766,7 +23767,7 @@ async fn owner_docs_publish_read_and_project_state() {
     assert_eq!(source.fetches.load(Ordering::SeqCst), fetches);
 
     let (_, obligations) = get_json(app.clone(), "/session-obligations").await;
-    assert_eq!(obligations["schema_version"], 3);
+    assert_eq!(obligations["schema_version"], 4);
     let author = owner_doc_session(&obligations, "author01");
     assert_eq!(author["docs"][0]["id"], id);
     assert_eq!(
@@ -24747,6 +24748,7 @@ async fn owner_doc_token_opens_the_json_endpoints_for_its_own_doc_only() {
         commit_sha: "a".repeat(40),
         blob_sha: git_blob_sha(REVIEW_MEMO),
         review_requested: false,
+        checkout_root: None,
     };
     let id = store
         .publish(publish("specs/memo.html"), |_| true)
@@ -24969,6 +24971,7 @@ async fn owner_doc_page_cookie_opens_only_the_files_beside_that_doc() {
         commit_sha: c1.clone(),
         blob_sha: "0".repeat(40),
         review_requested: false,
+        checkout_root: None,
     };
     let id = store
         .publish(publish("docs/working/walk.html"), |_| true)

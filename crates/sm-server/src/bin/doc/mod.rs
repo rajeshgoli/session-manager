@@ -375,6 +375,14 @@ fn run_doc_publish(client: &ApiClient, args: DocPublishArgs) -> Result<()> {
     if args.review && resolved.pr_number.is_none() {
         bail!("--review needs an open PR: open one containing the file, then pass --pr <N>");
     }
+    let file = if args.path.is_absolute() {
+        args.path.clone()
+    } else {
+        cwd.join(&args.path)
+    };
+    let checkout_root = file
+        .parent()
+        .and_then(|dir| main_checkout_root(&ProcessTools, dir));
     let doc = client.post_json(
         "/docs",
         json!({
@@ -386,6 +394,7 @@ fn run_doc_publish(client: &ApiClient, args: DocPublishArgs) -> Result<()> {
             "title": args.title,
             "note": args.note,
             "review": args.review,
+            "checkout_root": checkout_root,
         }),
     )?;
     println!(
@@ -400,11 +409,32 @@ fn run_doc_publish(client: &ApiClient, args: DocPublishArgs) -> Result<()> {
     }
     if args.review {
         println!(
-            "Review requested. The owner's review arrives as a GitHub PR review on #{}; sm wakes you with [sm review] when it lands.",
+            "Review requested. {} is notified in the sm app; the review arrives as a GitHub PR review on #{}, and sm wakes you with [sm review].",
+            doc["owner_name"].as_str().unwrap_or("The owner"),
             resolved.pr_number.unwrap_or_default()
         );
     }
     Ok(())
+}
+
+/// The repo's main checkout: the parent of git's common dir, run in `dir`.
+/// For a file in a linked worktree this is the checkout the worktree was
+/// made from, which outlives it (sm#1580). `None` when git can't say.
+pub(crate) fn main_checkout_root(tools: &dyn DocTools, dir: &Path) -> Option<String> {
+    let common = run_ok(
+        tools,
+        "git",
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()?;
+    let root = Path::new(common.trim()).parent()?;
+    Some(
+        fs::canonicalize(root)
+            .unwrap_or_else(|_| root.to_path_buf())
+            .display()
+            .to_string(),
+    )
 }
 
 fn doc_location(doc: &Value) -> String {
@@ -548,6 +578,56 @@ fn review_line(review: &Value) -> String {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn checkout_root_is_the_main_checkout() {
+        let base = std::env::temp_dir().join(format!(
+            "sm-doc-checkout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let main = base.join("repo");
+        let linked = base.join("linked");
+        fs::create_dir_all(main.join("docs")).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let output = process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{args:?}: {output:?}");
+        };
+        git(&main, &["init", "-q"]);
+        fs::write(main.join("docs/memo.md"), "# Memo\n").unwrap();
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-q", "-m", "memo"]);
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "wt",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let expected = fs::canonicalize(&main).unwrap().display().to_string();
+        assert_eq!(
+            main_checkout_root(&ProcessTools, &main.join("docs")).as_deref(),
+            Some(expected.as_str())
+        );
+        // From a linked worktree: the checkout it was made from.
+        assert_eq!(
+            main_checkout_root(&ProcessTools, &linked.join("docs")).as_deref(),
+            Some(expected.as_str())
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn reader_url_prefers_the_browser_hostname_link() {

@@ -480,7 +480,7 @@ fun waitingSummary(session: ClientSession): String? {
     if (waits.isEmpty()) return null
     val prefix = if (isWaitingForResult(session)) "Waiting for " else "Pending: "
     return if (waits.size == 1) prefix + waits.first().label + " · " + ageFromIso(waits.first().since)
-    else prefix + listOf("queue_job" to "job", "review" to "review", "owner_review" to "owner review").mapNotNull { (kind, label) ->
+    else prefix + listOf("queue_job" to "job", "review" to "review", "owner_review" to "owner review", "owner_message" to "message").mapNotNull { (kind, label) ->
         val count = waits.count { it.kind == kind }
         if (count == 0) null else "$count $label${if (count == 1) "" else "s"}"
     }.joinToString(" and ")
@@ -539,11 +539,19 @@ fun summaryAgeLabel(timestamp: String?, now: OffsetDateTime = OffsetDateTime.now
     }
 }
 
-/** Prefilled message the Follow dialog sends the agent; sm adds the `[sm follow]` marker (sm#1569). */
-const val DEFAULT_FOLLOW_MESSAGE =
-    "Rajesh is following you from the sm app. When your task is done, commit a completion report " +
-        "(conclusion first, written for Rajesh), publish it with `sm doc publish <path>`, then run " +
+/** How the app names the owner until the server says (`owner_name`, sm#1580). */
+const val DEFAULT_OWNER_NAME = "Owner"
+
+/**
+ * Prefilled message the Follow dialog sends the agent; sm adds the `[sm follow]` marker
+ * (sm#1569). [ownerName] is the server's `owner_name` setting (sm#1580).
+ */
+fun defaultFollowMessage(ownerName: String): String {
+    val name = ownerName.trim().ifEmpty { DEFAULT_OWNER_NAME }
+    return "$name is following you from the sm app. When your task is done, commit a completion report " +
+        "(conclusion first, written for $name), publish it with `sm doc publish <path>`, then run " +
         "`sm task-complete`. Publish before task-complete: the notification links to the newest doc you published."
+}
 
 const val NOTIFICATIONS_OFF_MESSAGE = "Notifications off — you'll be emailed instead"
 

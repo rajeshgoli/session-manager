@@ -16,9 +16,6 @@
 use super::*;
 use crate::owner_docs::{OwnerDocDraft, OwnerDocReview, OwnerDocVerdict, PostedOwnerDocReview};
 
-/// How wake messages name the owner.
-const OWNER_NAME: &str = "Rajesh";
-
 pub(super) fn review_marker(submission_id: &str) -> String {
     format!("<!-- sm-review:{submission_id} -->")
 }
@@ -53,6 +50,7 @@ fn plural(count: i64, noun: &str) -> String {
 }
 
 pub(super) fn render_owner_review_wake(
+    owner_name: &str,
     doc: &OwnerDoc,
     review: &OwnerDocReview,
     review_url: &str,
@@ -85,7 +83,7 @@ pub(super) fn render_owner_review_wake(
         );
     }
     let mut wake = format!(
-        "[sm review] {OWNER_NAME}'s review of \"{}\" (PR #{} @ {}) is here: {review_url}\nVerdict: {verdict} · {}",
+        "[sm review] {owner_name}'s review of \"{}\" (PR #{} @ {}) is here: {review_url}\nVerdict: {verdict} · {}",
         doc.title,
         doc.pr_number.unwrap_or_default(),
         &review.commit_sha[..review.commit_sha.len().min(7)],
@@ -94,7 +92,7 @@ pub(super) fn render_owner_review_wake(
     // The overall text carries instructions the verdict alone does not
     // (sm#1578), so it rides in the wake instead of only behind the link.
     if let Some(overall) = overall {
-        wake.push_str(&format!("\n{OWNER_NAME} wrote:\n"));
+        wake.push_str(&format!("\n{owner_name} wrote:\n"));
         wake.push_str(&quote_overall(overall));
     }
     wake
@@ -121,31 +119,14 @@ fn quote_overall(overall: &str) -> String {
 }
 
 pub(super) fn is_retired(session: &SessionRecord) -> bool {
-    matches!(
-        session.completion_status.as_deref(),
-        Some("retired" | "killed")
-    )
+    super::super::messages::session_ended(session)
 }
 
 /// The author if it still exists (a stopped session gets the queued message
-/// on restore), else the retired author's parent, else nobody.
+/// on restore), else the retired author's parent, else nobody: the rule
+/// message replies use too.
 pub(super) fn review_wake_recipient(state: &AppState, doc: &OwnerDoc) -> Option<String> {
-    let author = state
-        .session_store
-        .get_session(&doc.author_session_id)
-        .ok()
-        .flatten()?;
-    if !is_retired(&author) {
-        return Some(author.id);
-    }
-    let parent = author.parent_session_id.as_deref()?;
-    state
-        .session_store
-        .get_session(parent)
-        .ok()
-        .flatten()
-        .filter(|parent| !is_retired(parent))
-        .map(|parent| parent.id)
+    super::super::messages::live_recipient(state, &doc.author_session_id).map(|session| session.id)
 }
 
 #[derive(Debug, Deserialize)]
@@ -590,7 +571,14 @@ fn finish(
     let wake = review_wake_recipient(state, doc).map(|session_id| {
         (
             session_id,
-            render_owner_review_wake(doc, review, review_url, line_comments, file_comments),
+            render_owner_review_wake(
+                &state.config.owner_name,
+                doc,
+                review,
+                review_url,
+                line_comments,
+                file_comments,
+            ),
         )
     });
     let (posted, changed) = owner_doc_store(state).finish_review(
@@ -619,6 +607,122 @@ fn finish(
         }
     }
     Ok(posted)
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AssignReviewRequest {
+    review_id: String,
+}
+
+/// The task a new agent gets for a review nobody was left to take.
+pub(super) fn assign_task_text(
+    owner_name: &str,
+    doc: &OwnerDoc,
+    review: &OwnerDocReview,
+) -> String {
+    let pr = doc.pr_number.unwrap_or_default();
+    format!(
+        "[sm review] Your task is {owner_name}'s latest review of \"{title}\" on PR #{pr} in {repo}. \
+         The agent that wrote the doc has ended, so the review is yours.\n{wake}\n\
+         Check out the PR branch in your own worktree, run `sm pr` from it to claim the PR, \
+         address the review, push, and republish with `sm doc publish {path} --pr {pr} --review`.",
+        title = doc.title,
+        repo = doc.repo,
+        path = doc.path,
+        wake = render_owner_review_wake(
+            owner_name,
+            doc,
+            review,
+            review.github_review_url.as_deref().unwrap_or_default(),
+            review.line_comment_count,
+            review.file_comment_count,
+        ),
+    )
+}
+
+/// `POST /docs/{id}/assign` (sm#1580, appendix D5): starts an agent of the
+/// ended author's type and model in the repo's checkout, with the doc's
+/// latest undelivered review as its task. Eligibility is checked here, not
+/// on the page, so a stale page can never start a second agent.
+pub(super) async fn assign_review(
+    state: &Arc<AppState>,
+    doc: &OwnerDoc,
+    payload: AssignReviewRequest,
+) -> Result<Value, ApiError> {
+    let _guard = state.owner_doc_review_lock.lock().await;
+    let store = owner_doc_store(state);
+    let review_id = payload.review_id.trim();
+    let review = store
+        .review(review_id)?
+        .filter(|review| review.doc_id == doc.id && review.status == "posted")
+        .ok_or_else(|| conflict("Review not found"))?;
+    if let Some(session_id) = review.delivered_to_session_id.as_deref() {
+        return Err(conflict(format!(
+            "Review is already with {}",
+            session_name_or_id(state, session_id)
+        )));
+    }
+    let latest = store
+        .reviews(&doc.id)?
+        .into_iter()
+        .rfind(|review| review.status == "posted");
+    if latest.as_ref().map(|latest| latest.id.as_str()) != Some(review.id.as_str()) {
+        return Err(conflict("A newer review exists; reload"));
+    }
+    if let Some(session_id) = review_wake_recipient(state, doc) {
+        return Err(conflict(format!(
+            "The doc has an agent again: {}",
+            session_name_or_id(state, &session_id)
+        )));
+    }
+    let working_dir = store
+        .publishes(&doc.id)?
+        .into_iter()
+        .rev()
+        .filter_map(|publish| publish.checkout_root)
+        .find(|root| StdPath::new(root).is_dir())
+        .ok_or_else(|| {
+            conflict(format!(
+                "No local checkout is known for {}; start the agent yourself.",
+                crate::owner_docs::repo_name(&doc.repo)
+            ))
+        })?;
+    let author = state.session_store.get_session(&doc.author_session_id)?;
+    let payload = CreateCoreSessionRequest {
+        id: None,
+        name: None,
+        working_dir: Some(working_dir),
+        provider: author.as_ref().map(|author| author.provider.clone()),
+        parent_session_id: None,
+        node: None,
+        initial_message: Some(assign_task_text(&state.config.owner_name, doc, &review)),
+        model: author.as_ref().and_then(|author| author.model.clone()),
+        reasoning_effort: author
+            .as_ref()
+            .and_then(|author| author.reasoning_effort.clone()),
+        wait: None,
+        spawn_prompt_source: Some(SpawnBriefSource {
+            kind: "positional".to_owned(),
+            path: None,
+        }),
+        spawn_brief: None,
+    };
+    let session = super::super::create_session_from_request(state.clone(), payload).await?;
+    store.assign_review(&review.id, &session.id)?;
+    Ok(json!({
+        "session_id": session.id,
+        "name": session_display_name(session.clone()),
+    }))
+}
+
+fn session_name_or_id(state: &AppState, session_id: &str) -> String {
+    state
+        .session_store
+        .get_session(session_id)
+        .ok()
+        .flatten()
+        .map(session_display_name)
+        .unwrap_or_else(|| session_id.to_owned())
 }
 
 /// Startup: finish or restart any submit a crash left `submitting`.
@@ -692,6 +796,7 @@ mod tests {
     fn wake_names_the_doc_pr_version_verdict_and_counts() {
         assert_eq!(
             render_owner_review_wake(
+                "Rajesh",
                 &doc("Decision memo"),
                 &review("changes_requested"),
                 "https://github.com/acme/widgets/pull/12#pullrequestreview-1",
@@ -701,11 +806,11 @@ mod tests {
             "[sm review] Rajesh's review of \"Decision memo\" (PR #12 @ abcdef0) is here: https://github.com/acme/widgets/pull/12#pullrequestreview-1\nVerdict: changes requested · 5 line comments · 1 file comment"
         );
         assert!(
-            render_owner_review_wake(&doc("M"), &review("approve"), "u", 0, 0)
+            render_owner_review_wake("Rajesh", &doc("M"), &review("approve"), "u", 0, 0)
                 .ends_with("Verdict: approved · no comments")
         );
         assert!(
-            render_owner_review_wake(&doc("M"), &review("comment"), "u", 1, 0)
+            render_owner_review_wake("Rajesh", &doc("M"), &review("comment"), "u", 1, 0)
                 .ends_with("Verdict: comments · 1 line comment")
         );
     }
@@ -718,18 +823,20 @@ mod tests {
                 .into(),
         );
         assert_eq!(
-            render_owner_review_wake(&doc("M"), &approved, "u", 0, 0),
+            render_owner_review_wake("Rajesh", &doc("M"), &approved, "u", 0, 0),
             "[sm review] Rajesh's review of \"M\" (PR #12 @ abcdef0) is here: u\nVerdict: approved · no line or file comments\nRajesh wrote:\n> Decisions look good.\n>\n> Merge after 2 Codex rounds. File only tickets that can start now."
         );
 
         let mut blank = review("approve");
         blank.body = Some(" \n ".into());
-        assert!(render_owner_review_wake(&doc("M"), &blank, "u", 0, 0)
-            .ends_with("Verdict: approved · no comments"));
+        assert!(
+            render_owner_review_wake("Rajesh", &doc("M"), &blank, "u", 0, 0)
+                .ends_with("Verdict: approved · no comments")
+        );
 
         let mut long = review("comment");
         long.body = Some("é".repeat(WAKE_OVERALL_MAX_CHARS + 1));
-        let wake = render_owner_review_wake(&doc("M"), &long, "u", 1, 0);
+        let wake = render_owner_review_wake("Rajesh", &doc("M"), &long, "u", 1, 0);
         assert!(wake.contains("Verdict: comments · 1 line comment\nRajesh wrote:\n> é"));
         assert!(wake.ends_with(&format!(
             "{}\n> … (truncated; read the rest at the link above)",

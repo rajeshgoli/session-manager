@@ -165,6 +165,34 @@ class DocReaderTest {
         assertEquals("/history", readerPageForLink("https://sm.example.com/history", host)!!.path)
     }
 
+    @Test fun obligationsWithAndWithoutMessagesParse() {
+        val without = """{"schema_version":3,"sessions":[{"session_id":"abc12345","waiting_on":[],"review_history":[],"docs":[],"claims":[]}]}"""
+        assertTrue(json.decodeFromString(SessionObligationsResponse.serializer(), without).sessions.single().messages.isEmpty())
+        val with = """
+            {"schema_version":4,"sessions":[{"session_id":"abc12345","review_history":[],"docs":[],"claims":[],
+              "waiting_on":[{"kind":"owner_message","id":"msg_3f9a2c1d","label":"Rajesh · Keep it?","since":"2026-09-26T10:00:00Z"}],
+              "messages":[{"id":"msg_3f9a2c1d","title":"Keep it?","state":"needs_you","created_at":"2026-09-26T10:00:00Z",
+                           "reader_path":"/messages/msg_3f9a2c1d"}]}]}
+        """.trimIndent()
+        val session = json.decodeFromString(SessionObligationsResponse.serializer(), with).sessions.single()
+        val message = session.messages.single()
+        assertEquals("needs_you", message.state)
+        assertEquals("Needs you", messageStateLabel(message.state))
+        assertEquals("/messages/msg_3f9a2c1d", messageReaderPage(message).path)
+        assertEquals("Keep it?", messageReaderPage(message).title)
+        assertEquals("owner_message", session.waitingOn.single().kind)
+    }
+
+    @Test fun messageLinksOpenAndStayInTheReader() {
+        val link = "https://sm.example.com/messages/msg_3f9a2c1d"
+        val page = readerPageForLink(link, "sm.example.com")!!
+        assertEquals("/messages/msg_3f9a2c1d", page.path)
+        assertEquals(link, page.browserUrl)
+        assertNull(readerPageForLink("https://sm.example.com/messages/", "sm.example.com"))
+        assertEquals(DocNavigation.Reload, docNavigation(server, "$server/messages/msg_00000001", "$server/messages/msg_3f9a2c1d"))
+        assertTrue(isOwnerPagePath("/messages/msg_3f9a2c1d"))
+    }
+
     @Test fun otherLinksAreNotReaderLinks() {
         val host = "sm.example.com"
         assertNull(readerPageForLink("https://sm.example.com/watch", host))

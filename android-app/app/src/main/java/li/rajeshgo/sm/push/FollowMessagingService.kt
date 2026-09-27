@@ -11,7 +11,10 @@ import kotlinx.coroutines.runBlocking
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
 
-/** Receives follow pushes. They are data-only, so this builds the notification whether the app is open or closed. */
+/**
+ * Receives follow, message and review-request pushes. They are data-only, so
+ * this builds the notification whether the app is open or closed.
+ */
 class FollowMessagingService : FirebaseMessagingService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
@@ -20,7 +23,6 @@ class FollowMessagingService : FirebaseMessagingService() {
     }
 
     override fun onMessageReceived(message: RemoteMessage) {
-        val followMessage = FollowMessage.fromData(message.data) ?: return
         // Firebase calls this on a background thread; the settings read is local.
         val settings = SettingsRepository(applicationContext)
         val (serverUrl, accessToken) = runBlocking {
@@ -28,6 +30,16 @@ class FollowMessagingService : FirebaseMessagingService() {
         }
         // A signed-out phone shows nothing, even if its token outlived sign-out.
         if (serverUrl.isBlank() || accessToken.isBlank()) return
+        if (message.data["kind"] in NoticePush.KINDS) {
+            val notice = NoticeMessage.fromData(message.data) ?: return
+            // Acknowledged only when actually shown, as follows are (sm#1580).
+            if (!NoticePush.show(applicationContext, notice)) return
+            scope.launch {
+                SessionManagerRepository(settings).ackNotice(serverUrl, accessToken, notice.noticeId)
+            }
+            return
+        }
+        val followMessage = FollowMessage.fromData(message.data) ?: return
         val shown = FollowPush.show(applicationContext, followMessage)
         val followId = followMessage.followId
         // The ack tells sm the phone showed it, so no fallback email is sent;

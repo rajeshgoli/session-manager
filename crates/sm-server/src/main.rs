@@ -85,6 +85,7 @@ async fn main() -> Result<()> {
         // that parses cleanly can still have no working sign-in.
         let overlay =
             sm_server::config::local_env_overlay_path(&args.config, args.local_env.as_deref());
+        println!("owner name: {}", config.owner_name);
         println!(
             "local env overlay: {} ({})",
             overlay.display(),

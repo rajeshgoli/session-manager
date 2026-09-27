@@ -1,6 +1,7 @@
 package li.rajeshgo.sm.push
 
-import li.rajeshgo.sm.ui.watch.DEFAULT_FOLLOW_MESSAGE
+import li.rajeshgo.sm.ui.watch.DEFAULT_OWNER_NAME
+import li.rajeshgo.sm.ui.watch.defaultFollowMessage
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -46,8 +47,19 @@ class FollowMessageTest {
 
     @Test
     fun defaultMessageLeavesTheMarkerToTheServer() {
-        assertFalse(DEFAULT_FOLLOW_MESSAGE.startsWith("[sm follow]"))
-        assertTrue(DEFAULT_FOLLOW_MESSAGE.contains("sm doc publish"))
-        assertTrue(DEFAULT_FOLLOW_MESSAGE.contains("sm task-complete"))
+        val message = defaultFollowMessage("Rajesh")
+        assertFalse(message.startsWith("[sm follow]"))
+        assertTrue(message.contains("sm doc publish"))
+        assertTrue(message.contains("sm task-complete"))
+    }
+
+    @Test
+    fun defaultMessageNamesTheConfiguredOwner() {
+        val message = defaultFollowMessage("  Rajesh ")
+        assertTrue(message.startsWith("Rajesh is following you from the sm app."))
+        assertTrue(message.contains("(conclusion first, written for Rajesh)"))
+        // Before the server answers, or with a blank name: the default.
+        assertEquals(defaultFollowMessage(DEFAULT_OWNER_NAME), defaultFollowMessage(" "))
+        assertTrue(defaultFollowMessage("").startsWith("Owner is following you"))
     }
 }

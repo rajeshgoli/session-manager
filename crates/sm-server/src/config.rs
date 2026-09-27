@@ -58,6 +58,27 @@ pub struct AppConfig {
     pub work_claims: WorkClaimsConfig,
     pub web_watch: WebWatchConfig,
     pub push: PushConfig,
+    /// How sm names the owner in text it writes to agents (sm#1580): the
+    /// reply header, `[sm review]`, the waiting label. Trimmed, 1-40
+    /// characters; [`DEFAULT_OWNER_NAME`] when absent or blank.
+    pub owner_name: String,
+}
+
+/// `owner_name` when the config leaves it out.
+pub const DEFAULT_OWNER_NAME: &str = "Owner";
+const MAX_OWNER_NAME_CHARS: usize = 40;
+
+/// The configured owner name: trimmed, [`DEFAULT_OWNER_NAME`] when absent or
+/// blank, refused past 40 characters.
+pub fn normalize_owner_name(raw: Option<&str>) -> Result<String> {
+    let name = raw.map(str::trim).unwrap_or_default();
+    if name.is_empty() {
+        return Ok(DEFAULT_OWNER_NAME.to_owned());
+    }
+    if name.chars().count() > MAX_OWNER_NAME_CHARS {
+        bail!("owner_name must be at most {MAX_OWNER_NAME_CHARS} characters");
+    }
+    Ok(name.to_owned())
 }
 
 impl Default for AppConfig {
@@ -106,6 +127,7 @@ impl Default for AppConfig {
             work_claims: WorkClaimsConfig::default(),
             web_watch: WebWatchConfig::default(),
             push: PushConfig::default(),
+            owner_name: DEFAULT_OWNER_NAME.to_owned(),
         }
     }
 }
@@ -140,7 +162,10 @@ impl AppConfig {
                 .with_context(|| format!("failed to read config {}", path.display()))?;
             let raw: RawConfig = serde_yaml::from_str(&content)
                 .with_context(|| format!("failed to parse config {}", path.display()))?;
-            raw.into()
+            let owner_name = normalize_owner_name(raw.owner_name.as_deref())?;
+            let mut config: Self = raw.into();
+            config.owner_name = owner_name;
+            config
         };
 
         let env_path = local_env_overlay_path(path, local_env_path.as_ref().map(AsRef::as_ref));
@@ -1952,6 +1977,8 @@ struct RawConfig {
     web_watch: WebWatchConfig,
     #[serde(default)]
     push: PushConfig,
+    #[serde(default)]
+    owner_name: Option<String>,
 }
 
 impl From<RawConfig> for AppConfig {
@@ -2060,6 +2087,8 @@ impl From<RawConfig> for AppConfig {
             work_claims: raw.work_claims,
             web_watch: raw.web_watch,
             push: raw.push,
+            owner_name: normalize_owner_name(raw.owner_name.as_deref())
+                .unwrap_or_else(|_| DEFAULT_OWNER_NAME.to_owned()),
         }
     }
 }
@@ -3661,6 +3690,43 @@ queue_runner:
             .unwrap_err()
             .to_string()
             .contains("cannot consume the entire global queue capacity"));
+    }
+
+    #[test]
+    fn owner_name_defaults_and_bounds() {
+        assert_eq!(AppConfig::default().owner_name, "Owner");
+        assert_eq!(normalize_owner_name(None).unwrap(), "Owner");
+        assert_eq!(normalize_owner_name(Some("   ")).unwrap(), "Owner");
+        assert_eq!(normalize_owner_name(Some("  Rajesh \n")).unwrap(), "Rajesh");
+        assert_eq!(
+            normalize_owner_name(Some(&"é".repeat(40))).unwrap(),
+            "é".repeat(40)
+        );
+        assert!(normalize_owner_name(Some(&"a".repeat(41)))
+            .unwrap_err()
+            .to_string()
+            .contains("at most 40 characters"));
+
+        let root = env::temp_dir().join(format!(
+            "sm-config-owner-name-{}-{}",
+            std::process::id(),
+            TEST_ISOLATION_INSTANCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.yaml");
+        fs::write(&config_path, "{}\n").unwrap();
+        assert_eq!(
+            AppConfig::load_from_path(&config_path).unwrap().owner_name,
+            "Owner"
+        );
+        fs::write(&config_path, "owner_name: \"  Rajesh  \"\n").unwrap();
+        assert_eq!(
+            AppConfig::load_from_path(&config_path).unwrap().owner_name,
+            "Rajesh"
+        );
+        fs::write(&config_path, format!("owner_name: {}\n", "x".repeat(41))).unwrap();
+        assert!(AppConfig::load_from_path(&config_path).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

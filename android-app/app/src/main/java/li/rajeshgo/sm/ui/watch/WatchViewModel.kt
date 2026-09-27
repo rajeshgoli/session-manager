@@ -94,6 +94,8 @@ data class WatchUiState(
     val followedSessionIds: Set<String> = emptySet(),
     val followedJobIds: Set<String> = emptySet(),
     val pushConfigured: Boolean = false,
+    /** How sm names the owner (`owner_name`, sm#1580). */
+    val ownerName: String = DEFAULT_OWNER_NAME,
 )
 
 class WatchViewModel(application: Application, private val savedState: androidx.lifecycle.SavedStateHandle) : AndroidViewModel(application) {
@@ -158,6 +160,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                     followedSessionIds = active.filter { it.targetKind == "session" }.map { it.sessionId }.toSet(),
                     followedJobIds = active.mapNotNull { it.jobId }.toSet(),
                     pushConfigured = response.pushConfigured,
+                    ownerName = response.ownerName?.trim()?.takeIf { it.isNotEmpty() } ?: DEFAULT_OWNER_NAME,
                 )
             }
     }

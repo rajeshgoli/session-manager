@@ -117,6 +117,7 @@ import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.data.model.SessionClaim
 import li.rajeshgo.sm.data.model.SessionDoc
+import li.rajeshgo.sm.data.model.SessionMessage
 import li.rajeshgo.sm.data.model.SessionJob
 import li.rajeshgo.sm.ui.navigation.AppBottomNav
 import li.rajeshgo.sm.ui.navigation.Routes
@@ -537,6 +538,7 @@ fun WatchScreen(
         followDialogSession?.let { session ->
             FollowDialog(
                 session = session,
+                ownerName = state.ownerName,
                 onDismiss = { followDialogSession = null },
                 onFollow = { message ->
                     followDialogSession = null
@@ -1602,8 +1604,12 @@ private fun FollowableJobDetail(job: SessionJob, detail: String?, follow: Follow
 }
 
 @Composable
-private fun FollowDialog(session: ClientSession, onDismiss: () -> Unit, onFollow: (String) -> Unit) {
-    var message by remember(session.id) { mutableStateOf(DEFAULT_FOLLOW_MESSAGE) }
+private fun FollowDialog(session: ClientSession, ownerName: String, onDismiss: () -> Unit, onFollow: (String) -> Unit) {
+    var message by remember(session.id) { mutableStateOf(defaultFollowMessage(ownerName)) }
+    var edited by remember(session.id) { mutableStateOf(false) }
+    // The owner's name can arrive after the dialog opens; refresh the
+    // default draft then, but never text the owner has changed.
+    LaunchedEffect(ownerName) { if (!edited) message = defaultFollowMessage(ownerName) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Follow ${sessionDisplayName(session)}") },
@@ -1611,7 +1617,7 @@ private fun FollowDialog(session: ClientSession, onDismiss: () -> Unit, onFollow
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
                     value = message,
-                    onValueChange = { message = it },
+                    onValueChange = { message = it; edited = true },
                     modifier = Modifier.fillMaxWidth(),
                     minLines = 5,
                     maxLines = 10,
@@ -1644,6 +1650,15 @@ private fun ActivityDetail(title: String, detail: String?, tint: Color) {
 private fun AgentWorkSections(session: ClientSession, onOpenPage: (ReaderPage) -> Unit, follow: FollowUi) {
     val claims = workClaims(session.obligations?.claims.orEmpty())
     if (claims.isNotEmpty()) WorkLine(claims, onOpenPage)
+    val messages = session.obligations?.messages.orEmpty()
+    if (messages.isNotEmpty()) {
+        Surface(color = Fuchsia.copy(alpha = 0.06f), shape = RoundedCornerShape(12.dp)) {
+            Column(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
+                Text("Messages", style = MaterialTheme.typography.titleSmall, color = Fuchsia, modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp))
+                messages.forEach { message -> MessageRow(message, onClick = { onOpenPage(messageReaderPage(message)) }) }
+            }
+        }
+    }
     val docs = session.obligations?.docs.orEmpty()
     if (docs.isNotEmpty()) {
         Surface(color = Emerald.copy(alpha = 0.06f), shape = RoundedCornerShape(12.dp)) {
@@ -1691,7 +1706,7 @@ private fun AgentWorkSections(session: ClientSession, onOpenPage: (ReaderPage) -
                     }
                 }
                 waiting.filter { it.kind != "review" && (it.kind != "queue_job" || activeJobs.isEmpty()) }.forEach { wait ->
-                    ActivityDetail(wait.label, "${wait.state.replace('_', ' ')} · ${ageFromIso(wait.since)}", Cyan)
+                    ActivityDetail(wait.label, listOf(wait.state.replace('_', ' '), ageFromIso(wait.since)).filter { it.isNotBlank() }.joinToString(" · "), Cyan)
                     if (wait.lastError != null || wait.lastPolledAt != null) AgentDisclosure("Check details", wait.lastPolledAt?.let { "Last checked ${ageFromIso(it)} ago" } ?: "Check needs attention") {
                         Text(wait.lastError ?: "Waiting for the next result.", style = MaterialTheme.typography.bodySmall, color = if (wait.lastError != null) Amber else TextSecondary)
                     }
@@ -1735,6 +1750,29 @@ private fun WorkLine(claims: List<SessionClaim>, onOpenPage: (ReaderPage) -> Uni
             }
         }
     }
+}
+
+/** One message the agent sent the owner: title, state chip, age (sm#1580). */
+@Composable
+private fun MessageRow(message: SessionMessage, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 14.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(message.title.ifBlank { "Message" }, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Text("Sent ${relativeSummaryAge(message.createdAt).replaceFirstChar { it.lowercaseChar() }}", style = MaterialTheme.typography.bodySmall, color = TextMuted, maxLines = 1)
+        }
+        StatusChip(label = messageStateLabel(message.state), tint = messageStateTint(message.state))
+    }
+}
+
+private fun messageStateTint(state: String): Color = when (state) {
+    "needs_you" -> Fuchsia
+    "new" -> Cyan
+    "replied" -> Emerald
+    else -> TextMuted
 }
 
 @Composable
