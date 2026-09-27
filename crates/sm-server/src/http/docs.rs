@@ -4,8 +4,8 @@ use super::*;
 use crate::owner_docs::{
     default_doc_title, doc_dir_reader_prefix, doc_name, doc_readable_path, git_blob_sha,
     is_doc_version, is_full_commit_sha, is_owner_doc_id, render_doc_page, validate_repo_path,
-    validate_repo_slug, DocCache, OwnerDoc, OwnerDocPublish, OwnerDocStore, OwnerDocSummary,
-    PublishOwnerDoc, ReadableDocError, DOC_CACHE_MAX_IDLE,
+    validate_repo_slug, DocCache, OwnerDoc, OwnerDocPublish, OwnerDocState, OwnerDocStore,
+    OwnerDocSummary, PublishOwnerDoc, ReadableDocError, DOC_CACHE_MAX_IDLE,
 };
 use axum::http::header::{ETAG, SET_COOKIE, X_CONTENT_TYPE_OPTIONS};
 use axum::http::HeaderValue;
@@ -541,7 +541,7 @@ pub(super) fn doc_reader_path(summary: &OwnerDocSummary) -> String {
 
 /// Absolute reader URL as the caller reached this server. Clients that know
 /// their own API base should prefer `reader_path`.
-fn doc_reader_url(headers: &HeaderMap, path: String) -> String {
+pub(super) fn doc_reader_url(headers: &HeaderMap, path: String) -> String {
     let header = |name: &str| {
         headers
             .get(name)
@@ -617,6 +617,10 @@ pub(super) struct PublishOwnerDocRequest {
     note: Option<String>,
     #[serde(default)]
     review: bool,
+    /// The repo's main checkout on this machine (sm#1580), when the CLI
+    /// could find it.
+    #[serde(default)]
+    checkout_root: Option<String>,
 }
 
 pub(super) async fn publish_owner_doc(
@@ -711,6 +715,12 @@ pub(super) async fn publish_owner_doc(
             commit_sha,
             blob_sha,
             review_requested: payload.review,
+            checkout_root: payload
+                .checkout_root
+                .as_deref()
+                .map(str::trim)
+                .filter(|root| StdPath::new(root).is_absolute())
+                .map(ToOwned::to_owned),
         },
         |author_id| {
             // An unreadable session store keeps the recorded author.
@@ -724,9 +734,13 @@ pub(super) async fn publish_owner_doc(
     let summary = store
         .summary(&published.doc.id)?
         .ok_or(ApiError::NotFound("Doc not found"))?;
+    if published.publish.review_requested {
+        super::follows::notice_review_publish(&state, &published.doc, &published.publish);
+    }
     let mut response = summary_json(&state.config, &summary, &headers)?;
     response["created"] = json!(published.created);
     response["publish"] = serde_json::to_value(&published.publish)?;
+    response["owner_name"] = json!(state.config.owner_name);
     if let Some(pr_number) = published.doc.pr_number {
         // The publishing session's implicit PR claim (sm#1452).
         if let Some(warning) = super::claims::record_implicit_pr_claim(
@@ -1077,7 +1091,7 @@ fn revision_entries(doc: &OwnerDoc, publishes: &[OwnerDocPublish]) -> Vec<Value>
 }
 
 /// The review client (one `<style>`, one `<script>`) with its config inlined.
-fn review_client_injection(config: &Value) -> String {
+pub(super) fn review_client_injection(config: &Value) -> String {
     format!(
         "<style id=\"sm-doc-style\">{}</style><script id=\"sm-doc-client\">{}({});</script>",
         include_str!("doc_client.css"),
@@ -1113,8 +1127,17 @@ async fn view_doc_response(
         (Value::Null, Some(pr)) => json!(format!("https://github.com/{}/pull/{pr}", doc.repo)),
         (url, _) => url,
     };
+    let summary = store.summary(&doc.id)?;
+    let undelivered = store
+        .reviews(&doc.id)?
+        .into_iter()
+        .rfind(|review| review.status == "posted")
+        .filter(|review| review.delivered_to_session_id.is_none())
+        .map(|review| json!({"id": review.id, "url": review.github_review_url}));
     let config = json!({
         "docId": doc.id,
+        "docState": summary.as_ref().map(|summary| summary.state),
+        "undeliveredReview": undelivered,
         "title": doc.title,
         "name": doc_name(&doc.repo, &doc.path),
         "sha": commit_sha,
@@ -1570,7 +1593,7 @@ fn ensure_doc_write_allowed(
     ensure_core_writes_enabled(state)
 }
 
-fn parse_json_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
+pub(super) fn parse_json_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
     serde_json::from_slice(if body.is_empty() { b"{}" } else { body })
         .map_err(|error| bad_request(format!("invalid JSON body: {error}")))
 }
@@ -1582,8 +1605,11 @@ pub(super) async fn post_owner_doc_subpath(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<Value>, ApiError> {
-    if !matches!(rest.as_str(), "retract" | "drafts" | "review") {
+) -> Result<Response, ApiError> {
+    if !matches!(
+        rest.as_str(),
+        "retract" | "drafts" | "review" | "dismiss-review" | "assign"
+    ) {
         ensure_session_allowed_from_parts(
             &state.config,
             &headers,
@@ -1606,18 +1632,27 @@ pub(super) async fn post_owner_doc_subpath(
         let summary = store
             .summary(&doc_id)?
             .ok_or(ApiError::NotFound("Doc not found"))?;
-        return Ok(Json(summary_json(&state.config, &summary, &headers)?));
+        return Ok(Json(summary_json(&state.config, &summary, &headers)?).into_response());
     }
     ensure_doc_write_allowed(&state, &headers, peer_addr, &doc_id, &rest)?;
     let doc = find_doc(&state, &doc_id)?;
     if rest == "drafts" {
         // Drafts don't change under a review being submitted.
         let _guard = state.owner_doc_review_lock.lock().await;
-        return create_draft(&state, &doc, parse_json_body(&body)?).map(Json);
+        return create_draft(&state, &doc, parse_json_body(&body)?)
+            .map(|draft| Json(draft).into_response());
+    }
+    if rest == "dismiss-review" {
+        dismiss_review(&state, &doc).await?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    if rest == "assign" {
+        let assigned = review::assign_review(&state, &doc, parse_json_body(&body)?).await?;
+        return Ok((StatusCode::CREATED, Json(assigned)).into_response());
     }
     review::submit_owner_doc_review(&state, &doc, parse_json_body(&body)?)
         .await
-        .map(Json)
+        .map(|review| Json(review).into_response())
 }
 
 /// `PATCH /docs/{id}/drafts/{draft_id}`: edit a draft's text.
@@ -1671,6 +1706,23 @@ pub(super) async fn delete_owner_doc_subpath(
     Ok(Json(json!({ "deleted": true, "id": draft_id })))
 }
 
+/// No review needed (sm#1580): clears an open review request. Sends
+/// nothing to the agent.
+async fn dismiss_review(state: &AppState, doc: &OwnerDoc) -> Result<(), ApiError> {
+    let _guard = state.owner_doc_review_lock.lock().await;
+    let store = owner_doc_store(state);
+    let requested = store
+        .summary(&doc.id)?
+        .is_some_and(|summary| summary.state == OwnerDocState::ReviewRequested);
+    if !requested || !store.dismiss_review(&doc.id)? {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "No review is requested on this doc".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// A revision's drafts are frozen while a submission of it is unfinished:
 /// the retry posts them, and GitHub may already hold their text.
 fn ensure_drafts_unfrozen(state: &AppState, doc: &OwnerDoc, sha: &str) -> Result<(), ApiError> {
@@ -1695,12 +1747,12 @@ fn draft_subroute(rest: &str) -> Result<&str, ApiError> {
 /// Draft and quote size caps: far above any real comment, well under
 /// GitHub's 65536-character comment limit once quoted.
 const MAX_DRAFT_BODY: usize = 20_000;
-const MAX_DRAFT_QUOTE: usize = 20_000;
+pub(super) const MAX_DRAFT_QUOTE: usize = 20_000;
 /// Drafts per revision: one review carries at most this many comments, which
 /// is the page size reconciliation reads back from GitHub (`comments(first:)`).
 pub(super) const MAX_DRAFTS_PER_REVISION: usize = 100;
 
-fn validated_draft_body(body: &str) -> Result<String, ApiError> {
+pub(super) fn validated_draft_body(body: &str) -> Result<String, ApiError> {
     let body = body.trim();
     if body.is_empty() {
         return Err(bad_request("A comment needs some text"));

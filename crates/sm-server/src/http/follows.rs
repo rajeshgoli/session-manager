@@ -5,9 +5,12 @@
 use super::*;
 use crate::email::{EmailBridge, RegisteredEmailUser};
 use crate::owner_docs::{doc_readable_path, OwnerDocStore};
+use crate::owner_docs::{OwnerDoc, OwnerDocPublish, OwnerDocState};
+use crate::owner_messages::{derive_message_state, OwnerMessage, OwnerMessageState};
 use crate::owner_push::{
     self, follow_message_text, Follow, FollowMailer, FollowTarget, FollowWorld, JobView, MailError,
-    Notification, OwnerPushStore, PushSender, PushTokenRegistration, ReportView, SessionView,
+    NewNotice, Notice, NoticeMailer, NoticeWorld, Notification, OwnerPushStore, PushSender,
+    PushTokenRegistration, ReportView, SessionView, NOTICE_MESSAGE, NOTICE_REVIEW_REQUESTED,
     TARGET_QUEUE_JOB, TARGET_SESSION,
 };
 
@@ -22,7 +25,7 @@ pub(super) fn push_store(state: &AppState) -> OwnerPushStore {
 /// The same guard chain as `POST /client/request-status`, returning the
 /// follow owner: the signed-in email, or for a local call the first
 /// allowlisted Google email.
-fn owner_guard(
+pub(super) fn owner_guard(
     state: &AppState,
     headers: &HeaderMap,
     peer_addr: SocketAddr,
@@ -407,6 +410,7 @@ pub(super) async fn list_follows(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(json!({
         "push_configured": state.push_sender.is_some(),
+        "owner_name": state.config.owner_name,
         "follows": follows,
     })))
 }
@@ -423,6 +427,251 @@ pub(super) async fn ack_follow(
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::NotFound("Follow not found"))
+    }
+}
+
+/// `POST /client/notices/{id}/ack`: the phone showed the notice (sm#1580).
+pub(super) async fn ack_notice(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Path(notice_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let user_id = owner_guard(&state, &headers, peer_addr, "POST", &uri)?;
+    if push_store(&state).ack_notice(&user_id, &notice_id, OffsetDateTime::now_utc())? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::NotFound("Notice not found"))
+    }
+}
+
+/// `GET /client/notices`: the owner's notices from the last 7 days.
+pub(super) async fn list_notices(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let user_id = owner_guard(&state, &headers, peer_addr, "GET", &uri)?;
+    let notices = push_store(&state).list_notices(&user_id, OffsetDateTime::now_utc())?;
+    Ok(Json(json!({ "notices": notices })))
+}
+
+/// Whom a notice goes to (appendix F1): the identity the app's push tokens
+/// are registered under. The human's email when it is an allowlisted
+/// Google email, else the first allowlisted email, else the local bypass.
+fn notice_user_id(state: &AppState, human: Option<&str>) -> String {
+    let email = EmailBridge::load(&state.config).ok().and_then(|bridge| {
+        let name = match human {
+            Some(name) => name.to_owned(),
+            None => bridge.list_humans().first()?.name.clone(),
+        };
+        bridge.lookup_human_email_user(&name).ok().flatten()
+    });
+    let allowlisted = email
+        .map(|user| user.email.trim().to_ascii_lowercase())
+        .filter(|email| {
+            state
+                .config
+                .google_auth
+                .allowlist_emails
+                .iter()
+                .any(|allowed| allowed.trim().eq_ignore_ascii_case(email))
+        });
+    allowlisted.unwrap_or_else(|| follow_owner_id(&state.config, None))
+}
+
+fn message_notice(state: &AppState, message: &OwnerMessage) -> NewNotice {
+    NewNotice::message(
+        &notice_user_id(state, Some(&message.human)),
+        &message.sender_session_id,
+        &message.sender_session_name,
+        &message.id,
+        &message.title,
+        message.blocking,
+    )
+}
+
+fn review_notice(state: &AppState, doc: &OwnerDoc, publish: &OwnerDocPublish) -> NewNotice {
+    let session_name = state
+        .session_store
+        .get_session(&publish.session_id)
+        .ok()
+        .flatten()
+        .map(session_display_name)
+        .or_else(|| doc.author_session_name.clone())
+        .unwrap_or_else(|| publish.session_id.clone());
+    NewNotice::review_requested(
+        &notice_user_id(state, None),
+        &publish.session_id,
+        &session_name,
+        publish.id,
+        &doc.title,
+        &crate::owner_docs::doc_readable_path(&doc.repo, &doc.path, &publish.commit_sha),
+    )
+}
+
+/// The notice for a new message. A failure is logged: the repair pass
+/// creates the notice later.
+pub(super) fn notice_new_message(state: &AppState, message: &OwnerMessage) {
+    let notice = message_notice(state, message);
+    if let Err(error) = push_store(state).create_notice(&notice, OffsetDateTime::now_utc()) {
+        eprintln!(
+            "Owner message {}: notice insert failed: {error:#}",
+            message.id
+        );
+    }
+}
+
+/// The notice for a `--review` publish; as for messages, failures wait for
+/// the repair pass.
+pub(super) fn notice_review_publish(state: &AppState, doc: &OwnerDoc, publish: &OwnerDocPublish) {
+    let notice = review_notice(state, doc, publish);
+    if let Err(error) = push_store(state).create_notice(&notice, OffsetDateTime::now_utc()) {
+        eprintln!(
+            "Owner doc {}: review notice insert failed: {error:#}",
+            doc.id
+        );
+    }
+}
+
+/// The server as notice delivery sees it.
+struct AppNoticeWorld<'a> {
+    state: &'a AppState,
+}
+
+impl AppNoticeWorld<'_> {
+    fn message(&self, notice: &Notice) -> anyhow::Result<Option<OwnerMessage>> {
+        super::messages::owner_message_store(self.state).get(&notice.subject_id)
+    }
+}
+
+impl NoticeWorld for AppNoticeWorld<'_> {
+    fn still_wanted(&self, notice: &Notice) -> anyhow::Result<bool> {
+        match notice.kind.as_str() {
+            NOTICE_MESSAGE => {
+                let Some(message) = self.message(notice)? else {
+                    return Ok(false);
+                };
+                let store = super::messages::owner_message_store(self.state);
+                let sender_ended = self
+                    .state
+                    .session_store
+                    .get_session(&message.sender_session_id)?
+                    .is_none_or(|session| super::messages::session_ended(&session));
+                Ok(matches!(
+                    derive_message_state(&message, store.has_reply(&message.id)?, sender_ended),
+                    OwnerMessageState::New | OwnerMessageState::Read | OwnerMessageState::NeedsYou
+                ))
+            }
+            NOTICE_REVIEW_REQUESTED => {
+                let Ok(publish_id) = notice.subject_id.parse::<i64>() else {
+                    return Ok(false);
+                };
+                let store = OwnerDocStore::new(expand_home(&self.state.config.sm_send.db_path));
+                let Some((doc, _)) = store.publish_by_id(publish_id)? else {
+                    return Ok(false);
+                };
+                let latest = store.publishes(&doc.id)?.last().map(|publish| publish.id);
+                Ok(latest == Some(publish_id)
+                    && store
+                        .summary(&doc.id)?
+                        .is_some_and(|summary| summary.state == OwnerDocState::ReviewRequested))
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn unread_count(&self, notice: &Notice) -> anyhow::Result<i64> {
+        let Some(message) = self.message(notice)? else {
+            return Ok(0);
+        };
+        super::messages::owner_message_store(self.state)
+            .unread_count(&message.sender_session_id, &message.human)
+    }
+
+    fn notice_candidates(&self, since: OffsetDateTime) -> anyhow::Result<Vec<NewNotice>> {
+        let since = owner_push::format_ts(since);
+        let mut candidates: Vec<NewNotice> = super::messages::owner_message_store(self.state)
+            .created_since(&since)?
+            .iter()
+            .map(|message| message_notice(self.state, message))
+            .collect();
+        candidates.extend(
+            OwnerDocStore::new(expand_home(&self.state.config.sm_send.db_path))
+                .review_publishes_since(&since)?
+                .iter()
+                .map(|(doc, publish)| review_notice(self.state, doc, publish)),
+        );
+        Ok(candidates)
+    }
+}
+
+/// The fallback email's body (appendix F4): the message markdown, or the
+/// doc title, then the link.
+fn notice_email_body(notice: &Notice, message_markdown: Option<&str>, base_url: &str) -> String {
+    let lead = match message_markdown {
+        Some(markdown) => markdown.to_owned(),
+        None => notice.body.clone(),
+    };
+    format!("{lead}\n\nOpen in sm: {base_url}{}", notice.reader_path)
+}
+
+/// Notice emails go through the email bridge as the agent, so a reply to
+/// the email reaches it.
+struct AppNoticeMailer<'a> {
+    state: &'a AppState,
+}
+
+impl NoticeMailer for AppNoticeMailer<'_> {
+    fn send(&self, notice: &Notice) -> Result<(), MailError> {
+        let unavailable = |detail: String| MailError::Unavailable(detail);
+        let bridge = EmailBridge::load(&self.state.config)
+            .map_err(|error| unavailable(format!("{error:#}")))?;
+        if !bridge.bridge_is_available() {
+            return Err(unavailable(bridge.availability_error_detail()));
+        }
+        let recipient = owner_email_recipient(&bridge, &notice.user_id)
+            .map_err(|error| unavailable(format!("{error:#}")))?
+            .ok_or_else(|| {
+                unavailable(format!(
+                    "no email address configured for {}",
+                    notice.user_id
+                ))
+            })?;
+        let markdown = if notice.kind == NOTICE_MESSAGE {
+            super::messages::owner_message_store(self.state)
+                .get(&notice.subject_id)
+                .map_err(|error| MailError::Transient(format!("{error:#}")))?
+                .map(|message| message.body_markdown)
+        } else {
+            None
+        };
+        let base = docs::doc_browser_base_url(&self.state.config).unwrap_or_default();
+        let provider = self
+            .state
+            .session_store
+            .get_session(&notice.session_id)
+            .ok()
+            .flatten()
+            .map(|session| session.provider)
+            .unwrap_or_else(|| "unknown".to_owned());
+        bridge
+            .send_agent_email(SendAgentEmailRequest {
+                sender_session_id: notice.session_id.clone(),
+                sender_name: notice.session_name.clone(),
+                sender_provider: provider,
+                to_users: vec![recipient],
+                cc_users: Vec::new(),
+                subject: Some(notice.email_subject()),
+                body_text: notice_email_body(notice, markdown.as_deref(), &base),
+                body_html: String::new(),
+                body_markdown: markdown.is_some(),
+                auto_subject: false,
+            })
+            .map_err(|error| MailError::Transient(format!("{error:#}")))?;
+        Ok(())
     }
 }
 
@@ -540,7 +789,7 @@ impl FollowMailer for AppFollowMailer<'_> {
 
 /// The configured human whose email matches the follow owner, or the only
 /// human with an email address when the owner is not an email.
-fn owner_email_recipient(
+pub(super) fn owner_email_recipient(
     bridge: &EmailBridge,
     user_id: &str,
 ) -> anyhow::Result<Option<RegisteredEmailUser>> {
@@ -566,17 +815,94 @@ impl AppState {
         if sweep {
             owner_push::sweep(&store, &world, now)?;
         }
-        owner_push::deliver(
+        let mut problems = owner_push::deliver(
             &store,
             &world,
             self.push_sender.as_deref(),
             &AppFollowMailer { state: self },
             now,
-        )
+        )?;
+        // Notices ride the same pass, after follows (sm#1580); the repair
+        // pass runs on sweep passes, every third.
+        let notice_world = AppNoticeWorld { state: self };
+        if sweep {
+            owner_push::repair_notices(&store, &notice_world, now)?;
+        }
+        problems.extend(owner_push::deliver_notices(
+            &store,
+            &notice_world,
+            self.push_sender.as_deref(),
+            &AppNoticeMailer { state: self },
+            now,
+        )?);
+        Ok(problems)
     }
 
     pub fn with_push_sender(mut self, sender: Option<Arc<dyn PushSender>>) -> Self {
         self.push_sender = sender;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn notice(kind: &str, reader_path: &str, body: &str) -> Notice {
+        Notice {
+            id: "not_aaaaaaaaaaaa".into(),
+            user_id: "owner@example.com".into(),
+            kind: kind.into(),
+            session_id: "eng00001".into(),
+            session_name: "sm-1679-engineer".into(),
+            subject_id: "x".into(),
+            title: "sm-1679-engineer needs you".into(),
+            body: body.into(),
+            reader_path: reader_path.into(),
+            blocking: true,
+            created_at: String::new(),
+            notify_after: String::new(),
+            push_attempts: 0,
+            last_push_error: None,
+            notified_at: None,
+            notified_via: None,
+            acked_at: None,
+            email_sent_at: None,
+        }
+    }
+
+    #[test]
+    fn notice_email_shape() {
+        let message = notice(
+            NOTICE_MESSAGE,
+            "/messages/msg_3f9a2c1d",
+            "Keep the old fills table?",
+        );
+        assert_eq!(
+            message.email_subject(),
+            "sm-1679-engineer needs you: Keep the old fills table?"
+        );
+        assert_eq!(
+            notice_email_body(
+                &message,
+                Some("# Keep the old fills table?\nDrop it after a week."),
+                "https://sm.example.com"
+            ),
+            "# Keep the old fills table?\nDrop it after a week.\n\nOpen in sm: https://sm.example.com/messages/msg_3f9a2c1d"
+        );
+        let mut doc = notice(
+            NOTICE_REVIEW_REQUESTED,
+            "/docs/widgets/memo.html?version=aaaaaaaaaaaa",
+            "Decision memo",
+        );
+        doc.title = "sm-1679-engineer asks for your review".into();
+        assert_eq!(
+            doc.email_subject(),
+            "sm-1679-engineer asks for your review: Decision memo"
+        );
+        assert_eq!(
+            notice_email_body(&doc, None, "https://sm.example.com"),
+            "Decision memo\n\nOpen in sm: https://sm.example.com/docs/widgets/memo.html?version=aaaaaaaaaaaa"
+        );
     }
 }

@@ -1,6 +1,10 @@
 # Claude Session Manager Configuration
 # Copy this file to config.yaml and fill in your values
 
+# How sm names you in text it writes to agents: message reply headers,
+# [sm review] wakes, "Waiting for <name>". Default: Owner.
+# owner_name: "Rajesh"
+
 server:
   host: "127.0.0.1"
   port: 8420

@@ -323,6 +323,7 @@ mod claims;
 mod docs;
 mod follows;
 mod history;
+mod messages;
 mod watch;
 mod worktrees;
 pub use docs::{
@@ -464,6 +465,8 @@ pub struct AppState {
     owner_doc_pr_cache: Arc<Mutex<docs::DocPullRequestCache>>,
     /// Serializes owner doc review submits and their reconciliation.
     owner_doc_review_lock: Arc<AsyncMutex<()>>,
+    /// Serializes owner message replies with their draft writes (sm#1580).
+    owner_message_lock: Arc<AsyncMutex<()>>,
     /// Ticket and PR state for work claims (sm#1452).
     work_item_source: Arc<dyn crate::work_claims::WorkItemSource>,
     codex_review_creation_locks: Arc<Mutex<BTreeSet<String>>>,
@@ -593,6 +596,7 @@ impl AppState {
             owner_doc_source: Arc::new(docs::GhCliDocSource),
             owner_doc_pr_cache: Arc::new(Mutex::new(BTreeMap::new())),
             owner_doc_review_lock: Arc::new(AsyncMutex::new(())),
+            owner_message_lock: Arc::new(AsyncMutex::new(())),
             work_item_source: Arc::new(claims::GhCliWorkItemSource),
             codex_review_creation_locks: Arc::new(Mutex::new(BTreeSet::new())),
             codex_review_watcher_ids: Arc::new(Mutex::new(BTreeSet::new())),
@@ -1476,6 +1480,8 @@ pub fn router(state: AppState) -> Router {
         .route("/client/push/test", post(follows::send_test_push))
         .route("/client/follows", get(follows::list_follows))
         .route("/client/follows/{follow_id}/ack", post(follows::ack_follow))
+        .route("/client/notices", get(follows::list_notices))
+        .route("/client/notices/{notice_id}/ack", post(follows::ack_notice))
         .route(
             "/sessions/{session_id}/follow",
             post(follows::follow_session).delete(follows::unfollow_session),
@@ -1571,6 +1577,28 @@ pub fn router(state: AppState) -> Router {
         .route("/humans", get(list_humans))
         .route("/humans/{identifier}", get(get_human))
         .route("/humans/{identifier}/email", post(send_human_email))
+        .route(
+            "/humans/{identifier}/messages",
+            post(messages::create_owner_message),
+        )
+        .route("/messages/{message_id}", get(messages::get_owner_message))
+        .route(
+            "/messages/{message_id}/drafts",
+            get(messages::list_message_drafts).post(messages::create_message_draft),
+        )
+        .route(
+            "/messages/{message_id}/drafts/{draft_id}",
+            axum::routing::patch(messages::update_message_draft)
+                .delete(messages::delete_message_draft),
+        )
+        .route(
+            "/messages/{message_id}/reply",
+            post(messages::reply_to_owner_message),
+        )
+        .route(
+            "/messages/{message_id}/handled",
+            post(messages::mark_owner_message_handled),
+        )
         .route("/email/send", post(send_registered_email))
         .route(DEFAULT_EMAIL_WEBHOOK_PATH, post(inbound_email_webhook))
         .route("/usage/accounts", get(get_account_usage))
@@ -3999,10 +4027,21 @@ async fn create_session(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(mut payload): Json<CreateCoreSessionRequest>,
+    Json(payload): Json<CreateCoreSessionRequest>,
 ) -> Result<Json<SessionResponse>, ApiError> {
     ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/sessions")?;
     ensure_core_writes_enabled(&state)?;
+    let session = create_session_from_request(state.clone(), payload).await?;
+    Ok(Json(session_response_with_live_activity(&state, session)))
+}
+
+/// `POST /sessions` after auth: a brief given with its source is accepted
+/// durably before the session exists. Assigning a review to a new agent
+/// (sm#1580) starts its agent the same way.
+async fn create_session_from_request(
+    state: Arc<AppState>,
+    mut payload: CreateCoreSessionRequest,
+) -> Result<SessionRecord, ApiError> {
     if let Some(source) = payload.spawn_prompt_source.take() {
         let accepted = accept_spawn_brief(
             &state,
@@ -4033,7 +4072,7 @@ async fn create_session(
     } else {
         state.session_store.create_core_session(payload, log_dir)?
     };
-    Ok(Json(session_response_with_live_activity(&state, session)))
+    Ok(session)
 }
 
 /// Accept a textual brief durably before session creation.  The returned prompt
@@ -6478,18 +6517,60 @@ fn session_obligations(state: &AppState) -> Result<Value, ApiError> {
     )?;
     let docs = docs::obligation_doc_summaries(state)?;
     let claims = claims::work_claim_store(state).active_claims()?;
-    Ok(project_session_obligations(
+    let messages = messages::obligation_messages(state)?;
+    // A review request from an agent that has ended waits on nobody.
+    let ended_sessions = if docs
+        .iter()
+        .any(|doc| doc.state == crate::owner_docs::OwnerDocState::ReviewRequested)
+    {
+        state
+            .session_store
+            .list_sessions(true)?
+            .into_iter()
+            .filter(messages::session_ended)
+            .map(|session| session.id)
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    let mut projected = project_session_obligations(
         &jobs,
         &reviews,
         &docs,
         &claims,
         docs::doc_browser_base_url(&state.config).as_deref(),
-    ))
+        &ended_sessions,
+    );
+    let mut sessions: BTreeMap<String, Value> = projected["sessions"]
+        .as_array_mut()
+        .map(std::mem::take)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| Some((entry["session_id"].as_str()?.to_owned(), entry)))
+        .collect();
+    messages::project_messages(&mut sessions, &messages, &state.config.owner_name);
+    for entry in sessions.values_mut() {
+        set_waiting_since(entry);
+    }
+    projected["sessions"] = json!(sessions.into_values().collect::<Vec<_>>());
+    Ok(projected)
 }
 
 fn new_obligation_entry(session_id: &str) -> Value {
     json!({"session_id": session_id, "waiting_on": [], "review_history": [], "docs": [],
-           "claims": []})
+           "claims": [], "messages": []})
+}
+
+/// The oldest `since` among what the session waits on.
+fn set_waiting_since(entry: &mut Value) {
+    let since = entry["waiting_on"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v["since"].as_str())
+        .min()
+        .map(str::to_owned);
+    entry["waiting_since"] = json!(since);
 }
 
 fn project_session_obligations(
@@ -6498,6 +6579,7 @@ fn project_session_obligations(
     docs: &[crate::owner_docs::OwnerDocSummary],
     claims: &[crate::work_claims::ClaimView],
     doc_browser_base: Option<&str>,
+    ended_sessions: &BTreeSet<String>,
 ) -> Value {
     let mut sessions = BTreeMap::<String, Value>::new();
     for job in jobs
@@ -6581,8 +6663,10 @@ fn project_session_obligations(
             .as_array_mut()
             .unwrap()
             .push(docs::obligation_doc_entry(doc, doc_browser_base));
-        // A review request blocks the author on the owner.
-        if doc.state == crate::owner_docs::OwnerDocState::ReviewRequested {
+        // A review request blocks the author on the owner, until it ends.
+        if doc.state == crate::owner_docs::OwnerDocState::ReviewRequested
+            && !ended_sessions.contains(author)
+        {
             entry["waiting_on"].as_array_mut().unwrap().push(json!({
                 "kind": "owner_review", "id": doc.doc.id,
                 "label": format!("Owner review · {}", doc.doc.title),
@@ -6618,16 +6702,9 @@ fn project_session_obligations(
                 }));
             }
         }
-        let since = entry["waiting_on"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|v| v["since"].as_str())
-            .min()
-            .map(str::to_owned);
-        entry["waiting_since"] = json!(since);
+        set_waiting_since(entry);
     }
-    json!({"schema_version": 3, "sessions": sessions.into_values().collect::<Vec<_>>()})
+    json!({"schema_version": 4, "sessions": sessions.into_values().collect::<Vec<_>>()})
 }
 
 async fn list_queue_jobs(
@@ -13769,6 +13846,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/watch/state"
         || path == "/docs"
         || path.starts_with("/docs/")
+        || path.starts_with("/messages/")
         || path == "/queue-jobs"
         || path.starts_with("/queue-jobs/")
         || path == "/nodes"
@@ -15606,7 +15684,7 @@ mod tests {
             })
             .collect();
         let start = std::time::Instant::now();
-        let retained = project_session_obligations(&[], &history, &[], &[], None);
+        let retained = project_session_obligations(&[], &history, &[], &[], None, &BTreeSet::new());
         eprintln!("4000 retained reviews projected in {:?}", start.elapsed());
         let retained_sessions = retained["sessions"].as_array().unwrap();
         assert_eq!(retained_sessions.len(), 8000);
@@ -15622,6 +15700,7 @@ mod tests {
             &[],
             &[],
             None,
+            &BTreeSet::new(),
         );
         let sessions = projected["sessions"].as_array().unwrap();
         let recipient = sessions
@@ -15644,7 +15723,8 @@ mod tests {
         let mut finished = job;
         finished.state = "succeeded".into();
         assert!(
-            project_session_obligations(&[finished], &[], &[], &[], None)["sessions"]
+            project_session_obligations(&[finished], &[], &[], &[], None, &BTreeSet::new())
+                ["sessions"]
                 .as_array()
                 .unwrap()
                 .is_empty()
@@ -18414,6 +18494,15 @@ mod tests {
         let (status, body) = browser_host_get(&app, "/docs", Some(&owner)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(body["docs"].is_array(), "{body}");
+        // Message pages read like doc pages (sm#1580).
+        for uri in [
+            "/messages/msg_00000000",
+            "/messages/msg_00000000?format=json",
+        ] {
+            let (status, body) = browser_host_get(&app, uri, Some(&owner)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+            assert_eq!(body["detail"], "Message not found", "{uri}");
+        }
     }
 
     #[tokio::test]
@@ -18548,6 +18637,12 @@ mod tests {
             (Method::POST, "/codex-review-requests"),
             (Method::POST, "/docs"),
             (Method::POST, "/docs/zzzzzzzz/reviews"),
+            (Method::POST, "/humans/rajesh/messages"),
+            (Method::POST, "/messages/msg_00000000/reply"),
+            (Method::POST, "/messages/msg_00000000/handled"),
+            (Method::POST, "/messages/msg_00000000/drafts"),
+            (Method::PATCH, "/messages/msg_00000000/drafts/d1"),
+            (Method::DELETE, "/messages/msg_00000000/drafts/d1"),
             (
                 Method::POST,
                 "/scheduler/remind?session_id=abc12345&delay_seconds=60&message=hi",
@@ -18576,6 +18671,14 @@ mod tests {
                     "commit_sha": "c".repeat(40), "session_id": "abc12345", "review": false}),
                 "/email/send" => json!({"recipients": ["rajesh"], "cc": [], "subject": "s",
                     "body": "b", "body_markdown": false, "auto_subject": false}),
+                "/humans/rajesh/messages" => {
+                    json!({"sender_session_id": "abc12345", "text": "hi"})
+                }
+                "/messages/msg_00000000/reply" => {
+                    json!({"submission_id": "sub-00000001", "body": "hi"})
+                }
+                "/messages/msg_00000000/drafts" => json!({"line": 1, "quote": "q", "body": "b"}),
+                "/messages/msg_00000000/drafts/d1" => json!({"body": "b"}),
                 _ => json!({}),
             }
             .to_string();

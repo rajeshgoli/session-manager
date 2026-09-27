@@ -212,6 +212,7 @@ impl OwnerPushStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(notices::NOTICE_SCHEMA)?;
         Ok(conn)
     }
 
@@ -1124,6 +1125,9 @@ pub fn follow_message_text(message: &str) -> String {
 pub fn push_db_path(config: &crate::config::AppConfig) -> PathBuf {
     crate::sessions::expand_home(&config.push.db_path)
 }
+
+mod notices;
+pub use notices::*;
 
 #[cfg(test)]
 mod tests;

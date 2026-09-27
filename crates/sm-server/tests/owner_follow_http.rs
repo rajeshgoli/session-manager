@@ -422,3 +422,72 @@ async fn task_complete_fires_an_agent_follow_that_waits_for_a_report() {
     assert_eq!(fired["state"], "fired");
     assert_ne!(fired["notify_after"], fired["fired_at"]);
 }
+
+#[tokio::test]
+async fn notice_ack_is_owner_scoped() {
+    use sm_server::owner_push::{NewNotice, OwnerPushStore};
+    let f = fixture(None);
+    let store = OwnerPushStore::new(f.dir.join("owner_push.db"));
+    let now = time::OffsetDateTime::now_utc();
+    // A local call acts as the local owner (no Google allowlist here).
+    for (user, message) in [
+        ("local_bypass", "msg_00000001"),
+        ("other@example.com", "msg_00000002"),
+    ] {
+        store
+            .create_notice(
+                &NewNotice::message(user, "eng00001", "eng00001-agent", message, "Title", false),
+                now,
+            )
+            .unwrap();
+    }
+    let mine = store
+        .notice_for_subject("message", "msg_00000001")
+        .unwrap()
+        .unwrap();
+    let theirs = store
+        .notice_for_subject("message", "msg_00000002")
+        .unwrap()
+        .unwrap();
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &format!("/client/notices/{}/ack", mine.id),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(store.notice(&mine.id).unwrap().unwrap().acked_at.is_some());
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &format!("/client/notices/{}/ack", theirs.id),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(store
+        .notice(&theirs.id)
+        .unwrap()
+        .unwrap()
+        .acked_at
+        .is_none());
+    let (status, _) = request(&f.app, "POST", "/client/notices/not_nope/ack", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, listed) = request(&f.app, "GET", "/client/notices", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed = listed["notices"].as_array().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], mine.id.as_str());
+    assert!(listed[0].get("user_id").is_none());
+    assert_eq!(listed[0]["reader_path"], "/messages/msg_00000001");
+}
+
+#[tokio::test]
+async fn follows_carry_owner_name() {
+    let f = fixture(None);
+    let (status, body) = request(&f.app, "GET", "/client/follows", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["owner_name"], "Owner");
+}

@@ -4,14 +4,23 @@
   // window.__smDoc and a shadow root so the doc's own scripts and styles
   // are untouched.
   if (window.__smDoc) return;
+  // Mode "review" (docs, the default), "reply" (a message with an agent to
+  // answer) or "read" (a message nobody is left to answer) (sm#1580).
+  var MODE = CONFIG.mode || 'review';
+  var MSG = MODE !== 'review';
   var S = window.__smDoc = {
     config: CONFIG,
     drafts: (CONFIG.drafts || []).slice(),
+    replies: (CONFIG.replies || []).slice(),
     head: null,
-    canComment: !!CONFIG.canComment,
+    canComment: MSG ? MODE === 'reply' : !!CONFIG.canComment,
     prState: CONFIG.prState,
     // A reloaded page resumes the server's unfinished submission.
-    attempt: CONFIG.unfinishedReview || null
+    attempt: CONFIG.unfinishedReview || null,
+    docState: CONFIG.docState,
+    // A posted review no agent received (sm#1580): offer Assign.
+    undelivered: CONFIG.undeliveredReview || null,
+    assigned: ''
   };
   var coarse = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
   var BLOCK = '[data-sm-line]';
@@ -43,7 +52,7 @@
     var headers = { Accept: 'application/json' };
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     if (CONFIG.token) headers['X-SM-Doc-Token'] = CONFIG.token;
-    return fetch('/docs/' + CONFIG.docId + suffix, {
+    return fetch((CONFIG.apiBase || '/docs/' + CONFIG.docId) + suffix, {
       method: method, headers: headers, credentials: 'same-origin',
       body: body === undefined ? undefined : JSON.stringify(body)
     }).then(function (r) {
@@ -64,7 +73,7 @@
     if (S.head && S.head.pr_head_sha === sha) return S.head.pr_head_reader_path;
     return null;
   }
-  function currentDrafts() { return S.drafts.filter(function (d) { return d.commit_sha === CONFIG.sha; }); }
+  function currentDrafts() { return MSG ? S.drafts : S.drafts.filter(function (d) { return d.commit_sha === CONFIG.sha; }); }
 
   // ---- shadow UI -------------------------------------------------------
   var host = el('div', { id: 'sm-doc-ui' });
@@ -73,7 +82,9 @@
   root.appendChild(el('style', { text: [
     ':host{all:initial}',
     '[hidden]{display:none!important}',
-    '.bar,.pill,.ban,.chip,.sheet{pointer-events:auto}',
+    '.bar,.pill,.ban,.chip,.sheet,.reply{pointer-events:auto}',
+    '.reply{position:fixed;left:0;right:0;bottom:0;background:#fff;color:#111827;box-shadow:0 -2px 12px rgba(0,0,0,.3);padding:8px 10px;display:flex;flex-direction:column;gap:6px}',
+    '.reply textarea{min-height:0;resize:none;overflow-y:auto}',
     '*{box-sizing:border-box;font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
     '.bar{position:fixed;top:0;left:0;right:0;display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:6px 10px;background:#111827;color:#f9fafb;box-shadow:0 1px 4px rgba(0,0,0,.3)}',
     '.bar .t{font-weight:600;max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
@@ -99,7 +110,10 @@
     '.touch .sheet{width:100%;border-radius:12px 12px 0 0;padding:14px}',
     '.touch .sheet button{padding:10px 16px}',
     '.touch textarea{min-height:9em}',
-    '.touch .chip{font-size:16px;padding:10px 18px}'
+    '.touch .chip{font-size:16px;padding:10px 18px}',
+    '.touch .reply,.touch .reply *{font-size:16px}',
+    '.touch .reply textarea{min-height:0}',
+    '.touch .reply button{padding:10px 16px}'
   ].join('\n') }));
   var ui = el('div', { class: coarse ? 'touch' : '' });
   root.appendChild(ui);
@@ -166,7 +180,9 @@
   window.addEventListener('resize', queueSync);
   syncViewport();
 
+  var STATE_LABELS = { new: 'New', read: 'Read', needs_you: 'Needs you', replied: 'Replied', handled: 'Handled' };
   function stateText() {
+    if (MSG) return MODE === 'read' ? ['No agent is left to reply to', 'ro'] : [STATE_LABELS[S.state] || '', S.state === 'needs_you' ? 'ro' : 'muted'];
     if (!CONFIG.prNumber) return ['Read-only: no PR', 'ro'];
     if (S.prState === 'open') return [S.canComment ? 'PR open' : 'Read-only', S.canComment ? 'muted' : 'ro'];
     if (S.prState === 'unknown' || !S.prState) return ['Read-only: PR state unknown', 'ro'];
@@ -175,6 +191,16 @@
 
   function renderBar() {
     clear(bar);
+    if (MSG) {
+      var ms = stateText();
+      [el('span', { class: 't', title: CONFIG.title, text: CONFIG.title }),
+        el('span', { class: ms[1], text: ms[0] }),
+        el('span', { class: 'sp' }),
+        el('button', { title: 'Hide', text: '▴', onclick: function () { setCollapsed(true); } })
+      ].forEach(function (c) { bar.appendChild(c); });
+      layout();
+      return;
+    }
     var picker = el('select', { 'aria-label': 'Revision', onchange: function () { if (picker.value && picker.value !== CONFIG.sha) { var p = pathFor(picker.value); if (p) location.href = p; } } });
     var shas = {};
     (CONFIG.revisions || []).forEach(function (r, i) {
@@ -197,6 +223,11 @@
       CONFIG.prUrl ? el('a', { href: CONFIG.prUrl, target: '_blank', rel: 'noopener', text: 'PR #' + CONFIG.prNumber }) : null,
       el('span', { class: st[1], text: st[0] }),
       el('span', { class: 'sp' }),
+      S.docState === 'review_requested' ? el('button', { text: 'No review needed', onclick: function (e) {
+        var b = e.currentTarget; b.disabled = true;
+        api('POST', '/dismiss-review').then(function () { S.docState = 'read'; renderBar(); },
+          function (err) { b.disabled = false; alertBar(err.message); });
+      } }) : null,
       (S.canComment || n) ? el('button', { class: 'p', text: 'Review (' + n + ')', onclick: openReview }) : null,
       el('button', { title: 'Hide', text: '▴', onclick: function () { setCollapsed(true); } })
     ].forEach(function (c) { if (c) bar.appendChild(c); });
@@ -219,8 +250,20 @@
         lines.push([el('span', { text: 'The PR has newer unpublished changes to this doc.' }), el('a', { href: head.pr_head_reader_path, text: 'View the PR head' })]);
       }
     }
+    if (!MSG && S.undelivered) {
+      var parts = [el('span', { text: 'Review posted to PR #' + CONFIG.prNumber + ', but no agent is left to wake.' })];
+      if (S.assigned) parts.push(el('span', { text: S.assigned }));
+      else parts.push(el('button', { class: 'lk', text: 'Assign to a new agent', onclick: function (e) {
+        var b = e.currentTarget; b.disabled = true;
+        api('POST', '/assign', { review_id: S.undelivered.id }).then(function (res) {
+          S.assigned = 'Assigned to ' + (res.name || res.session_id);
+          renderBanner();
+        }, function (err) { S.assigned = err.message; renderBanner(); });
+      } }));
+      lines.push(parts);
+    }
     var other = {};
-    S.drafts.forEach(function (d) { if (d.commit_sha !== CONFIG.sha) (other[d.commit_sha] = other[d.commit_sha] || []).push(d); });
+    if (!MSG) S.drafts.forEach(function (d) { if (d.commit_sha !== CONFIG.sha) (other[d.commit_sha] = other[d.commit_sha] || []).push(d); });
     Object.keys(other).forEach(function (sha) {
       var list = other[sha];
       var path = pathFor(sha);
@@ -249,7 +292,7 @@
   }
 
   function pollHead() {
-    if (document.visibilityState === 'hidden') return;
+    if (MSG || document.visibilityState === 'hidden') return;
     api('GET', '/head?sha=' + CONFIG.sha).then(function (head) {
       S.head = head;
       if (head.pr_state) {
@@ -350,7 +393,7 @@
               deleteArmed = null;
               api('DELETE', '/drafts/' + d.id).then(function () {
                 S.drafts = S.drafts.filter(function (x) { return x.id !== d.id; });
-                markers(); renderBar();
+                markers(); renderBar(); if (MSG) renderReply();
               }, function (err) { alertBar(err.message); });
             } }),
             el('button', { text: 'Edit', onclick: function () { compose({ line: d.line, quote: d.quote, block: block }, d); } })
@@ -373,7 +416,7 @@
   function placeChip() {
     if (!anchor) return;
     var r = anchor.rect();
-    if (coarse) { chip.style.left = '50%'; chip.style.transform = 'translateX(-50%)'; chip.style.top = ''; chip.style.bottom = '16px'; }
+    if (coarse) { chip.style.left = '50%'; chip.style.transform = 'translateX(-50%)'; chip.style.top = ''; chip.style.bottom = ((MSG && replyPanel.isConnected ? replyPanel.offsetHeight : 0) + 16) + 'px'; }
     else {
       // Page coordinates to `ui` coordinates (visible area, unzoomed).
       var scale = vv ? vv.scale || 1 : 1;
@@ -452,7 +495,8 @@
   function saveDraft(a, draft, body) {
     return draft
       ? api('PATCH', '/drafts/' + draft.id, { body: body }).then(function (d) { S.drafts = S.drafts.map(function (x) { return x.id === d.id ? d : x; }); })
-      : api('POST', '/drafts', { sha: CONFIG.sha, line: a.line, quote: a.quote, body: body }).then(function (d) { S.drafts.push(d); });
+      : api('POST', '/drafts', MSG ? { line: a.line, quote: a.quote, body: body } : { sha: CONFIG.sha, line: a.line, quote: a.quote, body: body })
+        .then(function (d) { S.drafts.push(d); if (MSG) renderReply(); });
   }
   // New comment (a = {line, quote, block}) or edit (draft). Inline under the
   // block when there is one; a comment with no line uses the sheet.
@@ -507,7 +551,7 @@
         draft ? el('button', { class: 'd', text: 'Delete', onclick: function () {
           api('DELETE', '/drafts/' + draft.id).then(function () {
             S.drafts = S.drafts.filter(function (x) { return x.id !== draft.id; });
-            closeSheet(); markers(); renderBar();
+            closeSheet(); markers(); renderBar(); if (MSG) renderReply();
           }).catch(function (err) { msg.textContent = err.message; });
         } }) : null,
         el('button', { text: 'Cancel', onclick: closeSheet }),
@@ -515,7 +559,7 @@
       ]),
       msg,
       quote ? el('div', { class: 'q', text: quote }) : null,
-      el('div', { class: 'muted', text: 'Not tied to a line: posts as a comment on the file.' }),
+      el('div', { class: 'muted', text: MSG ? 'Not tied to a line.' : 'Not tied to a line: posts as a comment on the file.' }),
       box
     ].forEach(function (c) { if (c) sheet.appendChild(c); });
     sheet.hidden = false;
@@ -594,6 +638,8 @@
         return api('POST', '/review', { submission_id: S.attempt.id, sha: CONFIG.sha, verdict: S.attempt.verdict, body: S.attempt.body })
           .then(function (res) {
             S.attempt = null;
+            S.docState = 'reviewed';
+            if (res.delivered_to_session_id == null) { S.undelivered = { id: res.submission_id, url: res.github_review_url }; S.assigned = ''; renderBanner(); }
             S.drafts = S.drafts.filter(function (d) { return d.commit_sha !== CONFIG.sha; });
             markers(); renderBar();
             clear(sheet);
@@ -625,7 +671,114 @@
     placeSheet();
   }
 
+
+  // ---- message reply (sm#1580) ------------------------------------------
+  // Reply mode swaps the review panel for a box fixed to the bottom of the
+  // visible area: overall text plus every passage comment go to the agent
+  // as one message. One submission id is kept until the server confirms,
+  // so a retry after a lost response delivers once.
+  var replyPanel = el('div', { class: 'reply' });
+  var repliesHost = null;
+  var replyAttempt = null;
+  var replyBox = null;
+  var replyNotice = '';
+  S.state = CONFIG.state;
+  function renderReplies() {
+    if (!MSG) return;
+    if (!repliesHost) {
+      repliesHost = document.createElement('section');
+      repliesHost.id = 'sm-replies';
+      (document.querySelector('article') || document.body).insertAdjacentElement('afterend', repliesHost);
+    }
+    clear(repliesHost);
+    repliesHost.appendChild(el('h3', { text: 'Your replies' }));
+    if (!S.replies.length) repliesHost.appendChild(el('p', { class: 'sm-meta', text: 'none yet' }));
+    S.replies.forEach(function (r) {
+      var item = el('div', { class: 'sm-reply' });
+      item.style.cssText = 'border-left:3px solid color-mix(in srgb,currentColor 25%,transparent);padding-left:.75rem;margin:.75rem 0';
+      item.appendChild(el('p', { class: 'sm-meta', text: (r.created_at || '').slice(0, 16).replace('T', ' ') + ' UTC' }));
+      if (r.body) item.appendChild(el('p', { text: r.body }));
+      (r.comments || []).forEach(function (c) {
+        if (c.quote) item.appendChild(el('blockquote', { text: c.quote.length > 300 ? c.quote.slice(0, 300) + '…' : c.quote }));
+        item.appendChild(el('p', { text: c.body }));
+      });
+      repliesHost.appendChild(item);
+    });
+  }
+  function padForPanel() {
+    document.body.style.paddingBottom = MODE === 'review' ? '' : (replyPanel.offsetHeight + 24) + 'px';
+  }
+  function switchToRead() {
+    MODE = 'read';
+    S.canComment = false;
+    hideChip(); closeComposer(); closeSheet();
+    renderBar(); renderReply();
+  }
+  function renderReply() {
+    if (!MSG) return;
+    var draft = replyBox ? replyBox.value : '';
+    clear(replyPanel);
+    if (MODE === 'read') {
+      replyPanel.appendChild(el('div', { class: 'ro', text: 'No agent is left to reply to' }));
+      padForPanel();
+      return;
+    }
+    var n = currentDrafts().length;
+    replyBox = el('textarea', { rows: '1', placeholder: 'Reply to ' + (CONFIG.replyTo || 'the agent') + '…' });
+    replyBox.value = draft;
+    var grow = function () {
+      replyBox.style.height = 'auto';
+      var line = parseFloat(getComputedStyle(replyBox).lineHeight) || 20;
+      replyBox.style.height = Math.min(replyBox.scrollHeight, line * 6 + 16) + 'px';
+      padForPanel();
+    };
+    replyBox.addEventListener('input', grow);
+    var msg = el('div', { class: replyNotice ? 'err' : 'muted', text: replyNotice });
+    var send = el('button', { class: 'p', text: n ? 'Send (' + n + ' comment' + (n === 1 ? '' : 's') + ')' : 'Send', onclick: function () {
+      var shown = draftKey(currentDrafts());
+      send.disabled = true;
+      msg.className = 'muted'; msg.textContent = 'Sending…';
+      refreshDrafts().then(function () {
+        if (draftKey(currentDrafts()) !== shown) {
+          replyNotice = 'The comments changed on another device. Check them, then send.';
+          renderReply();
+          return;
+        }
+        if (!replyBox.value.trim() && !currentDrafts().length) {
+          send.disabled = false; msg.className = 'err'; msg.textContent = 'Write a reply or add a comment first.';
+          return;
+        }
+        if (!replyAttempt) replyAttempt = newId();
+        return api('POST', '/reply', { submission_id: replyAttempt, body: replyBox.value }).then(function (res) {
+          replyAttempt = null;
+          replyNotice = '';
+          S.drafts = [];
+          S.replies.push(res);
+          if (S.state !== 'handled') S.state = 'replied';
+          replyBox.value = '';
+          markers(); renderBar(); renderReplies(); renderReply();
+          var ok = replyPanel.querySelector('.muted');
+          if (ok) { ok.className = 'ok'; ok.textContent = 'Sent to ' + (res.delivered_to_session_name || CONFIG.replyTo || 'the agent'); }
+        });
+      }).catch(function (err) {
+        if (err.status === 409 && /No agent is left/.test(err.message)) { switchToRead(); return; }
+        send.disabled = false;
+        msg.className = 'err';
+        msg.textContent = err.message + (replyAttempt ? ' Sending again is safe.' : '');
+      });
+    } });
+    var handled = S.state === 'needs_you' ? el('button', { text: 'Handled', onclick: function () {
+      handled.disabled = true;
+      api('POST', '/handled').then(function () { S.state = 'handled'; renderBar(); renderReply(); },
+        function (err) { handled.disabled = false; msg.className = 'err'; msg.textContent = err.message; });
+    } }) : null;
+    [replyBox, msg, el('div', { class: 'row' }, [handled, send])].forEach(function (c) { if (c) replyPanel.appendChild(c); });
+    requestAnimationFrame(grow);
+  }
+
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { closeSheet(); closeComposer(); hideChip(); } });
+  // First in `ui`, so the chip, composer sheet and banners sit above it.
+  if (MSG) { ui.insertBefore(replyPanel, ui.firstChild); renderReplies(); renderReply(); }
   renderBar();
   renderBanner();
   markers();

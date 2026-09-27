@@ -1509,6 +1509,31 @@ fn check_c_fires_at_thirty_idle_minutes_once_per_stretch() {
     );
 }
 
+/// A blocking owner message or a review request puts an entry in the
+/// session's `waiting_on`, which `idle_sessions` turns into `waiting`
+/// (sm#1580): Check C leaves such a session alone however long it idles,
+/// and nudges it once the owner answers.
+#[test]
+fn check_c_skips_session_awaiting_owner() {
+    let (store, db) = new_store();
+    let dir = directory();
+    claim_ticket(&store, "lead", &dir);
+    let idle = Duration::from_secs(30 * 60);
+    for now in [30, 60, 600] {
+        assert!(store
+            .run_check_c(&answered(&[1]), &idle_lead(0, true), &dir, idle, at(now))
+            .unwrap()
+            .is_empty());
+    }
+    assert!(queued(&db, "lead").is_empty());
+    assert_eq!(
+        store
+            .run_check_c(&answered(&[1]), &idle_lead(0, false), &dir, idle, at(601))
+            .unwrap(),
+        vec!["lead"]
+    );
+}
+
 #[test]
 fn check_c_skips_working_sessions_and_closed_work() {
     let (store, db) = new_store();

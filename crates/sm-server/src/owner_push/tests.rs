@@ -1069,3 +1069,447 @@ fn concurrent_follows_of_one_target_all_return_the_same_follow() {
     assert!(ids.iter().all(|id| id == &ids[0]), "{ids:?}");
     fs::remove_dir_all(dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Owner notices (sm#1580).
+
+/// Subjects the owner has answered, unread counts, and repair candidates.
+#[derive(Default)]
+struct FakeNoticeWorld {
+    answered: Mutex<std::collections::BTreeSet<String>>,
+    unread: i64,
+    candidates: Vec<NewNotice>,
+}
+
+impl FakeNoticeWorld {
+    fn answer(&self, subject_id: &str) {
+        self.answered.lock().unwrap().insert(subject_id.to_owned());
+    }
+}
+
+impl NoticeWorld for FakeNoticeWorld {
+    fn still_wanted(&self, notice: &Notice) -> Result<bool> {
+        Ok(!self.answered.lock().unwrap().contains(&notice.subject_id))
+    }
+    fn unread_count(&self, _notice: &Notice) -> Result<i64> {
+        Ok(self.unread)
+    }
+    fn notice_candidates(&self, _since: OffsetDateTime) -> Result<Vec<NewNotice>> {
+        Ok(self.candidates.clone())
+    }
+}
+
+#[derive(Default)]
+struct FakeNoticeMailer {
+    sent: Mutex<Vec<String>>,
+    unavailable: bool,
+    transient_failures: Mutex<usize>,
+}
+
+impl NoticeMailer for FakeNoticeMailer {
+    fn send(&self, notice: &Notice) -> Result<(), MailError> {
+        if self.unavailable {
+            return Err(MailError::Unavailable("no bridge".to_owned()));
+        }
+        let mut failures = self.transient_failures.lock().unwrap();
+        if *failures > 0 {
+            *failures -= 1;
+            return Err(MailError::Transient("resend 503".to_owned()));
+        }
+        self.sent.lock().unwrap().push(notice.id.clone());
+        Ok(())
+    }
+}
+
+fn message_notice(message_id: &str, blocking: bool) -> NewNotice {
+    NewNotice::message(
+        OWNER,
+        "eng00001",
+        "sm-1679-engineer",
+        message_id,
+        "Keep the old fills table or drop it?",
+        blocking,
+    )
+}
+
+fn review_notice(publish_id: i64) -> NewNotice {
+    NewNotice::review_requested(
+        OWNER,
+        "eng00001",
+        "sm-1679-engineer",
+        publish_id,
+        "Decision memo",
+        "/docs/widgets/memo.html?version=aaaaaaaaaaaa",
+    )
+}
+
+fn notice_of(store: &OwnerPushStore, kind: &str, subject: &str) -> Notice {
+    store.notice_for_subject(kind, subject).unwrap().unwrap()
+}
+
+#[test]
+fn message_creates_notice() {
+    let (store, dir) = temp_store();
+    let now = at("2026-09-26T10:00:00Z");
+    assert!(store
+        .create_notice(&message_notice("msg_00000001", true), now)
+        .unwrap());
+    assert!(!store
+        .create_notice(&message_notice("msg_00000001", true), now)
+        .unwrap());
+    assert!(store.create_notice(&review_notice(7), now).unwrap());
+    let notice = notice_of(&store, NOTICE_MESSAGE, "msg_00000001");
+    assert!(
+        notice.id.starts_with("not_") && notice.id.len() == 16,
+        "{}",
+        notice.id
+    );
+    assert_eq!(notice.created_at, "2026-09-26T10:00:00Z");
+    assert_eq!(notice.notify_after, notice.created_at);
+    assert_eq!(notice.reader_path, "/messages/msg_00000001");
+    assert_eq!(store.list_notices(OWNER, now).unwrap().len(), 2);
+    assert!(store
+        .list_notices(OWNER, now + Duration::days(8))
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .list_notices("other@example.com", now)
+        .unwrap()
+        .is_empty());
+    // Acks are the owner's only.
+    assert!(!store
+        .ack_notice("other@example.com", &notice.id, now)
+        .unwrap());
+    assert!(store.ack_notice(OWNER, &notice.id, now).unwrap());
+    assert!(store
+        .notice(&notice.id)
+        .unwrap()
+        .unwrap()
+        .acked_at
+        .is_some());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn repair_pass_creates_missing_notices() {
+    let (store, dir) = temp_store();
+    let now = at("2026-09-26T10:00:00Z");
+    store
+        .create_notice(&message_notice("msg_00000001", false), now)
+        .unwrap();
+    let world = FakeNoticeWorld {
+        candidates: vec![
+            message_notice("msg_00000001", false),
+            message_notice("msg_00000002", true),
+            review_notice(9),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(repair_notices(&store, &world, now).unwrap(), 2);
+    assert_eq!(repair_notices(&store, &world, now).unwrap(), 0);
+    assert_eq!(store.list_notices(OWNER, now).unwrap().len(), 3);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn create_and_repair_race_leaves_one_notice() {
+    let (store, dir) = temp_store();
+    let db = dir.join("owner_push.db");
+    store
+        .create_notice(&review_notice(1), at("2026-09-26T10:00:00Z"))
+        .unwrap();
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                OwnerPushStore::new(db)
+                    .create_notice(
+                        &message_notice("msg_00000001", true),
+                        OffsetDateTime::now_utc(),
+                    )
+                    .unwrap()
+            })
+        })
+        .collect();
+    let created = threads
+        .into_iter()
+        .map(|thread| thread.join().unwrap())
+        .filter(|created| *created)
+        .count();
+    assert_eq!(created, 1);
+    let rows: i64 = Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM owner_notices WHERE subject_id = 'msg_00000001'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 1);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn resolved_subject_closes_notice_without_sending() {
+    let (store, dir) = temp_store();
+    register(&store, "tok1", None);
+    let now = at("2026-09-26T10:00:00Z");
+    let world = FakeNoticeWorld::default();
+    let mailer = FakeNoticeMailer::default();
+
+    // Answered before the first push: closed, nothing sent.
+    store
+        .create_notice(&message_notice("msg_replied", true), now)
+        .unwrap();
+    world.answer("msg_replied");
+    let sender = FakeSender::default();
+    deliver_notices(&store, &world, Some(&sender), &mailer, now).unwrap();
+    let closed = notice_of(&store, NOTICE_MESSAGE, "msg_replied");
+    assert_eq!(closed.notified_via.as_deref(), Some("resolved"));
+    assert_eq!(closed.notified_at.as_deref(), Some("2026-09-26T10:00:00Z"));
+    assert!(sender.sent().is_empty());
+
+    // Answered while a push is retrying: the retry doesn't happen.
+    store.create_notice(&review_notice(3), now).unwrap();
+    let flaky = FakeSender::failing("tok1", vec![PushError::Retryable("503".to_owned())]);
+    deliver_notices(&store, &world, Some(&flaky), &mailer, now).unwrap();
+    assert_eq!(
+        notice_of(&store, NOTICE_REVIEW_REQUESTED, "3").push_attempts,
+        1
+    );
+    world.answer("3");
+    deliver_notices(
+        &store,
+        &world,
+        Some(&flaky),
+        &mailer,
+        now + Duration::seconds(30),
+    )
+    .unwrap();
+    assert_eq!(
+        notice_of(&store, NOTICE_REVIEW_REQUESTED, "3")
+            .notified_via
+            .as_deref(),
+        Some("resolved")
+    );
+    assert!(flaky.sent().is_empty());
+
+    // Answered after the push, before the 15-minute fallback: no email.
+    store
+        .create_notice(&message_notice("msg_handled", true), now)
+        .unwrap();
+    let sender = FakeSender::default();
+    deliver_notices(&store, &world, Some(&sender), &mailer, now).unwrap();
+    assert_eq!(sender.sent().len(), 1);
+    world.answer("msg_handled");
+    deliver_notices(&store, &world, Some(&sender), &mailer, now + ACK_FALLBACK).unwrap();
+    let pushed = notice_of(&store, NOTICE_MESSAGE, "msg_handled");
+    assert_eq!(pushed.notified_via.as_deref(), Some("resolved"));
+    assert_eq!(pushed.notified_at.as_deref(), Some("2026-09-26T10:00:00Z"));
+    assert!(pushed.email_sent_at.is_none());
+    // Answered with push unconfigured: no email either.
+    store
+        .create_notice(&message_notice("msg_nopush", false), now)
+        .unwrap();
+    world.answer("msg_nopush");
+    deliver_notices(&store, &world, None, &mailer, now + Duration::hours(1)).unwrap();
+    assert!(mailer.sent.lock().unwrap().is_empty());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// The follow rules, case by case, for notices.
+#[test]
+fn notice_delivery_follows_follow_rules() {
+    let now = at("2026-09-26T10:00:00Z");
+    let world = FakeNoticeWorld::default();
+
+    // Push succeeds on one token; the dead one is invalidated.
+    let (store, dir) = temp_store();
+    register(&store, "tok1", None);
+    register(&store, "dead", None);
+    store
+        .create_notice(&message_notice("msg_1", false), now)
+        .unwrap();
+    let sender = FakeSender::failing(
+        "dead",
+        vec![PushError::InvalidToken("UNREGISTERED".to_owned())],
+    );
+    let mailer = FakeNoticeMailer::default();
+    deliver_notices(&store, &world, Some(&sender), &mailer, now).unwrap();
+    let notice = notice_of(&store, NOTICE_MESSAGE, "msg_1");
+    assert_eq!(notice.notified_via.as_deref(), Some("push"));
+    assert_eq!(sender.sent().len(), 1);
+    assert_eq!(store.valid_tokens(OWNER).unwrap().len(), 1);
+    // Acked: no fallback. Not acked: one email at 15 minutes, never twice.
+    store
+        .create_notice(&message_notice("msg_2", false), now)
+        .unwrap();
+    deliver_notices(&store, &world, Some(&sender), &mailer, now).unwrap();
+    store.ack_notice(OWNER, &notice.id, now).unwrap();
+    for later in [Duration::minutes(14), ACK_FALLBACK, Duration::minutes(40)] {
+        deliver_notices(&store, &world, Some(&sender), &mailer, now + later).unwrap();
+    }
+    let unacked = notice_of(&store, NOTICE_MESSAGE, "msg_2");
+    assert_eq!(*mailer.sent.lock().unwrap(), vec![unacked.id.clone()]);
+    assert_eq!(
+        unacked.email_sent_at.as_deref(),
+        Some("2026-09-26T10:15:00Z")
+    );
+    fs::remove_dir_all(dir).unwrap();
+
+    // Retryable failures back off 30 s, 1, 2, 5, 10 minutes, then email.
+    let (store, dir) = temp_store();
+    register(&store, "tok1", None);
+    store
+        .create_notice(&message_notice("msg_3", false), now)
+        .unwrap();
+    let sender = FakeSender::failing(
+        "tok1",
+        (0..6)
+            .map(|_| PushError::Retryable("503".to_owned()))
+            .collect(),
+    );
+    let mailer = FakeNoticeMailer::default();
+    let mut clock = now;
+    for (attempt, delay) in [30_i64, 60, 120, 300, 600].into_iter().enumerate() {
+        deliver_notices(&store, &world, Some(&sender), &mailer, clock).unwrap();
+        let notice = notice_of(&store, NOTICE_MESSAGE, "msg_3");
+        assert_eq!(notice.push_attempts, i64::try_from(attempt).unwrap() + 1);
+        assert_eq!(
+            notice.notify_after,
+            format_ts(clock + Duration::seconds(delay))
+        );
+        clock += Duration::seconds(delay);
+    }
+    deliver_notices(&store, &world, Some(&sender), &mailer, clock).unwrap();
+    let notice = notice_of(&store, NOTICE_MESSAGE, "msg_3");
+    assert_eq!(notice.notified_via.as_deref(), Some("email"));
+    assert_eq!(mailer.sent.lock().unwrap().len(), 1);
+    fs::remove_dir_all(dir).unwrap();
+
+    // No push configured, or push configured but no valid token: email at once.
+    for push_configured in [false, true] {
+        let (store, dir) = temp_store();
+        store
+            .create_notice(&message_notice("msg_4", false), now)
+            .unwrap();
+        let mailer = FakeNoticeMailer::default();
+        let sender = FakeSender::default();
+        let sender = push_configured.then_some(&sender as &dyn PushSender);
+        deliver_notices(&store, &world, sender, &mailer, now).unwrap();
+        assert_eq!(
+            notice_of(&store, NOTICE_MESSAGE, "msg_4")
+                .notified_via
+                .as_deref(),
+            Some("email")
+        );
+        assert_eq!(mailer.sent.lock().unwrap().len(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // A transient email failure retries every 5 minutes within the hour.
+    let (store, dir) = temp_store();
+    store
+        .create_notice(&message_notice("msg_5", false), now)
+        .unwrap();
+    let mailer = FakeNoticeMailer {
+        transient_failures: Mutex::new(2),
+        ..Default::default()
+    };
+    deliver_notices(&store, &world, None, &mailer, now).unwrap();
+    let notice = notice_of(&store, NOTICE_MESSAGE, "msg_5");
+    assert!(notice.notified_at.is_none());
+    assert_eq!(notice.notify_after, "2026-09-26T10:05:00Z");
+    deliver_notices(&store, &world, None, &mailer, now + Duration::minutes(5)).unwrap();
+    deliver_notices(&store, &world, None, &mailer, now + Duration::minutes(10)).unwrap();
+    assert_eq!(
+        notice_of(&store, NOTICE_MESSAGE, "msg_5")
+            .notified_via
+            .as_deref(),
+        Some("email")
+    );
+    assert_eq!(mailer.sent.lock().unwrap().len(), 1);
+    fs::remove_dir_all(dir).unwrap();
+
+    // Email not set up at all: marked notified rather than looping.
+    let (store, dir) = temp_store();
+    store
+        .create_notice(&message_notice("msg_6", false), now)
+        .unwrap();
+    let mailer = FakeNoticeMailer {
+        unavailable: true,
+        ..Default::default()
+    };
+    deliver_notices(&store, &world, None, &mailer, now).unwrap();
+    let notice = notice_of(&store, NOTICE_MESSAGE, "msg_6");
+    assert_eq!(notice.last_push_error.as_deref(), Some("no channel"));
+    assert!(notice.notified_at.is_some());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn notice_text_and_payload() {
+    let (store, dir) = temp_store();
+    register(&store, "tok1", None);
+    let now = at("2026-09-26T10:00:00Z");
+    store
+        .create_notice(&message_notice("msg_3f9a2c1d", true), now)
+        .unwrap();
+    store
+        .create_notice(&message_notice("msg_00000002", false), now)
+        .unwrap();
+    store.create_notice(&review_notice(12), now).unwrap();
+    let world = FakeNoticeWorld {
+        unread: 3,
+        ..Default::default()
+    };
+    let sender = FakeSender::default();
+    deliver_notices(
+        &store,
+        &world,
+        Some(&sender),
+        &FakeNoticeMailer::default(),
+        now,
+    )
+    .unwrap();
+    let sent = sender.sent();
+    let blocking = notice_of(&store, NOTICE_MESSAGE, "msg_3f9a2c1d");
+    assert_eq!(
+        sent[0].1,
+        BTreeMap::from([
+            ("kind".to_owned(), "message".to_owned()),
+            ("notice_id".to_owned(), blocking.id.clone()),
+            ("session_id".to_owned(), "eng00001".to_owned()),
+            ("title".to_owned(), "sm-1679-engineer needs you".to_owned()),
+            (
+                "body".to_owned(),
+                "Keep the old fills table or drop it?".to_owned()
+            ),
+            (
+                "reader_path".to_owned(),
+                "/messages/msg_3f9a2c1d".to_owned()
+            ),
+            ("blocking".to_owned(), "1".to_owned()),
+            ("unread_count".to_owned(), "3".to_owned()),
+        ])
+    );
+    assert_eq!(sent[1].1["title"], "sm-1679-engineer");
+    assert_eq!(sent[1].1["blocking"], "0");
+    assert_eq!(sent[2].1["kind"], "review_requested");
+    assert_eq!(sent[2].1["unread_count"], "0");
+    assert_eq!(sent[2].1["title"], "sm-1679-engineer asks for your review");
+    assert_eq!(sent[2].1["body"], "Decision memo");
+    assert_eq!(
+        sent[2].1["reader_path"],
+        "/docs/widgets/memo.html?version=aaaaaaaaaaaa"
+    );
+    assert_eq!(
+        blocking.email_subject(),
+        "sm-1679-engineer needs you: Keep the old fills table or drop it?"
+    );
+    assert_eq!(
+        notice_of(&store, NOTICE_REVIEW_REQUESTED, "12").email_subject(),
+        "sm-1679-engineer asks for your review: Decision memo"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
