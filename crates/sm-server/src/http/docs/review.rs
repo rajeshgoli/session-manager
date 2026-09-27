@@ -145,6 +145,16 @@ fn valid_submission_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+/// A GitHub call failed. 503, not 502: Cloudflare replaces an origin 502 or
+/// 504 with its own error, which would hide this detail from the page
+/// (sm#1591).
+fn github_failure(detail: String) -> ApiError {
+    ApiError::Status {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        detail,
+    }
+}
+
 fn conflict(detail: impl Into<String>) -> ApiError {
     ApiError::Status {
         status: StatusCode::CONFLICT,
@@ -259,10 +269,7 @@ pub(super) async fn submit_owner_doc_review(
     })
     .await
     .map_err(|error| anyhow::anyhow!("PR lookup task failed: {error}"))?
-    .map_err(|detail| ApiError::Status {
-        status: StatusCode::BAD_GATEWAY,
-        detail,
-    })?;
+    .map_err(github_failure)?;
     if !pr.is_open() {
         return Err(conflict(format!(
             "PR #{pr_number} is {}, so the doc is read-only",
@@ -317,17 +324,13 @@ fn run_submission(
     let body = review_body(verdict, review.body.as_deref(), &review.id);
     let marker = review_marker(&review.id);
     let source = state.owner_doc_source.as_ref();
-    let github_error = |detail: String| ApiError::Status {
-        status: StatusCode::BAD_GATEWAY,
-        detail,
-    };
 
     let pr = match fresh {
         Some(pr) => pr,
         None => {
             let on_github = source
                 .viewer_reviews(&doc.repo, pr_number)
-                .map_err(github_error)?;
+                .map_err(github_failure)?;
             let marked = |pending: bool| {
                 on_github
                     .iter()
@@ -352,7 +355,7 @@ fn run_submission(
                 let _ = source.delete_pending_review(stale);
                 store.set_pending_review_node_id(&review.id, None)?;
             }
-            let pr = doc_pull_request(state, &doc.repo, pr_number, true).map_err(github_error)?;
+            let pr = doc_pull_request(state, &doc.repo, pr_number, true).map_err(github_failure)?;
             if !pr.is_open() {
                 store.fail_review(&review.id)?;
                 return Err(conflict(format!(
@@ -364,6 +367,21 @@ fn run_submission(
         }
     };
 
+    // GitHub takes comments only on files the PR changes. Say so rather
+    // than let every comment fail (sm#1591). A failed lookup leaves the
+    // answer to GitHub.
+    if !drafts.is_empty()
+        && matches!(
+            source.pr_changes_path(&doc.repo, pr_number, &doc.path),
+            Ok(false)
+        )
+    {
+        store.fail_review(&review.id)?;
+        return Err(conflict(format!(
+            "{} Ask the doc's author to push a change to it on the PR, then submit again. Your comments are kept.",
+            doc_not_in_pr_diff(pr_number, &doc.path)
+        )));
+    }
     let pending_id = match source.add_pending_review(&pr.node_id, &review.commit_sha, &body) {
         Ok(id) => id,
         // The review may exist even though the response was lost: look for
@@ -376,11 +394,17 @@ fn run_submission(
                 Some(found) => found.node_id.clone(),
                 None => {
                     store.fail_review(&review.id)?;
-                    return Err(github_error(format!("GitHub refused the review: {error}")));
+                    return Err(github_failure(format!(
+                        "GitHub refused the review: {error}"
+                    )));
                 }
             },
             // Unknown: leave the row submitting; a retry reconciles it.
-            Err(_) => return Err(github_error(format!("GitHub refused the review: {error}"))),
+            Err(_) => {
+                return Err(github_failure(format!(
+                    "GitHub refused the review: {error}"
+                )))
+            }
         },
     };
     store.set_pending_review_node_id(&review.id, Some(&pending_id))?;
@@ -524,16 +548,14 @@ fn abort(
             "Owner doc review {}: could not delete pending review {pending_id}: {delete_error}",
             review.id
         );
-        return Err(ApiError::Status {
-            status: StatusCode::BAD_GATEWAY,
-            detail: format!("GitHub refused the review: {error}. Submitting again resumes it."),
-        });
+        return Err(github_failure(format!(
+            "GitHub refused the review: {error}. Submitting again resumes it."
+        )));
     }
     owner_doc_store(state).fail_review(&review.id)?;
-    Err(ApiError::Status {
-        status: StatusCode::BAD_GATEWAY,
-        detail: format!("GitHub refused the review: {error}"),
-    })
+    Err(github_failure(format!(
+        "GitHub refused the review: {error}"
+    )))
 }
 
 fn finish_from_github(

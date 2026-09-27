@@ -656,8 +656,10 @@
           return;
         }
         // Keep the attempt: the server reconciles a retry against GitHub,
-        // so resubmitting can never post the review twice.
-        renderReview(err.message + ' Submitting again is safe.');
+        // so resubmitting can never post the review twice. A 4xx says what
+        // must change first, so a bare retry is not offered.
+        var refused = err.status >= 400 && err.status < 500;
+        renderReview(err.message + (refused ? '' : ' Submitting again is safe.'));
       });
     } });
     // Actions above the overall comment, clear of the on-screen keyboard.

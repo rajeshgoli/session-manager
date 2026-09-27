@@ -23419,6 +23419,8 @@ struct FakeGitHub {
     lose_pending_response: bool,
     lose_line_response: bool,
     fail_delete: bool,
+    /// Paths the PR's diff leaves out: GitHub takes no comments on them.
+    unchanged_paths: std::collections::BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -23510,6 +23512,12 @@ impl OwnerDocSource for StubDocSource {
             head_sha: head,
             url: format!("https://github.com/{repo}/pull/{pr_number}"),
         })
+    }
+
+    fn pr_changes_path(&self, _repo: &str, _pr_number: i64, path: &str) -> Result<bool, String> {
+        let mut github = self.github.lock().unwrap();
+        github.calls.push("pr_files".to_owned());
+        Ok(!github.unchanged_paths.contains(path))
     }
 
     fn add_pending_review(
@@ -24293,7 +24301,7 @@ async fn owner_doc_review_posts_one_github_review_and_wakes_the_author_once() {
         let calls: Vec<_> = github
             .calls
             .iter()
-            .filter(|c| *c != "pull_request")
+            .filter(|c| *c != "pull_request" && *c != "pr_files")
             .cloned()
             .collect();
         assert_eq!(
@@ -24389,6 +24397,84 @@ async fn owner_doc_review_posts_one_github_review_and_wakes_the_author_once() {
 }
 
 #[tokio::test]
+async fn owner_doc_on_a_pr_that_does_not_change_it_is_refused_at_publish_and_submit() {
+    let c1 = "a".repeat(40);
+    let source = review_memo_source(&c1);
+    let (app, dir) = owner_docs_app(source.clone());
+    let id = publish_review_memo(&app, "specs/memo.html", &c1, "author01", true).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "Why now?").await;
+
+    // The PR later stops changing the doc: the submit says why, nothing
+    // reaches GitHub, and the drafts stay.
+    {
+        let mut github = source.github.lock().unwrap();
+        github.unchanged_paths.insert("specs/memo.html".to_owned());
+        github.calls.clear();
+    }
+    for attempt in 0..2 {
+        let (status, error) = post_json(
+            app.clone(),
+            &format!("/docs/{id}/review"),
+            json!({"submission_id": "sub-nodiff1", "sha": c1, "verdict": "comment"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "attempt {attempt}: {error}");
+        assert!(
+            error["detail"]
+                .as_str()
+                .unwrap()
+                .contains("PR #12 does not change specs/memo.html"),
+            "{error}"
+        );
+    }
+    {
+        let github = source.github.lock().unwrap();
+        assert!(github.reviews.is_empty());
+        assert!(
+            !github.calls.contains(&"add_pending_review".to_owned()),
+            "{:?}",
+            github.calls
+        );
+    }
+    let (_, drafts) = get_json(app.clone(), &format!("/docs/{id}/drafts")).await;
+    assert_eq!(drafts["drafts"].as_array().unwrap().len(), 1);
+    assert!(queued_wakes(&dir, "[sm review]").is_empty());
+
+    // Publishing a doc on such a PR is refused, with or without --review.
+    for review in [true, false] {
+        let (status, error) = post_json(
+            app.clone(),
+            "/docs",
+            json!({"repo": "acme/widgets", "path": "specs/memo.html", "commit_sha": c1,
+                   "pr_number": 12, "session_id": "author01", "review": review}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{error}");
+        assert!(
+            error["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Push a change to specs/memo.html"),
+            "{error}"
+        );
+    }
+
+    // Once the PR changes the doc again, the same submission posts.
+    source.github.lock().unwrap().unchanged_paths.clear();
+    let (status, review) = post_json(
+        app.clone(),
+        &format!("/docs/{id}/review"),
+        json!({"submission_id": "sub-nodiff1", "sha": c1, "verdict": "comment"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{review}");
+    assert_eq!(review["line_comment_count"], 1);
+}
+
+#[tokio::test]
 async fn owner_doc_review_failure_deletes_the_pending_review_and_keeps_drafts() {
     let c1 = "a".repeat(40);
     let source = review_memo_source(&c1);
@@ -24414,7 +24500,7 @@ async fn owner_doc_review_failure_deletes_the_pending_review_and_keeps_drafts() 
             json!({"submission_id": submission, "sha": c1, "verdict": "comment"}),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "{error}");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error}");
         {
             let github = source.github.lock().unwrap();
             assert!(
@@ -24446,7 +24532,7 @@ async fn owner_doc_review_failure_deletes_the_pending_review_and_keeps_drafts() 
         json!({"submission_id": "sub-blocked1", "sha": c1, "verdict": "comment"}),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     source.github.lock().unwrap().reviews.clear();
     let (status, review) = post_json(
         app.clone(),
@@ -24593,6 +24679,7 @@ async fn owner_doc_review_reconciles_a_submission_a_crash_interrupted() {
         [
             "viewer_reviews",
             "pull_request",
+            "pr_files",
             "add_pending_review",
             "line_thread 5",
             "submit"
@@ -25085,11 +25172,11 @@ async fn owner_doc_review_a_newer_submission_from_another_device_takes_over() {
     // Tab A's attempt fails cleanly: its row is failed, the drafts stay.
     source.github.lock().unwrap().fail_submit = true;
     let (status, _) = submit("sub-tab-a", "approve", "Ship it.").await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     // Device B submits the same drafts under its own id and gets stuck.
     source.github.lock().unwrap().fail_delete = true;
     let (status, _) = submit("sub-device-b", "changes_requested", "Not yet.").await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     {
         let mut github = source.github.lock().unwrap();
         github.fail_submit = false;
@@ -25128,7 +25215,7 @@ async fn owner_doc_review_a_newer_submission_from_another_device_takes_over() {
     add_draft(&app, &id, &c1, json!(3), "Buy the dip.", "And later?").await;
     source.github.lock().unwrap().fail_submit = true;
     let (status, _) = submit("sub-tab-a-2", "comment", "").await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     source.github.lock().unwrap().fail_submit = false;
     let (status, review) = submit("sub-tab-a-2", "comment", "").await;
     assert_eq!(status, StatusCode::OK, "{review}");
@@ -25169,7 +25256,7 @@ async fn owner_doc_review_retries_under_one_id_never_post_twice() {
     let id = doc("specs/memo.html").await;
     source.github.lock().unwrap().fail_submit = true;
     let (status, _) = submit(id.clone(), "sub-retry-failed").await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     source.github.lock().unwrap().fail_submit = false;
     let (status, review) = submit(id, "sub-retry-failed").await;
     assert_eq!(status, StatusCode::OK, "{review}");
@@ -25196,7 +25283,7 @@ async fn owner_doc_review_retries_under_one_id_never_post_twice() {
         github.fail_delete = true;
     }
     let (status, error) = submit(id.clone(), "sub-stuck-delete").await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{error}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error}");
     let store = OwnerDocStore::new(dir.join("message_queue.db"));
     assert_eq!(
         store.review("sub-stuck-delete").unwrap().unwrap().status,
