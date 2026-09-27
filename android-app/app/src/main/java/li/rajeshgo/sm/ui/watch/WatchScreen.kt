@@ -1601,6 +1601,10 @@ private fun FollowableJobDetail(job: SessionJob, detail: String?, follow: Follow
 @Composable
 private fun FollowDialog(session: ClientSession, ownerName: String, onDismiss: () -> Unit, onFollow: (String) -> Unit) {
     var message by remember(session.id) { mutableStateOf(defaultFollowMessage(ownerName)) }
+    var edited by remember(session.id) { mutableStateOf(false) }
+    // The owner's name can arrive after the dialog opens; refresh the
+    // default draft then, but never text the owner has changed.
+    LaunchedEffect(ownerName) { if (!edited) message = defaultFollowMessage(ownerName) }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Follow ${sessionDisplayName(session)}") },
@@ -1608,7 +1612,7 @@ private fun FollowDialog(session: ClientSession, ownerName: String, onDismiss: (
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
                     value = message,
-                    onValueChange = { message = it },
+                    onValueChange = { message = it; edited = true },
                     modifier = Modifier.fillMaxWidth(),
                     minLines = 5,
                     maxLines = 10,
