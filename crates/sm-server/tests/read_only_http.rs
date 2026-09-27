@@ -6369,8 +6369,11 @@ async fn queue_runtime_perf_waits_for_tests_and_blocks_new_tests_through_cooldow
     let working_dir = unique_temp_path().with_extension("queue-cwd");
     fs::create_dir_all(&working_dir).unwrap();
     // The first test holds until released, so the perf job is always submitted
-    // while it runs rather than racing a fixed sleep (sm#1432).
+    // while it runs rather than racing a fixed sleep (sm#1432). The perf job
+    // holds the same way, so it is still running while the second test is
+    // checked (sm#1597).
     let release = working_dir.join("release-first-test");
+    let release_perf = working_dir.join("release-perf");
     let mut config = AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
@@ -6418,11 +6421,14 @@ async fn queue_runtime_perf_waits_for_tests_and_blocks_new_tests_through_cooldow
         json!({
             "type": "perf",
             "label": "exclusive perf",
-            "script": "sleep 1; printf perf",
+            "script": format!(
+                "while [ ! -f '{}' ]; do sleep 0.05; done; printf perf",
+                release_perf.display()
+            ),
             "cwd": working_dir.display().to_string(),
             "notify_target": "run12345",
             "requester_session_id": "run12345",
-            "timeout_seconds": 5,
+            "timeout_seconds": 30,
             "cpu_percent": 100,
             "gpu_percent": 0,
             "memory_bytes": 4294967296_i64
@@ -6457,12 +6463,23 @@ async fn queue_runtime_perf_waits_for_tests_and_blocks_new_tests_through_cooldow
     wait_for_queue_job_state(app.clone(), &first_test_id, &["succeeded"]).await;
     let perf_running = wait_for_queue_job_state(app.clone(), &perf_id, &["running"]).await;
     assert_eq!(perf_running["state"], "running");
-    let (status, second_held) =
-        get_json(app.clone(), &format!("/queue-jobs/{second_test_id}")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(second_held["state"], "pending");
+    // The admission pass clears pending jobs' reasons and marks them behind
+    // the perf job only after starting it, so the reason can trail the perf
+    // job's `running` state (sm#1597).
+    let mut second_held = Value::Null;
+    for _ in 0..80 {
+        let (status, job) = get_json(app.clone(), &format!("/queue-jobs/{second_test_id}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(job["state"], "pending", "{job}");
+        second_held = job;
+        if second_held["holding_reason"] == "perf_running" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert_eq!(second_held["holding_reason"], "perf_running");
 
+    fs::write(&release_perf, "").unwrap();
     wait_for_queue_job_state(app.clone(), &perf_id, &["succeeded"]).await;
     wait_for_queue_job_state(app, &second_test_id, &["succeeded"]).await;
 }

@@ -1179,6 +1179,10 @@ impl RetainedQueueStore {
             "#,
             params![job_id, now_rfc3339(), pid, process_limit],
         )?;
+        // Read the record before the monitor starts: a job that exits at
+        // once could otherwise be finished by the monitor first, and the
+        // caller would count a started job as not started (sm#1597).
+        let started = get_queue_job_conn(&conn, job_id);
         let monitor_state_dir = state_dir.to_path_buf();
         let monitor_message_queue_db_path = message_queue_db_path.to_path_buf();
         let monitor_job_id = job_id.to_owned();
@@ -1197,7 +1201,7 @@ impl RetainedQueueStore {
                 admission_policy,
             );
         });
-        get_queue_job_conn(&conn, job_id)
+        started
     }
 
     pub fn admit_queue_jobs_in_state_dir(
