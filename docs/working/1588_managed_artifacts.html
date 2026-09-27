@@ -1,0 +1,772 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1588 — sm-managed artifact storage</title>
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;
+    --orange:     #eb6834;
+    --red:        #e34948;
+    --green:      #008300;
+    --violet:     #4a3aa7;
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  .fn { font-size: .82rem; color: var(--ink-2); }
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: var(--ink); }
+  svg .muted { fill: var(--ink-2); }
+  svg .box { fill: var(--surface-2); stroke: var(--ink-3); stroke-width: 1.2; }
+  svg .box-keep { fill: var(--surface-2); stroke: var(--green); stroke-width: 2; }
+  svg .box-gone { fill: var(--surface-2); stroke: var(--red); stroke-width: 2; }
+  svg .box-warn { fill: var(--surface-2); stroke: var(--orange); stroke-width: 2; }
+  svg .edge { stroke: var(--ink-2); stroke-width: 1.3; fill: none; }
+  svg .bar { fill: var(--blue); }
+  svg .bar2 { fill: var(--orange); }
+  svg .axis { stroke: var(--ink-3); stroke-width: 1; }
+  @media print {
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" style="fill: var(--ink-2)"/>
+    </marker>
+  </defs>
+</svg>
+
+<h1>1588 — sm-managed artifact storage</h1>
+<p class="sans"><small>Author: sm-1588-spec-author <code>541e4b49</code> · Ticket #1588 · 26 Sep 2026 · Revision 1</small></p>
+
+<h2>Memo</h2>
+
+<p><b>Session Manager takes ownership of <code>~/Artifacts</code> and keeps the disk from filling.</b> Every folder in it gets a record. The record says what the folder is, who made it, how to rebuild it, and what keeps it alive. sm deletes folders once nothing keeps them alive. When the disk runs short, sm deletes folders that are cheap to rebuild. Anything expensive comes to you as one list with a Delete button. New builds wait in <code>sm queue</code> until their output fits. The free-text <code>RETENTION.md</code> notes give way to a record that sm checks every day.</p>
+
+<p>Most of today's disk is cheap to rebuild, which is what makes this work. The NQ input chain from #1692 takes 290 GB and took <b>21 minutes</b> to build, going by its own command log.<a href="#fn1"><sup>1</sup></a> Under this design, sm can delete it when space is short and an agent can rebuild it with one command. You would not be asked.</p>
+
+<h3>Why now</h3>
+
+<figure>
+<svg viewBox="0 0 760 250" role="img" aria-label="Gigabytes in ~/Artifacts by the week each folder was created">
+  <line class="axis" x1="60" y1="200" x2="740" y2="200"/>
+  <!-- scale: 1052 GB = 160 px -->
+  <g>
+    <rect class="bar" x="80"  y="199" width="60" height="1"/>   <text x="110" y="192" text-anchor="middle" font-size="12">&lt;1</text>
+    <rect class="bar" x="175" y="199" width="60" height="1"/>   <text x="205" y="192" text-anchor="middle" font-size="12">&lt;1</text>
+    <rect class="bar" x="270" y="199" width="60" height="1"/>   <text x="300" y="192" text-anchor="middle" font-size="12">1</text>
+    <rect class="bar" x="365" y="187" width="60" height="13"/>  <text x="395" y="181" text-anchor="middle" font-size="12">85</text>
+    <rect class="bar" x="460" y="197" width="60" height="3"/>   <text x="490" y="191" text-anchor="middle" font-size="12">17</text>
+    <rect class="bar" x="555" y="199" width="60" height="1"/>   <text x="585" y="192" text-anchor="middle" font-size="12">4</text>
+    <rect class="bar" x="650" y="40"  width="60" height="160"/>
+    <rect class="bar2" x="650" y="40" width="60" height="18"/>
+    <text x="680" y="32" text-anchor="middle" font-size="12" font-weight="700">1,052 GB</text>
+    <text x="645" y="53" text-anchor="end" font-size="11" class="muted">no note: 120 GB</text>
+  </g>
+  <g font-size="11" class="muted">
+    <text x="110" y="218" text-anchor="middle" class="muted">Aug 8–14</text>
+    <text x="205" y="218" text-anchor="middle" class="muted">Aug 15–21</text>
+    <text x="300" y="218" text-anchor="middle" class="muted">Aug 22–31</text>
+    <text x="395" y="218" text-anchor="middle" class="muted">Sep 1–7</text>
+    <text x="490" y="218" text-anchor="middle" class="muted">Sep 8–14</text>
+    <text x="585" y="218" text-anchor="middle" class="muted">Sep 15–21</text>
+    <text x="680" y="218" text-anchor="middle" class="muted">Sep 22–26</text>
+  </g>
+  <text x="60" y="244" font-size="11" class="muted">GB now in ~/Artifacts, by the week each top-level folder was created (26 Sep 2026). Orange: folders with no retention note.</text>
+</svg>
+<figcaption>Figure 1. What is in <code>~/Artifacts</code> today (1.1 TB, 217 folders) and when it arrived. Most of it arrived in the last five days. The 17 Sep crisis had already cleared older folders: the disk reached 96% then, blocked the #1462 runs, and #1470 deleted about 480 GB by hand.</figcaption>
+</figure>
+
+<p>Retention notes cover about 89% of the bytes, so the notes themselves are not the gap. The gap is that nothing can <i>act</i> on them. A note says "keep while an NQ/YM pretraining ticket reads them; delete by 2027-03-31 at the latest". A person can read that. No program can decide from it today whether the folder can go. Meanwhile, nothing stops a 300 GB build from starting when the disk has 200 GB free.</p>
+
+<div class="vocab">
+<b class="sans">Terms used in this memo</b>
+<dl>
+<dt>Managed root</dt><dd>A directory sm owns, such as <code>~/Artifacts</code>. It is set in sm's config together with its GitHub repo. fractal-algo-rust is the first repo with one.</dd>
+<dt>Artifact</dt><dd>One top-level folder in the managed root. It is the unit sm tracks, sizes and deletes. Its name is the folder name, for example <code>1692_nq_bundle</code>.</dd>
+<dt>Record</dt><dd>sm's database row for an artifact: owner session, ticket, epic label, size, a free-text <b>description</b> written by the agent, its holds, its review date, and its recipe.</dd>
+<dt>Hold</dt><dd>One reason to keep an artifact that sm can check by itself. An artifact stays while at least one hold is active. The kinds are listed in the next section.</dd>
+<dt>Review date</dt><dd>A date on every record. If the artifact is still being kept on that date, sm asks you whether to keep it. sm never deletes because a review date arrived.</dd>
+<dt>Recipe</dt><dd>How the artifact was built: the <code>sm queue run</code> jobs that wrote it, the git commit each ran at, the artifacts each read (its <b>inputs</b>), and each job's measured run time. sm records the recipe itself, so the agent writes none of it.</dd>
+<dt>Cheap to rebuild</dt><dd>The recipe is complete, its commit is preserved on GitHub, and its recorded build time is at most 4 hours of Mac time with no GPU spend.</dd>
+<dt>Floor</dt><dd>The free space sm protects: 5% of the disk, about 180 GB.</dd>
+<dt>Pressure pass</dt><dd>What sm runs when free space falls below the floor, or when a new build would push it below: delete what is expired, then what is cheap to rebuild, then ask you.</dd>
+<dt>Digest</dt><dd>At most one message a day from sm to you in the sm app. It lists what sm deleted and what needs you. It sends nothing on a quiet day.</dd>
+</dl>
+</div>
+
+<h3>How an artifact lives</h3>
+
+<figure>
+<svg viewBox="0 0 760 330" role="img" aria-label="Artifact lifecycle">
+  <rect class="box-warn" x="20"  y="20"  width="130" height="44" rx="6"/><text x="85"  y="47" text-anchor="middle" font-size="14" font-weight="700">unregistered</text>
+  <rect class="box"      x="20"  y="150" width="130" height="44" rx="6"/><text x="85"  y="177" text-anchor="middle" font-size="14" font-weight="700">building</text>
+  <rect class="box-keep" x="240" y="150" width="130" height="44" rx="6"/><text x="305" y="177" text-anchor="middle" font-size="14" font-weight="700">kept</text>
+  <rect class="box-warn" x="460" y="150" width="130" height="44" rx="6"/><text x="525" y="177" text-anchor="middle" font-size="14" font-weight="700">expired</text>
+  <rect class="box-gone" x="620" y="20"  width="120" height="44" rx="6"/><text x="680" y="47" text-anchor="middle" font-size="14" font-weight="700">deleted</text>
+  <rect class="box-warn" x="240" y="265" width="130" height="44" rx="6"/><text x="305" y="292" text-anchor="middle" font-size="14" font-weight="700">evicted</text>
+
+  <line class="edge" x1="150" y1="172" x2="238" y2="172" marker-end="url(#arr)"/>
+  <text x="194" y="164" text-anchor="middle" font-size="11">sm artifact done</text>
+
+  <line class="edge" x1="120" y1="64" x2="270" y2="148" marker-end="url(#arr)"/>
+  <text x="222" y="100" font-size="11">sm artifact adopt</text>
+
+  <line class="edge" x1="150" y1="42" x2="618" y2="42" marker-end="url(#arr)"/>
+  <text x="385" y="35" text-anchor="middle" font-size="11">7-day grace ends, nobody adopted it</text>
+
+  <line class="edge" x1="370" y1="164" x2="458" y2="164" marker-end="url(#arr)"/>
+  <text x="414" y="157" text-anchor="middle" font-size="11">last hold lapses</text>
+  <line class="edge" x1="458" y1="182" x2="372" y2="182" marker-end="url(#arr)"/>
+  <text x="414" y="199" text-anchor="middle" font-size="11">a hold returns</text>
+
+  <line class="edge" x1="560" y1="150" x2="660" y2="66" marker-end="url(#arr)"/>
+  <text x="630" y="120" font-size="11">24 h later</text>
+
+  <line class="edge" x1="330" y1="150" x2="640" y2="66" marker-end="url(#arr)"/>
+  <text x="400" y="118" font-size="11">deleted by agent or you</text>
+
+  <line class="edge" x1="305" y1="194" x2="305" y2="263" marker-end="url(#arr)"/>
+  <text x="312" y="234" font-size="11">pressure pass (cheap to rebuild)</text>
+
+  <path class="edge" d="M240,287 C120,287 85,250 85,196" marker-end="url(#arr)"/>
+  <text x="95" y="262" font-size="11">sm artifact rebuild</text>
+
+  <path class="edge" d="M370,287 C600,287 700,200 690,66" marker-end="url(#arr)"/>
+  <text x="560" y="262" font-size="11">last hold lapses (nothing on disk to remove)</text>
+</svg>
+<figcaption>Figure 2. The six states. <b>Kept</b> means on disk and wanted. <b>Expired</b> means no hold is active, and sm deletes it 24 hours after it is listed in your digest. <b>Evicted</b> means sm deleted it under pressure while it was still wanted. Its record, recipe and holds stay, so an agent can rebuild it. <b>Deleted</b> means gone for good. The record remains as history.</figcaption>
+</figure>
+
+<p><b>Only two ways into the root.</b> An agent either (1) runs <code>sm queue run --artifact &lt;name&gt; --est-size &lt;size&gt; …</code>, or (2) runs <code>sm artifact new &lt;name&gt;</code> for hand-made work, such as files pulled back from a Runpod pod. In both cases, when the work is finished, the agent runs <code>sm artifact done</code> with a description and at least one hold. A folder that arrives any other way is <b>unregistered</b>. It appears in your digest and is deleted seven days after sm first sees it unless an agent runs <code>sm artifact adopt</code> on it.</p>
+
+<p><b>The holds.</b> An agent declares three kinds. sm adds three more by itself.</p>
+<table>
+<thead><tr><th style="width:26%">Hold</th><th>Active while</th><th style="width:28%">Example</th></tr></thead>
+<tbody>
+<tr><td><code>until:2027-03-31</code></td><td>the date has not passed</td><td>A fixture kept until year end</td></tr>
+<tr><td><code>open:#1665</code></td><td>that ticket or PR is open on GitHub</td><td>"keep until epic 1665 merges"</td></tr>
+<tr><td><code>project</code></td><td>always; only you or an agent's explicit delete removes it</td><td>The ES bundle, the resident detector</td></tr>
+<tr><td><i>named on main</i> (automatic)</td><td>a file on <code>main</code> names the artifact's path, not counting <code>docs/working</code> and <code>docs/execution</code></td><td><code>1299_model_bundle</code>, named by <code>docs/specs/1302…</code></td></tr>
+<tr><td><i>input of</i> (automatic)</td><td>a kept or evicted artifact lists it as an input</td><td><code>1691_scratch</code>, read to build <code>1665-labels</code></td></tr>
+<tr><td><i>in use</i> (automatic)</td><td>a waiting or running queue job reads or writes it</td><td>Any artifact a running training job reads</td></tr>
+</tbody>
+</table>
+<p>A condition sm cannot check, such as "until Rajesh has reviewed the result", goes in the description. The agent pairs it with a hold sm can check (usually <code>open:</code> on the ticket) and a review date. When the review date comes, the artifact shows up in your digest with the note and a Delete / Keep 30 more days choice.</p>
+
+<p><b>Under disk pressure</b>, sm runs three steps in order. It stops as soon as free space is back above the floor, plus whatever a waiting build needs:</p>
+<table>
+<thead><tr><th style="width:8%">Step</th><th>Deletes</th><th style="width:40%">Never touches</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Expired artifacts, without waiting out their 24-hour notice.</td><td rowspan="2">Artifacts in use by a queue job; <code>project</code> holds; hand-made or adopted artifacts (no recipe); anything whose inputs are missing; an input of anything kept.</td></tr>
+<tr><td>2</td><td>Artifacts that are cheap to rebuild, most gigabytes per build-hour first. Their state becomes <b>evicted</b>.</td></tr>
+<tr><td>3</td><td>Nothing. It sends you one message: how much space is needed, and the largest artifacts sm may not delete itself, each with the reason and a Delete button.</td><td></td></tr>
+</tbody>
+</table>
+
+<p><b>The queue hold.</b> A job that declares <code>--artifact</code> starts only if, after its estimated output and what running jobs still expect to write, free space stays above the floor. Otherwise sm runs the pressure pass. If the job still does not fit, it waits with the reason <code>disk_floor</code>. Such a job waits up to 24 hours instead of the queue's usual 5-minute admission window. It starts on its own as soon as space frees, for example when you press Delete. For a rebuild, sm uses the last measured size, so no estimate is needed.</p>
+
+<h3>Examples</h3>
+
+<h4>1. Today's notes, as holds</h4>
+<table>
+<thead><tr><th style="width:24%">Folder</th><th style="width:38%">What its note says</th><th>Record</th></tr></thead>
+<tbody>
+<tr><td><code>1692_nq_bundle</code> (+ <code>_inputs</code>, <code>_context</code>)</td><td>Keep while an NQ/YM pretraining ticket reads them; delete by 2027-03-31 at the latest.</td><td><code>open:</code> the pretraining ticket; review date 2027-03-31. Built by one queue job, so all three share one recipe (21 min) and are cheap to rebuild.</td></tr>
+<tr><td><code>1299_model_bundle_0f71094b</code></td><td>Keep until <code>docs/specs/1302_shared_frame_inputs.html</code> stops naming it.</td><td>No declared hold is needed: <i>named on main</i> keeps it. Review date six months out.</td></tr>
+<tr><td><code>1691_scratch</code> (its <code>ref/</code>)</td><td>Keep while <code>1665-labels/tables</code> references it; delete by 2027-03-31.</td><td><i>input of</i> <code>1665-labels</code> keeps it; review date 2027-03-31. The three <code>1642_es_*</code> symlinks become aliases, deleted with it.</td></tr>
+<tr><td><code>1680-forecast-fixture</code></td><td>Delete when #1679's real predictions replace it, no later than 2026-12-31. Rebuild takes about 2 minutes.</td><td><code>open:#1679</code>; review date 2026-12-31. It was made by hand, so it has no recipe and is never deleted under pressure.</td></tr>
+<tr><td><code>1629-completion</code></td><td>Keep until the iteration-4 epic closes and Rajesh has reviewed its result.</td><td><code>open:</code> the epic's ticket; the Rajesh-review condition goes in the description; review date at the epic's planned end.</td></tr>
+</tbody>
+</table>
+
+<h4>2. A build, end to end</h4>
+<pre><code>sm queue run --type background --label 1692-nq-chain \
+  --artifact 1692_nq_bundle --artifact 1692_nq_inputs --artifact 1692_nq_context \
+  --est-size 300G --cwd ~/worktrees/fractal-algo-rust-1692-build-nq-and-ym \
+  --script-file ~/Artifacts/1692_scratch/job.sh
+# … job succeeds in 21 min; sm records the commit, the time and the inputs it read …
+sm artifact done 1692_nq_bundle 1692_nq_inputs 1692_nq_context --recipe-complete \
+  --hold open:#1705 --review-by 2027-03-31 --epic iter6 --describe @README.md</code></pre>
+<p>When the job is submitted, sm checks the space: free space minus 300 GB minus what running jobs still expect to write. The job starts only if the result is above 180 GB. When the job finishes, sm records the commit it ran at and the 21 minutes it took. When the agent runs <code>done … --recipe-complete</code>, the agent is attesting that re-running this job at this commit reproduces the folders. sm then pushes a git tag so the commit survives the squash merge and branch deletion. Two months later, suppose the disk is short. sm deletes all three folders together (about 14 GB per build-minute) and marks them evicted. When #1705's next run needs them, its agent runs <code>sm artifact rebuild 1692_nq_bundle</code>, which queues the same job at the same commit.</p>
+
+<h4>3. A build that must wait</h4>
+<p>Suppose the disk has 300 GB free and a running job still expects to write 60 GB. A new 150 GB build arrives. 300 − 60 − 150 = 90 GB, which is below the 180 GB floor, so sm needs 90 GB more. Step 1 finds nothing expired. Step 2 evicts the cheap-to-rebuild YM chain (about 311 GB), and the build starts. If nothing cheap were left, the build would wait, and you would get one message:</p>
+<pre><code>Artifacts: build "1710-es-states" (150 GB) is waiting for disk. Needs 90 GB.
+  1691_scratch     301 GB  input of 1665-labels · review 2027-03-31    [Delete]
+  1299_model_…      75 GB  named in docs/specs/1302_shared_frame_inputs.html [Delete]
+  1629-completion   14 GB  made by hand, no recipe · open #1629          [Delete]</code></pre>
+
+<div class="ruling">
+<b class="sans">Already decided (in session, 26 Sep 2026)</b>
+<ol style="margin:.3rem 0 0 1.1rem;padding:0">
+<li>Artifacts are sm-managed. Only sm writes into the root, through <code>sm queue run --artifact</code> or <code>sm artifact new</code>. The daily scan flags anything else and deletes it after a grace period.</li>
+<li>sm may delete a still-wanted artifact that is cheap to rebuild when the disk is tight. Everything else goes to you.</li>
+<li>A rebuild recipe is the queue job, its commit, and the artifacts it read. sm records it from the queue, and the agent writes none of it.</li>
+<li>The queue holds a build until its output fits above a 5% floor.</li>
+<li>No secondary drive. This is a general sm feature, and fractal-algo-rust is the first user.</li>
+<li>Runpod storage volumes are out of scope. You manage them.</li>
+<li>No per-epic disk budgets for now. Each record carries an epic label, and the list shows totals by epic.</li>
+</ol>
+</div>
+
+<h3>Decision surface</h3>
+<table>
+<thead>
+<tr><th style="width:22%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
+</thead>
+<tbody>
+<tr><td>1. What counts as cheap to rebuild?</td><td><b>At most 4 hours of recorded build time, and no GPU spend.</b> Changeable in sm's config.</td><td>It covers every input chain seen so far (#1692 at 21 min) and excludes training runs (#1629 at about 9 h each).</td></tr>
+<tr><td>2. Keeping the build commit alive</td><td><b>sm pushes a tag <code>artifact/&lt;name&gt;/&lt;sha7&gt;</code> to the fractal-algo-rust GitHub repo.</b> It pushes when an agent marks a recipe complete, and removes the tag when the artifact is deleted for good.</td><td>Squash merges delete feature branches. Without a tag, the exact commit disappears and the recipe cannot be re-run. Agents already hand-make <code>run/…</code> tags for this reason.</td></tr>
+<tr><td>3. Your buttons</td><td><b>Two actions in the sm app and sm web artifact list: Delete, and Keep 30 more days.</b> Only your signed-in account can use them, not agents on the local machine.</td><td>Without them, your only way to answer the digest is to tell an agent, which is slow from a phone.</td></tr>
+<tr><td>4. Notice before an expiry deletion</td><td><b>24 hours:</b> the digest lists "deleting tomorrow". Disk pressure skips the wait.</td><td>It gives one chance to catch a wrong hold without letting expired data sit on a full disk.</td></tr>
+<tr><td>5. Grace for unregistered folders</td><td><b>7 days.</b> For the 217 folders already on disk: a one-time import first, then 14 days for anything it leaves.</td><td>A week covers a forgotten <code>adopt</code>. The import needs longer because a low-tier agent must read 91 notes.</td></tr>
+<tr><td>6. Starting safely</td><td><b>First 7 days in dry run:</b> sm records and reports every deletion it <i>would</i> make, but deletes nothing on its own.</td><td>You see a week of sm's judgement on real data before it can remove anything.</td></tr>
+<tr><td>7. Review-date limit</td><td><b>At most 6 months out when set.</b> By default it is the latest <code>until:</code> date.</td><td>Matches the 2027-03-31 horizon agents already write, so nothing is kept without a look at least twice a year.</td></tr>
+<tr><td>8. Who may declare <code>project</code> (keep for the project's life)</td><td><b>Any agent. Each new one appears once in your digest with a Delete button.</b></td><td>You said only a few artifacts deserve this. Seeing each one once is enough to police it without a per-item approval step.</td></tr>
+</tbody>
+</table>
+
+<h3>What ships, in order</h3>
+<table>
+<thead><tr><th style="width:8%">#</th><th>Ticket</th><th style="width:30%">You notice</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Records, <code>sm artifact</code> commands, config, the daily size scan and unregistered detection. Dry run only.</td><td>Nothing yet.</td></tr>
+<tr><td>2</td><td>Queue integration: <code>--artifact</code>, <code>--input</code>, <code>--est-size</code>, recipe capture, commit tags, the <code>disk_floor</code> hold, <code>sm artifact rebuild</code>.</td><td>A build can wait for disk.</td></tr>
+<tr><td>3</td><td>Hold checks, expiry, the pressure pass and the daily digest. Deletions stay in dry run for 7 days after this ships.</td><td>The digest starts.</td></tr>
+<tr><td>4</td><td>The artifact list and your two buttons in sm web and the sm app.</td><td>The list, with totals by epic.</td></tr>
+<tr><td>5</td><td>fractal-algo-rust: import the existing folders, and replace the <code>RETENTION.md</code> rule in its agent instructions with the new commands.</td><td>One digest listing whatever the import could not map.</td></tr>
+</tbody>
+</table>
+
+<h3>Risks</h3>
+<ul>
+<li><b>An agent reading a folder outside a queue job gets no protection.</b> For example, it reads the folder interactively, without <code>--input</code>. sm can evict the folder under that agent. The agent then fails, reads the record, and rebuilds. That costs only minutes, because only cheap artifacts are evicted.</li>
+<li><b>A wrong "recipe complete" claim makes an eviction permanent.</b> For example, the job needed a binary built outside the queue. The mitigation is the dry-run week, plus a rule in the agent instructions that the recipe's jobs must build what they use. A failed rebuild is reported to you in the digest.</li>
+<li><b>A hold that reads GitHub fails safe.</b> If GitHub cannot be reached, sm treats every ticket as still open and deletes nothing on that basis.</li>
+</ul>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p>This is the first revision.</p>
+
+<p class="fn" id="fn1">1. <code>~/Artifacts/1692_nq_inputs/commands.jsonl</code>: ten recorded stages, 20.6 minutes in total. The bundle stage is 12.1 minutes of that. Sizes: <code>1692_nq_bundle</code> 135.5 GB, <code>1692_nq_context</code> 133.2 GB, <code>1692_nq_inputs</code> 23.9 GB.</p>
+
+<!-- memo-print-scope keys on this divider -->
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<div class="toc">
+<div><a href="#A">A. States and transitions</a></div>
+<div><a href="#B">B. Configuration</a></div>
+<div><a href="#C">C. Persisted shapes</a></div>
+<div><a href="#D">D. The <code>sm artifact</code> commands</a></div>
+<div><a href="#E">E. Queue integration</a></div>
+<div><a href="#F">F. Hold evaluation</a></div>
+<div><a href="#G">G. Deletion mechanics and safety</a></div>
+<div><a href="#H">H. The pressure pass</a></div>
+<div><a href="#I">I. The daily scan</a></div>
+<div><a href="#J">J. Rebuild</a></div>
+<div><a href="#K">K. Owner surface: digest, list, actions</a></div>
+<div><a href="#L">L. fractal-algo-rust rollout</a></div>
+<div><a href="#M">M. Tickets, code locations and tests</a></div>
+<div><a href="#Z">Z. FAQ</a></div>
+</div>
+
+<h3 id="A">A. States and transitions</h3>
+
+<p>An artifact is identified by <code>(root, name)</code>, where <code>name</code> is a single path segment matching <code>^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$</code>. Names compare case-insensitively, because APFS is case-insensitive and agents write both <code>~/Artifacts</code> and <code>~/artifacts</code>. The stored name keeps the case the creator used.</p>
+
+<table>
+<thead><tr><th>From</th><th>To</th><th>Trigger</th><th>Effects</th></tr></thead>
+<tbody>
+<tr><td>(none)</td><td>building</td><td><code>sm artifact new</code>, or submission of a queue job naming an absent artifact in <code>--artifact</code></td><td>Creates the folder (mode 0755), inserts the record with <code>owner_session_id</code> = requester and <code>ticket</code> resolved per D.1, and logs <code>created</code>.</td></tr>
+<tr><td>(none)</td><td>unregistered</td><td>The scan finds a top-level entry with no record and no alias row</td><td>Inserts a record with <code>first_seen_at</code> = now and <code>grace_until</code> = first_seen + <code>unregistered_grace_days</code> (or the initial grace, B).</td></tr>
+<tr><td>building</td><td>kept</td><td><code>sm artifact done</code> succeeds (D.3)</td><td>Sets description, holds, review date and <code>finalized_at</code>. If <code>--recipe-complete</code> is given, validates the recipe and pushes tags (E.6).</td></tr>
+<tr><td>unregistered</td><td>kept</td><td><code>sm artifact adopt</code></td><td>Same as <code>done</code>, but the artifact has no recipe and is never rebuildable.</td></tr>
+<tr><td>unregistered</td><td>deleted</td><td><code>grace_until</code> passes (and the artifact is not in use)</td><td>Deletion (G). Reason <code>unregistered</code>.</td></tr>
+<tr><td>building</td><td>deleted</td><td>An agent's <code>sm artifact delete</code>; or the orphan rule: the owner session has ended, no job references it, and 7 days have passed since the session ended</td><td>Deletion (G).</td></tr>
+<tr><td>kept</td><td>expired</td><td>Hold evaluation finds no active hold (F)</td><td>Sets <code>expired_at</code> = now and <code>delete_after</code> = now + <code>expiry_notice_hours</code>.</td></tr>
+<tr><td>expired</td><td>kept</td><td>Any hold becomes active again, or an agent adds a hold, or you press Keep 30 more days</td><td>Clears <code>expired_at</code> and <code>delete_after</code>.</td></tr>
+<tr><td>expired</td><td>deleted</td><td><code>delete_after</code> passes, or step 1 of the pressure pass</td><td>Deletion (G). Reason <code>expired</code>.</td></tr>
+<tr><td>kept</td><td>evicted</td><td>Step 2 of the pressure pass</td><td>Deletion from disk (G). The record, holds and recipe stay. Reason <code>pressure</code>.</td></tr>
+<tr><td>evicted</td><td>deleted</td><td>Hold evaluation finds no active hold</td><td>No disk action; sets <code>deleted_at</code>. Tags are removed (E.6).</td></tr>
+<tr><td>evicted</td><td>building</td><td><code>sm artifact rebuild</code> (J)</td><td>Recreates the folder and queues the recipe.</td></tr>
+<tr><td>kept, expired</td><td>deleted</td><td>An agent's <code>sm artifact delete</code> (D.6) or your Delete (K.3)</td><td>Deletion (G). Reason <code>agent</code> or <code>owner</code>.</td></tr>
+</tbody>
+</table>
+
+<p><b>Review due</b> is a flag, not a state: <code>state = kept</code> and <code>review_by &lt;= today</code>. Such an artifact appears under "Needs you" in every digest until you act or its holds lapse. <b>Deleted</b> is terminal for a name. A new artifact may reuse the name only with <code>sm artifact new --replace-deleted</code>, which archives the old row's history under a suffixed name (<code>&lt;name&gt;@&lt;deleted_at&gt;</code>).</p>
+
+<p><b>Sets.</b> Two artifacts belong to the same <b>set</b> when any queue job wrote to both. Sets are the connected components of the job-to-artifact graph. A set is finalized when all its members are finalized. It is rebuildable only when every member is rebuildable. It is evicted, rebuilt and tagged as a unit. A hand-made or adopted artifact is a set of one.</p>
+
+<h3 id="B">B. Configuration</h3>
+<p>This is a new top-level section in <code>~/.config/session-manager/config.yaml</code>, parsed into <code>ManagedArtifactsConfig</code> next to <code>AppArtifactsConfig</code> (<code>crates/sm-server/src/config.rs:684</code>). The name avoids <code>app_artifacts</code>, which is the unrelated mobile-app build store.</p>
+<pre><code>managed_artifacts:
+  enabled: false                 # default false; the feature is inert when false
+  deletion: dry_run              # dry_run | enabled
+  db_path: ~/.local/share/claude-sessions/artifacts.db
+  mirror_dir: ~/.local/share/claude-sessions/artifact-mirrors
+  cheap_rebuild_hours: 4.0
+  expiry_notice_hours: 24
+  unregistered_grace_days: 7
+  initial_grace_days: 14         # applies to entries present at the first scan
+  orphan_building_days: 7
+  max_review_days: 183
+  disk_hold_max_wait_hours: 24
+  overrun_factor: 1.5
+  pressure_check_seconds: 600
+  scan_time: "04:17"             # local time; the daily scan (I) and hold evaluation (F)
+  digest_time: "08:07"           # local time
+  roots:
+    - path: ~/Artifacts
+      repo: rajeshgoli/fractal-algo-rust
+      repo_checkout: ~/projects/fractal-algo-rust   # used only for rebuild worktrees (J)
+      default_branch: main
+      named_exclude: ["docs/working/", "docs/execution/"]
+      floor_percent: 5</code></pre>
+<ul>
+<li><b>Path resolution.</b> <code>db_path</code>, <code>mirror_dir</code>, <code>roots[].path</code> and <code>repo_checkout</code> go through <code>expand_home</code>. The first three also go through <code>isolate_path_from_protected_root</code>, like <code>app_artifacts.root_dir</code> at <code>config.rs:341-347</code>. That way <code>scripts/test-rust-isolated.sh</code> never touches the live root.</li>
+<li><b>Validation at startup</b> (refuse to start on failure and print the reason): each root exists and is a directory; no two roots are on the same filesystem (compare <code>st_dev</code>); <code>floor_percent</code> is in 1–50; the times parse as <code>HH:MM</code>; <code>deletion</code> is one of the two values.</li>
+<li><b>Dry run</b> means every deletion sm would start on its own (expiry, unregistered, orphan, pressure) is logged as <code>would_delete</code>, reported in the digest, and not performed. The artifact's state does not change. Agent deletions (<code>sm artifact delete</code>) and your Delete button run even in dry run, because each is an explicit act. The <code>disk_floor</code> queue hold runs in dry run, because it deletes nothing. Decision 6 is met by shipping ticket 3 with <code>deletion: dry_run</code>. The maintainer switches it to <code>enabled</code> seven days later, and the digest states the switch.</li>
+<li><code>sm --check-config</code> reports the section, each root's filesystem size, the free space and the floor in bytes.</li>
+</ul>
+
+<h3 id="C">C. Persisted shapes</h3>
+<p>This uses its own database file, <code>artifacts.db</code>, following <code>owner_push.db</code> and <code>mobile_devices.db</code>. The schema is created with <code>CREATE TABLE IF NOT EXISTS</code>, and later columns are added with <code>ensure_column</code> (<code>queue.rs:6287</code>). Times are RFC 3339 UTC strings, as in <code>queue_jobs</code>.</p>
+<pre><code>CREATE TABLE artifacts (
+  root              TEXT NOT NULL,          -- canonical root path
+  name              TEXT NOT NULL COLLATE NOCASE,
+  state             TEXT NOT NULL,          -- unregistered|building|kept|expired|evicted|deleted
+  set_id            TEXT NOT NULL,          -- see A (Sets); equals name for a set of one
+  origin            TEXT NOT NULL,          -- queue|hand|adopted|unregistered
+  owner_session_id  TEXT,
+  owner_session_name TEXT,
+  repo              TEXT NOT NULL,          -- owner/name
+  ticket            INTEGER,                -- issue or PR number in repo
+  epic              TEXT,                   -- free label
+  description       TEXT,                   -- markdown, &lt;= 8000 chars
+  review_by         TEXT,                   -- YYYY-MM-DD; NULL only for project-held
+  recipe_complete   INTEGER NOT NULL DEFAULT 0,
+  gpu_hours         REAL,                   -- hand-entered, informational
+  gpu_cost_usd      REAL,                   -- hand-entered; &gt; 0 makes the set not cheap
+  size_bytes        INTEGER,
+  size_measured_at  TEXT,
+  est_size_bytes    INTEGER,
+  created_at        TEXT NOT NULL,
+  first_seen_at     TEXT,                   -- unregistered only
+  grace_until       TEXT,                   -- unregistered only
+  finalized_at      TEXT,
+  expired_at        TEXT,
+  delete_after      TEXT,
+  evicted_at        TEXT,
+  deleted_at        TEXT,
+  deleted_by        TEXT,                   -- sm|session id|owner
+  delete_reason     TEXT,                   -- expired|pressure|unregistered|orphan|agent|owner
+  PRIMARY KEY (root, name)
+);
+CREATE TABLE artifact_holds (             -- declared holds only
+  root TEXT NOT NULL, name TEXT NOT NULL COLLATE NOCASE,
+  kind TEXT NOT NULL,                     -- until|open|project
+  value TEXT NOT NULL,                    -- YYYY-MM-DD | owner/repo#N | ''
+  added_by TEXT NOT NULL, added_at TEXT NOT NULL,
+  PRIMARY KEY (root, name, kind, value)
+);
+CREATE TABLE artifact_auto_holds (        -- recomputed by F; replaced wholesale per artifact
+  root TEXT NOT NULL, name TEXT NOT NULL COLLATE NOCASE,
+  kind TEXT NOT NULL,                     -- named|input_of|in_use
+  evidence TEXT NOT NULL,                 -- file path on main | dependent name | queue job id
+  evaluated_at TEXT NOT NULL
+);
+CREATE TABLE artifact_jobs (              -- the recipe; one row per (artifact, job)
+  root TEXT NOT NULL, name TEXT NOT NULL COLLATE NOCASE,
+  job_id TEXT NOT NULL,                   -- queue_jobs.id
+  seq INTEGER NOT NULL,                   -- submission order within the set
+  type TEXT NOT NULL, label TEXT NOT NULL,
+  argv_json TEXT, script_text TEXT,       -- script file contents captured at submission
+  env_json TEXT NOT NULL, timeout_seconds INTEGER NOT NULL,
+  cwd TEXT NOT NULL, cwd_rel TEXT,        -- cwd relative to the git top level
+  commit_sha TEXT, dirty INTEGER,         -- at submission; NULL sha when cwd is not in git
+  tag TEXT,                               -- pushed tag, E.6
+  state TEXT NOT NULL,                    -- mirrors queue_jobs.state at last update
+  exit_code INTEGER, wall_seconds INTEGER,
+  bytes_written INTEGER,                  -- measured at finish (E.5)
+  PRIMARY KEY (root, name, job_id)
+);
+CREATE TABLE artifact_inputs (
+  root TEXT NOT NULL, name TEXT NOT NULL COLLATE NOCASE,
+  input TEXT NOT NULL COLLATE NOCASE,
+  source TEXT NOT NULL,                   -- declared|detected
+  job_id TEXT NOT NULL,
+  PRIMARY KEY (root, name, input, job_id)
+);
+CREATE TABLE artifact_aliases (           -- top-level symlinks resolving into an artifact
+  root TEXT NOT NULL, alias TEXT NOT NULL COLLATE NOCASE,
+  target_name TEXT NOT NULL COLLATE NOCASE, target_rel TEXT NOT NULL,
+  PRIMARY KEY (root, alias)
+);
+CREATE TABLE artifact_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  root TEXT NOT NULL, name TEXT NOT NULL, at TEXT NOT NULL,
+  kind TEXT NOT NULL,     -- created|finalized|hold_added|hold_removed|expired|revived|
+                          -- evicted|deleted|would_delete|rebuild_queued|rebuilt|
+                          -- rebuild_failed|owner_extend|overrun|tag_pushed|tag_removed
+  actor TEXT NOT NULL,    -- sm | session id | owner
+  detail_json TEXT NOT NULL
+);
+CREATE TABLE artifact_job_reservations (  -- queue jobs that declared outputs
+  job_id TEXT PRIMARY KEY, root TEXT NOT NULL,
+  outputs_json TEXT NOT NULL, inputs_json TEXT NOT NULL,
+  est_size_bytes INTEGER NOT NULL,
+  start_bytes INTEGER,                    -- sum of output sizes when the job started
+  first_disk_hold_at TEXT
+);</code></pre>
+<p><b>Derived values</b> (not stored, computed on read):</p>
+<ul>
+<li><code>rebuild_seconds(set)</code> = the sum of <code>wall_seconds</code> over the distinct succeeded jobs that wrote any member.</li>
+<li><code>cheap(set)</code> = all members have <code>recipe_complete = 1</code>, and <code>rebuild_seconds ≤ cheap_rebuild_hours × 3600</code>, and no member has <code>gpu_cost_usd &gt; 0</code> or <code>gpu_hours &gt; 0</code>.</li>
+<li><code>active_holds(a)</code> = the declared holds that are active (F) plus the rows in <code>artifact_auto_holds</code>.</li>
+</ul>
+
+<h3 id="D">D. The <code>sm artifact</code> commands</h3>
+<p>All commands call HTTP endpoints on the local server (K.2) and accept <code>--root &lt;path&gt;</code>. The root resolves as follows: <code>--root</code> if given; else the root whose <code>repo</code> equals the GitHub repo of the current directory (<code>gh_repo_view_in_dir</code>, <code>http.rs:1344</code>); else the only configured root; else an error listing the roots. A hold value <code>open:#N</code> means <code>open:&lt;root repo&gt;#N</code>, and <code>open:owner/repo#N</code> is accepted. Every command exits 0 on success. On refusal it exits 2 and prints a single line that starts with <code>error:</code> and gives the reason.</p>
+
+<h4>D.1 Ticket and epic resolution</h4>
+<p><code>ticket</code> is <code>--ticket N</code> if given. Otherwise it is the requester's single active claim in the root's repo (<code>WorkClaimStore::claims_for_session</code>, <code>work_claims.rs:708</code>). With zero or several claims it is NULL, and <code>done</code> then requires <code>--ticket</code>. <code>epic</code> is <code>--epic</code> if given, else NULL. The list groups NULL-epic artifacts under <code>#&lt;ticket&gt;</code>, or under "no ticket".</p>
+
+<h4>D.2 <code>sm artifact new &lt;name&gt; [--ticket N] [--epic L] [--describe TEXT|@FILE]</code></h4>
+<p>Creates a hand-made artifact in state <b>building</b> and prints its absolute path. It refuses if the name is invalid, if a record exists in any state other than deleted, or if a filesystem entry with that name exists. Use <code>adopt</code> for an existing folder.</p>
+
+<h4>D.3 <code>sm artifact done &lt;name&gt;... --describe TEXT|@FILE --hold SPEC... [--review-by YYYY-MM-DD] [--recipe-complete] [--ticket N] [--epic L] [--gpu-hours H --gpu-cost USD]</code></h4>
+<ul>
+<li>Each named artifact must be <b>building</b>. No waiting or running queue job may name it as an output. The description must be 1–8000 characters.</li>
+<li>At least one <code>--hold</code> is required. The SPEC grammar is <code>until:YYYY-MM-DD</code> (a date after today), <code>open:[owner/repo]#N</code>, or <code>project</code>.</li>
+<li><code>--review-by</code> defaults to the latest <code>until:</code> date. It is required when there is no <code>until:</code> and no <code>project</code>. It must be after today and within <code>max_review_days</code>, and so must any <code>until:</code> date. A <code>project</code> hold makes <code>review_by</code> NULL.</li>
+<li><code>--recipe-complete</code> applies to every named artifact. It requires the named artifacts to be exactly one whole set: all members named, each with at least one succeeded job, and every succeeded job with a non-NULL <code>commit_sha</code> and <code>dirty = 0</code>. Then E.6 runs. If any check or tag push fails, the whole command fails and changes nothing.</li>
+<li>On success: <code>finalized_at</code> = now, <code>state = kept</code>, and hold evaluation (F) runs for these artifacts at once.</li>
+</ul>
+<p>Example error: <code>error: 1692_nq_bundle's set also contains 1692_nq_inputs, 1692_nq_context; name all of them with --recipe-complete</code></p>
+
+<h4>D.4 <code>sm artifact adopt &lt;name&gt; ...same flags as done except --recipe-complete</code></h4>
+<p>This applies to an <b>unregistered</b> artifact. It becomes kept with <code>origin = adopted</code> and the adopting session as owner. If the entry is a symlink that resolves into a registered artifact, adopt refuses and names the target. Aliases are recorded automatically (I.3).</p>
+
+<h4>D.5 <code>sm artifact hold &lt;name&gt; add|remove SPEC</code>, and <code>sm artifact review &lt;name&gt; --review-by DATE</code></h4>
+<p>These add or remove declared holds on a kept, expired or evicted artifact. Adding to an expired artifact revives it (A). Removing the last declared hold is allowed; F decides the result. <code>project</code> may be removed by any agent (logged). Changing the review date follows the limits in D.3.</p>
+
+<h4>D.6 <code>sm artifact delete &lt;name&gt; --reason TEXT</code></h4>
+<p>This deletes now (G), in any state except deleted. It refuses when:</p>
+<ul>
+<li>the artifact is in use by a waiting or running job (the error names the job);</li>
+<li>it has a <code>project</code> hold (answer: remove the hold first, which is visible in your digest);</li>
+<li>it is an input of a kept or evicted artifact (the error names the dependents).</li>
+</ul>
+<p>Deleting an evicted artifact only marks it deleted. The reason is stored and shown in the digest.</p>
+
+<h4>D.7 <code>sm artifact list [--state S] [--epic L] [--json]</code>, <code>sm artifact show &lt;name&gt; [--json]</code>, <code>sm artifact disk [--json]</code></h4>
+<p><code>list</code> prints one line per non-deleted artifact: name, state, size, epic, ticket, holds summary, review date, and rebuild cost ("21 min", "not rebuildable", or "hand-made"). <code>show</code> prints the whole record, holds with evidence, the recipe (jobs, commits, tags, inputs) and the last 20 events. <code>disk</code> prints for each root: filesystem size, free space, floor, the reservations of running jobs, and the jobs waiting on <code>disk_floor</code>. <code>--json</code> emits the same objects as the HTTP API (K.2).</p>
+
+<h4>D.8 <code>sm artifact rebuild &lt;name&gt;</code></h4>
+<p>See J.</p>
+
+<h3 id="E">E. Queue integration</h3>
+
+<h4>E.1 New <code>sm queue run</code> flags</h4>
+<p>These are added to <code>QueueRunArgs</code> (<code>bin/sm.rs:550-603</code>) and sent in the <code>POST /queue-jobs</code> body (<code>bin/sm.rs:1652</code>):</p>
+<ul>
+<li><code>--artifact NAME</code> (repeatable). An output artifact. It must be absent (the job creates it, state building), or already building. It is refused if it is kept, expired or evicted ("finalized; choose a new name"). The exception is a rebuild, which J issues itself.</li>
+<li><code>--input NAME</code> (repeatable). An input artifact. It must be kept, or building with no job writing it. It is refused if evicted ("run sm artifact rebuild NAME first") or deleted.</li>
+<li><code>--est-size SIZE</code>. Accepts <code>K</code>, <code>M</code>, <code>G</code> and <code>T</code> suffixes (powers of 1024). Required when <code>--artifact</code> is given, except for jobs issued by J, which use the recorded size.</li>
+</ul>
+<p>A job with no <code>--artifact</code> behaves exactly as today. <code>--input</code> without <code>--artifact</code> is allowed. It marks the input as in use for the job's lifetime, which is how a training job protects what it reads.</p>
+
+<h4>E.2 At submission (<code>create_queue_job</code>, <code>http.rs:6920</code>)</h4>
+<ol>
+<li>Resolve the root (D rules, using the job's <code>cwd</code>).</li>
+<li><b>Detect inputs.</b> Search <code>argv</code> and the script file's text, case-insensitively, for the root's path in three spellings: absolute, <code>~/…</code> and <code>$HOME/…</code>. Each spelling is followed by <code>/NAME</code>, where the next character is not in <code>[A-Za-z0-9_.-]</code>. Every NAME that is a registered artifact or an alias (resolved to its target) and is not an output is added to the inputs with <code>source = detected</code>. A detected input that is evicted or deleted does not refuse the job. It is recorded, and the job's requester receives the one-line warning <code>[sm artifact] job &lt;label&gt; references evicted artifact &lt;name&gt;</code>.</li>
+<li>Capture git state in <code>cwd</code>: <code>git rev-parse --show-toplevel</code>, <code>git rev-parse HEAD</code>, and <code>git status --porcelain --untracked-files=no</code> (non-empty output means <code>dirty = 1</code>). If <code>cwd</code> is not in a git repo, <code>commit_sha</code> is NULL. Put a shared <code>pub(crate) fn git_in(dir, args)</code> helper beside <code>git_command_success</code> (<code>sessions.rs:11644</code>).</li>
+<li>Capture the script file's contents (up to 1 MiB; a larger file refuses the job with a message).</li>
+<li>In one transaction: create the absent output artifacts; insert the <code>artifact_job_reservations</code> row; insert <code>artifact_jobs</code> rows (state <code>queued</code>) for every output; insert <code>artifact_inputs</code> rows; and recompute <code>set_id</code> for the affected artifacts (the union of the existing sets and this job's outputs). The queue job row is created in the same request. If the artifact write fails, the queue job is not created.</li>
+</ol>
+
+<h4>E.3 The admission check (<code>admit_pending_queue_jobs_conn</code>, <code>queue.rs:3243</code>)</h4>
+<p>This check applies only to jobs with a reservation row. It runs after the existing checks pass, meaning the job would otherwise start now. With all values in bytes on the root's filesystem:</p>
+<pre><code>free        = statvfs(root).f_bavail × f_frsize          (nix::sys::statvfs, "fs" feature already enabled)
+floor       = floor_percent / 100 × f_blocks × f_frsize
+outstanding = Σ over running jobs r with reservations on this filesystem:
+                max(0, r.est_size − (current_output_size(r) − r.start_bytes))
+start iff   free − outstanding − job.est_size ≥ floor</code></pre>
+<p><code>current_output_size</code> uses the size walk (I.2) on the job's outputs, cached per job for 5 minutes. If the check fails, the job gets the hold reason <code>disk_floor</code>, <code>first_disk_hold_at</code> is set if it is empty, and the pressure pass (H) runs with <code>needed = floor − (free − outstanding − job.est_size)</code>, at most once per 10 minutes per job. Admission is retried on the queue's usual cadence. When the job starts, <code>start_bytes</code> is set to the current sum of its outputs' sizes.</p>
+<p><b>The wait window.</b> A job whose current hold reason is <code>disk_floor</code> does not expire at <code>max_wait_seconds</code>. It expires <code>disk_hold_max_wait_hours</code> after <code>first_disk_hold_at</code>, with state <code>wait_expired</code>, and its wake names <code>disk_floor</code>. If its hold reason changes to another reason, the normal window applies again, measured from <code>queued_at</code>. The existing expiry path is <code>expire_pending_queue_jobs_conn</code> (<code>queue.rs:3433</code>), and <code>disk_floor</code> joins the holding reasons listed by <code>sm queue status</code>. The requester gets the existing "queued" notification with reason <code>disk_floor</code> once.</p>
+<p><b>Perf interaction.</b> The check never makes a perf job wait for disk ahead of the existing perf rules. The existing order of checks is unchanged; <code>disk_floor</code> is evaluated last.</p>
+
+<h4>E.4 While running</h4>
+<p>Outputs and inputs of waiting and running jobs carry the automatic <b>in use</b> hold (F). If a size walk finds <code>current_output_size − start_bytes &gt; overrun_factor × est_size</code>, sm sends one message to the requester (<code>[sm artifact] &lt;label&gt; has written X, estimated Y</code>), logs an <code>overrun</code> event, and does nothing else.</p>
+
+<h4>E.5 At completion (<code>finish_queue_job_conn_with_policy</code>, <code>queue.rs:5143</code>)</h4>
+<p>This updates the job's <code>artifact_jobs</code> rows with state, exit code and <code>wall_seconds</code> (<code>finished_at − started_at</code>). It measures the outputs' sizes, updates <code>size_bytes</code>, and stores <code>bytes_written</code> = new size − <code>start_bytes</code>. The reservation row is deleted. A failed, timed-out or cancelled job stays in <code>artifact_jobs</code> for history but does not count toward the recipe or <code>rebuild_seconds</code>. The recording happens in the same code path as the completion wake, so a crash between them is repaired by the existing retry loop (<code>retry_unnotified_queue_job_completions_conn</code>).</p>
+
+<h4>E.6 Commit tags</h4>
+<p>On <code>done --recipe-complete</code>, for each distinct <code>commit_sha</code> among the set's succeeded jobs, the tag name is <code>artifact/&lt;set_id&gt;/&lt;sha7&gt;</code>. If <code>git ls-remote --tags origin &lt;tag&gt;</code> already shows it, sm records it and skips the push. Otherwise sm pushes from the job's recorded <code>cwd</code> if that directory still exists, else from the mirror (F.3) if the mirror has the commit, using <code>git push origin &lt;sha&gt;:refs/tags/&lt;tag&gt;</code>. If neither can push, the command fails with <code>error: commit &lt;sha7&gt; is not available to push; rebuild from a pushed commit</code>. When a set becomes deleted (not evicted), sm deletes its tags with <code>git push origin :refs/tags/&lt;tag&gt;</code> from the mirror. A failed tag removal is logged and retried at the next daily scan. It never blocks anything.</p>
+
+<h3 id="F">F. Hold evaluation</h3>
+
+<h4>F.1 When</h4>
+<p>Holds are evaluated at <code>scan_time</code> daily for every non-deleted artifact. They are also evaluated at the start of every pressure pass if the last evaluation is older than one hour, and immediately for the artifacts touched by <code>done</code>, <code>adopt</code>, <code>hold</code> and <code>delete</code>. The <b>in use</b> hold is always computed live from the queue tables. It is never cached.</p>
+
+<h4>F.2 Each kind</h4>
+<table>
+<thead><tr><th style="width:18%">Kind</th><th>Active when</th><th style="width:32%">On failure to check</th></tr></thead>
+<tbody>
+<tr><td><code>until:D</code></td><td>Today's local date ≤ D.</td><td>(cannot fail)</td></tr>
+<tr><td><code>open:R#N</code></td><td>The GitHub issue or PR R#N has state OPEN. Fetched in batches through <code>gh api graphql</code> on the same plumbing as <code>GhCliWorkItemSource</code> (<code>http/claims.rs:16-73</code>). A number that is neither an issue nor a PR is an error.</td><td>Treated as <b>active</b>. The artifact shows "hold unverifiable" in the list, and the digest names the failure once per day.</td></tr>
+<tr><td><code>project</code></td><td>Always.</td><td>—</td></tr>
+<tr><td><i>named</i></td><td>F.3 finds a file on the default branch, outside <code>named_exclude</code>, that names the artifact or one of its aliases.</td><td>Mirror fetch fails: the previous evaluation's <i>named</i> rows are kept.</td></tr>
+<tr><td><i>input_of</i></td><td>Some artifact in state building, kept, expired or evicted has this artifact in <code>artifact_inputs</code>. An expired dependent still counts, so that its 24-hour notice can be reversed. A deleted dependent does not count.</td><td>—</td></tr>
+<tr><td><i>in_use</i></td><td>A queue job in state queued or running names it in its reservation's outputs or inputs.</td><td>—</td></tr>
+</tbody>
+</table>
+
+<h4>F.3 The <i>named on main</i> check</h4>
+<p>sm keeps a bare mirror per repo at <code>&lt;mirror_dir&gt;/&lt;owner&gt;__&lt;name&gt;.git</code>. It is created with <code>git clone --bare --filter=blob:none</code> on first use and updated with <code>git fetch origin '+refs/heads/&lt;default_branch&gt;:refs/heads/&lt;default_branch&gt;'</code> before each daily evaluation. This never touches <code>repo_checkout</code>. One pass:</p>
+<pre><code>git -C &lt;mirror&gt; grep -I -i -o -E 'artifacts/[A-Za-z0-9][A-Za-z0-9_.-]*' &lt;default_branch&gt; -- . ':!docs/working/' ':!docs/execution/'</code></pre>
+<p>The exclusions come from <code>named_exclude</code>. The output lines are <code>&lt;branch&gt;:&lt;path&gt;:&lt;match&gt;</code>. The final path segment of each match is taken as a name. A name matching an artifact or alias adds a <i>named</i> row with <code>evidence = &lt;path&gt;</code>, one row per (artifact, file) and at most 20 per artifact. The match relies on the literal segment <code>artifacts/</code>, which fits a root whose final segment is <code>Artifacts</code>. For any other root, the pattern uses that root's final path segment. Example: <code>docs/specs/1302_shared_frame_inputs.html</code> contains <code>~/artifacts/1299_model_bundle_0f71094b/bin</code>, which produces the row <code>(1299_model_bundle_0f71094b, named, docs/specs/1302_shared_frame_inputs.html)</code>.</p>
+
+<h4>F.4 Result</h4>
+<p>After evaluation, a kept artifact with no active hold becomes expired. An expired artifact with an active hold becomes kept (event <code>revived</code>). An evicted artifact with no active hold becomes deleted. A building or unregistered artifact is not affected by holds. For each change, the owner session (if alive) gets a one-line <code>[sm artifact]</code> message. It is sent as a system message through the same delivery path as queue wakes.</p>
+
+<h3 id="G">G. Deletion mechanics and safety</h3>
+<ul>
+<li><b>Target.</b> The target is always <code>&lt;root&gt;/&lt;name&gt;</code>, where <code>name</code> is a single validated segment. sm resolves the root with <code>canonicalize</code> once at startup and refuses any target whose parent is not exactly that path.</li>
+<li><b>Removal.</b> sm walks the tree without following symlinks and removes files, links and directories. A symlink inside the artifact that points elsewhere is removed as a link, and its target is untouched. It then removes every alias symlink recorded in <code>artifact_aliases</code> for the artifact. Deletion is permanent. Nothing goes to the Trash, because the Trash is on the same disk.</li>
+<li><b>Re-check at the moment of deletion.</b> Immediately before removing anything, sm re-checks in one database transaction that the artifact is still in the state that justified deletion and is not in use. This closes the race with a job submitted a second earlier.</li>
+<li><b>Errors.</b> On a partial failure (for example, permission denied), the artifact keeps its state. sm logs the error as an event, and the digest lists it under "Needs you". There are no retries within the day.</li>
+<li><b>Dry run</b>: B.</li>
+<li><b>History.</b> Every deletion writes one event carrying <code>size_bytes</code>, the reason and the actor, and the digest reports it.</li>
+</ul>
+
+<h3 id="H">H. The pressure pass</h3>
+<p>Triggers: every <code>pressure_check_seconds</code>, when <code>free &lt; floor</code> on a root's filesystem, with <code>needed = floor − free</code>; and from E.3, with its <code>needed</code>. Only one pass runs per filesystem at a time. A trigger that arrives during a pass waits for it and then re-measures.</p>
+<ol>
+<li>Refresh holds if they are stale (F.1). Recompute <code>free</code>.</li>
+<li><b>Step 1.</b> Delete every expired artifact that is not in use, largest first, re-measuring <code>free</code> after each. Stop when <code>free − outstanding ≥ floor + needed_by_waiting_jobs</code>, where <code>needed_by_waiting_jobs</code> is the largest <code>est_size</code> among jobs waiting on <code>disk_floor</code>, or 0.</li>
+<li><b>Step 2.</b> Candidates are sets where: every member is kept; <code>cheap(set)</code> holds; no member has a <code>project</code> hold or is in use; no member is an input of an artifact outside the set that is building, kept or expired; and every input of every member is kept, building or expired, meaning present on disk. Order the candidates by <code>size_bytes(set) / max(rebuild_seconds(set), 60)</code>, descending, with ties broken by name. Evict whole sets in that order, re-measuring after each, with the same stop rule.</li>
+<li><b>Step 3.</b> If the stop rule is still unmet, send you one message (K.1 format "disk") listing up to 10 non-deleted, non-building artifacts on that filesystem, largest first. Each line has the reason sm would not delete it: <i>project</i>, <i>not rebuildable (hand-made / adopted / recipe incomplete)</i>, <i>over 4 h (N h)</i>, <i>GPU cost</i>, <i>input of X</i>, or <i>in use by job L</i>. At most one such message goes out per filesystem per 6 hours, and a new one replaces the pending one in the list view.</li>
+</ol>
+<p>In dry run, steps 1 and 2 log <code>would_delete</code> and assume the space was freed when choosing what comes next. That way the digest shows the full list sm would have deleted.</p>
+<p><b>Worked ordering</b> (sizes from 26 Sep; build times as recorded, or assumed where marked): YM chain 311 GB / 21 min (assumed equal to NQ) → 14.8 GB per minute; NQ chain 292 GB / 21 min → 13.9; <code>1680-forecast-fixture</code> is hand-made, so it is not a candidate. The pass evicts YM first, then NQ.</p>
+
+<h3 id="I">I. The daily scan</h3>
+<h4>I.1 Schedule and perf courtesy</h4>
+<p>The scan runs at <code>scan_time</code> on a dedicated OS thread (the thread-and-sleep idiom of <code>main.rs:157-196</code>). If a perf job is running or waiting for its quiet window, the scan waits until it finishes. A walk of about 1 TB competes for I/O, and perf jobs need a quiet machine. If the scan has not run for 36 hours, it runs regardless, and the digest says so.</p>
+<h4>I.2 Size walk</h4>
+<p>Size is the sum of <code>st_blocks × 512</code> over every entry, walking with <code>lstat</code> and never following symlinks. Each <code>(st_dev, st_ino)</code> is counted once per artifact. Other mounts are not crossed (an entry whose <code>st_dev</code> differs from the root's is skipped). A hand-rolled <code>read_dir</code> recursion is enough; no new crate is needed.</p>
+<h4>I.3 Classification of top-level entries</h4>
+<table>
+<thead><tr><th>Entry</th><th>Treatment</th></tr></thead>
+<tbody>
+<tr><td>Directory with a record</td><td>Size it and update <code>size_bytes</code>.</td></tr>
+<tr><td>Symlink whose target resolves inside the root, below a registered artifact's top-level folder</td><td>Upsert <code>artifact_aliases</code>. It is not unregistered. Example: <code>1642_es_bundle → 1691_scratch/ref/bundle</code> becomes an alias of <code>1691_scratch</code>.</td></tr>
+<tr><td>Any other entry with no record (directory, file, dangling or outward symlink)</td><td>It becomes unregistered (A). Deleting it removes the entry itself only, never a symlink's target.</td></tr>
+<tr><td>A record whose folder is missing while its state is building, kept or expired</td><td>Mark it deleted with reason <code>vanished</code> and <code>deleted_by = unknown</code>, and list it in the digest.</td></tr>
+<tr><td>Hidden entries (<code>.DS_Store</code>, <code>.localized</code>)</td><td>Ignored.</td></tr>
+</tbody>
+</table>
+<p>After sizing, the scan runs hold evaluation (F), expiry deletions that are due, unregistered deletions whose grace has passed, and orphan deletions (A), in that order. Everything the scan does feeds the next digest.</p>
+
+<h3 id="J">J. Rebuild</h3>
+<p><code>sm artifact rebuild &lt;name&gt;</code> accepts an evicted artifact, and rebuilds its whole set. It refuses with a reason if any member is not evicted, if the set is not <code>recipe_complete</code>, or if any input is evicted or deleted. In that last case the error names them, and the caller rebuilds those first.</p>
+<ol>
+<li>Create a detached worktree at <code>~/worktrees/sm-rebuild-&lt;set_id&gt;-&lt;sha7&gt;</code> with <code>git -C &lt;repo_checkout&gt; worktree add --detach &lt;path&gt; &lt;sha&gt;</code>, fetching the tag first. With several commits, create one worktree per commit.</li>
+<li>Set every member to building. Then queue the set's succeeded jobs in their original <code>seq</code> order. Each job keeps its original type, timeout, env and argv, and gets its script text written to <code>&lt;worktree&gt;/.sm-rebuild/&lt;seq&gt;.sh</code>. <code>cwd = &lt;worktree&gt;/&lt;cwd_rel&gt;</code>. The job carries the same <code>--artifact</code> outputs, with <code>est_size</code> set to the recorded <code>bytes_written</code>. Its notify target is the requesting session. Each job is queued when the previous one succeeds. The chain is driven by the completion path (E.5), not by a watcher.</li>
+<li>When the last job succeeds, return every member to <b>kept</b> with its previous holds, description and review date. Log <code>rebuilt</code>, remove the worktree, and send the requester <code>[sm artifact] rebuilt &lt;set&gt; in N min</code>.</li>
+<li>When any job fails, stop the chain and leave the members building with <code>origin</code> unchanged. Log <code>rebuild_failed</code>, keep the worktree for diagnosis, notify the requester, and list the failure in the digest under "Needs you". The failed set is no longer <code>cheap</code> until a later rebuild succeeds (a <code>rebuild_failed</code> event newer than the last <code>rebuilt</code> excludes it from step 2).</li>
+</ol>
+
+<h3 id="K">K. Owner surface</h3>
+<h4>K.1 Messages to you</h4>
+<p>Messages to you go through <code>OwnerMessageStore::create</code> (<code>owner_messages.rs:427</code>) to the configured owner human. The sender is <code>sender_session_id = "sm-artifacts"</code> and <code>sender_session_name = "sm artifacts"</code>. The reply endpoint (<code>/messages/{id}/reply</code>) returns 409 <code>this sender does not take replies; use the artifact list</code> for that sender, and the app and web hide the reply box for it. Two kinds:</p>
+<ul>
+<li><b>Digest</b>: at most once per day at <code>digest_time</code>, and only if at least one section is non-empty. The title is <code>Artifacts: &lt;n&gt; deleted, &lt;m&gt; need you, disk &lt;p&gt;% used</code> (in dry run, "would delete"). The sections appear in this order, each omitted when empty:
+  <ol>
+  <li><i>Needs you</i>: review due; <code>rebuild_failed</code>; deletion errors; new <code>project</code> holds since the last digest; unverifiable holds; a vanished folder.</li>
+  <li><i>Deleting tomorrow</i>: expired artifacts with their last hold and description's first line; unregistered entries whose grace ends within 48 hours.</li>
+  <li><i>Deleted or evicted since the last digest</i>: name, size, reason, actor.</li>
+  <li><i>Disk</i>: used, free and floor per root, plus the top 5 epics by size.</li>
+  </ol>
+  Every artifact name links to its row in the web list.</li>
+<li><b>Disk</b> (H step 3): <code>blocking = true</code>, with the format of memo Example 3.</li>
+</ul>
+<h4>K.2 HTTP API</h4>
+<p>These are added to the route table in <code>http.rs</code> next to <code>/queue-jobs</code> (<code>http.rs:1523</code>).</p>
+<table>
+<thead><tr><th>Route</th><th>Who</th><th>Body / result</th></tr></thead>
+<tbody>
+<tr><td><code>GET /artifacts?root=&amp;state=&amp;epic=</code></td><td>any</td><td><code>{roots:[{path, fs_bytes, free_bytes, floor_bytes, outstanding_bytes, waiting_jobs:[…], deletion_mode}], artifacts:[ArtifactSummary], epics:[{label, bytes, count}]}</code></td></tr>
+<tr><td><code>GET /artifacts/{name}?root=</code></td><td>any</td><td><code>ArtifactDetail</code>: the summary plus description, holds with evidence, jobs, inputs, aliases and the last 50 events</td></tr>
+<tr><td><code>POST /artifacts</code> · <code>/{name}/done</code> · <code>/adopt</code> · <code>/holds</code> · <code>/review</code> · <code>/delete</code> · <code>/rebuild</code></td><td>agents (the CLI; requires the session header the CLI already sends)</td><td>The D commands' fields. The response is <code>ArtifactDetail</code>, or <code>{error}</code> with 400, 404 or 409.</td></tr>
+<tr><td><code>POST /artifacts/{name}/owner-action</code> <code>{action: "delete" | "extend"}</code></td><td><b>owner only</b></td><td><code>delete</code>: as G, reason <code>owner</code>. It bypasses the D.6 refusals except <i>in use</i>, and for an input of other artifacts the response lists the dependents that become unrebuildable. <code>extend</code>: <code>review_by = max(today, review_by) + 30 days</code>; on an expired artifact it also adds <code>until:today+30</code>. Both are logged with actor <code>owner</code>.</td></tr>
+</tbody>
+</table>
+<p><code>ArtifactSummary</code> fields are <code>name, root, state, origin, size_bytes, epic, ticket, repo, owner_session_name, holds:[{kind, value, active, evidence?}], review_by, review_due, rebuild_seconds, cheap, recipe_complete, delete_after, grace_until, needs_owner</code>. <b>Owner only</b> means <code>request_actor_email</code> (<code>http.rs:14354</code>) returns an email that is not the local bypass actor (<code>http.rs:14338</code>), and that email maps to a configured user with <code>owner: true</code>. Agents on the local machine therefore cannot call it.</p>
+<h4>K.3 sm web and the sm app</h4>
+<ul>
+<li><b>Web</b>: a new Artifacts view in <code>web/sm-watch/src</code>, using the same polling-fetch pattern as <code>App.tsx</code>. It has a disk bar per root (used, floor line, outstanding), an epic filter, and a table sorted by size, with "needs you" rows pinned on top. A row expands to the detail. For the owner, the Delete and Keep 30 more days buttons sit on each row. Delete asks for confirmation with the size and, when relevant, "not rebuildable" or "input of …".</li>
+<li><b>App</b>: an Artifacts screen under <code>android-app/…/ui/</code>, following <code>WatchScreen.kt</code> / <code>WatchViewModel.kt</code>. It has the same disk bar, list, detail and two buttons. The digest's links open this screen at the row.</li>
+</ul>
+
+<h3 id="L">L. fractal-algo-rust rollout</h3>
+<h4>L.1 Import (ticket 5, low tier)</h4>
+<p>After ticket 1 ships, every entry is unregistered with <code>grace_until = first scan + 14 days</code>. A low-tier agent (Sonnet, high effort) works through <code>sm artifact list --state unregistered --json</code>. For each entry, it reads every <code>RETENTION*.md</code> at depth 1 and 2 and maps the note to <code>sm artifact adopt</code>:</p>
+<table>
+<thead><tr><th>Note says</th><th>Adopt with</th></tr></thead>
+<tbody>
+<tr><td>"delete by / no later than D"</td><td><code>--review-by D</code>, capped at 183 days (if D is later, cap it and say so in the description)</td></tr>
+<tr><td>"preserve until D"</td><td><code>--hold until:D</code></td></tr>
+<tr><td>"while ticket/epic/PR #N open / until #N merges / closes"</td><td><code>--hold open:#N</code> (for an epic, its tracking issue's number)</td></tr>
+<tr><td>"for the project's duration / indefinitely"</td><td><code>--hold project</code></td></tr>
+<tr><td>"until spec/file X stops naming it"</td><td>No declared hold is needed if F.3 finds it. Otherwise record the condition in the description and add <code>--hold until:</code> on the review date.</td></tr>
+<tr><td>"while artifact Y references it"</td><td>Nothing. Adopting Y with an input would record it, but adopted artifacts have no recipe, so add <code>--hold until:</code> on the review date and name Y in the description.</td></tr>
+<tr><td>Anything else, or no note</td><td>Do not adopt. Add it to a single list for Rajesh with size, date and best guess.</td></tr>
+</tbody>
+</table>
+<p>The description is the note's text, verbatim, followed by <code>(imported from RETENTION.md by &lt;sm id&gt;)</code>. <code>--ticket</code> and <code>--epic</code> come from the note. The agent does not delete the <code>RETENTION.md</code> files, because the folder contents belong to the folder. The agent publishes the unmappable list as one owner message. A folder that mixes several tickets' material (for example <code>1303_block1</code>) is adopted once with every hold named in any of its notes. Splitting such a folder is future work for its owners.</p>
+<h4>L.2 Instruction change</h4>
+<p>This replaces fractal-algo-rust <code>AGENTS.md:160</code> and <code>CLAUDE.md:160</code> ("Don't keep things in ~/artifacts/ …") with:</p>
+<pre><code>**~/artifacts is managed by sm.** Write into it only through `sm queue run --artifact <name> --est-size <size>` (builds) or `sm artifact new <name>` (anything made by hand, such as files pulled back from a pod). Declare every artifact a job reads with `--input <name>`. When the work is done, run `sm artifact done <names> --describe @<file> --hold <spec> [--review-by <date>]`: the description says what it is, what consumes it and how to use it; holds are `until:<date>`, `open:#<ticket>` or `project` (only for the few artifacts the project lives on). Add `--recipe-complete` only when re-running the recorded jobs at their commit reproduces the folders — build binaries inside the job, not beforehand. An artifact can be evicted when disk is short; if one you need is evicted, run `sm artifact rebuild <name>`. Anything written another way is deleted after 7 days.</code></pre>
+
+<h3 id="M">M. Tickets, code locations and tests</h3>
+<p>Each ticket is sized for one agent without compaction. File sets are disjoint except where noted, so the tickets are serialized in the order listed. The model tier per CLAUDE.md is Mid (Opus 1M, high) for 1–4 and Low (Sonnet 1M, high) for 5.</p>
+<table>
+<thead><tr><th style="width:6%">#</th><th style="width:34%">Covers</th><th style="width:28%">Code</th><th>Tests (each a named test in the PR)</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>A (all transitions except expiry, eviction and rebuild), B, C, D.1–D.7 without <code>--recipe-complete</code>, G, I, the <code>GET /artifacts</code> routes</td><td>new <code>managed_artifacts.rs</code> (+ <code>managed_artifacts/{store,scan,delete}.rs</code>); <code>config.rs</code>; <code>bin/sm.rs</code>; <code>http.rs</code> routes; <code>main.rs</code> scan thread</td><td>name validation; root resolution; new/done/adopt/hold/delete refusals (one test per refusal in D); review-date limits; size walk counts hard links once and does not follow symlinks; alias detection; unregistered→deleted after grace; initial grace; vanished folder; dry run performs no deletion; deletion refuses a target outside the root; deletion race re-check</td></tr>
+<tr><td>2</td><td>E, J, <code>--recipe-complete</code>, sets</td><td><code>queue.rs</code> (admission at 3243, finish at 5143, expiry at 3433); <code>http.rs</code> create_queue_job at 6920; <code>bin/sm.rs</code> QueueRunArgs at 550; <code>sessions.rs</code> git helper</td><td>input detection over argv and script (three path spellings, boundary character); dirty-worktree capture; set union across jobs; admission arithmetic incl. outstanding bytes; <code>disk_floor</code> 24 h window vs normal window; overrun message once; recipe excludes failed jobs; tag pushed from cwd, then mirror fallback; rebuild chain order, success restores kept, failure leaves building</td></tr>
+<tr><td>3</td><td>F, H, K.1, the expiry/eviction transitions of A</td><td><code>managed_artifacts/{holds,pressure,digest}.rs</code>; <code>owner_messages.rs</code> reply refusal for <code>sm-artifacts</code></td><td>each hold kind active/inactive; GitHub failure keeps <code>open</code> active; mirror grep with exclusions; expired→kept revival; evicted→deleted; pressure ordering and stop rule; step 2 excludes every "never touches" case in the memo table; step 3 message rate limit; dry-run cascade; digest sections empty → no message</td></tr>
+<tr><td>4</td><td>K.2 owner-action, K.3</td><td><code>http.rs</code>; <code>web/sm-watch/src</code>; <code>android-app/…/ui/artifacts</code></td><td>owner-action refuses local bypass and non-owner; extend arithmetic; delete of an input reports dependents; web and app render a fixture list (existing frontend and Android test patterns)</td></tr>
+<tr><td>5</td><td>L</td><td>fractal-algo-rust <code>AGENTS.md</code>, <code>CLAUDE.md</code>; operational import</td><td>After import: <code>sm artifact list --state unregistered</code> contains only the entries on the list for Rajesh</td></tr>
+</tbody>
+</table>
+<p><b>Memo-to-appendix coverage.</b> Two ways in → D.2, E.1, I.3. Holds table → F.2. Review date → D.3, K.1. Pressure steps → H. Queue hold → E.3. Tags → E.6. Buttons → K.2–K.3. Notice → A, B. Grace → A, B, L.1. Dry run → B. Review limit → D.3. Project hold → D.5, K.1. Risks → E.2 warning, J step 4, F.2 failure column. Runpod: out of scope, recorded only as <code>gpu_hours</code>/<code>gpu_cost_usd</code> (C).</p>
+
+<h3 id="Z">Z. FAQ</h3>
+<p><b>Why top-level folders only?</b> Retention notes today sometimes govern a subfolder (<code>1691_scratch/ref</code>) or specific runs (<code>1303_block1</code>). Tracking arbitrary subpaths would make deletion, sizing and aliasing depend on nesting rules that two engineers would implement differently. One folder, one lifetime is a rule agents can follow. Material with a different life goes in its own top-level folder.</p>
+<p><b>Why not follow the <code>commands.jsonl</code> that fractal agents already write?</b> It is a fractal convention, not an sm primitive, and it records steps that may not run through the queue. The queue is the one place sm sees start, finish, commit and exit code for certain.</p>
+<p><b>Why a bare mirror instead of grepping <code>~/projects/fractal-algo-rust</code>?</b> That checkout is Rajesh's, and its branch and working state are not <code>main</code>. The mirror is read-only to everything else and always at <code>origin/main</code>.</p>
+<p><b>Why do evicted artifacts keep holding their inputs?</b> An evicted artifact is still wanted. Its rebuild needs its inputs present. If the inputs could expire while it sits evicted, "cheap to rebuild" would silently become "cannot rebuild".</p>
+<p><b>Can this cope with a job that writes outside its declared outputs?</b> Not in real time. sm does not sandbox jobs. A new top-level folder shows up at the next scan as unregistered. Growth inside another kept artifact shows up as a size change in <code>sm artifact show</code>, and it is not acted on.</p>
+<p><b>What about files agents keep inside worktrees?</b> They are out of scope. <code>sm worktree keep</code> already governs worktrees, and <code>cargo clean</code> covers build output.</p>
+
+<!-- memo-dark-mode -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
