@@ -364,9 +364,9 @@ impl OwnerDocSource for GhCliDocSource {
                 command_stderr(&output)
             ));
         }
-        Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|file| file == path))
+        let listed = String::from_utf8_lossy(&output.stdout);
+        // GitHub lists at most 3,000 files; past that, absence proves nothing.
+        Ok(listed.lines().any(|file| file == path) || listed.lines().count() >= 3000)
     }
 
     fn add_pending_review(
