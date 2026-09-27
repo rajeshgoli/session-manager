@@ -1501,12 +1501,17 @@ private fun SessionRow(
                     }
                     var actionsExpanded by remember { mutableStateOf(false) }
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (remoteControlUrl != null) ActionPill(label = "Open in Claude", icon = Icons.AutoMirrored.Rounded.OpenInNew, onClick = openAgent, tint = Emerald)
-                        if (attachSupported) ActionPill(label = "Open terminal", icon = Icons.Rounded.Terminal, onClick = onOpenAttach, tint = if (remoteControlUrl != null) TextSecondary else Emerald)
+                        // Two pills at most, so the actions menu stays on screen at phone width.
+                        if (remoteControlUrl != null) {
+                            ActionPill(label = "Open in Claude", icon = Icons.AutoMirrored.Rounded.OpenInNew, onClick = openAgent, tint = Emerald)
+                        } else if (attachSupported) {
+                            ActionPill(label = "Open terminal", icon = Icons.Rounded.Terminal, onClick = onOpenAttach, tint = Emerald)
+                        }
                         if (supportsSessionCloning(session.provider)) ActionPill(label = "Clone", icon = Icons.Rounded.ContentCopy, onClick = onClone)
                         Box {
                             IconButton(onClick = { actionsExpanded = true }) { Icon(Icons.Rounded.MoreVert, "Agent actions", tint = TextSecondary) }
                             DropdownMenu(actionsExpanded, { actionsExpanded = false }) {
+                                if (remoteControlUrl != null && attachSupported) DropdownMenuItem(text = { Text("Open terminal") }, onClick = { actionsExpanded = false; onOpenAttach() })
                                 if (attachSupported) DropdownMenuItem(text = { Text("Copy attach command") }, onClick = { actionsExpanded = false; onCopyAttach() })
                                 if (telegramLink(session) != null) DropdownMenuItem(text = { Text("Open in Telegram") }, onClick = { actionsExpanded = false; onOpenTelegram() })
                                 if (followed) {
