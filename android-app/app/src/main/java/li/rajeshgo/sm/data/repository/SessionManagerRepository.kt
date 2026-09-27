@@ -424,6 +424,10 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token).ackFollow(followId) }.mapFailure(::classifyWriteFailure)
     }
 
+    suspend fun ackNotice(baseUrl: String, token: String, noticeId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).ackNotice(noticeId) }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun registerPushToken(baseUrl: String, token: String, request: li.rajeshgo.sm.data.model.PushTokenRequest): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching { api(baseUrl, token).registerPushToken(request) }.mapFailure(::classifyWriteFailure)
     }

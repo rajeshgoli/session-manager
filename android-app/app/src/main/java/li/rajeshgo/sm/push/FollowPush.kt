@@ -47,6 +47,7 @@ object FollowPush {
 
     fun initialize(context: Context) {
         createChannel(context)
+        NoticePush.createChannel(context)
         if (!isConfigured || FirebaseApp.getApps(context).isNotEmpty()) return
         FirebaseApp.initializeApp(
             context,

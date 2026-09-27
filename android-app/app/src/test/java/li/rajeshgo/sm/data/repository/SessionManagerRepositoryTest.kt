@@ -84,6 +84,29 @@ class SessionManagerRepositoryTest {
     }
 
     @Test
+    fun noticeAckUsesSpecRoute() = kotlinx.coroutines.runBlocking {
+        val seen = mutableListOf<String>()
+        val client = okhttp3.OkHttpClient.Builder().addInterceptor { chain ->
+            val request = chain.request()
+            seen += "${request.method} ${request.url.encodedPath}"
+            val body = if (request.url.encodedPath == "/client/follows") {
+                """{"push_configured":true,"owner_name":"Rajesh","follows":[]}"""
+            } else {
+                ""
+            }
+            okhttp3.Response.Builder().request(request).protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(if (body.isEmpty()) 204 else 200).message("OK")
+                .body(body.toResponseBody("application/json".toMediaType())).build()
+        }.build()
+        val service = retrofit2.Retrofit.Builder().baseUrl("https://example.com/").client(client)
+            .addConverterFactory(kotlinx.serialization.json.Json { ignoreUnknownKeys = true }.asConverterFactory("application/json".toMediaType()))
+            .build().create(li.rajeshgo.sm.data.remote.ApiService::class.java)
+        service.ackNotice("not_abcdefghijkl")
+        assertEquals("Rajesh", service.getFollows().ownerName)
+        assertEquals(listOf("POST /client/notices/not_abcdefghijkl/ack", "GET /client/follows"), seen)
+    }
+
+    @Test
     fun attachTicketLimitIsRetryableButAuthenticationIsNot() {
         val repository = SessionManagerRepository()
         fun failure(code: Int): Throwable = repository.classifyWriteFailure(

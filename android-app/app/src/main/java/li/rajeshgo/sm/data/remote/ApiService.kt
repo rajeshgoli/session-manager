@@ -156,6 +156,10 @@ interface ApiService {
     @POST("client/follows/{follow_id}/ack")
     suspend fun ackFollow(@Path("follow_id") followId: String)
 
+    /** The phone showed a message or review notification (sm#1580). */
+    @POST("client/notices/{notice_id}/ack")
+    suspend fun ackNotice(@Path("notice_id") noticeId: String)
+
     @PUT("client/push-token")
     suspend fun registerPushToken(@Body request: li.rajeshgo.sm.data.model.PushTokenRequest)
 
