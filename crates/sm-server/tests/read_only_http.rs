@@ -23399,6 +23399,8 @@ struct StubDocSource {
     files: Arc<Mutex<std::collections::BTreeMap<DocFileKey, Vec<u8>>>>,
     fetches: Arc<AtomicU64>,
     wrong_blob_sha: bool,
+    /// Every fetch fails this way, as GitHub being down does.
+    fetch_error: Option<String>,
     github: Arc<Mutex<FakeGitHub>>,
 }
 
@@ -23475,6 +23477,9 @@ impl StubDocSource {
 impl OwnerDocSource for StubDocSource {
     fn fetch_doc(&self, repo: &str, path: &str, sha: &str) -> Result<Vec<u8>, DocFetchError> {
         self.fetches.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = &self.fetch_error {
+            return Err(DocFetchError::Other(error.clone()));
+        }
         self.files
             .lock()
             .unwrap()
@@ -24073,11 +24078,21 @@ async fn owner_docs_publish_rejects_bad_input_and_reports_missing_files() {
     mismatched.put("acme/widgets", "memo.md", &"a".repeat(40), b"# Memo\n");
     let (app, _dir) = owner_docs_app(mismatched);
     let (status, payload) = post_json(app, "/docs", body(json!({}))).await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    // 503, not 502: Cloudflare would replace a 502 and hide the detail.
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert!(payload["detail"]
         .as_str()
         .unwrap()
         .contains("Blob SHA mismatch"));
+
+    let github_down = StubDocSource {
+        fetch_error: Some("gh: HTTP 500".to_owned()),
+        ..StubDocSource::default()
+    };
+    let (app, _dir) = owner_docs_app(github_down);
+    let (status, payload) = post_json(app, "/docs", body(json!({}))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{payload}");
+    assert_eq!(payload["detail"], "gh: HTTP 500");
 }
 
 #[tokio::test]
