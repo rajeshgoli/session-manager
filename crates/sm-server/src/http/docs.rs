@@ -541,6 +541,16 @@ fn load_repo_file(
     Ok(bytes)
 }
 
+/// A GitHub call failed. 503, not 502: Cloudflare replaces an origin 502 or
+/// 504 with its own error page, which would hide this detail from the owner
+/// (sm#1591, sm#1593).
+fn github_failure(detail: String) -> ApiError {
+    ApiError::Status {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        detail,
+    }
+}
+
 fn doc_fetch_api_error(error: DocFetchError, doc_path: &str, commit_sha: &str) -> ApiError {
     match error {
         DocFetchError::NotFound(_) => ApiError::Status {
@@ -550,10 +560,7 @@ fn doc_fetch_api_error(error: DocFetchError, doc_path: &str, commit_sha: &str) -
                 &commit_sha[..commit_sha.len().min(7)]
             ),
         },
-        DocFetchError::Other(detail) => ApiError::Status {
-            status: StatusCode::BAD_GATEWAY,
-            detail,
-        },
+        DocFetchError::Other(detail) => github_failure(detail),
     }
 }
 
@@ -728,12 +735,7 @@ pub(super) async fn publish_owner_doc(
                 });
             }
             Ok(_) => {}
-            Err(error) if payload.review => {
-                return Err(ApiError::Status {
-                    status: StatusCode::BAD_GATEWAY,
-                    detail: error,
-                });
-            }
+            Err(error) if payload.review => return Err(github_failure(error)),
             // Without --review, a doc publishes even when GitHub can't be
             // asked about its PR.
             Err(_) => {}
@@ -751,12 +753,9 @@ pub(super) async fn publish_owner_doc(
         fetched.map_err(|error| doc_fetch_api_error(error, &path, &commit_sha))?;
     let blob_sha = git_blob_sha(&bytes);
     if blob_sha != api_blob_sha {
-        return Err(ApiError::Status {
-            status: StatusCode::BAD_GATEWAY,
-            detail: format!(
-                "Blob SHA mismatch for {path}: computed {blob_sha}, contents API {api_blob_sha}"
-            ),
-        });
+        return Err(github_failure(format!(
+            "Blob SHA mismatch for {path}: computed {blob_sha}, contents API {api_blob_sha}"
+        )));
     }
     if let Err(error) = owner_doc_cache(&state.config).put(&repo, &commit_sha, &path, &bytes) {
         eprintln!("Owner doc cache write failed: {error:#}");

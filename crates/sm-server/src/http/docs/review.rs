@@ -145,16 +145,6 @@ fn valid_submission_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-/// A GitHub call failed. 503, not 502: Cloudflare replaces an origin 502 or
-/// 504 with its own error, which would hide this detail from the page
-/// (sm#1591).
-fn github_failure(detail: String) -> ApiError {
-    ApiError::Status {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        detail,
-    }
-}
-
 fn conflict(detail: impl Into<String>) -> ApiError {
     ApiError::Status {
         status: StatusCode::CONFLICT,
