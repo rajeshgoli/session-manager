@@ -1579,8 +1579,8 @@ img {{ max-width: 100%; }}
 /// The owner pages' shell (`/history`, `/t/…`, and the web watch): the sm
 /// Watch app's palette (`android-app/.../ui/theme/Color.kt`), cards with a
 /// colored left edge, sans for human text and mono for machine text, and
-/// the two-tab **Watch · History** top bar. `active_tab` is `"watch"`,
-/// `"history"`, or anything else for neither.
+/// the **Watch · History · Guestbook** top bar. `active_tab` is `"watch"`,
+/// `"history"`, `"guestbook"`, or anything else for none.
 pub fn page_shell(title: &str, active_tab: &str, body: &str) -> String {
     page_shell_with_status(title, active_tab, "", body)
 }
@@ -1663,7 +1663,7 @@ h2.lbl {{ margin: 18px 0 4px; font-weight: 400; }}
 </head>
 <body>
 <div class="wrap">
-<nav class="top"><a class="brand" href="/">sm</a>{watch}{history}<span class="sp"></span>{status}</nav>
+<nav class="top"><a class="brand" href="/">sm</a>{watch}{history}{guestbook}<span class="sp"></span>{status}</nav>
 {body}
 </div>
 </body>
@@ -1672,6 +1672,7 @@ h2.lbl {{ margin: 18px 0 4px; font-weight: 400; }}
         title = escape_html(title),
         watch = tab("watch", "/", "Watch"),
         history = tab("history", "/history", "History"),
+        guestbook = tab("guestbook", "/guestbook", "Guestbook"),
     )
 }
 
