@@ -23613,6 +23613,7 @@ impl OwnerDocSource for StubDocSource {
         Ok(SubmittedDocReview {
             database_id: Some(review.database_id),
             url: review_url(review.database_id),
+            submitted_at: None,
         })
     }
 
@@ -23643,6 +23644,7 @@ impl OwnerDocSource for StubDocSource {
                 database_id: Some(review.database_id),
                 url: review_url(review.database_id),
                 state: review.state.clone(),
+                submitted_at: None,
                 body: review.body.clone(),
                 comments: review
                     .threads

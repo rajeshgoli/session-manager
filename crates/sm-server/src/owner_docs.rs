@@ -181,6 +181,9 @@ pub struct OwnerDocReview {
 pub struct PostedOwnerDocReview {
     pub github_review_id: Option<i64>,
     pub github_review_url: String,
+    /// GitHub's `submittedAt`; the store records its own clock when GitHub
+    /// gave none.
+    pub posted_at: Option<String>,
     pub line_comment_count: i64,
     pub file_comment_count: i64,
     /// Drafts the review carried; they are deleted with the transition.
@@ -1261,7 +1264,7 @@ impl OwnerDocStore {
                 posted.github_review_id,
                 posted.github_review_url,
                 posted.wake.as_ref().map(|(session, _)| session),
-                now_rfc3339()
+                posted.posted_at.clone().unwrap_or_else(now_rfc3339)
             ],
         )? > 0;
         if changed {
@@ -2056,6 +2059,7 @@ mod tests {
         let posted = PostedOwnerDocReview {
             github_review_id: Some(99),
             github_review_url: "https://github.com/acme/widgets/pull/7#pullrequestreview-99".into(),
+            posted_at: None,
             line_comment_count: 1,
             file_comment_count: 0,
             draft_ids: vec![draft.id.clone()],

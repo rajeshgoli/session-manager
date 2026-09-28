@@ -248,6 +248,7 @@ fn post_review(f: &Fixture, doc_id: &str, submission: &str, delivered_to: Option
                 github_review_id: Some(7),
                 github_review_url: "https://github.com/acme/widgets/pull/12#pullrequestreview-7"
                     .into(),
+                posted_at: None,
                 line_comment_count: 1,
                 file_comment_count: 0,
                 draft_ids: Vec::new(),
@@ -442,6 +443,7 @@ async fn republish_after_undelivered_review_clears_it() {
                 github_review_id: Some(8),
                 github_review_url: "https://github.com/acme/widgets/pull/12#pullrequestreview-8"
                     .into(),
+                posted_at: None,
                 line_comment_count: 0,
                 file_comment_count: 0,
                 draft_ids: Vec::new(),
@@ -451,6 +453,41 @@ async fn republish_after_undelivered_review_clears_it() {
         .unwrap();
     let (_, meta) = request(&f.app, "GET", &format!("/docs/{id}?format=json"), None).await;
     assert_eq!(meta["review_undelivered"], true, "{meta}");
+
+    // GitHub's own post time wins over when sm learned of it: a review that
+    // reached GitHub before a publish, but was only reconciled after (a
+    // crash mid-submit), counts as answered by that publish.
+    store
+        .begin_review(
+            "sub-answer-3",
+            &id,
+            &"c".repeat(40),
+            &git_blob_sha(MEMO),
+            OwnerDocVerdict::Comment,
+            None,
+        )
+        .unwrap();
+    let on_github = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    publish(&f, "retired1", "a", true, Some(&f.dir)).await;
+    store
+        .finish_review(
+            "sub-answer-3",
+            &PostedOwnerDocReview {
+                github_review_id: Some(9),
+                github_review_url: "https://github.com/acme/widgets/pull/12#pullrequestreview-9"
+                    .into(),
+                posted_at: Some(on_github),
+                line_comment_count: 0,
+                file_comment_count: 0,
+                draft_ids: Vec::new(),
+                wake: None,
+            },
+        )
+        .unwrap();
+    let (_, meta) = request(&f.app, "GET", &format!("/docs/{id}?format=json"), None).await;
+    assert_eq!(meta["review_undelivered"], false, "{meta}");
 }
 
 #[tokio::test]
