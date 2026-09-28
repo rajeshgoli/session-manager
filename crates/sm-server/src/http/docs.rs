@@ -125,6 +125,8 @@ impl DocPullRequest {
 pub struct SubmittedDocReview {
     pub database_id: Option<i64>,
     pub url: String,
+    /// GitHub's `submittedAt`, when it returned one.
+    pub submitted_at: Option<String>,
 }
 
 /// One of the viewer's reviews, as reconciliation needs it.
@@ -135,6 +137,8 @@ pub struct DocReviewOnGitHub {
     pub url: String,
     /// GraphQL review state: `PENDING`, `COMMENTED`, ...
     pub state: String,
+    /// GitHub's `submittedAt`; null while pending.
+    pub submitted_at: Option<String>,
     pub body: String,
     /// Each comment's body and whether it is anchored to a line.
     pub comments: Vec<(String, bool)>,
@@ -217,7 +221,7 @@ const ADD_FILE_THREAD: &str = "mutation($review: ID!, $path: String!, $body: Str
 }";
 const SUBMIT_REVIEW: &str = "mutation($review: ID!, $body: String!) {
   submitPullRequestReview(input: {pullRequestReviewId: $review, event: COMMENT, body: $body}) {
-    pullRequestReview { databaseId url }
+    pullRequestReview { databaseId url submittedAt }
   }
 }";
 const DELETE_REVIEW: &str = "mutation($review: ID!) {
@@ -232,7 +236,7 @@ const VIEWER_REVIEWS: &str =
     pullRequest(number: $number) {
       reviews(author: $author, first: 50, after: $after) {
         pageInfo { hasNextPage endCursor }
-        nodes { id databaseId url state body
+        nodes { id databaseId url state body submittedAt
           comments(first: 100) { nodes { body line originalLine } } }
       }
     }
@@ -425,6 +429,7 @@ impl OwnerDocSource for GhCliDocSource {
                 .as_str()
                 .ok_or_else(|| "GitHub returned no submitted review".to_owned())?
                 .to_owned(),
+            submitted_at: review["submittedAt"].as_str().map(ToOwned::to_owned),
         })
     }
 
@@ -467,6 +472,7 @@ impl OwnerDocSource for GhCliDocSource {
                 database_id: node["databaseId"].as_i64(),
                 url: node["url"].as_str().unwrap_or_default().to_owned(),
                 state: node["state"].as_str().unwrap_or_default().to_owned(),
+                submitted_at: node["submittedAt"].as_str().map(ToOwned::to_owned),
                 body: node["body"].as_str().unwrap_or_default().to_owned(),
                 comments: node["comments"]["nodes"]
                     .as_array()
@@ -1199,10 +1205,7 @@ async fn view_doc_response(
     };
     let summary = store.summary(&doc.id)?;
     let undelivered = store
-        .reviews(&doc.id)?
-        .into_iter()
-        .rfind(|review| review.status == "posted")
-        .filter(|review| review.delivered_to_session_id.is_none())
+        .review_awaiting_agent(&doc.id)?
         .map(|review| json!({"id": review.id, "url": review.github_review_url}));
     let config = json!({
         "docId": doc.id,

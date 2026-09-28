@@ -89,8 +89,8 @@ pub struct OwnerDocSummary {
     pub latest_blob_sha: String,
     pub published_at: String,
     pub publish_count: usize,
-    /// The latest posted review reached no session: its author was retired
-    /// with no parent to take it.
+    /// The latest posted review reached no session (its author was retired
+    /// with no parent to take it) and no revision was published after it.
     pub review_undelivered: bool,
 }
 
@@ -171,6 +171,9 @@ pub struct OwnerDocReview {
     pub github_review_url: Option<String>,
     pub submitted_at: String,
     pub delivered_to_session_id: Option<String>,
+    /// When GitHub accepted the review; null before that and on rows older
+    /// than sm#1606.
+    pub posted_at: Option<String>,
 }
 
 /// What a review submission records once GitHub has the review.
@@ -178,6 +181,9 @@ pub struct OwnerDocReview {
 pub struct PostedOwnerDocReview {
     pub github_review_id: Option<i64>,
     pub github_review_url: String,
+    /// GitHub's `submittedAt`; the store records its own clock when GitHub
+    /// gave none.
+    pub posted_at: Option<String>,
     pub line_comment_count: i64,
     pub file_comment_count: i64,
     /// Drafts the review carried; they are deleted with the transition.
@@ -249,6 +255,19 @@ pub fn derive_owner_doc_state(inputs: &OwnerDocStateInputs<'_>) -> OwnerDocState
         return OwnerDocState::Updated;
     }
     OwnerDocState::New
+}
+
+/// Whether a posted review still waits for an agent: nobody was woken for
+/// it, and no revision was published after it posted. A later publish means
+/// some agent took the review up (sm#1606). `posted_at` falls back to the
+/// submit time for rows older than the column.
+fn review_awaits_agent(
+    delivered: bool,
+    posted_at: &str,
+    latest_published_at: Option<&str>,
+) -> bool {
+    !delivered
+        && !latest_published_at.is_some_and(|published_at| timestamp_after(published_at, posted_at))
 }
 
 fn timestamp_after(candidate: &str, reference: &str) -> bool {
@@ -459,7 +478,8 @@ pub fn init_owner_docs_schema(conn: &Connection) -> Result<()> {
             github_review_id INTEGER,
             github_review_url TEXT,
             submitted_at TEXT NOT NULL,
-            delivered_to_session_id TEXT
+            delivered_to_session_id TEXT,
+            posted_at TEXT
         );
         "#,
     )?;
@@ -473,6 +493,13 @@ pub fn init_owner_docs_schema(conn: &Connection) -> Result<()> {
                 "ALTER TABLE owner_doc_publishes ADD COLUMN {column} TEXT"
             ))?;
         }
+    }
+    // When GitHub accepted the review (sm#1606); older rows have none.
+    let present = conn
+        .prepare("SELECT 1 FROM pragma_table_info('owner_doc_reviews') WHERE name = 'posted_at'")?
+        .exists([])?;
+    if !present {
+        conn.execute_batch("ALTER TABLE owner_doc_reviews ADD COLUMN posted_at TEXT")?;
     }
     Ok(())
 }
@@ -822,11 +849,13 @@ impl OwnerDocStore {
             }
         }
         let mut reviews = BTreeMap::<String, Vec<(String, String)>>::new();
-        // Whether each doc's latest posted review reached a session.
-        let mut latest_delivered = BTreeMap::<String, bool>::new();
+        // Whether each doc's latest posted review reached a session, and when
+        // it posted.
+        let mut latest_review = BTreeMap::<String, (bool, String)>::new();
         {
             let mut statement = conn.prepare(
-                "SELECT doc_id, blob_sha, submitted_at, delivered_to_session_id
+                "SELECT doc_id, blob_sha, submitted_at, delivered_to_session_id,
+                        COALESCE(posted_at, submitted_at)
                  FROM owner_doc_reviews WHERE status = 'posted'
                  ORDER BY submitted_at, rowid",
             )?;
@@ -836,10 +865,11 @@ impl OwnerDocStore {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })? {
-                let (doc_id, blob, submitted_at, delivered_to) = row?;
-                latest_delivered.insert(doc_id.clone(), delivered_to.is_some());
+                let (doc_id, blob, submitted_at, delivered_to, posted_at) = row?;
+                latest_review.insert(doc_id.clone(), (delivered_to.is_some(), posted_at));
                 reviews
                     .entry(doc_id)
                     .or_default()
@@ -876,7 +906,11 @@ impl OwnerDocStore {
                 latest_blob_sha: latest.blob_sha.clone(),
                 published_at: latest.published_at.clone(),
                 publish_count: doc_publishes.len(),
-                review_undelivered: latest_delivered.get(&doc.id) == Some(&false),
+                review_undelivered: latest_review.get(&doc.id).is_some_and(
+                    |(delivered, posted_at)| {
+                        review_awaits_agent(*delivered, posted_at, Some(&latest.published_at))
+                    },
+                ),
                 doc,
             });
         }
@@ -1071,6 +1105,25 @@ impl OwnerDocStore {
         Ok(rows)
     }
 
+    /// The doc's latest posted review while it still waits for an agent: see
+    /// `review_awaits_agent`.
+    pub fn review_awaiting_agent(&self, doc_id: &str) -> Result<Option<OwnerDocReview>> {
+        let latest_publish = self.publishes(doc_id)?.pop();
+        Ok(self
+            .reviews(doc_id)?
+            .into_iter()
+            .rfind(|review| review.status == "posted")
+            .filter(|review| {
+                review_awaits_agent(
+                    review.delivered_to_session_id.is_some(),
+                    review.posted_at.as_deref().unwrap_or(&review.submitted_at),
+                    latest_publish
+                        .as_ref()
+                        .map(|publish| publish.published_at.as_str()),
+                )
+            }))
+    }
+
     /// Rows a crash or restart left mid-submit.
     pub fn submitting_reviews(&self) -> Result<Vec<OwnerDocReview>> {
         let Some(conn) = self.open_read()? else {
@@ -1202,7 +1255,7 @@ impl OwnerDocStore {
              SET status = 'posted', pending_review_node_id = NULL,
                  line_comment_count = ?2, file_comment_count = ?3,
                  github_review_id = ?4, github_review_url = ?5,
-                 delivered_to_session_id = ?6
+                 delivered_to_session_id = ?6, posted_at = ?7
              WHERE id = ?1 AND status = 'submitting'",
             params![
                 submission_id,
@@ -1210,7 +1263,8 @@ impl OwnerDocStore {
                 posted.file_comment_count,
                 posted.github_review_id,
                 posted.github_review_url,
-                posted.wake.as_ref().map(|(session, _)| session)
+                posted.wake.as_ref().map(|(session, _)| session),
+                posted.posted_at.clone().unwrap_or_else(now_rfc3339)
             ],
         )? > 0;
         if changed {
@@ -1242,7 +1296,7 @@ impl OwnerDocStore {
 
 const REVIEW_COLUMNS: &str = "id, status, pending_review_node_id, doc_id, commit_sha, blob_sha, \
      verdict, body, line_comment_count, file_comment_count, github_review_id, github_review_url, \
-     submitted_at, delivered_to_session_id";
+     submitted_at, delivered_to_session_id, posted_at";
 const DRAFT_COLUMNS: &str = "id, doc_id, commit_sha, line, quote, body, created_at, updated_at";
 
 fn review_from_row(row: &Row<'_>) -> rusqlite::Result<OwnerDocReview> {
@@ -1261,6 +1315,7 @@ fn review_from_row(row: &Row<'_>) -> rusqlite::Result<OwnerDocReview> {
         github_review_url: row.get(11)?,
         submitted_at: row.get(12)?,
         delivered_to_session_id: row.get(13)?,
+        posted_at: row.get(14)?,
     })
 }
 
@@ -2004,6 +2059,7 @@ mod tests {
         let posted = PostedOwnerDocReview {
             github_review_id: Some(99),
             github_review_url: "https://github.com/acme/widgets/pull/7#pullrequestreview-99".into(),
+            posted_at: None,
             line_comment_count: 1,
             file_comment_count: 0,
             draft_ids: vec![draft.id.clone()],
@@ -2049,6 +2105,10 @@ mod tests {
         };
         store.finish_review("sub-00000002", &undelivered).unwrap();
         assert!(store.summary(&doc.id).unwrap().unwrap().review_undelivered);
+        assert_eq!(
+            store.review_awaiting_agent(&doc.id).unwrap().unwrap().id,
+            "sub-00000002"
+        );
         store
             .begin_review(
                 "sub-00000003",

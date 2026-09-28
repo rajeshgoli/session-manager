@@ -484,6 +484,7 @@ fn post_and_submit(
             drafts,
             submitted.database_id,
             &submitted.url,
+            submitted.submitted_at,
             line_comments,
             file_comments,
         ),
@@ -567,6 +568,7 @@ fn finish_from_github(
         drafts,
         submitted.database_id,
         &submitted.url,
+        submitted.submitted_at.clone(),
         line_comments,
         file_comments,
     )
@@ -580,6 +582,7 @@ fn finish(
     drafts: &[OwnerDocDraft],
     github_review_id: Option<i64>,
     review_url: &str,
+    posted_at: Option<String>,
     line_comments: i64,
     file_comments: i64,
 ) -> Result<OwnerDocReview, ApiError> {
@@ -601,6 +604,7 @@ fn finish(
         &PostedOwnerDocReview {
             github_review_id,
             github_review_url: review_url.to_owned(),
+            posted_at,
             line_comment_count: line_comments,
             file_comment_count: file_comments,
             draft_ids: drafts.iter().map(|draft| draft.id.clone()).collect(),
@@ -689,6 +693,13 @@ pub(super) async fn assign_review(
             "The doc has an agent again: {}",
             session_name_or_id(state, &session_id)
         )));
+    }
+    // Undelivered and the latest review, so only a later publish can make
+    // it no longer wait: an agent already took it up (sm#1606).
+    if store.review_awaiting_agent(&doc.id)?.is_none() {
+        return Err(conflict(
+            "A newer revision was published after this review; reload",
+        ));
     }
     let working_dir = store
         .publishes(&doc.id)?
@@ -804,6 +815,7 @@ mod tests {
             github_review_url: None,
             submitted_at: String::new(),
             delivered_to_session_id: None,
+            posted_at: None,
         }
     }
 

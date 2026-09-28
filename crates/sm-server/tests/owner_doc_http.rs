@@ -248,6 +248,7 @@ fn post_review(f: &Fixture, doc_id: &str, submission: &str, delivered_to: Option
                 github_review_id: Some(7),
                 github_review_url: "https://github.com/acme/widgets/pull/12#pullrequestreview-7"
                     .into(),
+                posted_at: None,
                 line_comment_count: 1,
                 file_comment_count: 0,
                 draft_ids: Vec::new(),
@@ -391,6 +392,102 @@ async fn assign_undelivered_review_spawns_agent() {
             .starts_with("Review is already with "),
         "{body}"
     );
+}
+
+/// sm#1606: a review nobody was woken for stops waiting once a revision is
+/// published after it, since some agent took it up. The flag clears and
+/// Assign refuses, even if that agent has since ended too.
+#[tokio::test]
+async fn republish_after_undelivered_review_clears_it() {
+    let f = fixture();
+    let doc = publish(&f, "retired1", "a", true, Some(&f.dir)).await;
+    let id = doc["id"].as_str().unwrap().to_owned();
+    post_review(&f, &id, "sub-answer-1", None);
+    let (_, meta) = request(&f.app, "GET", &format!("/docs/{id}?format=json"), None).await;
+    assert_eq!(meta["review_undelivered"], true, "{meta}");
+
+    publish(&f, "retired1", "b", true, Some(&f.dir)).await;
+    let (_, meta) = request(&f.app, "GET", &format!("/docs/{id}?format=json"), None).await;
+    assert_eq!(meta["review_undelivered"], false, "{meta}");
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &format!("/docs/{id}/assign"),
+        Some(json!({"review_id": "sub-answer-1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body["detail"],
+        "A newer revision was published after this review; reload"
+    );
+
+    // A publish while the review was still on its way to GitHub is not an
+    // answer: the agent could not have seen it.
+    let store = OwnerDocStore::new(f.dir.join("message_queue.db"));
+    store
+        .begin_review(
+            "sub-answer-2",
+            &id,
+            &"b".repeat(40),
+            &git_blob_sha(MEMO),
+            OwnerDocVerdict::Comment,
+            None,
+        )
+        .unwrap();
+    publish(&f, "retired1", "c", true, Some(&f.dir)).await;
+    store
+        .finish_review(
+            "sub-answer-2",
+            &PostedOwnerDocReview {
+                github_review_id: Some(8),
+                github_review_url: "https://github.com/acme/widgets/pull/12#pullrequestreview-8"
+                    .into(),
+                posted_at: None,
+                line_comment_count: 0,
+                file_comment_count: 0,
+                draft_ids: Vec::new(),
+                wake: None,
+            },
+        )
+        .unwrap();
+    let (_, meta) = request(&f.app, "GET", &format!("/docs/{id}?format=json"), None).await;
+    assert_eq!(meta["review_undelivered"], true, "{meta}");
+
+    // GitHub's own post time wins over when sm learned of it: a review that
+    // reached GitHub before a publish, but was only reconciled after (a
+    // crash mid-submit), counts as answered by that publish.
+    store
+        .begin_review(
+            "sub-answer-3",
+            &id,
+            &"c".repeat(40),
+            &git_blob_sha(MEMO),
+            OwnerDocVerdict::Comment,
+            None,
+        )
+        .unwrap();
+    let on_github = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    publish(&f, "retired1", "a", true, Some(&f.dir)).await;
+    store
+        .finish_review(
+            "sub-answer-3",
+            &PostedOwnerDocReview {
+                github_review_id: Some(9),
+                github_review_url: "https://github.com/acme/widgets/pull/12#pullrequestreview-9"
+                    .into(),
+                posted_at: Some(on_github),
+                line_comment_count: 0,
+                file_comment_count: 0,
+                draft_ids: Vec::new(),
+                wake: None,
+            },
+        )
+        .unwrap();
+    let (_, meta) = request(&f.app, "GET", &format!("/docs/{id}?format=json"), None).await;
+    assert_eq!(meta["review_undelivered"], false, "{meta}");
 }
 
 #[tokio::test]
