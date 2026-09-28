@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent message inbox</title>
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<style>
+  .phone-note { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 1.2rem; }
+  @media (max-width: 640px) { .two { grid-template-columns: 1fr; } }
+  svg text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  @media print { .phones svg { max-height: 8.2in; } }
+</style>
+
+<h1>An Inbox for agent messages</h1>
+<p class="sans"><small>Author: sm-inbox-designer <code>519d87fe</code> · Design proposal, no ticket yet · Revision 1 · Builds on the shipped design in <code>specs/1580_app_messages_replace_email.html</code></small></p>
+
+<h2>Memo</h2>
+
+<p><b>Yes: agent messages belong in an Inbox, a tab of its own, not on the Watch page.</b> Watch answers "what are my agents doing?" and is sorted by repo and agent tree. Messages answer a different question, "what is waiting on me?", and want to be sorted by urgency and time. Hanging them off agent cards, as the app does today, makes you scan every card to find what needs you, splits one back-and-forth across several pages, and hides a conversation once its agent's card leaves the screen.</p>
+
+<p>The design below adds a third bottom-nav tab, <b>Inbox</b>, next to Watch and Analytics. Each row is one conversation with one agent. Opening a row shows the whole conversation as a single scrolling page: the agent's messages, your replies, its review requests and its finish report, oldest at the top, with a reply box at the bottom. A notification opens that page, and Back returns to the Inbox, so you can work through several agents in a row without passing through Watch. The Watch card keeps a one-line pointer into the conversation instead of its own message list.</p>
+
+<p>Almost nothing new is stored. Messages, replies, review requests and follow results already sit in the server's database; the Inbox is a new way to list them. The new pieces are two list views (a native Inbox tab in the app, and the same list on sm web), a conversation page built from the existing message reader, a <b>Done</b> action, and the ability to write to a live agent from its conversation without waiting for it to write first.</p>
+
+<h3>Terms used here</h3>
+<dl class="vocab">
+<dt>Message</dt><dd>What an agent's <code>sm send rajesh</code> creates today: a titled markdown note stored by the sm server, with its own page at <code>/messages/&lt;id&gt;</code>. Unchanged by this design.</dd>
+<dt>Blocking message</dt><dd>A message sent with <code>--blocking</code>, meaning the agent cannot continue without you. It shows as <b>Needs you</b> until you reply or clear it.</dd>
+<dt>Review request</dt><dd>What <code>sm doc publish --pr N --review</code> creates: a doc the agent asks you to review on GitHub. Unchanged by this design.</dd>
+<dt>Follow result</dt><dd>What you get after tapping Follow on an agent or a queue job: a notification when the agent finishes (with its report) or dies, or when the job ends. Unchanged; it now also lands in the Inbox.</dd>
+<dt>Conversation</dt><dd><i>New.</i> Everything between you and one agent, in time order: its messages, your replies, its review requests, follow results for it and its queue jobs. One agent, one conversation, because each agent works one task.</dd>
+<dt>Inbox</dt><dd><i>New.</i> The list of conversations, one row each, with the ones that need you on top.</dd>
+<dt>Done</dt><dd><i>New.</i> Your "I have dealt with this" on a conversation. It moves the row out of the open list and clears every open ask in it without sending the agent anything. The row comes back if the agent sends something new.</dd>
+</dl>
+
+<h3>What is wrong with messages on the Watch page</h3>
+
+<figure>
+<svg viewBox="0 0 760 250" role="img" aria-label="Today versus proposed navigation">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--ink-2)"/></marker>
+  </defs>
+  <text x="10" y="20" font-size="13" font-weight="700" fill="var(--ink)">Today</text>
+  <g font-size="11.5" fill="var(--ink)">
+    <rect x="10" y="32" width="120" height="44" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/>
+    <text x="70" y="52" text-anchor="middle">Notification</text><text x="70" y="67" text-anchor="middle" fill="var(--ink-2)">one agent</text>
+    <rect x="170" y="32" width="130" height="44" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/>
+    <text x="235" y="52" text-anchor="middle">Message page</text><text x="235" y="67" text-anchor="middle" fill="var(--ink-2)">one message only</text>
+    <rect x="340" y="32" width="150" height="44" rx="6" fill="var(--surface-2)" stroke="var(--orange)" stroke-width="1.6"/>
+    <text x="415" y="52" text-anchor="middle">Watch page</text><text x="415" y="67" text-anchor="middle" fill="var(--orange)">scan every card</text>
+    <rect x="530" y="32" width="130" height="44" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/>
+    <text x="595" y="52" text-anchor="middle">Next message page</text><text x="595" y="67" text-anchor="middle" fill="var(--ink-2)">history not shown</text>
+    <line x1="130" y1="54" x2="168" y2="54" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+    <line x1="300" y1="54" x2="338" y2="54" stroke="var(--ink-2)" marker-end="url(#ar)"/><text x="319" y="46" text-anchor="middle" font-size="10" fill="var(--ink-2)">Back</text>
+    <line x1="490" y1="54" x2="528" y2="54" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+  </g>
+  <g font-size="11" fill="var(--ink-2)">
+    <text x="10" y="100">A three-round exchange (agent asks, you reply, agent answers, you reply) is two message pages, each showing only</text>
+    <text x="10" y="115">its own replies. What waits on you is spread across cards sorted by repo, not by urgency.</text>
+  </g>
+  <text x="10" y="150" font-size="13" font-weight="700" fill="var(--ink)">Proposed</text>
+  <g font-size="11.5" fill="var(--ink)">
+    <rect x="10" y="162" width="120" height="44" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/>
+    <text x="70" y="182" text-anchor="middle">Notification</text><text x="70" y="197" text-anchor="middle" fill="var(--ink-2)">one agent</text>
+    <rect x="170" y="162" width="150" height="44" rx="6" fill="var(--surface-2)" stroke="var(--green)" stroke-width="1.6"/>
+    <text x="245" y="182" text-anchor="middle">Conversation</text><text x="245" y="197" text-anchor="middle" fill="var(--green)">whole history, reply box</text>
+    <rect x="360" y="162" width="150" height="44" rx="6" fill="var(--surface-2)" stroke="var(--green)" stroke-width="1.6"/>
+    <text x="435" y="182" text-anchor="middle">Inbox</text><text x="435" y="197" text-anchor="middle" fill="var(--green)">needs-you first</text>
+    <rect x="550" y="162" width="150" height="44" rx="6" fill="var(--surface-2)" stroke="var(--rule)"/>
+    <text x="625" y="182" text-anchor="middle">Next conversation</text><text x="625" y="197" text-anchor="middle" fill="var(--ink-2)">one tap</text>
+    <line x1="130" y1="184" x2="168" y2="184" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+    <line x1="320" y1="184" x2="358" y2="184" stroke="var(--ink-2)" marker-end="url(#ar)"/><text x="339" y="176" text-anchor="middle" font-size="10" fill="var(--ink-2)">Back</text>
+    <line x1="510" y1="184" x2="548" y2="184" stroke="var(--ink-2)" marker-end="url(#ar)"/>
+    <path d="M625,206 C625,240 435,240 435,208" fill="none" stroke="var(--ink-3)" stroke-dasharray="4 3" marker-end="url(#ar)"/><text x="530" y="243" text-anchor="middle" font-size="10" fill="var(--ink-2)">Back, repeat</text>
+  </g>
+</svg>
+<figcaption>Figure 1. Today a notification drops you onto one message, and Back lands on Watch, where messages are one list per agent card among dozens of cards. With an Inbox, Back lands on the list of what is waiting on you, and each row holds the whole exchange with that agent.</figcaption>
+</figure>
+
+<p>Four concrete problems with today's layout, all from the shipped design:</p>
+<ol>
+<li><b>Finding what needs you means scanning.</b> The Messages list sits on each agent's card, and cards are grouped by repo and parent agent. With fifteen agents running, a blocking question from one of them is a line on one card among fifteen.</li>
+<li><b>A back-and-forth is split across pages.</b> Every <code>sm send rajesh</code> makes a new message page, and your reply is stored under the message you answered. When the agent answers your reply, that is a new page, which does not show the earlier exchange.</li>
+<li><b>History disappears with the agent.</b> The card shows the last 30 days and at most 20 messages<sup>1</sup>, and a retired agent's card leaves Watch, taking its messages with it. The notification or email link is the only way back.</li>
+<li><b>Three kinds of "for you" live in three places.</b> Messages are on the card's Messages list, review requests on its Docs list, and follow results only in the notification shade.</li>
+</ol>
+
+<h3>What the Inbox looks like</h3>
+
+<figure class="phones">
+<div class="two">
+<svg viewBox="0 0 320 640" role="img" aria-label="Inbox tab mockup">
+  <rect x="2" y="2" width="316" height="636" rx="28" fill="#09090D" stroke="#3B3B49" stroke-width="2"/>
+  <text x="24" y="40" font-size="11" fill="#777C8B">9:41</text>
+  <text x="24" y="76" font-size="22" font-weight="700" fill="#F5F7FA">Inbox</text>
+  <rect x="190" y="58" width="52" height="24" rx="12" fill="#143744"/><text x="216" y="74" font-size="11" text-anchor="middle" fill="#5EE7FF">Open</text>
+  <rect x="248" y="58" width="52" height="24" rx="12" fill="none" stroke="#2B2B37"/><text x="274" y="74" font-size="11" text-anchor="middle" fill="#ADB2C2">Done</text>
+
+  <text x="24" y="110" font-size="10.5" font-weight="700" letter-spacing=".08em" fill="#FBBF24">NEEDS YOU · 2</text>
+  <!-- row 1 -->
+  <rect x="14" y="118" width="292" height="70" rx="10" fill="#121219" stroke="#FBBF24" stroke-opacity=".55"/>
+  <circle cx="34" cy="138" r="4" fill="#FBBF24"/>
+  <text x="46" y="142" font-size="12.5" font-weight="700" fill="#F5F7FA">sm-1679-engineer</text>
+  <text x="294" y="142" font-size="10.5" text-anchor="end" fill="#777C8B">12m</text>
+  <text x="46" y="160" font-size="12" fill="#F5F7FA">Keep the old fills table or drop it?</text>
+  <text x="46" y="177" font-size="10.5" fill="#777C8B">trading-core · 3 messages · asks you</text>
+  <!-- row 2 -->
+  <rect x="14" y="194" width="292" height="70" rx="10" fill="#121219" stroke="#FBBF24" stroke-opacity=".55"/>
+  <circle cx="34" cy="214" r="4" fill="#FBBF24"/>
+  <text x="46" y="218" font-size="12.5" font-weight="700" fill="#F5F7FA">sm-1612-spec-author</text>
+  <text x="294" y="218" font-size="10.5" text-anchor="end" fill="#777C8B">1h</text>
+  <text x="46" y="236" font-size="12" fill="#F5F7FA">Review: queue fairness memo</text>
+  <text x="46" y="253" font-size="10.5" fill="#A78BFA">session-manager · review on PR #1614</text>
+
+  <text x="24" y="292" font-size="10.5" font-weight="700" letter-spacing=".08em" fill="#F0ABFC">NEW · 1</text>
+  <rect x="14" y="300" width="292" height="70" rx="10" fill="#121219" stroke="#2B2B37"/>
+  <circle cx="34" cy="320" r="4" fill="#F0ABFC"/>
+  <text x="46" y="324" font-size="12.5" font-weight="700" fill="#F5F7FA">sm-1701-scout</text>
+  <text x="294" y="324" font-size="10.5" text-anchor="end" fill="#777C8B">25m</text>
+  <text x="46" y="342" font-size="12" fill="#F5F7FA">Inventory done: 14 readers of fills</text>
+  <text x="46" y="359" font-size="10.5" fill="#777C8B">trading-core · for your information</text>
+
+  <text x="24" y="398" font-size="10.5" font-weight="700" letter-spacing=".08em" fill="#777C8B">EARLIER</text>
+  <rect x="14" y="406" width="292" height="62" rx="10" fill="#121219" stroke="#2B2B37"/>
+  <text x="46" y="428" font-size="12.5" fill="#ADB2C2">sm-1655-engineer</text>
+  <text x="294" y="428" font-size="10.5" text-anchor="end" fill="#777C8B">3h</text>
+  <text x="46" y="446" font-size="12" fill="#4ADE80">Finished · report: bar-feed readout</text>
+  <text x="46" y="460" font-size="10.5" fill="#777C8B">trading-core · agent ended</text>
+  <rect x="14" y="474" width="292" height="62" rx="10" fill="#121219" stroke="#2B2B37"/>
+  <text x="46" y="496" font-size="12.5" fill="#ADB2C2">sm-1640-engineer</text>
+  <text x="294" y="496" font-size="10.5" text-anchor="end" fill="#777C8B">Tue</text>
+  <text x="46" y="514" font-size="12" fill="#ADB2C2">You: Ship it after the recon passes.</text>
+  <text x="46" y="528" font-size="10.5" fill="#777C8B">session-manager · you replied</text>
+
+  <!-- bottom nav -->
+  <line x1="14" y1="570" x2="306" y2="570" stroke="#2B2B37"/>
+  <rect x="30" y="582" width="76" height="34" rx="17" fill="#143744"/>
+  <text x="68" y="604" font-size="12" text-anchor="middle" font-weight="700" fill="#5EE7FF">Inbox</text>
+  <circle cx="102" cy="584" r="9" fill="#FBBF24"/><text x="102" y="588" font-size="10" text-anchor="middle" font-weight="700" fill="#09090D">2</text>
+  <text x="160" y="604" font-size="12" text-anchor="middle" fill="#ADB2C2">Watch</text>
+  <text x="252" y="604" font-size="12" text-anchor="middle" fill="#ADB2C2">Analytics</text>
+</svg>
+
+<svg viewBox="0 0 320 640" role="img" aria-label="Conversation page mockup">
+  <rect x="2" y="2" width="316" height="636" rx="28" fill="#09090D" stroke="#3B3B49" stroke-width="2"/>
+  <text x="24" y="40" font-size="11" fill="#777C8B">9:41</text>
+  <text x="24" y="70" font-size="16" fill="#ADB2C2">‹</text>
+  <text x="42" y="68" font-size="14" font-weight="700" fill="#F5F7FA">sm-1679-engineer</text>
+  <text x="42" y="84" font-size="10.5" fill="#4ADE80">● working · trading-core</text>
+  <rect x="236" y="56" width="68" height="26" rx="13" fill="none" stroke="#2B2B37"/><text x="270" y="73" font-size="11" text-anchor="middle" fill="#5EE7FF">Terminal</text>
+  <line x1="14" y1="96" x2="306" y2="96" stroke="#2B2B37"/>
+
+  <!-- agent msg 1 -->
+  <rect x="14" y="108" width="236" height="52" rx="12" fill="#181820"/>
+  <text x="26" y="126" font-size="11.5" font-weight="700" fill="#F5F7FA">Copying fills into fills_v2</text>
+  <text x="26" y="143" font-size="11" fill="#ADB2C2">Starting now, about 40 minutes.</text>
+  <text x="26" y="155" font-size="9.5" fill="#777C8B">09:12</text>
+  <!-- you -->
+  <rect x="150" y="168" width="156" height="36" rx="12" fill="#143744"/>
+  <text x="162" y="186" font-size="11" fill="#F5F7FA">Go ahead.</text>
+  <text x="294" y="199" font-size="9.5" text-anchor="end" fill="#5EE7FF">You · 09:14</text>
+  <!-- event -->
+  <text x="160" y="226" font-size="10" text-anchor="middle" fill="#777C8B">Queue job 1679-copy-fills succeeded · 38m</text>
+  <!-- blocking msg -->
+  <rect x="14" y="238" width="270" height="158" rx="12" fill="#181820" stroke="#FBBF24" stroke-width="1.4"/>
+  <rect x="26" y="248" width="66" height="17" rx="8.5" fill="#FBBF24" fill-opacity=".18"/><text x="59" y="260" font-size="9.5" text-anchor="middle" font-weight="700" fill="#FBBF24">NEEDS YOU</text>
+  <text x="26" y="284" font-size="11.5" font-weight="700" fill="#F5F7FA">Keep the old fills table or drop it?</text>
+  <text x="26" y="302" font-size="11" fill="#ADB2C2">The copy matches row for row. I</text>
+  <text x="26" y="317" font-size="11" fill="#ADB2C2">recommend dropping fills after one</text>
+  <text x="26" y="332" font-size="11" fill="#ADB2C2">week of both tables agreeing. Confirm?</text>
+  <rect x="22" y="340" width="254" height="22" rx="4" fill="#F0ABFC" fill-opacity=".14"/>
+  <text x="26" y="355" font-size="11" fill="#F5F7FA">Nothing reads fills after the cutover.</text>
+  <text x="26" y="386" font-size="9.5" fill="#777C8B">10:02 · tap a paragraph to quote it</text>
+
+  <!-- composer -->
+  <rect x="2" y="470" width="316" height="100" fill="#121219"/>
+  <line x1="14" y1="470" x2="306" y2="470" stroke="#2B2B37"/>
+  <rect x="14" y="480" width="292" height="24" rx="6" fill="#1E1E28"/>
+  <rect x="14" y="480" width="3" height="24" fill="#F0ABFC"/>
+  <text x="24" y="496" font-size="10.5" fill="#ADB2C2">Nothing reads fills after the cutover.</text>
+  <text x="298" y="496" font-size="11" text-anchor="end" fill="#777C8B">×</text>
+  <rect x="14" y="510" width="292" height="30" rx="8" fill="#1E1E28" stroke="#3B3B49"/>
+  <text x="24" y="529" font-size="11" fill="#F5F7FA">The month-end recon does. Check it first.</text>
+  <rect x="14" y="546" width="72" height="20" rx="10" fill="none" stroke="#2B2B37"/><text x="50" y="560" font-size="10.5" text-anchor="middle" fill="#ADB2C2">Done</text>
+  <rect x="234" y="546" width="72" height="20" rx="10" fill="#5EE7FF"/><text x="270" y="560" font-size="10.5" text-anchor="middle" font-weight="700" fill="#09090D">Send</text>
+
+  <line x1="14" y1="580" x2="306" y2="580" stroke="#2B2B37"/>
+  <text x="160" y="606" font-size="10.5" text-anchor="middle" fill="#777C8B">Back returns to the Inbox</text>
+</svg>
+</div>
+<figcaption>Figure 2. Left: the Inbox tab. Rows that need you (blocking messages and review requests) sit on top in amber, then unread notes, then everything else by time. The tab badge counts only rows that need you. Right: one conversation. The agent's messages sit on the left, your replies on the right, and events such as a finished queue job appear as small grey lines. Tapping a paragraph quotes it into the reply box, which replaces the select-and-comment gesture of the current message page. <b>Done</b> clears the conversation without sending anything; <b>Send</b> delivers your text and quotes as one message. <b>Terminal</b> opens the agent's terminal, as the Watch card does today.</figcaption>
+</figure>
+
+<p><b>The Watch card after the change.</b> The Messages list comes off the card. In its place is one line, for example <i>2 new from this agent · open conversation</i>, or <i>Waiting for Rajesh · Keep the old fills table or drop it?</i>, which opens the conversation. The Docs list stays on the card, because docs are the agent's work product, not mail to you. A review request appears in both places: as a doc on the card and as an ask in the Inbox.</p>
+
+<h3>How it behaves</h3>
+<table>
+<thead><tr><th style="width:34%">Situation</th><th>What happens</th></tr></thead>
+<tbody>
+<tr><td>An agent sends a blocking question</td><td>Your phone buzzes, as today. The tap opens its conversation, scrolled to the question. The row sits under <b>Needs you</b> until you Send or tap Done.</td></tr>
+<tr><td>You reply, and the agent answers with another <code>sm send rajesh</code></td><td>The answer lands in the same conversation under your reply. You see the whole exchange on one page.</td></tr>
+<tr><td>You want to tell a running agent something it has not asked about</td><td>Open its conversation from the Inbox or from the Watch card and type. It arrives as <code>[Input from: Rajesh via sm app]</code>, the header agents already answer. Today this needs the terminal's "Message agent" box.</td></tr>
+<tr><td>An agent asks for a review</td><td>An ask card in its conversation with <b>Open doc</b> and <b>No review needed</b>. Your review still goes to GitHub and wakes the agent with <code>[sm review]</code>, as today.</td></tr>
+<tr><td>A followed agent finishes, or dies</td><td>The notification, as today, plus a line in its conversation: <i>Finished · report: &lt;title&gt;</i> linking the report, or <i>Ended without finishing</i>.</td></tr>
+<tr><td>A followed queue job ends</td><td>A grey line in the conversation of the agent that submitted it: <i>Queue job &lt;label&gt; failed · 12m</i>.</td></tr>
+<tr><td>You tap Done on a conversation</td><td>It moves to the Done filter. Any open blocking message becomes Handled and any open review request becomes No review needed, without messaging the agent, which are the two clear actions that already exist. The next thing the agent sends reopens the row.</td></tr>
+<tr><td>The agent has ended</td><td>The conversation stays in the Inbox with its full history. The reply box says where a reply would go: to the agent's live parent, or nowhere, in which case it is hidden, as the current message page does.</td></tr>
+<tr><td>Fifteen agents are running, three want you</td><td>The badge says 3. The top three rows are theirs. Agents that only sent notes show a dot, not a number, so the badge means "you are blocking someone".</td></tr>
+<tr><td>On a laptop</td><td>sm web gets the same Inbox at <code>/inbox</code>. Links in <code>sm send</code> output and in fallback email open the conversation, scrolled to that message.</td></tr>
+</tbody>
+</table>
+
+<h3>Decision surface</h3>
+<table>
+<thead><tr><th style="width:22%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr></thead>
+<tbody>
+<tr><td>1. Is the Inbox its own tab?</td><td><b>Yes: bottom nav becomes Inbox · Watch · Analytics.</b> The app still opens on Watch; the Inbox badge tells you when to switch.</td><td>"What needs me" and "what are agents doing" are different questions with different sort orders.</td></tr>
+<tr><td>2. What is one row?</td><td><b>One conversation per agent</b>, not one row per message.</td><td>Each agent works one task, so one agent is one topic, and agents already answer your reply with a fresh message rather than threading it.</td></tr>
+<tr><td>3. What lands in the Inbox?</td><td><b>Messages, review requests, and follow results.</b> Not plain doc publishes and not agent status changes.</td><td>These are the three things addressed to you; everything else is the Watch page's job.</td></tr>
+<tr><td>4. Can you write first?</td><td><b>Yes, to any live agent, from its conversation.</b></td><td>With a reply box on every conversation, refusing to let you use it until the agent speaks is an artificial limit. The shipped design left this out of scope.</td></tr>
+<tr><td>5. What does Done do?</td><td><b>One Done per conversation</b> that clears every open ask in it (Handled, No review needed) without messaging the agent. A new item reopens it.</td><td>One gesture to clear your list; no separate archive, snooze or per-message clearing.</td></tr>
+<tr><td>6. What stays on the Watch card?</td><td><b>A one-line pointer into the conversation</b> replaces the Messages list. The Docs list stays.</td><td>A second full message list would drift from the Inbox and clutter the card.</td></tr>
+<tr><td>7. What does the badge count?</td><td><b>Only conversations that need you</b> (a blocking message or a review request). Unread notes show a dot.</td><td>A badge that counts FYI notes trains you to ignore it.</td></tr>
+<tr><td>8. How is it built?</td><td><b>The Inbox list is native in the app; the conversation page is a server-rendered page</b> shown in the app's existing reader and on sm web.</td><td>The current message page already renders markdown and takes quotes this way, and one page then serves phone and laptop.</td></tr>
+<tr><td>9. How many build tickets?</td><td><b>Two, in order:</b> (a) server: the Inbox list, the conversation page, Done, writing first; (b) Android: the Inbox tab, the Watch card pointer, notification taps opening the conversation. Mid tier (Opus 1M, high) for both.</td><td>The server half is testable on sm web before the app changes, and each fits one agent without compaction.</td></tr>
+</tbody>
+</table>
+
+<h3>Not in this design</h3>
+<p>Browser or desktop notifications on sm web. Search across conversations (the Done filter plus scrolling covers two weeks of history; search can follow if it proves too little). Grouping conversations by repo or by parent agent. Messages from agents to anyone other than you. Changes to how <code>sm send rajesh</code>, <code>--blocking</code>, the unread cap or the email fallback work: agents see no difference.</p>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p>This is the first revision.</p>
+
+<p class="phone-note"><sup>1</sup> <code>CARD_MESSAGE_WINDOW</code> and <code>CARD_MESSAGE_LIMIT</code> in <code>crates/sm-server/src/http/messages.rs:16-17</code>; the messages attach to the sender's card in <code>project_messages</code>, same file.</p>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+<p>These appendices sketch the build so the direction can be judged. Once the decisions above are settled, they become the full spec, with exact response shapes and a test per behaviour, before either ticket starts.</p>
+
+<h3>A. What already exists</h3>
+<table>
+<thead><tr><th>Piece</th><th>Where</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><td>Messages, drafts, replies</td><td><code>owner_messages</code>, <code>owner_message_drafts</code>, <code>owner_message_replies</code> tables, <code>crates/sm-server/src/owner_messages.rs</code></td><td>Conversation items: agent messages and your replies.</td></tr>
+<tr><td>Message state</td><td><code>derive_message_state</code> in <code>owner_messages.rs</code> (new, read, needs_you, replied, handled; no stored state column)</td><td>Row grouping and badge.</td></tr>
+<tr><td>Review requests</td><td><code>owner_docs</code>, <code>owner_doc_reviews</code>, <code>crates/sm-server/src/owner_docs.rs</code>; review state <code>ReviewRequested</code></td><td>Ask cards; Needs you.</td></tr>
+<tr><td>Follows and notices</td><td><code>owner_follows</code> in <code>owner_push.rs</code>; <code>owner_notices</code> in <code>owner_push/notices.rs</code></td><td>Finished / died / job-ended lines; notification tap target.</td></tr>
+<tr><td>Message reader page</td><td><code>GET /messages/{id}</code> in <code>http/messages.rs</code>; client in <code>http/doc_client.js</code> ("reply" mode); Android <code>DocReader.kt</code> WebView</td><td>Base for the conversation page.</td></tr>
+<tr><td>Reply delivery</td><td><code>POST /messages/{id}/reply</code> with a submission id for deduplication; header <code>[Input from: &lt;owner_name&gt; via sm app]</code>; routes to the live parent when the sender has ended</td><td>Send from a conversation.</td></tr>
+<tr><td>Handled / No review needed</td><td><code>POST /messages/{id}/handled</code>; doc no-review route in <code>http/docs/review.rs</code></td><td>What Done calls for each open ask.</td></tr>
+</tbody>
+</table>
+
+<h3>B. Server additions (ticket a)</h3>
+<ol>
+<li><b>Conversation key.</b> The sending agent's session id. Items: that session's messages and their replies, its review requests, follow results for the session, and follow results for queue jobs it submitted. Your first-written messages (section D) belong to the addressed session.</li>
+<li><b>Done state.</b> New table <code>owner_inbox_threads(session_id TEXT PRIMARY KEY, done_at TEXT, last_read_at TEXT)</code>. A conversation is Done when <code>done_at</code> is later than its newest item. Tapping Done also calls the existing handled and no-review-needed paths for every open ask in it.</li>
+<li><b><code>GET /inbox</code></b>: one row per conversation with activity in the last 30 days (Open) or <code>?filter=done</code>. Row fields: session id and name, repo, agent status (live or ended), group (<code>needs_you</code>, <code>new</code>, <code>earlier</code>), newest item preview (title or "You: …"), newest item time, counts of messages and open asks. Sort: group, then newest item time descending. Also <code>needs_you_count</code> for the badge. Protected the same way <code>/messages/</code> is (<code>is_protected_read_surface</code> in <code>http.rs</code>).</li>
+<li><b><code>GET /inbox/{session_id}</code></b>: the conversation page, server-rendered, reusing the message reader's markdown rendering and reply client. Items in time order. Opening it sets <code>first_viewed_at</code> on its unread messages and <code>last_read_at</code> on the conversation. <code>?at=msg_…</code> scrolls to that message. <code>/messages/{id}</code> keeps working and redirects to <code>/inbox/{sender}?at={id}</code>, so old links in email and agent output still land correctly.</li>
+<li><b>Send from the conversation.</b> A quote targets the message it was taken from. The whole send is one delivered message, as today. If the conversation has an open blocking message, the reply is recorded against the newest one (making it Replied); otherwise against the newest agent message; otherwise it is a first-written message (section D).</li>
+<li><b>Notification tap target.</b> Message and review notices link to <code>/inbox/{session_id}?at=…</code> instead of <code>/messages/{id}</code> or the doc.</li>
+</ol>
+
+<h3>C. Android additions (ticket b)</h3>
+<ol>
+<li>Bottom nav gains Inbox as the first tab (<code>AppBottomNav.kt</code>, <code>AppNavigation.kt</code>), with a badge from <code>needs_you_count</code> and a dot when any row is <code>new</code>. Start destination stays Watch.</li>
+<li>Inbox screen: native list of <code>GET /inbox</code> rows grouped as in Figure 2, pull to refresh, Open / Done filter, swipe right for Done.</li>
+<li>Row tap opens <code>/inbox/{session_id}</code> in the existing reader overlay (<code>DocReader.kt</code>); Back closes the overlay onto the Inbox list.</li>
+<li>Watch card: the Messages section in <code>WatchScreen.kt</code> is replaced by the one-line pointer; the server's <code>messages</code> list on the session feed becomes a count plus the newest title.</li>
+<li>Notification taps (<code>push/NoticePush.kt</code>) switch to the Inbox tab and open the conversation.</li>
+</ol>
+
+<h3>D. Writing first</h3>
+<p>A message you start is stored as a reply with no agent message above it: <code>owner_message_replies.message_id</code> becomes nullable and a <code>session_id</code> column is added. Delivery, header, deduplication and the "no live agent" rule are the same as a reply. The first line reads <code>[Input from: Rajesh via sm app]</code> with no <code>Re:</code> part.</p>
+
+<h3>Z. FAQ</h3>
+<p><b>Why not thread by message, with a <code>--re</code> flag for agents?</b> Agents would have to remember to pass it, and they answer your reply with a fresh <code>sm send</code>. Grouping by agent needs nothing from them and is correct because each agent works one task.</p>
+<p><b>What if one agent raises two unrelated questions?</b> They appear as two message cards in one conversation, each with its own title and its own Needs you tag. Quoting a paragraph makes clear which one you answer.</p>
+<p><b>Why keep the Docs list on the Watch card?</b> Docs are what an agent produced, which belongs with its status. The Inbox only carries the ask to review.</p>
+
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
