@@ -15428,6 +15428,7 @@ fn queue_job_response_with_names(
         "termination_reason": termination_reason,
         "memory_guard": job.termination_detail.as_ref().filter(|_| job.state == "memory_exceeded"),
         "process_guard": job.termination_detail.as_ref().filter(|_| job.state == "process_limit_exceeded"),
+        "wait_blockers": job.termination_detail.as_ref().filter(|_| job.state == "wait_expired"),
         "process_limit": job.process_limit,
         "peak_process_count": job.peak_process_count,
         "readable_log_path": job.log_path.as_deref().and_then(|p| std::path::Path::new(p).parent()).map(|p| p.join(crate::queue::queue_log_filename(&job.label, &job.id)).display().to_string()).filter(|p| std::path::Path::new(p).exists()),

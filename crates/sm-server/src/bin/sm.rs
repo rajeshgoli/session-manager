@@ -1877,6 +1877,12 @@ fn run_queue_status(client: &ApiClient, args: QueueStatusArgs) -> Result<()> {
         "Termination: {}",
         payload["termination_reason"].as_str().unwrap_or("-")
     );
+    if payload["wait_blockers"].is_object() {
+        println!(
+            "Never started: the {}",
+            sm_server::queue::concurrency_cap_wait_text(&payload["wait_blockers"])
+        );
+    }
     if let Some(guard) = payload["memory_guard"].as_object() {
         let bytes = |key: &str| {
             guard

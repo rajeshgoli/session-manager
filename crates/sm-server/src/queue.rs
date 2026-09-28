@@ -3450,6 +3450,16 @@ fn expire_pending_queue_jobs_conn(
                     job.holding_reason = Some(reason.to_owned());
                 }
             }
+            if job.holding_reason.as_deref() == Some("concurrency_cap") {
+                // Record who held the slots at the deadline; the completion
+                // notice and `sm queue status` render from this snapshot.
+                let detail = concurrency_cap_wait_detail(&job, jobs, admission_policy).to_string();
+                conn.execute(
+                    "UPDATE queue_jobs SET termination_detail_json = ?2 WHERE id = ?1 AND state = 'pending'",
+                    params![job.id, detail],
+                )?;
+                job.termination_detail_json = Some(detail);
+            }
             let result = finish_queue_job_conn_with_policy(
                 conn,
                 &job,
@@ -3473,6 +3483,80 @@ fn expire_pending_queue_jobs_conn(
         }
     }
     Ok(expired)
+}
+
+/// Why a job held at `concurrency_cap` never started: the limit that was full,
+/// the jobs running in it, and the same-type jobs queued ahead of it.
+fn concurrency_cap_wait_detail(
+    job: &QueueJobRuntimeRecord,
+    jobs: &[QueueJobRuntimeRecord],
+    admission_policy: QueueAdmissionPolicy,
+) -> JsonValue {
+    let global = running_queue_job_count(jobs, None) as i64 >= admission_policy.max_running_jobs;
+    let summary = |other: &QueueJobRuntimeRecord| serde_json::json!({"id": other.id, "label": other.label, "type": other.job_type});
+    let running = jobs
+        .iter()
+        .filter(|other| other.state == "running" && (global || other.job_type == job.job_type))
+        .map(summary)
+        .collect::<Vec<_>>();
+    let ahead = jobs
+        .iter()
+        .filter(|other| {
+            other.state == "pending"
+                && other.job_type == job.job_type
+                && (&other.queued_at, &other.id) < (&job.queued_at, &job.id)
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "cause": "concurrency_cap",
+        "limit_scope": if global { "global" } else { job.job_type.as_str() },
+        "limit": if global {
+            admission_policy.max_running_jobs
+        } else {
+            admission_policy.max_concurrent_jobs(&job.job_type) as i64
+        },
+        "running": running,
+        "queued_ahead_count": ahead.len(),
+        "queued_ahead": ahead.into_iter().take(5).map(summary).collect::<Vec<_>>(),
+    })
+}
+
+/// One-line rendering of [`concurrency_cap_wait_detail`] for notices and status.
+pub fn concurrency_cap_wait_text(detail: &JsonValue) -> String {
+    let names = |key: &str| {
+        detail[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|job| {
+                format!(
+                    "{} ({})",
+                    job["label"].as_str().unwrap_or("-"),
+                    job["id"].as_str().unwrap_or("-")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let running = names("running");
+    let ahead_count = detail["queued_ahead_count"].as_u64().unwrap_or(0);
+    let mut text = format!(
+        "{} limit of {} running jobs was full; running: {}",
+        detail["limit_scope"].as_str().unwrap_or("-"),
+        detail["limit"].as_i64().unwrap_or(0),
+        if running.is_empty() { "-" } else { &running }
+    );
+    if ahead_count > 0 {
+        text.push_str(&format!(
+            "; {ahead_count} queued ahead: {}",
+            names("queued_ahead")
+        ));
+        let shown = detail["queued_ahead"].as_array().map_or(0, Vec::len) as u64;
+        if ahead_count > shown {
+            text.push_str(&format!(", {} more", ahead_count - shown));
+        }
+    }
+    text
 }
 
 fn ensure_service_capacity_reserve_before_admission(
@@ -3611,8 +3695,18 @@ fn next_admissible_queue_job_id_conn(
         if running_queue_job_count(jobs, Some(job_type))
             >= admission_policy.max_concurrent_jobs(job_type)
         {
-            summary.held +=
-                mark_pending_queue_jobs_holding_conn(conn, Some(&oldest.id), "concurrency_cap")?;
+            // Hold every queued job of the type, not only the oldest: an
+            // unmarked job reports no reason and expires as not_admitted (sm#1600).
+            for pending in jobs
+                .iter()
+                .filter(|job| job.state == "pending" && job.job_type == job_type)
+            {
+                summary.held += mark_pending_queue_jobs_holding_conn(
+                    conn,
+                    Some(&pending.id),
+                    "concurrency_cap",
+                )?;
+            }
             continue;
         }
         let job = if job_type == "perf" {
@@ -5159,7 +5253,7 @@ fn finish_queue_job_conn_with_policy(
         SET state = ?2,
             holding_reason = CASE WHEN ?2 = 'wait_expired' THEN holding_reason ELSE NULL END,
             termination_detail_json = CASE
-                WHEN ?2 IN ('memory_exceeded', 'process_limit_exceeded') THEN termination_detail_json
+                WHEN ?2 IN ('memory_exceeded', 'process_limit_exceeded', 'wait_expired') THEN termination_detail_json
                 ELSE NULL
             END,
             finished_at = ?3,
@@ -5332,6 +5426,7 @@ pub fn queue_hold_explanation(
         names.join(", ")
     };
     let mut blockers: Vec<&QueueJobRecord> = Vec::new();
+    let mut queued_ahead = 0;
     let (summary, detail) = match reason {
         "awaiting_tests" => {
             blockers = running.iter().copied().filter(|j| j.job_type == "tests").collect();
@@ -5373,11 +5468,21 @@ pub fn queue_hold_explanation(
             blockers = running.iter().copied().filter(|j| global || j.job_type == job.job_type).collect();
             let limit = if global { format!("global limit of {} running jobs", policy.max_running_jobs) }
                 else { format!("{} limit of {} running jobs", job.job_type, policy.max_concurrent_jobs(&job.job_type)) };
-            let detail = if blockers.is_empty() {
+            let mut detail = if blockers.is_empty() {
                 format!("The scheduler reports the {limit}, but no matching running jobs are present in the latest snapshot. Awaiting the next scheduler pass.")
             } else {
                 format!("Waiting for an available slot ({limit}). Currently running: {}.", names(&blockers))
             };
+            let ahead: Vec<&QueueJobRecord> = jobs
+                .iter()
+                .filter(|j| j.state == "pending" && j.job_type == job.job_type && (&j.queued_at, &j.id) < (&job.queued_at, &job.id))
+                .collect();
+            queued_ahead = ahead.len();
+            if ahead.is_empty() {
+                detail.push_str(&format!(" No queued {} jobs are ahead of this one.", job.job_type));
+            } else {
+                detail.push_str(&format!(" Queued {} jobs ahead of this one ({}): {}.", job.job_type, ahead.len(), names(&ahead)));
+            }
             ("waiting for an available job slot".into(), detail)
         }
         "memory_pressure" => (
@@ -5423,6 +5528,8 @@ pub fn queue_hold_explanation(
             })
         }
         "perf_cooldown" => Some(policy.perf_cooldown_seconds.max(0)),
+        // Running blockers alone understate the wait for a job behind others.
+        "concurrency_cap" if queued_ahead > 0 => None,
         _ => blocker_seconds,
     };
     let wait_remaining_seconds = queue_elapsed_since(&job.queued_at, OffsetDateTime::now_utc())
@@ -5507,6 +5614,7 @@ fn queue_job_completion_text_with_policy(
     } else {
         String::new()
     };
+    let mut wait_note = String::new();
     let wait_text = if state == "wait_expired" {
         let reason = job.holding_reason.as_deref().unwrap_or("not_admitted");
         if reason == "memory_pressure" {
@@ -5524,6 +5632,17 @@ fn queue_job_completion_text_with_policy(
                 job.max_wait_seconds
             )
         } else {
+            if let Some(detail) = job
+                .termination_detail_json
+                .as_deref()
+                .filter(|_| reason == "concurrency_cap")
+                .and_then(|raw| serde_json::from_str::<JsonValue>(raw).ok())
+            {
+                wait_note = format!(
+                    ". Never started: the {}. Resubmit with a longer --max-wait to keep waiting.",
+                    concurrency_cap_wait_text(&detail)
+                );
+            }
             format!(" wait_reason={reason} max_wait={}s", job.max_wait_seconds)
         }
     } else {
@@ -5535,7 +5654,7 @@ fn queue_job_completion_text_with_policy(
         ""
     };
     format!(
-        "[sm queue] {} completed: {}{}{}{}{} runtime={} queue={}. Log: {}. ID: {}{}",
+        "[sm queue] {} completed: {}{}{}{}{} runtime={} queue={}. Log: {}. ID: {}{}{}",
         if job.label.trim().is_empty() {
             &job.id
         } else {
@@ -5550,6 +5669,7 @@ fn queue_job_completion_text_with_policy(
         queued,
         job.log_path.as_deref().unwrap_or("-"),
         job.id,
+        wait_note,
         revived_text
     )
 }
@@ -7277,6 +7397,21 @@ mod tests {
         limited.holding_reason = Some("concurrency_cap".into());
         let typed = queue_hold_explanation(&limited, &jobs, policy).unwrap();
         assert!(typed["detail"].as_str().unwrap().contains("tests limit"));
+        assert!(typed["detail"]
+            .as_str()
+            .unwrap()
+            .contains("No queued tests jobs are ahead of this one."));
+        let earlier = record("earlier-tests", "tests", "pending", Some("concurrency_cap"));
+        let in_line = queue_hold_explanation(
+            &limited,
+            &[earlier, limited.clone(), running.clone()],
+            policy,
+        )
+        .unwrap();
+        assert!(in_line["estimated_wait_seconds"].is_null());
+        assert!(in_line["detail"].as_str().unwrap().contains(
+            "Queued tests jobs ahead of this one (1): friendly-earlier-tests (earlier-tests)."
+        ));
         let global = queue_hold_explanation(
             &limited,
             &jobs,
@@ -7705,6 +7840,108 @@ mod tests {
             )
             .unwrap();
         assert_eq!(holding_reason.as_deref(), Some("concurrency_cap"));
+
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn every_job_behind_a_full_type_is_held_and_expiry_names_the_blockers() {
+        let state_dir = unique_temp_path("type-cap-queue-line");
+        let message_queue_db = state_dir.join("messages.db");
+        let create_job = |label: &str| {
+            RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
+                &state_dir,
+                CreateQueueJob {
+                    job_type: "background".to_owned(),
+                    label: label.to_owned(),
+                    requester_session_id: Some("requester".to_owned()),
+                    notify_session_id: "notify".to_owned(),
+                    cwd: "/tmp".to_owned(),
+                    argv: Some(vec!["true".to_owned()]),
+                    script: None,
+                    env: BTreeMap::new(),
+                    timeout_seconds: 60,
+                    cpu_percent: None,
+                    gpu_percent: None,
+                    memory_bytes: None,
+                },
+                300,
+            )
+            .unwrap()
+        };
+        let running = [create_job("probes"), create_job("real-data")];
+        let queued = [
+            create_job("warm"),
+            create_job("trace"),
+            create_job("traces"),
+        ];
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        for job in &running {
+            conn.execute(
+                "UPDATE queue_jobs SET state = 'running', started_at = ?2 WHERE id = ?1",
+                params![job.id, now_rfc3339()],
+            )
+            .unwrap();
+        }
+        for (second, job) in queued.iter().enumerate() {
+            conn.execute(
+                "UPDATE queue_jobs SET queued_at = ?2 WHERE id = ?1",
+                params![job.id, format!("2020-01-01T00:00:0{second}Z")],
+            )
+            .unwrap();
+        }
+        let policy = QueueAdmissionPolicy {
+            max_running_jobs: 8,
+            ..QueueAdmissionPolicy::default()
+        };
+
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        let mut summary = QueueAdmissionSummary::default();
+        assert_eq!(
+            next_admissible_queue_job_id_conn(&conn, &jobs, policy, &mut summary).unwrap(),
+            None
+        );
+        for job in &queued {
+            let held = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+            assert_eq!(
+                held.holding_reason.as_deref(),
+                Some("concurrency_cap"),
+                "{}",
+                job.label
+            );
+        }
+
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        assert_eq!(
+            expire_pending_queue_jobs_conn(&conn, &jobs, &message_queue_db, policy).unwrap(),
+            3
+        );
+        let expired = get_queue_job_conn(&conn, &queued[1].id).unwrap().unwrap();
+        assert_eq!(expired.state, "wait_expired");
+        let detail = expired.termination_detail.unwrap();
+        assert_eq!(detail["limit_scope"], "background");
+        assert_eq!(detail["running"].as_array().unwrap().len(), 2);
+        assert_eq!(detail["queued_ahead_count"], 1);
+        assert_eq!(detail["queued_ahead"][0]["id"], queued[0].id.as_str());
+        let notifications = RetainedQueueStore::new(message_queue_db)
+            .pending_messages_for_target_by_category("notify", "queue-completion", 10)
+            .unwrap();
+        let notice = notifications
+            .iter()
+            .find(|message| message.text.contains(&format!("ID: {}", queued[1].id)))
+            .unwrap();
+        assert!(notice.text.contains("wait_reason=concurrency_cap"));
+        assert!(notice
+            .text
+            .contains("background limit of 2 running jobs was full"));
+        assert!(notice.text.contains(&format!("probes ({})", running[0].id)));
+        assert!(notice
+            .text
+            .contains(&format!("real-data ({})", running[1].id)));
+        assert!(notice
+            .text
+            .contains(&format!("1 queued ahead: warm ({})", queued[0].id)));
 
         drop(conn);
         fs::remove_dir_all(state_dir).unwrap();
