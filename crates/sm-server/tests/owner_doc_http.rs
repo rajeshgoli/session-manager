@@ -393,6 +393,35 @@ async fn assign_undelivered_review_spawns_agent() {
     );
 }
 
+/// sm#1606: a review nobody was woken for stops waiting once a revision is
+/// published after it, since some agent took it up. The flag clears and
+/// Assign refuses, even if that agent has since ended too.
+#[tokio::test]
+async fn republish_after_undelivered_review_clears_it() {
+    let f = fixture();
+    let doc = publish(&f, "retired1", "a", true, Some(&f.dir)).await;
+    let id = doc["id"].as_str().unwrap().to_owned();
+    post_review(&f, &id, "sub-answer-1", None);
+    let (_, meta) = request(&f.app, "GET", &format!("/docs/{id}?format=json"), None).await;
+    assert_eq!(meta["review_undelivered"], true, "{meta}");
+
+    publish(&f, "retired1", "b", true, Some(&f.dir)).await;
+    let (_, meta) = request(&f.app, "GET", &format!("/docs/{id}?format=json"), None).await;
+    assert_eq!(meta["review_undelivered"], false, "{meta}");
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        &format!("/docs/{id}/assign"),
+        Some(json!({"review_id": "sub-answer-1"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body["detail"],
+        "A newer revision was published after this review; reload"
+    );
+}
+
 #[tokio::test]
 async fn assign_refuses_delivered_or_unknown_checkout() {
     let f = fixture();

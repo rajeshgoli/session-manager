@@ -89,8 +89,8 @@ pub struct OwnerDocSummary {
     pub latest_blob_sha: String,
     pub published_at: String,
     pub publish_count: usize,
-    /// The latest posted review reached no session: its author was retired
-    /// with no parent to take it.
+    /// The latest posted review reached no session (its author was retired
+    /// with no parent to take it) and no revision was published after it.
     pub review_undelivered: bool,
 }
 
@@ -249,6 +249,19 @@ pub fn derive_owner_doc_state(inputs: &OwnerDocStateInputs<'_>) -> OwnerDocState
         return OwnerDocState::Updated;
     }
     OwnerDocState::New
+}
+
+/// Whether a posted review still waits for an agent: nobody was woken for
+/// it, and no revision was published after it was submitted. A later publish
+/// means some agent took the review up (sm#1606).
+fn review_awaits_agent(
+    delivered: bool,
+    submitted_at: &str,
+    latest_published_at: Option<&str>,
+) -> bool {
+    !delivered
+        && !latest_published_at
+            .is_some_and(|published_at| timestamp_after(published_at, submitted_at))
 }
 
 fn timestamp_after(candidate: &str, reference: &str) -> bool {
@@ -822,8 +835,9 @@ impl OwnerDocStore {
             }
         }
         let mut reviews = BTreeMap::<String, Vec<(String, String)>>::new();
-        // Whether each doc's latest posted review reached a session.
-        let mut latest_delivered = BTreeMap::<String, bool>::new();
+        // Whether each doc's latest posted review reached a session, and when
+        // it was submitted.
+        let mut latest_review = BTreeMap::<String, (bool, String)>::new();
         {
             let mut statement = conn.prepare(
                 "SELECT doc_id, blob_sha, submitted_at, delivered_to_session_id
@@ -839,7 +853,10 @@ impl OwnerDocStore {
                 ))
             })? {
                 let (doc_id, blob, submitted_at, delivered_to) = row?;
-                latest_delivered.insert(doc_id.clone(), delivered_to.is_some());
+                latest_review.insert(
+                    doc_id.clone(),
+                    (delivered_to.is_some(), submitted_at.clone()),
+                );
                 reviews
                     .entry(doc_id)
                     .or_default()
@@ -876,7 +893,11 @@ impl OwnerDocStore {
                 latest_blob_sha: latest.blob_sha.clone(),
                 published_at: latest.published_at.clone(),
                 publish_count: doc_publishes.len(),
-                review_undelivered: latest_delivered.get(&doc.id) == Some(&false),
+                review_undelivered: latest_review.get(&doc.id).is_some_and(
+                    |(delivered, submitted_at)| {
+                        review_awaits_agent(*delivered, submitted_at, Some(&latest.published_at))
+                    },
+                ),
                 doc,
             });
         }
@@ -1069,6 +1090,25 @@ impl OwnerDocStore {
             .query_map(params![doc_id], review_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// The doc's latest posted review while it still waits for an agent: see
+    /// `review_awaits_agent`.
+    pub fn review_awaiting_agent(&self, doc_id: &str) -> Result<Option<OwnerDocReview>> {
+        let latest_publish = self.publishes(doc_id)?.pop();
+        Ok(self
+            .reviews(doc_id)?
+            .into_iter()
+            .rfind(|review| review.status == "posted")
+            .filter(|review| {
+                review_awaits_agent(
+                    review.delivered_to_session_id.is_some(),
+                    &review.submitted_at,
+                    latest_publish
+                        .as_ref()
+                        .map(|publish| publish.published_at.as_str()),
+                )
+            }))
     }
 
     /// Rows a crash or restart left mid-submit.
@@ -2049,6 +2089,10 @@ mod tests {
         };
         store.finish_review("sub-00000002", &undelivered).unwrap();
         assert!(store.summary(&doc.id).unwrap().unwrap().review_undelivered);
+        assert_eq!(
+            store.review_awaiting_agent(&doc.id).unwrap().unwrap().id,
+            "sub-00000002"
+        );
         store
             .begin_review(
                 "sub-00000003",

@@ -1199,10 +1199,7 @@ async fn view_doc_response(
     };
     let summary = store.summary(&doc.id)?;
     let undelivered = store
-        .reviews(&doc.id)?
-        .into_iter()
-        .rfind(|review| review.status == "posted")
-        .filter(|review| review.delivered_to_session_id.is_none())
+        .review_awaiting_agent(&doc.id)?
         .map(|review| json!({"id": review.id, "url": review.github_review_url}));
     let config = json!({
         "docId": doc.id,

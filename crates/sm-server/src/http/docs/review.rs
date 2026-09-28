@@ -690,6 +690,13 @@ pub(super) async fn assign_review(
             session_name_or_id(state, &session_id)
         )));
     }
+    // Undelivered and the latest review, so only a later publish can make
+    // it no longer wait: an agent already took it up (sm#1606).
+    if store.review_awaiting_agent(&doc.id)?.is_none() {
+        return Err(conflict(
+            "A newer revision was published after this review; reload",
+        ));
+    }
     let working_dir = store
         .publishes(&doc.id)?
         .into_iter()
