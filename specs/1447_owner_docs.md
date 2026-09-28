@@ -78,11 +78,18 @@ agent's cwd):
    slug (`owner/name`, from `gh repo view --json nameWithOwner` or by parsing the
    `origin` URL).
 2. Resolve the commit:
-   - `--pr N`: fetch the PR (`gh pr view N --json headRefOid,state,files`). The pinned
-     SHA is the PR head. If local `HEAD` differs from the PR head, or the working-tree
-     file differs from the file at the PR head, print a warning ("the owner will see
-     the pushed version at <sha7>; push first if that's not what you want"). Fail if
-     the PR doesn't contain the file at its head (a 404 from the contents API).
+   - `--pr N`: fetch the PR (`gh pr view N --json headRefOid,headRefName,state`). The
+     pinned SHA is the PR head. GitHub moves the PR head a few seconds after `git push`
+     returns (sm#1599), so when local `HEAD` differs from the PR head but a
+     remote-tracking ref named `<remote>/<headRefName>` points at `HEAD` (this checkout
+     pushed it), re-read the PR after 1, 2, 3, 4 and 5 s and pin `HEAD` once GitHub
+     reports it. If GitHub still reports another head after those 15 s, fail ("you
+     pushed <sha7> to <branch>, but after 15s GitHub still shows <sha7> as PR #N's
+     head; …") rather than pin the previous commit. Otherwise, if local `HEAD` differs
+     from the PR head, or the working-tree file differs from the file at the PR head,
+     print a warning ("the owner will see the pushed version at <sha7>; push first if
+     that's not what you want"). Fail if the PR doesn't contain the file at its head
+     (a 404 from the contents API).
    - `--commit SHA`: use it as given.
    - Neither: if the current branch has an open PR (`gh pr view --json number,state`
      with no argument), behave as `--pr <that number>` and print

@@ -238,6 +238,64 @@ fn full_commit_sha(tools: &dyn DocTools, root: &Path, rev: &str) -> Result<Strin
     .with_context(|| format!("unknown commit {rev}"))
 }
 
+/// Seconds between re-reads of a PR's head while GitHub catches up with a
+/// push: about 15 s in all.
+const PR_HEAD_POLL_DELAYS: [u64; 5] = [1, 2, 3, 4, 5];
+
+/// A PR's head commit and head branch, as GitHub reports them now.
+fn pr_head(tools: &dyn DocTools, root: &Path, repo: &str, pr: i64) -> Result<(String, String)> {
+    let payload = run_ok(
+        tools,
+        "gh",
+        root,
+        &[
+            "pr",
+            "view",
+            &pr.to_string(),
+            "--repo",
+            repo,
+            "--json",
+            "headRefOid,headRefName,state",
+        ],
+    )
+    .with_context(|| format!("could not read PR #{pr} in {repo}"))?;
+    let payload: Value =
+        serde_json::from_str(&payload).context("gh pr view returned invalid JSON")?;
+    let head = payload["headRefOid"]
+        .as_str()
+        .filter(|head| !head.is_empty())
+        .ok_or_else(|| anyhow!("PR #{pr} in {repo} has no head commit"))?
+        .to_ascii_lowercase();
+    let branch = payload["headRefName"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    Ok((head, branch))
+}
+
+/// Whether this checkout pushed HEAD to `branch`: `git push` moves the
+/// matching remote-tracking ref (`refs/remotes/<remote>/<branch>`) to HEAD.
+/// The whole branch name must match, so `feature/topic` is not `topic`.
+fn pushed_to(tools: &dyn DocTools, root: &Path, branch: &str) -> bool {
+    if branch.is_empty() {
+        return false;
+    }
+    run_ok(
+        tools,
+        "git",
+        root,
+        &[
+            "for-each-ref",
+            "--points-at",
+            "HEAD",
+            // `refs/remotes/<remote>/<branch>` → `<branch>`
+            "--format=%(refname:lstrip=3)",
+            "refs/remotes",
+        ],
+    )
+    .is_ok_and(|refs| refs.lines().any(|name| name.trim() == branch))
+}
+
 pub(crate) fn resolve_doc_publish(
     tools: &dyn DocTools,
     cwd: &Path,
@@ -275,29 +333,29 @@ pub(crate) fn resolve_doc_publish(
     }
 
     if let Some(pr) = pr_number {
-        let payload = run_ok(
-            tools,
-            "gh",
-            &root,
-            &[
-                "pr",
-                "view",
-                &pr.to_string(),
-                "--repo",
-                &repo,
-                "--json",
-                "headRefOid,state",
-            ],
-        )
-        .with_context(|| format!("could not read PR #{pr} in {repo}"))?;
-        let payload: Value =
-            serde_json::from_str(&payload).context("gh pr view returned invalid JSON")?;
-        let head = payload["headRefOid"]
-            .as_str()
-            .filter(|head| !head.is_empty())
-            .ok_or_else(|| anyhow!("PR #{pr} in {repo} has no head commit"))?
-            .to_ascii_lowercase();
+        let (mut head, branch) = pr_head(tools, &root, &repo, pr)?;
         let local_head = run_ok(tools, "git", &root, &["rev-parse", "HEAD"]).unwrap_or_default();
+        // GitHub moves a PR's head a few seconds after `git push` returns
+        // (sm#1599). When this checkout just pushed HEAD to the PR's branch,
+        // wait for GitHub rather than publish the previous commit.
+        if !local_head.is_empty() && local_head != head && pushed_to(tools, &root, &branch) {
+            for delay in PR_HEAD_POLL_DELAYS {
+                tools.sleep(Duration::from_secs(delay));
+                head = pr_head(tools, &root, &repo, pr)?.0;
+                if head == local_head {
+                    break;
+                }
+            }
+            if head != local_head {
+                bail!(
+                    "you pushed {} to {branch}, but after {}s GitHub still shows {} as PR #{pr}'s head; \
+                     publish again in a minute, or pull {branch} first if someone pushed to it since",
+                    short_sha(&local_head),
+                    PR_HEAD_POLL_DELAYS.iter().sum::<u64>(),
+                    short_sha(&head)
+                );
+            }
+        }
         let stale_file = run_ok(tools, "git", &root, &["hash-object", "--", &path])
             .ok()
             .zip(
@@ -577,7 +635,7 @@ fn review_line(review: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::{cell::RefCell, collections::VecDeque};
 
     #[test]
     fn checkout_root_is_the_main_checkout() {
@@ -718,17 +776,27 @@ mod tests {
     }
 
     /// Scripted git/gh: `(program, args)` → output. Unscripted calls fail.
+    /// `then` queues further answers; the last one repeats.
     #[derive(Default)]
     struct FakeTools {
-        responses: BTreeMap<String, ToolOutput>,
+        responses: RefCell<BTreeMap<String, VecDeque<ToolOutput>>>,
         calls: RefCell<Vec<String>>,
+        sleeps: RefCell<Vec<Duration>>,
     }
 
     impl FakeTools {
-        fn with(mut self, command: &str, success: bool, stdout: &str) -> Self {
-            self.responses.insert(
-                command.to_owned(),
-                ToolOutput {
+        /// Scripts `command`, replacing any earlier answers.
+        fn with(self, command: &str, success: bool, stdout: &str) -> Self {
+            self.responses.borrow_mut().remove(command);
+            self.then(command, success, stdout)
+        }
+
+        fn then(self, command: &str, success: bool, stdout: &str) -> Self {
+            self.responses
+                .borrow_mut()
+                .entry(command.to_owned())
+                .or_default()
+                .push_back(ToolOutput {
                     success,
                     stdout: stdout.to_owned(),
                     stderr: if success {
@@ -736,8 +804,7 @@ mod tests {
                     } else {
                         "failed".into()
                     },
-                },
-            );
+                });
             self
         }
     }
@@ -746,11 +813,23 @@ mod tests {
         fn run(&self, program: &str, _cwd: &Path, args: &[&str]) -> Result<ToolOutput> {
             let key = format!("{program} {}", args.join(" "));
             self.calls.borrow_mut().push(key.clone());
-            Ok(self.responses.get(&key).cloned().unwrap_or(ToolOutput {
+            let mut responses = self.responses.borrow_mut();
+            let answer = responses.get_mut(&key).and_then(|queue| {
+                if queue.len() > 1 {
+                    queue.pop_front()
+                } else {
+                    queue.front().cloned()
+                }
+            });
+            Ok(answer.unwrap_or(ToolOutput {
                 success: false,
                 stdout: String::new(),
                 stderr: format!("unscripted: {key}"),
             }))
+        }
+
+        fn sleep(&self, duration: Duration) {
+            self.sleeps.borrow_mut().push(duration);
         }
     }
 
@@ -834,9 +913,9 @@ mod tests {
                 r#"{"number":42,"state":"OPEN"}"#,
             )
             .with(
-                "gh pr view 42 --repo acme/widgets --json headRefOid,state",
+                "gh pr view 42 --repo acme/widgets --json headRefOid,headRefName,state",
                 true,
-                &format!(r#"{{"headRefOid":"{HEAD}","state":"OPEN"}}"#),
+                &pr_view(HEAD),
             )
             .with("git hash-object -- specs/memo.html", true, "b1")
             .with(&format!("git rev-parse {HEAD}:specs/memo.html"), true, "b1");
@@ -870,28 +949,82 @@ mod tests {
             .any(|call| call.starts_with("gh pr view")));
     }
 
+    fn pr_view(head: &str) -> String {
+        format!(r#"{{"headRefOid":"{head}","headRefName":"topic","state":"OPEN"}}"#)
+    }
+
+    const PR_7_VIEW: &str = "gh pr view 7 --repo acme/widgets --json headRefOid,headRefName,state";
+    const REMOTE_REFS_AT_HEAD: &str =
+        "git for-each-ref --points-at HEAD --format=%(refname:lstrip=3) refs/remotes";
+
+    fn pr_7_request(path: &Path) -> PublishRequest<'_> {
+        let mut request = request(path);
+        request.pr = Some(7);
+        request
+    }
+
     #[test]
     fn pr_head_mismatch_warns_and_pins_the_pushed_head() {
         let root = repo_dir();
+        // HEAD is not what origin/topic points at: this checkout never
+        // pushed it to the PR's branch (`feature/topic` is another branch),
+        // so there is nothing to wait for.
         let tools = base_tools(&root)
-            .with(
-                "gh pr view 7 --repo acme/widgets --json headRefOid,state",
-                true,
-                &format!(r#"{{"headRefOid":"{PR_HEAD}","state":"OPEN"}}"#),
-            )
+            .with(PR_7_VIEW, true, &pr_view(PR_HEAD))
+            .with(REMOTE_REFS_AT_HEAD, true, "feature/topic\nother-topic")
             .with("git hash-object -- specs/memo.html", true, "local")
             .with(
                 &format!("git rev-parse {PR_HEAD}:specs/memo.html"),
                 true,
                 "pushed",
             );
-        let mut request = request(Path::new("specs/memo.html"));
-        request.pr = Some(7);
-        let resolved = resolve_doc_publish(&tools, &root, &request).unwrap();
+        let resolved =
+            resolve_doc_publish(&tools, &root, &pr_7_request(Path::new("specs/memo.html")))
+                .unwrap();
         assert_eq!(resolved.commit_sha, PR_HEAD);
         assert_eq!(resolved.pr_number, Some(7));
         assert_eq!(resolved.messages.len(), 1);
         assert!(resolved.messages[0].contains("pushed version at 2222222"));
+        assert!(tools.sleeps.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_push_github_has_not_seen_yet_is_waited_for() {
+        let root = repo_dir();
+        // `git push` returned, but GitHub reports the old head twice more.
+        let tools = base_tools(&root)
+            .with(PR_7_VIEW, true, &pr_view(PR_HEAD))
+            .then(PR_7_VIEW, true, &pr_view(PR_HEAD))
+            .then(PR_7_VIEW, true, &pr_view(PR_HEAD))
+            .then(PR_7_VIEW, true, &pr_view(HEAD))
+            .with(REMOTE_REFS_AT_HEAD, true, "HEAD\ntopic")
+            .with("git hash-object -- specs/memo.html", true, "b1")
+            .with(&format!("git rev-parse {HEAD}:specs/memo.html"), true, "b1");
+        let resolved =
+            resolve_doc_publish(&tools, &root, &pr_7_request(Path::new("specs/memo.html")))
+                .unwrap();
+        assert_eq!(resolved.commit_sha, HEAD);
+        assert!(resolved.messages.is_empty(), "{:?}", resolved.messages);
+        assert_eq!(
+            *tools.sleeps.borrow(),
+            [1, 2, 3].map(Duration::from_secs).to_vec()
+        );
+    }
+
+    #[test]
+    fn a_push_github_never_shows_is_an_error_not_the_old_head() {
+        let root = repo_dir();
+        let tools = base_tools(&root)
+            .with(PR_7_VIEW, true, &pr_view(PR_HEAD))
+            .with(REMOTE_REFS_AT_HEAD, true, "topic");
+        let error = resolve_doc_publish(&tools, &root, &pr_7_request(Path::new("specs/memo.html")))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("you pushed 1111111 to topic, but after 15s GitHub still shows 2222222 as PR #7's head"),
+            "{error}"
+        );
+        assert_eq!(tools.sleeps.borrow().len(), PR_HEAD_POLL_DELAYS.len());
     }
 
     #[test]
