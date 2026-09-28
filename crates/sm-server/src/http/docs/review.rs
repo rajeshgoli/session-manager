@@ -811,6 +811,7 @@ mod tests {
             github_review_url: None,
             submitted_at: String::new(),
             delivered_to_session_id: None,
+            posted_at: None,
         }
     }
 

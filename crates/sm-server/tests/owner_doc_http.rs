@@ -420,6 +420,37 @@ async fn republish_after_undelivered_review_clears_it() {
         body["detail"],
         "A newer revision was published after this review; reload"
     );
+
+    // A publish while the review was still on its way to GitHub is not an
+    // answer: the agent could not have seen it.
+    let store = OwnerDocStore::new(f.dir.join("message_queue.db"));
+    store
+        .begin_review(
+            "sub-answer-2",
+            &id,
+            &"b".repeat(40),
+            &git_blob_sha(MEMO),
+            OwnerDocVerdict::Comment,
+            None,
+        )
+        .unwrap();
+    publish(&f, "retired1", "c", true, Some(&f.dir)).await;
+    store
+        .finish_review(
+            "sub-answer-2",
+            &PostedOwnerDocReview {
+                github_review_id: Some(8),
+                github_review_url: "https://github.com/acme/widgets/pull/12#pullrequestreview-8"
+                    .into(),
+                line_comment_count: 0,
+                file_comment_count: 0,
+                draft_ids: Vec::new(),
+                wake: None,
+            },
+        )
+        .unwrap();
+    let (_, meta) = request(&f.app, "GET", &format!("/docs/{id}?format=json"), None).await;
+    assert_eq!(meta["review_undelivered"], true, "{meta}");
 }
 
 #[tokio::test]
