@@ -5426,6 +5426,7 @@ pub fn queue_hold_explanation(
         names.join(", ")
     };
     let mut blockers: Vec<&QueueJobRecord> = Vec::new();
+    let mut queued_ahead = 0;
     let (summary, detail) = match reason {
         "awaiting_tests" => {
             blockers = running.iter().copied().filter(|j| j.job_type == "tests").collect();
@@ -5476,6 +5477,7 @@ pub fn queue_hold_explanation(
                 .iter()
                 .filter(|j| j.state == "pending" && j.job_type == job.job_type && (&j.queued_at, &j.id) < (&job.queued_at, &job.id))
                 .collect();
+            queued_ahead = ahead.len();
             if ahead.is_empty() {
                 detail.push_str(&format!(" No queued {} jobs are ahead of this one.", job.job_type));
             } else {
@@ -5526,6 +5528,8 @@ pub fn queue_hold_explanation(
             })
         }
         "perf_cooldown" => Some(policy.perf_cooldown_seconds.max(0)),
+        // Running blockers alone understate the wait for a job behind others.
+        "concurrency_cap" if queued_ahead > 0 => None,
         _ => blocker_seconds,
     };
     let wait_remaining_seconds = queue_elapsed_since(&job.queued_at, OffsetDateTime::now_utc())
@@ -7404,6 +7408,7 @@ mod tests {
             policy,
         )
         .unwrap();
+        assert!(in_line["estimated_wait_seconds"].is_null());
         assert!(in_line["detail"].as_str().unwrap().contains(
             "Queued tests jobs ahead of this one (1): friendly-earlier-tests (earlier-tests)."
         ));
