@@ -12,6 +12,11 @@ pub(crate) struct ToolOutput {
 /// git and gh, behind a seam so resolution is testable without a repo.
 pub(crate) trait DocTools {
     fn run(&self, program: &str, cwd: &Path, args: &[&str]) -> Result<ToolOutput>;
+
+    /// Waits between polls of GitHub; test doubles record the wait instead.
+    fn sleep(&self, duration: Duration) {
+        thread::sleep(duration);
+    }
 }
 
 pub(crate) struct ProcessTools;
