@@ -9593,27 +9593,15 @@ async fn task_complete(
     )?;
     ensure_core_writes_enabled(&state)?;
     let TaskCompleteBody { request, guestbook } = payload;
-    // A malformed entry refuses the whole call, so nothing is completed;
-    // a storage failure only warns, so the entry never blocks completion.
+    // A malformed entry refuses the whole call, so nothing is completed.
+    // The entry is stored only once the task completes, and a storage
+    // failure only warns, so the guestbook never blocks completion.
     if let Some(text) = &guestbook {
         crate::guestbook::validate_entry(text).map_err(|detail| ApiError::Status {
             status: StatusCode::BAD_REQUEST,
             detail,
         })?;
     }
-    let signed = match guestbook {
-        Some(text) if request.requester_session_id.trim() == session_id => {
-            let task_state = state.clone();
-            let id = session_id.clone();
-            Some(
-                tokio::task::spawn_blocking(move || guestbook_page::sign(&task_state, &id, text))
-                    .await
-                    .map_err(|error| anyhow::anyhow!("guestbook task failed: {error}"))
-                    .and_then(|result| result),
-            )
-        }
-        _ => None,
-    };
     let runtime = state
         .config
         .rust_core
@@ -9626,13 +9614,22 @@ async fn task_complete(
         TaskCompleteOutcome::Completed(result) => {
             claims::schedule_check_b(&state, &session_id);
             let mut body = serde_json::to_value(result)?;
-            match signed {
-                Some(Ok(entry_id)) => body["guestbook"] = json!({ "signed": true, "id": entry_id }),
-                Some(Err(error)) => {
-                    eprintln!("Guestbook sign for {session_id} failed: {error:#}");
-                    body["guestbook"] = json!({ "signed": false, "error": format!("{error:#}") });
-                }
-                None => {}
+            if let Some(text) = guestbook {
+                let task_state = state.clone();
+                let id = session_id.clone();
+                let signed = tokio::task::spawn_blocking(move || {
+                    guestbook_page::sign(&task_state, &id, text)
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("guestbook task failed: {error}"))
+                .and_then(|result| result);
+                body["guestbook"] = match signed {
+                    Ok(entry_id) => json!({ "signed": true, "id": entry_id }),
+                    Err(error) => {
+                        eprintln!("Guestbook sign for {session_id} failed: {error:#}");
+                        json!({ "signed": false, "error": format!("{error:#}") })
+                    }
+                };
             }
             Ok(Json(body))
         }
@@ -17647,6 +17644,36 @@ mod tests {
         assert!(!html.contains("<script>alert"), "{html}");
         assert!(html.contains("<strong>bold</strong>"), "{html}");
         assert!(html.contains(r#"<a class="tab on" href="/guestbook">Guestbook</a>"#));
+    }
+
+    #[tokio::test]
+    async fn task_complete_that_fails_stores_no_guestbook_entry() {
+        let session_id = "context-monitor-agent";
+        let app = router(AppState::new(context_monitor_test_config("claude", "idle")));
+        let mut request = task_complete_request(session_id, Some("I finished!"));
+        *request.body_mut() = Body::from(
+            serde_json::to_vec(&json!({
+                "requester_session_id": "someone-else",
+                "guestbook": "I finished!",
+            }))
+            .unwrap(),
+        );
+        let (status, body) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["error"].as_str().is_some(), "{body}");
+        assert!(body.get("guestbook").is_none(), "{body}");
+        assert_eq!(completed_at(&app, session_id).await, Value::Null);
+        let (_, body) = response_json(
+            app.oneshot(local_request(
+                Method::GET,
+                "/guestbook?format=json",
+                Body::empty(),
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(body["entries"], json!([]), "{body}");
     }
 
     #[tokio::test]
