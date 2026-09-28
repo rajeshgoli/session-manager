@@ -275,11 +275,11 @@ fn pr_head(tools: &dyn DocTools, root: &Path, repo: &str, pr: i64) -> Result<(St
 
 /// Whether this checkout pushed HEAD to `branch`: `git push` moves the
 /// matching remote-tracking ref (`refs/remotes/<remote>/<branch>`) to HEAD.
+/// The whole branch name must match, so `feature/topic` is not `topic`.
 fn pushed_to(tools: &dyn DocTools, root: &Path, branch: &str) -> bool {
     if branch.is_empty() {
         return false;
     }
-    let suffix = format!("/{branch}");
     run_ok(
         tools,
         "git",
@@ -288,11 +288,12 @@ fn pushed_to(tools: &dyn DocTools, root: &Path, branch: &str) -> bool {
             "for-each-ref",
             "--points-at",
             "HEAD",
-            "--format=%(refname)",
+            // `refs/remotes/<remote>/<branch>` → `<branch>`
+            "--format=%(refname:lstrip=3)",
             "refs/remotes",
         ],
     )
-    .is_ok_and(|refs| refs.lines().any(|name| name.trim().ends_with(&suffix)))
+    .is_ok_and(|refs| refs.lines().any(|name| name.trim() == branch))
 }
 
 pub(crate) fn resolve_doc_publish(
@@ -954,7 +955,7 @@ mod tests {
 
     const PR_7_VIEW: &str = "gh pr view 7 --repo acme/widgets --json headRefOid,headRefName,state";
     const REMOTE_REFS_AT_HEAD: &str =
-        "git for-each-ref --points-at HEAD --format=%(refname) refs/remotes";
+        "git for-each-ref --points-at HEAD --format=%(refname:lstrip=3) refs/remotes";
 
     fn pr_7_request(path: &Path) -> PublishRequest<'_> {
         let mut request = request(path);
@@ -966,10 +967,11 @@ mod tests {
     fn pr_head_mismatch_warns_and_pins_the_pushed_head() {
         let root = repo_dir();
         // HEAD is not what origin/topic points at: this checkout never
-        // pushed it, so there is nothing to wait for.
+        // pushed it to the PR's branch (`feature/topic` is another branch),
+        // so there is nothing to wait for.
         let tools = base_tools(&root)
             .with(PR_7_VIEW, true, &pr_view(PR_HEAD))
-            .with(REMOTE_REFS_AT_HEAD, true, "refs/remotes/origin/other-topic")
+            .with(REMOTE_REFS_AT_HEAD, true, "feature/topic\nother-topic")
             .with("git hash-object -- specs/memo.html", true, "local")
             .with(
                 &format!("git rev-parse {PR_HEAD}:specs/memo.html"),
@@ -995,11 +997,7 @@ mod tests {
             .then(PR_7_VIEW, true, &pr_view(PR_HEAD))
             .then(PR_7_VIEW, true, &pr_view(PR_HEAD))
             .then(PR_7_VIEW, true, &pr_view(HEAD))
-            .with(
-                REMOTE_REFS_AT_HEAD,
-                true,
-                "refs/remotes/origin/HEAD\nrefs/remotes/origin/topic",
-            )
+            .with(REMOTE_REFS_AT_HEAD, true, "HEAD\ntopic")
             .with("git hash-object -- specs/memo.html", true, "b1")
             .with(&format!("git rev-parse {HEAD}:specs/memo.html"), true, "b1");
         let resolved =
@@ -1018,7 +1016,7 @@ mod tests {
         let root = repo_dir();
         let tools = base_tools(&root)
             .with(PR_7_VIEW, true, &pr_view(PR_HEAD))
-            .with(REMOTE_REFS_AT_HEAD, true, "refs/remotes/origin/topic");
+            .with(REMOTE_REFS_AT_HEAD, true, "topic");
         let error = resolve_doc_publish(&tools, &root, &pr_7_request(Path::new("specs/memo.html")))
             .unwrap_err()
             .to_string();
