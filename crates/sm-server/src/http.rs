@@ -322,6 +322,7 @@ pub enum GitHubPullRequestState {
 mod claims;
 mod docs;
 mod follows;
+mod guestbook_page;
 mod history;
 mod messages;
 mod watch;
@@ -1544,6 +1545,7 @@ pub fn router(state: AppState) -> Router {
         .route("/claims/worktree", post(worktrees::post_claim_worktree))
         .route("/worktrees/keep", post(worktrees::post_worktree_keep))
         .route("/history", get(history::get_history))
+        .route("/guestbook", get(guestbook_page::get_guestbook))
         .route("/t/{repo}/{number}", get(history::get_timeline))
         .route("/", get(watch::get_watch_page))
         .route("/watch", get(watch::get_watch_page))
@@ -9566,12 +9568,22 @@ async fn set_agent_status(
     Ok(Json(serde_json::to_value(result)?))
 }
 
+/// `sm task-complete`'s body: the shared request plus an optional
+/// guestbook entry (sm#1603).
+#[derive(Debug, Deserialize)]
+struct TaskCompleteBody {
+    #[serde(flatten)]
+    request: TaskCompleteRequest,
+    #[serde(default)]
+    guestbook: Option<String>,
+}
+
 async fn task_complete(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(payload): Json<TaskCompleteRequest>,
+    Json(payload): Json<TaskCompleteBody>,
 ) -> Result<Json<Value>, ApiError> {
     ensure_session_allowed_from_parts(
         &state.config,
@@ -9580,6 +9592,16 @@ async fn task_complete(
         &format!("/sessions/{session_id}/task-complete"),
     )?;
     ensure_core_writes_enabled(&state)?;
+    let TaskCompleteBody { request, guestbook } = payload;
+    // A malformed entry refuses the whole call, so nothing is completed.
+    // The entry is stored only once the task completes, and a storage
+    // failure only warns, so the guestbook never blocks completion.
+    if let Some(text) = &guestbook {
+        crate::guestbook::validate_entry(text).map_err(|detail| ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail,
+        })?;
+    }
     let runtime = state
         .config
         .rust_core
@@ -9587,11 +9609,29 @@ async fn task_complete(
         .then(|| TmuxRuntime::from_app_config(&state.config));
     match state
         .session_store
-        .task_complete(&session_id, payload, runtime.as_ref())?
+        .task_complete(&session_id, request, runtime.as_ref())?
     {
         TaskCompleteOutcome::Completed(result) => {
             claims::schedule_check_b(&state, &session_id);
-            Ok(Json(serde_json::to_value(result)?))
+            let mut body = serde_json::to_value(result)?;
+            if let Some(text) = guestbook {
+                let task_state = state.clone();
+                let id = session_id.clone();
+                let signed = tokio::task::spawn_blocking(move || {
+                    guestbook_page::sign(&task_state, &id, text)
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("guestbook task failed: {error}"))
+                .and_then(|result| result);
+                body["guestbook"] = match signed {
+                    Ok(entry_id) => json!({ "signed": true, "id": entry_id }),
+                    Err(error) => {
+                        eprintln!("Guestbook sign for {session_id} failed: {error:#}");
+                        json!({ "signed": false, "error": format!("{error:#}") })
+                    }
+                };
+            }
+            Ok(Json(body))
         }
         TaskCompleteOutcome::Error(error) => Ok(Json(json!({ "error": error }))),
     }
@@ -13840,6 +13880,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/session-obligations"
         || path == "/claims"
         || path == "/history"
+        || path == "/guestbook"
         || path.starts_with("/t/")
         || path == "/"
         || path == "/watch"
@@ -17475,6 +17516,190 @@ mod tests {
         request
     }
 
+    fn task_complete_request(
+        session_id: &str,
+        guestbook: Option<&str>,
+    ) -> axum::http::Request<Body> {
+        let mut body = json!({ "requester_session_id": session_id });
+        if let Some(text) = guestbook {
+            body["guestbook"] = json!(text);
+        }
+        let mut request = local_request(
+            Method::POST,
+            &format!("/sessions/{session_id}/task-complete"),
+            Body::from(serde_json::to_vec(&body).unwrap()),
+        );
+        request
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        request
+    }
+
+    async fn completed_at(app: &Router, session_id: &str) -> Value {
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(local_request(
+                    Method::GET,
+                    &format!("/sessions/{session_id}"),
+                    Body::empty(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["agent_task_completed_at"].clone()
+    }
+
+    #[tokio::test]
+    async fn task_complete_signs_the_guestbook_and_the_page_lists_it_escaped() {
+        let session_id = "context-monitor-agent";
+        let app = router(AppState::new(context_monitor_test_config("claude", "idle")));
+
+        // A malformed entry refuses the whole call: nothing is completed.
+        for bad in ["  \n", &"x".repeat(crate::guestbook::MAX_ENTRY_BYTES + 1)] {
+            let (status, body) = response_json(
+                app.clone()
+                    .oneshot(task_complete_request(session_id, Some(bad)))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("Guestbook entry is"));
+        }
+        assert_eq!(completed_at(&app, session_id).await, Value::Null);
+
+        let text = "Loved it. <script>alert(1)</script> **bold**";
+        for _ in 0..2 {
+            let (status, body) = response_json(
+                app.clone()
+                    .oneshot(task_complete_request(session_id, Some(text)))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["status"], "completed", "{body}");
+            assert_eq!(body["guestbook"]["signed"], true, "{body}");
+        }
+        assert!(completed_at(&app, session_id).await.is_string());
+
+        // Plain task-complete says nothing about the guestbook.
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(task_complete_request(session_id, None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.get("guestbook").is_none(), "{body}");
+
+        // Signing twice keeps both entries, with the context sm filled in.
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(local_request(
+                    Method::GET,
+                    "/guestbook?format=json",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["schema_version"], 1);
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "{body}");
+        assert_eq!(entries[0]["session_id"], session_id);
+        assert_eq!(
+            entries[0]["session_name"],
+            "codex-fork-context-monitor-agent"
+        );
+        assert_eq!(entries[0]["provider"], "claude");
+        assert_eq!(entries[0]["working_dir"], "/repo");
+        assert_eq!(entries[0]["text"], text);
+
+        let response = app
+            .clone()
+            .oneshot(local_request(Method::GET, "/guestbook", Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            to_bytes(response.into_body(), 1024 * 1024)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{html}"
+        );
+        assert!(!html.contains("<script>alert"), "{html}");
+        assert!(html.contains("<strong>bold</strong>"), "{html}");
+        assert!(html.contains(r#"<a class="tab on" href="/guestbook">Guestbook</a>"#));
+    }
+
+    #[tokio::test]
+    async fn task_complete_that_fails_stores_no_guestbook_entry() {
+        let session_id = "context-monitor-agent";
+        let app = router(AppState::new(context_monitor_test_config("claude", "idle")));
+        let mut request = task_complete_request(session_id, Some("I finished!"));
+        *request.body_mut() = Body::from(
+            serde_json::to_vec(&json!({
+                "requester_session_id": "someone-else",
+                "guestbook": "I finished!",
+            }))
+            .unwrap(),
+        );
+        let (status, body) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["error"].as_str().is_some(), "{body}");
+        assert!(body.get("guestbook").is_none(), "{body}");
+        assert_eq!(completed_at(&app, session_id).await, Value::Null);
+        let (_, body) = response_json(
+            app.oneshot(local_request(
+                Method::GET,
+                "/guestbook?format=json",
+                Body::empty(),
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(body["entries"], json!([]), "{body}");
+    }
+
+    #[tokio::test]
+    async fn task_complete_still_completes_when_the_guestbook_cannot_store() {
+        let session_id = "context-monitor-agent";
+        let config = context_monitor_test_config("claude", "idle");
+        // A table of the wrong shape makes every insert fail.
+        rusqlite::Connection::open(&config.sm_send.db_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE guestbook_entries (x TEXT);")
+            .unwrap();
+        let app = router(AppState::new(config));
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(task_complete_request(session_id, Some("hello")))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "completed", "{body}");
+        assert_eq!(body["guestbook"]["signed"], false, "{body}");
+        assert!(body["guestbook"]["error"].as_str().is_some(), "{body}");
+        assert!(completed_at(&app, session_id).await.is_string());
+    }
+
     #[tokio::test]
     async fn context_monitor_http_fails_closed_or_persists_a_visible_enrollment() {
         let session_id = "context-monitor-agent";
@@ -18568,12 +18793,16 @@ mod tests {
         let (status, body) = browser_host_get(&app, "/t/widgets/1?format=json", Some(&owner)).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         assert_eq!(body["detail"], "Not tracked");
+        let (status, body) = browser_host_get(&app, "/guestbook?format=json", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["entries"], json!([]));
+        assert_eq!(body["page_url"], "https://sm.example.com/guestbook");
 
         let expired =
             test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 1_700_000_100);
         let stranger =
             test_browser_access_assertion("sm-browser-aud", "stranger@example.com", 4_102_444_800);
-        for uri in ["/history", "/t/widgets/1"] {
+        for uri in ["/history", "/t/widgets/1", "/guestbook"] {
             let (status, _) = browser_host_get(&app, uri, Some(&expired)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
             for assertion in [Some(stranger.as_str()), None] {

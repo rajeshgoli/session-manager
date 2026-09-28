@@ -208,7 +208,7 @@ pub(super) fn html_response(status: StatusCode, html: String) -> Response {
 
 // ---- links -----------------------------------------------------------------
 
-fn encode_component(value: &str) -> String {
+pub(super) fn encode_component(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
@@ -266,7 +266,7 @@ fn list_href(params: &HistoryParams, before: Option<&str>) -> String {
     history_href(params, &[("before", before)])
 }
 
-fn agent_href(session_id: &str) -> String {
+pub(super) fn agent_href(session_id: &str) -> String {
     format!("/history?agent={}", encode_component(session_id))
 }
 
@@ -623,7 +623,7 @@ fn render_timeline(timeline: &Timeline) -> String {
 // ---- time ------------------------------------------------------------------
 
 /// `45s`, `12m`, `3h`, `2d`.
-fn age(at: &str) -> String {
+pub(super) fn age(at: &str) -> String {
     let Some(at) = crate::work_history::parse_time(at) else {
         return "?".to_owned();
     };
@@ -642,7 +642,7 @@ const MONTHS: [&str; 12] = [
 
 /// `Sep 24 14:02` in the server's local time (the owner's Mac), with the
 /// year when it is not this year.
-fn local_time(at: &str) -> String {
+pub(super) fn local_time(at: &str) -> String {
     let Some(utc) = crate::work_history::parse_time(at) else {
         return escape_html(at);
     };

@@ -10,6 +10,7 @@ pub mod codex_requests;
 pub mod config;
 pub mod email;
 pub mod google_auth;
+pub mod guestbook;
 pub mod http;
 pub mod mobile_analytics;
 pub mod mobile_devices;

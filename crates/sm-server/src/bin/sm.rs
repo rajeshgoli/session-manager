@@ -63,7 +63,7 @@ enum Command {
     Clear(ClearArgs),
     Handoff(HandoffArgs),
     #[command(name = "task-complete")]
-    TaskComplete(EmptyArgs),
+    TaskComplete(TaskCompleteArgs),
     #[command(name = "turn-complete")]
     TurnComplete(EmptyArgs),
     #[command(alias = "ctx")]
@@ -172,6 +172,20 @@ struct RecredentialArgs {
     session: Option<String>,
     #[arg(long, conflicts_with = "session")]
     all_live: bool,
+}
+
+#[derive(Args)]
+struct TaskCompleteArgs {
+    /// Also leave a note in the guestbook (/guestbook on the sm web UI):
+    /// how you liked the job, what did or didn't work. Omit TEXT, or pass
+    /// `-`, to read it from piped stdin: --sign-guestbook <<'EOF' ... EOF
+    #[arg(
+        long = "sign-guestbook",
+        value_name = "TEXT",
+        num_args = 0..=1,
+        default_missing_value = "-"
+    )]
+    sign_guestbook: Option<String>,
 }
 
 #[derive(Args)]
@@ -317,6 +331,46 @@ fn read_send_text_from<R: Read>(
         bail!("send text read from stdin is empty; nothing was sent");
     }
     Ok(input.to_owned())
+}
+
+const GUESTBOOK_TEXT_REQUIRED: &str =
+    "guestbook entry is required: pass it after --sign-guestbook, or pipe it on stdin \
+(for example: sm task-complete --sign-guestbook <<'EOF' ... EOF)";
+
+/// `--sign-guestbook`'s value, or piped stdin for `-`; refused when empty or
+/// over the size limit, before anything is sent.
+fn read_guestbook_entry<R: Read>(
+    value: &str,
+    stdin: &mut R,
+    stdin_is_terminal: bool,
+) -> Result<String> {
+    let entry = if value == "-" {
+        if stdin_is_terminal {
+            bail!(GUESTBOOK_TEXT_REQUIRED);
+        }
+        let mut input = String::new();
+        stdin
+            .read_to_string(&mut input)
+            .context("failed to read the guestbook entry from stdin")?;
+        input.trim_end_matches(['\n', '\r']).to_owned()
+    } else {
+        value.to_owned()
+    };
+    sm_server::guestbook::validate_entry(&entry).map_err(|error| anyhow!(error))?;
+    Ok(entry)
+}
+
+/// Whether the server stored the entry; a server without the guestbook
+/// ignores the field and says nothing about it.
+fn guestbook_outcome(payload: &Value) -> Result<(), String> {
+    let guestbook = &payload["guestbook"];
+    if guestbook["signed"].as_bool() == Some(true) {
+        return Ok(());
+    }
+    Err(guestbook["error"].as_str().map_or_else(
+        || "this sm-server does not know the guestbook; restart it on a build that does".to_owned(),
+        str::to_owned,
+    ))
 }
 
 fn read_spawn_prompt(args: &SpawnArgs) -> Result<(String, Value)> {
@@ -1155,19 +1209,43 @@ fn run() -> Result<()> {
                 ),
             }
         }
-        Command::TaskComplete(_) => {
+        Command::TaskComplete(args) => {
             let Some(session_id) = optional_current_session_id() else {
                 eprintln!(
                     "Error: SESSION_MANAGER_ID not set. sm task-complete can only be called from within a session."
                 );
                 process::exit(2);
             };
-            let payload = client.post_json(
-                &format!("/sessions/{session_id}/task-complete"),
-                json!({ "requester_session_id": session_id }),
-            )?;
+            let guestbook = match args.sign_guestbook.as_deref() {
+                Some(text) => {
+                    let stdin = io::stdin();
+                    let stdin_is_terminal = stdin.is_terminal();
+                    match read_guestbook_entry(text, &mut stdin.lock(), stdin_is_terminal) {
+                        Ok(entry) => Some(entry),
+                        Err(error) => {
+                            eprintln!("Error: {error}");
+                            process::exit(2);
+                        }
+                    }
+                }
+                None => None,
+            };
+            let mut body = json!({ "requester_session_id": session_id });
+            if let Some(entry) = &guestbook {
+                body["guestbook"] = json!(entry);
+            }
+            let payload =
+                client.post_json(&format!("/sessions/{session_id}/task-complete"), body)?;
             if payload["error"].as_str().is_some() {
                 bail!("Failed to mark task complete");
+            }
+            if guestbook.is_some() {
+                match guestbook_outcome(&payload) {
+                    Ok(()) => println!("Signed the guestbook."),
+                    Err(reason) => {
+                        eprintln!("Warning: could not sign the guestbook: {reason}")
+                    }
+                }
             }
             if payload["em_notified"].as_bool().unwrap_or(false) {
                 println!("Task complete. Remind cancelled. EM notified.");
@@ -7904,6 +7982,68 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exactly one"));
+    }
+
+    #[test]
+    fn guestbook_entry_from_value_or_piped_stdin() {
+        let mut stdin = io::Cursor::new(b"ignored".to_vec());
+        assert_eq!(
+            read_guestbook_entry("inline note", &mut stdin, false).unwrap(),
+            "inline note"
+        );
+        assert_eq!(stdin.position(), 0);
+
+        let body = "Loved `sm` and $(nothing ran)\n\nBye\n";
+        let mut stdin = io::Cursor::new(body.as_bytes().to_vec());
+        assert_eq!(
+            read_guestbook_entry("-", &mut stdin, false).unwrap(),
+            "Loved `sm` and $(nothing ran)\n\nBye"
+        );
+    }
+
+    #[test]
+    fn guestbook_entry_refuses_terminal_empty_and_oversize() {
+        let mut stdin = io::Cursor::new(b"unused".to_vec());
+        let error = read_guestbook_entry("-", &mut stdin, true).unwrap_err();
+        assert!(error.to_string().contains("pipe it on stdin"), "{error}");
+
+        let mut stdin = io::Cursor::new(b" \n".to_vec());
+        let error = read_guestbook_entry("-", &mut stdin, false).unwrap_err();
+        assert_eq!(error.to_string(), "Guestbook entry is empty.");
+
+        let big = "x".repeat(sm_server::guestbook::MAX_ENTRY_BYTES + 1);
+        let error = read_guestbook_entry(&big, &mut io::empty(), false).unwrap_err();
+        assert!(error.to_string().contains("16 KB"), "{error}");
+    }
+
+    #[test]
+    fn sign_guestbook_flag_takes_an_optional_value() {
+        let parse = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Command::TaskComplete(args) => args.sign_guestbook,
+            _ => panic!("not task-complete"),
+        };
+        assert_eq!(parse(&["sm", "task-complete"]), None);
+        assert_eq!(
+            parse(&["sm", "task-complete", "--sign-guestbook"]).as_deref(),
+            Some("-")
+        );
+        assert_eq!(
+            parse(&["sm", "task-complete", "--sign-guestbook", "hi"]).as_deref(),
+            Some("hi")
+        );
+    }
+
+    #[test]
+    fn guestbook_outcome_reads_the_server_answer() {
+        assert!(guestbook_outcome(&json!({"guestbook": {"signed": true, "id": 1}})).is_ok());
+        assert_eq!(
+            guestbook_outcome(&json!({"guestbook": {"signed": false, "error": "disk full"}}))
+                .unwrap_err(),
+            "disk full"
+        );
+        assert!(guestbook_outcome(&json!({"status": "completed"}))
+            .unwrap_err()
+            .contains("does not know the guestbook"));
     }
 
     #[test]
