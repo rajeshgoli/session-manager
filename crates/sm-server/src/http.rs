@@ -665,6 +665,12 @@ impl AppState {
         claims::run_sync_pass(self)
     }
 
+    /// The sync pass's doc step alone: end review requests on merged or
+    /// closed PRs. Tests call it without the claims machinery.
+    pub fn end_closed_pr_review_requests(&self) -> anyhow::Result<()> {
+        docs::end_closed_pr_review_requests(self)
+    }
+
     /// Shared handle to the Studio SSH desired-state flag, for the reconcile loop.
     pub fn studio_ssh_enabled_flag(&self) -> Arc<AtomicBool> {
         self.studio_ssh_enabled.clone()
