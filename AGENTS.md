@@ -32,6 +32,8 @@ This file is the whole standing contract. Read all of it.
 - **Cite code or other docs in footnotes as needed.**
 - **The author line carries the `sm` id in backticks** — the restore key when a question about intent arrives weeks later.
 
+**Use `sm doc cat` to read docs.** It turns HTML into compact Markdown, so you spend tokens on the document rather than its markup. Pass a local file, a published doc name (`<repo-name>/<path>`), or an sm reader URL. If I give you a versioned URL, pass that URL so you read the revision I am looking at. Use `--raw` when you need the source HTML to edit or check rendering. Read the whole document; compact output is not a summary.
+
 **Reviewing a document: re-read the whole thing after each revision, not the diff.** A change in one section may have invalidated an assumption in another. A finding qualifies when this change introduced it and you can name what breaks. On a multi-option architectural call, post which option you would pick and why rather than only critiquing.
 
 **Prefer a image or chart to a paragraph.** Please use charts, diagrams, or tables to clarify concepts. This is much easier for me to grok than it is to read dense text. Unlike you, I don't entirely live in the textual dimension :).
