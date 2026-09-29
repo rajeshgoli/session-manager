@@ -464,16 +464,48 @@ mod mac {
     }
 }
 
+/// Longest a sampling command may run; a hung `ioreg` or `ps` must not stall
+/// every later sample.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
+
 fn run(program: &str, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(program)
+    run_with_timeout(program, args, COMMAND_TIMEOUT)
+}
+
+/// Stdout of a successful run; `None` on failure or after killing it at
+/// `timeout`.
+fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(program)
         .args(args)
         .env("LC_ALL", "C")
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    let mut stdout = child.stdout.take()?;
+    // Drain concurrently so a large listing cannot fill the pipe and stall.
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).ok().map(|_| text)
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let text = reader.join().ok()??;
+    status.success().then_some(text)
 }
 
 struct Recorder {
@@ -1387,6 +1419,24 @@ mod tests {
             latest.pressure_level
         );
         assert!(cpu_ms < 50.0, "{cpu_ms} ms CPU per sample");
+    }
+
+    #[test]
+    fn sampling_commands_are_killed_at_their_timeout() {
+        let started = Instant::now();
+        assert_eq!(
+            run_with_timeout("/bin/sleep", &["10"], Duration::from_millis(200)),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            run_with_timeout("/bin/echo", &["ok"], Duration::from_secs(4)).as_deref(),
+            Some("ok\n")
+        );
+        assert_eq!(
+            run_with_timeout("/usr/bin/false", &[], Duration::from_secs(4)),
+            None
+        );
     }
 
     #[test]
