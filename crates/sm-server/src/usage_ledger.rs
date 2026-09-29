@@ -29,6 +29,7 @@ const MATERIALIZATION_BATCH_PAUSE: Duration = Duration::from_millis(1);
 /// A thread's first booked row above this carries inherited history, not a turn.
 const INHERITED_CODEX_TURN_FLOOR: i64 = 1_000_000;
 const INHERITED_CODEX_TURN_REPAIR: &str = "1409-inherited-codex-turns";
+const NESTED_NULL_CLAUDE_RESCAN_REPAIR: &str = "1658-nested-null-claude-rescan";
 const INHERITED_BY_REPAIR: &str = "repair";
 const INHERITED_BY_SCAN: &str = "scan";
 const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
@@ -579,6 +580,7 @@ impl UsageLedgerStore {
         self.snapshot_seat_meta(&seats)?;
         let bindings = self.artifact_bindings()?;
         self.extend_with_persisted_bound_seats(&mut seats, &bindings)?;
+        self.rescan_nested_null_claude_artifacts(&bindings)?;
         let seat_by_source = bindings
             .iter()
             .map(|binding| {
@@ -631,6 +633,69 @@ impl UsageLedgerStore {
             );
         }
         Ok(summary)
+    }
+
+    /// Rescan the Claude transcripts whose turns the pre-#1658 parser dropped.
+    ///
+    /// That parser rejected a line for an explicit null anywhere in it, and Claude Code 2.1.25x
+    /// writes `usage.iterations[].model: null` on every turn, so scans advanced past those turns
+    /// without booking them. Clearing the saved offset of each bound Claude transcript that
+    /// contains a null in any field the old parser checked makes the next scan re-read it;
+    /// turns already booked dedupe as ignored. Runs once, recorded in `usage_repairs`.
+    fn rescan_nested_null_claude_artifacts(&self, bindings: &[ArtifactBinding]) -> Result<()> {
+        let connection = self.open()?;
+        let applied = connection
+            .query_row(
+                "SELECT 1 FROM usage_repairs WHERE name = ?1",
+                [NESTED_NULL_CLAUDE_RESCAN_REPAIR],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if applied {
+            return Ok(());
+        }
+        drop(connection);
+        // Every field the old parser rejected when null at any depth.
+        let nulls = ROOT_NULL_REJECT_FIELDS
+            .iter()
+            .chain(&MESSAGE_NULL_REJECT_FIELDS)
+            .chain(&USAGE_NULL_REJECT_FIELDS)
+            .map(|field| format!("\"{field}\":null").into_bytes())
+            .collect::<Vec<_>>();
+        let paths = expand_artifacts(bindings)
+            .into_iter()
+            .filter(|artifact| artifact.provider == "claude")
+            .map(|artifact| artifact.path)
+            .filter(|path| {
+                fs::read(path).is_ok_and(|bytes| {
+                    nulls.iter().any(|null| {
+                        bytes
+                            .windows(null.len())
+                            .any(|window| window == null.as_slice())
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut connection = self.open()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut reset = 0_i64;
+        for path in &paths {
+            reset += tx.execute(
+                "DELETE FROM scan_offsets WHERE artifact_path = ?1",
+                [path.to_string_lossy().as_ref()],
+            )? as i64;
+        }
+        tx.execute(
+            "INSERT INTO usage_repairs (name, applied_at, rows, tokens) VALUES (?1, ?2, ?3, 0)",
+            params![
+                NESTED_NULL_CLAUDE_RESCAN_REPAIR,
+                format_timestamp(OffsetDateTime::now_utc())?,
+                reset
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn resolve_seat_models(&self, seats: &[UsageSeatMetadata]) -> Result<Vec<UsageSeatMetadata>> {
@@ -1535,6 +1600,7 @@ struct Artifact {
 
 fn expand_artifacts(bindings: &[ArtifactBinding]) -> Vec<Artifact> {
     let mut artifacts = BTreeMap::<(String, PathBuf), BTreeMap<String, String>>::new();
+    let mut transcripts_by_root = BTreeMap::new();
     for binding in bindings {
         let mut paths = vec![binding.artifact_path.clone()];
         if binding.provider == "claude" {
@@ -1542,6 +1608,17 @@ fn expand_artifacts(bindings: &[ArtifactBinding]) -> Vec<Artifact> {
                 &binding.artifact_path,
                 &binding.provider_session_id,
             ));
+            if let Some(main) = claude_main_transcript(
+                &binding.artifact_path,
+                &binding.provider_session_id,
+                &mut transcripts_by_root,
+            ) {
+                paths.extend(claude_sibling_artifacts(
+                    &main,
+                    &binding.provider_session_id,
+                ));
+                paths.push(main);
+            }
         }
         for path in paths {
             artifacts
@@ -1606,6 +1683,56 @@ fn codex_artifact_project_key(path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// The session's main transcript when a binding names a different file: a subagent file that
+/// transcript discovery met first, or a path under the seat's starting directory after Claude
+/// Code moved into a worktree and filed the transcript under that project folder instead.
+fn claude_main_transcript(
+    path: &Path,
+    session_id: &str,
+    transcripts_by_root: &mut BTreeMap<PathBuf, BTreeMap<String, PathBuf>>,
+) -> Option<PathBuf> {
+    let file_name = format!("{session_id}.jsonl");
+    let expected = if path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        == Some("subagents")
+    {
+        path.parent()?.parent()?.with_file_name(&file_name)
+    } else if path.file_name().and_then(|value| value.to_str()) == Some(file_name.as_str()) {
+        path.to_path_buf()
+    } else {
+        return None;
+    };
+    let main = if expected.is_file() {
+        expected
+    } else {
+        let projects_root = expected.parent()?.parent()?.to_path_buf();
+        transcripts_by_root
+            .entry(projects_root)
+            .or_insert_with_key(|root| claude_transcripts_by_session(root))
+            .get(session_id)?
+            .clone()
+    };
+    (main != path).then_some(main)
+}
+
+fn claude_transcripts_by_session(projects_root: &Path) -> BTreeMap<String, PathBuf> {
+    let Ok(projects) = fs::read_dir(projects_root) else {
+        return BTreeMap::new();
+    };
+    projects
+        .flatten()
+        .filter_map(|project| fs::read_dir(project.path()).ok())
+        .flat_map(|entries| entries.flatten().map(|entry| entry.path()))
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+        .filter_map(|path| {
+            let session_id = path.file_stem()?.to_str()?.to_owned();
+            Some((session_id, path))
+        })
+        .collect()
 }
 
 fn claude_sibling_artifacts(path: &Path, session_id: &str) -> Vec<PathBuf> {
@@ -1813,30 +1940,43 @@ fn parse_claude_line(line: &[u8], path: &Path) -> Result<Option<ParsedMessage>> 
     }))
 }
 
-const NULL_REJECT_FIELDS: [&str; 12] = [
-    "id",
+// Explicit nulls reject a line only where the parser reads the field. Nested
+// payloads the parser ignores (e.g. `usage.iterations[].model: null`, written
+// by Claude Code 2.1.25x) must not drop the turn.
+const ROOT_NULL_REJECT_FIELDS: [&str; 7] = [
     "cwd",
-    "model",
     "speed",
     "costUSD",
     "version",
     "sessionId",
     "requestId",
     "isApiErrorMessage",
+];
+const MESSAGE_NULL_REJECT_FIELDS: [&str; 3] = ["id", "model", "usage"];
+const USAGE_NULL_REJECT_FIELDS: [&str; 3] = [
+    "speed",
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
-    "usage",
 ];
 
 fn has_explicit_null(value: &Value) -> bool {
-    match value {
-        Value::Object(object) => object.iter().any(|(key, value)| {
-            (NULL_REJECT_FIELDS.contains(&key.as_str()) && value.is_null())
-                || has_explicit_null(value)
-        }),
-        Value::Array(values) => values.iter().any(has_explicit_null),
-        _ => false,
-    }
+    let nulls = |object: Option<&Map<String, Value>>, fields: &[&str]| {
+        object.is_some_and(|object| {
+            fields
+                .iter()
+                .any(|field| object.get(*field).is_some_and(Value::is_null))
+        })
+    };
+    let root = value.as_object();
+    let message = root
+        .and_then(|root| root.get("message"))
+        .and_then(Value::as_object);
+    let usage = message
+        .and_then(|message| message.get("usage"))
+        .and_then(Value::as_object);
+    nulls(root, &ROOT_NULL_REJECT_FIELDS)
+        || nulls(message, &MESSAGE_NULL_REJECT_FIELDS)
+        || nulls(usage, &USAGE_NULL_REJECT_FIELDS)
 }
 
 fn valid_semver_prefix(value: &str) -> bool {
@@ -4349,6 +4489,30 @@ mod tests {
         .unwrap()
         .is_none());
 
+        // Claude Code 2.1.25x writes `usage.iterations[].model: null`; the turn
+        // still counts. Nulls in fields the parser reads still reject it.
+        let mut nested_null = base.clone();
+        nested_null["message"]["usage"]["iterations"] =
+            json!([{ "type": "message", "input_tokens": 10, "model": null }]);
+        assert!(parse_claude_line(
+            &serde_json::to_vec(&nested_null).unwrap(),
+            Path::new("chat.jsonl")
+        )
+        .unwrap()
+        .is_some());
+        let mut null_fields = [base.clone(), base.clone(), base.clone()];
+        null_fields[0]["cwd"] = Value::Null;
+        null_fields[1]["message"]["model"] = Value::Null;
+        null_fields[2]["message"]["usage"]["cache_read_input_tokens"] = Value::Null;
+        for explicit_null in null_fields {
+            assert!(parse_claude_line(
+                &serde_json::to_vec(&explicit_null).unwrap(),
+                Path::new("chat.jsonl")
+            )
+            .unwrap()
+            .is_none());
+        }
+
         let mut no_usage = base.clone();
         no_usage["message"].as_object_mut().unwrap().remove("usage");
         assert!(parse_claude_line(
@@ -5367,6 +5531,189 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM message_window", [], |row| row.get(0))
             .unwrap();
         assert_eq!(window_count, 0);
+    }
+
+    #[test]
+    fn nested_null_repair_rescans_turns_an_old_scan_skipped_once() {
+        let dir = TestDir::new("nested-null-rescan");
+        let db_path = dir.0.join("usage.db");
+        let account = identity(Provider::Claude, "account-one", "max");
+        UsageIdentityStore::new(&db_path)
+            .unwrap()
+            .record_observation(
+                Provider::Claude,
+                Some(&account),
+                at("2026-09-18T15:00:00Z"),
+                None,
+                None,
+            )
+            .unwrap();
+        UsageBurnStore::new(&db_path).unwrap();
+        let transcript = dir.0.join("session-one.jsonl");
+        let message = |id: &str| {
+            json!({
+                "timestamp": "2026-09-18T16:00:00Z",
+                "sessionId": "session-one",
+                "requestId": format!("request-{id}"),
+                "cwd": "/repo",
+                "version": "2.1.257",
+                "message": {
+                    "id": format!("message-{id}"),
+                    "model": "claude-fable-5-1",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "iterations": [{ "type": "message", "model": null }]
+                    }
+                }
+            })
+        };
+        fs::write(&transcript, format!("{}\n", message("booked"))).unwrap();
+        SeatSessionStore::new(&db_path)
+            .append("seat-one", "claude", "session-one", transcript.to_str())
+            .unwrap();
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        store.scan(&[]).unwrap();
+
+        // An old parser read past the next turn without booking it, and the repair is pending.
+        fs::write(
+            &transcript,
+            format!("{}\n{}\n", message("booked"), message("skipped")),
+        )
+        .unwrap();
+        let metadata = fs::metadata(&transcript).unwrap();
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE scan_offsets SET byte_offset = ?1, mtime_ns = ?2",
+                params![metadata.len() as i64, file_mtime_ns(&metadata)],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM usage_repairs WHERE name = ?1",
+                [NESTED_NULL_CLAUDE_RESCAN_REPAIR],
+            )
+            .unwrap();
+        let ledger_ids = || {
+            connection
+                .prepare("SELECT message_id FROM message_ledger ORDER BY message_id")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(ledger_ids(), vec!["message-booked"]);
+
+        let summary = store.scan(&[]).unwrap();
+        assert_eq!(summary.messages_inserted, 1);
+        assert_eq!(summary.messages_ignored, 1);
+        assert_eq!(ledger_ids(), vec!["message-booked", "message-skipped"]);
+        let reset: i64 = connection
+            .query_row(
+                "SELECT rows FROM usage_repairs WHERE name = ?1",
+                [NESTED_NULL_CLAUDE_RESCAN_REPAIR],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reset, 1);
+
+        // Recorded once: a later scan does not re-read the transcript.
+        assert_eq!(store.scan(&[]).unwrap().artifacts_scanned, 0);
+    }
+
+    #[test]
+    fn claude_binding_to_a_subagent_or_missing_path_scans_the_main_transcript() {
+        let dir = TestDir::new("claude-main-transcript");
+        let db_path = dir.0.join("usage.db");
+        let account = identity(Provider::Claude, "account-one", "max");
+        UsageIdentityStore::new(&db_path)
+            .unwrap()
+            .record_observation(
+                Provider::Claude,
+                Some(&account),
+                at("2026-09-07T15:00:00Z"),
+                None,
+                None,
+            )
+            .unwrap();
+        UsageBurnStore::new(&db_path).unwrap();
+        let projects = dir.0.join("projects");
+        let write = |path: PathBuf, session: &str, id: &str| {
+            let line = json!({
+                "timestamp": "2026-09-07T16:00:00Z",
+                "sessionId": session,
+                "requestId": format!("request-{id}"),
+                "cwd": "/repo",
+                "version": "2.1.200",
+                "message": {
+                    "id": format!("message-{id}"),
+                    "model": "claude-opus-5-5",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0
+                    }
+                }
+            });
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format!("{line}\n")).unwrap();
+            path
+        };
+        // Discovery met the subagent file first and bound it instead of the main transcript.
+        write(
+            projects.join("-repo/session-sub.jsonl"),
+            "session-sub",
+            "sub-main",
+        );
+        let subagent = write(
+            projects.join("-repo/session-sub/subagents/agent-one.jsonl"),
+            "session-sub",
+            "sub-agent",
+        );
+        // Claude Code moved into a worktree, so the transcript is not where the seat's
+        // starting directory puts it.
+        write(
+            projects.join("-repo--claude-worktrees-fix/session-moved.jsonl"),
+            "session-moved",
+            "moved-main",
+        );
+        let seats = SeatSessionStore::new(&db_path);
+        seats
+            .append("seat-sub", "claude", "session-sub", subagent.to_str())
+            .unwrap();
+        seats
+            .append(
+                "seat-moved",
+                "claude",
+                "session-moved",
+                projects.join("-repo/session-moved.jsonl").to_str(),
+            )
+            .unwrap();
+        UsageLedgerStore::new(&db_path).unwrap().scan(&[]).unwrap();
+
+        let connection = Connection::open(db_path).unwrap();
+        let booked = connection
+            .prepare("SELECT message_id, seat_id FROM message_ledger ORDER BY message_id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            booked,
+            vec![
+                ("message-moved-main".to_owned(), "seat-moved".to_owned()),
+                ("message-sub-agent".to_owned(), "seat-sub".to_owned()),
+                ("message-sub-main".to_owned(), "seat-sub".to_owned()),
+            ]
+        );
     }
 
     #[test]
