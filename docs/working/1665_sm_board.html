@@ -653,7 +653,7 @@ fragment Ref on Issue { number title url state stateReason closedAt repository {
         </ul>
         The row keeps the holder and PR details and shows the reason: the message title, or "PR #N waits for your review" (or "DOC TITLE waits for your review" without a PR). Both sources are read at recompute; a message reply, <code>sm doc</code> review or the sender's end clears the state on the next recompute. Message and review changes also request a recompute, so the row updates within seconds rather than at the next GitHub pass.</li>
       <li><code>in_progress</code>: an active ticket claim exists whose holder is not Retired, or a <code>board_prs</code> row is <code>OPEN</code>.</li>
-      <li><code>ready</code>: every <i>b</i> in waits_on(<i>t</i>) is closed. This includes having no <i>b</i>, and it requires <i>t</i> not to be in a cycle (D3).</li>
+      <li><code>ready</code>: every <i>b</i> in waits_on(<i>t</i>) is closed, and neither <i>t</i>'s repo nor any <i>b</i>'s repo is stale (C4); a ticket that would be ready but for staleness is <code>blocked</code> with the <code>stale</code> warning. This includes having no <i>b</i>, and it requires <i>t</i> not to be in a cycle (D3).</li>
       <li><code>blocked</code>: anything else.</li>
     </ol>
   </li>
