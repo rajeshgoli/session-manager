@@ -903,7 +903,7 @@ pub(super) async fn force_start_queue_job(
             .ok_or(ApiError::NotFound("Queue job not found"))?;
     let queue_state_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
     let message_queue_db_path = expand_home(&state.config.sm_send.db_path);
-    let started = RetainedQueueStore::force_start_queue_job_in_state_dir(
+    let (started, by_this_call) = RetainedQueueStore::force_start_queue_job_in_state_dir(
         &queue_state_dir,
         &message_queue_db_path,
         &job.id,
@@ -911,7 +911,7 @@ pub(super) async fn force_start_queue_job(
         queue_admission_policy(&state.config),
     )?
     .ok_or(ApiError::NotFound("Queue job not found"))?;
-    if started.owner_forced_at.is_none() {
+    if !by_this_call {
         return Err(conflict(&format!(
             "job is no longer queued ({})",
             started.state

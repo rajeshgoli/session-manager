@@ -1213,15 +1213,16 @@ impl RetainedQueueStore {
 
     /// Starts a pending job now, past every admission rule, for the owner's
     /// Start now (sm#1627). The run is marked owner-forced: host memory
-    /// pressure stops it first and puts it back in line. A job that is no
-    /// longer pending is returned as it stands.
+    /// pressure stops it first and puts it back in line. Returns the job and
+    /// whether this call started it; a job that is no longer pending is
+    /// returned as it stands with `false`.
     pub fn force_start_queue_job_in_state_dir(
         state_dir: &Path,
         message_queue_db_path: &Path,
         job_id: &str,
         cancel_grace_seconds: u64,
         admission_policy: QueueAdmissionPolicy,
-    ) -> Result<Option<QueueJobRecord>> {
+    ) -> Result<Option<(QueueJobRecord, bool)>> {
         // Admission starts jobs under this lock; holding it keeps one run.
         let _admission_guard = QUEUE_ADMISSION_LOCK
             .lock()
@@ -1233,15 +1234,16 @@ impl RetainedQueueStore {
             params![job_id, now_rfc3339()],
         )?;
         if marked == 0 {
-            return get_queue_job_conn(&conn, job_id);
+            return Ok(get_queue_job_conn(&conn, job_id)?.map(|job| (job, false)));
         }
-        Self::start_queue_job_in_state_dir_with_policy(
+        Ok(Self::start_queue_job_in_state_dir_with_policy(
             state_dir,
             message_queue_db_path,
             job_id,
             cancel_grace_seconds,
             admission_policy,
-        )
+        )?
+        .map(|job| (job, true)))
     }
 
     pub fn admit_queue_jobs_in_state_dir(
@@ -8457,7 +8459,7 @@ mod tests {
         };
         // And the host is below its memory reserve.
         TEST_HOST_MEMORY.with(|host| host.set(Some((256 * GIB, GIB))));
-        let started = RetainedQueueStore::force_start_queue_job_in_state_dir(
+        let (started, by_this_call) = RetainedQueueStore::force_start_queue_job_in_state_dir(
             &state_dir,
             &message_queue_db,
             &waiting.id,
@@ -8466,13 +8468,14 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        assert!(by_this_call);
         TEST_HOST_MEMORY.with(|host| host.set(None));
         assert_eq!(started.state, "running");
         assert!(started.owner_forced_at.is_some());
         assert_eq!(started.holding_reason, None);
 
         // A job that is no longer pending is returned untouched.
-        let again = RetainedQueueStore::force_start_queue_job_in_state_dir(
+        let (again, by_this_call) = RetainedQueueStore::force_start_queue_job_in_state_dir(
             &state_dir,
             &message_queue_db,
             &waiting.id,
@@ -8481,6 +8484,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        assert!(!by_this_call);
         assert_eq!(again.started_at, started.started_at);
         if let Some(pgid) = started.process_group_id {
             terminate_process_group(pgid, true);
