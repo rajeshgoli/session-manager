@@ -3678,6 +3678,47 @@ const DEFAULT_PERF_COOLDOWN_SECONDS: i64 = 30;
 pub const DEFAULT_QUEUE_MAX_WAIT_SECONDS: i64 = 5 * 60;
 const QUEUE_JOB_TYPE_ORDER: [&str; 4] = ["perf", "tests", "background", "service"];
 static QUEUE_ADMISSION_LOCK: Mutex<()> = Mutex::new(());
+
+/// A pending or running job as the utilization recorder sees it (sm#1609).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveQueueJob {
+    pub id: String,
+    pub job_type: String,
+    pub state: String,
+    pub holding_reason: Option<String>,
+    pub process_group_id: Option<i64>,
+}
+
+/// Read every pending and running job while holding the admission lock, so a
+/// sample never sees a pass half-way (a pass clears every hold reason first).
+pub fn active_queue_jobs_for_sampling(db_path: &Path) -> Result<Vec<ActiveQueueJob>> {
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = open_queue_jobs_connection(db_path)?;
+    let _admission_guard = QUEUE_ADMISSION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut statement = conn.prepare(
+        r#"
+        SELECT id, type, state, holding_reason, process_group_id
+        FROM queue_jobs
+        WHERE state IN ('pending', 'running')
+        ORDER BY queued_at, id
+        "#,
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(ActiveQueueJob {
+            id: row.get(0)?,
+            job_type: row.get(1)?,
+            state: row.get(2)?,
+            holding_reason: row.get(3)?,
+            process_group_id: row.get(4)?,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
 const PERF_MEMORY_SAMPLE_INTERVAL: StdDuration = StdDuration::from_millis(250);
 #[cfg(target_os = "macos")]
 const MACOS_MEMORY_RESERVE_BYTES: i64 = 8 * 1024 * 1024 * 1024;

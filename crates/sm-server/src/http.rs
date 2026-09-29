@@ -1472,6 +1472,8 @@ pub fn router(state: AppState) -> Router {
         .route("/client/bootstrap", get(client_bootstrap))
         .route("/client/session-models", get(client_session_models))
         .route("/client/host-status", get(client_host_status))
+        .route("/client/queue/stats", get(client_queue_stats))
+        .route("/client/utilization/series", get(client_utilization_series))
         .route("/client/analytics/summary", get(client_analytics_summary))
         .route("/client/request-status", post(client_request_status))
         .route(
@@ -2552,6 +2554,72 @@ async fn client_session_models(
     .await
     .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
     Ok(Json(json!({ "models": models })))
+}
+
+#[derive(Debug, Deserialize)]
+struct UtilizationHoursQuery {
+    hours: Option<i64>,
+}
+
+/// The owner-read checks every `/client/...` read shares.
+fn ensure_client_read(state: &AppState, request: &Request) -> Result<(), ApiError> {
+    let access_context = ensure_mobile_cloudflare_access_for_request(state, request)?;
+    ensure_public_edge_assertion_for_request(state, request)?;
+    ensure_session_read_allowed(state, request)?;
+    ensure_mobile_cloudflare_access_context_matches_optional_actor(
+        state,
+        access_context.as_ref(),
+        request_actor_email(&state.config, request).as_deref(),
+    )?;
+    Ok(())
+}
+
+async fn read_utilization(
+    state: &AppState,
+    read: impl FnOnce(&std::path::Path) -> anyhow::Result<Value> + Send + 'static,
+) -> Result<Json<Value>, ApiError> {
+    let db_path = expand_home(&state.config.utilization.db_path);
+    let body = tokio::task::spawn_blocking(move || read(&db_path))
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
+    Ok(Json(body))
+}
+
+/// The Queue page's "Held back?" card (sm#1609).
+async fn client_queue_stats(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<UtilizationHoursQuery>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_client_read(&state, &request)?;
+    let hours = query.hours.unwrap_or(168);
+    if !matches!(hours, 24 | 168 | 720) {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "hours must be 24, 168 or 720".into(),
+        });
+    }
+    read_utilization(&state, move |path| {
+        crate::utilization::queue_stats(path, hours)
+    })
+    .await
+}
+
+/// The Mac usage charts (sm#1609).
+async fn client_utilization_series(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<UtilizationHoursQuery>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_client_read(&state, &request)?;
+    let hours = query.hours.unwrap_or(24);
+    if crate::utilization::series_bucket_seconds(hours).is_none() {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "hours must be 1, 24, 168 or 720".into(),
+        });
+    }
+    read_utilization(&state, move |path| crate::utilization::series(path, hours)).await
 }
 
 async fn client_host_status(
@@ -13875,6 +13943,8 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/client/analytics/summary"
         || path == "/client/session-models"
         || path == "/client/host-status"
+        || path == "/client/queue/stats"
+        || path == "/client/utilization/series"
         || path == "/codex-review-requests"
         || path.starts_with("/codex-review-requests/")
         || path == "/session-obligations"
@@ -19541,6 +19611,8 @@ mod tests {
         let routes = [
             (Method::GET, "/client/bootstrap", "", false),
             (Method::GET, "/client/host-status", "", false),
+            (Method::GET, "/client/queue/stats", "", false),
+            (Method::GET, "/client/utilization/series", "", false),
             (
                 Method::POST,
                 "/auth/device/google",
@@ -20522,6 +20594,37 @@ mod tests {
         let (status, body) = response_json(response).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["ticket_id"].as_str().unwrap().starts_with("att_"));
+    }
+
+    #[tokio::test]
+    async fn utilization_reads_validate_ranges_and_report_missing_data() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        let dir = std::env::temp_dir().join(format!("sm-utilization-http-{}", std::process::id()));
+        config.utilization.db_path = dir.join("absent.db").to_string_lossy().into_owned();
+        let app = router(AppState::new(config));
+        for (uri, expected) in [
+            ("/client/queue/stats", StatusCode::OK),
+            ("/client/queue/stats?hours=720", StatusCode::OK),
+            ("/client/queue/stats?hours=1", StatusCode::BAD_REQUEST),
+            ("/client/utilization/series", StatusCode::OK),
+            ("/client/utilization/series?hours=1", StatusCode::OK),
+            (
+                "/client/utilization/series?hours=48",
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(local_request(Method::GET, uri, Body::empty()))
+                .await
+                .unwrap();
+            let (status, body) = response_json(response).await;
+            assert_eq!(status, expected, "{uri}");
+            if status == StatusCode::OK {
+                assert_eq!(body, json!({"available": false}), "{uri}");
+            }
+        }
     }
 
     #[tokio::test]

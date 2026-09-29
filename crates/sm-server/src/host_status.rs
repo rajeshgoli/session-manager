@@ -128,7 +128,7 @@ fn memory_used(top: &str) -> Option<u64> {
     (value.is_finite() && value >= 0.0).then_some((value * multiplier) as u64)
 }
 
-fn gpu_percent(ioreg: &str) -> Option<f64> {
+pub(crate) fn gpu_percent(ioreg: &str) -> Option<f64> {
     let (_, value) = ioreg.split_once("\"Device Utilization %\"=")?;
     let number = value
         .chars()
