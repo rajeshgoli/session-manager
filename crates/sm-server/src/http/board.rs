@@ -570,7 +570,79 @@ pub(super) async fn post_lane(
     Ok(Json(body))
 }
 
-/// The owner's write guard: a signed-in owner, as Start now on the queue.
+/// Board and its model picker accept either verified browser-owner login or
+/// the existing mobile owner guard. Browser writes also require same-origin.
+pub(super) fn owner_guard(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_addr: SocketAddr,
+    method: &str,
+    uri: &Uri,
+    signed_write: bool,
+) -> Result<String, ApiError> {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    *request.headers_mut() = headers.clone();
+    request.extensions_mut().insert(ConnectInfo(peer_addr));
+    if request_cloudflare_access_application(state, &request)
+        == Some(CloudflareAccessApplication::Browser)
+        && !is_request_local_bypass(state, &request)
+    {
+        let assertion =
+            header_text(headers, "cf-access-jwt-assertion").ok_or_else(|| ApiError::Status {
+                status: StatusCode::FORBIDDEN,
+                detail: "Browser owner login required".into(),
+            })?;
+        let context = classify_cloudflare_access_assertion_cached(
+            state,
+            CloudflareAccessApplication::Browser,
+            &assertion,
+        )
+        .map_err(cloudflare_access_error)?;
+        let email = context
+            .email
+            .as_deref()
+            .filter(|email| allowlisted_google_email(&state.config, email))
+            .ok_or_else(|| ApiError::Status {
+                status: StatusCode::UNAUTHORIZED,
+                detail: "Owner login required".into(),
+            })?;
+        if method != "GET" {
+            if header_text(headers, handoff::SESSION_HEADER).is_some() {
+                return Err(ApiError::Status {
+                    status: StatusCode::FORBIDDEN,
+                    detail: "Board actions are owner-only".into(),
+                });
+            }
+            let origin = header_text(headers, "origin");
+            let host =
+                header_text(headers, "x-forwarded-host").or_else(|| header_text(headers, "host"));
+            if !origin
+                .as_deref()
+                .is_some_and(|origin| handoff::origin_matches_host(origin, host.as_deref()))
+            {
+                return Err(ApiError::Status {
+                    status: StatusCode::FORBIDDEN,
+                    detail: "Origin does not match host".into(),
+                });
+            }
+        }
+        return Ok(follows::follow_owner_id(&state.config, Some(email)));
+    }
+    let owner = follows::owner_guard(state, headers, peer_addr, method, uri)?;
+    if signed_write && authenticated_user(headers, &state.config).is_none() {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Only the owner, signed in to sm, changes the board or starts agents"
+                .to_owned(),
+        });
+    }
+    Ok(owner)
+}
+
 fn owner_write_guard(
     state: &AppState,
     headers: &HeaderMap,
@@ -578,14 +650,7 @@ fn owner_write_guard(
     method: &str,
     uri: &Uri,
 ) -> Result<(), ApiError> {
-    follows::owner_guard(state, headers, peer_addr, method, uri)?;
-    if authenticated_user(headers, &state.config).is_none() {
-        return Err(ApiError::Status {
-            status: StatusCode::FORBIDDEN,
-            detail: "Only the owner, signed in to sm, orders or ends lanes".to_owned(),
-        });
-    }
-    Ok(())
+    owner_guard(state, headers, peer_addr, method, uri, true).map(|_| ())
 }
 
 /// `GET /client/board`: the board JSON, for the app.
@@ -596,7 +661,7 @@ pub(super) async fn client_board(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    follows::owner_guard(&state, &headers, peer_addr, "GET", &uri)?;
+    owner_guard(&state, &headers, peer_addr, "GET", &uri, false)?;
     let mut payload = blocking(&state, |state| Ok(board_payload(state, None)?)).await?;
     if query.html {
         payload["html"] = json!(super::board_page::render(&payload));
@@ -702,7 +767,7 @@ pub(super) async fn client_board_badge(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    follows::owner_guard(&state, &headers, peer_addr, "GET", &uri)?;
+    owner_guard(&state, &headers, peer_addr, "GET", &uri, false)?;
     let count = blocking(&state, |state| {
         let store = board_store(state);
         let (board, _) = store.board(&outside(state)?, time::OffsetDateTime::now_utc())?;
@@ -720,7 +785,7 @@ pub(super) async fn client_board_seen(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let owner = follows::owner_guard(&state, &headers, peer_addr, "POST", &uri)?;
+    let owner = owner_guard(&state, &headers, peer_addr, "POST", &uri, false)?;
     blocking(&state, move |state| {
         let now = time::OffsetDateTime::now_utc();
         board_store(state).set_seen(&owner, now)?;
@@ -745,7 +810,7 @@ pub(super) async fn client_board_refresh(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    follows::owner_guard(&state, &headers, peer_addr, "POST", &uri)?;
+    owner_guard(&state, &headers, peer_addr, "POST", &uri, false)?;
     request_pass(&state);
     Ok(StatusCode::ACCEPTED)
 }
@@ -802,7 +867,7 @@ pub(super) async fn start_options(
     headers: HeaderMap,
     Query(query): Query<StartOptionsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    follows::owner_guard(&state, &headers, peer_addr, "GET", &uri)?;
+    owner_guard(&state, &headers, peer_addr, "GET", &uri, false)?;
     let key = ticket_key(&query.repo, query.number)?;
     Ok(Json(
         blocking(&state, move |state| start_options_payload(state, &key)).await?,
@@ -832,6 +897,60 @@ pub(super) async fn client_start(
     start(state, payload).await.map(Json)
 }
 
+/// Called again under the board lock immediately before reserving the claim.
+pub(super) fn validate_start(state: &AppState, key: &Key) -> Result<Vec<i64>, ApiError> {
+    let (board, input) =
+        board_store(state).board(&outside(state)?, time::OffsetDateTime::now_utc())?;
+    let item = input
+        .items
+        .get(key)
+        .ok_or(ApiError::NotFound("Ticket not on the board"))?;
+    if !item.is_open() {
+        return Err(ApiError::Status {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail: format!("#{} is closed", key.1),
+        });
+    }
+    if let Some(facts) = board.facts.get(key) {
+        if facts.needs_you.is_some() {
+            return Err(ApiError::Status {
+                status: StatusCode::CONFLICT,
+                detail: format!("#{} is waiting on you", key.1),
+            });
+        }
+        if let Some(holder) = &facts.holder {
+            return Err(ApiError::Status {
+                status: StatusCode::CONFLICT,
+                detail: format!(
+                    "#{} is held by {} ({})",
+                    key.1,
+                    holder.name,
+                    holder.state.as_str()
+                ),
+            });
+        }
+    }
+    let facts = board
+        .facts
+        .get(key)
+        .ok_or(ApiError::NotFound("Ticket not on the board"))?;
+    if facts.state != crate::board::model::TicketState::Ready
+        || facts.warnings.contains(&"merged_not_closed")
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: format!("#{} is no longer ready to start; refresh the board", key.1),
+        });
+    }
+    let lanes: Vec<i64> = board
+        .lanes
+        .iter()
+        .filter(|lane| lane.contains(key))
+        .map(|lane| lane.lane.id)
+        .collect();
+    Ok(lanes)
+}
+
 async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, ApiError> {
     if !matches!(payload.provider.as_str(), "claude" | "codex-fork") {
         return Err(bad_request("provider must be claude or codex-fork"));
@@ -839,43 +958,7 @@ async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, Api
     let key = ticket_key(&payload.repo, payload.number)?;
     let checked_key = key.clone();
     let (options, lanes) = blocking(&state, move |state| {
-        let (board, input) =
-            board_store(state).board(&outside(state)?, time::OffsetDateTime::now_utc())?;
-        let item = input
-            .items
-            .get(&checked_key)
-            .ok_or(ApiError::NotFound("Ticket not on the board"))?;
-        if !item.is_open() {
-            return Err(ApiError::Status {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                detail: format!("#{} is closed", checked_key.1),
-            });
-        }
-        if let Some(facts) = board.facts.get(&checked_key) {
-            if facts.needs_you.is_some() {
-                return Err(ApiError::Status {
-                    status: StatusCode::CONFLICT,
-                    detail: format!("#{} is waiting on you", checked_key.1),
-                });
-            }
-            if let Some(holder) = &facts.holder {
-                return Err(ApiError::Status {
-                    status: StatusCode::CONFLICT,
-                    detail: format!(
-                        "#{} is held by {} ({})",
-                        checked_key.1,
-                        holder.name,
-                        holder.state.as_str()
-                    ),
-                });
-            }
-        }
-        let lanes: Vec<i64> = board
-            .lanes
-            .iter()
-            .filter(|lane| lane.contains(&checked_key))
-            .map(|lane| lane.lane.id)
-            .collect();
+        let lanes = validate_start(state, &checked_key)?;
         Ok((start_options_payload(state, &checked_key)?, lanes))
     })
     .await?;
@@ -883,7 +966,7 @@ async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, Api
     let name = trimmed(&payload.name)
         .unwrap_or_else(|| options["name"].as_str().unwrap_or_default().to_owned());
     let reservation = claims::reserve_spawn_ticket(&state, claims::SpawnTicket {
-        session_id: &id, name: Some(&name), parent: None, ticket: key.1, repo: &key.0,
+        session_id: &id, check_board: true, name: Some(&name), parent: None, ticket: key.1, repo: &key.0,
         worktree_path: None, branch: None,
     }).await.map_err(|error| match error {
         ApiError::StatusBody { status: StatusCode::CONFLICT, body } => ApiError::StatusBody {

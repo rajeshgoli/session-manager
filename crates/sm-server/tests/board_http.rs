@@ -243,7 +243,10 @@ fn fixture_config(configure: impl FnOnce(&mut AppConfig)) -> Fixture {
     fixture_options(None, configure)
 }
 
-fn fixture_options(sender: Option<Arc<RecordingSender>>, configure: impl FnOnce(&mut AppConfig)) -> Fixture {
+fn fixture_options(
+    sender: Option<Arc<RecordingSender>>,
+    configure: impl FnOnce(&mut AppConfig),
+) -> Fixture {
     let dir = temp_dir();
     let state_file = dir.join("sessions.json");
     let session = |id: &str, completion: Option<&str>| {
@@ -1049,4 +1052,73 @@ async fn start_rejects_missing_closed_and_unsigned() {
     let (status, body) =
         owner_request(&f, "POST", "/client/board/start", Some(start_body(2))).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+#[tokio::test]
+async fn start_rejects_new_blockers_cycles_and_merged_unclosed_tickets() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    for cycle in [false, true] {
+        f.board.issues.lock().unwrap().get_mut(&2).unwrap().1 = vec![3];
+        if cycle {
+            f.board.issues.lock().unwrap().get_mut(&3).unwrap().1 = vec![2];
+        }
+        pass(&f).await;
+        let (status, body) =
+            owner_request(&f, "POST", "/client/board/start", Some(start_body(2))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    }
+    f.board
+        .issues
+        .lock()
+        .unwrap()
+        .get_mut(&2)
+        .unwrap()
+        .1
+        .clear();
+    f.board
+        .issues
+        .lock()
+        .unwrap()
+        .get_mut(&3)
+        .unwrap()
+        .1
+        .clear();
+    pass(&f).await;
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    conn.execute("INSERT INTO board_prs (repo,issue_number,pr_repo,pr_number,pr_state,url) VALUES (?1,2,?1,99,'MERGED','https://github.com/acme/widgets/pull/99')",[REPO]).unwrap();
+    let (status, body) =
+        owner_request(&f, "POST", "/client/board/start", Some(start_body(2))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM work_claims", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn start_rechecks_readiness_after_github_fetch_before_claiming() {
+    use sm_server::work_claims::{BatchFetch, WorkItemSource};
+    struct LateBlocker(PathBuf);
+    impl WorkItemSource for LateBlocker {
+        fn fetch(&self, repo: &str, numbers: &[i64]) -> Result<BatchFetch, String> {
+            Connection::open(&self.0).unwrap().execute("INSERT INTO board_edges (waiter_repo,waiter_number,blocker_repo,blocker_number,kind,source,first_seen_at) VALUES (?1,2,?1,3,'after','github','2026-09-29T00:00:00Z')",[REPO]).unwrap();
+            BoardClaimItems.fetch(repo, numbers)
+        }
+    }
+    let mut f = start_fixture();
+    add_goal(&f).await;
+    f.state = f
+        .state
+        .clone()
+        .with_work_item_source(Arc::new(LateBlocker(f.dir.join("message_queue.db"))));
+    f.app = router(f.state.clone());
+    let (status, body) =
+        owner_request(&f, "POST", "/client/board/start", Some(start_body(2))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM work_claims", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
 }

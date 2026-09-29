@@ -215,6 +215,14 @@ async fn run_explicit_claim(
     state: &Arc<AppState>,
     request: ClaimRequest,
 ) -> Result<ClaimResult, ApiError> {
+    run_explicit_claim_checked(state, request, false).await
+}
+
+async fn run_explicit_claim_checked(
+    state: &Arc<AppState>,
+    request: ClaimRequest,
+    check_board: bool,
+) -> Result<ClaimResult, ApiError> {
     if request.tickets.len() + 1 > MAX_ALIASES_PER_QUERY {
         return Err(bad_request("too many --ticket numbers"));
     }
@@ -222,13 +230,25 @@ async fn run_explicit_claim(
     numbers.extend(request.tickets.iter().copied());
     let fetched = fetch_for_claim(state, &request.repo, numbers).await;
     let worker_state = state.clone();
-    tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || -> Result<ClaimResult, ApiError> {
+        let _board_guard = if check_board {
+            Some(
+                worker_state
+                    .board_lock
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("board lock poisoned"))?,
+            )
+        } else {
+            None
+        };
+        if check_board {
+            super::board::validate_start(&worker_state, &(request.repo.clone(), request.number))?;
+        }
         let sessions = session_directory(&worker_state)?;
-        work_claim_store(&worker_state).claim_explicit(&request, fetched, &sessions)
+        Ok(work_claim_store(&worker_state).claim_explicit(&request, fetched, &sessions)?)
     })
     .await
     .map_err(|error| anyhow::anyhow!("claim task failed: {error}"))?
-    .map_err(ApiError::from)
 }
 
 /// Every outcome but a new or held claim, as an API error.
@@ -438,6 +458,7 @@ pub(super) struct SpawnTicketReservation {
 
 pub(super) struct SpawnTicket<'a> {
     pub session_id: &'a str,
+    pub check_board: bool,
     pub name: Option<&'a str>,
     pub parent: Option<&'a SessionRecord>,
     pub ticket: i64,
@@ -477,7 +498,7 @@ pub(super) async fn reserve_spawn_ticket(
         tickets: Vec::new(),
         reserve: true,
     };
-    let result = run_explicit_claim(state, request).await?;
+    let result = run_explicit_claim_checked(state, request, spawn.check_board).await?;
     deliver_claim_notices(state, &result.notified);
     match result.outcome {
         ClaimOutcome::Claimed { claim, notes, .. } => Ok(SpawnTicketReservation {
