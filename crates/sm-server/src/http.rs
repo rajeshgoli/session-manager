@@ -323,6 +323,7 @@ pub enum GitHubPullRequestState {
 mod agent_history;
 mod analytics;
 mod board;
+mod board_page;
 mod claims;
 mod docs;
 mod follows;
@@ -1590,6 +1591,8 @@ pub fn router(state: AppState) -> Router {
         .route("/board/links", post(board::post_link))
         .route("/board/lanes", post(board::post_lane))
         .route("/client/board", get(board::client_board))
+        .route("/client/board/start", post(board::client_start))
+        .route("/client/board/start-options", get(board::start_options))
         .route("/client/board/order", put(board::put_order))
         .route("/client/board/lanes", post(board::client_post_lane))
         .route(
@@ -4241,7 +4244,7 @@ async fn spawn_session(
                 claims::SpawnTicket {
                     session_id: &id,
                     name: payload.name.as_deref(),
-                    parent: &parent,
+                    parent: Some(&parent),
                     ticket,
                     repo: &ticket_repo,
                     worktree_path: trimmed(&payload.ticket_worktree_path),
@@ -14279,6 +14282,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/board"
         || path == "/client/board"
         || path == "/client/board/badge"
+        || path == "/client/board/start-options"
         || path == "/history"
         || path == "/history/agents"
         || path == "/guestbook"

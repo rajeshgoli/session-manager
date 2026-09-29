@@ -439,7 +439,7 @@ pub(super) struct SpawnTicketReservation {
 pub(super) struct SpawnTicket<'a> {
     pub session_id: &'a str,
     pub name: Option<&'a str>,
-    pub parent: &'a SessionRecord,
+    pub parent: Option<&'a SessionRecord>,
     pub ticket: i64,
     pub repo: &'a str,
     pub worktree_path: Option<String>,
@@ -466,7 +466,7 @@ pub(super) async fn reserve_spawn_ticket(
                 .filter(|name| !name.is_empty())
                 .unwrap_or(spawn.session_id)
                 .to_owned(),
-            parent_session_id: Some(spawn.parent.id.clone()),
+            parent_session_id: spawn.parent.map(|parent| parent.id.clone()),
             state: HolderState::Working,
             stopped_at: None,
         },
