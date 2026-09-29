@@ -12,6 +12,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ViewList
 import androidx.compose.material.icons.rounded.Analytics
 import androidx.compose.material.icons.rounded.HourglassTop
+import androidx.compose.material.icons.rounded.Inbox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -21,6 +22,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import li.rajeshgo.sm.ui.inbox.InboxBadge
+import li.rajeshgo.sm.ui.theme.Amber
 import li.rajeshgo.sm.ui.theme.BorderStrong
 import li.rajeshgo.sm.ui.theme.Cyan
 import li.rajeshgo.sm.ui.theme.PanelElevated
@@ -29,6 +32,7 @@ import li.rajeshgo.sm.ui.theme.TextMuted
 @Composable
 fun AppBottomNav(
     currentRoute: String,
+    onInbox: () -> Unit,
     onWatch: () -> Unit,
     onQueue: () -> Unit,
     onAnalytics: () -> Unit,
@@ -48,6 +52,17 @@ fun AppBottomNav(
                 .padding(horizontal = 8.dp, vertical = 8.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
         ) {
+            val inboxBadge = InboxBadge.needsYou
+            AppBottomNavItem(
+                label = when {
+                    inboxBadge > 0 -> "Inbox · $inboxBadge"
+                    InboxBadge.hasNew -> "Inbox •"
+                    else -> "Inbox"
+                },
+                selected = currentRoute == Routes.INBOX,
+                icon = { Icon(Icons.Rounded.Inbox, contentDescription = null, modifier = Modifier.size(18.dp), tint = if (inboxBadge > 0) Amber else androidx.compose.material3.LocalContentColor.current) },
+                onClick = onInbox,
+            )
             AppBottomNavItem(
                 label = "Watch",
                 selected = currentRoute == Routes.WATCH,
@@ -86,9 +101,9 @@ private fun AppBottomNavItem(
                 shape = RoundedCornerShape(14.dp),
             )
             .clickable(onClick = onClick)
-            .padding(horizontal = 18.dp, vertical = 12.dp),
+            .padding(horizontal = 10.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         androidx.compose.runtime.CompositionLocalProvider(
             androidx.compose.material3.LocalContentColor provides iconTint,

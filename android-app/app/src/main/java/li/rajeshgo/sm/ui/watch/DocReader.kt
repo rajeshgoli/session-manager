@@ -179,6 +179,7 @@ fun readerPageForLink(url: String, linkHost: String): ReaderPage? {
         rawPath.startsWith("/messages/") && rawPath.length > "/messages/".length ->
             ReaderPage(title = "Message", subtitle = uri.path.removePrefix("/messages/"), path = path, browserUrl = url)
         rawPath.startsWith("/t/") -> ownerReaderPage("Ticket", path)
+        rawPath == "/inbox" || rawPath.startsWith("/inbox/") -> ownerReaderPage("Inbox", path)
         rawPath == "/history" -> ownerReaderPage("History", path)
         else -> null
     }
@@ -229,12 +230,13 @@ fun docNavigation(serverUrl: String, currentUrl: String?, targetUrl: String): Do
 }
 
 /**
- * The pages that stay in the reader: docs, owner messages (sm#1580), History, ticket pages, and the web
+ * The pages that stay in the reader: docs, owner messages (sm#1580), the Inbox (sm#1647), History, ticket pages, and the web
  * watch at `/` and `/watch`, so the page shell's Watch · History tabs never
  * leave the authenticated web view.
  */
 fun isOwnerPagePath(path: String): Boolean =
     path.startsWith("/docs/") || path.startsWith("/messages/") || path.startsWith("/t/") ||
+        path == "/inbox" || path.startsWith("/inbox/") ||
         path == "/history" || path == "/watch" || path == "/" || path.isEmpty()
 
 private fun sameOrigin(a: URI, b: URI): Boolean =
@@ -296,6 +298,8 @@ fun DocReaderOverlay(
     loadAuth: suspend () -> DocReaderAuth?,
     onClose: () -> Unit,
     onCopyLink: (String) -> Unit,
+    /** Extra buttons before Close, such as the Inbox's Agent (sm#1647). */
+    actions: (@Composable () -> Unit)? = null,
 ) {
     val auth by produceState<Result<DocReaderAuth?>?>(null, page) { value = runCatching { loadAuth() } }
     // Our own back stack: WebView history navigation would re-request pages
@@ -368,6 +372,7 @@ fun DocReaderOverlay(
                             Icon(Icons.Rounded.Link, contentDescription = "Copy doc link", tint = Cyan)
                         }
                     }
+                    actions?.invoke()
                     OutlinedButton(
                         onClick = onClose,
                         modifier = Modifier.height(40.dp),
