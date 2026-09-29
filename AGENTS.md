@@ -32,7 +32,7 @@ This file is the whole standing contract. Read all of it.
 - **Cite code or other docs in footnotes as needed.**
 - **The author line carries the `sm` id in backticks** — the restore key when a question about intent arrives weeks later.
 
-**Use `sm doc cat` to read html docs.** It turns HTML into compact Markdown. Pass a local file, a published doc name (`<repo-name>/<path>`), or an sm reader URL. Use `sm doc cat <doc> --out` to save the the file in a tmp dir or `--out /path/to/memo.md` to a specific path. This is handy to search with `rg` and read sections from it.
+**Use `sm doc cat` to read html docs.** It turns HTML into compact Markdown. Pass a local file, a published doc name (`<repo-name>/<path>`), or an sm reader URL. Use `sm doc cat <doc> --out` to save the file in a tmp dir or `--out /path/to/memo.md` to a specific path. This is handy to search with `rg` and read sections from it.
 
 **Reviewing a document: re-read the whole thing after each revision, not the diff.** A change in one section may have invalidated an assumption in another. A finding qualifies when this change introduced it and you can name what breaks. On a multi-option architectural call, post which option you would pick and why rather than only critiquing.
 
