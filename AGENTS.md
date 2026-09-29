@@ -68,6 +68,8 @@ and a reason. "Should we delete this?" is not a question for me; "I recommend de
 
 **A ticket is what one agent finishes without compaction.** If it does not fit, split it before briefing anyone.
 
+**Type each thing once; edit, don't resend.** Everything you type is output, the most expensive token on the meter; re-reading a file is nearly free. Put any script you may run more than once in a file in your scratchpad, then change it with targeted edits instead of resending it inline (`python3 - <<'EOF'`). Change an existing doc or source file with targeted edits; never regenerate or re-substitute the whole file to change one part. In September, inline scripts and whole-file rewrites through the shell were about 16% of all Claude output.
+
 **Use `sm send` between agents ONLY if instructed to use it** — If your task requires you to talk to other agents use sm send. If I did not say anything, and if you are not an orchestrator, do not message another agent. Don't poll another agent's output; go idle and you will be woken.
 
 **When told to stand by, go idle.**
