@@ -606,3 +606,20 @@ async fn doc_cat_formats_do_not_record_owner_views() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     fs::remove_dir_all(f.dir).unwrap();
 }
+
+#[tokio::test]
+async fn doc_cat_metadata_selects_unpublished_pr_head() {
+    let f = fixture();
+    publish(&f, "author01", "b", false, None).await;
+    let (status, meta) = request(
+        &f.app,
+        "GET",
+        "/docs/widgets/specs/memo.md?format=json&version=aaaaaaaaaaaa",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(meta["selected_commit_sha"], "a".repeat(40));
+    assert_eq!(meta["latest_commit_sha"], "b".repeat(40));
+    fs::remove_dir_all(f.dir).unwrap();
+}

@@ -104,22 +104,9 @@ pub(super) fn run(client: &ApiClient, args: DocCatArgs) -> Result<()> {
             }
         }
         let metadata = client.get_json(&metadata_path)?;
-        let sha = if let Some(version) = requested_version {
-            metadata["publishes"]
-                .as_array()
-                .and_then(|rows| {
-                    rows.iter().find_map(|row| {
-                        row["commit_sha"]
-                            .as_str()
-                            .filter(|sha| sha.starts_with(version))
-                    })
-                })
-                .ok_or_else(|| anyhow!("Version not found"))?
-        } else {
-            metadata["latest_commit_sha"]
-                .as_str()
-                .ok_or_else(|| anyhow!("Doc has no published revision"))?
-        };
+        let sha = metadata["selected_commit_sha"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Doc response has no selected revision"))?;
         let cached = cache_path(name, sha, args.raw)?;
         let bytes = if default_out && cached.is_file() {
             fs::read(&cached)?

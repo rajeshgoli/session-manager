@@ -902,7 +902,7 @@ pub(super) async fn get_owner_doc(
     ensure_owner_page_read_allowed(&state, &request)?;
     let doc = find_doc(&state, &doc_id)?;
     if query.format.as_deref() == Some("json") {
-        return doc_metadata_response(&state, &doc, request.headers());
+        return doc_metadata_response(&state, &doc, request.headers(), None);
     }
     // Default to the latest *published* revision, the one the agent
     // announced and the one the state chip describes. The address bar only
@@ -925,12 +925,14 @@ fn doc_metadata_response(
     state: &AppState,
     doc: &OwnerDoc,
     headers: &HeaderMap,
+    selected_commit_sha: Option<&str>,
 ) -> Result<Response, ApiError> {
     let store = owner_doc_store(state);
     let summary = store
         .summary(&doc.id)?
         .ok_or(ApiError::NotFound("Doc not found"))?;
     let mut value = summary_json(&state.config, &summary, headers)?;
+    value["selected_commit_sha"] = json!(selected_commit_sha.unwrap_or(&summary.latest_commit_sha));
     value["publishes"] = serde_json::to_value(store.publishes(&doc.id)?)?;
     value["reviews"] = serde_json::to_value(store.reviews(&doc.id)?)?;
     Ok(Json(value).into_response())
@@ -1609,7 +1611,7 @@ pub(super) async fn get_owner_doc_subpath(
     };
     let (doc, commit_sha) = resolved;
     if query.format.as_deref() == Some("json") {
-        return doc_metadata_response(&state, &doc, request.headers());
+        return doc_metadata_response(&state, &doc, request.headers(), Some(&commit_sha));
     }
     match query.format.as_deref() {
         Some("raw") => raw_doc_response(&state, &doc, &commit_sha).await,
