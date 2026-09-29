@@ -242,16 +242,25 @@ fn unseen(
     board: &board::model::Board,
 ) -> anyhow::Result<Unseen> {
     let owner = follows::follow_owner_id(&state.config, None);
-    let seen_at = store.seen_at(&owner)?;
-    let mut unseen = board::needs_you_unseen(board, &store.needs_you_since()?, seen_at.as_deref());
+    let seen = store.seen(&owner)?;
+    let seen_event_id = seen.as_ref().map_or(0, |(_, id)| *id);
+    let mut unseen = board::needs_you_unseen(board, &store.needs_you_since()?, seen_event_id);
     let now = time::OffsetDateTime::now_utc();
     for notice in follows::push_store(state).list_notices(&owner, now)? {
         if notice.kind != NOTICE_BOARD_READY && notice.kind != NOTICE_BOARD_LANE_DONE {
             continue;
         }
-        let opened = seen_at
-            .as_deref()
-            .is_some_and(|seen| seen > notice.created_at.as_str());
+        // `board:{lane}:{event}`: the event id orders it against the seen.
+        let event_id = notice
+            .subject_id
+            .rsplit(':')
+            .next()
+            .and_then(|id| id.parse::<i64>().ok());
+        let opened = match (event_id, &seen) {
+            (Some(event_id), Some(_)) => event_id <= seen_event_id,
+            (None, Some((seen_at, _))) => seen_at.as_str() > notice.created_at.as_str(),
+            (_, None) => false,
+        };
         if notice.acked_at.is_some() || opened {
             continue;
         }

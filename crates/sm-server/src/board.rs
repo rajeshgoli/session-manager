@@ -126,7 +126,10 @@ pub fn init_board_schema(conn: &Connection) -> Result<()> {
         );
         CREATE TABLE IF NOT EXISTS board_seen (
             user_id TEXT PRIMARY KEY,
-            seen_at TEXT NOT NULL
+            seen_at TEXT NOT NULL,
+            -- The newest board event when the owner looked: ids order events
+            -- that share a second.
+            seen_event_id INTEGER NOT NULL DEFAULT 0
         );
         "#,
     )?;
@@ -258,13 +261,9 @@ pub struct RepoSync {
 }
 
 impl RepoSync {
-    /// The repo's latest read failed (C4).
+    /// The repo's latest read failed (C4): a good read clears the error.
     pub fn stale(&self) -> bool {
-        match (&self.last_error_at, &self.last_ok_at) {
-            (Some(error_at), Some(ok_at)) => error_at > ok_at,
-            (Some(_), None) => true,
-            _ => false,
-        }
+        self.last_error_at.is_some()
     }
 }
 
@@ -408,35 +407,39 @@ impl BoardStore {
         active_lanes(&conn)
     }
 
-    pub fn seen_at(&self, user_id: &str) -> Result<Option<String>> {
+    /// When the owner last opened the board, and the newest board event
+    /// id at that moment.
+    pub fn seen(&self, user_id: &str) -> Result<Option<(String, i64)>> {
         let Some(conn) = self.open_read()? else {
             return Ok(None);
         };
         Ok(conn
             .query_row(
-                "SELECT seen_at FROM board_seen WHERE user_id = ?1",
+                "SELECT seen_at, seen_event_id FROM board_seen WHERE user_id = ?1",
                 params![user_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?)
     }
 
     pub fn set_seen(&self, user_id: &str, now: OffsetDateTime) -> Result<()> {
         self.open_write()?.execute(
-            "INSERT INTO board_seen (user_id, seen_at) VALUES (?1, ?2)
-             ON CONFLICT(user_id) DO UPDATE SET seen_at = excluded.seen_at",
+            "INSERT INTO board_seen (user_id, seen_at, seen_event_id)
+             VALUES (?1, ?2, (SELECT IFNULL(MAX(id), 0) FROM board_events))
+             ON CONFLICT(user_id) DO UPDATE SET seen_at = excluded.seen_at,
+                 seen_event_id = excluded.seen_event_id",
             params![user_id, format_ts(now)],
         )?;
         Ok(())
     }
 
-    /// The latest `became_needs_you` event time per ticket.
-    pub fn needs_you_since(&self) -> Result<BTreeMap<Key, String>> {
+    /// The latest `became_needs_you` event id per ticket.
+    pub fn needs_you_since(&self) -> Result<BTreeMap<Key, i64>> {
         let Some(conn) = self.open_read()? else {
             return Ok(BTreeMap::new());
         };
         let mut statement = conn.prepare(
-            "SELECT repo, number, MAX(ts) FROM board_events
+            "SELECT repo, number, MAX(id) FROM board_events
              WHERE kind = 'became_needs_you' GROUP BY repo, number",
         )?;
         let rows = statement
@@ -588,7 +591,8 @@ impl BoardStore {
         }
         tx.execute(
             "INSERT INTO board_repo_sync (repo, last_ok_at) VALUES (?1, ?2)
-             ON CONFLICT(repo) DO UPDATE SET last_ok_at = excluded.last_ok_at",
+             ON CONFLICT(repo) DO UPDATE SET last_ok_at = excluded.last_ok_at,
+                 last_error = NULL, last_error_at = NULL",
             params![repo, now],
         )?;
         tx.commit()?;
@@ -1665,12 +1669,9 @@ pub struct Unseen {
 }
 
 /// The Needs-you part of the Board count: tickets needs_you in an active
-/// lane whose latest `became_needs_you` is after `seen_at`, each once.
-pub fn needs_you_unseen(
-    board: &Board,
-    since: &BTreeMap<Key, String>,
-    seen_at: Option<&str>,
-) -> Unseen {
+/// lane whose latest `became_needs_you` event is newer than the newest
+/// event when the owner looked, each once.
+pub fn needs_you_unseen(board: &Board, since: &BTreeMap<Key, i64>, seen_event_id: i64) -> Unseen {
     let mut unseen = Unseen::default();
     let mut counted = BTreeSet::new();
     for view in &board.lanes {
@@ -1680,9 +1681,7 @@ pub fn needs_you_unseen(
             }
             let fresh = since
                 .get(&row.key)
-                // Seconds resolution: a change in the second the owner
-                // looked still counts, until the next seen.
-                .is_some_and(|at| seen_at.is_none_or(|seen| at.as_str() >= seen));
+                .is_some_and(|event_id| *event_id > seen_event_id);
             if fresh {
                 unseen.lane_ids.insert(view.lane.id);
                 if counted.insert(row.key.clone()) {

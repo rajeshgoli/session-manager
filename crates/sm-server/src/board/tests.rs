@@ -1392,12 +1392,14 @@ fn board_json_shape() {
 #[test]
 fn needs_you_counts_until_seen() {
     let board = compute(&iteration7(), now());
-    let since = BTreeMap::from([(ko(1813), "2026-09-28T22:40:00Z".to_owned())]);
-    let unseen = needs_you_unseen(&board, &since, None);
+    let since = BTreeMap::from([(ko(1813), 40)]);
+    let unseen = needs_you_unseen(&board, &since, 0);
     assert_eq!(unseen.count, 1);
     assert_eq!(unseen.lane_ids, BTreeSet::from([1]));
-    let seen = needs_you_unseen(&board, &since, Some("2026-09-28T23:00:00Z"));
-    assert_eq!(seen.count, 0);
+    // Seen with event 40 the newest: seen, even within the same second.
+    assert_eq!(needs_you_unseen(&board, &since, 40).count, 0);
+    // A later event in the same second is not.
+    assert_eq!(needs_you_unseen(&board, &since, 39).count, 1);
 }
 
 #[test]
@@ -1436,12 +1438,4 @@ fn lookup_state_reason_keeps_github_casing() {
     let mut closed = item(&k(5), false);
     closed.state_reason = Some("not_planned".into());
     assert_eq!(done_reason(&closed), Some("not_planned"));
-}
-
-#[test]
-fn needs_you_in_the_seen_second_still_counts() {
-    let board = compute(&iteration7(), now());
-    let since = BTreeMap::from([(ko(1813), "2026-09-28T22:40:00Z".to_owned())]);
-    let unseen = needs_you_unseen(&board, &since, Some("2026-09-28T22:40:00Z"));
-    assert_eq!(unseen.count, 1);
 }
