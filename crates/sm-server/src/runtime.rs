@@ -586,8 +586,22 @@ impl TmuxRuntime {
         }
 
         if let Err(error) = self.attach_session_log(spec, &prompt_mode) {
+            // Capture the rendered provider state before teardown; the pipe-pane
+            // log alone is a stream of terminal repaint sequences.
+            let snapshot = spec.log_file.with_extension("failed-spawn.txt");
+            let snapshot_saved = spec.force_initial_prompt_stdin
+                && self
+                    .capture_pane_text(&spec.tmux_session)
+                    .is_some_and(|pane| fs::write(&snapshot, pane).is_ok());
             let _ = self.kill_session(&spec.tmux_session);
-            return Err(error);
+            return Err(if snapshot_saved {
+                error.context(format!(
+                    "initial brief launch failed; provider pane retained at {}",
+                    snapshot.display()
+                ))
+            } else {
+                error
+            });
         }
         Ok(())
     }
@@ -1851,7 +1865,8 @@ impl TmuxRuntime {
     }
 
     /// Claude has no structured event stream.  Its provider-originated
-    /// acknowledgement is the exact user turn it appends to the transcript for
+    /// acknowledgement is the user turn (allowing Claude's boundary whitespace
+    /// trimming) it appends to the transcript for
     /// the generated provider session.  We do not resend if that turn is
     /// missing: the original Enter may already have been seen.
     fn wait_for_claude_initial_brief_acceptance(
@@ -2221,8 +2236,9 @@ fn claude_nested_transcript_candidates(project_directories: &[PathBuf]) -> Vec<P
     files
 }
 
-/// A transcript is acknowledgement only if it appends an exact user turn for
-/// this generated provider session after the startup boundary.  Incomplete and
+/// A transcript is acknowledgement only if it appends a matching user turn for
+/// this generated provider session after the startup boundary. Claude trims
+/// boundary whitespace on submission; interior text must still match exactly.  Incomplete and
 /// malformed JSONL records fail closed and are reconsidered on the next poll.
 fn claude_transcript_has_matching_user_turn(
     path: &Path,
@@ -2248,7 +2264,9 @@ fn claude_transcript_has_matching_user_turn(
                     .and_then(Value::as_object)
                     .and_then(|message| message.get("content"))
                     .and_then(Value::as_str)
-                    == Some(prompt)
+                    .is_some_and(|content| {
+                        content == prompt || (!prompt.trim().is_empty() && content == prompt.trim())
+                    })
         })
 }
 
@@ -3412,6 +3430,52 @@ esac
             offset,
             provider_session_id,
             "exact immutable brief"
+        ));
+    }
+
+    #[test]
+    fn claude_initial_brief_acceptance_allows_only_boundary_whitespace_trimming() {
+        let root = tempfile_path("claude-trimmed-brief");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("transcript.jsonl");
+        let body = format!(
+            "Read `the brief`.\n\n- {}\n1. Finish → report.",
+            "detail ".repeat(350)
+        );
+        let prompt = format!("  \n{body}\n");
+        let entry = serde_json::json!({
+            "type": "user", "sessionId": "provider-id",
+            "message": {"content": body}
+        });
+        fs::write(&path, format!("{entry}\n")).unwrap();
+        assert!(claude_transcript_has_matching_user_turn(
+            &path,
+            0,
+            "provider-id",
+            &prompt
+        ));
+        for wrong in [
+            prompt.replace("detail", "changed"),
+            prompt.replace("\n\n", "\n"),
+        ] {
+            assert!(!claude_transcript_has_matching_user_turn(
+                &path,
+                0,
+                "provider-id",
+                &wrong
+            ));
+        }
+        assert!(!claude_transcript_has_matching_user_turn(
+            &path,
+            0,
+            "other-provider",
+            &prompt
+        ));
+        assert!(!claude_transcript_has_matching_user_turn(
+            &path,
+            fs::metadata(&path).unwrap().len(),
+            "provider-id",
+            &prompt
         ));
     }
 

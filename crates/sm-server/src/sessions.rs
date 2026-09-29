@@ -4587,7 +4587,7 @@ impl SessionStore {
         if let Err(error) = runtime.create_session(&spec) {
             let _guard = self.write_guard()?;
             let mut state = self.load_raw_json_value()?;
-            let error_message = error.to_string();
+            let error_message = format!("{error:#}");
             let recovery_detail = request.spawn_brief.as_ref().and_then(|brief| {
                 state
                     .get("spawn_launch_intents")
@@ -4602,7 +4602,10 @@ impl SessionStore {
                         let path = artifact.get("path").and_then(Value::as_str)?;
                         let sha256 = artifact.get("sha256").and_then(Value::as_str)?;
                         Some(format!(
-                            "accepted brief retained at {path} (sha256 {sha256}); inspect provider state before manually recovering it"
+                            "accepted brief retained at {path} (sha256 {sha256}); failed session {} (provider session {}), runtime log {}; inspect retained diagnostics before manually recovering it",
+                            record.id,
+                            record.provider_resume_id.as_deref().unwrap_or("unavailable"),
+                            spec.log_file.display()
                         ))
                     })
             });
@@ -4610,6 +4613,10 @@ impl SessionStore {
                 .as_deref()
                 .map(|detail| format!("{error_message}; {detail}"))
                 .unwrap_or_else(|| error_message.clone());
+            eprintln!(
+                "session runtime launch failed: session={} provider={}: {failure_reason}",
+                record.id, record.provider
+            );
             let remove_provisional_session =
                 remove_failed_provisional_runtime_session(&state, &record.id);
             mark_runtime_launch_failed(
