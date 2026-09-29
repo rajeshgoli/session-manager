@@ -171,8 +171,6 @@ fun docReaderPage(doc: SessionDoc): ReaderPage = ReaderPage(
 fun ownerReaderPage(title: String, path: String): ReaderPage =
     ReaderPage(title = title, subtitle = path, path = path, followsPage = true)
 
-val historyReaderPage: ReaderPage get() = ownerReaderPage("History", "/history")
-
 /**
  * The reader page for an opened sm link on the owner's browser host
  * (`https://<linkHost>/docs/…`, `/messages/…`, `/t/…`, `/history` or `/guestbook`), or null when the link

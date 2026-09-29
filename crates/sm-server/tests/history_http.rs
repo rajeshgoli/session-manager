@@ -496,6 +496,69 @@ async fn timeline_of_an_untracked_item_is_404_not_tracked() {
 
 // ---- web watch (#1489) -----------------------------------------------------
 
+fn agent_ids(page: &Value) -> Vec<&str> {
+    page["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap())
+        .collect()
+}
+
+/// `/history/agents` (sm#1661): non-live agents newest first with what they
+/// worked on; a restored agent leaves the list.
+#[tokio::test]
+async fn agent_history_lists_stopped_agents_with_their_work_and_drops_restored_ones() {
+    let f = seeded().await;
+    post(&f.app, "/sessions/eng00001/retire", json!({})).await;
+
+    let (status, body) = get_json(&f.app, "/history/agents").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["schema_version"], 1);
+    assert_eq!(body["total"], 2);
+    assert_eq!(body["next_before"], Value::Null);
+    // Retired just now, so newer than gone0001's last activity.
+    assert_eq!(agent_ids(&body), vec!["eng00001", "gone0001"]);
+    let eng = &body["agents"][0];
+    assert_eq!(eng["name"], "eng00001-agent");
+    assert_eq!(eng["state"], "retired");
+    assert_eq!(eng["parent_session_id"], "lead0001");
+    assert_eq!(eng["restorable"], true);
+    assert_eq!(eng["unrestorable_reason"], Value::Null);
+    assert_eq!(
+        eng["work"]["tickets"],
+        json!([{"repo": REPO, "number": 1, "title": "Item <1>", "state": "open",
+                "url": "https://github.com/acme/widgets/issues/1",
+                "history_path": "/t/widgets/1"}])
+    );
+    assert_eq!(eng["work"]["prs"][0]["number"], 9);
+    assert_eq!(eng["work"]["prs"].as_array().unwrap().len(), 1);
+    assert_eq!(eng["work"]["docs"][0]["title"], "Memo <draft>");
+    let gone = &body["agents"][1];
+    assert_eq!(gone["state"], "stopped");
+    assert_eq!(gone["ended_at"], "2026-09-24T00:01:00Z");
+    assert_eq!(gone["work"], json!({"tickets": [], "prs": [], "docs": []}));
+
+    // Paging: one per page, the cursor continues below the last row.
+    let (_, first) = get_json(&f.app, "/history/agents?limit=1").await;
+    assert_eq!(agent_ids(&first), vec!["eng00001"]);
+    let cursor = first["next_before"].as_str().unwrap();
+    let (_, second) = get_json(&f.app, &format!("/history/agents?limit=1&before={cursor}")).await;
+    assert_eq!(agent_ids(&second), vec!["gone0001"]);
+    assert_eq!(second["next_before"], Value::Null);
+    let (status, _) = get_json(&f.app, "/history/agents?before=garbage!").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Search matches names case-insensitively; total counts the matches.
+    let (_, found) = get_json(&f.app, "/history/agents?q=GONE").await;
+    assert_eq!(agent_ids(&found), vec!["gone0001"]);
+    assert_eq!(found["total"], 1);
+
+    post(&f.app, "/sessions/gone0001/restore", json!({})).await;
+    let (_, after) = get_json(&f.app, "/history/agents").await;
+    assert_eq!(agent_ids(&after), vec!["eng00001"]);
+}
+
 async fn watch_state(app: &axum::Router, query: &str) -> Value {
     let (status, body) = get_json(app, &format!("/watch/state{query}")).await;
     assert_eq!(status, StatusCode::OK, "{body}");

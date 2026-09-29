@@ -199,4 +199,15 @@ interface ApiService {
         @Query("repo") repo: String?,
         @Query("before") before: Long?,
     ): li.rajeshgo.sm.data.model.GuestbookResponse
+
+    /** Agents no longer live (sm#1661), newest first; `before` is the previous page's `next_before`. */
+    @GET("history/agents")
+    suspend fun getAgentHistory(
+        @Query("q") query: String?,
+        @Query("before") before: String?,
+    ): li.rajeshgo.sm.data.model.AgentHistoryResponse
+
+    /** Brings a stopped or retired agent back, as `sm restore` does. */
+    @POST("sessions/{session_id}/restore")
+    suspend fun restoreSession(@Path("session_id") sessionId: String): kotlinx.serialization.json.JsonObject
 }
