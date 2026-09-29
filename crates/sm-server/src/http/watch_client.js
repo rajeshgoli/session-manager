@@ -7,6 +7,8 @@
   if (!W || !window.fetch) return;
   var every = Math.max(2, +W.getAttribute('data-refresh') || 3) * 1000;
   var open = {}, last = null, counts = S ? S.textContent : '', okAt = Date.now(), stale = false, busy = false;
+  var editor = null, latest = null, refreshAgain = false;
+  var defaultsPanel = document.getElementById('handoff-defaults');
 
   function e(x) {
     return String(x == null ? '' : x).replace(/[&<>"']/g, function (c) {
@@ -113,7 +115,7 @@
       '" style="margin-left:' + Math.min(v.depth || 0, 6) * 14 + 'px"><summary><span class="row"><span class="dot ' +
       e(v.state) + '"></span><span class="mt nm">' + e(v.name) + '</span><span class="m">' + e(v.provider) + ' · ' +
       e(v.state) + ' ' + age(v.last_activity, now) + '</span>' + chips + '</span>' +
-      (v.status_text ? '<span class="st">' + e(v.status_text) + '</span>' : '') + '</summary>' +
+      (v.status_text ? '<span class="st">' + e(v.status_text) + '</span>' : '') + handoffLine(v) + '</summary>' +
       sections([['Work', work(v)], ['Docs', docs(ds, now)], ['Reviews', reviews(v, waiting, now)],
         ['Jobs', jobs(v, now)], ['Attach', att]]) + '</details>';
   }
@@ -126,6 +128,113 @@
   }
   window.smWatchRender = render;
 
+  function handoffText(v) {
+    return (typeof v.context_percent === 'number' ? 'ctx ' + Math.round(v.context_percent) + '% · ' : '') + (v.handoff.display || '');
+  }
+  function handoffLine(v) {
+    return v.handoff ? '<span class="st"><button type="button" data-handoff="' + e(v.id) + '">' + e(handoffText(v)) + '</button></span>' : '';
+  }
+  function api(path, method, body) {
+    var options = { method: method, credentials: 'same-origin', cache: 'no-store' };
+    if (body) { options.headers = { 'Content-Type': 'application/json' }; options.body = JSON.stringify(body); }
+    return fetch(path, options).then(function (r) {
+      return r.json().then(function (value) {
+        if (!r.ok) throw new Error(value.detail || 'HTTP ' + r.status);
+        return value;
+      });
+    });
+  }
+  function closeEditor() {
+    if (editor) editor.remove();
+    editor = null; last = null; refresh();
+  }
+  function notice(panel, text) { panel.querySelector('[role="status"]').textContent = text; }
+  function saving(panel, enabled) {
+    panel.querySelectorAll('input, button').forEach(function (control) { control.disabled = enabled; });
+  }
+  function write(panel, path, body) {
+    saving(panel, true); notice(panel, 'Saving…');
+    return api(path, 'PUT', body).then(function (value) {
+      notice(panel, 'Saved'); refresh(); return value;
+    }).catch(function (error) { notice(panel, error.message); throw error; })
+      .finally(function () { saving(panel, false); });
+  }
+  function percent(input, zero) {
+    var value = input.value.trim(), number = Number(value);
+    if (!value || !Number.isFinite(number) || number > 100 || (zero ? number < 0 : number <= 0)) {
+      throw new Error(zero ? 'Enter a percentage from 0 to 100' : 'Enter a percentage greater than 0 and at most 100');
+    }
+    return number;
+  }
+  function openHandoff(button) {
+    if (editor) closeEditor();
+    var id = button.getAttribute('data-handoff'), panel = document.createElement('div');
+    var path = '/sessions/' + encodeURIComponent(id) + '/handoff-policy';
+    panel.className = 'handoff-panel';
+    panel.innerHTML = '<strong>Context handoff</strong> <button type="button" data-close>Close</button>' +
+      '<p role="status">Loading…</p><div data-controls hidden>' +
+      '<label><input type="checkbox" data-enabled> Enabled</label> ' +
+      '<label>Threshold (%) <input type="number" min="1" max="100" step="1" data-threshold></label> ' +
+      '<button type="button" data-default>Use default</button> <button type="button" data-now>Hand off now</button>' +
+      '<span data-confirm hidden> Ask this agent to hand off? <button type="button" data-yes>Confirm handoff</button> <button type="button" data-no>Cancel</button></span></div>';
+    button.closest('details').open = true;
+    button.closest('details').appendChild(panel); editor = panel;
+    panel.querySelector('[data-close]').onclick = closeEditor;
+    var enabled = panel.querySelector('[data-enabled]'), threshold = panel.querySelector('[data-threshold]');
+    function show(value) {
+      enabled.checked = value.enabled; threshold.value = value.threshold_percent;
+      panel.querySelector('[data-controls]').hidden = false;
+    }
+    api(path, 'GET').then(function (value) { show(value); notice(panel, 'Using ' + value.source + ' policy'); })
+      .catch(function (error) { notice(panel, error.message); });
+    function update(body) { write(panel, path, body).then(show).catch(function () {}); }
+    enabled.onchange = function () { update({ enabled: enabled.checked }); };
+    threshold.onchange = function () {
+      try {
+        var number = percent(threshold, false);
+        if (!Number.isInteger(number)) throw new Error('Enter an integer from 1 to 100');
+        update({ threshold_percent: number });
+      } catch (error) { notice(panel, error.message); }
+    };
+    panel.querySelector('[data-default]').onclick = function () { update({ use_default: true }); };
+    var confirm = panel.querySelector('[data-confirm]');
+    panel.querySelector('[data-now]').onclick = function () { confirm.hidden = false; };
+    panel.querySelector('[data-no]').onclick = function () { confirm.hidden = true; };
+    panel.querySelector('[data-yes]').onclick = function () { confirm.hidden = true; update({ ask_now: true }); };
+  }
+  function renderDefaults(value) {
+    var providers = Object.keys(value.providers || {});
+    ['claude', 'codex-fork', 'codex-app'].forEach(function (p) { if (providers.indexOf(p) < 0) providers.push(p); });
+    var fields = providers.sort().map(function (p) { return ['providers.' + p, 'Enable ' + p, !!value.providers[p]]; });
+    [['threshold_percent', 'Context threshold (%)'], ['ask_on_codex_review', 'Ask on Codex review request'],
+      ['ask_on_doc_review', 'Ask on doc review request'], ['review_floor_percent', 'Review floor (%)'],
+      ['reminder_percent', 'Reminder at (%)']].forEach(function (f) { fields.push([f[0], f[1], value[f[0]]]); });
+    defaultsPanel.innerHTML = '<strong>Handoff defaults</strong> <button type="button" data-close>Close</button><p role="status"></p>' +
+      fields.map(function (f) {
+        var bool = typeof f[2] === 'boolean';
+        return '<p><label>' + e(f[1]) + ' <input data-field="' + e(f[0]) + '" type="' + (bool ? 'checkbox' : 'number') + '" ' +
+          (bool ? (f[2] ? 'checked' : '') : 'min="0" max="100" step="any" value="' + e(f[2]) + '"') + '></label></p>';
+      }).join('');
+    defaultsPanel.querySelector('[data-close]').onclick = function () { defaultsPanel.hidden = true; };
+    defaultsPanel.querySelectorAll('[data-field]').forEach(function (input) {
+      input.onchange = function () {
+        try {
+          var field = input.getAttribute('data-field'), body = {};
+          var next = input.type === 'checkbox' ? input.checked : percent(input, field === 'review_floor_percent');
+          if (field.indexOf('providers.') === 0) { body.providers = {}; body.providers[field.slice(10)] = next; }
+          else body[field] = next;
+          write(defaultsPanel, '/handoff-defaults', body).then(renderDefaults).catch(function () {});
+        } catch (error) { notice(defaultsPanel, error.message); }
+      };
+    });
+  }
+  var defaultsButton = document.getElementById('handoff-defaults-open');
+  if (defaultsButton && defaultsPanel) defaultsButton.onclick = function () {
+    defaultsPanel.hidden = false;
+    defaultsPanel.innerHTML = '<p role="status">Loading…</p>';
+    api('/handoff-defaults', 'GET').then(renderDefaults).catch(function (error) { notice(defaultsPanel, error.message); });
+  };
+
   function label() {
     if (!S) return;
     var n = Math.floor((Date.now() - okAt) / 1000);
@@ -133,13 +242,21 @@
     S.className = stale ? 'm stale' : 'm';
   }
   function refresh() {
-    if (busy || document.visibilityState === 'hidden') return;
+    if (busy) { refreshAgain = true; return; }
+    if (document.visibilityState === 'hidden') return;
     busy = true;
     fetch('/watch/state' + location.search, { credentials: 'same-origin', cache: 'no-store' })
       .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
       .then(function (doc) {
+        latest = doc;
         var html = render(doc);
-        if (html !== last) {
+        if (editor) {
+          // Keep the form and focus intact while updating the visible context lines.
+          W.querySelectorAll('[data-handoff]').forEach(function (button) {
+            var v = arr(latest.sessions).filter(function (v) { return v.id === button.getAttribute('data-handoff'); })[0];
+            if (v && v.handoff) button.textContent = handoffText(v);
+          });
+        } else if (html !== last) {
           last = html;
           W.innerHTML = html;
           W.querySelectorAll('details[data-id]').forEach(function (d) {
@@ -151,7 +268,7 @@
         okAt = Date.now(); stale = false; label();
       })
       .catch(function () { stale = true; label(); })
-      .then(function () { busy = false; });
+      .then(function () { busy = false; if (refreshAgain) { refreshAgain = false; refresh(); } });
   }
 
   W.addEventListener('toggle', function (ev) {
@@ -159,6 +276,8 @@
     if (id) open[id] = ev.target.open;
   }, true);
   W.addEventListener('click', function (ev) {
+    var handoff = ev.target.closest && ev.target.closest('[data-handoff]');
+    if (handoff) { ev.preventDefault(); openHandoff(handoff); return; }
     var c = ev.target.closest && ev.target.closest('.cp');
     if (!c || !navigator.clipboard) return;
     navigator.clipboard.writeText(c.getAttribute('data-cp')).then(function () {

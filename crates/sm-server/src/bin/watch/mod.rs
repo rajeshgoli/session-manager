@@ -21,6 +21,7 @@ use std::{
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+mod handoff;
 #[cfg(test)]
 mod tests;
 
@@ -521,6 +522,13 @@ impl Client {
                 .patch(&url)
                 .header("Content-Type", "application/json")
                 .send(bytes.as_slice())?,
+            "PUT" => {
+                let mut request = agent.put(&url).header("Content-Type", "application/json");
+                if let Some(id) = super::optional_current_session_id() {
+                    request = request.header("X-SM-Session", &id);
+                }
+                request.send(bytes.as_slice())?
+            }
             _ => bail!("unsupported method"),
         };
         let status = response.status().as_u16();
@@ -845,6 +853,10 @@ struct View {
     retained: BTreeMap<String, Value>,
     flash: String,
     retire: Option<(String, Instant)>,
+    handoff: Option<(String, Instant)>,
+    defaults_open: bool,
+    defaults: Value,
+    default_index: usize,
     busy: bool,
     free_scroll: bool,
     /// API base, for absolute doc reader URLs.
@@ -872,6 +884,10 @@ impl View {
             retained: BTreeMap::new(),
             flash: String::new(),
             retire: None,
+            handoff: None,
+            defaults_open: false,
+            defaults: Value::Null,
+            default_index: 0,
             busy: false,
             free_scroll: false,
             base_url: String::new(),
@@ -1057,7 +1073,7 @@ impl View {
         let claims = obligation.map(claim_marker).unwrap_or_default();
         rows.push(Row {
             text: format!(
-                "{prefix}{} {:20} {:8} {:10} {:5} {:10} {:8} {:8}{}{claims}",
+                "{prefix}{} {:20} {:8} {:10} {:5} {:10} {:8} {:8} {}{}{claims}",
                 if state == "waiting" { "◷ " } else { "+-" },
                 clipped(name(v), 20),
                 id,
@@ -1066,6 +1082,7 @@ impl View {
                 s(v, "provider"),
                 s(v, "role"),
                 s(v, "node"),
+                handoff::context(v),
                 if docs.is_empty() {
                     docs
                 } else {
@@ -1470,6 +1487,7 @@ fn show_help() -> Result<()> {
         "In logs: PgUp/PgDn scroll; End follows newest output; q goes back",
         "Enter: attach (restore in --restore mode)",
         "s: send message; n: rename; +: create",
+        "H: handoff on/off/default/percent/now; P: handoff defaults",
         "K then K within 5s: retire selected session",
         "A/X: approve/reject a human-gated reparent request",
         "R/B: resume/rollback a failed reparent request",
@@ -1564,7 +1582,7 @@ fn frame(
     lines[1] = if jobs {
         "Job                         Type       State    Age   Agent / ID".into()
     } else {
-        "Session                  ID       Activity   Age   Provider   Role     Node".into()
+        "Session                  ID       Activity   Age   Provider   Role     Node     Context / handoff".into()
     };
     let available = h.saturating_sub(4);
     let list_height = if jobs {
@@ -1798,6 +1816,9 @@ pub(super) fn run(url: &str, mut args: WatchArgs) -> Result<()> {
             match reply.result {
                 Err(error) => view.flash = error,
                 Ok(value) => {
+                    if value.get("providers").is_some() {
+                        view.defaults = value.clone();
+                    }
                     if reply.attach {
                         view.flash = match attach(&terminal, &value) {
                             Ok(()) => "Detached".into(),
@@ -1814,6 +1835,14 @@ pub(super) fn run(url: &str, mut args: WatchArgs) -> Result<()> {
             }
         }
         let snap = worker.snapshot();
+        if view.defaults_open {
+            handoff::draw_defaults(&view)?;
+            if let Err(error) = handoff::defaults_key(key()?, &worker, &mut view) {
+                view.flash = error.to_string();
+            }
+            last_frame.clear();
+            continue;
+        }
         let rows = view.rows(&snap, &args, OffsetDateTime::now_utc().unix_timestamp());
         let (h, w) = size();
         view.tail_lines = h.saturating_mul(4).clamp(200, 10_000);
@@ -1839,6 +1868,9 @@ pub(super) fn run(url: &str, mut args: WatchArgs) -> Result<()> {
         last_frame.clear();
         if key != Key::Char('K') {
             view.retire = None;
+        }
+        if key != Key::Char('H') {
+            view.handoff = None;
         }
         if matches!(key, Key::Char('q') | Key::Esc) {
             if view.jobs_for.take().is_some() {
@@ -1926,6 +1958,25 @@ fn handle_key(
         }
         Key::Char('?') => {
             show_help()?;
+        }
+        Key::Char('P') => {
+            send_action(
+                worker,
+                view,
+                "GET",
+                "/handoff-defaults".into(),
+                Value::Null,
+                false,
+            )?;
+            view.defaults_open = true;
+        }
+        Key::Char('H') if !id.is_empty() && !args.restore => {
+            if handoff::confirm_now(worker, view, id)? {
+                return Ok(());
+            }
+            if let Some(text) = prompt("handoff [on | off | default | 1–100 | now]> ")? {
+                handoff::apply(worker, view, id, &text)?;
+            }
         }
         Key::Char('J') if !id.is_empty() && !args.restore => {
             view.jobs_for = Some(id.into());

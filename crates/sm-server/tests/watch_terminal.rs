@@ -56,6 +56,7 @@ fn native_watch_handles_key_bursts_live_logs_resize_and_signal_cleanup() {
     listener.set_nonblocking(true).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let done = stop.clone();
+    let (mutations, received) = std::sync::mpsc::channel();
     let peer = thread::spawn(move || {
         while !done.load(Ordering::Relaxed) {
             let Ok((mut stream, _)) = listener.accept() else {
@@ -77,17 +78,34 @@ fn native_watch_handles_key_bursts_live_logs_resize_and_signal_cleanup() {
             if request.is_empty() {
                 continue;
             }
-            assert!(
-                request.starts_with("GET "),
-                "unexpected mutation: {request}"
-            );
             let path = request.split_whitespace().nth(1).unwrap();
+            if request.starts_with("PUT ") {
+                let length: usize = request
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                let mut bytes = vec![0; length];
+                stream.read_exact(&mut bytes).unwrap();
+                mutations
+                    .send((
+                        path.to_owned(),
+                        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                    ))
+                    .unwrap();
+            } else {
+                assert!(request.starts_with("GET "), "unexpected request: {request}");
+            }
             assert!(
                 !path.contains("/output") && !path.contains("/tool-calls"),
                 "job tail must not fetch agent output: {path}"
             );
             let body=match path {
-            "/sessions"=>json!({"sessions":[{"id":"agent001","friendly_name":"needle","working_dir":"/repo","status":"running","activity_state":"idle","provider":"claude"}]}),
+            "/sessions"=>json!({"sessions":[{"id":"agent001","friendly_name":"needle","working_dir":"/repo","status":"running","activity_state":"idle","provider":"claude","context_percent":28,"handoff":{"enabled":true,"has_gauge":true,"threshold_percent":35,"state":null}}]}),
+            "/handoff-defaults"=>json!({"providers":{"claude":true,"codex-app":false,"codex-fork":false},"threshold_percent":35,"ask_on_codex_review":true,"ask_on_doc_review":true,"review_floor_percent":20,"reminder_percent":50}),
             "/queue-jobs"=>json!({"jobs":[{"id":"job001","requester_session_id":"agent001","notify_session_id":"agent001","state":"running","label":"fixture-job","queued_at":"2026-09-10T10:00:00Z","started_at":"2026-09-10T10:00:01Z"}]}),
             "/reparent-requests"=>json!({"requests":[]}),
             "/session-obligations"=>json!({"sessions":[{"session_id":"agent001","waiting_on":[{"kind":"queue_job","id":"job001","label":"fixture-job","since":"2026-09-10T10:00:00Z"}]}]}),
@@ -131,6 +149,38 @@ fn native_watch_handles_key_bursts_live_logs_resize_and_signal_cleanup() {
     );
     let initial = until(&mut master, "◷  needle");
     assert!(!initial.contains("fixture-job · waiting"));
+    assert!(initial.contains("28%/35"));
+    master.write_all(b"H45\r").unwrap();
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (
+            "/sessions/agent001/handoff-policy".into(),
+            json!({"threshold_percent":45})
+        )
+    );
+    until(&mut master, "Done");
+    master.write_all(b"Hnow\r").unwrap();
+    until(&mut master, "Press H within 5s");
+    assert!(received.try_recv().is_err());
+    master.write_all(b"H").unwrap();
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(5)).unwrap().1,
+        json!({"ask_now":true})
+    );
+    until(&mut master, "Done");
+    master.write_all(b"P").unwrap();
+    until(&mut master, "Enable claude: true");
+    master.write_all(b"\roff\r").unwrap();
+    assert_eq!(
+        received.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (
+            "/handoff-defaults".into(),
+            json!({"providers":{"claude":false}})
+        )
+    );
+    until(&mut master, "Done");
+    master.write_all(b"q").unwrap();
+    until(&mut master, "sm watch");
     // The job is directly selectable without expanding the agent or pressing J.
     master.write_all(b"/needle\rj\t").unwrap();
     until(&mut master, "five-line-output");

@@ -30,7 +30,12 @@ fn ensure_owner(
     path: &str,
     body: Option<&Value>,
 ) -> Result<(), ApiError> {
-    ensure_session_allowed_from_parts(&state.config, headers, Some(peer_addr), path)?;
+    // These controls share the watch page's owner login, including a verified
+    // Cloudflare browser assertion. Agent and Origin restrictions still apply.
+    let mut request = Request::builder().uri(path).body(Body::empty()).unwrap();
+    *request.headers_mut() = headers.clone();
+    request.extensions_mut().insert(ConnectInfo(peer_addr));
+    ensure_owner_page_read_allowed(state, &request)?;
     let from_agent = header_text(headers, SESSION_HEADER).is_some()
         || body.is_some_and(|body| body.get("requester_session_id").is_some());
     if from_agent {
