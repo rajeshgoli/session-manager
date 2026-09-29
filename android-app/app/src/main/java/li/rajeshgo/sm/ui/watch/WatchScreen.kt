@@ -137,6 +137,7 @@ import li.rajeshgo.sm.ui.theme.Violet
 import li.rajeshgo.sm.ui.update.SettingsIconButtonWithUpdate
 import li.rajeshgo.sm.ui.update.UpdateAvailabilityViewModel
 import li.rajeshgo.sm.ui.update.UpdateReadyBanner
+import li.rajeshgo.sm.ui.queue.waitingJobCount
 import li.rajeshgo.sm.util.launchTermuxAttach
 import li.rajeshgo.sm.util.termuxAttachCommand
 
@@ -148,6 +149,7 @@ private const val WATCH_TOAST_MS = 3500L
 fun WatchScreen(
     onNavigateToSettings: () -> Unit,
     onNavigateToAnalytics: () -> Unit,
+    onNavigateToQueue: () -> Unit,
     viewModel: WatchViewModel = viewModel(),
     updateViewModel: UpdateAvailabilityViewModel = viewModel(),
 ) {
@@ -479,7 +481,9 @@ fun WatchScreen(
             AppBottomNav(
                 currentRoute = Routes.WATCH,
                 onWatch = {},
+                onQueue = onNavigateToQueue,
                 onAnalytics = onNavigateToAnalytics,
+                queueBadge = waitingJobCount(state.sessions),
             )
         }
 

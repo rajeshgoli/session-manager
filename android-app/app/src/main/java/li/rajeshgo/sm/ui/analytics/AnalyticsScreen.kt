@@ -93,6 +93,7 @@ private const val ANALYTICS_AUTO_REFRESH_MS = 10000L
 fun AnalyticsScreen(
     onNavigateToWatch: () -> Unit,
     onNavigateToSettings: () -> Unit,
+    onNavigateToQueue: () -> Unit,
     onOpenDetail: (String) -> Unit,
     viewModel: AnalyticsViewModel = viewModel(),
     updateViewModel: UpdateAvailabilityViewModel = viewModel(),
@@ -251,6 +252,7 @@ fun AnalyticsScreen(
             AppBottomNav(
                 currentRoute = Routes.ANALYTICS,
                 onWatch = onNavigateToWatch,
+                onQueue = onNavigateToQueue,
                 onAnalytics = {},
             )
         }
@@ -264,6 +266,7 @@ fun AnalyticsDetailScreen(
     onNavigateToWatch: () -> Unit,
     onNavigateToAnalytics: () -> Unit,
     onNavigateToSettings: () -> Unit,
+    onNavigateToQueue: () -> Unit,
     viewModel: AnalyticsViewModel = viewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -403,6 +406,7 @@ fun AnalyticsDetailScreen(
             AppBottomNav(
                 currentRoute = Routes.ANALYTICS,
                 onWatch = onNavigateToWatch,
+                onQueue = onNavigateToQueue,
                 onAnalytics = onNavigateToAnalytics,
             )
         }

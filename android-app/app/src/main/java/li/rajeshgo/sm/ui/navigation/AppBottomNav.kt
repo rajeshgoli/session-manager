@@ -11,6 +11,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ViewList
 import androidx.compose.material.icons.rounded.Analytics
+import androidx.compose.material.icons.rounded.HourglassTop
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -29,8 +30,10 @@ import li.rajeshgo.sm.ui.theme.TextMuted
 fun AppBottomNav(
     currentRoute: String,
     onWatch: () -> Unit,
+    onQueue: () -> Unit,
     onAnalytics: () -> Unit,
     modifier: Modifier = Modifier,
+    queueBadge: Int = 0,
 ) {
     Surface(
         modifier = modifier,
@@ -50,6 +53,12 @@ fun AppBottomNav(
                 selected = currentRoute == Routes.WATCH,
                 icon = { Icon(Icons.AutoMirrored.Rounded.ViewList, contentDescription = null, modifier = Modifier.size(18.dp)) },
                 onClick = onWatch,
+            )
+            AppBottomNavItem(
+                label = if (queueBadge > 0) "Queue · $queueBadge" else "Queue",
+                selected = currentRoute == Routes.QUEUE,
+                icon = { Icon(Icons.Rounded.HourglassTop, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                onClick = onQueue,
             )
             AppBottomNavItem(
                 label = "Analytics",

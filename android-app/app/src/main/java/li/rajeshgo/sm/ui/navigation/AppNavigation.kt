@@ -12,6 +12,8 @@ import li.rajeshgo.sm.data.repository.SettingsRepository
 import li.rajeshgo.sm.push.FollowOpenRequests
 import li.rajeshgo.sm.ui.analytics.AnalyticsDetailScreen
 import li.rajeshgo.sm.ui.analytics.AnalyticsScreen
+import li.rajeshgo.sm.ui.queue.QueueScreen
+import li.rajeshgo.sm.ui.queue.UsageScreen
 import li.rajeshgo.sm.ui.settings.SettingsScreen
 import li.rajeshgo.sm.ui.watch.WatchScreen
 
@@ -20,6 +22,8 @@ object Routes {
     const val WATCH = "watch"
     const val ANALYTICS = "analytics"
     const val ANALYTICS_DETAIL = "analytics/detail"
+    const val QUEUE = "queue"
+    const val USAGE = "usage"
 }
 
 @Composable
@@ -88,7 +92,31 @@ fun AppNavigation() {
                         launchSingleTop = true
                     }
                 },
+                onNavigateToQueue = {
+                    navController.navigate(Routes.QUEUE) {
+                        launchSingleTop = true
+                    }
+                },
             )
+        }
+        composable(Routes.QUEUE) {
+            QueueScreen(
+                onNavigateToWatch = {
+                    navController.navigate(Routes.WATCH) {
+                        popUpTo(Routes.WATCH) { inclusive = false }
+                        launchSingleTop = true
+                    }
+                },
+                onNavigateToAnalytics = {
+                    navController.navigate(Routes.ANALYTICS) {
+                        launchSingleTop = true
+                    }
+                },
+                onOpenUsage = { navController.navigate(Routes.USAGE) },
+            )
+        }
+        composable(Routes.USAGE) {
+            UsageScreen(onBack = { navController.popBackStack() })
         }
         composable(Routes.ANALYTICS) {
             AnalyticsScreen(
@@ -100,6 +128,11 @@ fun AppNavigation() {
                 },
                 onNavigateToSettings = {
                     navController.navigate(Routes.SETTINGS)
+                },
+                onNavigateToQueue = {
+                    navController.navigate(Routes.QUEUE) {
+                        launchSingleTop = true
+                    }
                 },
                 onOpenDetail = { section ->
                     navController.navigate("${Routes.ANALYTICS_DETAIL}/$section")
@@ -124,6 +157,11 @@ fun AppNavigation() {
                 },
                 onNavigateToSettings = {
                     navController.navigate(Routes.SETTINGS)
+                },
+                onNavigateToQueue = {
+                    navController.navigate(Routes.QUEUE) {
+                        launchSingleTop = true
+                    }
                 },
             )
         }

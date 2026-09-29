@@ -33,6 +33,69 @@ class SessionManagerRepositoryTest {
     }
 
     @Test
+    fun askAgentDoesNotAttachToAnotherActiveWhatRequest() = kotlinx.coroutines.runBlocking {
+        val seen = mutableListOf<String>()
+        val client = okhttp3.OkHttpClient.Builder().addInterceptor { chain ->
+            val request = chain.request()
+            seen += "${request.method} ${request.url.encodedPath}"
+            okhttp3.Response.Builder().request(request).protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(409).message("Conflict").body(
+                    """{"detail":"Another summary request is already active: btw_abc123"}""".toResponseBody("application/json".toMediaType()),
+                ).build()
+        }.build()
+        val service = retrofit2.Retrofit.Builder().baseUrl("https://example.com/").client(client)
+            .addConverterFactory(kotlinx.serialization.json.Json { ignoreUnknownKeys = true }.asConverterFactory("application/json".toMediaType()))
+            .build().create(li.rajeshgo.sm.data.remote.ApiService::class.java)
+        val result = runCatching {
+            SessionManagerRepository().runWhatRequestWith(service, "agent", "How long?", attachOnConflict = false) {}
+        }
+        assertTrue(result.exceptionOrNull() is WhatRequestBusyException)
+        assertEquals(listOf("POST /sessions/agent/what"), seen)
+    }
+
+    @Test
+    fun queueRequestsUseTheSpecRoutesAndBodies() = kotlinx.coroutines.runBlocking {
+        val seen = mutableListOf<String>()
+        val client = okhttp3.OkHttpClient.Builder().addInterceptor { chain ->
+            val request = chain.request()
+            val buffer = okio.Buffer()
+            request.body?.writeTo(buffer)
+            seen += "${request.method} ${request.url.encodedPath}?${request.url.encodedQuery ?: ""} ${buffer.readUtf8()}"
+            val body = when {
+                request.url.encodedPath.endsWith("/cancel") -> """{"id":"job_1","state":"cancelled"}"""
+                request.url.encodedPath == "/client/queue" -> """{"owner_name":"Rajesh","slots":{"running":1,"max":8,"by_type":{"tests":{"running":1,"max":6}}},"running":[{"id":"r","type":"tests","state":"running"}],"queued":[{"id":"q","state":"pending","position":1,"wait_deadline_at":"2026-09-28T12:02:00Z"}],"ended":[{"id":"e","state":"displaced","ended_reason":"displaced","ended_summary":"Stopped"}]}"""
+                request.url.encodedPath == "/client/utilization/series" -> """{"available":true,"hours":1,"bucket_seconds":15,"buckets":[{"start":"2026-09-28T11:00:15Z","samples":3,"cpu_avg":25.0,"running":{"tests":2.0}},{"start":"2026-09-28T11:00:30Z","samples":0}]}"""
+                else -> """{"available":false}"""
+            }
+            okhttp3.Response.Builder().request(request).protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(200).message("OK").body(body.toResponseBody("application/json".toMediaType())).build()
+        }.build()
+        val service = retrofit2.Retrofit.Builder().baseUrl("https://example.com/").client(client)
+            .addConverterFactory(kotlinx.serialization.json.Json { ignoreUnknownKeys = true }.asConverterFactory("application/json".toMediaType()))
+            .build().create(li.rajeshgo.sm.data.remote.ApiService::class.java)
+        val overview = service.getQueue()
+        assertEquals("Rajesh", overview.ownerName)
+        assertEquals(1, overview.queued.single().position)
+        assertEquals("displaced", overview.ended.single().endedReason)
+        assertEquals(6, overview.slots.byType["tests"]?.max)
+        assertFalse(service.getQueueStats(168).available)
+        val series = service.getUtilizationSeries(1)
+        assertEquals(2.0, series.buckets[0].running["tests"])
+        assertEquals(0, series.buckets[1].samples)
+        assertNull(series.buckets[1].cpuAvg)
+        assertEquals("cancelled", service.cancelQueueJob("job_1", li.rajeshgo.sm.data.model.CancelQueueJobBody("not needed")).state)
+        assertEquals(
+            listOf(
+                "GET /client/queue? ",
+                "GET /client/queue/stats?hours=168 ",
+                "GET /client/utilization/series?hours=1 ",
+                """POST /queue-jobs/job_1/cancel? {"note":"not needed"}""",
+            ),
+            seen,
+        )
+    }
+
+    @Test
     fun followRequestsUseTheSpecRoutesAndBodies() = kotlinx.coroutines.runBlocking {
         val seen = mutableListOf<String>()
         val client = okhttp3.OkHttpClient.Builder().addInterceptor { chain ->

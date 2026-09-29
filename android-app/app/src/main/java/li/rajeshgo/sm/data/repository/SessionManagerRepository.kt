@@ -290,46 +290,91 @@ class SessionManagerRepository(
         }.mapFailure(::classifyWriteFailure)
     }
 
+    /**
+     * Ask an agent a side question. With [attachOnConflict] false (Ask agent on
+     * the Queue page) an already-active request fails with [WhatRequestBusyException]
+     * instead of showing that request's unrelated answer.
+     */
     suspend fun runWhatRequest(
         baseUrl: String,
         token: String,
         sessionId: String,
         prompt: String? = null,
+        attachOnConflict: Boolean = true,
         onUpdate: (WhatRequestRecord) -> Unit,
     ): Result<WhatRequestRecord> = withContext(Dispatchers.IO) {
         runCatching {
-            val service = api(baseUrl, token)
-            var current = try {
-                service.createWhatRequest(
-                    sessionId = sessionId,
-                    request = WhatRequestBody(deliveryMode = "poll", prompt = prompt),
-                )
-            } catch (error: HttpException) {
-                if (error.code() != 409) {
-                    throw classifyWriteFailure(error)
-                }
-                val detail = extractServerError(error)?.message
-                val activeRequestId = activeWhatRequestId(detail)
-                    ?: throw SessionManagerRequestException(
-                        detail ?: "Another summary request is already active.",
-                        error,
-                    )
-                executeReadRequest(service) {
-                    it.getWhatRequest(activeRequestId)
-                }
-            } catch (error: Throwable) {
+            runWhatRequestWith(api(baseUrl, token), sessionId, prompt, attachOnConflict, onUpdate)
+        }.mapFailure { if (it is WhatRequestBusyException) it else classifyWriteFailure(it) }
+    }
+
+    internal suspend fun runWhatRequestWith(
+        service: ApiService,
+        sessionId: String,
+        prompt: String?,
+        attachOnConflict: Boolean,
+        onUpdate: (WhatRequestRecord) -> Unit,
+    ): WhatRequestRecord {
+        var current = try {
+            service.createWhatRequest(
+                sessionId = sessionId,
+                request = WhatRequestBody(deliveryMode = "poll", prompt = prompt),
+            )
+        } catch (error: HttpException) {
+            if (error.code() != 409) {
                 throw classifyWriteFailure(error)
             }
-
-            onUpdate(current)
-            while (current.status !in setOf("completed", "failed", "timed_out")) {
-                delay(WHAT_REQUEST_POLL_INTERVAL_MS)
-                current = executeReadRequest(service) {
-                    it.getWhatRequest(current.requestId)
-                }
-                onUpdate(current)
+            val detail = extractServerError(error)?.message
+            if (!attachOnConflict) {
+                throw WhatRequestBusyException(detail, error)
             }
-            current
+            val activeRequestId = activeWhatRequestId(detail)
+                ?: throw SessionManagerRequestException(
+                    detail ?: "Another summary request is already active.",
+                    error,
+                )
+            executeReadRequest(service) {
+                it.getWhatRequest(activeRequestId)
+            }
+        } catch (error: WhatRequestBusyException) {
+            throw error
+        } catch (error: Throwable) {
+            throw classifyWriteFailure(error)
+        }
+
+        onUpdate(current)
+        while (current.status !in setOf("completed", "failed", "timed_out")) {
+            delay(WHAT_REQUEST_POLL_INTERVAL_MS)
+            current = executeReadRequest(service) {
+                it.getWhatRequest(current.requestId)
+            }
+            onUpdate(current)
+        }
+        return current
+    }
+
+    suspend fun fetchQueue(baseUrl: String, token: String): li.rajeshgo.sm.data.model.QueueOverview = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getQueue() }
+    }
+
+    suspend fun fetchQueueStats(baseUrl: String, token: String, hours: Int): li.rajeshgo.sm.data.model.QueueStats = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getQueueStats(hours) }
+    }
+
+    suspend fun fetchUtilizationSeries(baseUrl: String, token: String, hours: Int): li.rajeshgo.sm.data.model.UtilizationSeries = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getUtilizationSeries(hours) }
+    }
+
+    suspend fun fetchQueueJobLog(baseUrl: String, token: String, jobId: String, lines: Int): li.rajeshgo.sm.data.model.QueueJobLog = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getQueueJobLog(jobId, lines) }
+    }
+
+    suspend fun cancelQueueJob(baseUrl: String, token: String, jobId: String, note: String?): Result<li.rajeshgo.sm.data.model.SessionJob> = withContext(Dispatchers.IO) {
+        runCatching {
+            api(baseUrl, token).cancelQueueJob(
+                jobId,
+                li.rajeshgo.sm.data.model.CancelQueueJobBody(note?.trim()?.takeIf { it.isNotEmpty() }),
+            )
         }.mapFailure(::classifyWriteFailure)
     }
 
@@ -541,5 +586,9 @@ class SessionManagerRepository(
 }
 
 // A forbidden action or gateway refusal does not prove the device login expired.
+/** The agent is already answering another side question; nothing was sent. */
+class WhatRequestBusyException(detail: String?, cause: Throwable? = null) :
+    Exception(detail ?: "The agent is answering another question.", cause)
+
 internal fun forbiddenRequestFailure(error: Throwable): SessionManagerRequestException =
     SessionManagerRequestException("Access was refused. Your sign-in is saved. Retry or check device enrollment in Settings.", error)
