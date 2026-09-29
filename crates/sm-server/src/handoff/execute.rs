@@ -16,6 +16,10 @@ pub const RETIRE_SOURCE: &str = "handed_off";
 pub const ACCEPTED_TEXT: &str = "Handoff accepted. End your turn now; sm will start your successor when it ends and retire this session.";
 /// F.5 / G recovery: a `spawning` state found at startup.
 pub const RESTARTED_ERROR: &str = "server restarted while starting the successor";
+/// Predecessor-record stamps: the brief and the parent notice were queued,
+/// so a resumed transfer skips them.
+pub const BRIEF_QUEUED_KEY: &str = "handoff_brief_queued_at";
+pub const PARENT_NOTIFIED_KEY: &str = "handoff_parent_notified_at";
 /// The chain walk of H.2 stops after this many hops.
 pub const MAX_FORWARD_HOPS: usize = 32;
 

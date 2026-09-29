@@ -1406,12 +1406,21 @@ fn run_handoff(client: &ApiClient, args: HandoffArgs) -> Result<()> {
 fn handoff_note(args: HandoffArgs) -> Result<Value> {
     if let Some(link) = args.link {
         let link = link.trim();
-        let host = link
+        let authority = link
             .strip_prefix("https://")
             .or_else(|| link.strip_prefix("http://"))
             .and_then(|rest| rest.split(['/', '?', '#']).next())
-            .filter(|host| !host.is_empty());
-        if host.is_none() || link.chars().any(char::is_whitespace) {
+            .unwrap_or_default();
+        let (host, port) = authority.rsplit_once(':').unwrap_or((authority, ""));
+        let valid_host = !host.is_empty()
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && !label.starts_with('-')
+                    && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            });
+        let valid_port =
+            authority.contains(':') != port.is_empty() && port.chars().all(|c| c.is_ascii_digit());
+        if !valid_host || !valid_port || link.chars().any(char::is_whitespace) {
             bail!("--link must be an http or https URL: {link}");
         }
         return Ok(json!({ "kind": "link", "value": link }));
@@ -5829,11 +5838,21 @@ mod tests {
                 .to_string(),
             "sm handoff needs --link <url> or --path <file>"
         );
+        assert!(handoff_note(args(None, Some("http://localhost:8420/x"), None)).is_ok());
         assert_eq!(
             handoff_note(args(None, Some("https://github.com/a/b/pull/1#c"), None)).unwrap(),
             json!({"kind": "link", "value": "https://github.com/a/b/pull/1#c"})
         );
-        for bad in ["ftp://x", "https://", "notaurl", "https://a b"] {
+        for bad in [
+            "ftp://x",
+            "https://",
+            "notaurl",
+            "https://a b",
+            "http://:",
+            "https://.",
+            "https://a..b/x",
+            "https://host:/x",
+        ] {
             assert!(handoff_note(args(None, Some(bad), None)).is_err(), "{bad}");
         }
         let file = std::env::temp_dir().join(format!("sm-handoff-note-{}.md", std::process::id()));

@@ -402,15 +402,26 @@ impl SessionStore {
     }
 
     /// Queue the brief to the successor (G step 3) or the parent notice
-    /// (step 5). Both come from the predecessor.
+    /// (step 5), once: `stamp` on the predecessor record marks it queued, so
+    /// a resumed transfer never sends it twice. Both come from the
+    /// predecessor.
     pub fn queue_handoff_notice(
         &self,
         predecessor_id: &str,
         target_session_id: &str,
         text: &str,
+        stamp: &str,
     ) -> Result<()> {
         let _guard = self.write_guard()?;
         let mut state = self.load_raw_json_value()?;
+        let sessions = ensure_sessions_array_mut(&mut state)?;
+        let Some(predecessor) = session_object_mut(sessions, predecessor_id) else {
+            return Ok(());
+        };
+        if json_text(predecessor.get(stamp)).is_some() {
+            return Ok(());
+        }
+        predecessor.insert(stamp.to_owned(), Value::String(now_rfc3339()));
         let runtime = self.delivery_runtime.clone();
         self.queue_parent_message(
             &mut state,
@@ -942,6 +953,26 @@ mod tests {
             HandoffPhase::Done
         );
         assert!(store.pending_handoff_work().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_resumed_transfer_queues_each_notice_once() {
+        let store = store("notice", "idle");
+        for _ in 0..2 {
+            store
+                .queue_handoff_notice("pred0001", "succ0001", "brief", execute::BRIEF_QUEUED_KEY)
+                .unwrap();
+            store
+                .queue_handoff_notice(
+                    "pred0001",
+                    "lead0001",
+                    "notice",
+                    execute::PARENT_NOTIFIED_KEY,
+                )
+                .unwrap();
+        }
+        assert_eq!(queued(&store, "succ0001"), ["brief"]);
+        assert_eq!(queued(&store, "lead0001"), ["notice"]);
     }
 
     #[test]

@@ -384,9 +384,12 @@ async fn complete_handoff(
     let brief =
         tokio::task::spawn_blocking(move || move_work(&task_state, &store, &pred, &succ)).await??;
     // Step 3: the successor never acts before it holds the work.
-    state
-        .session_store
-        .queue_handoff_notice(predecessor_id, successor_id, &brief.text)?;
+    state.session_store.queue_handoff_notice(
+        predecessor_id,
+        successor_id,
+        &brief.text,
+        execute::BRIEF_QUEUED_KEY,
+    )?;
     // Step 4.
     retire_predecessor(state, predecessor_id, successor_id).await?;
     // Step 5.
@@ -397,9 +400,12 @@ async fn complete_handoff(
             brief.facts.percent,
             &brief.facts.note,
         );
-        state
-            .session_store
-            .queue_handoff_notice(predecessor_id, parent_id, &notice)?;
+        state.session_store.queue_handoff_notice(
+            predecessor_id,
+            parent_id,
+            &notice,
+            execute::PARENT_NOTIFIED_KEY,
+        )?;
     }
     // Steps 5 (leftover asks) and 6.
     state.session_store.finish_handoff(predecessor_id)
