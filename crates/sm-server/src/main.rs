@@ -169,6 +169,11 @@ async fn main() -> Result<()> {
             process_reserve: config.queue_runner.processes.reserve,
             job_process_limit: config.queue_runner.processes.job_max,
         };
+        sm_server::queue::spawn_host_memory_guard(
+            queue_state_dir.clone(),
+            cancel_grace_seconds,
+            admission_policy,
+        );
         thread::spawn(move || {
             match RetainedQueueStore::recover_queue_jobs_in_state_dir_with_policy(
                 &queue_state_dir,
