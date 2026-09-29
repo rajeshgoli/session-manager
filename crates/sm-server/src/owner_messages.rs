@@ -258,16 +258,7 @@ pub fn render_delivered_text(
             sections.push(comment.body.clone());
             continue;
         }
-        let quote = match quote.char_indices().nth(MAX_REPLY_QUOTE_CHARS) {
-            Some((cut, _)) => format!("{}…", &quote[..cut]),
-            None => quote.to_owned(),
-        };
-        let quoted = quote
-            .lines()
-            .map(|line| format!("> {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        sections.push(format!("{quoted}\n{}", comment.body));
+        sections.push(format!("{}\n{}", quote_block(quote), comment.body));
     }
     format!(
         "[Input from: {owner_name} via sm app] Re: \"{}\" ({})\n{}",
@@ -275,6 +266,48 @@ pub fn render_delivered_text(
         message.id,
         sections.join("\n\n")
     )
+}
+
+/// What the agent receives for a send from its Inbox thread (sm#1647): the
+/// quoted passages, then the text. `message` is the message the send answers;
+/// `None` is a note the owner wrote first, which has no `Re:` part.
+pub fn render_thread_text(
+    owner_name: &str,
+    message: Option<&OwnerMessage>,
+    body: &str,
+    quotes: &[String],
+) -> String {
+    let mut sections: Vec<String> = quotes
+        .iter()
+        .map(|quote| quote.trim())
+        .filter(|quote| !quote.is_empty())
+        .map(quote_block)
+        .collect();
+    let body = body.trim();
+    if !body.is_empty() {
+        sections.push(body.to_owned());
+    }
+    let header = match message {
+        Some(message) => format!(
+            "[Input from: {owner_name} via sm app] Re: \"{}\" ({})",
+            message.title, message.id
+        ),
+        None => format!("[Input from: {owner_name} via sm app]"),
+    };
+    format!("{header}\n{}", sections.join("\n\n"))
+}
+
+/// `> `-prefixed lines, cut at [`MAX_REPLY_QUOTE_CHARS`].
+fn quote_block(quote: &str) -> String {
+    let quote = match quote.char_indices().nth(MAX_REPLY_QUOTE_CHARS) {
+        Some((cut, _)) => format!("{}…", &quote[..cut]),
+        None => quote.to_owned(),
+    };
+    quote
+        .lines()
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Drafts in delivered order: by line, unplaceable ones last, then by age.
@@ -570,6 +603,43 @@ impl OwnerMessageStore {
             .query_map(params![since], message_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Every message, oldest first: the Inbox's agent threads.
+    pub fn all(&self) -> Result<Vec<OwnerMessage>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLUMNS} FROM owner_messages ORDER BY created_at, rowid"
+        ))?;
+        let rows = statement
+            .query_map([], message_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every reply, oldest first.
+    pub fn all_replies(&self) -> Result<Vec<OwnerMessageReply>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = conn.prepare(&format!(
+            "SELECT {REPLY_COLUMNS} FROM owner_message_replies ORDER BY created_at, rowid"
+        ))?;
+        let rows = statement
+            .query_map([], reply_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Sets `first_viewed_at` on every unread message from the sender.
+    pub fn mark_sender_viewed(&self, sender_session_id: &str) -> Result<usize> {
+        Ok(self.open_write()?.execute(
+            "UPDATE owner_messages SET first_viewed_at = ?2 \
+             WHERE sender_session_id = ?1 AND first_viewed_at IS NULL",
+            params![sender_session_id, now_rfc3339()],
+        )?)
     }
 
     pub fn has_reply(&self, message_id: &str) -> Result<bool> {

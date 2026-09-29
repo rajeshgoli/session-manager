@@ -90,7 +90,7 @@
 </style>
 
 <h1>An Inbox for agent messages and docs</h1>
-<p class="sans"><small>Author: sm-inbox-designer <code>519d87fe</code>; revision 2 by sm-1646-doc-review <code>58b00210</code> · Design proposal, no ticket yet · Revision 2 · Builds on the shipped design in <code>specs/1580_app_messages_replace_email.html</code></small></p>
+<p class="sans"><small>Author: sm-inbox-designer <code>519d87fe</code>; revisions 2–3 by sm-1647-inbox-engineer <code>58b00210</code> · Approved on PR #1646 · Server: #1647 (shipped) · Android: #1648 · Revision 3 · Builds on <code>specs/1580_app_messages_replace_email.html</code></small></p>
 
 <h2>Memo</h2>
 
@@ -301,7 +301,7 @@
 <tr><td>You want to tell a running agent something it has not asked about</td><td>Open its thread from the Inbox, or from the Watch card, and type. It arrives as <code>[Input from: Rajesh via sm app]</code>, the header agents already answer. Today this needs the terminal's "Message agent" box.</td></tr>
 <tr><td>An agent publishes a doc without <code>--review</code></td><td>Its doc thread shows under <b>New</b>, like a message without <code>--blocking</code>. Reading it moves it to Earlier. A later revision brings it back to New.</td></tr>
 <tr><td>An agent asks for a review</td><td>Its doc thread moves to <b>Needs you</b> and the phone buzzes, as today. The tap opens the doc page, where you comment and submit to GitHub, or tap <b>No review needed</b>. The review wakes the agent with <code>[sm review]</code>, as today. The agent thread gets a grey line, <i>Asked for review: &lt;title&gt;</i>, linking the doc.</td></tr>
-<tr><td>You review a doc whose author has ended</td><td>As on sm.rajeshgo.li today: the review goes to GitHub, and the doc page offers <b>Assign to a new agent</b>. If the PR already merged, commenting opens a new PR first. The hand-off and the new agent's next revision stay in the same doc thread.</td></tr>
+<tr><td>You review a doc whose author has ended</td><td>As on sm.rajeshgo.li today: the review goes to GitHub, and the doc page offers <b>Assign to a new agent</b>. If the PR already merged, commenting opens a new PR first. The hand-off and the new agent's next revision stay in the same doc thread. Until you review, the request shows under <b>New</b>, not Needs you: nobody is blocked, the same rule a blocking message from an ended agent follows today.</td></tr>
 <tr><td>You want a doc you signed off last month</td><td>The <b>Docs</b> filter lists every doc ever sent to you, newest activity first, each tagged with its state (Review requested, New, Read, Approved, Changes requested). No 30-day limit.</td></tr>
 <tr><td>A followed agent finishes, or dies</td><td>The notification, as today, plus a line in its thread: <i>Finished · report: &lt;title&gt;</i> linking the report, or <i>Ended without finishing</i>.</td></tr>
 <tr><td>A followed queue job ends</td><td>A grey line in the thread of the agent that submitted it: <i>Queue job &lt;label&gt; failed · 12m</i>.</td></tr>
@@ -333,16 +333,14 @@
 <p>Browser or desktop notifications on sm web. Search across threads (the Docs and Done filters plus scrolling cover it for now; search can follow if they prove too little). Grouping threads by repo or by parent agent. Messages from agents to anyone other than you. Any change to the Watch page. Changes to how <code>sm send rajesh</code>, <code>--blocking</code>, <code>sm doc publish</code>, the unread cap or the email fallback work: agents see no difference.</p>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p><b>Docs are in the Inbox.</b> Revision 1 carried only review requests, as asks inside an agent's conversation. Now every doc publish lands, as its own doc thread: a review request needs you, a plain publish is for your information, and a Docs filter keeps signed-off docs findable with no time limit.</p>
-<p><b>Two kinds of thread, not one.</b> Revision 1 had one conversation per agent. A doc now forms its own thread, because a doc can outlive its author and pass to another agent through Assign, and those hand-offs belong with the doc.</p>
-<p><b>Watch stays as it is.</b> Revision 1 replaced the card's Messages list with a one-line pointer. That is dropped.</p>
-<p><b>One Inbox across phone and web.</b> Needs you clears when you answer anywhere, and opening a thread withdraws the phone notification, matching what shipped in #1645.</p>
+<p><b>A review request from an ended agent is New, not Needs you.</b> Revision 2 put every open review request under Needs you. Watch and blocking messages already treat an ended agent as blocking nobody, so the Inbox does too; the doc still offers Assign.</p>
+<p><b>The server half has shipped (#1647).</b> sm.rajeshgo.li has the Inbox at <code>/inbox</code>. The Android tab is #1648. The thread page on the web has no Terminal button; the app adds one to its reader bar for agent threads.</p>
 
 <p class="phone-note"><sup>1</sup> <code>CARD_MESSAGE_WINDOW</code> and <code>CARD_MESSAGE_LIMIT</code> in <code>crates/sm-server/src/http/messages.rs:16-17</code>; the messages attach to the sender's card in <code>project_messages</code>, same file.</p>
 
 <hr class="appendix-divider">
 <h2>Appendices</h2>
-<p>These appendices sketch the build so the direction can be judged. Once the decisions above are settled, they become the full spec, with exact response shapes and a test per behaviour, before either ticket starts.</p>
+<p>The build spec. Appendix B is implemented in <code>crates/sm-server/src/http/inbox.rs</code> and <code>crates/sm-server/src/owner_inbox.rs</code> (#1647); appendix C is ticket #1648. Every behaviour below names its test in appendix E.</p>
 
 <h3>A. What already exists</h3>
 <table>
@@ -350,45 +348,157 @@
 <tbody>
 <tr><td>Messages, drafts, replies</td><td><code>owner_messages</code>, <code>owner_message_drafts</code>, <code>owner_message_replies</code> tables, <code>crates/sm-server/src/owner_messages.rs</code></td><td>Agent-thread items: agent messages and your replies.</td></tr>
 <tr><td>Message state</td><td><code>derive_message_state</code> in <code>owner_messages.rs</code> (new, read, needs_you, replied, handled; no stored state column)</td><td>Agent-thread grouping and badge.</td></tr>
-<tr><td>Docs, publishes, reviews</td><td><code>owner_docs</code> (one row per doc, <code>author_session_id</code>), its publishes (one per revision, each with its publishing <code>session_id</code> and <code>review_requested</code>), <code>owner_doc_reviews</code> (with <code>verdict</code>); <code>crates/sm-server/src/owner_docs.rs</code></td><td>Doc-thread items and author per revision.</td></tr>
-<tr><td>Doc state</td><td><code>derive_owner_doc_state</code> in <code>owner_docs.rs</code> (new, updated, review_requested, reviewed, read); <code>review_undelivered</code> on the doc summary</td><td>Doc-thread grouping, badge, Docs filter tags.</td></tr>
-<tr><td>Doc page</td><td><code>/docs/&lt;repo-name&gt;/&lt;path&gt;</code> in <code>http/docs.rs</code>; client in <code>http/doc_client.js</code> (review sheet, <b>Assign to a new agent</b> via <code>POST …/assign</code>, reopen or new PR via <code>http/docs/reopen.rs</code>)</td><td>What a doc thread opens. Unchanged.</td></tr>
-<tr><td>Follows and notices</td><td><code>owner_follows</code> in <code>owner_push.rs</code>; <code>owner_notices</code> in <code>owner_push/notices.rs</code>; withdrawal after answer or open in <code>withdraw_notices</code> (#1645)</td><td>Finished / died / job-ended lines; notification tap target; phone and web staying in step.</td></tr>
-<tr><td>Message reader page</td><td><code>GET /messages/{id}</code> in <code>http/messages.rs</code>; client in <code>http/doc_client.js</code> ("reply" mode); Android <code>DocReader.kt</code> WebView</td><td>Base for the agent-thread page.</td></tr>
-<tr><td>Reply delivery</td><td><code>POST /messages/{id}/reply</code> with a submission id for deduplication; header <code>[Input from: &lt;owner_name&gt; via sm app]</code>; routes to the live parent when the sender has ended</td><td>Send from an agent thread.</td></tr>
-<tr><td>Handled / No review needed</td><td><code>POST /messages/{id}/handled</code>; doc no-review route in <code>http/docs/review.rs</code></td><td>What Done calls for the open ask.</td></tr>
+<tr><td>Docs, publishes, reviews</td><td><code>owner_docs</code>, <code>owner_doc_publishes</code> (one per revision, with the publishing <code>session_id</code> and <code>review_requested</code>), <code>owner_doc_reviews</code> (with <code>verdict</code>); <code>crates/sm-server/src/owner_docs.rs</code></td><td>Doc rows and the author of each revision.</td></tr>
+<tr><td>Doc state</td><td><code>derive_owner_doc_state</code> in <code>owner_docs.rs</code> (new, updated, review_requested, reviewed, read)</td><td>Doc-row grouping, badge, Docs filter tags.</td></tr>
+<tr><td>Doc page</td><td><code>/docs/&lt;repo-name&gt;/&lt;path&gt;</code> in <code>http/docs.rs</code>; client in <code>http/doc_client.js</code> (review sheet, Assign, reopen or new PR)</td><td>What a doc row opens. Unchanged.</td></tr>
+<tr><td>Follows and notices</td><td><code>owner_follows</code> in <code>owner_push.rs</code>; <code>owner_notices</code> in <code>owner_push/notices.rs</code>; <code>withdraw_notices</code> (#1645)</td><td>Follow-result lines; notification tap target; phone and web staying in step.</td></tr>
+<tr><td>Reply delivery</td><td><code>OwnerMessageStore::record_reply</code>: records the reply and queues it in one transaction, deduplicated by submission id; <code>live_recipient</code> in <code>http/messages.rs</code> routes to the live parent when the sender has ended</td><td>Send from an agent thread.</td></tr>
+<tr><td>Handled / No review needed</td><td><code>OwnerMessageStore::mark_handled</code>; <code>OwnerDocStore::dismiss_review</code></td><td>What Done does to the open ask.</td></tr>
 </tbody>
 </table>
 
-<h3>B. Server additions (ticket a)</h3>
-<ol>
-<li><b>Thread key.</b> <code>agent:&lt;session_id&gt;</code> or <code>doc:&lt;owner_docs.id&gt;</code>. An agent thread's items: that session's messages and their replies, your first-written messages to it (section D), follow results for the session, follow results for queue jobs it submitted, and a pointer line for each doc publish it made. A doc thread's items: the doc's publishes (with the publishing session's name), review requests, posted reviews with verdict, and assignments. Retracted docs are excluded.</li>
-<li><b>Done state.</b> New table <code>owner_inbox_threads(thread_key TEXT PRIMARY KEY, done_at TEXT, last_read_at TEXT)</code>. A thread is Done when <code>done_at</code> is later than its newest item. Tapping Done also calls the existing handled path for every open blocking message in an agent thread, or the no-review-needed path for an open review request in a doc thread.</li>
-<li><b>Group.</b> <code>needs_you</code>: an agent thread with a message in state needs_you, or a doc in review_requested. <code>new</code>: otherwise, an agent thread with a message in state new or an unread follow result newer than <code>last_read_at</code>, or a doc in new or updated. <code>earlier</code>: everything else. The group is the same whichever device asks.</li>
-<li><b><code>GET /inbox</code></b>: rows for <code>?filter=open</code> (default; threads not Done with activity in the last 30 days), <code>?filter=done</code> (Done threads, newest first, paged), <code>?filter=docs</code> (every doc thread regardless of age or Done, newest activity first, paged). Row fields: thread key, kind (<code>agent</code> or <code>doc</code>), title (agent name, or doc title), repo, agent status or doc state and latest verdict, PR number for docs, author of the latest revision for docs, group, newest item preview (title or "You: …"), newest item time, counts of messages and open asks, and the URL the row opens. Sort: group, then newest item time descending. Also <code>needs_you_count</code> and <code>has_new</code> for the badge. Protected the same way <code>/messages/</code> is (<code>is_protected_read_surface</code> in <code>http.rs</code>). sm web renders the same rows at <code>/inbox</code> as HTML.</li>
-<li><b><code>GET /inbox/agent/{session_id}</code></b>: the agent-thread page, server-rendered, reusing the message reader's markdown rendering and reply client. Items in time order. Opening it sets <code>first_viewed_at</code> on its unread messages (which withdraws their phone notifications through the existing path) and <code>last_read_at</code> on the thread. <code>?at=msg_…</code> scrolls to that message. <code>/messages/{id}</code> keeps working and redirects to <code>/inbox/agent/{sender}?at={id}</code>, so old links in email and agent output still land correctly.</li>
-<li><b>Doc rows open the existing doc page</b> at <code>/docs/&lt;repo-name&gt;/&lt;path&gt;</code>. No new doc page. Viewing it already records the view and withdraws the notification.</li>
-<li><b>Send from an agent thread.</b> A quote targets the message it was taken from. The whole send is one delivered message, as today. If the thread has an open blocking message, the reply is recorded against the newest one (making it Replied); otherwise against the newest agent message; otherwise it is a first-written message (section D).</li>
-<li><b>Notification tap target.</b> Message notices link to <code>/inbox/agent/{session_id}?at=…</code> instead of <code>/messages/{id}</code>. Review-request notices keep linking to the doc page.</li>
-</ol>
+<h3>B. Server (#1647)</h3>
 
-<h3>C. Android additions (ticket b)</h3>
+<h4>B1. Threads and their items</h4>
+<p>A thread key is <code>agent:&lt;session_id&gt;</code> or <code>doc:&lt;owner_docs.id&gt;</code>.</p>
+<table>
+<thead><tr><th>Thread</th><th>Items (each counts once toward Done)</th><th>Also shown, not counted</th></tr></thead>
+<tbody>
+<tr><td>Agent</td><td>Messages whose <code>sender_session_id</code> is the session; replies to those messages; notes to the session (B6); fired, uncancelled follows whose <code>session_id</code> is the session, which covers queue-job follows the session submitted</td><td>On the thread page only: one line per doc publish the session made, newest 100</td></tr>
+<tr><td>Doc</td><td>Its publishes (revisions) and its posted reviews</td><td>—</td></tr>
+</tbody>
+</table>
+<p>An agent thread exists once it has one item. A doc publish alone makes no agent thread. A retracted doc has no thread. A session that is in the registry but has no items has a thread page (for writing first) but no Inbox row.</p>
+
+<h4>B2. Group</h4>
+<table>
+<thead><tr><th>Group</th><th>Agent thread</th><th>Doc thread</th></tr></thead>
+<tbody>
+<tr><td><code>needs_you</code></td><td>Some message is in state needs_you (blocking, no reply, not handled, sender live)</td><td>State review_requested and the latest revision's publisher is live</td></tr>
+<tr><td><code>new</code></td><td>Otherwise, some message is in state new, or a follow fired after the thread's <code>last_read_at</code> (or it was never read)</td><td>State new or updated, or review_requested from an ended publisher</td></tr>
+<tr><td><code>earlier</code></td><td>Everything else</td><td>State read or reviewed</td></tr>
+</tbody>
+</table>
+<p>"Live" means the session is in the registry and its <code>completion_status</code> is neither <code>retired</code> nor <code>killed</code>. Example: an agent sends a plain note, then a blocking question, then retires. Its question is no longer needs_you; the thread is <code>new</code> until opened, then <code>earlier</code>.</p>
+
+<h4>B3. Done</h4>
+<p>Table <code>owner_inbox_threads(thread_key TEXT PRIMARY KEY, done_at TEXT, done_items INTEGER, last_read_at TEXT)</code> in the retained queue DB (<code>sm_send.db_path</code>). Done records the thread's item count. A thread is Done while its item count is at most <code>done_items</code>, so any new item, including your own later reply, brings it back. Counting instead of comparing times keeps a message that lands in the same second as Done from being hidden.</p>
+<p><code>POST /inbox/done</code> with <code>{"thread_key": "…"}</code>:</p>
+<ul>
+<li>Agent thread: every blocking message from the session with no reply and no <code>handled_at</code> gets <code>handled_at</code>; every unread message from it gets <code>first_viewed_at</code>. 404 when the session has no items and is not in the registry.</li>
+<li>Doc thread: if the doc is review_requested, <code>dismiss_review</code> (No review needed). 404 when the doc is unknown or retracted.</li>
+<li>Any other key: 400. Response <code>200 {"thread_key": "…", "done": true}</code>. Nothing is queued for any agent.</li>
+</ul>
+
+<h4>B4. <code>GET /inbox</code></h4>
+<p><code>?filter=open</code> (default), <code>docs</code> or <code>done</code>; anything else is 400. <code>?format=json</code> returns JSON; otherwise an HTML page in the Watch palette with an <b>Inbox · Watch · History · Guestbook</b> top bar, Open / Docs / Done chips, group headings on Open, and a Done button per row.</p>
+<table>
+<thead><tr><th>Filter</th><th>Rows</th><th>Order</th></tr></thead>
+<tbody>
+<tr><td><code>open</code></td><td>Not Done, and either needs_you or newest item within 30 days</td><td>needs_you, new, earlier; then newest item first</td></tr>
+<tr><td><code>docs</code></td><td>Every doc thread, Done or not, any age</td><td>Newest item first; at most 200</td></tr>
+<tr><td><code>done</code></td><td>Every Done thread</td><td>Newest item first; at most 200</td></tr>
+</tbody>
+</table>
+<p>JSON shape. <code>needs_you_count</code> and <code>has_new</code> always describe the Open list, whatever the filter.</p>
+<pre><code>{
+  "filter": "open",
+  "needs_you_count": 2,          // Open rows in needs_you: the tab badge
+  "has_new": true,               // any Open row in new: the tab dot
+  "rows": [{
+    "thread_key": "agent:eng00001",
+    "kind": "agent",             // or "doc"
+    "title": "sm-1679-engineer", // agent name, or doc title
+    "repo": "trading-core",      // agent: working directory's last part; doc: repo name
+    "status": "live",            // agent: live | ended; doc: new | updated | review_requested | reviewed | read
+    "verdict": null,             // doc: approve | changes_requested | comment of its latest posted review
+    "pr_number": null,           // doc
+    "author": null,              // doc: publisher of the latest revision
+    "group": "needs_you",        // needs_you | new | earlier
+    "preview": "Keep the old fills table or drop it?",
+    "newest_at": "2026-09-28T10:02:00Z",
+    "message_count": 3,          // agent: messages from it
+    "revision_count": 0,         // doc: publishes
+    "open_asks": 1,              // agent: needs_you messages; doc: 1 when needs_you
+    "url": "/inbox/agent/eng00001", // doc: /docs/&lt;repo-name&gt;/&lt;path&gt;?version=…
+    "done": false,
+    "session_id": "eng00001",    // agent rows
+    "doc_id": null               // doc rows
+  }]
+}</code></pre>
+<p>Preview. Agent thread in needs_you: the newest needs_you message's title. Otherwise its newest item: a message's title; <code>You: </code> and the first line of a reply or note (a reply with no text shows its first quote); a follow line (B5). Doc thread: <i>Review requested · revision N</i>; <i>Published · for your information</i> (new, one revision); <i>Revision N published</i> (new or updated); <i>You reviewed · Approved | Changes requested | Commented</i> or <i>Read</i> (read or reviewed).</p>
+
+<h4>B5. <code>GET /inbox/agent/{session_id}</code></h4>
+<p>The agent thread's page, server-rendered in the Watch palette. 404 when the session has no items and is not in the registry. Opening it sets <code>first_viewed_at</code> on every unread message from the session (which withdraws their phone notifications through #1645) and sets the thread's <code>last_read_at</code>. Items in time order:</p>
+<ul>
+<li>Message: a bubble on the left with its title, markdown body (paragraphs carry <code>data-sm-line</code>), relative time and state; a needs_you message has an amber border and a NEEDS YOU chip. The bubble's element id is the message id.</li>
+<li>Reply and note: a bubble on the right with its quotes as blockquotes, its text, and <i>You · 5m ago</i>, plus <i>· to &lt;name&gt;</i> when it went to a parent.</li>
+<li>Follow: a grey line from the follow notification's title and body, for example <i>sm-1655-engineer finished · Report: bar-feed readout</i> (linking the report) or <i>Queue job 1679-copy-fills succeeded · sm-1679-engineer · ran 38m</i>.</li>
+<li>Doc publish: a grey line <i>Published: &lt;title&gt;</i> or <i>Asked for review: &lt;title&gt;</i>, linking that revision.</li>
+</ul>
+<p>The composer sits at the bottom. With a live recipient (B6) it has quote chips, a text box, Done and Send; tapping a paragraph of a message adds its text as a quote. With none it has Done and <i>No agent is left to reply to</i>. <code>?at=&lt;message id&gt;</code> scrolls to and highlights that message; without it the page opens at the bottom.</p>
+<p><code>GET /messages/{id}</code> (the page, not <code>?format=json</code>) serves the same thread page for the message's sender, scrolled to that message, so links in email, agent output, notifications and Watch cards land on the thread. It serves rather than redirects because the app's reader sends a path it does not know to the system browser, and apps built before #1648 do not know <code>/inbox/</code>. <code>?bottom=1</code> on either URL opens at the newest item instead; the page reloads that way after a send. The JSON form and the drafts, reply and handled endpoints are unchanged.</p>
+
+<h4>B6. <code>POST /inbox/agent/{session_id}/send</code></h4>
+<p>Body <code>{"submission_id": "…", "body": "…", "quotes": [{"message_id": "msg_…", "quote": "…"}]}</code>. The submission id is 8–64 letters, digits, <code>-</code> or <code>_</code>. Checks, in order:</p>
 <ol>
-<li>Bottom nav gains Inbox as the first tab (<code>AppBottomNav.kt</code>, <code>AppNavigation.kt</code>), with a badge from <code>needs_you_count</code> and a dot when <code>has_new</code>. Start destination stays Watch.</li>
-<li>Inbox screen: native list of <code>GET /inbox</code> rows grouped as in Figure 2, DOC tag on doc rows, pull to refresh, Open / Docs / Done filter, swipe right for Done.</li>
-<li>Row tap opens the row's URL in the existing reader overlay (<code>DocReader.kt</code>); Back closes the overlay onto the Inbox list.</li>
-<li>Notification taps (<code>push/NoticePush.kt</code>) switch to the Inbox tab and open the thread, so Back lands on the Inbox rather than Watch.</li>
+<li>At most 100 quotes; text at most the draft-comment limit.</li>
+<li>A submission id already stored as a reply to this thread, or as a note to this session, returns the stored send and queues nothing. Stored for another thread: 409.</li>
+<li>Unknown session with no messages: 404. No live recipient (the session, else its live parent): 409 <i>No agent is left to reply to</i>.</li>
+<li>Each quote must come from a message of this thread (400); empty quotes are dropped. No text and no quotes: 400.</li>
+</ol>
+<p>The send is recorded as a reply to the newest needs_you message; else the newest quoted message; else the agent's newest message. With no message at all it is a note. One message is queued for the recipient and delivered at once when the runtime is enabled. The text the agent receives:</p>
+<pre><code>[Input from: Rajesh via sm app] Re: "Keep it?" (msg_1a2b3c4d)
+&gt; Nothing reads fills.
+
+The month-end recon does.</code></pre>
+<p>A note has no <code>Re:</code> part: <code>[Input from: Rajesh via sm app]</code>, a newline, the text. Response: the stored reply or note with <code>kind</code> (<code>reply</code> or <code>note</code>), <code>message_id</code> (null for a note), <code>delivered_to_session_id</code> and <code>delivered_to_session_name</code>.</p>
+
+<h4>B7. Notices, access, token</h4>
+<ul>
+<li>Notices keep their links: a message notice opens <code>/messages/&lt;id&gt;</code>, which is the thread (B5); a review-request notice opens the doc page.</li>
+<li><code>/inbox</code> and <code>/inbox/…</code> reads use the owner page gate, as <code>/messages/</code> does, and are listed in <code>is_protected_read_surface</code>.</li>
+<li>Writes accept the page's signed token (<code>X-SM-Doc-Token</code>, subject <code>inbox</code>, minted into both pages) or the ordinary session guard the app uses; both need core writes enabled.</li>
+</ul>
+
+<h3>C. Android (#1648)</h3>
+<ol>
+<li>Bottom nav gains Inbox as the first tab (<code>AppBottomNav.kt</code>, <code>AppNavigation.kt</code>), badge from <code>needs_you_count</code>, dot when <code>has_new</code> and the badge is zero. Start destination stays Watch.</li>
+<li>Inbox screen: native list of <code>GET /inbox?format=json</code> rows, grouped as in Figure 2 on Open, a DOC tag on doc rows, pull to refresh, Open / Docs / Done chips, swipe right for <code>POST /inbox/done</code>.</li>
+<li>Row tap opens <code>url</code> in the existing reader overlay (<code>DocReader.kt</code>); Back closes the overlay onto the Inbox list. For an agent thread the reader bar adds Terminal, opening that session's terminal as the Watch card does.</li>
+<li><code>isOwnerPagePath</code> in <code>DocReader.kt</code> accepts <code>/inbox</code> and <code>/inbox/…</code>, so the thread page's links stay in the reader.</li>
+<li>Message and review notification taps (<code>push/NoticePush.kt</code>) switch to the Inbox tab and open <code>reader_path</code>, so Back lands on the Inbox.</li>
 <li>Watch is untouched.</li>
 </ol>
 
 <h3>D. Writing first</h3>
-<p>A message you start is stored as a reply with no agent message above it: <code>owner_message_replies.message_id</code> becomes nullable and a <code>session_id</code> column is added. Delivery, header, deduplication and the "no live agent" rule are the same as a reply. The first line reads <code>[Input from: Rajesh via sm app]</code> with no <code>Re:</code> part.</p>
+<p>A message you start before the agent has sent any is a note, in its own table <code>owner_message_notes(id, session_id, body, delivered_text, delivered_to_session_id, created_at)</code> beside the messages, recorded and queued in one transaction under the submission id (queue id <code>owner-note-&lt;id&gt;</code>). Delivery, deduplication and the "no live agent" rule are those of a reply.</p>
+
+<h3>E. Tests</h3>
+<table>
+<thead><tr><th>Behaviour</th><th>Test (<code>crates/sm-server/tests/owner_message_http.rs</code> unless noted)</th></tr></thead>
+<tbody>
+<tr><td>Groups, order, badge, row fields, filters, HTML headings (B2, B4)</td><td><code>inbox_groups_threads_by_what_they_need</code></td></tr>
+<tr><td>Review request from an ended publisher is new</td><td><code>a_review_request_from_an_ended_agent_is_new_not_needs_you</code></td></tr>
+<tr><td>Send answers the open question, quotes, idempotence, errors (B6)</td><td><code>thread_send_answers_the_open_question_once</code></td></tr>
+<tr><td>Writing first (D)</td><td><code>writing_first_sends_a_note_without_a_re_line</code></td></tr>
+<tr><td>Done on both kinds, reopening, errors (B3)</td><td><code>done_clears_the_ask_and_anything_new_reopens_the_thread</code></td></tr>
+<tr><td>Follow lines and read state (B2, B5)</td><td><code>a_fired_follow_is_new_until_its_thread_is_read</code></td></tr>
+<tr><td>Reply box by recipient; 404 (B5)</td><td><code>thread_reply_box_follows_recipient</code></td></tr>
+<tr><td><code>/messages/{id}</code> serves the thread, <code>?bottom=1</code>; opening marks viewed (B5)</td><td><code>page_marks_viewed_json_does_not</code>, <code>unread_cap_refuses_sixth_and_resets_on_view</code></td></tr>
+<tr><td>Notice opens the thread; opening withdraws it (B7)</td><td><code>opening_a_message_withdraws_its_phone_notification</code></td></tr>
+<tr><td>Done state storage</td><td><code>marks_start_empty_and_keep_both_columns</code> in <code>owner_inbox.rs</code></td></tr>
+</tbody>
+</table>
 
 <h3>Z. FAQ</h3>
 <p><b>Why not thread by message, with a <code>--re</code> flag for agents?</b> Agents would have to remember to pass it, and they answer your reply with a fresh <code>sm send</code>. Grouping by agent needs nothing from them and is correct because each agent works one task.</p>
-<p><b>What if one agent raises two unrelated questions?</b> They appear as two message cards in one thread, each with its own title and its own Needs you tag. Quoting a paragraph makes clear which one you answer.</p>
-<p><b>Why is a doc not part of its author's agent thread?</b> A doc can be revised by several agents: the author ends, you review, Assign hands it to a new agent, and that agent publishes the next revision. Keyed by agent, that history would split across two threads, and the second one would start with no context. The agent thread keeps a pointer line so its own story still reads in order.</p>
-<p><b>Does a doc thread show the doc's text?</b> It opens the doc page, which is the doc at its latest revision with the review controls. The Inbox row carries the state and the latest author.</p>
+<p><b>What if one agent raises two unrelated questions?</b> They appear as two message cards in one thread, each with its own title and its own Needs you tag. A send answers the newest open one; Done clears both.</p>
+<p><b>Why is a doc not part of its author's agent thread?</b> A doc can be revised by several agents: the author ends, you review, Assign hands it to a new agent, and that agent publishes the next revision. Keyed by agent, that history would split across two threads. The agent thread keeps a pointer line so its own story still reads in order.</p>
+<p><b>Why does Done count items instead of comparing times?</b> Stored times have one-second precision. A message that arrived in the same second as Done would compare as older and stay hidden.</p>
+<p><b>Why a separate notes table?</b> Making <code>owner_message_replies.message_id</code> nullable needs a table rebuild in SQLite; a notes table beside it holds the same facts with no migration of live rows.</p>
+<p><b>What happened to the single-message page?</b> Its URL now shows the whole thread, scrolled to the message. Its select-and-comment drafts are replaced by tapping a paragraph to quote it. The drafts endpoints stay for any old page left open.</p>
+<p><b>Revision history.</b> Revision 1 had one conversation per agent, only review requests from docs, and a pointer replacing the Watch card's message list. Revision 2 added doc threads and every doc publish, kept Watch unchanged, and made the Inbox one list across phone and web.</p>
 
 
 <!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.

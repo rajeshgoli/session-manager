@@ -425,6 +425,14 @@ impl OwnerPushStore {
         Ok(exists)
     }
 
+    /// Every fired, uncancelled follow: the Inbox's follow-result lines.
+    pub fn fired(&self) -> Result<Vec<Follow>> {
+        self.query(
+            "WHERE fired_at IS NOT NULL AND cancelled_at IS NULL ORDER BY fired_at, id",
+            params![],
+        )
+    }
+
     pub fn active(&self) -> Result<Vec<Follow>> {
         self.query("WHERE fired_at IS NULL AND cancelled_at IS NULL", params![])
     }

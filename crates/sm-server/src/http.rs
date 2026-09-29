@@ -324,6 +324,7 @@ mod docs;
 mod follows;
 mod guestbook_page;
 mod history;
+mod inbox;
 mod merge_holds;
 mod messages;
 mod watch;
@@ -1621,6 +1622,13 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/humans/{identifier}/messages",
             post(messages::create_owner_message),
+        )
+        .route("/inbox", get(inbox::get_inbox))
+        .route("/inbox/done", post(inbox::post_done))
+        .route("/inbox/agent/{session_id}", get(inbox::get_agent_thread))
+        .route(
+            "/inbox/agent/{session_id}/send",
+            post(inbox::post_agent_send),
         )
         .route("/messages/{message_id}", get(messages::get_owner_message))
         .route(
@@ -14265,6 +14273,8 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/docs"
         || path.starts_with("/docs/")
         || path.starts_with("/messages/")
+        || path == "/inbox"
+        || path.starts_with("/inbox/")
         || path == "/queue-jobs"
         || path.starts_with("/queue-jobs/")
         || path == "/nodes"
