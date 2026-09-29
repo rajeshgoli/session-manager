@@ -9,6 +9,7 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use sm_server::{
+    activity_ledger::ActivityRecorder,
     config::AppConfig,
     http::{router, AppState},
     queue::{QueueAdmissionPolicy, QueueRecoverySummary, RetainedQueueStore},
@@ -313,6 +314,32 @@ async fn main() -> Result<()> {
                         }
                     }
                     Err(error) => eprintln!("usage token ledger task failed: {error}"),
+                }
+            }
+        });
+        // Turns and tool spans for Analytics › Time, on the usage scan's cadence but its own
+        // task and database, so neither scan waits on the other (sm#1676).
+        let recorder = Arc::new(std::sync::Mutex::new(ActivityRecorder::new(
+            expand_home(&state.config().activity.db_path),
+            expand_home(&state.config().usage.db_path),
+        )));
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(scan_interval));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let recorder = recorder.clone();
+                match tokio::task::spawn_blocking(move || {
+                    recorder
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .scan()
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => eprintln!("activity recorder scan failed: {error:#}"),
+                    Err(error) => eprintln!("activity recorder task failed: {error}"),
                 }
             }
         });

@@ -59,6 +59,7 @@ pub struct AppConfig {
     pub web_watch: WebWatchConfig,
     pub push: PushConfig,
     pub utilization: UtilizationConfig,
+    pub activity: ActivityConfig,
     /// How sm names the owner in text it writes to agents (sm#1580): the
     /// reply header, `[sm review]`, the waiting label. Trimmed, 1-40
     /// characters; [`DEFAULT_OWNER_NAME`] when absent or blank.
@@ -129,6 +130,7 @@ impl Default for AppConfig {
             web_watch: WebWatchConfig::default(),
             push: PushConfig::default(),
             utilization: UtilizationConfig::default(),
+            activity: ActivityConfig::default(),
             owner_name: DEFAULT_OWNER_NAME.to_owned(),
         }
     }
@@ -335,6 +337,11 @@ impl AppConfig {
         self.utilization.db_path = isolate_default_data_path(
             &self.utilization.db_path,
             &default_utilization_db_path(),
+            &instance,
+        )?;
+        self.activity.db_path = isolate_default_data_path(
+            &self.activity.db_path,
+            &default_activity_db_path(),
             &instance,
         )?;
         // Tests never send real pushes with the live key.
@@ -1900,6 +1907,25 @@ fn default_utilization_retention_days() -> i64 {
     90
 }
 
+/// `activity`: turns and tool spans read from agent transcripts (sm#1676).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActivityConfig {
+    #[serde(default = "default_activity_db_path")]
+    pub db_path: String,
+}
+
+impl Default for ActivityConfig {
+    fn default() -> Self {
+        Self {
+            db_path: default_activity_db_path(),
+        }
+    }
+}
+
+fn default_activity_db_path() -> String {
+    "~/.local/share/claude-sessions/activity.db".to_owned()
+}
+
 /// `push`: owner follows and phone notifications (sm#1569).
 #[derive(Debug, Clone, Deserialize)]
 pub struct PushConfig {
@@ -2039,6 +2065,8 @@ struct RawConfig {
     #[serde(default)]
     utilization: UtilizationConfig,
     #[serde(default)]
+    activity: ActivityConfig,
+    #[serde(default)]
     owner_name: Option<String>,
 }
 
@@ -2149,6 +2177,7 @@ impl From<RawConfig> for AppConfig {
             web_watch: raw.web_watch,
             push: raw.push,
             utilization: raw.utilization,
+            activity: raw.activity,
             owner_name: normalize_owner_name(raw.owner_name.as_deref())
                 .unwrap_or_else(|_| DEFAULT_OWNER_NAME.to_owned()),
         }
@@ -2753,6 +2782,7 @@ mod tests {
             &config.bug_reports.db_path,
             &config.app_artifacts.root_dir,
             &config.utilization.db_path,
+            &config.activity.db_path,
         ];
         for path in durable_paths {
             assert!(

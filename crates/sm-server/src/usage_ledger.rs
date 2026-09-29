@@ -1688,7 +1688,7 @@ fn codex_artifact_project_key(path: &Path) -> Option<String> {
 /// The session's main transcript when a binding names a different file: a subagent file that
 /// transcript discovery met first, or a path under the seat's starting directory after Claude
 /// Code moved into a worktree and filed the transcript under that project folder instead.
-fn claude_main_transcript(
+pub(crate) fn claude_main_transcript(
     path: &Path,
     session_id: &str,
     transcripts_by_root: &mut BTreeMap<PathBuf, BTreeMap<String, PathBuf>>,

@@ -270,6 +270,11 @@ usage:
   poll_interval_secs: 30
   db_path: "~/.local/share/claude-sessions/usage.db"
 
+# Turns and tool spans read from the transcripts usage binds, for Analytics › Time.
+# Scanned on usage.scan_interval_secs while usage is enabled.
+activity:
+  db_path: "~/.local/share/claude-sessions/activity.db"
+
 # Codex CLI + app-server settings
 codex:
   # Command to launch Codex (CLI + app-server)
