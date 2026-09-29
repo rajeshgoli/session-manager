@@ -3389,6 +3389,14 @@ fn admit_pending_queue_jobs_conn(
                 mark_pending_queue_jobs_behind_running_perf_conn(conn, &jobs, admission_policy)?;
             break;
         }
+        // Below the reserve nothing starts: a job the host memory guard
+        // stopped must not be replaced by work that eats the freed memory
+        // (sm#1626). Unknown host memory does not hold non-perf work.
+        if host_below_memory_reserve(admission_policy) {
+            summary.held += mark_pending_queue_jobs_holding_conn(conn, None, "memory_pressure")?;
+            summary.retry_after_seconds = Some(admission_policy.resource_retry_interval_seconds);
+            break;
+        }
         let ready_perf = jobs.iter().find(|job| {
             job.state == "pending"
                 && job.job_type == "perf"
@@ -4028,7 +4036,17 @@ fn perf_resource_hold_reason(
     (!has_safe_headroom).then_some("memory_pressure")
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Stands in for the host's (total, available) memory in this test thread.
+    static TEST_HOST_MEMORY: std::cell::Cell<Option<(i64, i64)>> = const { std::cell::Cell::new(None) };
+}
+
 fn host_memory_capacity() -> Option<(i64, i64)> {
+    #[cfg(test)]
+    if let Some(capacity) = TEST_HOST_MEMORY.with(std::cell::Cell::get) {
+        return Some(capacity);
+    }
     #[cfg(target_os = "macos")]
     {
         let output = Command::new("/usr/bin/memory_pressure")
@@ -4047,6 +4065,11 @@ fn host_memory_capacity() -> Option<(i64, i64)> {
     }
     #[allow(unreachable_code)]
     None
+}
+
+fn host_below_memory_reserve(admission_policy: QueueAdmissionPolicy) -> bool {
+    let reserve = effective_memory_reserve_bytes(admission_policy.memory_min_free_bytes);
+    host_memory_capacity().is_some_and(|(_, available)| available < reserve)
 }
 
 fn perf_memory_headroom_is_safe(
@@ -5862,6 +5885,20 @@ pub fn queue_hold_explanation(
             }
             ("waiting for an available job slot".into(), detail)
         }
+        "memory_pressure" if job.memory_bytes.is_none() => (
+            "waiting for safe memory headroom".into(),
+            {
+                let reserve = effective_memory_reserve_bytes(policy.memory_min_free_bytes);
+                let available = host_memory_capacity().map(|(_, available)| available);
+                format!(
+                    "The Mac is below its memory safety reserve (available: {}, reserve: {}), so no job starts until memory recovers. Admission retries every {} seconds and gives up after {} seconds.",
+                    available.map_or_else(|| "unknown".to_owned(), memory_amount_text),
+                    memory_amount_text(reserve),
+                    policy.resource_retry_interval_seconds,
+                    job.max_wait_seconds
+                )
+            },
+        ),
         "memory_pressure" => (
             "waiting for safe memory headroom".into(),
             {
@@ -7962,6 +7999,64 @@ mod tests {
             Some("host_memory_pressure")
         );
         assert!(!process_group_exists(pgid));
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn no_job_of_any_type_starts_while_the_host_is_below_its_memory_reserve() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let state_dir = unique_temp_path("admission-host-pressure");
+        let message_queue_db = state_dir.join("messages.db");
+        let job = RetainedQueueStore::create_queue_job_in_state_dir(
+            &state_dir,
+            CreateQueueJob {
+                job_type: "tests".into(),
+                label: "waits for memory".into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["true".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 60,
+                cpu_percent: None,
+                gpu_percent: None,
+                memory_bytes: None,
+            },
+        )
+        .unwrap();
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let policy = QueueAdmissionPolicy {
+            max_running_jobs: 4,
+            ..QueueAdmissionPolicy::default()
+        };
+        let reserve = effective_memory_reserve_bytes(policy.memory_min_free_bytes);
+
+        TEST_HOST_MEMORY.with(|host| host.set(Some((256 * GIB, reserve - 1))));
+        let held =
+            admit_pending_queue_jobs_conn(&conn, &state_dir, &message_queue_db, 0, policy, true)
+                .unwrap();
+        assert_eq!(held.started, 0);
+        let row = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(row.state, "pending");
+        assert_eq!(row.holding_reason.as_deref(), Some("memory_pressure"));
+        let context = queue_hold_explanation(&row, std::slice::from_ref(&row), policy).unwrap();
+        assert!(
+            context["detail"]
+                .as_str()
+                .unwrap()
+                .contains("below its memory safety reserve"),
+            "{context}"
+        );
+
+        TEST_HOST_MEMORY.with(|host| host.set(Some((256 * GIB, 200 * GIB))));
+        let admitted =
+            admit_pending_queue_jobs_conn(&conn, &state_dir, &message_queue_db, 0, policy, true)
+                .unwrap();
+        assert_eq!(admitted.started, 1);
+        TEST_HOST_MEMORY.with(|host| host.set(None));
+        release_queue_admission_retry(&state_dir);
         drop(conn);
         let _ = fs::remove_dir_all(state_dir);
     }
