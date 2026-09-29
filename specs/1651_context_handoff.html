@@ -82,7 +82,7 @@
 </style>
 
 <h1>1651 — Context handoff: a fresh agent takes over the work</h1>
-<p class="sans"><small>Author: sm-handoff-redesign-spec-author <code>0f52d06d</code> · Ticket #1651 · Revision 2 · 2026-09-29</small></p>
+<p class="sans"><small>Author: sm-handoff-redesign-spec-author <code>0f52d06d</code> · Closeout: 1657-engineer <code>d39b7441</code> · Ticket #1651 · Revision 3 · 2026-09-29</small></p>
 
 <h2>Memo</h2>
 
@@ -235,7 +235,7 @@
 </tbody>
 </table>
 
-<p>Every row is editable from all three surfaces, and a change applies to all agents at once, except those with an override. Examples of the effective policy: a Claude agent with no override is asked at 35%. A Claude agent you set to 45% is asked at 45%. A codex-fork agent with no override is never asked. The same codex-fork agent after you switch it on is asked at 35%. A codex-app agent you switch on has no context reading, so only a review request or your button asks it. An agent already at 40% when you switch its policy on is asked immediately.</p>
+<p>Every row is editable from the web and terminal. Android offers the same settings except the codex-app provider default; it hides the shared settings when all displayed providers are off. A change applies to all agents at once, except those with an override. Examples of the effective policy: a Claude agent with no override is asked at 35%. A Claude agent you set to 45% is asked at 45%. A codex-fork agent with no override is never asked. The same codex-fork agent after you switch it on is asked at 35%. A codex-app agent you switch on has no context reading, so only a review request or your button asks it. An agent already at 40% when you switch its policy on is asked immediately.</p>
 
 <h3>What you can do from each surface</h3>
 
@@ -243,7 +243,7 @@
 <thead><tr><th style="width:18%">Surface</th><th>What you see</th><th>What you can change</th></tr></thead>
 <tbody>
 <tr><td>sm.rajeshgo.li</td><td>Each agent card gains a context line, for example <code>ctx 28% · hands off at 35%</code>, or <code>handoff off</code>, <code>asked 14:02</code>, <code>handoff overdue</code>, <code>→ sm-1651-engineer-h2</code>.</td><td>A small edit control on that line: on / off / threshold / use default, plus Hand off now. A “Handoff defaults” panel, linked from the page header, edits the default policy. These are the page's first write actions. They sit behind the same owner login as the page.</td></tr>
-<tr><td>sm app (Android)</td><td>The same line on the agent row and in the agent sheet.</td><td>A “Context handoff” row in the agent sheet with a switch, a threshold picker in 5% steps, Use default, and Hand off now. A “Handoff defaults” section in Settings edits the default policy. Needs a new APK install.</td></tr>
+<tr><td>sm app (Android)</td><td>A compact context ring with a rounded number, green at low usage, yellow at 50%, and red near full, beside the server's handoff status.</td><td>“Context handoff” in the expanded agent's three-dot menu opens a panel with a switch, a threshold picker shown only when on, Use default, and Hand off now. “Handoff defaults” sits below App updates in Settings; it omits codex-app and shows shared settings only when a displayed provider is on.</td></tr>
 <tr><td>sm watch</td><td>The context column shows <code>28%/35</code> and the same states.</td><td>Key <code>H</code> on the selected agent prompts <code>on | off | default | &lt;percent&gt; | now</code>. Key <code>P</code> opens the default policy for editing.</td></tr>
 </tbody>
 </table>
@@ -276,6 +276,7 @@
 <p>When ticket 2 ships I will ask you to try one thing: on a scratch Claude agent, press Hand off now in the app and watch sm watch show it pass through the states in Figure 1.</p>
 
 <h3>FAQ — what changed since the last revision</h3>
+<p><b>Revision 3 records the owner-approved Android interface shipped in PR #1700 and APK 0.5.42.</b> Context is a rounded circular gauge. Per-agent controls live inside the three-dot menu, with the threshold hidden when off. Handoff defaults moves below App updates, omits codex-app, and hides shared controls while all displayed providers are off. The web and terminal retain the full provider policy controls. All four build tickets (#1653, #1654, #1656, #1657) are closed; this specification lives in <code>specs/</code> so it survives lane cleanup.</p>
 <p><b>Revision 2</b> answers your three comments on revision 1.</p>
 <ul>
 <li><b>Every default is now editable from the surfaces.</b> Revision 1 kept the default policy in the config file. sm now stores it, and each surface has a “Handoff defaults” editor. 35%, 20% and 50% are only starting values (decisions 2 and 8).</li>
@@ -529,7 +530,8 @@ Read the handoff note first, then continue the work.</code></pre>
 
 <p><b>I.4 sm.rajeshgo.li</b> (<code>crates/sm-server/src/http/watch.rs</code>, <code>watch_client.js</code>). The card shows the <code>display</code> text after the context percent. Tapping it opens an inline panel: an on/off switch, a threshold number input (1–100), a Use default button, and a Hand off now button with a confirm step. Each action calls I.1 and refreshes <code>/watch/state</code>. A “Handoff defaults” link in the page header opens a panel with one control per B field. Each change is one <code>PUT /handoff-defaults</code>. The page header comment changes from read-only to “read-only except handoff policy”.</p>
 
-<p><b>I.5 Android</b> (<code>android-app/</code>). <code>ClientSession</code> gains <code>context_percent</code> and <code>handoff</code>. The agent row shows the <code>display</code> text. The agent sheet gains a “Context handoff” section: a switch, a threshold picker (5–95 in steps of 5, plus the current value if it is off-step), Use default, and Hand off now with a confirm dialog. The Settings screen gains a “Handoff defaults” section, modelled on the Studio SSH toggle<sup>[23]</sup>: a switch per provider, number pickers for the three percents, and switches for the two review triggers. <code>ApiService</code> gains <code>PUT sessions/{id}/handoff-policy</code> and <code>GET/PUT handoff-defaults</code>. They use the same host and auth as <code>retireSession</code>.</p>
+<p><b>I.5 Android</b> (<code>android-app/</code>). <code>ClientSession</code> carries <code>context_percent</code> and <code>handoff</code>. The agent row shows the server's <code>display</code> text beside a 36 dp context ring. Its center rounds finite usage to a whole number; fill uses the unrounded reading clamped to 0–100%. Color interpolates from Emerald at 0% through Amber at 50% to Rose at 100%. Missing or non-finite readings omit the ring. The expanded agent's three-dot menu opens “Context handoff”: a switch; a threshold picker shown only when enabled (5–95 in steps of 5, plus the current value if it is off-step); Use default, enabled only for an override; and Hand off now with a confirm dialog. These actions stay inside that panel.</p>
+<p>“Handoff defaults” sits below App updates in Settings. It has switches for Claude, Codex Fork, Codex, and any additional server providers except codex-app. When at least one displayed provider is enabled, it shows number pickers for threshold and reminder (1–100), review floor (0–100), each preserving an off-step current value, and switches for both review triggers. These shared controls are hidden when every displayed provider is off. This does not change the server's codex-app policy. <code>ApiService</code> provides <code>GET/PUT sessions/{id}/handoff-policy</code> and <code>GET/PUT handoff-defaults</code>, using the same host and auth as <code>retireSession</code>. Implementation: <code>ui/handoff/HandoffControls.kt</code>, <code>HandoffViewModel.kt</code>, <code>ui/watch/WatchScreen.kt</code>, and <code>ui/settings/SettingsScreen.kt</code>. Tests: <code>HandoffApiTest</code>, <code>HandoffViewModelTest</code>, and the owner-confirmed APK 0.5.42 install.</p>
 
 <p><b>I.6 No agent command.</b> There is no <code>sm</code> subcommand to read or change the policy. Agents learn of it only through the asks.</p>
 
