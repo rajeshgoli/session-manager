@@ -54,6 +54,8 @@ class GuestbookViewModel(application: Application) : AndroidViewModel(applicatio
     private val settingsRepository = SettingsRepository(application)
     private val repository = SessionManagerRepository(settingsRepository)
     private var loadJob: Job? = null
+    /** Whether the last failed load was an older page rather than the newest. */
+    private var failedOlder = false
 
     private val _uiState = MutableStateFlow(GuestbookUiState())
     val uiState: StateFlow<GuestbookUiState> = _uiState
@@ -96,10 +98,10 @@ class GuestbookViewModel(application: Application) : AndroidViewModel(applicatio
         load(before)
     }
 
-    /** After a failed older page, tries it again. */
-    fun retryMore() {
+    /** Tries the failed load again: the older page, or the newest after a failed refresh. */
+    fun retry() {
         _uiState.update { it.copy(error = null) }
-        loadMore()
+        if (failedOlder) loadMore() else refresh()
     }
 
     private fun load(before: Long?) {
@@ -110,6 +112,7 @@ class GuestbookViewModel(application: Application) : AndroidViewModel(applicatio
                 .onSuccess { page -> apply(repo, before, page) }
                 .onFailure { error ->
                     if (error is CancellationException) throw error
+                    failedOlder = before != null
                     if (error is SessionManagerAuthException) {
                         settingsRepository.clearAuth()
                         _uiState.update { it.copy(loading = false, loadingMore = false, refreshing = false, signedOut = true) }

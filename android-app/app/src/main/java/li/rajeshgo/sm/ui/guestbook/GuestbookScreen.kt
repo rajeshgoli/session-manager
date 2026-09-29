@@ -174,7 +174,7 @@ fun GuestbookScreen(
                             state.loadingMore -> Spinner()
                             state.error != null -> Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                                 Text(state.error.orEmpty(), color = Amber, style = MaterialTheme.typography.bodySmall)
-                                TextButton(onClick = viewModel::retryMore) { Text("Retry") }
+                                TextButton(onClick = viewModel::retry) { Text("Retry") }
                             }
                             state.nextBefore == null -> Text(
                                 "The first entry.",
