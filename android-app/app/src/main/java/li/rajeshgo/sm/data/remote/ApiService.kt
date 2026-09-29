@@ -192,4 +192,11 @@ interface ApiService {
     /** Done on a thread: clears its open ask without messaging the agent. */
     @POST("inbox/done")
     suspend fun markInboxDone(@Body request: li.rajeshgo.sm.data.model.InboxDoneRequest)
+
+    /** Guestbook entries (sm#1660), newest first; `before` is the previous page's `next_before`. */
+    @GET("guestbook?format=json")
+    suspend fun getGuestbook(
+        @Query("repo") repo: String?,
+        @Query("before") before: Long?,
+    ): li.rajeshgo.sm.data.model.GuestbookResponse
 }

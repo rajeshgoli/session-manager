@@ -18,8 +18,7 @@ import li.rajeshgo.sm.ui.watch.loadDocReaderAuth
 
 /**
  * A menu page shown through the reader until it has a native screen
- * (History and the Guestbook, sm#1660 and sm#1661). Back returns to the tab it
- * was opened from.
+ * (History, sm#1661). Back returns to the tab it was opened from.
  */
 @Composable
 fun OwnerPageScreen(page: ReaderPage, onBack: () -> Unit) {

@@ -173,8 +173,6 @@ fun ownerReaderPage(title: String, path: String): ReaderPage =
 
 val historyReaderPage: ReaderPage get() = ownerReaderPage("History", "/history")
 
-val guestbookReaderPage: ReaderPage get() = ownerReaderPage("Guestbook", "/guestbook")
-
 /**
  * The reader page for an opened sm link on the owner's browser host
  * (`https://<linkHost>/docs/…`, `/messages/…`, `/t/…`, `/history` or `/guestbook`), or null when the link
