@@ -433,10 +433,11 @@ impl SessionStore {
             },
             ahead_of,
         )?;
-        if !inserted {
-            return Ok(());
-        }
+        // A resumed transfer still delivers a notice queued before the crash.
         self.drain_after_handoff_raw(&mut state, target_session_id, Some(id))?;
+        if !inserted {
+            return self.write_raw_json_value(&state);
+        }
         push_retained_message_raw(
             &mut state,
             target_session_id,
