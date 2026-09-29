@@ -313,7 +313,12 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private suspend fun applyFollowPushEnabled(enabled: Boolean) {
         settingsRepository.saveFollowPushEnabled(enabled)
         if (enabled) {
-            FollowPush.registerToken(getApplication())
+            // App start registers again, so a failure here is only reported.
+            FollowPush.registerToken(getApplication()).onFailure {
+                _uiState.value = _uiState.value.copy(
+                    notificationTestStatus = "Couldn't reach sm; this phone registers next time the app starts",
+                )
+            }
         } else {
             runCatching {
                 FollowPush.unregisterToken(
