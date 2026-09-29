@@ -89,7 +89,7 @@ fun SettingsScreen(
                     Column(Modifier.weight(1f)) {
                         Text("Notify this phone", style = MaterialTheme.typography.bodyLarge)
                         Text(
-                            if (state.followPushEnabled) "When an agent or job you follow finishes" else "Off — follows arrive by email",
+                            if (state.followPushEnabled) "Follows, agent messages and review requests" else "Off — sm emails you instead",
                             style = MaterialTheme.typography.bodySmall,
                             color = TextMuted,
                         )

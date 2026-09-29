@@ -8,6 +8,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.repository.AppUpdateRepository
 import li.rajeshgo.sm.data.repository.AvailableAppUpdate
@@ -299,20 +301,31 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun setFollowPushEnabled(enabled: Boolean) {
         _uiState.value = _uiState.value.copy(followPushEnabled = enabled, notificationTestStatus = null)
         viewModelScope.launch {
-            settingsRepository.saveFollowPushEnabled(enabled)
-            if (enabled) {
-                FollowPush.registerToken(getApplication())
-            } else {
-                runCatching {
-                    FollowPush.unregisterToken(
-                        getApplication(),
-                        settingsRepository.serverUrl.first(),
-                        settingsRepository.accessToken.first(),
-                    )
-                }
+            // One change at a time, and only the latest tap is applied, so a
+            // slow "off" can never land after a newer "on".
+            followPushSwitchLock.withLock {
+                if (_uiState.value.followPushEnabled != enabled) return@withLock
+                applyFollowPushEnabled(enabled)
             }
         }
     }
+
+    private suspend fun applyFollowPushEnabled(enabled: Boolean) {
+        settingsRepository.saveFollowPushEnabled(enabled)
+        if (enabled) {
+            FollowPush.registerToken(getApplication())
+        } else {
+            runCatching {
+                FollowPush.unregisterToken(
+                    getApplication(),
+                    settingsRepository.serverUrl.first(),
+                    settingsRepository.accessToken.first(),
+                )
+            }
+        }
+    }
+
+    private val followPushSwitchLock = Mutex()
 
     /** Asks sm to push a test notification to this account's phones. */
     fun sendTestNotification() {

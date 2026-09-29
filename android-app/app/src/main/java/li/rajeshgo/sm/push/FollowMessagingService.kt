@@ -25,11 +25,14 @@ class FollowMessagingService : FirebaseMessagingService() {
     override fun onMessageReceived(message: RemoteMessage) {
         // Firebase calls this on a background thread; the settings read is local.
         val settings = SettingsRepository(applicationContext)
-        val (serverUrl, accessToken) = runBlocking {
-            settings.serverUrl.first().trim() to settings.accessToken.first().trim()
+        val (serverUrl, accessToken, enabled) = runBlocking {
+            Triple(settings.serverUrl.first().trim(), settings.accessToken.first().trim(), settings.followPushEnabled.first())
         }
         // A signed-out phone shows nothing, even if its token outlived sign-out.
         if (serverUrl.isBlank() || accessToken.isBlank()) return
+        // Turned off in Settings: nothing is shown or acknowledged, so sm emails
+        // instead, even when unregistering the token failed (offline, say).
+        if (!enabled) return
         if (message.data["kind"] in NoticePush.KINDS) {
             val notice = NoticeMessage.fromData(message.data) ?: return
             // Acknowledged only when actually shown, as follows are (sm#1580).
