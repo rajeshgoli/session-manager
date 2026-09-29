@@ -239,25 +239,23 @@ struct TimelineSpan {
     to: Option<i128>,
 }
 
-/// The provider whose current weekly meter reads higher; Claude on a tie
-/// or when neither has one.
+/// The provider whose current weekly meters, summed over its accounts,
+/// read higher; Claude on a tie or when neither has one.
 pub fn default_provider(usage_db: &Path, now: OffsetDateTime) -> Result<&'static str> {
     if !usage_db.exists() {
         return Ok("claude");
     }
     let usage = open_read_only(usage_db)?;
     let now = now.unix_timestamp_nanos();
-    let highest = |provider: &str| -> Result<f64> {
+    let current = |provider: &str| -> Result<f64> {
         let accounts = provider_accounts(&usage, provider)?;
-        Ok(
-            load_windows(&usage, provider, &accounts, now - WINDOWS_LOOKBACK_NANOS)?
-                .iter()
-                .filter(|window| window.resets_at > now)
-                .map(|window| window.percent)
-                .fold(0.0, f64::max),
-        )
+        let windows = load_windows(&usage, provider, &accounts, now - WINDOWS_LOOKBACK_NANOS)?;
+        Ok(current_windows(&windows, now)
+            .into_iter()
+            .map(|i| windows[i].percent)
+            .sum())
     };
-    Ok(if highest("codex")? > highest("claude")? {
+    Ok(if current("codex")? > current("claude")? {
         "codex"
     } else {
         "claude"

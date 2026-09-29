@@ -580,6 +580,19 @@ fn default_provider_is_the_meter_closer_to_its_limit() {
 }
 
 #[test]
+fn default_provider_sums_the_codex_accounts() {
+    let fixture = fixture();
+    let observed = at("2026-09-29T18:00:00Z");
+    fixture.sample(CLAUDE, at("2026-09-27T16:00:00Z"), 22.0, observed);
+    fixture.sample(CODEX_A, at("2026-09-26T18:00:00Z"), 15.0, observed);
+    fixture.sample(CODEX_B, at("2026-09-27T10:00:00Z"), 10.0, observed);
+    assert_eq!(
+        default_provider(&fixture.usage_path, now()).unwrap(),
+        "codex"
+    );
+}
+
+#[test]
 fn missing_databases_read_as_an_empty_report() {
     let missing = std::env::temp_dir().join("sm-analytics-spend-missing/usage.db");
     let labels = BTreeMap::new();
