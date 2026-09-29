@@ -45,6 +45,7 @@ impl StubItems {
         self.items.lock().unwrap().insert(
             number,
             GhItem {
+                is_draft: false,
                 kind,
                 title: format!("Item {number}"),
                 state: state.into(),
@@ -220,6 +221,7 @@ fn fixture() -> Fixture {
     items.put(10, WorkKind::Pr, "merged");
     let state = AppState::new(config)
         .with_work_item_source(Arc::new(items.clone()))
+        .with_merge_hold_source(Arc::new(items.clone()))
         .with_owner_doc_source(Arc::new(StubDocs))
         .with_github_review_poster(Arc::new(StubPoster));
     // The DB exists before the router starts, as it does on the live server.
@@ -521,11 +523,11 @@ async fn implicit_claims_from_doc_publish_and_codex_review_and_the_feed() {
         json!([
             {"kind": "pr", "repo": REPO, "number": 9, "title": "Item 9", "state": "open",
              "claimed_at": eng["claims"][0]["claimed_at"], "source": "explicit",
-             "history_path": "/t/widgets/9",
+             "history_path": "/t/widgets/9", "merge_hold": null,
              "url": format!("https://github.com/{REPO}/issues/9"), "worktree_path": "/wt"},
             {"kind": "ticket", "repo": REPO, "number": 1, "title": "Item 1", "state": "open",
              "claimed_at": eng["claims"][1]["claimed_at"], "source": "explicit",
-             "history_path": "/t/widgets/1",
+             "history_path": "/t/widgets/1", "merge_hold": null,
              "url": format!("https://github.com/{REPO}/issues/1"), "worktree_path": "/wt"},
         ])
     );
@@ -880,4 +882,88 @@ async fn retire_deletes_a_managed_worktree_left_at_its_base() {
         json!([{"path": path, "removed": true, "reason": "no commits"}])
     );
     assert!(!std::path::Path::new(&path).exists());
+}
+
+impl sm_server::work_claims::merge_holds::MergeHoldSource for StubItems {
+    fn pull_request(
+        &self,
+        _: &str,
+        pr: i64,
+    ) -> Result<sm_server::work_claims::merge_holds::HoldPr, String> {
+        let items = self.items.lock().unwrap();
+        let item = items.get(&pr).ok_or("not found")?;
+        Ok(sm_server::work_claims::merge_holds::HoldPr {
+            node_id: pr.to_string(),
+            state: item.state.clone(),
+            is_draft: item.is_draft,
+        })
+    }
+    fn set_draft(&self, id: &str, draft: bool) -> Result<(), String> {
+        self.items
+            .lock()
+            .unwrap()
+            .get_mut(&id.parse::<i64>().unwrap())
+            .unwrap()
+            .is_draft = draft;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn merge_holds_http_authority_recipients_projection_and_sync() {
+    let f = fixture();
+    claim(&f, "eng00001", "pr", 9, json!({})).await;
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/merge-holds",
+        Some(json!({"repo":REPO,"pr":9,"reason":"decision"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["notified"], json!(["eng00001"]));
+    assert!(queued_texts(&f, "eng00001")
+        .iter()
+        .any(|s| s.contains("[sm hold]") && s.contains("Reason: decision")));
+    assert!(f.items.items.lock().unwrap()[&9].is_draft);
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/merge-holds/release",
+        Some(json!({"repo":REPO,"pr":9,"requester_session_id":"eng00001"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, feed) = request(&f.app, "GET", "/session-obligations", None).await;
+    let session = feed["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["session_id"] == "eng00001")
+        .unwrap();
+    assert!(session["claims"][0]["merge_hold"].is_object());
+    f.items.items.lock().unwrap().get_mut(&9).unwrap().is_draft = false;
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert!(f.items.items.lock().unwrap()[&9].is_draft);
+    assert!(queued_texts(&f, "eng00001")
+        .iter()
+        .any(|s| s.contains("returned it to draft")));
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/merge-holds/release",
+        Some(json!({"repo":REPO,"pr":9})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!f.items.items.lock().unwrap()[&9].is_draft);
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/merge-holds",
+        Some(json!({"repo":REPO,"pr":999})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    fs::remove_dir_all(f.dir).unwrap();
 }

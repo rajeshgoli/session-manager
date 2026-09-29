@@ -324,6 +324,7 @@ mod docs;
 mod follows;
 mod guestbook_page;
 mod history;
+mod merge_holds;
 mod messages;
 mod watch;
 mod worktrees;
@@ -470,6 +471,7 @@ pub struct AppState {
     owner_message_lock: Arc<AsyncMutex<()>>,
     /// Ticket and PR state for work claims (sm#1452).
     work_item_source: Arc<dyn crate::work_claims::WorkItemSource>,
+    merge_hold_source: Arc<dyn crate::work_claims::merge_holds::MergeHoldSource>,
     codex_review_creation_locks: Arc<Mutex<BTreeSet<String>>>,
     codex_review_watcher_ids: Arc<Mutex<BTreeSet<String>>>,
     tmux_client_event_state: Arc<Mutex<TmuxClientEventState>>,
@@ -599,6 +601,7 @@ impl AppState {
             owner_doc_review_lock: Arc::new(AsyncMutex::new(())),
             owner_message_lock: Arc::new(AsyncMutex::new(())),
             work_item_source: Arc::new(claims::GhCliWorkItemSource),
+            merge_hold_source: Arc::new(merge_holds::GhMergeHoldSource),
             codex_review_creation_locks: Arc::new(Mutex::new(BTreeSet::new())),
             codex_review_watcher_ids: Arc::new(Mutex::new(BTreeSet::new())),
             tmux_client_event_state: Arc::new(Mutex::new(TmuxClientEventState::default())),
@@ -635,6 +638,14 @@ impl AppState {
 
     pub fn with_owner_doc_source(mut self, source: Arc<dyn OwnerDocSource>) -> Self {
         self.owner_doc_source = source;
+        self
+    }
+
+    pub fn with_merge_hold_source(
+        mut self,
+        source: Arc<dyn crate::work_claims::merge_holds::MergeHoldSource>,
+    ) -> Self {
+        self.merge_hold_source = source;
         self
     }
 
@@ -1547,6 +1558,11 @@ pub fn router(state: AppState) -> Router {
             "/docs",
             get(docs::list_owner_docs).post(docs::publish_owner_doc),
         )
+        .route(
+            "/merge-holds",
+            get(merge_holds::list).post(merge_holds::place),
+        )
+        .route("/merge-holds/release", post(merge_holds::release))
         .route("/claims", get(claims::list_claims).post(claims::post_claim))
         .route("/claims/release", post(claims::release_claim))
         .route("/claims/worktree", post(worktrees::post_claim_worktree))
@@ -6653,6 +6669,18 @@ fn session_obligations(state: &AppState) -> Result<Value, ApiError> {
         .into_iter()
         .filter_map(|entry| Some((entry["session_id"].as_str()?.to_owned(), entry)))
         .collect();
+    let hold_store = claims::work_claim_store(state);
+    for entry in sessions.values_mut() {
+        for claim in entry["claims"].as_array_mut().into_iter().flatten() {
+            claim["merge_hold"] = match (claim["repo"].as_str(), claim["number"].as_i64()) {
+                (Some(repo), Some(pr)) if claim["kind"] == "pr" => hold_store
+                    .merge_hold(repo, pr)?
+                    .map(|h| h.projection())
+                    .unwrap_or(Value::Null),
+                _ => Value::Null,
+            };
+        }
+    }
     messages::project_messages(&mut sessions, &messages, &state.config.owner_name);
     for entry in sessions.values_mut() {
         set_waiting_since(entry);

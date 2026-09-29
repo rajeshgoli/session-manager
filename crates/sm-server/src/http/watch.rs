@@ -514,9 +514,14 @@ fn work_html(v: &Value) -> String {
                 String::new()
             };
             parts.push(format!(
-                "{} {}{codex}",
+                "{} {}{codex}{}",
                 external(s(&claim, "url"), &format!("PR #{number}")),
-                state_chip(s(&claim, "state"))
+                state_chip(s(&claim, "state")),
+                if claim["merge_hold"].is_object() {
+                    " ⏸"
+                } else {
+                    ""
+                }
             ));
         } else {
             parts.push(format!(

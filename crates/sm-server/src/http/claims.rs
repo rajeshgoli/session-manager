@@ -158,7 +158,7 @@ fn claim_json(state: &AppState, claim_id: &str) -> Result<Value, ApiError> {
 }
 
 /// Delivers queued `[sm claim]` messages now instead of at the next drain.
-fn deliver_claim_notices(state: &AppState, targets: &[String]) {
+pub(super) fn deliver_claim_notices(state: &AppState, targets: &[String]) {
     if !state.config.rust_core.runtime_enabled {
         return;
     }
@@ -615,6 +615,7 @@ pub(super) fn run_sync_pass(state: &AppState) -> anyhow::Result<()> {
             store.record_fetch(&repo, chunk, &fetched)?;
         }
     }
+    super::merge_holds::sync(state)?;
     let now = time::OffsetDateTime::now_utc();
     let mut notified = store.run_check_a(&answered, &sessions, now)?;
     for session_id in store.sessions_due_check_b()? {

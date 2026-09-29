@@ -12,6 +12,7 @@ use axum::http::HeaderValue;
 
 mod review;
 pub(super) use review::recover_owner_doc_reviews;
+pub(super) use review::review_wake_recipient;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocFetchError {
@@ -150,7 +151,7 @@ pub(super) struct GhCliDocSource;
 /// `gh api graphql` with the request body in a temp file, so variables keep
 /// their JSON types. Mutations are not retried: a retry after a lost
 /// response could post a second thread.
-fn gh_graphql(query: &str, variables: Value, retry: bool) -> Result<Value, String> {
+pub(super) fn gh_graphql(query: &str, variables: Value, retry: bool) -> Result<Value, String> {
     let mut nonce = [0u8; 8];
     OsRng.fill_bytes(&mut nonce);
     let input = std::env::temp_dir().join(format!(

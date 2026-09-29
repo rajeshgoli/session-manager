@@ -22,6 +22,7 @@ mod claims;
 mod doc;
 mod git_repo;
 mod history;
+mod merge_holds;
 mod watch;
 
 #[derive(Parser)]
@@ -106,6 +107,8 @@ enum Command {
     Doc(doc::DocArgs),
     /// Claim the ticket you work on; no number lists your claims
     Ticket(claims::TicketArgs),
+    /// Place, release, or list PR merge holds
+    MergeHold(merge_holds::MergeHoldArgs),
     /// Claim the PR you work on; no number uses the current branch's PR
     Pr(claims::PrArgs),
     /// Keep a worktree past your retirement
@@ -1338,6 +1341,7 @@ fn run() -> Result<()> {
         Command::RequestCodexReview(args) => run_request_codex_review(&client, args)?,
         Command::Watch(args) => run_watch(&api_url, args)?,
         Command::Doc(args) => doc::run_doc(&client, args)?,
+        Command::MergeHold(args) => merge_holds::run(&client, args)?,
         Command::Ticket(args) => claims::run_ticket(&client, args)?,
         Command::Pr(args) => claims::run_pr(&client, args)?,
         Command::Worktree(args) => claims::worktree::run_worktree(&client, args)?,

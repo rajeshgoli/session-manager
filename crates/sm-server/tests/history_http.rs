@@ -48,6 +48,7 @@ impl StubItems {
         self.items.lock().unwrap().insert(
             number,
             GhItem {
+                is_draft: false,
                 kind,
                 title: format!("Item <{number}>"),
                 state: state.into(),

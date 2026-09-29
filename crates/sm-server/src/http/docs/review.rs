@@ -125,7 +125,7 @@ pub(super) fn is_retired(session: &SessionRecord) -> bool {
 /// The author if it still exists (a stopped session gets the queued message
 /// on restore), else the retired author's parent, else nobody: the rule
 /// message replies use too.
-pub(super) fn review_wake_recipient(state: &AppState, doc: &OwnerDoc) -> Option<String> {
+pub(in crate::http) fn review_wake_recipient(state: &AppState, doc: &OwnerDoc) -> Option<String> {
     super::super::messages::live_recipient(state, &doc.author_session_id).map(|session| session.id)
 }
 
