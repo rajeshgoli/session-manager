@@ -23850,6 +23850,14 @@ fn owner_docs_app_with(
     source: StubDocSource,
     configure: impl FnOnce(&mut AppConfig),
 ) -> (axum::Router, PathBuf) {
+    let (state, dir) = owner_docs_state_with(source, configure);
+    (router(state), dir)
+}
+
+fn owner_docs_state_with(
+    source: StubDocSource,
+    configure: impl FnOnce(&mut AppConfig),
+) -> (AppState, PathBuf) {
     let dir = unique_temp_path();
     fs::create_dir_all(&dir).unwrap();
     let state_file = dir.join("sessions.json");
@@ -23898,7 +23906,7 @@ fn owner_docs_app_with(
     config.rust_core.fixture_writes_enabled = true;
     configure(&mut config);
     (
-        router(AppState::new(config).with_owner_doc_source(Arc::new(source))),
+        AppState::new(config).with_owner_doc_source(Arc::new(source)),
         dir,
     )
 }
@@ -24614,6 +24622,60 @@ async fn owner_doc_review_posts_one_github_review_and_wakes_the_author_once() {
         .unwrap()
         .contains("\"canComment\":true"));
     assert_eq!(source.github.lock().unwrap().reviews.len(), 1);
+}
+
+#[tokio::test]
+async fn owner_doc_review_request_ends_when_its_pr_merges_or_closes() {
+    let c1 = "a".repeat(40);
+    let source = review_memo_source(&c1);
+    let (state, _dir) = owner_docs_state_with(source.clone(), |_| {});
+    let app = router(state.clone());
+    publish_review_memo(&app, "specs/memo.html", &c1, "author01", true).await;
+    let state_of = |path: &'static str| {
+        let app = app.clone();
+        async move {
+            let (_, list) = get_json(app, "/docs?session=author01").await;
+            let doc = list["docs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|doc| doc["path"] == path)
+                .cloned();
+            doc.unwrap()["state"].as_str().unwrap().to_owned()
+        }
+    };
+    let waiting = |obligations: &Value| {
+        !owner_doc_session(obligations, "author01")["waiting_on"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    };
+    let sweep = |state: &AppState| {
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || state.end_closed_pr_review_requests().unwrap())
+    };
+
+    // An open PR keeps the request.
+    sweep(&state).await.unwrap();
+    let (_, obligations) = get_json(app.clone(), "/session-obligations").await;
+    assert!(waiting(&obligations));
+
+    // The author merges without a review: the request ends, the doc reads as read.
+    source.github.lock().unwrap().set_pr(12, "merged", &c1);
+    sweep(&state).await.unwrap();
+    let (_, obligations) = get_json(app.clone(), "/session-obligations").await;
+    assert!(!waiting(&obligations), "{obligations}");
+    assert_ne!(state_of("specs/memo.html").await, "review_requested");
+
+    // A closed, unmerged PR ends it too; a PR that fails to load changes nothing.
+    source.github.lock().unwrap().set_pr(12, "open", &c1);
+    publish_review_memo(&app, "specs/a.html", &c1, "author01", true).await;
+    source.github.lock().unwrap().prs.remove(&12);
+    sweep(&state).await.unwrap();
+    assert_eq!(state_of("specs/a.html").await, "review_requested");
+    source.github.lock().unwrap().set_pr(12, "closed", &c1);
+    sweep(&state).await.unwrap();
+    assert_ne!(state_of("specs/a.html").await, "review_requested");
 }
 
 #[tokio::test]

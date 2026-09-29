@@ -555,16 +555,20 @@ fun WatchScreen(
             )
         }
         openPage?.let { page ->
-            DocReaderOverlay(
-                page = page,
-                loadAuth = viewModel::docReaderAuth,
-                onClose = { openPage = null },
-                onCopyLink = { link ->
-                    val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
-                    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm doc", link))
-                    toast = "Doc link copied"
-                },
-            )
+            // A new page (a notification tapped while reading) gets a fresh reader:
+            // the WebView loads its page only when it is created.
+            androidx.compose.runtime.key(page) {
+                DocReaderOverlay(
+                    page = page,
+                    loadAuth = viewModel::docReaderAuth,
+                    onClose = { openPage = null },
+                    onCopyLink = { link ->
+                        val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                        clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("sm doc", link))
+                        toast = "Doc link copied"
+                    },
+                )
+            }
         }
     }
 }

@@ -2121,6 +2121,45 @@ fn create_draft(
     Ok(serde_json::to_value(draft)?)
 }
 
+/// Every sync pass: a review request ends, as though dismissed, once the
+/// doc's PR is merged or closed. The author has moved on, so it no longer
+/// waits on the owner, who can still review through Open PR and submit
+/// (sm#1641). Publishing `--review` on a merged or closed PR is refused, so
+/// the PR closed after the request.
+pub(super) fn end_closed_pr_review_requests(state: &AppState) -> anyhow::Result<()> {
+    let store = owner_doc_store(state);
+    for summary in store.summaries(None, false)? {
+        let (OwnerDocState::ReviewRequested, Some(pr)) = (summary.state, summary.doc.pr_number)
+        else {
+            continue;
+        };
+        match state.owner_doc_source.pull_request(&summary.doc.repo, pr) {
+            Ok(pull) if !pull.is_open() => {
+                // A submit in flight settles the request itself; else the
+                // next pass. Taken after the `gh` call so no submit waits on it.
+                let Ok(_guard) = state.owner_doc_review_lock.try_lock() else {
+                    continue;
+                };
+                // A publish during the lookup may have moved the doc to a new PR.
+                let still_requested = store.summary(&summary.doc.id)?.is_some_and(|now| {
+                    now.state == OwnerDocState::ReviewRequested
+                        && now.doc.pr_number == summary.doc.pr_number
+                        && now.publish_count == summary.publish_count
+                });
+                if still_requested {
+                    store.dismiss_review(&summary.doc.id)?;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "doc review sync of {}#{pr} failed: {error}",
+                summary.doc.repo
+            ),
+        }
+    }
+    Ok(())
+}
+
 /// Docs for the obligations projection: stored data only, never `gh`.
 pub(super) fn obligation_doc_summaries(state: &AppState) -> Result<Vec<OwnerDocSummary>, ApiError> {
     Ok(owner_doc_store(state).summaries(None, false)?)
