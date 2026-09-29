@@ -592,7 +592,16 @@ impl TmuxRuntime {
             let snapshot_saved = spec.force_initial_prompt_stdin
                 && self
                     .capture_pane_text(&spec.tmux_session)
-                    .is_some_and(|pane| fs::write(&snapshot, pane).is_ok());
+                    .is_some_and(|pane| {
+                        fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&snapshot)
+                            .and_then(|mut file| {
+                                std::io::Write::write_all(&mut file, pane.as_bytes())
+                            })
+                            .is_ok()
+                    });
             let _ = self.kill_session(&spec.tmux_session);
             return Err(if snapshot_saved {
                 error.context(format!(
