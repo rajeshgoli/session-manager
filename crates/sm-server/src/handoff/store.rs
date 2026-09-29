@@ -536,7 +536,9 @@ mod tests {
                     session("agent001", "claude", agent_extra),
                     session("fork0001", "codex-fork", json!({})),
                     session("app00001", "codex-app", json!({})),
-                ]
+                ],
+                // As the owner turns it on once `sm handoff` ships (#1654).
+                "handoff_defaults": {"providers": {"claude": true}}
             })
             .to_string(),
         )
@@ -865,7 +867,12 @@ mod tests {
     fn defaults_start_filled_merge_and_reask_below_a_lowered_threshold() {
         let store = store("defaults");
         let defaults = store.handoff_defaults().unwrap();
-        assert_eq!(defaults, HandoffDefaults::default());
+        assert_eq!(
+            defaults,
+            HandoffDefaults::default()
+                .merged(&json!({"providers": {"claude": true}}))
+                .unwrap()
+        );
         sample(&store, "agent001", 30.0);
         assert!(queued(&store, "agent001").is_empty());
 

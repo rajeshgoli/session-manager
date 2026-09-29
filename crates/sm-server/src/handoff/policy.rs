@@ -55,7 +55,9 @@ impl Default for HandoffDefaults {
     fn default() -> Self {
         Self {
             providers: BTreeMap::from([
-                ("claude".to_owned(), true),
+                // Off until `sm handoff --link/--path` ships (#1654), which
+                // turns it on: an ask names a command this build lacks.
+                ("claude".to_owned(), false),
                 ("codex-fork".to_owned(), false),
                 ("codex-app".to_owned(), false),
             ]),
@@ -623,6 +625,9 @@ mod tests {
     #[test]
     fn resolution_table_matches_appendix_b() {
         let defaults = HandoffDefaults::default();
+        let defaults = defaults
+            .merged(&json!({"providers": {"claude": true}}))
+            .unwrap();
         let claude = effective_policy(&defaults, "claude", None, true);
         assert!(claude.enabled);
         assert_eq!(claude.threshold_percent, 35.0);
@@ -676,7 +681,10 @@ mod tests {
             .merged(&json!({"threshold_percent": 40, "providers": {"codex-fork": true}}))
             .unwrap();
         assert_eq!(merged.threshold_percent, 40.0);
-        assert!(merged.provider_enabled("claude"));
+        assert!(
+            !merged.provider_enabled("claude"),
+            "untouched provider keeps its value"
+        );
         assert!(merged.provider_enabled("codex-fork"));
         assert_eq!(merged.review_floor_percent, 20.0);
 
@@ -813,7 +821,9 @@ mod tests {
 
     #[test]
     fn display_strings_per_state() {
-        let defaults = HandoffDefaults::default();
+        let defaults = HandoffDefaults::default()
+            .merged(&json!({"providers": {"claude": true}}))
+            .unwrap();
         let on = effective_policy(&defaults, "claude", None, true);
         let off = effective_policy(&defaults, "codex-fork", None, true);
         assert_eq!(display(&on, None, None), "hands off at 35%");

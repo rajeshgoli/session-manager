@@ -548,6 +548,7 @@ async fn review_requests_carry_the_handoff_ask_above_the_floor() {
         };
         session["context_used_percentage"] = json!(percent);
     }
+    state["handoff_defaults"] = json!({"providers": {"claude": true}});
     fs::write(&state_file, state.to_string()).unwrap();
 
     let (status, body) = request(
