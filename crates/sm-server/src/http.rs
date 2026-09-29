@@ -131,15 +131,15 @@ use crate::sessions::{
     ContextMonitorRequest, ContextSnapshotResponse, ContextUsageEvent, ContextUsageOutcome,
     CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
     CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, CreateReparentRequest,
-    CreateReparentTreeRequest, CredentialRotationOutcome, DecideReparentRequest, HandoffOutcome,
-    HandoffRequest, HierarchyRootResolution, MaintainerMutationOutcome, RegistryMutationOutcome,
-    ReparentDecision, ReparentMutationOutcome, ReparentRepairAction, RetireAuthority,
-    RoleRegistrationRequest, SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest,
-    SendCoreInputRequest, SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore,
-    SessionsEnvelope, SetMaintainerRequest, SpawnBriefBinding, SpawnBriefSource,
-    SpawnReviewRequest, StartReviewRequest, SubagentStartOutcome, SubagentStartRequest,
-    SubagentStopOutcome, SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest,
-    TurnCompleteOutcome, UpdateSessionMetadataRequest,
+    CreateReparentTreeRequest, CredentialRotationOutcome, DecideReparentRequest,
+    HierarchyRootResolution, MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision,
+    ReparentMutationOutcome, ReparentRepairAction, RetireAuthority, RoleRegistrationRequest,
+    SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest, SendCoreInputRequest,
+    SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
+    SetMaintainerRequest, SpawnBriefBinding, SpawnBriefSource, SpawnReviewRequest,
+    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
+    SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
+    UpdateSessionMetadataRequest,
 };
 
 use crate::studio_ssh::{self, StudioSshStatus};
@@ -573,11 +573,11 @@ impl AppState {
         if let Err(error) = session_store.recover_session_credential_rotation_workers() {
             eprintln!("session credential rotation recovery failed: {error:#}");
         }
-        if let Err(error) = session_store.recover_pending_codex_fork_handoffs() {
-            eprintln!("codex-fork handoff recovery failed: {error:#}");
+        if let Err(error) = session_store.strip_legacy_handoff_fields() {
+            eprintln!("removing old /clear handoff fields failed: {error:#}");
         }
-        if let Err(error) = session_store.recover_pending_claude_handoffs() {
-            eprintln!("Claude handoff recovery failed: {error:#}");
+        if let Err(error) = session_store.recover_interrupted_handoff_starts() {
+            eprintln!("handoff start recovery failed: {error:#}");
         }
         if let Err(error) = session_store.recover_codex_fork_event_monitors() {
             eprintln!("codex-fork event monitor recovery failed: {error:#}");
@@ -1480,6 +1480,7 @@ pub fn router(state: AppState) -> Router {
     recover_btw_requests(state.clone());
     if state.config.rust_core.runtime_enabled {
         spawn_scheduled_reminder_dispatcher(state.clone());
+        handoff::spawn_handoff_sweeper(state.clone());
     }
     let mut app = Router::new()
         .route("/health", get(health))
@@ -1742,7 +1743,10 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{session_id}/kill", post(retire_session_legacy))
         .route("/sessions/{session_id}/restore", post(restore_session))
         .route("/sessions/{session_id}/clear", post(clear_session))
-        .route("/sessions/{session_id}/handoff", post(schedule_handoff))
+        .route(
+            "/sessions/{session_id}/handoff",
+            post(handoff::post_handoff),
+        )
         .route(
             "/sessions/{session_id}/handoff-policy",
             get(handoff::get_handoff_policy).put(handoff::put_handoff_policy),
@@ -2128,12 +2132,7 @@ async fn claude_hook(
             emitted_at,
         )?;
         if stop_applied {
-            if let Err(error) = state
-                .session_store
-                .start_pending_claude_handoff(&session_id)
-            {
-                eprintln!("failed to start Claude handoff for {session_id}: {error:#}");
-            }
+            handoff::kick_handoff(state.clone(), session_id.clone());
         }
     }
 
@@ -4949,6 +4948,7 @@ async fn create_codex_review_request(
     let Some(notify_session) = resolve_session_or_registry_role(&state, notify_identifier)? else {
         return Err(ApiError::NotFound("Notify target not found"));
     };
+    let notify_session = forward_handed_off(&state, notify_session)?;
     if notify_session.is_stopped() {
         return Err(ApiError::Status {
             status: StatusCode::CONFLICT,
@@ -6385,6 +6385,7 @@ async fn schedule_reminder(
     let Some(session) = state.session_store.get_session(&payload.session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
+    let session = forward_handed_off(&state, session)?;
     if session.is_stopped() {
         return Err(ApiError::Status {
             status: StatusCode::CONFLICT,
@@ -7234,6 +7235,7 @@ async fn create_queue_job(
     let Some(notify_session) = resolve_session_or_registry_role(&state, &notify_identifier)? else {
         return Err(ApiError::NotFound("Notify target not found"));
     };
+    let notify_session = forward_handed_off(&state, notify_session)?;
 
     let job_type = payload.job_type.trim();
     let default_timeout =
@@ -7420,6 +7422,18 @@ fn cancel_queue_job_inner(
         return Err(ApiError::NotFound("Queue job not found"));
     };
     Ok(Json(queue_job_response(state, job)?))
+}
+
+/// H.2 (sm#1651): an ended session that handed off resolves to the live end
+/// of its successor chain. Anything else resolves to itself.
+fn forward_handed_off(state: &AppState, session: SessionRecord) -> Result<SessionRecord, ApiError> {
+    if !session.is_stopped() || session.successor_session_id.is_none() {
+        return Ok(session);
+    }
+    Ok(state
+        .session_store
+        .forwarded_session(&session.id)?
+        .unwrap_or(session))
 }
 
 fn resolve_session_or_registry_role(
@@ -9023,9 +9037,17 @@ async fn send_session_input(
             detail: "text is required".to_owned(),
         });
     }
-    let Some(session) = state.session_store.get_session(&session_id)? else {
+    let Some(named) = state.session_store.get_session(&session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
+    let session = forward_handed_off(&state, named.clone())?;
+    let forwarded = (session.id != named.id).then(|| {
+        crate::handoff::execute::forwarded_text(
+            &session_target_name(&named).unwrap_or_else(|| named.id.clone()),
+            &session_target_name(&session).unwrap_or_else(|| session.id.clone()),
+            &session.id,
+        )
+    });
     let result = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_session_node_supported(&state, &session.id)?;
         let runtime = TmuxRuntime::from_app_config(&state.config);
@@ -9038,7 +9060,11 @@ async fn send_session_input(
     let Some(result) = result else {
         return Err(ApiError::NotFound("Session not found"));
     };
-    Ok(Json(serde_json::to_value(result)?))
+    let mut response = serde_json::to_value(result)?;
+    if let Some(forwarded) = forwarded {
+        response["forwarded"] = json!(forwarded);
+    }
+    Ok(Json(response))
 }
 
 async fn create_btw_request(
@@ -9752,6 +9778,7 @@ fn send_session_input_batch_one(
             format!("Session '{identifier}' not found"),
         ));
     };
+    let session = forward_handed_off(state, session)?;
     if runtime.is_some() && !is_primary_node(&session.node) {
         return Ok(failed_batch_result(
             identifier,
@@ -10200,6 +10227,19 @@ async fn set_context_monitor(
         &format!("/sessions/{session_id}/context-monitor"),
     )?;
     ensure_core_writes_enabled(&state)?;
+    let mut payload = payload;
+    let forward = |identifier: &str| -> Result<Option<String>, ApiError> {
+        Ok(match state.session_store.get_session(identifier)? {
+            Some(session) => Some(forward_handed_off(&state, session)?.id),
+            None => None,
+        })
+    };
+    let session_id = forward(&session_id)?.unwrap_or(session_id);
+    if let Some(notify) = payload.notify_session_id.clone() {
+        if let Some(forwarded) = forward(&notify)? {
+            payload.notify_session_id = Some(forwarded);
+        }
+    }
     match state
         .session_store
         .set_context_monitor(&session_id, payload)?
@@ -10308,30 +10348,6 @@ async fn list_subagents(
         return Err(ApiError::NotFound("Session not found"));
     };
     Ok(Json(serde_json::to_value(result)?))
-}
-
-async fn schedule_handoff(
-    State(state): State<Arc<AppState>>,
-    Path(session_id): Path<String>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(payload): Json<HandoffRequest>,
-) -> Result<Json<Value>, ApiError> {
-    ensure_session_allowed_from_parts(
-        &state.config,
-        &headers,
-        Some(peer_addr),
-        &format!("/sessions/{session_id}/handoff"),
-    )?;
-    ensure_core_writes_enabled(&state)?;
-    if state.config.rust_core.runtime_enabled {
-        ensure_core_runtime_session_node_supported(&state, &session_id)?;
-    }
-    let result = state.session_store.schedule_handoff(&session_id, payload)?;
-    match result {
-        HandoffOutcome::Recorded(result) => Ok(Json(serde_json::to_value(result)?)),
-        HandoffOutcome::Error(error) => Ok(Json(json!({ "error": error }))),
-    }
 }
 
 async fn set_maintainer(

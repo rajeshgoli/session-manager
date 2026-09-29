@@ -487,10 +487,18 @@ struct TailArgs {
 
 #[derive(Args)]
 #[command(
-    after_help = "Destructive operation: after the current turn, this sends /clear to the calling Claude session and injects the handoff prompt."
+    after_help = "After your turn ends, sm starts a fresh agent of the same kind in this worktree, moves your claims, children, roles and pending wakes to it, and retires this session. `sm handoff FILE` means `--path FILE`."
 )]
 struct HandoffArgs {
+    /// Same as --path.
+    #[arg(conflicts_with_all = ["link", "path"])]
     file_path: Option<String>,
+    /// URL of the handoff note (a PR or ticket comment).
+    #[arg(long, conflicts_with = "path")]
+    link: Option<String>,
+    /// File holding the handoff note.
+    #[arg(long)]
+    path: Option<String>,
 }
 
 #[derive(Args)]
@@ -1189,29 +1197,7 @@ fn run() -> Result<()> {
                 payload["session_id"].as_str().unwrap_or(&args.session_id)
             );
         }
-        Command::Handoff(args) => {
-            let session_id = current_session_id()?;
-            let file_path = args.file_path.unwrap_or_else(|| "HANDOFF.md".to_owned());
-            let absolute = fs::canonicalize(&file_path)
-                .with_context(|| format!("File not found: {file_path}"))?;
-            let payload = client.post_json(
-                &format!("/sessions/{session_id}/handoff"),
-                json!({
-                    "requester_session_id": session_id,
-                    "file_path": absolute.display().to_string()
-                }),
-            )?;
-            if let Some(error) = payload["error"].as_str() {
-                bail!("{error}");
-            }
-            match payload["status"].as_str() {
-                Some("executed") => println!("Handoff executed"),
-                Some("recorded") => println!("Handoff recorded"),
-                _ => println!(
-                    "Handoff scheduled - after this turn it will /clear this session and inject the handoff prompt"
-                ),
-            }
-        }
+        Command::Handoff(args) => run_handoff(&client, args)?,
         Command::TaskComplete(args) => {
             let Some(session_id) = optional_current_session_id() else {
                 eprintln!(
@@ -1391,6 +1377,55 @@ fn retire_response_status(payload: &Value, target_session_id: &str) -> Result<&'
 
 const PERSON_FLAGS_ONLY: &str = "--title/--blocking only apply to a message to a person";
 
+/// `sm handoff --link|--path` (sm#1651, Appendix E).
+fn run_handoff(client: &ApiClient, args: HandoffArgs) -> Result<()> {
+    let note = handoff_note(args)?;
+    let session_id = current_session_id()?;
+    let response = client.request(
+        "POST",
+        &format!("/sessions/{session_id}/handoff"),
+        Some(json!({ "requester_session_id": session_id, "note": note })),
+    )?;
+    if !(200..300).contains(&response.status) {
+        let detail = serde_json::from_str::<Value>(&response.body)
+            .ok()
+            .and_then(|body| body["detail"].as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| format!("HTTP {}: {}", response.status, response.body));
+        bail!("{detail}");
+    }
+    let payload = response.into_json()?;
+    println!(
+        "{}",
+        payload["message"].as_str().unwrap_or("Handoff accepted.")
+    );
+    Ok(())
+}
+
+/// The note of `sm handoff`: a link that parses as http(s), or an existing
+/// regular file made absolute. Neither is fetched or read.
+fn handoff_note(args: HandoffArgs) -> Result<Value> {
+    if let Some(link) = args.link {
+        let link = link.trim();
+        let host = link
+            .strip_prefix("https://")
+            .or_else(|| link.strip_prefix("http://"))
+            .and_then(|rest| rest.split(['/', '?', '#']).next())
+            .filter(|host| !host.is_empty());
+        if host.is_none() || link.chars().any(char::is_whitespace) {
+            bail!("--link must be an http or https URL: {link}");
+        }
+        return Ok(json!({ "kind": "link", "value": link }));
+    }
+    let Some(path) = args.path.or(args.file_path) else {
+        bail!("sm handoff needs --link <url> or --path <file>");
+    };
+    let absolute = fs::canonicalize(&path).with_context(|| format!("File not found: {path}"))?;
+    if !absolute.is_file() {
+        bail!("--path must name a regular file: {path}");
+    }
+    Ok(json!({ "kind": "path", "value": absolute.display().to_string() }))
+}
+
 fn run_send(client: &ApiClient, args: SendArgs) -> Result<()> {
     let text = read_send_text(&args.text)?;
     let person_flags = args.title.is_some() || args.blocking;
@@ -1433,6 +1468,10 @@ fn run_send(client: &ApiClient, args: SendArgs) -> Result<()> {
             bail!(PERSON_FLAGS_ONLY);
         }
         let payload = client.post_json(&format!("/sessions/{session_id}/input"), payload)?;
+        if let Some(forwarded) = payload["forwarded"].as_str() {
+            println!("{forwarded}");
+            return Ok(());
+        }
         println!(
             "{}",
             if payload["delivered"].as_bool().unwrap_or(false) {
@@ -5776,6 +5815,43 @@ mod tests {
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn handoff_note_needs_a_link_or_an_existing_file() {
+        let args = |file_path: Option<&str>, link: Option<&str>, path: Option<&str>| HandoffArgs {
+            file_path: file_path.map(ToOwned::to_owned),
+            link: link.map(ToOwned::to_owned),
+            path: path.map(ToOwned::to_owned),
+        };
+        assert_eq!(
+            handoff_note(args(None, None, None))
+                .unwrap_err()
+                .to_string(),
+            "sm handoff needs --link <url> or --path <file>"
+        );
+        assert_eq!(
+            handoff_note(args(None, Some("https://github.com/a/b/pull/1#c"), None)).unwrap(),
+            json!({"kind": "link", "value": "https://github.com/a/b/pull/1#c"})
+        );
+        for bad in ["ftp://x", "https://", "notaurl", "https://a b"] {
+            assert!(handoff_note(args(None, Some(bad), None)).is_err(), "{bad}");
+        }
+        let file = std::env::temp_dir().join(format!("sm-handoff-note-{}.md", std::process::id()));
+        fs::write(&file, "note").unwrap();
+        let absolute = fs::canonicalize(&file).unwrap().display().to_string();
+        for form in [
+            args(Some(file.to_str().unwrap()), None, None),
+            args(None, None, Some(file.to_str().unwrap())),
+        ] {
+            assert_eq!(
+                handoff_note(form).unwrap(),
+                json!({"kind": "path", "value": absolute})
+            );
+        }
+        assert!(handoff_note(args(None, None, Some("/no/such/file.md"))).is_err());
+        assert!(handoff_note(args(None, None, Some("/tmp"))).is_err());
+        fs::remove_file(file).unwrap();
+    }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 

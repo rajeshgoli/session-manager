@@ -913,6 +913,56 @@ impl WorkClaimStore {
         Ok(claims.len())
     }
 
+    /// Context handoff (sm#1651, Appendix G): re-point the predecessor's
+    /// active claims and worktree keeps to the successor in place, keeping
+    /// every other column, with one `claim.handed_off` event per claim and no
+    /// `[sm claim]` notice. Safe to repeat. Returns the claims moved.
+    pub fn hand_off(
+        &self,
+        predecessor_id: &str,
+        successor_id: &str,
+        successor_name: &str,
+    ) -> Result<usize> {
+        let Some(mut conn) = self.open_existing()? else {
+            return Ok(0);
+        };
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let claims = query_claims(
+            &tx,
+            "WHERE session_id = ?1 AND ended_at IS NULL ORDER BY claimed_at, id",
+            params![predecessor_id],
+        )?;
+        let now = now_rfc3339();
+        for claim in &claims {
+            tx.execute(
+                "UPDATE work_claims SET session_id = ?2, session_name = ?3
+                  WHERE id = ?1 AND session_id = ?4 AND ended_at IS NULL",
+                params![claim.id, successor_id, successor_name, predecessor_id],
+            )?;
+            let (ticket, pr) = item_keys(&tx, &claim.repo, claim.kind(), claim.number)?;
+            write_event(
+                &tx,
+                "claim.handed_off",
+                Some(predecessor_id),
+                Some(&claim.repo),
+                ticket,
+                pr,
+                json!({
+                    "claim_id": claim.id,
+                    "successor_session_id": successor_id,
+                    "successor_name": successor_name,
+                }),
+                &now,
+            )?;
+        }
+        tx.execute(
+            "UPDATE worktree_keeps SET session_id = ?2 WHERE session_id = ?1",
+            params![predecessor_id, successor_id],
+        )?;
+        tx.commit()?;
+        Ok(claims.len())
+    }
+
     /// Spawn step 4: the session exists, so the claim becomes real and
     /// supersedes any stopped holders. Returns the sessions sent a message.
     pub fn confirm_reservation(

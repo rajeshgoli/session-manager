@@ -202,6 +202,26 @@ impl OwnerPushStore {
         Self { db_path }
     }
 
+    /// Context handoff (sm#1651): pending follows of an agent follow its
+    /// successor. Safe to repeat.
+    pub fn hand_off_follows(
+        &self,
+        predecessor_id: &str,
+        successor_id: &str,
+        successor_name: &str,
+    ) -> Result<()> {
+        if !self.db_path.exists() {
+            return Ok(());
+        }
+        self.open()?.execute(
+            "UPDATE OR IGNORE owner_follows SET session_id = ?2, session_name = ?3
+              WHERE session_id = ?1 AND target_kind = 'session'
+                AND fired_at IS NULL AND cancelled_at IS NULL",
+            params![predecessor_id, successor_id, successor_name],
+        )?;
+        Ok(())
+    }
+
     fn open(&self) -> Result<Connection> {
         if let Some(parent) = self.db_path.parent() {
             fs::create_dir_all(parent)

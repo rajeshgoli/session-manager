@@ -920,12 +920,25 @@ pub(super) fn agent_thread_page(
     let name = world.agent_name(&session_id);
     let live = world.live(&session_id);
     let recipient = live_recipient(state, &session_id);
+    // A thread whose agent handed off continues with its successor (sm#1651).
+    let status = match state.session_store.get_session(&session_id)? {
+        Some(session) if !live && session.successor_session_id.is_some() => {
+            match state.session_store.forwarded_session(&session_id)? {
+                Some(successor) => format!(
+                    "continued by {}",
+                    escape_html(&world.agent_name(&successor.id))
+                ),
+                None => "ended".to_owned(),
+            }
+        }
+        _ if live => "live".to_owned(),
+        _ => "ended".to_owned(),
+    };
     let repo = world.agent_repo(&session_id);
     let mut body = format!(
         r#"<style>{THREAD_STYLE}</style><div class="th-head"><a class="dim" href="/inbox">‹ Inbox</a><span class="big">{name}</span><span class="m"><span class="dot {dot}"></span>{status}{repo}</span></div><div class="items{quote_class}">"#,
         name = escape_html(&name),
         dot = if live { "working" } else { "retired" },
-        status = if live { "live" } else { "ended" },
         repo = if repo.is_empty() {
             String::new()
         } else {

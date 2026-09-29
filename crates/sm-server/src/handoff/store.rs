@@ -469,7 +469,7 @@ impl SessionStore {
     }
 
     /// `<claims>` of D.1: the session's active claims in claim order.
-    fn handoff_claims_text(&self, session_id: &str) -> String {
+    pub fn handoff_claims_text(&self, session_id: &str) -> String {
         let Some(queue) = &self.queue_store else {
             return claims_text(&[]);
         };
@@ -537,8 +537,6 @@ mod tests {
                     session("fork0001", "codex-fork", json!({})),
                     session("app00001", "codex-app", json!({})),
                 ],
-                // As the owner turns it on once `sm handoff` ships (#1654).
-                "handoff_defaults": {"providers": {"claude": true}}
             })
             .to_string(),
         )
@@ -867,12 +865,7 @@ mod tests {
     fn defaults_start_filled_merge_and_reask_below_a_lowered_threshold() {
         let store = store("defaults");
         let defaults = store.handoff_defaults().unwrap();
-        assert_eq!(
-            defaults,
-            HandoffDefaults::default()
-                .merged(&json!({"providers": {"claude": true}}))
-                .unwrap()
-        );
+        assert_eq!(defaults, HandoffDefaults::default());
         sample(&store, "agent001", 30.0);
         assert!(queued(&store, "agent001").is_empty());
 

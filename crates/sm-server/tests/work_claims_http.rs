@@ -1166,3 +1166,131 @@ async fn doc_agent_claim_precedence_stale_retire_and_owner_hold() {
     assert_eq!(head["agent"]["session_id"], "eng00001");
     fs::remove_dir_all(f.dir).unwrap();
 }
+
+/// Context handoff (sm#1651, Appendices G and H.1): claims move in place, so
+/// the managed worktree belongs to the successor when the predecessor
+/// retires, and cleanup leaves it alone.
+#[tokio::test]
+async fn handoff_moves_claims_in_place_and_the_worktree_survives_retire() {
+    let f = fixture();
+    let (path, head) = git_worktree(&f.dir, "1-item-1");
+    let (_, body) = claim(&f, "eng00001", "ticket", 1, json!({"worktree_path": null})).await;
+    let claim_id = body["claim"]["id"].as_str().unwrap().to_owned();
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/claims/worktree",
+        Some(
+            json!({"requester_session_id": "eng00001", "claim_id": claim_id,
+                    "state": "intent", "worktree_path": path, "branch": "1-item-1",
+                    "base_sha": head}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = claim(&f, "eng00001", "pr", 9, json!({"worktree_path": null})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let note = f.dir.join("HANDOFF.md");
+    fs::write(&note, "next steps").unwrap();
+
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/sessions/eng00002/handoff",
+        Some(json!({"requester_session_id": "eng00001",
+                    "note": {"kind": "path", "value": note.display().to_string()}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["detail"], "sm handoff is self-directed only");
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/sessions/eng00001/handoff",
+        Some(json!({"requester_session_id": "eng00001",
+                    "note": {"kind": "path", "value": note.display().to_string()}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        "/hooks/claude",
+        Some(json!({"hook_event_name": "Stop", "session_manager_id": "eng00001"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut done = Value::Null;
+    for _ in 0..50 {
+        let (_, body) = request(&f.app, "GET", "/sessions/eng00001", None).await;
+        if body["handoff"]["state"] == "done" {
+            done = body;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(done["handoff"]["state"], "done", "handoff did not finish");
+    let successor = done["handoff"]["successor"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(done["handoff"]["successor"]["name"], "eng00001-agent-h2");
+
+    let held = f.store().claims_for_session(&successor, true).unwrap();
+    let held = held
+        .iter()
+        .map(|view| {
+            (
+                view.claim.number,
+                view.claim.worktree_path.clone(),
+                view.claim.managed_worktree,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(held, vec![(1, Some(path.clone()), true), (9, None, false)]);
+    assert!(f
+        .store()
+        .claims_for_session("eng00001", true)
+        .unwrap()
+        .is_empty());
+    let handed_off = f
+        .store()
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.kind == "claim.handed_off")
+        .count();
+    assert_eq!(handed_off, 2);
+
+    // Retired, yet the worktree stays: its claim is the successor's.
+    assert!(std::path::Path::new(&path).exists());
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert!(std::path::Path::new(&path).exists());
+
+    let brief = queued_texts(&f, &successor).join("\n---\n");
+    assert!(
+        brief.contains(&format!(
+            "[sm handoff] You are taking over from eng00001-agent (eng00001).\nHandoff note: {}\nWorking directory: /repo (branch 1-item-1)\nYou now hold: ticket #1, PR #9\n",
+            note.display()
+        )),
+        "{brief}"
+    );
+    let notice = queued_texts(&f, "lead0001").join("\n");
+    assert!(
+        notice.contains(&format!(
+            "[sm handoff] eng00001-agent (eng00001) handed off to eng00001-agent-h2 ({successor}). Note: {}",
+            note.display()
+        )),
+        "{notice}"
+    );
+
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/sessions/eng00001/handoff",
+        Some(json!({"requester_session_id": "eng00001",
+                    "note": {"kind": "link", "value": "https://x/y"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}

@@ -35,6 +35,18 @@ pub(super) fn live_recipient(state: &AppState, session_id: &str) -> Option<Sessi
     if !session_ended(&session) {
         return Some(session);
     }
+    // A session that handed off forwards along its successor chain (sm#1651).
+    if session.successor_session_id.is_some() {
+        if let Some(successor) = state
+            .session_store
+            .forwarded_session(session_id)
+            .ok()
+            .flatten()
+            .filter(|successor| !session_ended(successor))
+        {
+            return Some(successor);
+        }
+    }
     let parent = session.parent_session_id.as_deref()?;
     state
         .session_store
