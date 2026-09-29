@@ -95,7 +95,8 @@ fn recorder_snapshot(sample: &crate::utilization::HostSample, host: Option<Strin
             .ok()
     });
     json!({
-        "available": sample.cpu_busy_pct.is_some() || sample.mem_used_bytes.is_some(),
+        // A fresh sample is a reading; a failed measurement is its own null.
+        "available": true,
         "host": host,
         "sampled_at": sampled_at,
         "memory_total_bytes": sample.mem_total_bytes,
@@ -254,6 +255,12 @@ mod tests {
         assert_eq!(value["cpu_percent"], 42.5);
         assert_eq!(value["sampled_at"], "1970-01-01T00:16:40Z");
         assert_eq!(value["gpu_percent"], Value::Null);
+        let empty = crate::utilization::HostSample {
+            sampled_at_ms: 1_000_000,
+            interval_ms: 5000,
+            ..Default::default()
+        };
+        assert_eq!(recorder_snapshot(&empty, None)["available"], true);
     }
 
     #[test]

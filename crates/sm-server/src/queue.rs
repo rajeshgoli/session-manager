@@ -1304,39 +1304,100 @@ impl RetainedQueueStore {
         let db_path = state_dir.join("queue_runner.db");
         let conn = open_queue_jobs_connection(&db_path)?;
         init_queue_jobs_schema(&conn)?;
-        let Some(mut job) = get_queue_job_runtime_conn(&conn, job_id)? else {
-            return Ok(None);
-        };
-        if is_terminal_queue_state(&job.state) {
-            return get_queue_job_conn(&conn, job_id);
-        }
-        if let Some(detail) = detail {
-            // Before the state change: a running job may be finished by its
-            // monitor, which reads the row, not this record.
-            let raw = detail.to_string();
-            conn.execute(
-                "UPDATE queue_jobs SET termination_detail_json = ?2 WHERE id = ?1",
-                params![job_id, raw],
-            )?;
-            job.termination_detail_json = Some(raw);
-        }
-        if job.state == "running" {
-            mark_queue_job_cancelling_conn(&conn, job_id)?;
-            if let Some(pgid) = job.process_group_id.or(job.pid) {
-                terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+        let raw_detail = detail.map(JsonValue::to_string);
+        // Under the admission lock, so admission cannot start a pending job
+        // between reading its state and cancelling it (which would leave its
+        // process running unmanaged), and the detail lands in the same
+        // statement as the transition.
+        let running_job = {
+            let _admission_guard = QUEUE_ADMISSION_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(mut job) = get_queue_job_runtime_conn(&conn, job_id)? else {
+                return Ok(None);
+            };
+            if is_terminal_queue_state(&job.state) {
+                return get_queue_job_conn(&conn, job_id);
             }
+            let transition = if job.state == "running" {
+                "UPDATE queue_jobs
+                 SET termination_detail_json = COALESCE(?2, termination_detail_json),
+                     holding_reason = 'cancelling'
+                 WHERE id = ?1 AND state = 'running'"
+            } else {
+                "UPDATE queue_jobs
+                 SET termination_detail_json = COALESCE(?2, termination_detail_json)
+                 WHERE id = ?1 AND state = ?3"
+            };
+            let changed = if job.state == "running" {
+                conn.execute(transition, params![job_id, raw_detail])?
+            } else {
+                conn.execute(transition, params![job_id, raw_detail, job.state])?
+            };
+            if changed == 0 {
+                // It finished on its own a moment ago; nothing to cancel.
+                return get_queue_job_conn(&conn, job_id);
+            }
+            if raw_detail.is_some() {
+                job.termination_detail_json = raw_detail.clone();
+            }
+            if job.state == "running" {
+                job
+            } else {
+                let exit_code = read_exit_code(job.exit_code_path.as_deref());
+                finish_queue_job_conn(
+                    &conn,
+                    &job,
+                    "cancelled",
+                    exit_code,
+                    Some(message_queue_db_path),
+                )?;
+                return Self::after_cancel(
+                    &conn,
+                    state_dir,
+                    message_queue_db_path,
+                    job_id,
+                    cancel_grace_seconds,
+                    admission_policy,
+                    admit_after_cancel,
+                );
+            }
+        };
+        // Outside the lock: the grace wait can take seconds.
+        if let Some(pgid) = running_job.process_group_id.or(running_job.pid) {
+            terminate_process_group_with_grace(pgid, cancel_grace_seconds);
         }
-        let exit_code = read_exit_code(job.exit_code_path.as_deref());
+        let exit_code = read_exit_code(running_job.exit_code_path.as_deref());
         finish_queue_job_conn(
             &conn,
-            &job,
+            &running_job,
             "cancelled",
             exit_code,
             Some(message_queue_db_path),
         )?;
+        Self::after_cancel(
+            &conn,
+            state_dir,
+            message_queue_db_path,
+            job_id,
+            cancel_grace_seconds,
+            admission_policy,
+            admit_after_cancel,
+        )
+    }
+
+    fn after_cancel(
+        conn: &Connection,
+        state_dir: &Path,
+        message_queue_db_path: &Path,
+        job_id: &str,
+        cancel_grace_seconds: u64,
+        admission_policy: QueueAdmissionPolicy,
+        admit_after_cancel: bool,
+    ) -> Result<Option<QueueJobRecord>> {
         if admit_after_cancel {
             let _ = admit_pending_queue_jobs_conn(
-                &conn,
+                conn,
                 state_dir,
                 message_queue_db_path,
                 cancel_grace_seconds,
@@ -1344,7 +1405,7 @@ impl RetainedQueueStore {
                 true,
             );
         }
-        get_queue_job_conn(&conn, job_id)
+        get_queue_job_conn(conn, job_id)
     }
 
     pub fn recover_queue_jobs_in_state_dir(
@@ -3779,20 +3840,45 @@ pub fn queue_job_ended_reason(job: &QueueJobRecord) -> Option<(&'static str, Str
                 },
             ),
         ),
-        "memory_exceeded" => (
-            "over_memory",
-            match (
-                detail_bytes("process_group_rss_bytes"),
-                detail_bytes("memory_limit_bytes"),
-            ) {
-                (Some(rss), Some(limit)) => format!(
-                    "Stopped: used {} against its {} memory limit",
-                    memory_amount_text(rss),
-                    memory_amount_text(limit)
-                ),
-                _ => "Stopped: over its memory limit".to_owned(),
-            },
-        ),
+        "memory_exceeded" => {
+            let cause = job
+                .termination_detail
+                .as_ref()
+                .and_then(|detail| detail.get("cause"))
+                .and_then(JsonValue::as_str);
+            let text = match cause {
+                Some(MEMORY_GUARD_HOST_PRESSURE) => match (
+                    detail_bytes("host_available_bytes"),
+                    detail_bytes("effective_reserve_bytes"),
+                ) {
+                    (Some(available), Some(reserve)) => format!(
+                        "Stopped: the machine ran low on memory ({} free, {} reserve)",
+                        memory_amount_text(available),
+                        memory_amount_text(reserve)
+                    ),
+                    _ => "Stopped: the machine ran low on memory".to_owned(),
+                },
+                Some(MEMORY_GUARD_HOST_UNAVAILABLE) => {
+                    "Stopped: the machine's free memory could not be read".to_owned()
+                }
+                Some(MEMORY_GUARD_BUDGET_MISSING) => {
+                    "Stopped: it declared no memory budget".to_owned()
+                }
+                Some(MEMORY_GUARD_JOB_OVER_BUDGET) | None => match (
+                    detail_bytes("process_group_rss_bytes"),
+                    detail_bytes("memory_limit_bytes"),
+                ) {
+                    (Some(rss), Some(limit)) if cause.is_some() => format!(
+                        "Stopped: used {} against its {} memory limit",
+                        memory_amount_text(rss),
+                        memory_amount_text(limit)
+                    ),
+                    _ => "Stopped: over its memory limit".to_owned(),
+                },
+                Some(_) => "Stopped by the memory guard".to_owned(),
+            };
+            ("over_memory", text)
+        }
         "process_limit_exceeded" => (
             "over_process_limit",
             match (job.peak_process_count, job.process_limit) {
@@ -5331,6 +5417,7 @@ fn queue_job_is_cancelled_in_state_dir(state_dir: &Path, job_id: &str) -> bool {
     job.state == "cancelled"
 }
 
+#[cfg(test)]
 fn mark_queue_job_cancelling_conn(conn: &Connection, job_id: &str) -> Result<()> {
     conn.execute(
         r#"
@@ -7126,13 +7213,45 @@ mod tests {
             queue_job_ended_reason(&memory).unwrap().1,
             "Stopped: over its memory limit"
         );
+        const GIB: i64 = 1024 * 1024 * 1024;
         memory.termination_detail = Some(serde_json::json!({
-            "process_group_rss_bytes": 241_i64 * 1024 * 1024 * 1024,
-            "memory_limit_bytes": 200_i64 * 1024 * 1024 * 1024,
+            "cause": "memory_budget",
+            "process_group_rss_bytes": 241 * GIB,
+            "memory_limit_bytes": 200 * GIB,
         }));
         assert_eq!(
             queue_job_ended_reason(&memory).unwrap().1,
             "Stopped: used 241.0 GiB against its 200.0 GiB memory limit"
+        );
+        // Host pressure: the job was within its budget; say what happened.
+        memory.termination_detail = Some(serde_json::json!({
+            "cause": "host_memory_pressure",
+            "process_group_rss_bytes": 20 * GIB,
+            "memory_limit_bytes": 240 * GIB,
+            "host_available_bytes": 6 * GIB,
+            "effective_reserve_bytes": 8 * GIB,
+        }));
+        assert_eq!(
+            queue_job_ended_reason(&memory).unwrap().1,
+            "Stopped: the machine ran low on memory (6.0 GiB free, 8.0 GiB reserve)"
+        );
+        memory.termination_detail = Some(serde_json::json!({
+            "cause": "host_memory_unavailable",
+            "process_group_rss_bytes": 20 * GIB,
+            "memory_limit_bytes": 240 * GIB,
+        }));
+        assert_eq!(
+            queue_job_ended_reason(&memory).unwrap().1,
+            "Stopped: the machine's free memory could not be read"
+        );
+        // Rows from before causes were recorded name no cause at all.
+        memory.termination_detail = Some(serde_json::json!({
+            "process_group_rss_bytes": 20 * GIB,
+            "memory_limit_bytes": 240 * GIB,
+        }));
+        assert_eq!(
+            queue_job_ended_reason(&memory).unwrap().1,
+            "Stopped: over its memory limit"
         );
         let mut processes = with("process_limit_exceeded");
         assert_eq!(
