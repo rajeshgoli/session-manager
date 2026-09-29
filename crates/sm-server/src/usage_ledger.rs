@@ -29,6 +29,7 @@ const MATERIALIZATION_BATCH_PAUSE: Duration = Duration::from_millis(1);
 /// A thread's first booked row above this carries inherited history, not a turn.
 const INHERITED_CODEX_TURN_FLOOR: i64 = 1_000_000;
 const INHERITED_CODEX_TURN_REPAIR: &str = "1409-inherited-codex-turns";
+const NESTED_NULL_CLAUDE_RESCAN_REPAIR: &str = "1658-nested-null-claude-rescan";
 const INHERITED_BY_REPAIR: &str = "repair";
 const INHERITED_BY_SCAN: &str = "scan";
 const DB_TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] = time::macros::format_description!(
@@ -579,6 +580,7 @@ impl UsageLedgerStore {
         self.snapshot_seat_meta(&seats)?;
         let bindings = self.artifact_bindings()?;
         self.extend_with_persisted_bound_seats(&mut seats, &bindings)?;
+        self.rescan_nested_null_claude_artifacts(&bindings)?;
         let seat_by_source = bindings
             .iter()
             .map(|binding| {
@@ -631,6 +633,60 @@ impl UsageLedgerStore {
             );
         }
         Ok(summary)
+    }
+
+    /// Rescan the Claude transcripts whose turns the pre-#1658 parser dropped.
+    ///
+    /// That parser rejected a line for an explicit null anywhere in it, and Claude Code 2.1.25x
+    /// writes `usage.iterations[].model: null` on every turn, so scans advanced past those turns
+    /// without booking them. Clearing the saved offset of each bound Claude transcript that
+    /// contains a null model makes the next scan re-read it; turns already booked dedupe as
+    /// ignored. Runs once, recorded in `usage_repairs`.
+    fn rescan_nested_null_claude_artifacts(&self, bindings: &[ArtifactBinding]) -> Result<()> {
+        let connection = self.open()?;
+        let applied = connection
+            .query_row(
+                "SELECT 1 FROM usage_repairs WHERE name = ?1",
+                [NESTED_NULL_CLAUDE_RESCAN_REPAIR],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if applied {
+            return Ok(());
+        }
+        drop(connection);
+        let paths = expand_artifacts(bindings)
+            .into_iter()
+            .filter(|artifact| artifact.provider == "claude")
+            .map(|artifact| artifact.path)
+            .filter(|path| {
+                fs::read(path).is_ok_and(|bytes| {
+                    bytes
+                        .windows(b"\"model\":null".len())
+                        .any(|window| window == b"\"model\":null")
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut connection = self.open()?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut reset = 0_i64;
+        for path in &paths {
+            reset += tx.execute(
+                "DELETE FROM scan_offsets WHERE artifact_path = ?1",
+                [path.to_string_lossy().as_ref()],
+            )? as i64;
+        }
+        tx.execute(
+            "INSERT INTO usage_repairs (name, applied_at, rows, tokens) VALUES (?1, ?2, ?3, 0)",
+            params![
+                NESTED_NULL_CLAUDE_RESCAN_REPAIR,
+                format_timestamp(OffsetDateTime::now_utc())?,
+                reset
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn resolve_seat_models(&self, seats: &[UsageSeatMetadata]) -> Result<Vec<UsageSeatMetadata>> {
@@ -1813,30 +1869,43 @@ fn parse_claude_line(line: &[u8], path: &Path) -> Result<Option<ParsedMessage>> 
     }))
 }
 
-const NULL_REJECT_FIELDS: [&str; 12] = [
-    "id",
+// Explicit nulls reject a line only where the parser reads the field. Nested
+// payloads the parser ignores (e.g. `usage.iterations[].model: null`, written
+// by Claude Code 2.1.25x) must not drop the turn.
+const ROOT_NULL_REJECT_FIELDS: [&str; 7] = [
     "cwd",
-    "model",
     "speed",
     "costUSD",
     "version",
     "sessionId",
     "requestId",
     "isApiErrorMessage",
+];
+const MESSAGE_NULL_REJECT_FIELDS: [&str; 3] = ["id", "model", "usage"];
+const USAGE_NULL_REJECT_FIELDS: [&str; 3] = [
+    "speed",
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
-    "usage",
 ];
 
 fn has_explicit_null(value: &Value) -> bool {
-    match value {
-        Value::Object(object) => object.iter().any(|(key, value)| {
-            (NULL_REJECT_FIELDS.contains(&key.as_str()) && value.is_null())
-                || has_explicit_null(value)
-        }),
-        Value::Array(values) => values.iter().any(has_explicit_null),
-        _ => false,
-    }
+    let nulls = |object: Option<&Map<String, Value>>, fields: &[&str]| {
+        object.is_some_and(|object| {
+            fields
+                .iter()
+                .any(|field| object.get(*field).is_some_and(Value::is_null))
+        })
+    };
+    let root = value.as_object();
+    let message = root
+        .and_then(|root| root.get("message"))
+        .and_then(Value::as_object);
+    let usage = message
+        .and_then(|message| message.get("usage"))
+        .and_then(Value::as_object);
+    nulls(root, &ROOT_NULL_REJECT_FIELDS)
+        || nulls(message, &MESSAGE_NULL_REJECT_FIELDS)
+        || nulls(usage, &USAGE_NULL_REJECT_FIELDS)
 }
 
 fn valid_semver_prefix(value: &str) -> bool {
@@ -4349,6 +4418,30 @@ mod tests {
         .unwrap()
         .is_none());
 
+        // Claude Code 2.1.25x writes `usage.iterations[].model: null`; the turn
+        // still counts. Nulls in fields the parser reads still reject it.
+        let mut nested_null = base.clone();
+        nested_null["message"]["usage"]["iterations"] =
+            json!([{ "type": "message", "input_tokens": 10, "model": null }]);
+        assert!(parse_claude_line(
+            &serde_json::to_vec(&nested_null).unwrap(),
+            Path::new("chat.jsonl")
+        )
+        .unwrap()
+        .is_some());
+        let mut null_fields = [base.clone(), base.clone(), base.clone()];
+        null_fields[0]["cwd"] = Value::Null;
+        null_fields[1]["message"]["model"] = Value::Null;
+        null_fields[2]["message"]["usage"]["cache_read_input_tokens"] = Value::Null;
+        for explicit_null in null_fields {
+            assert!(parse_claude_line(
+                &serde_json::to_vec(&explicit_null).unwrap(),
+                Path::new("chat.jsonl")
+            )
+            .unwrap()
+            .is_none());
+        }
+
         let mut no_usage = base.clone();
         no_usage["message"].as_object_mut().unwrap().remove("usage");
         assert!(parse_claude_line(
@@ -5367,6 +5460,98 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM message_window", [], |row| row.get(0))
             .unwrap();
         assert_eq!(window_count, 0);
+    }
+
+    #[test]
+    fn nested_null_repair_rescans_turns_an_old_scan_skipped_once() {
+        let dir = TestDir::new("nested-null-rescan");
+        let db_path = dir.0.join("usage.db");
+        let account = identity(Provider::Claude, "account-one", "max");
+        UsageIdentityStore::new(&db_path)
+            .unwrap()
+            .record_observation(
+                Provider::Claude,
+                Some(&account),
+                at("2026-09-18T15:00:00Z"),
+                None,
+                None,
+            )
+            .unwrap();
+        UsageBurnStore::new(&db_path).unwrap();
+        let transcript = dir.0.join("session-one.jsonl");
+        let message = |id: &str| {
+            json!({
+                "timestamp": "2026-09-18T16:00:00Z",
+                "sessionId": "session-one",
+                "requestId": format!("request-{id}"),
+                "cwd": "/repo",
+                "version": "2.1.257",
+                "message": {
+                    "id": format!("message-{id}"),
+                    "model": "claude-fable-5-1",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "iterations": [{ "type": "message", "model": null }]
+                    }
+                }
+            })
+        };
+        fs::write(&transcript, format!("{}\n", message("booked"))).unwrap();
+        SeatSessionStore::new(&db_path)
+            .append("seat-one", "claude", "session-one", transcript.to_str())
+            .unwrap();
+        let store = UsageLedgerStore::new(&db_path).unwrap();
+        store.scan(&[]).unwrap();
+
+        // An old parser read past the next turn without booking it, and the repair is pending.
+        fs::write(
+            &transcript,
+            format!("{}\n{}\n", message("booked"), message("skipped")),
+        )
+        .unwrap();
+        let metadata = fs::metadata(&transcript).unwrap();
+        let connection = Connection::open(&db_path).unwrap();
+        connection
+            .execute(
+                "UPDATE scan_offsets SET byte_offset = ?1, mtime_ns = ?2",
+                params![metadata.len() as i64, file_mtime_ns(&metadata)],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM usage_repairs WHERE name = ?1",
+                [NESTED_NULL_CLAUDE_RESCAN_REPAIR],
+            )
+            .unwrap();
+        let ledger_ids = || {
+            connection
+                .prepare("SELECT message_id FROM message_ledger ORDER BY message_id")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(ledger_ids(), vec!["message-booked"]);
+
+        let summary = store.scan(&[]).unwrap();
+        assert_eq!(summary.messages_inserted, 1);
+        assert_eq!(summary.messages_ignored, 1);
+        assert_eq!(ledger_ids(), vec!["message-booked", "message-skipped"]);
+        let reset: i64 = connection
+            .query_row(
+                "SELECT rows FROM usage_repairs WHERE name = ?1",
+                [NESTED_NULL_CLAUDE_RESCAN_REPAIR],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reset, 1);
+
+        // Recorded once: a later scan does not re-read the transcript.
+        assert_eq!(store.scan(&[]).unwrap().artifacts_scanned, 0);
     }
 
     #[test]
