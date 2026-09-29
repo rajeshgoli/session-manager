@@ -281,6 +281,7 @@ fn rows_are_tickets_and_unlinked_prs_with_agents_prs_and_docs() {
     assert_eq!(
         one.prs,
         vec![RowPr {
+            merge_hold: None,
             number: 9,
             title: "Item 9".into(),
             state: "open".into(),

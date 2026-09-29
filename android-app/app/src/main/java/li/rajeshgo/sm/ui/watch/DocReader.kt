@@ -113,7 +113,7 @@ fun claimHistoryPath(claim: SessionClaim): String =
 fun workClaimLabel(claim: SessionClaim, withRepo: Boolean): String {
     val kind = if (claim.kind == "pr") "PR" else "Ticket"
     val repo = if (withRepo) "${claim.repo.substringAfterLast('/')} " else ""
-    return "$kind $repo#${claim.number}"
+    return "$kind $repo#${claim.number}" + if (claim.mergeHold != null) " ⏸" else ""
 }
 
 /** The Work line's claims: tickets first, then PRs, each in claim order. */

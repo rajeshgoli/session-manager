@@ -25,6 +25,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::owner_docs::{repo_name, validate_repo_slug};
 
+pub mod merge_holds;
 pub mod worktrees;
 
 /// At most this many aliases per GraphQL call (about 20 KB of output).
@@ -35,6 +36,7 @@ pub const RESERVATION_RECOVERY_AGE: Duration = Duration::from_secs(5 * 60);
 pub const MESSAGE_CATEGORY: &str = "work_claim";
 
 pub fn init_work_claims_schema(conn: &Connection) -> Result<()> {
+    merge_holds::init_schema(conn)?;
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS work_items (
@@ -112,6 +114,18 @@ pub fn init_work_claims_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    let has_draft = conn
+        .prepare("PRAGMA table_info(work_items)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|n| n == "is_draft");
+    if !has_draft {
+        conn.execute(
+            "ALTER TABLE work_items ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -264,6 +278,7 @@ impl SessionDirectory {
 /// An item as GitHub reported it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GhItem {
+    pub is_draft: bool,
     pub kind: WorkKind,
     pub title: String,
     /// `open`, `closed` or `merged` (PRs only).
@@ -300,7 +315,7 @@ pub trait WorkItemSource: Send + Sync {
 const ITEM_FRAGMENT: &str = "fragment F on IssueOrPullRequest {
   __typename
   ... on Issue { title state stateReason closedAt url }
-  ... on PullRequest { title state mergedAt closedAt url headRefName headRefOid
+  ... on PullRequest { title state isDraft mergedAt closedAt url headRefName headRefOid
     closingIssuesReferences(first: 20) { totalCount pageInfo { hasNextPage endCursor }
       nodes { number repository { nameWithOwner } } } } }";
 
@@ -414,6 +429,7 @@ fn parse_item(node: &Value) -> Option<GhItem> {
     let closing_refs =
         (kind == WorkKind::Pr).then(|| parse_ref_nodes(&node["closingIssuesReferences"]["nodes"]));
     Some(GhItem {
+        is_draft: node["isDraft"].as_bool().unwrap_or(false),
         kind,
         title: text("title").unwrap_or_default(),
         state,
@@ -467,6 +483,7 @@ pub fn parse_closing_refs_page(stdout: &[u8]) -> Result<(ClosingRefs, Option<Str
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkItem {
+    pub is_draft: bool,
     pub repo: String,
     pub number: i64,
     pub kind: String,
@@ -978,6 +995,8 @@ impl WorkClaimStore {
         };
         let mut statement = conn.prepare(
             r#"
+            SELECT repo, pr AS number FROM merge_holds WHERE ended_at IS NULL
+            UNION
             SELECT repo, number FROM work_items WHERE synced_at IS NULL
             UNION
             SELECT i.repo, i.number FROM work_items i
@@ -1981,15 +2000,15 @@ fn apply_item(conn: &Connection, repo: &str, number: i64, item: &GhItem, now: &s
         r#"
         INSERT INTO work_items
             (repo, number, kind, title, state, state_reason, url, head_ref, head_sha,
-             closed_at, merged_at, synced_at, merge_check, sync_error)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL)
+             closed_at, merged_at, synced_at, merge_check, sync_error, is_draft)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL, ?14)
         ON CONFLICT(repo, number) DO UPDATE SET
             kind = excluded.kind, title = excluded.title, state = excluded.state,
             state_reason = excluded.state_reason, url = excluded.url,
             head_ref = excluded.head_ref, head_sha = excluded.head_sha,
             closed_at = excluded.closed_at, merged_at = excluded.merged_at,
             synced_at = excluded.synced_at, merge_check = excluded.merge_check,
-            sync_error = NULL
+            sync_error = NULL, is_draft = excluded.is_draft
         "#,
         params![
             repo,
@@ -2005,6 +2024,7 @@ fn apply_item(conn: &Connection, repo: &str, number: i64, item: &GhItem, now: &s
             item.merged_at,
             now,
             merge_check,
+            item.is_draft,
         ],
     )?;
     if item.kind == WorkKind::Pr {
@@ -2177,10 +2197,11 @@ fn get_claim(conn: &Connection, id: &str) -> Result<Option<WorkClaim>> {
 
 pub(crate) const ITEM_COLUMNS: &str =
     "repo, number, kind, title, state, state_reason, url, head_ref, \
-     head_sha, closed_at, merged_at, synced_at, merge_check, sync_error";
+     head_sha, closed_at, merged_at, synced_at, merge_check, sync_error, is_draft";
 
 pub(crate) fn item_from_row(row: &Row<'_>) -> rusqlite::Result<WorkItem> {
     Ok(WorkItem {
+        is_draft: row.get(14)?,
         repo: row.get(0)?,
         number: row.get(1)?,
         kind: row.get(2)?,

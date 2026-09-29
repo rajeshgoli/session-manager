@@ -606,7 +606,15 @@ data class SessionMessage(
 
 /** A ticket or PR this session holds. `history_path` is its ticket page, `/t/<repo-name>/<n>`. */
 @Serializable
+data class MergeHold(
+    @SerialName("placed_by") val placedBy: String = "",
+    @SerialName("placed_at") val placedAt: String = "",
+    val reason: String? = null,
+)
+
+@Serializable
 data class SessionClaim(
+    @SerialName("merge_hold") val mergeHold: MergeHold? = null,
     val kind: String = "",
     val repo: String = "",
     val number: Long = 0,

@@ -41,6 +41,7 @@ fn directory() -> SessionDirectory {
 
 fn ticket(state: &str) -> ItemFetch {
     ItemFetch::Found(Box::new(GhItem {
+        is_draft: false,
         kind: WorkKind::Ticket,
         title: "Agent work claims".into(),
         state: state.into(),
@@ -56,6 +57,7 @@ fn ticket(state: &str) -> ItemFetch {
 
 fn pr(state: &str, closes: &[i64]) -> ItemFetch {
     ItemFetch::Found(Box::new(GhItem {
+        is_draft: false,
         kind: WorkKind::Pr,
         title: "Claims core".into(),
         state: state.into(),

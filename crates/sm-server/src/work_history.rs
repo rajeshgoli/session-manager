@@ -131,6 +131,7 @@ pub struct RowAgent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RowPr {
+    pub merge_hold: Option<Value>,
     pub number: i64,
     pub title: String,
     pub state: String,
@@ -261,6 +262,7 @@ pub struct HistoryPage {
 /// Every stored row the page reads, loaded once per request.
 #[derive(Debug, Clone, Default)]
 pub struct HistoryData {
+    merge_holds: BTreeMap<(String, i64), Value>,
     items: BTreeMap<(String, i64), WorkItem>,
     /// Reserved spawn claims are left out: pages ignore them.
     claims: Vec<WorkClaim>,
@@ -314,6 +316,10 @@ impl HistoryData {
         let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.pragma_update(None, "busy_timeout", 5000)?;
         let mut data = Self::default();
+        for hold in crate::work_claims::WorkClaimStore::new(db_path.to_owned()).merge_holds(None)? {
+            data.merge_holds
+                .insert((hold.repo.clone(), hold.pr), hold.projection());
+        }
         if table_exists(&conn, "work_items")? {
             let mut statement = conn.prepare(&format!("SELECT {ITEM_COLUMNS} FROM work_items"))?;
             for item in statement.query_map([], item_from_row)? {
@@ -840,6 +846,7 @@ impl HistoryData {
                 let pr_item = self.items.get(&(item.repo.clone(), number));
                 let requests: Vec<_> = reviews.iter().filter(|r| r.pr == number).collect();
                 RowPr {
+                    merge_hold: self.merge_holds.get(&(item.repo.clone(), number)).cloned(),
                     number,
                     title: pr_item.map(|i| i.title.clone()).unwrap_or_default(),
                     state: pr_item.map_or_else(|| "open".to_owned(), |i| i.state.clone()),
@@ -1194,6 +1201,19 @@ impl HistoryData {
             list.join(", ")
         };
         let text = match event.kind.as_str() {
+            "hold.placed" | "hold.released" | "hold.ended" | "hold.redrafted" => {
+                let by = payload["by"].as_str().unwrap_or("unknown");
+                let action = match event.kind.as_str() {
+                    "hold.placed" => format!("merge hold placed by {by}"),
+                    "hold.released" => format!("merge hold released by {by}"),
+                    "hold.redrafted" => "held PR returned to draft".to_owned(),
+                    _ => "merge hold ended when the PR closed or merged".to_owned(),
+                };
+                match payload["reason"].as_str().filter(|s| !s.is_empty()) {
+                    Some(reason) => format!("{subject}: {action}. Reason: {reason}"),
+                    None => format!("{subject}: {action}"),
+                }
+            }
             "claim.taken" => {
                 let how = match payload["source"].as_str() {
                     Some("spawn") => " at spawn",

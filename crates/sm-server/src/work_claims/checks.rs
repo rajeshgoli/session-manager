@@ -168,7 +168,7 @@ impl WorkClaimStore {
             if !named.is_empty() {
                 let text = format!(
                     "[sm claim] At task-complete you hold: {}.",
-                    held_list(&named)
+                    held_list(&tx, &named)?
                 );
                 nudge(&tx, "B", session_id, &named, &text, now, &mut notified)?;
                 set_nudged_idle(&tx, &named, now)?;
@@ -234,7 +234,7 @@ impl WorkClaimStore {
             let text = format!(
                 "[sm claim] Idle {}m, nothing pending. You hold: {}.",
                 idle_for.whole_minutes(),
-                held_list(&named)
+                held_list(&tx, &named)?
             );
             nudge(
                 &tx,
@@ -428,15 +428,14 @@ fn open_claims<'a>(
 }
 
 /// `ticket #1452 (open), PR #1470 (open, not merged)`.
-fn held_list(claims: &[WorkClaim]) -> String {
-    claims
-        .iter()
-        .map(|claim| match claim.kind() {
-            WorkKind::Ticket => format!("ticket #{} (open)", claim.number),
-            WorkKind::Pr => format!("PR #{} (open, not merged)", claim.number),
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+fn held_list(conn: &Connection, claims: &[WorkClaim]) -> Result<String> {
+    claims.iter().map(|claim| Ok(match claim.kind() {
+        WorkKind::Ticket => format!("ticket #{} (open)", claim.number),
+        WorkKind::Pr => {
+            let name: Option<String> = conn.query_row("SELECT placed_by_name FROM merge_holds WHERE repo=?1 AND pr=?2 AND ended_at IS NULL", params![claim.repo,claim.number], |r|r.get(0)).optional()?;
+            match name { Some(name)=>format!("PR #{} (merge hold by {name})",claim.number), None=>format!("PR #{} (open, not merged)",claim.number) }
+        }
+    })).collect::<Result<Vec<_>>>().map(|items|items.join(", "))
 }
 
 /// Enqueues `text` to `session_id` and writes a `claim.nudge` event on

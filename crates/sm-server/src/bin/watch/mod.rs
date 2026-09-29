@@ -195,13 +195,18 @@ fn claim_rows(obligation: &Value, prefix: &str, base_url: &str) -> Vec<Row> {
         .iter()
         .map(|claim| {
             Row::plain(format!(
-                "{prefix}   {} #{} {}  {}  {base_url}{}",
+                "{prefix}   {} #{}{} {}  {}  {base_url}{}",
                 if s(claim, "kind") == "pr" {
                     "PR"
                 } else {
                     "ticket"
                 },
                 claim["number"].as_i64().unwrap_or_default(),
+                if claim["merge_hold"].is_object() {
+                    " ⏸"
+                } else {
+                    ""
+                },
                 s(claim, "state"),
                 s(claim, "title"),
                 s(claim, "history_path"),
