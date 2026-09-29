@@ -437,7 +437,7 @@
 <table>
 <thead><tr><th style="width:30%">What happens</th><th style="width:18%">You get</th><th>Example</th></tr></thead>
 <tbody>
-<tr><td>Tickets in a lane become Ready (their last blocker closed, or a link was removed)</td><td>Phone push, one per lane per read, and a count on the Board tab on the web and in the app</td><td>"Ready in lane 2, Context handoff: #1654, #1656, #1657 can start — #1653 closed"</td></tr>
+<tr><td>Tickets in a lane become Ready: their last blocker closed, a link was removed, or the agent or PR on them went away without closing them</td><td>Phone push, one per lane per read, and a count on the Board tab on the web and in the app</td><td>"Ready in lane 2, Context handoff: #1654, #1656, #1657 can start — #1653 closed"</td></tr>
 <tr><td>A lane's goal closes</td><td>Phone push and Board count. The lane ends and the lanes below move up.</td><td>"Lane done: Iter7: scoring, money and the readout"</td></tr>
 <tr><td>A ticket becomes Needs you</td><td>Board only: top of the lane, and in the Board count</td><td>No push, because the agent's own message or review request already reached you. "#1813: spec PR #1814 waits for your review"</td></tr>
 <tr><td>A ticket joins or leaves a lane, a link changes, or an agent adds a lane</td><td>Board only: "new" marker for 24 h and the lane's recent-changes list</td><td>"#1660 joined, added by sm-1656-engineer"</td></tr>
@@ -793,8 +793,15 @@ Not in any lane
 <ol>
   <li><b>Guard:</b> the owner guard as in F.</li>
   <li><b>Open ticket:</b> the ticket must be in <code>board_items</code> and open. Otherwise 422 "#N is closed" or 404.</li>
-  <li><b>Not waiting on you:</b> a <code>needs_you</code> ticket returns 409 "#N is waiting on you". Start is shown on ready rows only.</li>
-  <li><b>Not held:</b> if an active ticket claim with a non-Retired holder exists, the result is 409 <code>{detail: "#N is held by NAME (state)"}</code>.</li>
+  <li><b>Still Ready:</b> sm recomputes the ticket's state from the current tables (D1), under the same lock as the claim reservation in step 7. Only <code>ready</code> without <code>merged_not_closed</code> proceeds. Otherwise the result is 409 with the reason:
+    <ul>
+      <li>"#N is waiting on you";</li>
+      <li>"#N is held by NAME (state)";</li>
+      <li>"PR #n will close #N";</li>
+      <li>"#N waits on #a, #b";</li>
+      <li>"#N's PR merged; close the ticket".</li>
+    </ul>
+    Start is shown on ready rows only, and the page and app refresh the board after a 409.</li>
   <li><b>Checkout:</b> <code>board.checkouts[repo]</code> if set. Otherwise <code>~/projects/&lt;name&gt;</code>, if it is a git checkout whose <code>origin</code> URL names the same <code>owner/name</code>. Otherwise 422 "sm doesn't know where owner/name is checked out; set board.checkouts in config".</li>
   <li><b>Name:</b> defaults to <code>&lt;name&gt;-&lt;number&gt;</code>, cut to 32 characters.</li>
   <li><b>Brief:</b> defaults to this text:
@@ -833,13 +840,18 @@ You already hold the claim on #{number}. Run `sm ticket {number} --setup-worktre
 <h3 id="i">I. Pushes and the Board count</h3>
 <ul>
   <li><b>When they are decided.</b> At the end of every recompute, sm compares the new member states with <code>board_members</code> before it is rewritten.</li>
-  <li><b>Ready alert.</b> One per lane per recompute, listing the members whose previous state was <code>blocked</code> and whose new state is <code>ready</code>. Excluded:
+  <li><b>Ready alert.</b> One per lane per recompute, listing the members whose previous state was anything but <code>ready</code> (blocked, in_progress or needs_you) and whose new state is <code>ready</code>. Excluded:
     <ul>
       <li>tickets whose repo is stale that pass;</li>
       <li>lanes added since the previous recompute;</li>
-      <li>tickets that were not members before.</li>
+      <li>tickets that were not members before;</li>
+      <li>tickets with the <code>merged_not_closed</code> warning, which need closing, not an agent.</li>
     </ul>
-    The title is <code>Ready in lane {rank}, {goal title}</code>. The body is <code>#a, #b, #c can start — #x closed</code>: up to four numbers, then "+N more". The cause names the waits_on tickets that closed since the last recompute, or reads "a link was removed". <code>kind = "board_ready"</code>, and <code>reader_path = "/board#lane-{id}"</code>.</li>
+    The title is <code>Ready in lane {rank}, {goal title}</code>. The body is <code>#a, #b, #c can start — CAUSE</code>: up to four numbers, then "+N more". CAUSE, for the first listed ticket:
+    <ul>
+      <li>from blocked: the waits_on tickets that closed since the last recompute ("#x closed"), or "a link was removed";</li>
+      <li>from in_progress or needs_you: "NAME let go of it" when a claim ended, or "PR #n closed" when its only open closing PR closed unmerged.</li>
+    </ul> <code>kind = "board_ready"</code>, and <code>reader_path = "/board#lane-{id}"</code>.</li>
   <li><b>Lane-done alert.</b> Sent when a lane ends because its goal closed. The title is <code>Lane done: {goal title}</code>. The body is <code>{repo short}#{n} closed · lanes below move up</code>. <code>kind = "board_lane_done"</code>, <code>reader_path = "/board"</code>.</li>
   <li><b>One record per alert.</b> Each alert is an owner notice created with <code>create_notice</code> (<code>owner_push/notices.rs:190</code>). The fields are:
     <ul>
@@ -852,10 +864,16 @@ You already hold the claim on #{number}. Run `sm ticket {number} --setup-worktre
   <li><b>Clearing.</b> The <code>NoticeWorld</code> implementation (<code>owner_push/notices.rs:364</code>) answers for the two board kinds:
     <ul>
       <li><code>opened</code> is true once <code>board_seen.seen_at</code> is later than the notice's <code>created_at</code>;</li>
-      <li><code>still_wanted</code> is true while the lane is active and, for <code>board_ready</code>, while at least one listed ticket is still ready and unheld.</li>
+      <li><code>still_wanted</code> for <code>board_ready</code> is true while the lane is active and at least one listed ticket is still ready and unheld;</li>
+      <li><code>still_wanted</code> for <code>board_lane_done</code> is always true. The lane has already ended when this notice is created, so its lifetime depends only on <code>opened</code>.</li>
     </ul>
     So opening the board on the web or in the app withdraws the phone notification through the existing withdrawal pass (sm#1643). <code>notice_candidates</code> returns nothing for board kinds, because the board creates its notices directly.</li>
-  <li><b>The count.</b> The Board count is the number of board-kind notices for the owner that are unacked and not yet opened. <code>POST /client/board/seen</code> acks them. The web nav (J) and the app's bottom bar (K) show it; 0 shows nothing.</li>
+  <li><b>The count.</b> The Board count is the sum of:
+    <ul>
+      <li>board-kind notices for the owner that are unacked and not yet opened;</li>
+      <li>tickets currently <code>needs_you</code> in an active lane whose latest <code>became_needs_you</code> event is later than <code>board_seen.seen_at</code>. A ticket in two lanes counts once.</li>
+    </ul>
+    <code>POST /client/board/seen</code> acks the notices and moves <code>seen_at</code>, so both parts clear together. Needs you creates no notice and no push. The web nav (J) and the app's bottom bar (K) show the count; 0 shows nothing. <code>unseen.lane_ids</code> in the board JSON lists the lanes contributing to either part.</li>
   <li><b>No other alerts.</b> Needs you, lane growth, link changes and loops show on the board only (memo section 8).</li>
 </ul>
 
@@ -949,9 +967,9 @@ You already hold the claim on #{number}. Run `sm ticket {number} --setup-worktre
 <tr><td>Lanes, states, longest chain, row order</td><td>D</td><td><code>membership_follows_both_kinds</code>, <code>membership_stops_at_closed</code>, <code>state_rules</code> (table-driven over D1), <code>retired_holder_is_not_in_progress</code>, <code>chain_example_1651</code>, <code>row_order</code>, <code>cycle_flagged_never_ready</code>, <code>not_planned_blocker_counts_closed</code>, <code>merged_not_closed_warning</code>, <code>iteration7_stage_d_example</code>, <code>two_lanes_min_rank</code>, <code>cross_repo_blocker_member</code> (1)</td></tr>
 <tr><td>You rank lanes; agents only add</td><td>D4, D5, F</td><td><code>lane_add_bottom_rank</code>, <code>lane_add_duplicate_409</code>, <code>order_put_requires_full_set</code>, <code>owner_routes_reject_agent_callers</code>, <code>goal_closed_ends_lane_and_renumbers</code> (1)</td></tr>
 <tr><td>Queue: lane rank first within a type</td><td>H</td><td><code>rank_session_requester_parent_cwd_none</code>, <code>admission_orders_by_lane_rank_within_type</code>, <code>perf_candidate_by_lane_rank</code>, <code>unranked_after_ranked</code>, <code>reorder_applies_to_pending</code>, the extended <code>pending_jobs_are_ordered_as_admission_examines_them</code> (2)</td></tr>
-<tr><td>Alerts: ready and lane done only, same on web and phone</td><td>I</td><td><code>ready_notice_once_per_lane_pass</code>, <code>no_notice_when_repo_stale</code>, <code>no_notice_for_new_member_or_new_lane</code>, <code>lane_done_notice</code>, <code>board_seen_acks_and_withdraws</code>, <code>still_wanted_false_once_started</code>, <code>unseen_count_matches_notices</code> (2); <code>nav_board_badge</code> (3)</td></tr>
+<tr><td>Alerts: ready and lane done only, same on web and phone</td><td>I</td><td><code>ready_notice_once_per_lane_pass</code>, <code>ready_notice_after_holder_lets_go</code>, <code>ready_notice_after_pr_closed_unmerged</code>, <code>no_ready_notice_for_merged_not_closed</code>, <code>lane_done_notice_survives_lane_end</code>, <code>needs_you_counts_until_seen</code>, <code>no_notice_when_repo_stale</code>, <code>no_notice_for_new_member_or_new_lane</code>, <code>lane_done_notice</code>, <code>board_seen_acks_and_withdraws</code>, <code>still_wanted_false_once_started</code>, <code>unseen_count_matches_notices</code> (2); <code>nav_board_badge</code> (3)</td></tr>
 <tr><td>Needs you</td><td>D1, F</td><td><code>blocking_message_from_holder_is_needs_you</code>, <code>replied_or_handled_message_clears</code>, <code>ended_sender_clears</code>, <code>review_request_by_holder_is_needs_you</code>, <code>review_request_via_pr_link_is_needs_you</code>, <code>superseded_or_reviewed_publish_clears</code>, <code>needs_you_beats_in_progress</code>, <code>no_notice_for_needs_you</code> (1); <code>start_refuses_needs_you</code> (3)</td></tr>
-<tr><td>Board page with Start</td><td>G, J</td><td><code>board_page_renders_lanes_server_side</code>, <code>nav_has_board_tab</code>, <code>start_resolves_checkout</code> (config, convention, missing), <code>start_rejects_held_ticket</code>, <code>start_reserves_claim_and_creates_root_session</code>, <code>start_drops_reservation_on_failure</code>, <code>holder_setup_worktree_after_start</code> (3)</td></tr>
+<tr><td>Board page with Start</td><td>G, J</td><td><code>board_page_renders_lanes_server_side</code>, <code>nav_has_board_tab</code>, <code>start_resolves_checkout</code> (config, convention, missing), <code>start_rejects_held_ticket</code>, <code>start_rejects_non_ready_states</code>, <code>start_reserves_claim_and_creates_root_session</code>, <code>start_drops_reservation_on_failure</code>, <code>holder_setup_worktree_after_start</code> (3)</td></tr>
 <tr><td>App Board tab</td><td>K</td><td>The K checklist on the phone (4)</td></tr>
 <tr><td>Agent paragraph; text-plan conversion</td><td>L</td><td>Live check in ticket 1: #1651's links are recorded and <code>sm board</code> matches GitHub</td></tr>
 </tbody>
