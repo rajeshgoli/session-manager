@@ -786,23 +786,10 @@ impl TreeBuilder {
                 let thread_nodes = threads
                     .into_iter()
                     .map(|(thread, agents)| {
-                        let item = thread.and_then(|number| attributor.item(&repo, number));
-                        let label = match (thread, item) {
-                            (None, _) => "No ticket".to_owned(),
-                            (Some(number), Some(item)) if !item.title.is_empty() => {
-                                format!("#{number} {}", item.title)
-                            }
-                            (Some(number), _) => format!("#{number}"),
-                        };
-                        let id = match thread {
-                            Some(number) => format!("t:{repo}#{number}"),
-                            None => format!("t:{repo}#none"),
-                        };
-                        let mut node = parent_node(id, "thread", label, agents);
-                        node.state = item.map(|item| item.state.clone());
-                        node.history_path = thread
-                            .filter(|_| repo.contains('/'))
-                            .map(|number| history_path(&repo, number));
+                        let meta = thread_meta(attributor, &repo, thread);
+                        let mut node = parent_node(meta.id, "thread", meta.label, agents);
+                        node.state = meta.state;
+                        node.history_path = meta.history_path;
                         node
                     })
                     .collect();
@@ -811,6 +798,37 @@ impl TreeBuilder {
             })
             .collect();
         parent_node("root".to_owned(), "root", "All".to_owned(), repo_nodes)
+    }
+}
+
+/// A thread node's id, label, state and History link, shared with Time.
+pub(crate) struct ThreadMeta {
+    pub id: String,
+    pub label: String,
+    pub state: Option<String>,
+    pub history_path: Option<String>,
+}
+
+pub(crate) fn thread_meta(attributor: &Attributor, repo: &str, thread: Option<i64>) -> ThreadMeta {
+    let item = thread.and_then(|number| attributor.item(repo, number));
+    let label = match (thread, item) {
+        (None, _) => "No ticket".to_owned(),
+        (Some(number), Some(item)) if !item.title.is_empty() => {
+            format!("#{number} {}", item.title)
+        }
+        (Some(number), _) => format!("#{number}"),
+    };
+    let id = match thread {
+        Some(number) => format!("t:{repo}#{number}"),
+        None => format!("t:{repo}#none"),
+    };
+    ThreadMeta {
+        id,
+        label,
+        state: item.map(|item| item.state.clone()),
+        history_path: thread
+            .filter(|_| repo.contains('/'))
+            .map(|number| history_path(repo, number)),
     }
 }
 
@@ -872,14 +890,14 @@ fn round_node(node: &mut SpendNode) {
     }
 }
 
-fn open_read_only(path: &Path) -> Result<Connection> {
+pub(crate) fn open_read_only(path: &Path) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("failed to open {}", path.display()))?;
     conn.pragma_update(None, "busy_timeout", 5000)?;
     Ok(conn)
 }
 
-fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+pub(crate) fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
     Ok(conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -1148,7 +1166,7 @@ fn lexical_bound(at: i128) -> String {
     .unwrap_or_default()
 }
 
-fn format_nanos(at: i128) -> String {
+pub(crate) fn format_nanos(at: i128) -> String {
     OffsetDateTime::from_unix_timestamp_nanos(at)
         .map(|at| at.replace_nanosecond(0).unwrap_or(at))
         .ok()

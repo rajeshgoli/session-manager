@@ -1511,6 +1511,10 @@ pub fn router(state: AppState) -> Router {
             get(analytics::client_analytics_spend),
         )
         .route(
+            "/client/analytics/time",
+            get(analytics::client_analytics_time),
+        )
+        .route(
             "/client/push-token",
             put(follows::put_push_token).delete(follows::delete_push_token),
         )
@@ -14267,6 +14271,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/apk"
         || path == "/client/analytics/summary"
         || path == "/client/analytics/spend"
+        || path == "/client/analytics/time"
         || path == "/client/session-models"
         || path == "/client/host-status"
         || path == "/client/queue"
@@ -19985,6 +19990,7 @@ mod tests {
             ),
             (Method::GET, "/client/analytics/summary", "", false),
             (Method::GET, "/client/analytics/spend", "", false),
+            (Method::GET, "/client/analytics/time", "", false),
             (
                 Method::GET,
                 "/client/session-models?provider=claude",
@@ -20960,6 +20966,36 @@ mod tests {
             if status == StatusCode::OK {
                 assert_eq!(body["total"]["percent"], json!(0.0), "{uri}");
                 assert_eq!(body["root"]["kind"], "root", "{uri}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn analytics_time_validates_range_and_reads_missing_dbs() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        let dir = std::env::temp_dir().join(format!("sm-analytics-time-{}", std::process::id()));
+        config.activity.db_path = dir.join("activity.db").to_string_lossy().into_owned();
+        config.usage.db_path = dir.join("usage.db").to_string_lossy().into_owned();
+        config.sm_send.db_path = dir.join("queue.db").to_string_lossy().into_owned();
+        let app = router(AppState::new(config));
+        for (uri, expected) in [
+            ("/client/analytics/time", StatusCode::OK),
+            ("/client/analytics/time?range=24h", StatusCode::OK),
+            ("/client/analytics/time?range=30d", StatusCode::OK),
+            ("/client/analytics/time?range=week", StatusCode::BAD_REQUEST),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(local_request(Method::GET, uri, Body::empty()))
+                .await
+                .unwrap();
+            let (status, body) = response_json(response).await;
+            assert_eq!(status, expected, "{uri}");
+            if status == StatusCode::OK {
+                assert_eq!(body["total"]["active_seconds"], json!(0), "{uri}");
+                assert_eq!(body["root"]["kind"], "root", "{uri}");
+                assert_eq!(body["parts_legend"][0]["key"], "model", "{uri}");
             }
         }
     }

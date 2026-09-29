@@ -264,6 +264,42 @@ impl Attributor {
         self.items.get(&(canonical_repo(repo), number))
     }
 
+    pub fn parent(&self, seat: &str) -> Option<&str> {
+        self.parents.get(seat).map(String::as_str)
+    }
+
+    /// Whether `seat` itself holds an active claim at `at`.
+    pub fn holds_claim_at(&self, seat: &str, at: i128) -> bool {
+        self.claims_by_seat
+            .get(seat)
+            .is_some_and(|claims| claims.iter().any(|claim| claim.active_at(at)))
+    }
+
+    /// Every instant at which `attribute(seat, …)` or `holds_claim_at` can
+    /// change: claim starts and ends of the seat and of the ancestors the
+    /// parent rule walks.
+    pub fn claim_boundaries(&self, seat: &str) -> Vec<i128> {
+        let mut boundaries = Vec::new();
+        let mut current = seat;
+        let mut visited = BTreeSet::from([seat]);
+        for level in 0..=MAX_PARENT_LEVELS {
+            for claim in self.claims_by_seat.get(current).into_iter().flatten() {
+                boundaries.push(claim.claimed_at);
+                boundaries.extend(claim.ended_at);
+            }
+            if level == MAX_PARENT_LEVELS {
+                break;
+            }
+            match self.parents.get(current) {
+                Some(parent) if visited.insert(parent.as_str()) => current = parent,
+                _ => break,
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        boundaries
+    }
+
     /// The thread `seat`'s work at `at` (Unix nanoseconds) belongs to.
     /// `folder_repo` is the repo of the seat's working folder.
     pub fn attribute(&self, seat: &str, at: i128, folder_repo: &str) -> Attribution {
