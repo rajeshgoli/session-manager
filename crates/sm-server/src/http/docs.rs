@@ -1534,6 +1534,8 @@ fn doc_agent(state: &AppState, doc: &OwnerDoc) -> Option<Value> {
         "claim"
     } else if id == doc.author_session_id {
         "author"
+    } else if review::assigned_review_recipient(state, doc).as_deref() == Some(id.as_str()) {
+        "assignment"
     } else {
         "parent"
     };

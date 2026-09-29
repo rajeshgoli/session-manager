@@ -504,6 +504,8 @@ pub fn init_owner_docs_schema(conn: &Connection) -> Result<()> {
     }
     for (table, column, kind) in [
         ("owner_doc_reviews", "reopen_target", "TEXT"),
+        ("owner_doc_reviews", "assigned_session_id", "TEXT"),
+        ("owner_doc_reviews", "assigned_pr_number", "INTEGER"),
         ("owner_doc_reviews", "target_base", "TEXT"),
         ("owner_doc_reviews", "target_tip", "TEXT"),
         ("owner_doc_reviews", "target_pr", "INTEGER"),
@@ -726,10 +728,21 @@ impl OwnerDocStore {
     pub fn assign_review(&self, submission_id: &str, session_id: &str) -> Result<bool> {
         let conn = self.open_write()?;
         Ok(conn.execute(
-            "UPDATE owner_doc_reviews SET delivered_to_session_id = ?2
+            "UPDATE owner_doc_reviews SET delivered_to_session_id = ?2, assigned_session_id = ?2,
+             assigned_pr_number = (SELECT pr_number FROM owner_docs WHERE id = doc_id)
              WHERE id = ?1 AND status = 'posted' AND delivered_to_session_id IS NULL",
             params![submission_id, session_id],
         )? > 0)
+    }
+
+    /// Explicit Assign on the current PR, never an ordinary review delivery.
+    pub fn assigned_doc_session(&self, doc_id: &str) -> Result<Option<String>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        Ok(conn.query_row("SELECT r.assigned_session_id FROM owner_doc_reviews r JOIN owner_docs d ON d.id = r.doc_id
+            WHERE r.doc_id = ?1 AND r.assigned_session_id IS NOT NULL AND r.assigned_pr_number IS d.pr_number
+            ORDER BY r.submitted_at DESC, r.rowid DESC LIMIT 1", params![doc_id], |r|r.get(0)).optional()?)
     }
 
     /// Publishes with `review_requested`, newest first, since `since`: the

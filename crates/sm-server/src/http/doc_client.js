@@ -309,7 +309,9 @@
       else parts.push(el('button', { class: 'lk', text: 'Assign to a new agent', onclick: function (e) {
         var b = e.currentTarget; b.disabled = true;
         api('POST', '/assign', { review_id: S.undelivered.id }).then(function (res) {
-          S.assigned = 'Assigned to ' + (res.name || res.session_id); pollHead();
+          S.assigned = 'Assigned to ' + (res.name || res.session_id);
+          if (res.agent) { S.agent = res.agent; renderBar(); }
+          pollHead();
           renderBanner();
         }, function (err) { S.assigned = err.message; renderBanner(); });
       } }));
