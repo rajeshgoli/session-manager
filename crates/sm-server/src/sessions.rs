@@ -8,7 +8,7 @@ use std::{
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Condvar, Mutex, Weak},
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
@@ -37,8 +37,7 @@ use crate::{
         ContextMonitorConfig,
     },
     runtime::{
-        ConditionalClearOutcome, RestoreTmuxLivenessOutcome, RestoreTmuxTeardownOutcome,
-        TmuxRuntime, TmuxSessionSpec,
+        RestoreTmuxLivenessOutcome, RestoreTmuxTeardownOutcome, TmuxRuntime, TmuxSessionSpec,
     },
     seat_sessions::{SeatSessionIdentity, SeatSessionStore},
     usage_burn::UsageBurnStore,
@@ -49,9 +48,13 @@ use crate::{
 
 #[path = "handoff/store.rs"]
 mod handoff_store;
+#[path = "handoff/transfer.rs"]
+mod handoff_transfer;
 use crate::handoff::policy::HandoffDefaults;
 use handoff_store::{handoff_session_ref, handoff_view_for_record};
 pub use handoff_store::{HandoffPolicyOutcome, ReviewAsk};
+use handoff_transfer::handoff_fences_delivery_raw;
+pub use handoff_transfer::{HandoffAcceptOutcome, HandoffFacts, HandoffWork, SuccessorPlan};
 
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
 const LEGACY_TMP_SESSION_STATE_FILE: &str = "/tmp/claude-sessions/sessions.json";
@@ -106,8 +109,6 @@ pub struct SessionStore {
     /// message queue on a timer, so a message queued without a runtime waits for
     /// an unrelated request to happen to flush it.
     delivery_runtime: Option<TmuxRuntime>,
-    codex_fork_handoff_monitors: Arc<Mutex<BTreeSet<String>>>,
-    claude_handoff_workers: Arc<Mutex<BTreeSet<String>>>,
     credential_rotation_workers: Arc<Mutex<BTreeSet<String>>>,
     seat_session_appends: Arc<Mutex<BTreeSet<(String, String, String)>>>,
     clear_operation_locks: Arc<Mutex<BTreeMap<String, Weak<SessionClearLock>>>>,
@@ -232,8 +233,6 @@ impl SessionStore {
             context_monitor: ContextMonitorConfig::default(),
             codex_fork_create_startup_timeout: DEFAULT_CODEX_FORK_CREATE_STARTUP_TIMEOUT,
             delivery_runtime: None,
-            codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
-            claude_handoff_workers: Arc::new(Mutex::new(BTreeSet::new())),
             credential_rotation_workers: Arc::new(Mutex::new(BTreeSet::new())),
             seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1512,8 +1511,7 @@ impl SessionStore {
             .ok_or_else(|| anyhow::anyhow!("session {session_id} disappeared"))?;
         if !credential_rotation_has_fresh_idle_proof(&rotations[rotation_index], &session)
             || active_reparent_request_for_session(&state, session_id)?.is_some()
-            || json_text(raw_session.get("pending_handoff_path")).is_some()
-            || json_text(raw_session.get("claude_handoff_in_progress_at")).is_some()
+            || handoff_fences_delivery_raw(raw_session)
             || review_dispatch_in_progress(raw_session)
             || !self.credential_rotation_queue_is_drained(session_id)?
             || self.credential_rotation_has_active_btw(session_id)?
@@ -1740,8 +1738,6 @@ impl SessionStore {
             context_monitor: ContextMonitorConfig::default(),
             codex_fork_create_startup_timeout: DEFAULT_CODEX_FORK_CREATE_STARTUP_TIMEOUT,
             delivery_runtime: None,
-            codex_fork_handoff_monitors: Arc::new(Mutex::new(BTreeSet::new())),
-            claude_handoff_workers: Arc::new(Mutex::new(BTreeSet::new())),
             credential_rotation_workers: Arc::new(Mutex::new(BTreeSet::new())),
             seat_session_appends: Arc::new(Mutex::new(BTreeSet::new())),
             clear_operation_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1978,21 +1974,7 @@ impl SessionStore {
                 increment_completed_turns(session);
                 session.insert("last_counted_claude_turn".into(), json!(turn_key));
             }
-            let reserves_handoff = provider == "claude"
-                && json_text(session.get("pending_handoff_path")).is_some()
-                && json_text(session.get("pending_handoff_recorded_at")).is_some();
-            if reserves_handoff {
-                session.insert(
-                    "claude_handoff_in_progress_at".to_owned(),
-                    Value::String(now.clone()),
-                );
-                // Keep queue delivery from treating the Stop transition as an
-                // ordinary idle prompt before the handoff owns the pane.
-                session.insert("status".to_owned(), Value::String("running".to_owned()));
-            } else {
-                session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
-                session.insert("status".to_owned(), Value::String("idle".to_owned()));
-            }
+            session.insert("status".to_owned(), Value::String("idle".to_owned()));
             session.insert("last_activity".to_owned(), Value::String(now.clone()));
             session.insert("activity_hook_at".to_owned(), Value::String(now.clone()));
             session.insert(
@@ -2081,7 +2063,6 @@ impl SessionStore {
 
         let now = now_rfc3339();
         session.insert("status".to_owned(), Value::String("running".to_owned()));
-        session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
         session.insert("last_activity".to_owned(), Value::String(now.clone()));
         session.insert("activity_hook_at".to_owned(), Value::String(now.clone()));
         session.insert("agent_task_completed_at".to_owned(), Value::Null);
@@ -2153,7 +2134,6 @@ impl SessionStore {
                 Value::String(emitted_at.to_owned())
             }),
         );
-        session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
         session.insert("agent_task_completed_at".to_owned(), Value::Null);
         self.write_raw_json_value(&state)?;
         Ok(true)
@@ -6866,686 +6846,6 @@ impl SessionStore {
         Ok(())
     }
 
-    pub fn schedule_handoff(
-        &self,
-        session_id: &str,
-        request: HandoffRequest,
-    ) -> Result<HandoffOutcome> {
-        let monitor = {
-            let _guard = self.write_guard()?;
-            let mut state = self.load_raw_json_value()?;
-            let sessions = ensure_sessions_array_mut(&mut state)?;
-            if request.requester_session_id.trim() != session_id {
-                return Ok(HandoffOutcome::Error(
-                    "sm handoff is self-directed only - requester must equal target session"
-                        .to_owned(),
-                ));
-            }
-            let Some(session) = session_object_mut(sessions, session_id) else {
-                return Ok(HandoffOutcome::Error(format!(
-                    "Session {session_id} not found"
-                )));
-            };
-            let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
-            if provider == "codex-app" {
-                return Ok(HandoffOutcome::Error(
-                    "sm handoff is not supported for codex-app sessions".to_owned(),
-                ));
-            }
-
-            let monitor = if provider == "codex-fork" {
-                let runtime = self.delivery_runtime.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("codex-fork handoff requires the tmux runtime")
-                })?;
-                let spec = codex_fork_spec_for_session_raw(session_id, session)?;
-                let artifacts = runtime
-                    .codex_fork_runtime_artifacts(&spec)?
-                    .ok_or_else(|| anyhow::anyhow!("codex-fork runtime artifacts unavailable"))?;
-                let offset = fs::metadata(&artifacts.event_stream_path)
-                    .map(|metadata| metadata.len())
-                    .unwrap_or(0);
-                session.insert("pending_handoff_event_offset".to_owned(), json!(offset));
-                Some((artifacts.event_stream_path, offset))
-            } else {
-                None
-            };
-            session.insert(
-                "pending_handoff_path".to_owned(),
-                Value::String(request.file_path.clone()),
-            );
-            if provider == "claude" {
-                // Also versions the Rust execution contract: older pending paths
-                // must not rotate dormant seats when the fixed server is deployed.
-                session.insert(
-                    "pending_handoff_recorded_at".to_owned(),
-                    Value::String(now_rfc3339()),
-                );
-                session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
-            }
-            self.write_raw_json_value(&state)?;
-            monitor
-        };
-
-        if let Some((event_stream_path, offset)) = monitor {
-            self.start_codex_fork_handoff_monitor(
-                session_id.to_owned(),
-                event_stream_path,
-                offset,
-            )?;
-        }
-        Ok(HandoffOutcome::Recorded(HandoffResult {
-            status: "recorded".to_owned(),
-        }))
-    }
-
-    pub fn recover_pending_codex_fork_handoffs(&self) -> Result<usize> {
-        let Some(runtime) = self.delivery_runtime.as_ref() else {
-            return Ok(0);
-        };
-        let monitors = {
-            let _guard = self.write_guard()?;
-            let mut state = self.load_raw_json_value()?;
-            let Some(sessions) = state.get_mut("sessions").and_then(Value::as_array_mut) else {
-                return Ok(0);
-            };
-            let mut monitors = Vec::new();
-            let mut changed = false;
-            for session in sessions.iter_mut().filter_map(Value::as_object_mut) {
-                let Some(session_id) = json_text(session.get("id")) else {
-                    continue;
-                };
-                if json_text(session.get("provider")).as_deref() != Some("codex-fork")
-                    || json_text(session.get("pending_handoff_path")).is_none()
-                {
-                    continue;
-                }
-                let spec = codex_fork_spec_for_session_raw(&session_id, session)?;
-                let Some(artifacts) = runtime.codex_fork_runtime_artifacts(&spec)? else {
-                    continue;
-                };
-                let offset = match session
-                    .get("pending_handoff_event_offset")
-                    .and_then(Value::as_u64)
-                {
-                    Some(offset) => offset,
-                    None => {
-                        let offset = fs::metadata(&artifacts.event_stream_path)
-                            .map(|metadata| metadata.len())
-                            .unwrap_or(0);
-                        session.insert("pending_handoff_event_offset".to_owned(), json!(offset));
-                        changed = true;
-                        offset
-                    }
-                };
-                monitors.push((session_id, artifacts.event_stream_path, offset));
-            }
-            if changed {
-                self.write_raw_json_value(&state)?;
-            }
-            monitors
-        };
-
-        for (session_id, event_stream_path, offset) in &monitors {
-            self.start_codex_fork_handoff_monitor(
-                session_id.clone(),
-                event_stream_path.clone(),
-                *offset,
-            )?;
-        }
-        Ok(monitors.len())
-    }
-
-    pub fn recover_pending_claude_handoffs(&self) -> Result<usize> {
-        if self.delivery_runtime.is_none() {
-            return Ok(0);
-        }
-        let parsed_state = self.load_parsed_state()?;
-        let state = &parsed_state.raw;
-        let session_ids = state
-            .get("sessions")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_object)
-            .filter(|session| {
-                json_text(session.get("provider")).as_deref() == Some("claude")
-                    && is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
-                    && !raw_session_is_stopped(session)
-                    && json_text(session.get("pending_handoff_path")).is_some()
-                    && json_text(session.get("pending_handoff_recorded_at")).is_some()
-                    && (json_text(session.get("claude_handoff_in_progress_at")).is_some()
-                        || normalized_status(&json_text(session.get("status")).unwrap_or_default())
-                            == "idle")
-            })
-            .filter_map(|session| json_text(session.get("id")))
-            .collect::<Vec<_>>();
-
-        let mut started = 0;
-        for session_id in session_ids {
-            started += usize::from(self.start_pending_claude_handoff(&session_id)?);
-        }
-        Ok(started)
-    }
-
-    pub fn start_pending_claude_handoff(&self, session_id: &str) -> Result<bool> {
-        let reservation = {
-            let _guard = self.write_guard()?;
-            let mut state = self.load_raw_json_value()?;
-            let (reservation, state_changed) = {
-                let sessions = ensure_sessions_array_mut(&mut state)?;
-                let Some(session) = session_object_mut(sessions, session_id) else {
-                    return Ok(false);
-                };
-                let status = json_text(session.get("status")).unwrap_or_default();
-                let file_path = json_text(session.get("pending_handoff_path"));
-                let recorded_at = json_text(session.get("pending_handoff_recorded_at"));
-                let eligible = json_text(session.get("provider")).as_deref() == Some("claude")
-                    && file_path.is_some()
-                    && recorded_at.is_some()
-                    && !raw_session_is_stopped(session)
-                    && is_primary_node(
-                        &json_text(session.get("node")).unwrap_or_else(default_node),
-                    );
-                if !eligible {
-                    (None, false)
-                } else {
-                    let (reservation_at, state_changed) = if let Some(existing) =
-                        json_text(session.get("claude_handoff_in_progress_at"))
-                    {
-                        (existing, false)
-                    } else if normalized_status(&status) == "idle" {
-                        let now = now_rfc3339();
-                        session.insert(
-                            "claude_handoff_in_progress_at".to_owned(),
-                            Value::String(now.clone()),
-                        );
-                        session.insert("status".to_owned(), Value::String("running".to_owned()));
-                        session.insert("last_activity".to_owned(), Value::String(now.clone()));
-                        (now, true)
-                    } else {
-                        return Ok(false);
-                    };
-                    (
-                        Some((file_path.unwrap(), recorded_at.unwrap(), reservation_at)),
-                        state_changed,
-                    )
-                }
-            };
-            if state_changed {
-                self.write_raw_json_value(&state)?;
-            }
-            reservation
-        };
-        let Some((file_path, recorded_at, reservation_at)) = reservation else {
-            return Ok(false);
-        };
-
-        {
-            let mut workers = self
-                .claude_handoff_workers
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Claude handoff worker lock poisoned"))?;
-            if !workers.insert(session_id.to_owned()) {
-                return Ok(false);
-            }
-        }
-
-        let store = self.clone();
-        let worker_session_id = session_id.to_owned();
-        let worker_file_path = file_path.clone();
-        let worker_recorded_at = recorded_at.clone();
-        let worker_reservation_at = reservation_at.clone();
-        let spawn_result = thread::Builder::new()
-            .name(format!(
-                "sm-claude-handoff-{}",
-                sanitize_path_component(session_id)
-            ))
-            .spawn(move || {
-                if let Err(error) = store.execute_pending_claude_handoff(&worker_session_id) {
-                    eprintln!("Claude handoff execution failed for {worker_session_id}: {error:#}");
-                }
-                if let Ok(mut workers) = store.claude_handoff_workers.lock() {
-                    workers.remove(&worker_session_id);
-                }
-                match store.claude_handoff_reservation_was_replaced(
-                    &worker_session_id,
-                    &worker_file_path,
-                    &worker_recorded_at,
-                    &worker_reservation_at,
-                ) {
-                    Ok(true) => {
-                        if let Err(error) =
-                            store.start_pending_claude_handoff(&worker_session_id)
-                        {
-                            eprintln!(
-                                "Replacement Claude handoff failed to start for {worker_session_id}: {error:#}"
-                            );
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(error) => eprintln!(
-                        "Replacement Claude handoff check failed for {worker_session_id}: {error:#}"
-                    ),
-                }
-            });
-        if let Err(error) = spawn_result {
-            let mut workers = self
-                .claude_handoff_workers
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Claude handoff worker lock poisoned"))?;
-            workers.remove(session_id);
-            let rollback = self.release_failed_claude_handoff_worker_reservation(
-                session_id,
-                &file_path,
-                &recorded_at,
-                &reservation_at,
-            );
-            drop(workers);
-            if let Err(rollback_error) = rollback {
-                return Err(anyhow::anyhow!(error)).context(format!(
-                    "failed to start Claude handoff worker; reservation rollback also failed: {rollback_error:#}"
-                ));
-            }
-            return Err(error).with_context(|| "failed to start Claude handoff worker");
-        }
-        Ok(true)
-    }
-
-    fn claude_handoff_reservation_was_replaced(
-        &self,
-        session_id: &str,
-        file_path: &str,
-        recorded_at: &str,
-        reservation_at: &str,
-    ) -> Result<bool> {
-        let _guard = self.write_guard()?;
-        let parsed_state = self.load_parsed_state()?;
-        let state = &parsed_state.raw;
-        let Some(session) = raw_session_object(state, session_id) else {
-            return Ok(false);
-        };
-        Ok(claude_handoff_reservation_replaced_raw(
-            session,
-            file_path,
-            recorded_at,
-            reservation_at,
-        ))
-    }
-
-    fn release_failed_claude_handoff_worker_reservation(
-        &self,
-        session_id: &str,
-        file_path: &str,
-        recorded_at: &str,
-        reservation_at: &str,
-    ) -> Result<bool> {
-        let released = {
-            let _guard = self.write_guard()?;
-            let mut state = self.load_raw_json_value()?;
-            let sessions = ensure_sessions_array_mut(&mut state)?;
-            let Some(session) = session_object_mut(sessions, session_id) else {
-                return Ok(false);
-            };
-            let matches = json_text(session.get("pending_handoff_path")).as_deref()
-                == Some(file_path)
-                && json_text(session.get("pending_handoff_recorded_at")).as_deref()
-                    == Some(recorded_at)
-                && json_text(session.get("claude_handoff_in_progress_at")).as_deref()
-                    == Some(reservation_at);
-            if matches {
-                session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
-                session.insert("status".to_owned(), Value::String("idle".to_owned()));
-                session.insert(
-                    "error_message".to_owned(),
-                    Value::String(
-                        "claude_handoff_failed: failed to start handoff worker".to_owned(),
-                    ),
-                );
-                self.write_raw_json_value(&state)?;
-            }
-            matches
-        };
-        if released {
-            if let Some(runtime) = self.delivery_runtime.as_ref() {
-                let _ = self.drain_runtime_pending_messages_for_session(session_id, runtime);
-            }
-        }
-        Ok(released)
-    }
-
-    #[allow(clippy::too_many_arguments)] // each argument is a distinct reservation field
-    fn with_current_claude_handoff_reservation<F>(
-        &self,
-        session_id: &str,
-        file_path: &str,
-        recorded_at: &str,
-        reservation_at: &str,
-        tmux_session: &str,
-        socket_name: &Option<String>,
-        action: F,
-    ) -> Result<bool>
-    where
-        F: FnOnce() -> Result<()>,
-    {
-        let _guard = self.write_guard()?;
-        let parsed_state = self.load_parsed_state()?;
-        let state = &parsed_state.raw;
-        let Some(session) = raw_session_object(state, session_id) else {
-            return Ok(false);
-        };
-        let matches = json_text(session.get("provider")).as_deref() == Some("claude")
-            && !raw_session_is_stopped(session)
-            && is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
-            && json_text(session.get("tmux_session")).as_deref() == Some(tmux_session)
-            && json_text(session.get("tmux_socket_name")).as_deref() == socket_name.as_deref()
-            && json_text(session.get("pending_handoff_path")).as_deref() == Some(file_path)
-            && json_text(session.get("pending_handoff_recorded_at")).as_deref()
-                == Some(recorded_at)
-            && json_text(session.get("claude_handoff_in_progress_at")).as_deref()
-                == Some(reservation_at);
-        if !matches {
-            return Ok(false);
-        }
-        action()?;
-        Ok(true)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn current_claude_handoff_clear_was_observed(
-        &self,
-        session_id: &str,
-        file_path: &str,
-        recorded_at: &str,
-        reservation_at: &str,
-        tmux_session: &str,
-        socket_name: &Option<String>,
-        previous_reset_emitted_at: Option<&str>,
-    ) -> Result<bool> {
-        let _guard = self.write_guard()?;
-        let parsed_state = self.load_parsed_state()?;
-        let state = &parsed_state.raw;
-        let Some(session) = raw_session_object(state, session_id) else {
-            return Ok(false);
-        };
-        let reservation_matches = json_text(session.get("provider")).as_deref() == Some("claude")
-            && !raw_session_is_stopped(session)
-            && is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
-            && json_text(session.get("tmux_session")).as_deref() == Some(tmux_session)
-            && json_text(session.get("tmux_socket_name")).as_deref() == socket_name.as_deref()
-            && json_text(session.get("pending_handoff_path")).as_deref() == Some(file_path)
-            && json_text(session.get("pending_handoff_recorded_at")).as_deref()
-                == Some(recorded_at)
-            && json_text(session.get("claude_handoff_in_progress_at")).as_deref()
-                == Some(reservation_at);
-        if !reservation_matches {
-            return Ok(false);
-        }
-        let reset_emitted_at = json_text(session.get("context_cycle_reset_emitted_at"));
-        let reset_is_new = reset_emitted_at.as_deref() != previous_reset_emitted_at;
-        let reset_follows_reservation = reset_emitted_at
-            .as_deref()
-            .and_then(parse_timestamp)
-            .zip(parse_timestamp(reservation_at))
-            .is_some_and(|(reset, reservation)| reset > reservation);
-        Ok(reset_is_new && reset_follows_reservation)
-    }
-
-    fn execute_pending_claude_handoff(&self, session_id: &str) -> Result<bool> {
-        let _clear_guard = self.lock_clear_operation(session_id)?;
-        let (file_path, recorded_at, reservation_at, tmux_session, socket_name, reset_emitted_at) = {
-            let _guard = self.write_guard()?;
-            let parsed_state = self.load_parsed_state()?;
-            let state = &parsed_state.raw;
-            let Some(session) = raw_session_object(state, session_id) else {
-                return Ok(false);
-            };
-            if json_text(session.get("provider")).as_deref() != Some("claude")
-                || raw_session_is_stopped(session)
-            {
-                return Ok(false);
-            }
-            let Some(file_path) = json_text(session.get("pending_handoff_path")) else {
-                return Ok(false);
-            };
-            let Some(recorded_at) = json_text(session.get("pending_handoff_recorded_at")) else {
-                return Ok(false);
-            };
-            let Some(reservation_at) = json_text(session.get("claude_handoff_in_progress_at"))
-            else {
-                return Ok(false);
-            };
-            (
-                file_path,
-                recorded_at,
-                reservation_at,
-                json_text(session.get("tmux_session"))
-                    .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?,
-                json_text(session.get("tmux_socket_name")),
-                json_text(session.get("context_cycle_reset_emitted_at")),
-            )
-        };
-
-        let clear_started = Arc::new(AtomicBool::new(false));
-        let result = (|| {
-            if !Path::new(&file_path).is_file() {
-                anyhow::bail!("handoff file not found: {file_path}");
-            }
-            let runtime = self
-                .delivery_runtime
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("Claude handoff requires the tmux runtime"))?
-                .for_socket_name(socket_name.as_deref());
-            let prompt = format!("Read {file_path} and continue from where you left off.");
-            let precondition_store = self.clone();
-            let precondition_session_id = session_id.to_owned();
-            let precondition_file_path = file_path.clone();
-            let precondition_recorded_at = recorded_at.clone();
-            let precondition_reservation_at = reservation_at.clone();
-            let precondition_tmux_session = tmux_session.clone();
-            let precondition_socket_name = socket_name.clone();
-            let commit_store = self.clone();
-            let commit_session_id = session_id.to_owned();
-            let commit_file_path = file_path.clone();
-            let commit_recorded_at = recorded_at.clone();
-            let commit_reservation_at = reservation_at.clone();
-            let commit_tmux_session = tmux_session.clone();
-            let commit_socket_name = socket_name.clone();
-            let commit_clear_started = clear_started.clone();
-            let confirmation_store = self.clone();
-            let confirmation_session_id = session_id.to_owned();
-            let confirmation_file_path = file_path.clone();
-            let confirmation_recorded_at = recorded_at.clone();
-            let confirmation_reservation_at = reservation_at.clone();
-            let confirmation_tmux_session = tmux_session.clone();
-            let confirmation_socket_name = socket_name.clone();
-            let confirmation_reset_emitted_at = reset_emitted_at.clone();
-            let prompt_store = self.clone();
-            let prompt_session_id = session_id.to_owned();
-            let prompt_file_path = file_path.clone();
-            let prompt_recorded_at = recorded_at.clone();
-            let prompt_reservation_at = reservation_at.clone();
-            let prompt_tmux_session = tmux_session.clone();
-            let prompt_socket_name = socket_name.clone();
-            runtime.clear_claude_session_if(
-                &tmux_session,
-                &prompt,
-                move || {
-                    precondition_store.with_current_claude_handoff_reservation(
-                        &precondition_session_id,
-                        &precondition_file_path,
-                        &precondition_recorded_at,
-                        &precondition_reservation_at,
-                        &precondition_tmux_session,
-                        &precondition_socket_name,
-                        || Ok(()),
-                    )
-                },
-                move |send_clear| {
-                    commit_store.with_current_claude_handoff_reservation(
-                        &commit_session_id,
-                        &commit_file_path,
-                        &commit_recorded_at,
-                        &commit_reservation_at,
-                        &commit_tmux_session,
-                        &commit_socket_name,
-                        || {
-                            // Conservatively treat an attempted send as
-                            // destructive if tmux reports an error mid-command.
-                            commit_clear_started.store(true, Ordering::Release);
-                            send_clear()
-                        },
-                    )
-                },
-                move || {
-                    confirmation_store.current_claude_handoff_clear_was_observed(
-                        &confirmation_session_id,
-                        &confirmation_file_path,
-                        &confirmation_recorded_at,
-                        &confirmation_reservation_at,
-                        &confirmation_tmux_session,
-                        &confirmation_socket_name,
-                        confirmation_reset_emitted_at.as_deref(),
-                    )
-                },
-                move |send_prompt| {
-                    prompt_store.with_current_claude_handoff_reservation(
-                        &prompt_session_id,
-                        &prompt_file_path,
-                        &prompt_recorded_at,
-                        &prompt_reservation_at,
-                        &prompt_tmux_session,
-                        &prompt_socket_name,
-                        send_prompt,
-                    )
-                },
-            )
-        })();
-
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let Some(session) = session_object_mut(sessions, session_id) else {
-            return Ok(false);
-        };
-        let still_same_session = json_text(session.get("provider")).as_deref() == Some("claude")
-            && !raw_session_is_stopped(session)
-            && is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
-            && json_text(session.get("tmux_session")).as_deref() == Some(tmux_session.as_str())
-            && json_text(session.get("tmux_socket_name")) == socket_name;
-        if !still_same_session {
-            return Ok(false);
-        }
-        match result {
-            Ok(ConditionalClearOutcome::Cleared) => {
-                session.insert(
-                    "last_handoff_path".to_owned(),
-                    Value::String(file_path.clone()),
-                );
-                let (cleared_pending, stopped_after_prompt) = consume_completed_claude_handoff_raw(
-                    session,
-                    &file_path,
-                    &recorded_at,
-                    &reservation_at,
-                );
-                let now = now_rfc3339();
-                reset_session_after_clear(session, &now);
-                session.insert(
-                    "status".to_owned(),
-                    Value::String(if stopped_after_prompt {
-                        "idle".to_owned()
-                    } else {
-                        "running".to_owned()
-                    }),
-                );
-                clear_claude_handoff_error_raw(session);
-                self.write_raw_json_value(&state)?;
-                drop(_guard);
-                let _ = self.cancel_context_monitor_alerts(session_id);
-                if let Some(runtime) = self.delivery_runtime.as_ref() {
-                    let _ = self.drain_runtime_pending_messages_for_session(session_id, runtime);
-                }
-                Ok(cleared_pending)
-            }
-            Ok(ConditionalClearOutcome::PostClearPreconditionFailed) => Ok(false),
-            Ok(ConditionalClearOutcome::PreconditionFailed) => {
-                let released = json_text(session.get("claude_handoff_in_progress_at")).as_deref()
-                    == Some(reservation_at.as_str());
-                if released {
-                    session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
-                    self.write_raw_json_value(&state)?;
-                }
-                drop(_guard);
-                if let Some(runtime) = self.delivery_runtime.as_ref() {
-                    let _ = self.drain_runtime_pending_messages_for_session(session_id, runtime);
-                }
-                Ok(false)
-            }
-            Ok(
-                outcome @ (ConditionalClearOutcome::IdlePromptNotReady
-                | ConditionalClearOutcome::SessionMissing),
-            ) => {
-                let still_current = json_text(session.get("pending_handoff_path")).as_deref()
-                    == Some(file_path.as_str())
-                    && json_text(session.get("pending_handoff_recorded_at")).as_deref()
-                        == Some(recorded_at.as_str())
-                    && json_text(session.get("claude_handoff_in_progress_at")).as_deref()
-                        == Some(reservation_at.as_str());
-                if still_current {
-                    session.insert("status".to_owned(), Value::String("idle".to_owned()));
-                    session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
-                    let reason = match outcome {
-                        ConditionalClearOutcome::IdlePromptNotReady => {
-                            "Claude handoff aborted because the idle prompt was not ready"
-                        }
-                        ConditionalClearOutcome::SessionMissing => "tmux session is not running",
-                        _ => unreachable!(),
-                    };
-                    session.insert(
-                        "error_message".to_owned(),
-                        Value::String(format!("claude_handoff_failed: {reason}")),
-                    );
-                    self.write_raw_json_value(&state)?;
-                }
-                drop(_guard);
-                if still_current {
-                    if let Some(runtime) = self.delivery_runtime.as_ref() {
-                        let _ =
-                            self.drain_runtime_pending_messages_for_session(session_id, runtime);
-                    }
-                }
-                Ok(false)
-            }
-            Err(error) => {
-                let still_current = json_text(session.get("pending_handoff_path")).as_deref()
-                    == Some(file_path.as_str())
-                    && json_text(session.get("pending_handoff_recorded_at")).as_deref()
-                        == Some(recorded_at.as_str())
-                    && json_text(session.get("claude_handoff_in_progress_at")).as_deref()
-                        == Some(reservation_at.as_str());
-                let failed_before_clear = !clear_started.load(Ordering::Acquire);
-                if still_current {
-                    session.insert("status".to_owned(), Value::String("idle".to_owned()));
-                    if failed_before_clear {
-                        session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
-                    }
-                    session.insert(
-                        "error_message".to_owned(),
-                        Value::String(format!("claude_handoff_failed: {error}")),
-                    );
-                    self.write_raw_json_value(&state)?;
-                }
-                drop(_guard);
-                if still_current && failed_before_clear {
-                    if let Some(runtime) = self.delivery_runtime.as_ref() {
-                        let _ =
-                            self.drain_runtime_pending_messages_for_session(session_id, runtime);
-                    }
-                }
-                Ok(false)
-            }
-        }
-    }
-
     pub fn recover_codex_fork_event_monitors(&self) -> Result<usize> {
         let Some(runtime) = self.delivery_runtime.as_ref() else {
             return Ok(0);
@@ -7696,209 +6996,6 @@ impl SessionStore {
             self.write_raw_json_value(&state)?;
         }
         Ok(())
-    }
-
-    fn start_codex_fork_handoff_monitor(
-        &self,
-        session_id: String,
-        event_stream_path: PathBuf,
-        initial_offset: u64,
-    ) -> Result<()> {
-        {
-            let mut monitors = self
-                .codex_fork_handoff_monitors
-                .lock()
-                .map_err(|_| anyhow::anyhow!("codex-fork handoff monitor lock poisoned"))?;
-            if !monitors.insert(session_id.clone()) {
-                return Ok(());
-            }
-        }
-
-        let store = self.clone();
-        let monitor_session_id = session_id.clone();
-        let spawn_result = thread::Builder::new()
-            .name(format!(
-                "sm-codex-fork-handoff-{}",
-                sanitize_path_component(&session_id)
-            ))
-            .spawn(move || {
-                store.monitor_codex_fork_handoff(
-                    &monitor_session_id,
-                    &event_stream_path,
-                    initial_offset,
-                );
-                if let Ok(mut monitors) = store.codex_fork_handoff_monitors.lock() {
-                    monitors.remove(&monitor_session_id);
-                }
-            });
-        if let Err(error) = spawn_result {
-            if let Ok(mut monitors) = self.codex_fork_handoff_monitors.lock() {
-                monitors.remove(&session_id);
-            }
-            return Err(error).with_context(|| "failed to start codex-fork handoff monitor");
-        }
-        Ok(())
-    }
-
-    fn monitor_codex_fork_handoff(
-        &self,
-        session_id: &str,
-        event_stream_path: &Path,
-        initial_offset: u64,
-    ) {
-        let mut offset = initial_offset;
-        let mut buffer = String::new();
-        loop {
-            match self.codex_fork_handoff_is_pending(session_id) {
-                Ok(true) => {}
-                Ok(false) | Err(_) => return,
-            }
-            if let Ok(chunk) = read_file_from_offset(event_stream_path, &mut offset) {
-                for line in split_complete_event_lines(&mut buffer, &chunk) {
-                    if codex_fork_event_is_turn_complete(&line)
-                        && self
-                            .execute_pending_codex_fork_handoff(session_id)
-                            .is_ok_and(|completed| completed)
-                    {
-                        return;
-                    }
-                }
-            }
-            thread::sleep(CODEX_FORK_EVENT_MONITOR_POLL);
-        }
-    }
-
-    fn codex_fork_handoff_is_pending(&self, session_id: &str) -> Result<bool> {
-        let parsed_state = self.load_parsed_state()?;
-        let state = &parsed_state.raw;
-        Ok(raw_session_object(state, session_id)
-            .and_then(|session| json_text(session.get("pending_handoff_path")))
-            .is_some())
-    }
-
-    fn execute_pending_codex_fork_handoff(&self, session_id: &str) -> Result<bool> {
-        let (
-            file_path,
-            tmux_session,
-            socket_name,
-            event_stream_path,
-            event_offset,
-            previous_provider_resume_id,
-        ) = {
-            let _guard = self.write_guard()?;
-            let parsed_state = self.load_parsed_state()?;
-            let state = &parsed_state.raw;
-            let Some(session) = raw_session_object(state, session_id) else {
-                return Ok(false);
-            };
-            let Some(file_path) = json_text(session.get("pending_handoff_path")) else {
-                return Ok(false);
-            };
-            let runtime = self
-                .delivery_runtime
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("codex-fork handoff requires the tmux runtime"))?;
-            let spec = codex_fork_spec_for_session_raw(session_id, session)?;
-            let artifacts = runtime
-                .codex_fork_runtime_artifacts(&spec)?
-                .ok_or_else(|| anyhow::anyhow!("codex-fork runtime artifacts unavailable"))?;
-            let event_offset = fs::metadata(&artifacts.event_stream_path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
-            (
-                file_path,
-                json_text(session.get("tmux_session"))
-                    .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?,
-                json_text(session.get("tmux_socket_name")),
-                artifacts.event_stream_path,
-                event_offset,
-                json_text(session.get("provider_resume_id")),
-            )
-        };
-
-        let result = (|| {
-            if !Path::new(&file_path).is_file() {
-                anyhow::bail!("handoff file not found: {file_path}");
-            }
-            let runtime = self
-                .delivery_runtime
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("codex-fork handoff requires the tmux runtime"))?
-                .for_socket_name(socket_name.as_deref());
-            let prompt = format!("Read {file_path} and continue from where you left off.");
-            if !runtime.clear_codex_session_confirming_prompt(
-                &tmux_session,
-                &prompt,
-                &event_stream_path,
-                event_offset,
-            )? {
-                anyhow::bail!("tmux session is not running");
-            }
-            wait_for_codex_fork_provider_resume_id_after_offset(
-                &event_stream_path,
-                event_offset,
-                CODEX_FORK_THREAD_STARTED_TIMEOUT,
-            )
-        })();
-
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let Some(session) = session_object_mut(sessions, session_id) else {
-            return Ok(false);
-        };
-        if raw_session_is_stopped(session) {
-            return Ok(false);
-        }
-        match result {
-            Ok(provider_resume_id) => {
-                session.insert(
-                    "provider_resume_id".to_owned(),
-                    Value::String(provider_resume_id.clone()),
-                );
-                session.insert(
-                    "last_handoff_path".to_owned(),
-                    Value::String(file_path.clone()),
-                );
-                let cleared_pending = json_text(session.get("pending_handoff_path")).as_deref()
-                    == Some(file_path.as_str());
-                if cleared_pending {
-                    session.insert("pending_handoff_path".to_owned(), Value::Null);
-                    session.insert("pending_handoff_event_offset".to_owned(), Value::Null);
-                }
-                let now = now_rfc3339();
-                reset_session_after_clear(session, &now);
-                session.insert("status".to_owned(), Value::String("running".to_owned()));
-                clear_codex_fork_control_degraded_raw(session);
-                clear_codex_fork_handoff_error_raw(session);
-                self.write_raw_json_value(&state)?;
-                drop(_guard);
-                if let Some(previous_provider_resume_id) = previous_provider_resume_id.as_deref() {
-                    self.append_seat_session(
-                        session_id,
-                        "codex-fork",
-                        previous_provider_resume_id,
-                        event_stream_path.to_str(),
-                    );
-                }
-                self.append_seat_session(
-                    session_id,
-                    "codex-fork",
-                    &provider_resume_id,
-                    event_stream_path.to_str(),
-                );
-                let _ = self.cancel_context_monitor_alerts(session_id);
-                Ok(cleared_pending)
-            }
-            Err(error) => {
-                session.insert(
-                    "error_message".to_owned(),
-                    Value::String(format!("codex_fork_handoff_failed: {error}")),
-                );
-                self.write_raw_json_value(&state)?;
-                Ok(false)
-            }
-        }
     }
 
     pub fn list_agent_registrations(&self) -> Result<Vec<AgentRegistrationResponse>> {
@@ -10498,12 +9595,6 @@ struct ContextAlert {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct HandoffRequest {
-    pub requester_session_id: String,
-    pub file_path: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct SetMaintainerRequest {
     pub requester_session_id: String,
 }
@@ -10668,6 +9759,7 @@ pub enum RetireAuthority {
     Operator { source: String },
     AuthenticatedParent { session_id: String },
     ServerLifecycle { source: String },
+    Handoff { successor_session_id: String },
 }
 
 impl RetireAuthority {
@@ -10689,6 +9781,15 @@ impl RetireAuthority {
         }
     }
 
+    /// A predecessor retired by its own handoff (sm#1651, Appendix H.1):
+    /// server lifecycle authority, so root protection does not block it, with
+    /// the successor recorded as the actor.
+    pub fn handoff(successor_session_id: impl Into<String>) -> Self {
+        Self::Handoff {
+            successor_session_id: successor_session_id.into(),
+        }
+    }
+
     fn is_authorized(&self, sessions: &[SessionRecord], credential: Option<&str>) -> bool {
         match self {
             Self::AuthenticatedParent { session_id } => {
@@ -10700,7 +9801,7 @@ impl RetireAuthority {
                         session_credential_matches(sessions, session_id, credential)
                     })
             }
-            Self::Operator { .. } | Self::ServerLifecycle { .. } => true,
+            Self::Operator { .. } | Self::ServerLifecycle { .. } | Self::Handoff { .. } => true,
         }
     }
 
@@ -10709,7 +9810,7 @@ impl RetireAuthority {
             Self::AuthenticatedParent { session_id } => {
                 json_text(target.get("parent_session_id")).as_deref() == Some(session_id)
             }
-            Self::Operator { .. } | Self::ServerLifecycle { .. } => true,
+            Self::Operator { .. } | Self::ServerLifecycle { .. } | Self::Handoff { .. } => true,
         }
     }
 
@@ -10721,7 +9822,9 @@ impl RetireAuthority {
                 CoreRetireOutcome::RootProtected
             }
             Self::AuthenticatedParent { .. } => CoreRetireOutcome::NotChild,
-            Self::Operator { .. } | Self::ServerLifecycle { .. } => CoreRetireOutcome::Forbidden,
+            Self::Operator { .. } | Self::ServerLifecycle { .. } | Self::Handoff { .. } => {
+                CoreRetireOutcome::Forbidden
+            }
         }
     }
 
@@ -10750,6 +9853,15 @@ impl RetireAuthority {
                 None,
                 "server_lifecycle",
                 source,
+                tmux_disposition,
+            ),
+            Self::Handoff {
+                successor_session_id,
+            } => TerminalProvenance::explicit_retire(
+                requested_at,
+                Some(successor_session_id),
+                "server_lifecycle",
+                crate::handoff::execute::RETIRE_SOURCE,
                 tmux_disposition,
             ),
         }
@@ -10942,17 +10054,6 @@ pub enum CredentialRotationOutcome {
     SessionNotFound,
     BadRequest(String),
     Conflict(String),
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct HandoffResult {
-    pub status: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum HandoffOutcome {
-    Recorded(HandoffResult),
-    Error(String),
 }
 
 #[derive(Debug, Clone)]
@@ -11876,7 +10977,7 @@ fn runtime_session_accepts_background_delivery_raw(
     if raw_session_is_stopped(session) {
         return Ok(false);
     }
-    if claude_handoff_is_pending_raw(session) {
+    if handoff_fences_delivery_raw(session) {
         return Ok(false);
     }
     let tmux_session = json_text(session.get("tmux_session"))
@@ -11922,7 +11023,7 @@ fn reparent_runtime_delivery_target(
     };
     let node = json_text(session.get("node")).unwrap_or_else(default_node);
     ensure_runtime_local_node(&node)?;
-    if raw_session_is_stopped(session) || claude_handoff_is_reserved_raw(session) {
+    if raw_session_is_stopped(session) || handoff_fences_delivery_raw(session) {
         return Ok(None);
     }
     let tmux_session = json_text(session.get("tmux_session"))
@@ -11968,10 +11069,7 @@ fn deliver_runtime_text_to_session_with_ready_fence_raw(
         let node = json_text(session.get("node")).unwrap_or_else(default_node);
         ensure_runtime_local_node(&node)?;
         let status = effective_raw_session_status(session);
-        if raw_session_is_stopped(session)
-            || (require_ready_fence && claude_handoff_is_pending_raw(session))
-            || (!require_ready_fence && claude_handoff_is_reserved_raw(session))
-        {
+        if raw_session_is_stopped(session) || handoff_fences_delivery_raw(session) {
             return Ok((status, false));
         }
         let tmux_session = json_text(session.get("tmux_session"))
@@ -12044,7 +11142,7 @@ fn deliver_urgent_runtime_text_to_session_raw(
         let node = json_text(session.get("node")).unwrap_or_else(default_node);
         ensure_runtime_local_node(&node)?;
         let status = effective_raw_session_status(session);
-        if raw_session_is_stopped(session) || claude_handoff_is_reserved_raw(session) {
+        if raw_session_is_stopped(session) || handoff_fences_delivery_raw(session) {
             return Ok((status, false));
         }
         let tmux_session = json_text(session.get("tmux_session"))
@@ -12113,7 +11211,7 @@ fn deliver_runtime_native_rename_to_session_raw(
     if raw_session_is_stopped(session) {
         return Ok((status, false));
     }
-    if claude_handoff_is_reserved_raw(session) {
+    if handoff_fences_delivery_raw(session) {
         return Ok((status, false));
     }
     let Some(friendly_name) = extract_provider_native_rename_name(text) else {
@@ -12516,88 +11614,6 @@ fn clear_codex_fork_control_degraded_raw(session: &mut Map<String, Value>) -> bo
         session.insert("error_message".to_owned(), Value::Null);
     }
     is_degraded_error
-}
-
-fn clear_codex_fork_handoff_error_raw(session: &mut Map<String, Value>) {
-    let is_handoff_error = json_text(session.get("error_message"))
-        .as_deref()
-        .is_some_and(|message| message.starts_with("codex_fork_handoff_failed:"));
-    if is_handoff_error {
-        session.insert("error_message".to_owned(), Value::Null);
-    }
-}
-
-fn clear_claude_handoff_error_raw(session: &mut Map<String, Value>) {
-    let is_handoff_error = json_text(session.get("error_message"))
-        .as_deref()
-        .is_some_and(|message| message.starts_with("claude_handoff_failed:"));
-    if is_handoff_error {
-        session.insert("error_message".to_owned(), Value::Null);
-    }
-}
-
-fn claude_handoff_is_pending_raw(session: &Map<String, Value>) -> bool {
-    json_text(session.get("provider")).as_deref() == Some("claude")
-        && json_text(session.get("pending_handoff_path")).is_some()
-        && json_text(session.get("pending_handoff_recorded_at")).is_some()
-}
-
-fn claude_handoff_is_reserved_raw(session: &Map<String, Value>) -> bool {
-    json_text(session.get("provider")).as_deref() == Some("claude")
-        && json_text(session.get("claude_handoff_in_progress_at")).is_some()
-}
-
-fn claude_handoff_reservation_replaced_raw(
-    session: &Map<String, Value>,
-    file_path: &str,
-    recorded_at: &str,
-    reservation_at: &str,
-) -> bool {
-    if json_text(session.get("provider")).as_deref() != Some("claude")
-        || raw_session_is_stopped(session)
-        || !is_primary_node(&json_text(session.get("node")).unwrap_or_else(default_node))
-    {
-        return false;
-    }
-    let Some(current_file_path) = json_text(session.get("pending_handoff_path")) else {
-        return false;
-    };
-    let Some(current_recorded_at) = json_text(session.get("pending_handoff_recorded_at")) else {
-        return false;
-    };
-    let Some(current_reservation_at) = json_text(session.get("claude_handoff_in_progress_at"))
-    else {
-        return false;
-    };
-    current_file_path != file_path
-        || current_recorded_at != recorded_at
-        || current_reservation_at != reservation_at
-}
-
-fn consume_completed_claude_handoff_raw(
-    session: &mut Map<String, Value>,
-    file_path: &str,
-    recorded_at: &str,
-    reservation_at: &str,
-) -> (bool, bool) {
-    let cleared_pending = json_text(session.get("pending_handoff_path")).as_deref()
-        == Some(file_path)
-        && json_text(session.get("pending_handoff_recorded_at")).as_deref() == Some(recorded_at);
-    let stopped_after_prompt = cleared_pending
-        && json_text(session.get("claude_handoff_in_progress_at"))
-            .is_some_and(|current| current != reservation_at);
-    if cleared_pending {
-        session.insert("pending_handoff_path".to_owned(), Value::Null);
-        session.insert("pending_handoff_recorded_at".to_owned(), Value::Null);
-        // The handoff turn's own Stop may refresh this timestamp before the
-        // worker persists success. It still reserves the intent consumed here.
-        session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
-    } else if json_text(session.get("claude_handoff_in_progress_at")).as_deref()
-        == Some(reservation_at)
-    {
-        session.insert("claude_handoff_in_progress_at".to_owned(), Value::Null);
-    }
-    (cleared_pending, stopped_after_prompt)
 }
 
 #[allow(clippy::too_many_arguments)] // each argument is a distinct drain input or filter
@@ -20702,123 +19718,11 @@ sleep 30
     }
 
     #[test]
-    fn completed_claude_handoff_clears_refreshed_reservation_for_consumed_intent() {
-        let mut session = json!({
-            "pending_handoff_path": "/tmp/handoff.md",
-            "pending_handoff_recorded_at": "2026-08-11T20:00:00Z",
-            "claude_handoff_in_progress_at": "2026-08-11T20:00:02Z"
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-
-        let outcome = consume_completed_claude_handoff_raw(
-            &mut session,
-            "/tmp/handoff.md",
-            "2026-08-11T20:00:00Z",
-            "2026-08-11T20:00:01Z",
-        );
-        assert_eq!(outcome, (true, true));
-        assert!(session["pending_handoff_path"].is_null());
-        assert!(session["pending_handoff_recorded_at"].is_null());
-        assert!(session["claude_handoff_in_progress_at"].is_null());
-    }
-
-    #[test]
-    fn retiring_claude_handoff_worker_detects_a_replacement_reservation() {
-        let session = json!({
-            "provider": "claude",
-            "status": "running",
-            "node": "primary",
-            "pending_handoff_path": "/tmp/replacement.md",
-            "pending_handoff_recorded_at": "2026-08-11T20:00:02Z",
-            "claude_handoff_in_progress_at": "2026-08-11T20:00:03Z"
-        });
-
-        assert!(claude_handoff_reservation_replaced_raw(
-            session.as_object().unwrap(),
-            "/tmp/original.md",
-            "2026-08-11T20:00:00Z",
-            "2026-08-11T20:00:01Z",
-        ));
-        assert!(!claude_handoff_reservation_replaced_raw(
-            session.as_object().unwrap(),
-            "/tmp/replacement.md",
-            "2026-08-11T20:00:02Z",
-            "2026-08-11T20:00:03Z",
-        ));
-    }
-
-    #[test]
-    fn failed_claude_handoff_worker_start_releases_matching_reservation() {
-        let store = store_with_running_claude_session("workerfail");
-        {
-            let mut state = store.load_raw_json_value().unwrap();
-            let sessions = ensure_sessions_array_mut(&mut state).unwrap();
-            let session = session_object_mut(sessions, "workerfail").unwrap();
-            session.insert(
-                "pending_handoff_path".to_owned(),
-                Value::String("/tmp/workerfail-handoff.md".to_owned()),
-            );
-            session.insert(
-                "pending_handoff_recorded_at".to_owned(),
-                Value::String("2026-08-11T20:00:00Z".to_owned()),
-            );
-            session.insert(
-                "claude_handoff_in_progress_at".to_owned(),
-                Value::String("2026-08-11T20:00:01Z".to_owned()),
-            );
-            store.write_raw_json_value(&state).unwrap();
-        }
-
-        assert!(store
-            .release_failed_claude_handoff_worker_reservation(
-                "workerfail",
-                "/tmp/workerfail-handoff.md",
-                "2026-08-11T20:00:00Z",
-                "2026-08-11T20:00:01Z",
-            )
-            .unwrap());
-
-        let state = store.load_raw_json_value().unwrap();
-        let session = raw_session_object(&state, "workerfail").unwrap();
-        assert_eq!(json_text(session.get("status")).as_deref(), Some("idle"));
-        assert!(json_text(session.get("pending_handoff_path")).is_some());
-        assert!(json_text(session.get("pending_handoff_recorded_at")).is_some());
-        assert!(json_text(session.get("claude_handoff_in_progress_at")).is_none());
-        assert_eq!(
-            json_text(session.get("error_message")).as_deref(),
-            Some("claude_handoff_failed: failed to start handoff worker")
-        );
-    }
-
-    #[test]
     fn claude_user_prompt_submit_hook_marks_the_turn_running() {
         let store = store_with_running_claude_session("turnstart");
-        {
-            let mut state = store.load_raw_json_value().unwrap();
-            let sessions = ensure_sessions_array_mut(&mut state).unwrap();
-            let session = session_object_mut(sessions, "turnstart").unwrap();
-            session.insert(
-                "pending_handoff_path".to_owned(),
-                Value::String("/tmp/turnstart-handoff.md".to_owned()),
-            );
-            session.insert(
-                "pending_handoff_recorded_at".to_owned(),
-                Value::String("2026-06-01T00:00:00Z".to_owned()),
-            );
-            store.write_raw_json_value(&state).unwrap();
-        }
         assert!(store
             .apply_claude_stop_hook("turnstart", None, None, None, None, None, None)
             .unwrap());
-        let reserved = store.load_raw_json_value().unwrap();
-        assert!(json_text(
-            raw_session_object(&reserved, "turnstart")
-                .unwrap()
-                .get("claude_handoff_in_progress_at")
-        )
-        .is_some());
         assert!(store
             .apply_claude_user_prompt_submit_hook("turnstart", None)
             .unwrap());
@@ -20828,13 +19732,6 @@ sleep 30
         assert_eq!(session.status, "running");
         assert!(session.agent_task_completed_at.is_none());
         assert_eq!(claude_hook_gate(&session), ClaudeHookGate::TurnRunning);
-        let cancelled = store.load_raw_json_value().unwrap();
-        assert!(json_text(
-            raw_session_object(&cancelled, "turnstart")
-                .unwrap()
-                .get("claude_handoff_in_progress_at")
-        )
-        .is_none());
     }
 
     #[test]
@@ -21269,74 +20166,6 @@ sleep 30
             1
         );
         assert!(pane.input_lines().is_empty());
-        let _ = fs::remove_file(state_file);
-        let _ = fs::remove_file(queue_db);
-    }
-
-    #[test]
-    fn completion_reconciler_retains_ready_target_with_pending_claude_handoff() {
-        let pane = queue_completion_test_pane(true);
-        let (store, queue, state_file, queue_db) = queue_completion_test_store(&pane, "running");
-        let mut state: Value =
-            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
-        let session = state["sessions"][0].as_object_mut().unwrap();
-        session.insert(
-            "pending_handoff_path".to_owned(),
-            Value::String("/tmp/queued-handoff.md".to_owned()),
-        );
-        session.insert(
-            "pending_handoff_recorded_at".to_owned(),
-            Value::String("2026-06-01T00:02:00Z".to_owned()),
-        );
-        fs::write(&state_file, state.to_string()).unwrap();
-        enqueue_queue_completion(&queue, "queue-completion-pending-handoff");
-
-        store
-            .drain_runtime_pending_message_targets_by_category("queue-completion")
-            .unwrap();
-
-        assert_eq!(
-            queue
-                .pending_messages_for_target_by_category("queue-target", "queue-completion", 10)
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(pane.input_lines().is_empty());
-        let _ = fs::remove_file(state_file);
-        let _ = fs::remove_file(queue_db);
-    }
-
-    #[test]
-    fn direct_delivery_allows_retryable_unreserved_claude_handoff() {
-        let pane = queue_completion_test_pane(true);
-        let (_store, _queue, state_file, queue_db) = queue_completion_test_store(&pane, "idle");
-        let mut state: Value =
-            serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
-        let session = state["sessions"][0].as_object_mut().unwrap();
-        session.insert(
-            "pending_handoff_path".to_owned(),
-            Value::String("/tmp/retryable-handoff.md".to_owned()),
-        );
-        session.insert(
-            "pending_handoff_recorded_at".to_owned(),
-            Value::String("2026-06-01T00:02:00Z".to_owned()),
-        );
-
-        let (status, delivered) = deliver_runtime_text_to_session_raw(
-            &mut state,
-            "queue-target",
-            "[sm queue] handoff retry drain",
-            &pane.runtime,
-        )
-        .unwrap();
-
-        assert_eq!(status, "idle");
-        assert!(delivered);
-        assert_eq!(
-            pane.wait_for_input_lines(1),
-            vec!["[sm queue] handoff retry drain"]
-        );
         let _ = fs::remove_file(state_file);
         let _ = fs::remove_file(queue_db);
     }
@@ -23139,202 +21968,6 @@ sleep 30
     }
 
     #[test]
-    fn codex_fork_handoff_executes_after_turn_complete() {
-        let Some(fixture) = CodexForkHandoffFixture::new("execute") else {
-            return;
-        };
-        let store = fixture.store();
-
-        assert!(matches!(
-            store
-                .schedule_handoff(
-                    "codex001",
-                    HandoffRequest {
-                        requester_session_id: "codex001".to_owned(),
-                        file_path: fixture.handoff_path.display().to_string(),
-                    },
-                )
-                .unwrap(),
-            HandoffOutcome::Recorded(_)
-        ));
-        let state = store.load_raw_json_value().unwrap();
-        assert!(raw_session_object(&state, "codex001")
-            .unwrap()
-            .get("pending_handoff_event_offset")
-            .and_then(Value::as_u64)
-            .is_some());
-
-        fixture.append_turn_complete();
-        fixture.wait_for_handoff(&store);
-
-        let session = store.get_session("codex001").unwrap().unwrap();
-        assert_eq!(session.id, "codex001");
-        assert_eq!(session.friendly_name.as_deref(), Some("stable-agent"));
-        assert_eq!(
-            session.last_handoff_path.as_deref(),
-            Some(fixture.handoff_path.to_str().unwrap())
-        );
-        assert_eq!(session.provider_resume_id.as_deref(), Some("new-thread"));
-        // The handoff records seat sessions after it commits
-        // `last_handoff_path` and releases the state lock, so poll (#1401).
-        let usage_db = fixture.state_file.with_extension("usage.db");
-        let read_provider_session_ids = || -> rusqlite::Result<Vec<String>> {
-            rusqlite::Connection::open(&usage_db)?
-                .prepare(
-                    "SELECT provider_session_id FROM seat_sessions WHERE seat_id = 'codex001' ORDER BY provider_session_id",
-                )?
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect()
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let provider_session_ids = loop {
-            let ids = read_provider_session_ids();
-            if ids.as_ref().is_ok_and(|ids| ids.len() >= 2) || Instant::now() >= deadline {
-                break ids;
-            }
-            thread::sleep(Duration::from_millis(50));
-        };
-        assert_eq!(
-            provider_session_ids.unwrap(),
-            vec!["new-thread", "old-thread"]
-        );
-        let state = store.load_raw_json_value().unwrap();
-        let session = raw_session_object(&state, "codex001").unwrap();
-        assert!(json_text(session.get("pending_handoff_path")).is_none());
-        assert!(json_text(session.get("pending_handoff_event_offset")).is_none());
-        let output = fixture.capture_pane();
-        let compact_output = output
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect::<String>();
-        let expected = format!(
-            "received:Read{}andcontinuefromwhereyouleftoff.",
-            fixture.handoff_path.display()
-        );
-        assert!(compact_output.contains(&expected), "{output}");
-    }
-
-    #[test]
-    fn codex_fork_handoff_recovery_replays_from_persisted_offset() {
-        let Some(fixture) = CodexForkHandoffFixture::new("recovery") else {
-            return;
-        };
-        let state = fixture.store().load_raw_json_value().unwrap();
-        let mut state = state;
-        let session =
-            session_object_mut(ensure_sessions_array_mut(&mut state).unwrap(), "codex001").unwrap();
-        session.insert(
-            "pending_handoff_path".to_owned(),
-            Value::String(fixture.handoff_path.display().to_string()),
-        );
-        session.insert("pending_handoff_event_offset".to_owned(), json!(0));
-        fs::write(
-            &fixture.state_file,
-            serde_json::to_vec_pretty(&state).unwrap(),
-        )
-        .unwrap();
-        fixture.append_turn_complete();
-
-        let restarted = fixture.store();
-        assert_eq!(restarted.recover_pending_codex_fork_handoffs().unwrap(), 1);
-        fixture.wait_for_handoff(&restarted);
-
-        assert_eq!(
-            restarted
-                .get_session("codex001")
-                .unwrap()
-                .unwrap()
-                .last_handoff_path
-                .as_deref(),
-            Some(fixture.handoff_path.to_str().unwrap())
-        );
-        assert_eq!(
-            restarted
-                .get_session("codex001")
-                .unwrap()
-                .unwrap()
-                .provider_resume_id
-                .as_deref(),
-            Some("new-thread")
-        );
-    }
-
-    #[test]
-    fn codex_fork_handoff_failure_keeps_pending_path() {
-        let Some(fixture) = CodexForkHandoffFixture::new("failure") else {
-            return;
-        };
-        let store = fixture.store();
-        store
-            .schedule_handoff(
-                "codex001",
-                HandoffRequest {
-                    requester_session_id: "codex001".to_owned(),
-                    file_path: fixture.handoff_path.display().to_string(),
-                },
-            )
-            .unwrap();
-        fixture.kill_tmux();
-        fixture.append_turn_complete();
-        fixture.wait_for_handoff_error(&store);
-
-        let state = store.load_raw_json_value().unwrap();
-        let session = raw_session_object(&state, "codex001").unwrap();
-        assert_eq!(
-            json_text(session.get("pending_handoff_path")).as_deref(),
-            Some(fixture.handoff_path.to_str().unwrap())
-        );
-        assert!(json_text(session.get("last_handoff_path")).is_none());
-        assert!(json_text(session.get("error_message"))
-            .unwrap()
-            .contains("codex_fork_handoff_failed: tmux session is not running"));
-
-        fixture.start_tmux();
-        fixture.append_turn_complete();
-        fixture.wait_for_handoff(&store);
-        let state = store.load_raw_json_value().unwrap();
-        let session = raw_session_object(&state, "codex001").unwrap();
-        assert!(json_text(session.get("pending_handoff_path")).is_none());
-        assert!(json_text(session.get("error_message")).is_none());
-    }
-
-    #[test]
-    fn codex_fork_handoff_recovery_initializes_legacy_offset_at_stream_end() {
-        let Some(fixture) = CodexForkHandoffFixture::new("legacy-offset") else {
-            return;
-        };
-        fixture.append_turn_complete();
-        let historical_stream_len = fs::metadata(&fixture.event_stream_path).unwrap().len();
-        let mut state = fixture.store().load_raw_json_value().unwrap();
-        let session =
-            session_object_mut(ensure_sessions_array_mut(&mut state).unwrap(), "codex001").unwrap();
-        session.insert(
-            "pending_handoff_path".to_owned(),
-            Value::String(fixture.handoff_path.display().to_string()),
-        );
-        fs::write(
-            &fixture.state_file,
-            serde_json::to_vec_pretty(&state).unwrap(),
-        )
-        .unwrap();
-
-        let restarted = fixture.store();
-        assert_eq!(restarted.recover_pending_codex_fork_handoffs().unwrap(), 1);
-        let state = restarted.load_raw_json_value().unwrap();
-        let session = raw_session_object(&state, "codex001").unwrap();
-        assert_eq!(
-            session
-                .get("pending_handoff_event_offset")
-                .and_then(Value::as_u64),
-            Some(historical_stream_len)
-        );
-        assert!(json_text(session.get("last_handoff_path")).is_none());
-
-        fixture.append_turn_complete();
-        fixture.wait_for_handoff(&restarted);
-    }
-
-    #[test]
     fn codex_fork_event_monitor_recovery_records_only_new_rate_limits() {
         let Some(fixture) = CodexForkHandoffFixture::new("event-monitor-recovery") else {
             return;
@@ -23400,7 +22033,6 @@ sleep 30
     struct CodexForkHandoffFixture {
         state_file: PathBuf,
         event_stream_path: PathBuf,
-        handoff_path: PathBuf,
         log_file: PathBuf,
         tmux_socket: String,
         tmux_session: String,
@@ -23421,9 +22053,7 @@ sleep 30
             let fixture_dir = state_file.with_extension("dir");
             fs::create_dir_all(&fixture_dir).unwrap();
             let log_file = fixture_dir.join("codex001.log");
-            let handoff_path = fixture_dir.join("handoff.md");
             fs::write(&log_file, "").unwrap();
-            fs::write(&handoff_path, "durable handoff body").unwrap();
             let tmux_socket = format!("sm-handoff-{}-{}", std::process::id(), label);
             let tmux_session = "codex-fork-handoff".to_owned();
 
@@ -23465,7 +22095,6 @@ sleep 30
             Some(Self {
                 state_file,
                 event_stream_path,
-                handoff_path,
                 log_file,
                 tmux_socket,
                 tmux_session,
@@ -23477,18 +22106,6 @@ sleep 30
                 .with_delivery_runtime(Some(TmuxRuntime::from_config(
                     &crate::config::RustCoreConfig::default(),
                 )))
-        }
-
-        fn append_turn_complete(&self) {
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(&self.event_stream_path)
-                .unwrap();
-            writeln!(
-                file,
-                r#"{{"event_type":"turn_complete","payload":{{"turn_id":"turn-1"}}}}"#
-            )
-            .unwrap();
         }
 
         fn append_rate_limit_to(&self, event_stream_path: &Path, percent: f64) {
@@ -23517,34 +22134,6 @@ sleep 30
             .unwrap();
         }
 
-        /// Wait as long as the product itself may take (#1401). An idle
-        /// machine completes this fixture's handoff in about 6s: 3s for the
-        /// Escape prompt wait (the fixture draws `›`, not `>`) plus 2s before
-        /// the unconfirmed-prompt Enter retry. A fixed 8s deadline flaked
-        /// under full-suite load; the product allows 30s to confirm the
-        /// prompt and `CODEX_FORK_THREAD_STARTED_TIMEOUT` for the new thread.
-        fn wait_for_handoff(&self, store: &SessionStore) {
-            let deadline =
-                Instant::now() + Duration::from_secs(5 + 30) + CODEX_FORK_THREAD_STARTED_TIMEOUT;
-            loop {
-                if store
-                    .get_session("codex001")
-                    .unwrap()
-                    .and_then(|session| session.last_handoff_path)
-                    .is_some()
-                {
-                    return;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "handoff did not complete; state={} pane={:?}",
-                    fs::read_to_string(&self.state_file).unwrap_or_default(),
-                    self.capture_pane()
-                );
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-
         fn capture_pane(&self) -> String {
             let output = Command::new("tmux")
                 .args([
@@ -23568,43 +22157,12 @@ sleep 30
             assert!(status.success());
         }
 
-        fn start_tmux(&self) {
-            start_codex_fork_handoff_tmux(
-                &self.tmux_socket,
-                &self.tmux_session,
-                &self.event_stream_path,
-            );
-        }
-
         fn start_delayed_clear_tmux(&self) {
             start_codex_fork_delayed_clear_tmux(
                 &self.tmux_socket,
                 &self.tmux_session,
                 &self.event_stream_path,
             );
-        }
-
-        /// The failure path is one monitor poll (250ms) plus a
-        /// `tmux has-session` before the error is written. A fixed 3s deadline
-        /// flaked under full-suite load (#1337), as the success wait did at 8s
-        /// (#1401); the deadline only bounds a genuine failure, so be generous.
-        fn wait_for_handoff_error(&self, store: &SessionStore) {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                let state = store.load_raw_json_value().unwrap();
-                let session = raw_session_object(&state, "codex001").unwrap();
-                if json_text(session.get("error_message"))
-                    .is_some_and(|message| message.starts_with("codex_fork_handoff_failed:"))
-                {
-                    return;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "handoff failure was not recorded; state={}",
-                    fs::read_to_string(&self.state_file).unwrap_or_default()
-                );
-                thread::sleep(Duration::from_millis(50));
-            }
         }
     }
 

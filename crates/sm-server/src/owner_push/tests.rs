@@ -18,6 +18,32 @@ fn at(value: &str) -> OffsetDateTime {
 
 const OWNER: &str = "owner@example.com";
 
+#[test]
+fn handoff_moves_pending_session_follows_only() {
+    let (store, _dir) = temp_store();
+    let now = at("2026-09-29T00:00:00Z");
+    store
+        .create_follow(OWNER, &session_target("pred"), None, now)
+        .unwrap();
+    store
+        .create_follow(OWNER, &job_target("job1"), None, now)
+        .unwrap();
+    for _ in 0..2 {
+        store.hand_off_follows("pred", "succ", "succ-name").unwrap();
+    }
+    let conn = store.open().unwrap();
+    let mut statement = conn
+        .prepare("SELECT target_kind || ':' || session_id || ':' || session_name FROM owner_follows ORDER BY target_kind")
+        .unwrap();
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows[1], "session:succ:succ-name");
+    assert!(!rows[0].contains("succ"), "{rows:?}");
+}
+
 fn session_target(id: &str) -> FollowTarget {
     FollowTarget::Session {
         session_id: id.to_owned(),

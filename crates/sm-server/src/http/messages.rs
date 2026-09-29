@@ -28,12 +28,29 @@ pub(super) fn session_ended(session: &SessionRecord) -> bool {
 }
 
 /// Who a reply to `session_id` reaches: the session while it exists and has
-/// not ended (a stopped one gets it on restore), else its parent when that
-/// has not ended, else nobody. Owner review wakes use the same rule.
+/// not ended (a stopped one gets it on restore), else the first successor in
+/// its handoff chain that has not ended, else its parent when that has not
+/// ended, else nobody. Owner review wakes use the same rule.
 pub(super) fn live_recipient(state: &AppState, session_id: &str) -> Option<SessionRecord> {
     let session = state.session_store.get_session(session_id).ok().flatten()?;
     if !session_ended(&session) {
         return Some(session);
+    }
+    // A session that handed off forwards along its successor chain
+    // (sm#1651). A successor that stopped but was not retired keeps the
+    // reply for its restore.
+    let mut next = session.successor_session_id.clone();
+    for _ in 0..crate::handoff::execute::MAX_FORWARD_HOPS {
+        let Some(successor) = next
+            .as_deref()
+            .and_then(|id| state.session_store.get_session(id).ok().flatten())
+        else {
+            break;
+        };
+        if !session_ended(&successor) {
+            return Some(successor);
+        }
+        next = successor.successor_session_id.clone();
     }
     let parent = session.parent_session_id.as_deref()?;
     state

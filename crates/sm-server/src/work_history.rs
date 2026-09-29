@@ -1350,6 +1350,10 @@ impl HistoryData {
                     other => format!("claim on {subject} ended: {other}"),
                 }
             }
+            "claim.handed_off" => {
+                let to = payload["successor_session_id"].as_str().unwrap_or_default();
+                format!("handed {subject} off to {} ({to})", name_of(to))
+            }
             "claim.refused" => format!(
                 "was refused {subject}: held by {}",
                 names("holder_session_ids")

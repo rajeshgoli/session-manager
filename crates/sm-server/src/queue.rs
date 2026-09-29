@@ -2423,6 +2423,253 @@ impl RetainedQueueStore {
         })
     }
 
+    /// Context handoff (sm#1651, Appendix G): re-point every wake this
+    /// database addresses to the predecessor onto the successor. Undelivered
+    /// context alerts and handoff asks are dropped: they describe the old
+    /// context. Messages waiting for the predecessor move later, with
+    /// [`Self::hand_off_messages`], so the brief goes first. Every statement
+    /// is `WHERE <column> = predecessor`, so a rerun after a crash is harmless.
+    pub fn hand_off_rows(&self, predecessor_id: &str, successor_id: &str) -> Result<()> {
+        self.with_connection(|conn| {
+            with_immediate_transaction(conn, |conn| {
+                let ids = params![predecessor_id, successor_id];
+                conn.execute(
+                    "DELETE FROM message_queue WHERE target_session_id = ?1
+                       AND delivered_at IS NULL
+                       AND message_category IN ('context_handoff', 'context_monitor')",
+                    params![predecessor_id],
+                )?;
+                for statement in [
+                    "UPDATE message_queue SET remind_cancel_on_reply_session_id = ?2
+                      WHERE remind_cancel_on_reply_session_id = ?1 AND delivered_at IS NULL",
+                    "UPDATE message_queue SET parent_session_id = ?2
+                      WHERE parent_session_id = ?1 AND delivered_at IS NULL",
+                    "UPDATE codex_review_request_registrations SET notify_session_id = ?2
+                      WHERE notify_session_id = ?1 AND is_active = 1",
+                    "UPDATE codex_review_request_registrations SET requester_session_id = ?2
+                      WHERE requester_session_id = ?1 AND is_active = 1",
+                    "UPDATE scheduled_reminders SET target_session_id = ?2
+                      WHERE target_session_id = ?1 AND is_active = 1",
+                    "UPDATE OR IGNORE remind_registrations SET target_session_id = ?2
+                      WHERE target_session_id = ?1 AND is_active = 1",
+                    "UPDATE remind_registrations SET cancel_on_reply_session_id = ?2
+                      WHERE cancel_on_reply_session_id = ?1 AND is_active = 1",
+                    "UPDATE OR IGNORE rust_stop_notify_states SET session_id = ?2
+                      WHERE session_id = ?1",
+                    "UPDATE rust_stop_notify_states SET sender_session_id = ?2
+                      WHERE sender_session_id = ?1",
+                    "UPDATE parent_wake_registrations SET parent_session_id = ?2
+                      WHERE parent_session_id = ?1 AND is_active = 1",
+                    "UPDATE OR IGNORE parent_wake_registrations SET child_session_id = ?2
+                      WHERE child_session_id = ?1 AND is_active = 1",
+                ] {
+                    conn.execute(statement, ids)?;
+                }
+                // The successor already had a watcher; the predecessor's
+                // would otherwise fire when it retires.
+                conn.execute(
+                    "DELETE FROM rust_stop_notify_states WHERE session_id = ?1",
+                    params![predecessor_id],
+                )?;
+                Ok(())
+            })
+        })
+    }
+
+    /// Messages still waiting for the predecessor go to the successor, minus
+    /// its old context alerts and asks. Run after the brief is queued and
+    /// again after the predecessor retires, so a message sent mid-handoff is
+    /// never stranded. Returns how many moved.
+    pub fn hand_off_messages(&self, predecessor_id: &str, successor_id: &str) -> Result<usize> {
+        self.with_connection(|conn| {
+            with_immediate_transaction(conn, |conn| {
+                conn.execute(
+                    "DELETE FROM message_queue WHERE target_session_id = ?1
+                       AND delivered_at IS NULL
+                       AND message_category IN ('context_handoff', 'context_monitor')",
+                    params![predecessor_id],
+                )?;
+                Ok(conn.execute(
+                    "UPDATE message_queue SET target_session_id = ?2
+                      WHERE target_session_id = ?1 AND delivered_at IS NULL",
+                    params![predecessor_id, successor_id],
+                )?)
+            })
+        })
+    }
+
+    /// Sessions with undelivered messages: the sweep's candidates for
+    /// messages that reached a predecessor after its handoff.
+    pub fn undelivered_targets(&self) -> Result<BTreeSet<String>> {
+        self.with_connection(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT DISTINCT target_session_id FROM message_queue WHERE delivered_at IS NULL",
+            )?;
+            let targets = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+            Ok(targets)
+        })
+    }
+
+    /// Queue a handoff notice under a stable `id`, once: false when a row
+    /// with that id already exists. Its `queued_at` sorts ahead of every
+    /// undelivered message for `ahead_of`, so the successor reads its brief
+    /// before anything it inherited.
+    pub fn enqueue_handoff_notice(
+        &self,
+        id: &str,
+        target_session_id: &str,
+        text: &str,
+        delivery_mode: &str,
+        metadata: QueueMessageMetadata,
+        ahead_of: &[&str],
+    ) -> Result<bool> {
+        self.with_connection(|conn| {
+            with_immediate_transaction(conn, |conn| {
+                let exists = conn
+                    .query_row(
+                        "SELECT 1 FROM message_queue WHERE id = ?1",
+                        params![id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if exists {
+                    return Ok(false);
+                }
+                enqueue_message_with_id_and_metadata_conn(
+                    conn,
+                    id,
+                    target_session_id,
+                    text,
+                    delivery_mode,
+                    metadata,
+                )?;
+                let mut earliest: Option<OffsetDateTime> = None;
+                for target in ahead_of {
+                    let queued: Option<String> = conn.query_row(
+                        "SELECT MIN(queued_at) FROM message_queue
+                          WHERE target_session_id = ?1 AND delivered_at IS NULL AND id != ?2",
+                        params![target, id],
+                        |row| row.get(0),
+                    )?;
+                    if let Some(at) =
+                        queued.and_then(|at| OffsetDateTime::parse(&at, &Rfc3339).ok())
+                    {
+                        earliest = Some(earliest.map_or(at, |current| current.min(at)));
+                    }
+                }
+                if let Some(earliest) = earliest {
+                    let ahead = (earliest - Duration::milliseconds(1)).format(&Rfc3339)?;
+                    conn.execute(
+                        "UPDATE message_queue SET queued_at = ?2 WHERE id = ?1 AND queued_at > ?2",
+                        params![id, ahead],
+                    )?;
+                }
+                Ok(true)
+            })
+        })
+    }
+
+    /// The Codex review wakes and reminders `session_id` holds, one line each
+    /// for a successor's brief (Appendix F.4).
+    pub fn handoff_pending_items(&self, session_id: &str) -> Result<Vec<String>> {
+        self.with_connection(|conn| {
+            let mut items = Vec::new();
+            let mut reviews = conn.prepare(
+                "SELECT pr_number, requested_at FROM codex_review_request_registrations
+                  WHERE notify_session_id = ?1 AND is_active = 1 ORDER BY requested_at, id",
+            )?;
+            for row in reviews.query_map(params![session_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (pr_number, requested_at) = row?;
+                items.push(format!(
+                    "Codex review of PR #{pr_number}, requested {}",
+                    handoff_local_time(&requested_at)
+                ));
+            }
+            let mut reminders = conn.prepare(
+                "SELECT message, fire_at FROM scheduled_reminders
+                  WHERE target_session_id = ?1 AND is_active = 1 AND fired = 0
+                  ORDER BY fire_at, id",
+            )?;
+            for row in reminders.query_map(params![session_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })? {
+                let (message, fire_at) = row?;
+                let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+                let message = match message.char_indices().nth(80) {
+                    Some((end, _)) => format!("{}…", &message[..end]),
+                    None => message,
+                };
+                items.push(format!(
+                    "Reminder at {}: {message}",
+                    handoff_local_time(&fire_at)
+                ));
+            }
+            Ok(items)
+        })
+    }
+
+    /// Queue jobs live in the queue runner's own database. Same contract as
+    /// [`Self::hand_off_rows`]: unfinished jobs, or finished ones whose
+    /// completion wake is still owed, notify the successor.
+    pub fn hand_off_queue_jobs(
+        state_dir: &Path,
+        predecessor_id: &str,
+        successor_id: &str,
+    ) -> Result<()> {
+        let db_path = state_dir.join("queue_runner.db");
+        if !db_path.exists() {
+            return Ok(());
+        }
+        let conn = open_queue_jobs_connection(&db_path)?;
+        init_queue_jobs_schema(&conn)?;
+        with_immediate_transaction(&conn, |conn| {
+            for column in ["notify_session_id", "requester_session_id"] {
+                conn.execute(
+                    &format!(
+                        "UPDATE queue_jobs SET {column} = ?2 WHERE {column} = ?1
+                           AND (finished_at IS NULL
+                                OR (completion_notification_required = 1
+                                    AND completion_notified_at IS NULL))"
+                    ),
+                    params![predecessor_id, successor_id],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// The queue jobs whose completion wakes `session_id`, for its brief.
+    pub fn handoff_queue_job_items(state_dir: &Path, session_id: &str) -> Result<Vec<String>> {
+        let db_path = state_dir.join("queue_runner.db");
+        if !db_path.exists() {
+            return Ok(Vec::new());
+        }
+        let conn = open_queue_jobs_connection(&db_path)?;
+        init_queue_jobs_schema(&conn)?;
+        let mut statement = conn.prepare(
+            "SELECT id, label, state FROM queue_jobs WHERE notify_session_id = ?1
+               AND (finished_at IS NULL
+                    OR (completion_notification_required = 1 AND completion_notified_at IS NULL))
+             ORDER BY queued_at, id",
+        )?;
+        let items = statement
+            .query_map(params![session_id], |row| {
+                Ok(format!(
+                    "Queue job {} ({}), {}",
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(2)?
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(items)
+    }
+
     fn with_connection<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         if let Some(parent) = self.db_path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
@@ -2720,6 +2967,16 @@ fn parent_routing_message_state_conn(
     )
     .optional()
     .map_err(Into::into)
+}
+
+/// `HH:MM` local time of an RFC3339 or SQLite timestamp, else the raw text.
+fn handoff_local_time(timestamp: &str) -> String {
+    let trimmed = timestamp.trim();
+    OffsetDateTime::parse(trimmed, &Rfc3339)
+        .ok()
+        .and_then(local_now_naive)
+        .map(|local| format!("{:02}:{:02}", local.hour(), local.minute()))
+        .unwrap_or_else(|| trimmed.to_owned())
 }
 
 fn with_immediate_transaction<T>(
@@ -7360,6 +7617,58 @@ mod tests {
     use time::Duration;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn handoff_moves_queue_job_wakes_still_owed() {
+        let dir = env::temp_dir().join(format!(
+            "sm-queue-handoff-{}-{}",
+            std::process::id(),
+            TEST_COUNTER.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = open_queue_jobs_connection(&dir.join("queue_runner.db")).unwrap();
+        init_queue_jobs_schema(&conn).unwrap();
+        for (id, finished_at, required, notified_at) in [
+            ("running", None, 0, None),
+            ("owed", Some("x"), 1, None),
+            ("notified", Some("x"), 1, Some("x")),
+        ] {
+            conn.execute(
+                "INSERT INTO queue_jobs (id, type, label, requester_session_id,
+                   notify_session_id, cwd, env_json, timeout_seconds, state, queued_at,
+                   finished_at, completion_notification_required, completion_notified_at)
+                 VALUES (?1, 'tests', ?1, 'pred', 'pred', '/', '{}', 60, 'running',
+                   '2026-09-29T00:00:00Z', ?2, ?3, ?4)",
+                params![id, finished_at, required, notified_at],
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            RetainedQueueStore::hand_off_queue_jobs(&dir, "pred", "succ").unwrap();
+        }
+        let mut statement = conn
+            .prepare(
+                "SELECT id || ':' || notify_session_id || ':' || requester_session_id
+                   FROM queue_jobs ORDER BY id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            ["notified:pred:pred", "owed:succ:succ", "running:succ:succ"]
+        );
+        assert_eq!(
+            RetainedQueueStore::handoff_queue_job_items(&dir, "succ").unwrap(),
+            [
+                "Queue job owed (owed), running",
+                "Queue job running (running), running"
+            ]
+        );
+    }
 
     #[test]
     fn macos_memory_pressure_reports_reclaimable_capacity() {

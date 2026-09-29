@@ -722,6 +722,41 @@ impl OwnerDocStore {
         })
     }
 
+    /// Context handoff (sm#1651, Appendix G): a doc with an open review
+    /// request wakes the successor when the review lands, as does a review
+    /// assigned to the predecessor. Other docs keep their author; forwarding
+    /// reaches the successor. Safe to repeat.
+    pub fn hand_off(
+        &self,
+        predecessor_id: &str,
+        successor_id: &str,
+        successor_name: &str,
+    ) -> Result<()> {
+        if !self.db_path.exists() {
+            return Ok(());
+        }
+        let conn = self.open_write()?;
+        conn.execute(
+            "UPDATE owner_docs SET author_session_id = ?2, author_session_name = ?3
+              WHERE author_session_id = ?1 AND retracted_at IS NULL AND EXISTS (
+                SELECT 1 FROM owner_doc_publishes p
+                 WHERE p.id = (SELECT MAX(id) FROM owner_doc_publishes
+                                WHERE doc_id = owner_docs.id)
+                   AND p.review_requested = 1 AND p.review_dismissed_at IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1 FROM owner_doc_reviews r
+                      WHERE r.doc_id = owner_docs.id AND r.status = 'posted'
+                        AND r.submitted_at > p.published_at))",
+            params![predecessor_id, successor_id, successor_name],
+        )?;
+        conn.execute(
+            "UPDATE owner_doc_reviews SET assigned_session_id = ?2
+              WHERE assigned_session_id = ?1",
+            params![predecessor_id, successor_id],
+        )?;
+        Ok(())
+    }
+
     /// No review needed: clears the latest publish's open review request.
     /// Returns whether a request was cleared.
     pub fn dismiss_review(&self, doc_id: &str) -> Result<bool> {
