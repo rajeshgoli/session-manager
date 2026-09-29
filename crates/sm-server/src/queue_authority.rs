@@ -309,6 +309,7 @@ mod tests {
                 cpu_percent: None,
                 gpu_percent: None,
                 memory_bytes: None,
+                rank_tickets: None,
             },
         )
         .unwrap();

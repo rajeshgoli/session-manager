@@ -19,7 +19,8 @@ import li.rajeshgo.sm.R
  */
 object NoticePush {
     const val CHANNEL_ID = "agent_messages"
-    val KINDS = setOf("message", "review_requested")
+    /** Board alerts (sm#1665) share the slot of session "board"; a newer one replaces the older. */
+    val KINDS = setOf("message", "review_requested", "board_ready", "board_lane_done")
     /** sm no longer needs the owner to see a shown notice (sm#1643). */
     const val KIND_WITHDRAW = "withdraw"
     /** The notice a notification shows, so a withdrawal removes only that one. */

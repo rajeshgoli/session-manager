@@ -579,6 +579,11 @@ impl NoticeWorld for AppNoticeWorld<'_> {
                         .summary(&doc.id)?
                         .is_some_and(|summary| summary.state == OwnerDocState::ReviewRequested))
             }
+            crate::board::NOTICE_BOARD_READY => {
+                super::board::board_store(self.state).ready_notice_wanted(&notice.subject_id)
+            }
+            // The lane has ended already: only opening the board clears it.
+            crate::board::NOTICE_BOARD_LANE_DONE => Ok(true),
             _ => Ok(false),
         }
     }
@@ -602,6 +607,14 @@ impl NoticeWorld for AppNoticeWorld<'_> {
                     .and_then(owner_push::parse_ts)
                     .zip(owner_push::parse_ts(&notice.created_at))
                     .is_some_and(|(viewed_at, created_at)| viewed_at >= created_at))
+            }
+            crate::board::NOTICE_BOARD_READY | crate::board::NOTICE_BOARD_LANE_DONE => {
+                let seen = super::board::board_store(self.state).seen(&notice.user_id)?;
+                Ok(crate::board::pushes::notice_opened(
+                    &notice.subject_id,
+                    &notice.created_at,
+                    seen.as_ref(),
+                ))
             }
             _ => Ok(false),
         }

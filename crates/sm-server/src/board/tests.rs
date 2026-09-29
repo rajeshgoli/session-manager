@@ -1468,3 +1468,311 @@ fn rate_limited_read_leaves_repo_stale() {
         .values()
         .all(|facts| facts.state != TicketState::Ready));
 }
+
+// ---------------------------------------------------------------------------
+// I: alerts (ticket #1682).
+
+fn push_store(dir: &std::path::Path) -> crate::owner_push::OwnerPushStore {
+    crate::owner_push::OwnerPushStore::new(dir.join("owner_push.db"))
+}
+
+/// A read pass, then its alerts as owner notices.
+fn pass_alerts(
+    store: &BoardStore,
+    github: &FakeGitHub,
+    push: &crate::owner_push::OwnerPushStore,
+) -> Vec<pushes::Alert> {
+    let recomputed = run_pass(store, github, &outside(), now()).unwrap();
+    pushes::send(store, push, "owner", &recomputed, now()).unwrap()
+}
+
+fn board_notices(push: &crate::owner_push::OwnerPushStore) -> Vec<crate::owner_push::Notice> {
+    push.list_notices("owner", now()).unwrap()
+}
+
+fn claim_ticket(store: &BoardStore, number: i64, session: &str, name: &str) {
+    store
+        .open_write()
+        .unwrap()
+        .execute(
+            "INSERT INTO work_claims (id, repo, number, kind, session_id, session_name, source,
+                                      claimed_at)
+             VALUES (?1, ?2, ?3, 'ticket', ?4, ?5, 'explicit', '2026-09-29T10:00:00Z')",
+            params![format!("c{number}"), REPO, number, session, name],
+        )
+        .unwrap();
+}
+
+fn set_pr(github: &FakeGitHub, number: i64, state: &str) {
+    github.with(&k(number), |issue| {
+        issue.prs = vec![PrRef {
+            repo: REPO.into(),
+            number: 1700,
+            state: state.into(),
+            url: String::new(),
+        }];
+    });
+}
+
+#[test]
+fn ready_notice_once_per_lane_pass() {
+    let (store, dir) = temp_store();
+    let push = push_store(&dir);
+    let github = FakeGitHub::new();
+    handoff(&github);
+    claim_ticket(&store, 1653, "eng1", "sm-1653-engineer");
+    let lane = add_lane(&store, &github, &k(1651));
+    github.close(&k(1653), "COMPLETED");
+    let alerts = pass_alerts(&store, &github, &push);
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0].title, "Ready in lane 1, Ticket 1651");
+    assert_eq!(
+        alerts[0].body,
+        "#1654, #1656, #1657 can start — #1653 closed"
+    );
+    let notices = board_notices(&push);
+    assert_eq!(notices.len(), 1);
+    let notice = &notices[0];
+    assert_eq!(notice.kind, NOTICE_BOARD_READY);
+    assert_eq!(notice.session_id, "board");
+    assert_eq!(notice.session_name, "sm board");
+    assert_eq!(notice.reader_path, format!("/board#lane-{lane}"));
+    assert!(!notice.blocking);
+    let (subject_lane, event_id) = pushes::subject_event(&notice.subject_id).unwrap();
+    assert_eq!(subject_lane, lane);
+    let event = store
+        .events(50)
+        .unwrap()
+        .into_iter()
+        .find(|event| event.id == event_id)
+        .unwrap();
+    assert_eq!(event.kind, "push_sent");
+    // Nothing new: no second notice.
+    assert!(pass_alerts(&store, &github, &push).is_empty());
+    assert_eq!(board_notices(&push).len(), 1);
+}
+
+#[test]
+fn ready_notice_lists_four_then_more() {
+    let (store, dir) = temp_store();
+    let push = push_store(&dir);
+    let github = FakeGitHub::new();
+    handoff(&github);
+    for number in [1658, 1659] {
+        github.open(k(number));
+        github.after(&k(number), &k(1653));
+        github.under(&k(number), &k(1651));
+    }
+    claim_ticket(&store, 1653, "eng1", "sm-1653-engineer");
+    add_lane(&store, &github, &k(1651));
+    github.close(&k(1653), "COMPLETED");
+    let alerts = pass_alerts(&store, &github, &push);
+    assert_eq!(
+        alerts[0].body,
+        "#1654, #1656, #1657, #1658, +1 more can start — #1653 closed"
+    );
+}
+
+#[test]
+fn ready_notice_after_holder_lets_go() {
+    let (store, dir) = temp_store();
+    let push = push_store(&dir);
+    let github = FakeGitHub::new();
+    handoff(&github);
+    claim_ticket(&store, 1653, "eng1", "sm-1653-engineer");
+    add_lane(&store, &github, &k(1651));
+    store
+        .open_write()
+        .unwrap()
+        .execute(
+            "UPDATE work_claims SET ended_at = '2026-09-29T11:30:00Z' WHERE id = 'c1653'",
+            [],
+        )
+        .unwrap();
+    let alerts = pass_alerts(&store, &github, &push);
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(
+        alerts[0].body,
+        "#1653 can start — sm-1653-engineer let go of it"
+    );
+}
+
+#[test]
+fn ready_notice_after_pr_closed_unmerged() {
+    let (store, dir) = temp_store();
+    let push = push_store(&dir);
+    let github = FakeGitHub::new();
+    handoff(&github);
+    set_pr(&github, 1653, "OPEN");
+    add_lane(&store, &github, &k(1651));
+    set_pr(&github, 1653, "CLOSED");
+    let alerts = pass_alerts(&store, &github, &push);
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0].body, "#1653 can start — PR #1700 closed");
+}
+
+#[test]
+fn no_ready_notice_for_merged_not_closed() {
+    let (store, dir) = temp_store();
+    let push = push_store(&dir);
+    let github = FakeGitHub::new();
+    handoff(&github);
+    set_pr(&github, 1653, "OPEN");
+    add_lane(&store, &github, &k(1651));
+    set_pr(&github, 1653, "MERGED");
+    let recomputed = run_pass(&store, &github, &outside(), now()).unwrap();
+    assert_eq!(state(&recomputed.board, &k(1653)), TicketState::Ready);
+    assert!(pushes::send(&store, &push, "owner", &recomputed, now())
+        .unwrap()
+        .is_empty());
+    assert!(board_notices(&push).is_empty());
+}
+
+#[test]
+fn ready_notice_after_reopen() {
+    let (store, dir) = temp_store();
+    let push = push_store(&dir);
+    let github = FakeGitHub::new();
+    handoff(&github);
+    github.close(&k(1653), "COMPLETED");
+    github.close(&k(1654), "COMPLETED");
+    add_lane(&store, &github, &k(1651));
+    github.with(&k(1654), |issue| {
+        issue.open = true;
+        issue.state_reason = Some("REOPENED".into());
+    });
+    let alerts = pass_alerts(&store, &github, &push);
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0].body, "#1654 can start — #1654 reopened");
+}
+
+#[test]
+fn no_notice_for_new_member_or_new_lane() {
+    let (store, dir) = temp_store();
+    let push = push_store(&dir);
+    let github = FakeGitHub::new();
+    handoff(&github);
+    github.close(&k(1653), "COMPLETED");
+    // The lane's first recompute: three tickets are Ready, and no alert.
+    check_goal(&store, &github, &k(1651), now())
+        .unwrap()
+        .unwrap();
+    store
+        .add_lane(&k(1651), "owner", "Owner", now())
+        .unwrap()
+        .unwrap();
+    assert!(pass_alerts(&store, &github, &push).is_empty());
+    // A ticket that joins Ready: no alert either.
+    github.open(k(1660));
+    github.under(&k(1660), &k(1651));
+    let alerts = pass_alerts(&store, &github, &push);
+    assert!(alerts.is_empty(), "{alerts:?}");
+    assert!(board_notices(&push).is_empty());
+}
+
+#[test]
+fn no_notice_when_repo_stale() {
+    let (store, dir) = temp_store();
+    let push = push_store(&dir);
+    let github = FakeGitHub::new();
+    handoff(&github);
+    claim_ticket(&store, 1653, "eng1", "sm-1653-engineer");
+    add_lane(&store, &github, &k(1651));
+    // The claim ends while the repo's reads fail: nothing is Ready.
+    store
+        .open_write()
+        .unwrap()
+        .execute(
+            "UPDATE work_claims SET ended_at = '2026-09-29T11:30:00Z'",
+            [],
+        )
+        .unwrap();
+    github.down.lock().unwrap().insert(REPO.to_owned());
+    assert!(pass_alerts(&store, &github, &push).is_empty());
+    // Reads recover: the alert comes then.
+    github.down.lock().unwrap().clear();
+    assert_eq!(pass_alerts(&store, &github, &push).len(), 1);
+}
+
+#[test]
+fn lane_done_notice() {
+    let (store, dir) = temp_store();
+    let push = push_store(&dir);
+    let github = FakeGitHub::new();
+    handoff(&github);
+    // A second lane below: #1671 starts after #1672, under goal #1670.
+    for number in [1670, 1671, 1672] {
+        github.open(k(number));
+    }
+    github.after(&k(1671), &k(1672));
+    github.under(&k(1671), &k(1670));
+    github.under(&k(1672), &k(1670));
+    claim_ticket(&store, 1672, "eng1", "sm-1653-engineer");
+    let first = add_lane(&store, &github, &k(1651));
+    add_lane(&store, &github, &k(1670));
+    github.close(&k(1651), "COMPLETED");
+    github.close(&k(1672), "COMPLETED");
+    let alerts = pass_alerts(&store, &github, &push);
+    let titles: Vec<&str> = alerts.iter().map(|alert| alert.title.as_str()).collect();
+    // The lane below is now lane 1.
+    assert_eq!(
+        titles,
+        ["Ready in lane 1, Ticket 1670", "Lane done: Ticket 1651"]
+    );
+    let done = &alerts[1];
+    assert_eq!(done.kind, NOTICE_BOARD_LANE_DONE);
+    assert_eq!(done.lane_id, first);
+    assert_eq!(done.body, "widgets#1651 closed · lanes below move up");
+    assert_eq!(done.reader_path, "/board");
+    assert_eq!(board_notices(&push).len(), 2);
+    // An owner End sends nothing.
+    let lanes = store.active_lanes().unwrap();
+    store.end_lane(lanes[0].id, now()).unwrap();
+    let recomputed = store.recompute(&outside(), now()).unwrap();
+    assert!(pushes::send(&store, &push, "owner", &recomputed, now())
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn still_wanted_false_once_started() {
+    let (store, dir) = temp_store();
+    let push = push_store(&dir);
+    let github = FakeGitHub::new();
+    handoff(&github);
+    claim_ticket(&store, 1653, "eng1", "sm-1653-engineer");
+    add_lane(&store, &github, &k(1651));
+    github.close(&k(1653), "COMPLETED");
+    pass_alerts(&store, &github, &push);
+    let subject = board_notices(&push)[0].subject_id.clone();
+    assert!(store.ready_notice_wanted(&subject).unwrap());
+    // Agents take two of the three: one is still Ready.
+    claim_ticket(&store, 1654, "eng1", "sm-1653-engineer");
+    claim_ticket(&store, 1656, "eng1", "sm-1653-engineer");
+    run_pass(&store, &github, &outside(), now()).unwrap();
+    assert!(store.ready_notice_wanted(&subject).unwrap());
+    claim_ticket(&store, 1657, "eng1", "sm-1653-engineer");
+    run_pass(&store, &github, &outside(), now()).unwrap();
+    assert!(!store.ready_notice_wanted(&subject).unwrap());
+}
+
+#[test]
+fn board_notice_opened_by_seen_event() {
+    let seen = ("2026-09-29T12:00:00Z".to_owned(), 40);
+    // Ordered by event id, even within one second.
+    assert!(pushes::notice_opened(
+        "board:7:40",
+        "2026-09-29T12:00:00Z",
+        Some(&seen)
+    ));
+    assert!(!pushes::notice_opened(
+        "board:7:41",
+        "2026-09-29T12:00:00Z",
+        Some(&seen)
+    ));
+    assert!(!pushes::notice_opened(
+        "board:7:1",
+        "2026-09-29T11:00:00Z",
+        None
+    ));
+}

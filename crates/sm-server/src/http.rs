@@ -6999,7 +6999,9 @@ async fn client_queue(
     }
 
     let mut queued_json = Vec::new();
-    for (index, id) in crate::queue::pending_queue_job_consideration_order(&active)
+    let ticket_ranks =
+        crate::queue::queue_ticket_ranks(&expand_home(&state.config.sm_send.db_path));
+    for (index, id) in crate::queue::pending_queue_job_consideration_order(&active, &ticket_ranks)
         .iter()
         .enumerate()
     {
@@ -7355,6 +7357,8 @@ async fn create_queue_job(
             })
         })
         .unwrap_or_else(|| "script".to_owned());
+    let requester_session_id = trimmed(&payload.requester_session_id);
+    let rank_tickets = queue_job_rank_tickets(&state, requester_session_id.as_deref(), &cwd_path)?;
     let queue_state_dir_config = state.config.queue_runner_state_dir();
     let queue_state_dir = expand_home(&queue_state_dir_config.to_string_lossy());
     let job = RetainedQueueStore::create_queue_job_in_state_dir_with_max_wait(
@@ -7362,7 +7366,7 @@ async fn create_queue_job(
         CreateQueueJob {
             job_type: job_type.to_owned(),
             label,
-            requester_session_id: trimmed(&payload.requester_session_id),
+            requester_session_id,
             notify_session_id: notify_session.id,
             cwd: cwd_path.display().to_string(),
             argv,
@@ -7372,6 +7376,7 @@ async fn create_queue_job(
             cpu_percent: payload.cpu_percent,
             gpu_percent: (job_type == "perf").then_some(payload.gpu_percent.unwrap_or(0)),
             memory_bytes: payload.memory_bytes,
+            rank_tickets,
         },
         max_wait_seconds,
     )?;
@@ -7392,6 +7397,42 @@ async fn create_queue_job(
         job
     };
     Ok(Json(queue_job_response(&state, job)?))
+}
+
+/// Appendix H1: the tickets the job's claimant holds now, which place the
+/// job in a board lane for as long as it waits.
+fn queue_job_rank_tickets(
+    state: &AppState,
+    requester_session_id: Option<&str>,
+    cwd: &std::path::Path,
+) -> Result<Option<Vec<(String, i64)>>, ApiError> {
+    let store = claims::work_claim_store(state);
+    let active: Vec<crate::work_claims::WorkClaim> = store
+        .active_claims()?
+        .into_iter()
+        .map(|view| view.claim)
+        .collect();
+    let parent_of = |session_id: &str| {
+        state
+            .session_store
+            .get_session(session_id)
+            .ok()
+            .flatten()
+            .and_then(|session| session.parent_session_id)
+    };
+    let pr_tickets = |repo: &str, pr: i64| {
+        store
+            .links_for_pr(repo, pr)
+            .map(|links| links.into_iter().map(|(ticket, _)| ticket).collect())
+            .unwrap_or_default()
+    };
+    Ok(crate::queue::queue_rank_tickets(
+        requester_session_id,
+        cwd,
+        &active,
+        &parent_of,
+        &pr_tickets,
+    ))
 }
 
 async fn cancel_queue_job(
@@ -15730,6 +15771,26 @@ fn codex_review_request_response(
     }))
 }
 
+/// Appendix H3: the board lane the job counts toward now, if any.
+fn queue_job_lane(
+    state: &AppState,
+    job: &QueueJobRecord,
+) -> Result<Option<crate::board::TicketRank>, ApiError> {
+    let Some(tickets) = job
+        .rank_tickets
+        .as_deref()
+        .filter(|tickets| !tickets.is_empty())
+    else {
+        return Ok(None);
+    };
+    let ranks = board::board_store(state).ticket_ranks()?;
+    Ok(tickets
+        .iter()
+        .filter_map(|ticket| ranks.get(ticket))
+        .min_by_key(|rank| rank.rank)
+        .cloned())
+}
+
 fn queue_job_response(state: &AppState, job: QueueJobRecord) -> Result<Value, ApiError> {
     let active = if job.state == "pending" {
         RetainedQueueStore::list_queue_jobs_from_path(
@@ -15775,6 +15836,7 @@ fn queue_job_response_with_names(
 ) -> Result<Value, ApiError> {
     let termination_reason =
         crate::queue::queue_job_termination_reason(&job.state, job.termination_detail.as_ref());
+    let lane = queue_job_lane(state, &job)?;
     let exit_evidence = if job.exit_code.is_some() {
         "recorded"
     } else if matches!(
@@ -15812,6 +15874,12 @@ fn queue_job_response_with_names(
         "holding": crate::queue::queue_hold_explanation(&job, active, queue_admission_policy(&state.config)),
         "holding_reason": job.holding_reason,
         "owner_forced_at": job.owner_forced_at,
+        "lane_rank": lane.as_ref().map(|lane| lane.rank),
+        "lane_goal": lane.as_ref().map(|lane| json!({
+            "repo": lane.goal.0,
+            "number": lane.goal.1,
+            "title": lane.goal_title,
+        })),
         "queued_at": job.queued_at,
         "started_at": job.started_at,
         "finished_at": job.finished_at,
@@ -16061,6 +16129,7 @@ mod tests {
             process_limit: None,
             peak_process_count: None,
             owner_forced_at: None,
+            rank_tickets: None,
         };
         let mut completed = review.clone();
         completed.id = "r2".into();
@@ -20995,6 +21064,7 @@ mod tests {
                     cpu_percent: Some(100),
                     gpu_percent: Some(0),
                     memory_bytes: Some(1),
+                    rank_tickets: None,
                 },
             )
             .unwrap()
@@ -21201,6 +21271,7 @@ mod tests {
                     cpu_percent: None,
                     gpu_percent: None,
                     memory_bytes: None,
+                    rank_tickets: None,
                 },
             )
             .unwrap();
