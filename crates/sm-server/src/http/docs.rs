@@ -542,7 +542,7 @@ impl OwnerDocSource for GhCliDocSource {
     }
 }
 
-fn owner_doc_store(state: &AppState) -> OwnerDocStore {
+pub(super) fn owner_doc_store(state: &AppState) -> OwnerDocStore {
     OwnerDocStore::new(expand_home(&state.config.sm_send.db_path))
 }
 

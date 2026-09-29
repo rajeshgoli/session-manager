@@ -4,7 +4,6 @@
 //! `specs/1580_app_messages_replace_email.html`, appendices D and E.
 
 use super::*;
-use crate::owner_docs::{escape_html, render_message_page};
 use crate::owner_messages::{
     derive_message_state, derive_title, is_owner_message_id, message_reader_path,
     order_reply_comments, render_delivered_text, validate_title, CreateOwnerMessage,
@@ -82,7 +81,7 @@ fn conflict(detail: impl Into<String>) -> ApiError {
     }
 }
 
-const NO_RECIPIENT: &str = "No agent is left to reply to";
+pub(super) const NO_RECIPIENT: &str = "No agent is left to reply to";
 
 fn find_message(state: &AppState, message_id: &str) -> Result<OwnerMessage, ApiError> {
     if !is_owner_message_id(message_id) {
@@ -241,6 +240,8 @@ fn reply_json(reply: &OwnerMessageReply) -> Value {
 pub(super) struct GetOwnerMessageQuery {
     #[serde(default)]
     format: Option<String>,
+    #[serde(default)]
+    bottom: Option<String>,
 }
 
 /// `GET /messages/{id}`: the message page, or `?format=json`. Serving the
@@ -267,48 +268,15 @@ pub(super) async fn get_owner_message(
             .collect::<Vec<_>>());
         return Ok(Json(value).into_response());
     }
-    let message = store.mark_viewed(&message.id)?.unwrap_or(message);
-    let state_value = message_state(&state, &store, &message)?;
-    let mode = if recipient.is_some() { "reply" } else { "read" };
-    let config = json!({
-        "mode": mode,
-        "apiBase": format!("/messages/{}", message.id),
-        "messageId": message.id,
-        "title": message.title,
-        "token": docs::issue_doc_token(&state.config, &message.id),
-        "drafts": store.drafts(&message.id)?,
-        "replies": store.replies(&message.id)?.iter().map(reply_json).collect::<Vec<_>>(),
-        "state": state_value,
-        "blocking": message.blocking,
-        "replyTo": recipient.map(session_display_name),
-        "ownerName": state.config.owner_name,
-    });
-    let mut meta = format!(
-        "{} · {}",
-        escape_html(&message.sender_session_name),
-        relative_time(&message.created_at, OffsetDateTime::now_utc())
-    );
-    if state_value == OwnerMessageState::NeedsYou {
-        meta.push_str(" · needs you");
-    }
-    Ok((
-        StatusCode::OK,
-        [
-            (CONTENT_TYPE, "text/html; charset=utf-8".to_owned()),
-            (CACHE_CONTROL, "private, no-cache".to_owned()),
-        ],
-        Body::from(render_message_page(
-            &message.title,
-            &meta,
-            &message.body_markdown,
-            &docs::review_client_injection(&config),
-        )),
-    )
-        .into_response())
+    // The page is the sender's Inbox thread, scrolled to this message
+    // (sm#1647). Served here rather than redirected: the app's reader sends
+    // paths it does not know to the system browser.
+    let at = Some(message.id.clone()).filter(|_| query.bottom.is_none());
+    super::inbox::agent_thread_page(&state, &message.sender_session_id, at)
 }
 
 /// `2m ago`, `3h ago`, `4d ago`; `just now` under a minute.
-fn relative_time(timestamp: &str, now: OffsetDateTime) -> String {
+pub(super) fn relative_time(timestamp: &str, now: OffsetDateTime) -> String {
     let Some(then) = crate::owner_push::parse_ts(timestamp) else {
         return timestamp.to_owned();
     };
@@ -436,7 +404,7 @@ struct ReplyRequest {
     body: String,
 }
 
-fn valid_submission_id(id: &str) -> bool {
+pub(super) fn valid_submission_id(id: &str) -> bool {
     (8..=64).contains(&id.len())
         && id
             .bytes()
@@ -490,22 +458,28 @@ pub(super) async fn reply_to_owner_message(
         recipient_session_id: recipient.id.clone(),
         draft_ids: drafts.iter().map(|draft| draft.id.clone()).collect(),
     })?;
-    if inserted && state.config.rust_core.runtime_enabled {
-        let runtime = TmuxRuntime::from_app_config(&state.config);
-        if let Err(error) = state
-            .session_store
-            .drain_runtime_pending_messages_for_session(&recipient.id, &runtime)
-        {
-            eprintln!(
-                "Owner message {}: immediate reply delivery failed: {error:#}",
-                message.id
-            );
-        }
+    if inserted {
+        deliver_now(&state, &recipient.id, &message.id);
     }
     Ok(Json(reply_response(&state, &reply)))
 }
 
-fn reply_response(state: &AppState, reply: &OwnerMessageReply) -> Value {
+/// Delivers what an owner reply just queued without waiting for the next
+/// runtime pass. `what` names it in the log.
+pub(super) fn deliver_now(state: &AppState, session_id: &str, what: &str) {
+    if !state.config.rust_core.runtime_enabled {
+        return;
+    }
+    let runtime = TmuxRuntime::from_app_config(&state.config);
+    if let Err(error) = state
+        .session_store
+        .drain_runtime_pending_messages_for_session(session_id, &runtime)
+    {
+        eprintln!("Owner message {what}: immediate reply delivery failed: {error:#}");
+    }
+}
+
+pub(super) fn reply_response(state: &AppState, reply: &OwnerMessageReply) -> Value {
     let name = state
         .session_store
         .get_session(&reply.delivered_to_session_id)

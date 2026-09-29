@@ -95,6 +95,17 @@ pub struct OwnerDocSummary {
     pub review_undelivered: bool,
 }
 
+/// What the Inbox needs about a doc beyond its summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DocInboxFacts {
+    pub latest_session_id: String,
+    /// `approve`, `changes_requested` or `comment`.
+    pub latest_verdict: Option<String>,
+    pub latest_review_at: Option<String>,
+    /// Posted reviews.
+    pub review_count: usize,
+}
+
 /// A comment the owner is writing, anchored to a revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OwnerDocDraft {
@@ -1180,6 +1191,41 @@ impl OwnerDocStore {
         get_review_conn(&conn, submission_id)
     }
 
+    /// Per doc: who published the latest revision, and the verdict and time
+    /// of the latest posted review. The Inbox's doc rows.
+    pub fn inbox_facts(&self) -> Result<BTreeMap<String, DocInboxFacts>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(BTreeMap::new());
+        };
+        let mut facts = BTreeMap::<String, DocInboxFacts>::new();
+        let mut statement =
+            conn.prepare("SELECT doc_id, session_id FROM owner_doc_publishes ORDER BY id")?;
+        for row in statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (doc_id, session_id) = row?;
+            facts.entry(doc_id).or_default().latest_session_id = session_id;
+        }
+        let mut statement = conn.prepare(
+            "SELECT doc_id, verdict, COALESCE(posted_at, submitted_at) FROM owner_doc_reviews
+             WHERE status = 'posted' ORDER BY submitted_at, rowid",
+        )?;
+        for row in statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (doc_id, verdict, posted_at) = row?;
+            let entry = facts.entry(doc_id).or_default();
+            entry.latest_verdict = Some(verdict);
+            entry.latest_review_at = Some(posted_at);
+            entry.review_count += 1;
+        }
+        Ok(facts)
+    }
+
     /// The doc's review submissions, oldest first.
     pub fn reviews(&self, doc_id: &str) -> Result<Vec<OwnerDocReview>> {
         let Some(conn) = self.open_read()? else {
@@ -1714,30 +1760,6 @@ pub fn render_doc_page(path: &str, title: &str, bytes: &[u8], injection: &str) -
     }
 }
 
-/// The owner message page (sm#1580): the markdown rendered as a `.md` doc
-/// is, under a meta line (`meta_html`, already escaped), with `injection`
-/// (the reader client) before `</body>`.
-pub fn render_message_page(
-    title: &str,
-    meta_html: &str,
-    markdown: &str,
-    injection: &str,
-) -> Vec<u8> {
-    use crate::owner_doc_render::{
-        find_body_end, inject_before_body_end, render_markdown_with_lines,
-    };
-    let page = doc_shell(
-        title,
-        &format!(
-            "<p class=\"sm-meta\">{meta_html}</p>\n<article>\n{}</article>",
-            render_markdown_with_lines(markdown)
-        ),
-    )
-    .into_bytes();
-    let body_end = find_body_end(&page);
-    inject_before_body_end(page, body_end, injection)
-}
-
 fn doc_shell(title: &str, body: &str) -> String {
     format!(
         r#"<!doctype html>
@@ -1774,8 +1796,8 @@ img {{ max-width: 100%; }}
 /// The owner pages' shell (`/history`, `/t/…`, and the web watch): the sm
 /// Watch app's palette (`android-app/.../ui/theme/Color.kt`), cards with a
 /// colored left edge, sans for human text and mono for machine text, and
-/// the **Watch · History · Guestbook** top bar. `active_tab` is `"watch"`,
-/// `"history"`, `"guestbook"`, or anything else for none.
+/// the **Inbox · Watch · History · Guestbook** top bar. `active_tab` is
+/// `"inbox"`, `"watch"`, `"history"`, `"guestbook"`, or anything else for none.
 pub fn page_shell(title: &str, active_tab: &str, body: &str) -> String {
     page_shell_with_status(title, active_tab, "", body)
 }
@@ -1858,13 +1880,14 @@ h2.lbl {{ margin: 18px 0 4px; font-weight: 400; }}
 </head>
 <body>
 <div class="wrap">
-<nav class="top"><a class="brand" href="/">sm</a>{watch}{history}{guestbook}<span class="sp"></span>{status}</nav>
+<nav class="top"><a class="brand" href="/">sm</a>{inbox}{watch}{history}{guestbook}<span class="sp"></span>{status}</nav>
 {body}
 </div>
 </body>
 </html>
 "#,
         title = escape_html(title),
+        inbox = tab("inbox", "/inbox", "Inbox"),
         watch = tab("watch", "/", "Watch"),
         history = tab("history", "/history", "History"),
         guestbook = tab("guestbook", "/guestbook", "Guestbook"),
