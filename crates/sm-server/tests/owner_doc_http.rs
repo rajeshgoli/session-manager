@@ -558,3 +558,68 @@ async fn assign_refuses_delivered_or_unknown_checkout() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["detail"], "Review is already with author01-writer");
 }
+
+#[tokio::test]
+async fn doc_cat_formats_do_not_record_owner_views() {
+    let f = fixture();
+    publish(&f, "author01", "a", false, None).await;
+    publish(&f, "author01", "b", false, None).await;
+    for (format, content_type) in [
+        ("markdown", "text/markdown; charset=utf-8"),
+        ("raw", "text/plain; charset=utf-8"),
+    ] {
+        for version in ["", "&version=aaaaaaaaaaaa"] {
+            let mut req = Request::builder()
+                .uri(format!(
+                    "/docs/widgets/specs/memo.md?format={format}{version}"
+                ))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))));
+            let res = f.app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            assert_eq!(res.headers()["content-type"], content_type);
+            assert_eq!(
+                to_bytes(res.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                MEMO
+            );
+        }
+    }
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM owner_doc_views", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    let (status, _) = request(
+        &f.app,
+        "GET",
+        "/docs/widgets/specs/memo.md?format=markdown&version=dddddddddddd",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    fs::remove_dir_all(f.dir).unwrap();
+}
+
+#[tokio::test]
+async fn doc_cat_metadata_selects_unpublished_pr_head() {
+    let f = fixture();
+    publish(&f, "author01", "b", false, None).await;
+    let (status, meta) = request(
+        &f.app,
+        "GET",
+        "/docs/widgets/specs/memo.md?format=json&version=aaaaaaaaaaaa",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(meta["selected_commit_sha"], "a".repeat(40));
+    assert_eq!(meta["latest_commit_sha"], "b".repeat(40));
+    fs::remove_dir_all(f.dir).unwrap();
+}
