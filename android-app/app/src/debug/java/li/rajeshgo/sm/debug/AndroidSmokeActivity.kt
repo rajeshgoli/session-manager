@@ -10,7 +10,8 @@ import androidx.lifecycle.lifecycleScope
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -235,9 +236,9 @@ private class AndroidSmokeRunner(
         val startedAt = Instant.now()
         val payload = try {
             block()
-        } catch (error: CancellationException) {
-            throw error
         } catch (error: Throwable) {
+            // A step-local timeout is reportable; cancellation of the run is not.
+            currentCoroutineContext().ensureActive()
             val result = JSONObject()
                 .put("id", id)
                 .put("status", "blocked")
@@ -296,9 +297,8 @@ private class AndroidSmokeRunner(
         repeat(SMOKE_READ_ATTEMPTS) { attempt ->
             try {
                 return block()
-            } catch (error: CancellationException) {
-                throw error
             } catch (error: Throwable) {
+                currentCoroutineContext().ensureActive()
                 lastError = error
                 if (attempt < SMOKE_READ_ATTEMPTS - 1) {
                     delay(SMOKE_READ_RETRY_DELAY_MS)
