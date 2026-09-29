@@ -1,9 +1,11 @@
-//! Analytics endpoints (sm#1662): `GET /client/analytics/spend`. Owner
-//! reads like `/client/queue`; each parameter set's result is cached for
-//! 60 s. Data assembly lives in `crate::analytics_spend`.
+//! Analytics endpoints (sm#1662): `GET /client/analytics/spend` and
+//! `GET /client/analytics/time`. Owner reads like `/client/queue`; each
+//! parameter set's result is cached for 60 s. Data assembly lives in
+//! `crate::analytics_spend` and `crate::analytics_time`.
 
 use super::*;
 use crate::analytics_spend::{self, SpendRange, SpendSources};
+use crate::analytics_time::{self, TimeRange, TimeSources};
 
 const ANALYTICS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -11,6 +13,12 @@ const ANALYTICS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(
 pub(super) struct SpendParams {
     #[serde(default)]
     provider: Option<String>,
+    #[serde(default)]
+    range: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct TimeParams {
     #[serde(default)]
     range: Option<String>,
 }
@@ -81,11 +89,70 @@ pub(super) async fn client_analytics_spend(
     })
     .await
     .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
+    store(&state, cache_key, &body);
+    Ok(Json(body))
+}
+
+pub(super) async fn client_analytics_time(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<TimeParams>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_client_read(&state, &request)?;
+    let range = match params.range.as_deref() {
+        None => TimeRange::Week,
+        Some(value) => TimeRange::parse(value).ok_or_else(|| ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "range must be 24h, 7d or 30d".into(),
+        })?,
+    };
+    let cache_key = format!("time:{}", range.id());
+    if let Some(body) = cached(&state, &cache_key) {
+        return Ok(Json(body));
+    }
+
+    let activity_db = expand_home(&state.config.activity.db_path);
+    let usage_db = expand_home(&state.config.usage.db_path);
+    let queue_db = expand_home(&state.config.sm_send.db_path);
+    let queue_runner_db = expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
+        .join("queue_runner.db");
+    // Live sessions, and whether each is in a turn now.
+    let live_sessions: BTreeMap<String, bool> = state
+        .session_store
+        .list_sessions(true)?
+        .into_iter()
+        .filter(|record| !record.is_stopped())
+        .map(|record| {
+            let working = record.lifecycle_status() == "running";
+            (record.id, working)
+        })
+        .collect();
+    let body = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+        let sources = TimeSources {
+            activity_db: &activity_db,
+            usage_db: &usage_db,
+            queue_db: &queue_db,
+            queue_runner_db: &queue_runner_db,
+            live_sessions: &live_sessions,
+            repo_of: &crate::work_attribution::folder_repo,
+        };
+        Ok(serde_json::to_value(analytics_time::time_report(
+            &sources,
+            range,
+            time::OffsetDateTime::now_utc(),
+        )?)?)
+    })
+    .await
+    .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
+    store(&state, cache_key, &body);
+    Ok(Json(body))
+}
+
+fn store(state: &AppState, key: String, body: &Value) {
     if let Ok(mut cache) = state.analytics_cache.lock() {
         cache.retain(|_, (at, _)| at.elapsed() < ANALYTICS_CACHE_TTL);
-        cache.insert(cache_key, (std::time::Instant::now(), body.clone()));
+        cache.insert(key, (std::time::Instant::now(), body.clone()));
     }
-    Ok(Json(body))
 }
 
 fn cached(state: &AppState, key: &str) -> Option<Value> {

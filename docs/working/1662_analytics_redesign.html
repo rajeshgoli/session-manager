@@ -576,7 +576,7 @@ CREATE TABLE activity_scan_offsets (artifact_path TEXT PRIMARY KEY, byte_offset 
 <li><b>Timeline.</b> Merge the seat's turns. The timeline runs from the first turn start to the last turn end, or to <code>now</code> if the session is not stopped. Clip everything to the range.</li>
 <li><b>Inside a turn.</b> Each instant covered by tool spans goes to the span with the latest start; on a tie, the latest end. That is the innermost span, so a Codex <code>exec</code> wrapper yields to the command inside it. Everything else is <code>model</code>.</li>
 <li><b>Between turns.</b> Collect the seat's waits (below). Each instant with at least one open wait goes to the open wait with the latest end (a still-open wait ends at +∞); on a tie, in the order you › review › queue › agents.</li>
-<li><b>No wait open.</b> If the seat holds an active claim, the instant is <code>you</code> when the gap ended with a prompt from you, otherwise <code>idle</code>. If it holds no claim now but held one earlier in its life, it is <code>parked</code>. If it never held a claim, the same test applies as with a claim: <code>you</code> or <code>idle</code>.</li>
+<li><b>No wait open.</b> If the seat holds an active claim, the instant is <code>you</code> when the gap ended with a prompt from you, otherwise <code>idle</code>. If it holds no claim, it is <code>parked</code>, whether its claims have ended or it never held one: a reviewer or scout that did its one job and sits unretired is parked, and so is the gap in an ad-hoc session you drive yourself.</li>
 </ol>
 <table>
 <thead><tr><th>Wait</th><th>Opens</th><th>Closes</th></tr></thead>
@@ -716,7 +716,7 @@ TNode = { "id", "kind", "label", "state", "history_path", "session_id", "session
 <tr><td>J.17</td><td>Wait that ends last wins; tie order</td><td>Queue 40 min + review 8 min; equal ends</td></tr>
 <tr><td>J.18</td><td>Queue job while in a turn does not count as waiting</td><td>Job spans a turn and a gap</td></tr>
 <tr><td>J.19</td><td>Prompt from you vs sm delivery (20 s window, inbox replies)</td><td>Three prompts</td></tr>
-<tr><td>J.20</td><td>Idle vs you vs parked by claim state</td><td>The Appendix E worked example, exact seconds</td></tr>
+<tr><td>J.20</td><td>Idle vs you vs parked by claim state</td><td>The Appendix E worked example, exact seconds; a seat that never claimed</td></tr>
 <tr><td>J.21</td><td>Service jobs excluded</td><td>Service job open across a gap</td></tr>
 <tr><td>J.22</td><td>Waiting on agents from child seats</td><td>Parent idle while its child has turns</td></tr>
 <tr><td>J.23</td><td>Range clipping; live agent extends to now</td><td>Agent spanning the range start</td></tr>
