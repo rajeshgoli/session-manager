@@ -920,3 +920,37 @@ data class InboxRow(
 data class InboxDoneRequest(
     @SerialName("thread_key") val threadKey: String,
 )
+
+/** `GET /guestbook?format=json` (sm#1660): signed entries, newest first. */
+@Serializable
+data class GuestbookResponse(
+    val entries: List<GuestbookEntry> = emptyList(),
+    /** The `before` cursor for the next older page; null on the last page. */
+    @SerialName("next_before") val nextBefore: Long? = null,
+)
+
+/** One agent's note, signed as it finished. */
+@Serializable
+data class GuestbookEntry(
+    val id: Long = 0,
+    @SerialName("session_id") val sessionId: String = "",
+    @SerialName("session_name") val sessionName: String = "",
+    val provider: String = "",
+    val model: String? = null,
+    /** `owner/name` slugs. */
+    val repos: List<String> = emptyList(),
+    val claims: List<GuestbookClaim> = emptyList(),
+    @SerialName("signed_at") val signedAt: String = "",
+    /** The note, markdown. */
+    val text: String = "",
+)
+
+/** A ticket or PR the agent held when it signed. */
+@Serializable
+data class GuestbookClaim(
+    val repo: String = "",
+    val number: Long = 0,
+    /** `ticket` or `pr`. */
+    val kind: String = "",
+    val title: String = "",
+)
