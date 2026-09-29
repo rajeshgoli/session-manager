@@ -13,6 +13,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
@@ -33,6 +35,8 @@ data class AskState(
     val status: String,
     val answer: String? = null,
     val error: String? = null,
+    /** When the question was sent, epoch milliseconds. */
+    val askedAtMs: Long = 0,
 )
 
 data class QueueUiState(
@@ -96,7 +100,6 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
             val (url, token) = credentials() ?: return@launch
             runCatching { repository.fetchQueue(url, token) }
                 .onSuccess {
-                    QueueAsks.retain((it.running + it.queued + it.ended).map { job -> job.id }.toSet())
                     _uiState.value = _uiState.value.copy(
                         overview = it,
                         loading = false,
@@ -222,14 +225,17 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
 /**
  * Ask agent requests by job id, kept for the life of the process. Polling runs
  * outside any screen so an answer that lands after the sheet or the Queue tab
- * closes is there when the job is opened again.
+ * closes, or after the job itself ends, is there when the job is opened again.
+ * Finished answers are saved, newest [MAX_SAVED], for [KEEP_MS].
  */
 internal object QueueAsks {
     private const val MAX_SAVED = 20
+    private const val KEEP_MS = 24 * 60 * 60 * 1000L
     private val FINISHED = setOf("completed", "failed", "timed_out")
     private val codec = ListSerializer(AskState.serializer())
     private val json = Json { ignoreUnknownKeys = true }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val saveLock = Mutex()
     private val jobs = mutableMapOf<String, Job>()
     private var store: SettingsRepository? = null
     val state = MutableStateFlow<Map<String, AskState>>(emptyMap())
@@ -241,25 +247,18 @@ internal object QueueAsks {
         store = settings
         scope.launch {
             val saved = runCatching { json.decodeFromString(codec, settings.loadQueueAsksJson()) }.getOrDefault(emptyList())
+            val cutoff = System.currentTimeMillis() - KEEP_MS
             // Anything asked since launch is newer than what was saved.
-            state.update { current -> saved.associateBy { it.jobId } + current }
+            state.update { current -> saved.filter { it.askedAtMs >= cutoff }.associateBy { it.jobId } + current }
         }
     }
 
     @Synchronized
     fun start(jobId: String, question: String, run: suspend (update: (AskState) -> Unit) -> Unit) {
         jobs.remove(jobId)?.cancel()
-        set(AskState(jobId, question, "sending"))
-        jobs[jobId] = scope.launch { run(::set) }
-    }
-
-    /** Drops requests for jobs no longer listed. */
-    @Synchronized
-    fun retain(jobIds: Set<String>) {
-        (jobs.keys - jobIds).forEach { jobs.remove(it)?.cancel() }
-        val before = state.value
-        state.update { asks -> asks.filterKeys { it in jobIds } }
-        if (state.value.size != before.size) save()
+        val askedAtMs = System.currentTimeMillis()
+        set(AskState(jobId, question, "sending", askedAtMs = askedAtMs))
+        jobs[jobId] = scope.launch { run { set(it.copy(askedAtMs = askedAtMs)) } }
     }
 
     private fun set(ask: AskState) {
@@ -267,9 +266,18 @@ internal object QueueAsks {
         if (ask.status in FINISHED) save()
     }
 
+    /** One writer at a time, each saving the state as it is when it writes. */
     private fun save() {
         val settings = store ?: return
-        val finished = state.value.values.filter { it.status in FINISHED }.takeLast(MAX_SAVED)
-        scope.launch { runCatching { settings.saveQueueAsksJson(json.encodeToString(codec, finished)) } }
+        scope.launch {
+            saveLock.withLock {
+                val cutoff = System.currentTimeMillis() - KEEP_MS
+                val finished = state.value.values
+                    .filter { it.status in FINISHED && it.askedAtMs >= cutoff }
+                    .sortedBy { it.askedAtMs }
+                    .takeLast(MAX_SAVED)
+                runCatching { settings.saveQueueAsksJson(json.encodeToString(codec, finished)) }
+            }
+        }
     }
 }
