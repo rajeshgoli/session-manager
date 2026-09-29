@@ -36,6 +36,8 @@ data class QueueUiState(
     val signedOut: Boolean = false,
     val log: Pair<String, String>? = null,
     val cancelError: String? = null,
+    /** Result of Follow for the open sheet: job id to message. */
+    val followMessage: Pair<String, String>? = null,
     val ask: AskState? = null,
     val usage: UtilizationSeries? = null,
     val usageHours: Int = 24,
@@ -135,6 +137,20 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun follow(job: SessionJob) {
+        viewModelScope.launch {
+            val (url, token) = credentials() ?: return@launch
+            val message = repository.followJob(url, token, job.id).fold(
+                onSuccess = { "Following — you'll be notified when it ends" },
+                onFailure = { error ->
+                    if (handleAuth(error)) return@launch
+                    error.message ?: "Couldn't follow this job"
+                },
+            )
+            _uiState.value = _uiState.value.copy(followMessage = job.id to message)
+        }
+    }
+
     fun ask(job: SessionJob, question: String) {
         val sessionId = job.notifySessionId?.takeIf { it.isNotBlank() } ?: return
         askJob?.cancel()
@@ -160,7 +176,7 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearSheetState() {
         askJob?.cancel()
-        _uiState.value = _uiState.value.copy(log = null, cancelError = null, ask = null)
+        _uiState.value = _uiState.value.copy(log = null, cancelError = null, ask = null, followMessage = null)
     }
 
     fun refreshUsage(hours: Int = _uiState.value.usageHours) {

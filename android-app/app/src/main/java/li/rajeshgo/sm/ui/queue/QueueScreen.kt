@@ -225,6 +225,8 @@ fun QueueScreen(
             log = state.log?.takeIf { it.first == job.id }?.second,
             ask = state.ask?.takeIf { it.jobId == job.id },
             cancelError = state.cancelError,
+            followMessage = state.followMessage?.takeIf { it.first == job.id }?.second,
+            onFollow = { viewModel.follow(current) },
             onCancel = { note -> viewModel.cancel(current, note) { sheetJob = null; viewModel.clearSheetState() } },
             onAsk = { question -> viewModel.ask(current, question) },
             onOpenAgent = current.notifySessionId?.takeIf { it.isNotBlank() }?.let { sessionId ->
@@ -357,6 +359,8 @@ private fun JobSheet(
     log: String?,
     ask: AskState?,
     cancelError: String?,
+    followMessage: String?,
+    onFollow: () -> Unit,
     onCancel: (String?) -> Unit,
     onAsk: (String) -> Unit,
     onOpenAgent: (() -> Unit)?,
@@ -386,7 +390,8 @@ private fun JobSheet(
             if (job.state == "pending") job.holding?.detail?.let { Detail("Why it is waiting", it) }
             job.endedSummary?.let { Detail("What happened", it) }
 
-            if (active && onOpenAgent != null) {
+            // Also on stopped jobs: "why did it stop?" is worth asking.
+            if (onOpenAgent != null) {
                 HorizontalDivider(color = Border)
                 Text("Ask ${jobAgentLabel(job)}", style = MaterialTheme.typography.titleSmall)
                 Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -422,9 +427,12 @@ private fun JobSheet(
                 color = TextSecondary,
             )
             cancelError?.let { Text(it, color = Rose) }
+            followMessage?.let { Text(it, color = TextSecondary) }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 24.dp)) {
                 if (active) {
                     OutlinedButton(onClick = { confirming = true }) { Text("Cancel", color = Rose) }
+                    // The server follows only jobs that have not finished.
+                    OutlinedButton(onClick = onFollow) { Text("Follow") }
                 }
                 onOpenAgent?.let { OutlinedButton(onClick = it) { Text("Open agent") } }
             }
