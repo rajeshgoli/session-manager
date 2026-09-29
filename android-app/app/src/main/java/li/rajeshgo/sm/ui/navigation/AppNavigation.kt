@@ -8,12 +8,13 @@ import androidx.compose.runtime.remember
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import androidx.compose.ui.platform.LocalContext
+import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import androidx.navigation.navArgument
 import li.rajeshgo.sm.data.repository.SettingsRepository
 import li.rajeshgo.sm.push.FollowOpenRequests
-import li.rajeshgo.sm.ui.analytics.AnalyticsDetailScreen
 import li.rajeshgo.sm.ui.analytics.AnalyticsScreen
 import li.rajeshgo.sm.ui.guestbook.GuestbookScreen
 import li.rajeshgo.sm.ui.history.HistoryScreen
@@ -32,7 +33,6 @@ object Routes {
     const val WATCH = "watch"
     const val INBOX = "inbox"
     const val ANALYTICS = "analytics"
-    const val ANALYTICS_DETAIL = "analytics/detail"
     const val QUEUE = "queue"
     const val USAGE = "usage"
     const val HISTORY = "history"
@@ -157,6 +157,9 @@ fun AppNavigation() {
                 onNavigateToInbox = toInbox,
                 onNavigateToWatch = toWatch,
                 onOpenUsage = { navController.navigate(Routes.USAGE) },
+                onOpenStopped = {
+                    navController.navigate("${Routes.ANALYTICS}?section=queue") { launchSingleTop = true }
+                },
                 menu = menu,
             )
         }
@@ -169,19 +172,16 @@ fun AppNavigation() {
         composable(Routes.GUESTBOOK) {
             GuestbookScreen(onBack = { navController.popBackStack() }, menu = menu)
         }
-        composable(Routes.ANALYTICS) {
+        // `section` (spend, time or queue) is optional; without it the last one shown opens.
+        composable(
+            "${Routes.ANALYTICS}?section={section}",
+            arguments = listOf(navArgument("section") { type = NavType.StringType; nullable = true }),
+        ) { backStackEntry ->
             AnalyticsScreen(
+                section = backStackEntry.arguments?.getString("section"),
                 onBack = { navController.popBackStack() },
-                menu = menu,
-                onOpenDetail = { section ->
-                    navController.navigate("${Routes.ANALYTICS_DETAIL}/$section")
-                },
-            )
-        }
-        composable("${Routes.ANALYTICS_DETAIL}/{section}") { backStackEntry ->
-            AnalyticsDetailScreen(
-                section = backStackEntry.arguments?.getString("section").orEmpty(),
-                onBack = { navController.popBackStack() },
+                onOpenUsage = { navController.navigate(Routes.USAGE) },
+                onOpenWatch = toWatch,
                 menu = menu,
             )
         }

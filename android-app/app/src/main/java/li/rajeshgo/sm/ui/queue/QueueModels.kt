@@ -115,6 +115,16 @@ fun endedLine(job: SessionJob, now: OffsetDateTime): String {
     return listOfNotNull(job.type, ago).joinToString(" · ")
 }
 
+/**
+ * The Queue tab's amber line to Analytics › Queue: null when nothing stopped
+ * in the last 24 h. The server returns at most 50 stopped jobs, so 50 reads "50+".
+ */
+fun stoppedLinkText(endedCount: Int): String? = when {
+    endedCount <= 0 -> null
+    endedCount >= 50 -> "50+ stopped in the last 24h ›"
+    else -> "$endedCount stopped in the last 24h ›"
+}
+
 /** ⌛ for jobs that never started, ✕ for jobs the queue stopped. */
 fun endedIcon(reason: String?): String = if (reason == "gave_up") "⌛" else "✕"
 
