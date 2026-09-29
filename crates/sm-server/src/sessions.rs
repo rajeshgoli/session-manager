@@ -1966,6 +1966,12 @@ impl SessionStore {
 
         let now = now_rfc3339();
         if !superseded {
+            let turn_key = json_text(session.get("activity_turn_start_hook_at"))
+                .unwrap_or_else(|| "initial".into());
+            if json_text(session.get("last_counted_claude_turn")).as_deref() != Some(&turn_key) {
+                increment_completed_turns(session);
+                session.insert("last_counted_claude_turn".into(), json!(turn_key));
+            }
             let reserves_handoff = provider == "claude"
                 && json_text(session.get("pending_handoff_path")).is_some()
                 && json_text(session.get("pending_handoff_recorded_at")).is_some();
@@ -9116,6 +9122,18 @@ impl SessionStore {
         }
 
         let root_provider_resume_id = json_text(session.get("provider_resume_id"));
+        if codex_fork_event_matches_root_thread(event, root_provider_resume_id.as_deref()) {
+            if codex_fork_event_starts_turn(event) {
+                session.insert("codex_turn_counted".into(), json!(false));
+            }
+            if codex_fork_event_is_turn_complete(line)
+                && session.get("codex_turn_counted").and_then(Value::as_bool) != Some(true)
+            {
+                increment_completed_turns(session);
+                session.insert("codex_turn_counted".into(), json!(true));
+                changed = true;
+            }
+        }
         if let Some(next_status) = codex_fork_status_for_event(event).filter(|next_status| {
             codex_fork_event_matches_root_thread(event, root_provider_resume_id.as_deref())
                 && (status != "idle"
@@ -9353,6 +9371,7 @@ impl SessionStore {
             agent_status_text: None,
             agent_status_at: None,
             agent_task_completed_at: None,
+            turns_completed: 0,
             completion_status: None,
             completion_message: None,
             completed_at: None,
@@ -9825,6 +9844,14 @@ pub(crate) fn codex_fork_event_line_matches_root_thread(
     event
         .as_object()
         .is_some_and(|event| codex_fork_event_matches_root_thread(event, root_thread_id))
+}
+
+fn increment_completed_turns(session: &mut serde_json::Map<String, Value>) {
+    let n = session
+        .get("turns_completed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    session.insert("turns_completed".into(), json!(n.saturating_add(1)));
 }
 
 fn codex_fork_event_is_turn_complete(line: &str) -> bool {
@@ -16770,6 +16797,8 @@ pub struct SessionRecord {
     #[serde(default)]
     pub agent_task_completed_at: Option<String>,
     #[serde(default)]
+    pub turns_completed: u64,
+    #[serde(default)]
     pub completion_status: Option<String>,
     #[serde(default)]
     pub completion_message: Option<String>,
@@ -20016,6 +20045,7 @@ sleep 30
             agent_status_text: None,
             agent_status_at: None,
             agent_task_completed_at: None,
+            turns_completed: 0,
             completion_status: None,
             completion_message: None,
             completed_at: None,
@@ -20199,6 +20229,64 @@ sleep 30
         )
         .unwrap();
         SessionStore::new_with_legacy_fallback(state_file.clone(), state_file)
+    }
+
+    #[test]
+    fn doc_agent_turns_count_once_per_turn_and_survive_reload() {
+        let store = store_with_running_claude_session("turncount");
+        for expected in 1..=2 {
+            store
+                .apply_claude_user_prompt_submit_hook("turncount", None)
+                .unwrap();
+            store
+                .apply_claude_stop_hook("turncount", None, None, None, None, None, None)
+                .unwrap();
+            store
+                .apply_claude_stop_hook("turncount", None, None, None, None, None, None)
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_session("turncount")
+                    .unwrap()
+                    .unwrap()
+                    .turns_completed,
+                expected
+            );
+        }
+        let fresh = SessionStore::new_with_legacy_fallback(
+            store.state_file.clone(),
+            store.state_file.clone(),
+        );
+        assert_eq!(
+            fresh
+                .get_session("turncount")
+                .unwrap()
+                .unwrap()
+                .turns_completed,
+            2
+        );
+        let mut raw = store.load_raw_json_value().unwrap();
+        raw["sessions"][0]["provider"] = json!("codex-fork");
+        store.write_raw_json_value(&raw).unwrap();
+        for expected in 3..=4 {
+            store
+                .apply_codex_fork_event_line("turncount", r#"{"event_type":"turn_started"}"#)
+                .unwrap();
+            store
+                .apply_codex_fork_event_line("turncount", r#"{"event_type":"turn_complete"}"#)
+                .unwrap();
+            store
+                .apply_codex_fork_event_line("turncount", r#"{"event_type":"turn_complete"}"#)
+                .unwrap();
+            assert_eq!(
+                store
+                    .get_session("turncount")
+                    .unwrap()
+                    .unwrap()
+                    .turns_completed,
+                expected
+            );
+        }
     }
 
     #[test]

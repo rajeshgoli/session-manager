@@ -1212,6 +1212,8 @@ async fn view_doc_response(
         .map(|review| json!({"id": review.id, "url": review.github_review_url}));
     let config = json!({
         "docId": doc.id,
+        "agent": doc_agent(state,doc),
+        "mergeHold": doc_hold(state,doc)?,
         "docState": summary.as_ref().map(|summary| summary.state),
         "undeliveredReview": undelivered,
         "title": doc.title,
@@ -1444,6 +1446,67 @@ fn percent_decode_path_segment(segment: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
+fn doc_agent(state: &AppState, doc: &OwnerDoc) -> Option<Value> {
+    let id = review_wake_recipient(state, doc)?;
+    let session = state.session_store.get_session(&id).ok().flatten()?;
+    let via = if doc.pr_number.is_some_and(|pr| {
+        super::claims::work_claim_store(state)
+            .claims_for_item(&doc.repo, pr)
+            .is_ok_and(|claims| {
+                claims
+                    .iter()
+                    .any(|c| c.ended_at.is_none() && c.session_id == id)
+            })
+    }) {
+        "claim"
+    } else if id == doc.author_session_id {
+        "author"
+    } else {
+        "parent"
+    };
+    let projected = serde_json::to_value(SessionResponse::from(session.clone())).ok()?;
+    let activity = if session.is_stopped() {
+        "stopped"
+    } else {
+        projected["activity_state"].as_str().unwrap_or("idle")
+    };
+    Some(
+        json!({"session_id":id,"name":super::claims::session_info(&session).name,"via":via,"state":activity,
+        "turns":if matches!(session.provider.as_str(),"claude"|"codex-fork") {Some(session.turns_completed)} else {None},
+        "context_percent":session.context_used_percentage,"task_completed_at":session.agent_task_completed_at}),
+    )
+}
+fn doc_hold(state: &AppState, doc: &OwnerDoc) -> Result<Value, ApiError> {
+    Ok(match doc.pr_number {
+        Some(pr) => super::claims::work_claim_store(state)
+            .merge_hold(&doc.repo, pr)?
+            .map(|h| h.projection())
+            .unwrap_or(Value::Null),
+        None => Value::Null,
+    })
+}
+async fn change_doc_hold(
+    state: Arc<AppState>,
+    doc: &OwnerDoc,
+    release: bool,
+) -> Result<Value, ApiError> {
+    let pr = doc
+        .pr_number
+        .ok_or_else(|| bad_request("This doc has no PR"))?;
+    super::merge_holds::change(
+        state,
+        super::merge_holds::HoldRequest {
+            repo: doc.repo.clone(),
+            pr,
+            reason: None,
+            requester_session_id: None,
+        },
+        release,
+        false,
+    )
+    .await
+}
+
 /// `GET /docs/{id}/head?sha=`: what the banners need. `pr_head_blob_differs`
 /// compares the file at the PR head with the viewed revision (`?sha=`), or
 /// with the latest publish without one.
@@ -1463,6 +1526,8 @@ async fn doc_head_response(
         None => latest.commit_sha.clone(),
     };
     let mut response = json!({
+        "agent": doc_agent(state,doc),
+        "merge_hold": doc_hold(state,doc)?,
         "latest_published_sha": latest.commit_sha,
         "latest_reader_path": doc_readable_path(&doc.repo, &doc.path, &latest.commit_sha),
         "pr_head_sha": null,
@@ -1706,7 +1771,13 @@ pub(super) async fn post_owner_doc_subpath(
 ) -> Result<Response, ApiError> {
     if !matches!(
         rest.as_str(),
-        "retract" | "drafts" | "review" | "dismiss-review" | "assign"
+        "retract"
+            | "drafts"
+            | "review"
+            | "dismiss-review"
+            | "assign"
+            | "merge-hold"
+            | "agent/retire"
     ) {
         ensure_session_allowed_from_parts(
             &state.config,
@@ -1734,6 +1805,31 @@ pub(super) async fn post_owner_doc_subpath(
     }
     ensure_doc_write_allowed(&state, &headers, peer_addr, &doc_id, &rest)?;
     let doc = find_doc(&state, &doc_id)?;
+    if rest == "merge-hold" {
+        return Ok(Json(change_doc_hold(state.clone(), &doc, false).await?).into_response());
+    }
+    if rest == "agent/retire" {
+        let payload: Value = parse_json_body(&body)?;
+        let id = payload["session_id"]
+            .as_str()
+            .ok_or_else(|| bad_request("session_id is required"))?;
+        if review_wake_recipient(&state, &doc).as_deref() != Some(id) {
+            return Err(ApiError::Status {
+                status: StatusCode::CONFLICT,
+                detail: "The doc's agent changed; reload".into(),
+            });
+        }
+        let payload = serde_json::from_value(json!({"requester_session_id":null}))?;
+        return Ok(super::retire_session_after_auth(
+            state,
+            id.to_owned(),
+            peer_addr,
+            headers,
+            payload,
+        )
+        .await?
+        .into_response());
+    }
     if rest == "drafts" {
         // Drafts don't change under a review being submitted.
         let _guard = state.owner_doc_review_lock.lock().await;
@@ -1788,6 +1884,10 @@ pub(super) async fn delete_owner_doc_subpath(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     ensure_doc_write_allowed(&state, &headers, peer_addr, &doc_id, &rest)?;
+    if rest == "merge-hold" {
+        let doc = find_doc(&state, &doc_id)?;
+        return Ok(Json(change_doc_hold(state, &doc, true).await?));
+    }
     let draft_id = draft_subroute(&rest)?;
     let doc = find_doc(&state, &doc_id)?;
     let _guard = state.owner_doc_review_lock.lock().await;

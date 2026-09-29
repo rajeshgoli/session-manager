@@ -10049,6 +10049,16 @@ async fn retire_session(
         &format!("/sessions/{session_id}/retire"),
     )?;
     ensure_core_writes_enabled(&state)?;
+    retire_session_after_auth(state, session_id, peer_addr, headers, payload).await
+}
+
+async fn retire_session_after_auth(
+    state: Arc<AppState>,
+    session_id: String,
+    peer_addr: SocketAddr,
+    headers: HeaderMap,
+    payload: RetireSessionRequest,
+) -> Result<Json<Value>, ApiError> {
     let requester_session_id = payload
         .requester_session_id
         .as_deref()

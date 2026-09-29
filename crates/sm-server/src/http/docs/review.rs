@@ -126,11 +126,31 @@ pub(super) fn is_retired(session: &SessionRecord) -> bool {
 /// on restore), else the retired author's parent, else nobody: the rule
 /// message replies use too.
 pub(in crate::http) fn review_wake_recipient(state: &AppState, doc: &OwnerDoc) -> Option<String> {
+    if let Some(pr) = doc.pr_number {
+        if let Ok(claims) =
+            super::super::claims::work_claim_store(state).claims_for_item(&doc.repo, pr)
+        {
+            for claim in claims {
+                if claim.ended_at.is_none()
+                    && state
+                        .session_store
+                        .get_session(&claim.session_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|s| !s.is_stopped() && !is_retired(&s))
+                {
+                    return Some(claim.session_id);
+                }
+            }
+        }
+    }
     super::super::messages::live_recipient(state, &doc.author_session_id).map(|session| session.id)
 }
 
 #[derive(Debug, Deserialize)]
 pub(super) struct SubmitReviewRequest {
+    #[serde(default)]
+    hold: bool,
     submission_id: String,
     sha: String,
     verdict: String,
@@ -265,6 +285,20 @@ pub(super) async fn submit_owner_doc_review(
             "PR #{pr_number} is {}, so the doc is read-only",
             pr.state
         )));
+    }
+    if payload.hold {
+        super::super::merge_holds::change(
+            state.clone(),
+            super::super::merge_holds::HoldRequest {
+                repo: doc.repo.clone(),
+                pr: pr_number,
+                reason: None,
+                requester_session_id: None,
+            },
+            false,
+            true,
+        )
+        .await?;
     }
     let bytes = load_doc_bytes_async(state, doc, &sha).await?;
     let (review, inserted) = store.begin_review(
@@ -586,18 +620,30 @@ fn finish(
     line_comments: i64,
     file_comments: i64,
 ) -> Result<OwnerDocReview, ApiError> {
+    let hold_line = doc
+        .pr_number
+        .and_then(|pr| {
+            super::super::claims::work_claim_store(state)
+                .merge_hold(&doc.repo, pr)
+                .ok()
+                .flatten()
+        })
+        .map(|h| h.placed_message());
     let wake = review_wake_recipient(state, doc).map(|session_id| {
-        (
-            session_id,
-            render_owner_review_wake(
+        (session_id, {
+            let mut text = render_owner_review_wake(
                 &state.config.owner_name,
                 doc,
                 review,
                 review_url,
                 line_comments,
                 file_comments,
-            ),
-        )
+            );
+            if let Some(line) = &hold_line {
+                text.push_str(&format!("\n{line}"));
+            }
+            text
+        })
     });
     let (posted, changed) = owner_doc_store(state).finish_review(
         &review.id,
