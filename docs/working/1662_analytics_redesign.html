@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1662 — Analytics: quota and agent time</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+<style>
+  /* Phone mockups: the app's dark palette (android-app/.../ui/theme/Color.kt). */
+  .phones { display: flex; flex-wrap: wrap; gap: 14px; justify-content: center; margin: 1rem 0 .4rem; }
+  .phone { width: 236px; background: #09090D; color: #F5F7FA; border-radius: 20px; padding: 10px 10px 14px; border: 3px solid #2B2B37;
+           font: 11px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; box-sizing: border-box; }
+  .phone .tb { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; padding: 2px 2px 8px; }
+  .phone .tb .sp { flex: 1; }
+  .phone .dim { color: #ADB2C2; } .phone .mut { color: #777C8B; }
+  .phone .seg { display: flex; background: #121219; border-radius: 8px; padding: 2px; margin-bottom: 7px; }
+  .phone .seg span { flex: 1; text-align: center; padding: 4px 0; border-radius: 6px; color: #ADB2C2; }
+  .phone .seg span.on { background: #143744; color: #5EE7FF; font-weight: 600; }
+  .phone .chips { display: flex; gap: 5px; margin-bottom: 7px; }
+  .phone .chip { border: 1px solid #3B3B49; border-radius: 999px; padding: 2px 8px; color: #ADB2C2; }
+  .phone .chip.on { border-color: #5EE7FF; color: #5EE7FF; }
+  .phone .card { background: #121219; border-radius: 10px; padding: 8px 9px; margin-bottom: 7px; }
+  .phone .big { font-size: 20px; font-weight: 700; }
+  .phone .crumb { color: #5EE7FF; margin: 2px 2px 6px; }
+  .phone .row { padding: 5px 2px 6px; border-bottom: 1px solid #1E1E28; }
+  .phone .row .l { display: flex; gap: 6px; }
+  .phone .row .l b { font-weight: 600; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .phone .row .l span { white-space: nowrap; }
+  .phone .row .s { color: #777C8B; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .phone .bar { display: flex; height: 6px; background: #1E1E28; border-radius: 3px; overflow: hidden; margin: 3px 0 1px; }
+  .phone .bar i { display: block; height: 100%; }
+  .phone .leg { display: flex; flex-wrap: wrap; gap: 3px 9px; font-size: 10px; color: #ADB2C2; margin-top: 4px; }
+  .phone .leg i { display: inline-block; width: 7px; height: 7px; border-radius: 2px; margin-right: 3px; }
+  .phone .sec { font-size: 10px; letter-spacing: .06em; color: #777C8B; margin: 8px 2px 4px; }
+  .phone .btn { display: inline-block; border: 1px solid #3B3B49; border-radius: 8px; padding: 3px 8px; color: #5EE7FF; margin-top: 5px; }
+  .phone table { font-size: 10px; margin: 3px 0; font-family: inherit; }
+  .phone td, .phone th { border: none; padding: 1px 3px; color: #ADB2C2; }
+  .phone th { color: #777C8B; font-weight: 400; }
+  .c-opus { background: #5EE7FF; } .c-fable { background: #A78BFA; } .c-sonnet { background: #4ADE80; }
+  .c-astra { background: #F0ABFC; } .c-rev { background: #FB7185; } .c-other { background: #777C8B; }
+  .c-model { background: #5EE7FF; } .c-tools { background: #A78BFA; } .c-queue { background: #FBBF24; }
+  .c-review { background: #F0ABFC; } .c-you { background: #FB7185; } .c-idle { background: #3B3B49; }
+  .num { font-variant-numeric: tabular-nums; }
+  .small { font-size: .88rem; }
+  @media print { .phone { break-inside: avoid; } }
+</style>
+
+<h1>1662 — Analytics: where the quota and the agents' time go</h1>
+<p class="sans"><small>Author: sm-1662-spec-author <code>dbd17da3</code> · Ticket #1662 · 2026-09-29 · Revision 1</small></p>
+
+<h2>Memo</h2>
+
+<p><b>I recommend replacing everything on today's Analytics screen with three views: Spend, Time and Queue.</b>
+<b>Spend</b> answers "what used my weekly quota?" as a drill-down, the way the Unix <code>du</code> command shows disk usage: total, then repo, then ticket, then agent, then model. <b>Time</b> answers "what did my agents spend their hours on?" with the same drill-down, ending in buckets such as model working, tools, waiting on a queue job, waiting on a Codex review and waiting on you. <b>Queue</b> holds the two diagnostic cards that leave the Queue tab. Nothing from the current screen survives: its content has not changed since March, its health checks are hardcoded empty, and its live counts repeat Queue and Watch.</p>
+
+<p>Spend needs no new recording: sm already records every model turn with its tokens, and I fitted a conversion from tokens to percent of the weekly quota that reproduces Claude's weekly meter within 4–10% in normal weeks. Time needs one new recorder: the per-turn and per-tool timings exist today only in Claude and Codex transcripts, which Claude Code deletes after about 30 days, so sm must copy them into its own database. No new hooks are needed. The work splits into six tickets, each sized for one agent (§7).</p>
+
+<p>I ran both analyses on live data (backup copies of the databases). This is what the screens will tell you:</p>
+
+<table>
+<thead><tr><th style="width:34%">Question</th><th>Answer from live data</th></tr></thead>
+<tbody>
+<tr><td>Where did this Claude week go? <span class="small">(Sat 9:00 to now, 2.1 days)</span></td><td class="num"><b>35% used</b>, on pace to run out Friday afternoon. fractal-algo-rust 28.8 points, session-manager 5.6. Opus 30.6, Fable 4.1, Sonnet 0.3. One Fable spec author on #1787 used <b>4.1 points in 141 turns</b>; the Opus author who took over used 2.1 in 335 turns.</td></tr>
+<tr><td>Where did this Codex week go?</td><td class="num"><b>21% used.</b> Codex cloud PR reviews are about <b>8 of the 21 points</b> (194 reviews); Astra agents about 13.</td></tr>
+<tr><td>What did agents spend the last 7 days on?</td><td class="num"><b>533 active agent-hours:</b> waiting on you 39%, waiting on queue jobs 29%, model working 15%, tools 10%, idle 4%, waiting on Codex review 3%. Another 216 hours were <i>parked</i>: work finished, agent not yet retired.</td></tr>
+</tbody>
+</table>
+<p class="small">"Waiting on you" is real, not a classification artefact. The largest case is a fractal-algo-rust engineer that held ticket #1764 open, asked you a question and waited 22 hours for "See the latest comment on the ticket." The waiting-on-you figure counts overnight hours; the screen shows them as they are.</p>
+
+<div class="vocab">
+<dl>
+<dt>Weekly quota, and "% of week"</dt><dd>The usage limit each subscription resets weekly: Claude's resets Saturday 9:00 Pacific; each Codex account has its own reset time. A row's "% of week" is its share of that meter. Claude and Codex are separate meters and never add up. The two Codex accounts are both Pro, so their percentages do add up.</dd>
+<dt>Claim</dt><dd>sm's record that an agent is working on a ticket or PR (<code>sm ticket</code>, <code>sm pr</code>), with a start and an end time.</dd>
+<dt>Thread</dt><dd>A ticket plus the PRs linked to it; a PR that links to no ticket is its own thread. This matches the History page.</dd>
+<dt>Active time and parked time</dt><dd>An agent's active time runs from its first turn to its last turn and excludes parked time. <i>Parked</i> means the agent finished all its claimed work and sits unretired until someone prompts or retires it. Parked time is reported but not counted in the Time view's bars.</dd>
+</dl>
+</div>
+
+<h3>Decision surface</h3>
+<table>
+<thead><tr><th style="width:20%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr></thead>
+<tbody>
+<tr><td>1. What the Analytics screen shows</td><td><b>Three sections: Spend, Time, Queue.</b> Delete every current card and the server's <code>/client/analytics/summary</code> endpoint.</td><td>Nothing on today's screen answers a question you ask; three things do.</td></tr>
+<tr><td>2. Spend's unit</td><td><b>Percent of the weekly quota, with tokens as the second number.</b> A Claude / Codex switch picks the meter. Ranges: this week, last week, 4 weeks.</td><td>The quota is what runs out. Raw tokens are about 97% cache re-reads, which cost little.</td></tr>
+<tr><td>3. Converting tokens to percent</td><td><b>Fitted per-model rates, then scaled so the rows add up to the real meter</b> (scaling capped at ±25%). Anything beyond the cap shows as a "Not in the ledger" row.</td><td>The rows match the number Claude and Codex show you, and a data gap stays visible instead of being smeared across agents.</td></tr>
+<tr><td>4. Which ticket gets a turn when an agent holds two claims</td><td><b>The claim it took most recently.</b> A PR counts toward its linked ticket. With no claim: the parent agent's claim, then a ticket number in the agent's name, then "No ticket".</td><td>Agents take a new claim when they start new work; this week 85% of Claude spend attributes by claim, 10% by name, 5% goes to "No ticket".</td></tr>
+<tr><td>5. Codex cloud reviews</td><td><b>Counted in Codex Spend at 0.05% of a Codex week each</b>, under the PR's thread and the agent that asked for the review.</td><td>They are about a third of this week's Codex usage and invisible today.</td></tr>
+<tr><td>6. Time: new recording</td><td><b>Copy turn and tool timings from transcripts into a new <code>activity.db</code>, kept 90 days. No new hooks.</b></td><td>Transcripts already have exact timings but expire after 30 days; hooks would require changing your Claude settings and give no history.</td></tr>
+<tr><td>7. Time: when an idle agent waits on two things</td><td><b>The time goes to whichever wait ended last.</b></td><td>That wait is the one that actually held the agent up.</td></tr>
+<tr><td>8. Queue diagnostics</td><td><b>Move "Stopped by the queue · last 24h" and "Held back?" into Analytics › Queue.</b> The Queue tab keeps meter, running and queued, plus "3 stopped in the last 24h ›" only when there are any. Mac usage stays one tap from the Queue meter, and Analytics › Queue links to it too.</td><td>Queue shows what is happening now; diagnostics are for looking back.</td></tr>
+<tr><td>9. sm web</td><td><b>Phone only in this work.</b> The endpoints return plain JSON, so a web page later is one ticket.</td><td>You read analytics on the phone, and History and Guestbook are getting native app screens.</td></tr>
+<tr><td>10. Order of work</td><td><b>Six tickets (§7); server Spend, the new recorder and the app's Analytics shell start in parallel.</b></td><td>Spend is useful on its own and ships first.</td></tr>
+</tbody>
+</table>
+
+<h3>1. Spend</h3>
+<p>Analytics opens from the ⋮ menu on every screen (ticket #1659) and has a back arrow. The Spend section opens on the Claude or Codex meter, whichever is closer to its limit, and remembers your last choice. Each row shows its share of the meter as a bar coloured by model, with tokens as the second number. Tapping a row re-roots the list at that row, the way <code>ncdu</code> does, and the back arrow walks back up. The numbers below are this week's real figures.</p>
+
+<div class="phones">
+  <div class="phone">
+    <div class="tb">←<span>Analytics</span><span class="sp"></span>⋮</div>
+    <div class="seg"><span class="on">Spend</span><span>Time</span><span>Queue</span></div>
+    <div class="chips"><span class="chip on">Claude</span><span class="chip">Codex</span><span class="chip">This week ▾</span></div>
+    <div class="card">
+      <div class="big num">35% <span class="dim" style="font-size:11px;font-weight:400">of the week used</span></div>
+      <div class="dim">resets Sat 9:00 · at this pace runs out Fri</div>
+      <div class="bar"><i class="c-opus" style="width:87.4%"></i><i class="c-fable" style="width:11.7%"></i><i class="c-sonnet" style="width:0.9%"></i></div>
+      <div class="leg"><span><i class="c-opus"></i>Opus 30.6</span><span><i class="c-fable"></i>Fable 4.1</span><span><i class="c-sonnet"></i>Sonnet 0.3</span></div>
+    </div>
+    <div class="sec">BY REPO</div>
+    <div class="row"><div class="l"><b>fractal-algo-rust</b><span class="num">28.8%</span></div>
+      <div class="bar"><i class="c-opus" style="width:86%"></i><i class="c-fable" style="width:14%"></i></div><div class="s">2.2B tokens · 34 tickets</div></div>
+    <div class="row"><div class="l"><b>session-manager</b><span class="num">5.6%</span></div>
+      <div class="bar"><i class="c-opus" style="width:19%"></i><i class="c-sonnet" style="width:0.5%"></i></div><div class="s">432M tokens · 24 tickets</div></div>
+    <div class="row"><div class="l"><b>qwen-image</b><span class="num">0.6%</span></div>
+      <div class="bar"><i class="c-opus" style="width:2%"></i></div><div class="s">41M tokens · no ticket</div></div>
+    <div class="mut" style="margin-top:6px">85% by claim · 10% by agent name · 5% no ticket</div>
+  </div>
+
+  <div class="phone">
+    <div class="tb">←<span>Analytics</span><span class="sp"></span>⋮</div>
+    <div class="seg"><span class="on">Spend</span><span>Time</span><span>Queue</span></div>
+    <div class="crumb">All › fractal-algo-rust · <span class="num">28.8%</span></div>
+    <div class="row"><div class="l"><b>#1787 Pivot detector: order an outside bar</b><span class="num">6.2%</span></div>
+      <div class="bar"><i class="c-fable" style="width:66%"></i><i class="c-opus" style="width:34%"></i></div><div class="s">2 agents · open</div></div>
+    <div class="row"><div class="l"><b>#1771 Iter7: reader and card design memo</b><span class="num">2.7%</span></div>
+      <div class="bar"><i class="c-opus" style="width:44%"></i></div><div class="s">2 agents · open</div></div>
+    <div class="row"><div class="l"><b>#1791 Price precision on cent-priced tapes</b><span class="num">2.7%</span></div>
+      <div class="bar"><i class="c-opus" style="width:44%"></i></div><div class="s">2 agents</div></div>
+    <div class="row"><div class="l"><b>#1759 Iter7: Databento RTY, MidCap, Mag 7</b><span class="num">1.8%</span></div>
+      <div class="bar"><i class="c-opus" style="width:29%"></i></div><div class="s">1 agent</div></div>
+    <div class="row"><div class="l"><b>#1807 1791 fix: exact decimal levels</b><span class="num">1.7%</span></div>
+      <div class="bar"><i class="c-opus" style="width:27%"></i></div><div class="s">1 agent · merged</div></div>
+    <div class="row"><div class="l"><b>#1746 Iteration 7 plan</b><span class="num">1.6%</span></div>
+      <div class="bar"><i class="c-opus" style="width:26%"></i></div><div class="s">2 agents</div></div>
+    <div class="row"><div class="l"><b class="dim">28 more</b><span class="num">12.2%</span></div></div>
+  </div>
+
+  <div class="phone">
+    <div class="tb">←<span>Analytics</span><span class="sp"></span>⋮</div>
+    <div class="seg"><span class="on">Spend</span><span>Time</span><span>Queue</span></div>
+    <div class="crumb">… › #1787 › 1787-spec-author</div>
+    <div class="card">
+      <div class="big num">4.1% <span class="dim" style="font-size:11px;font-weight:400">of the Claude week</span></div>
+      <div class="dim">Fable 5.1 · 141 turns · retired</div>
+      <table>
+        <tr><th></th><th>tokens</th><th>share</th></tr>
+        <tr><td>output</td><td class="num">0.36M</td><td class="num">48%</td></tr>
+        <tr><td>cache writes</td><td class="num">0.9M</td><td class="num">30%</td></tr>
+        <tr><td>cache reads</td><td class="num">67M</td><td class="num">22%</td></tr>
+        <tr><td>fresh input</td><td class="num">0.01M</td><td class="num">0%</td></tr>
+      </table>
+      <span class="btn">Open agent</span> <span class="btn">Ticket history</span>
+    </div>
+    <div class="sec">SAME TICKET</div>
+    <div class="row"><div class="l"><b>1787-spec-author-2</b><span class="num">2.1%</span></div>
+      <div class="bar"><i class="c-opus" style="width:51%"></i></div><div class="s">Opus 5.5 · 335 turns</div></div>
+    <div class="mut" style="margin-top:6px">Codex on #1787: 1.2% (a reviewer, 5 cloud reviews)</div>
+  </div>
+</div>
+<p class="small" style="text-align:center">Figure 1. Spend: the total, one repo, one agent. Real numbers from this week (Sat 9:00 to Tue 12:00 Pacific).</p>
+
+<p><b>How tokens become percent.</b> Each model gets a rate: percent of the weekly meter per million tokens, where an output token weighs 8, a cache write 1.25–2, a fresh input token 1 and a cache re-read 0.02. I fitted these rates against six weeks of meter readings. On Claude, Fable costs about 3.9× Opus per token and Sonnet about 0.6×. On Codex, Astra costs about 3× Sol. The fitted estimates are then scaled so the week's rows add up to the actual meter reading. In normal weeks the scale factor is 0.9–1.1. The factor is capped at 0.8–1.25; beyond that the screen shows the gap rather than hiding it.</p>
+
+<figure>
+<svg viewBox="0 0 640 210" role="img" aria-label="Claude weekly meter vs fitted estimate">
+  <style>.t{font:11px -apple-system,Helvetica,Arial,sans-serif;fill:#52514e}.v{font:10px -apple-system,Helvetica,Arial,sans-serif;fill:#0b0b0b}</style>
+  <line x1="40" y1="170" x2="630" y2="170" stroke="#8a8880"/>
+  <line x1="40" y1="20" x2="630" y2="20" stroke="#e2e1dc" stroke-dasharray="3 3"/><text x="4" y="24" class="t">100%</text>
+  <line x1="40" y1="95" x2="630" y2="95" stroke="#e2e1dc" stroke-dasharray="3 3"/><text x="10" y="99" class="t">50%</text>
+  <!-- groups: x start, meter, fitted -->
+  <g><rect x="55" y="32" width="26" height="138" fill="#52514e"/><rect x="83" y="41" width="26" height="129" fill="#2a78d6"/><text x="60" y="186" class="t">Aug 16</text></g>
+  <g><rect x="140" y="47" width="26" height="123" fill="#52514e"/><rect x="168" y="52" width="26" height="118" fill="#2a78d6"/><text x="145" y="186" class="t">Aug 23</text></g>
+  <g><rect x="225" y="108" width="26" height="62" fill="#52514e"/><rect x="253" y="71" width="26" height="99" fill="#eb6834"/><text x="230" y="186" class="t">Aug 30</text></g>
+  <g><rect x="310" y="92" width="26" height="78" fill="#52514e"/><rect x="338" y="95" width="26" height="75" fill="#2a78d6"/><text x="318" y="186" class="t">Sep 6</text></g>
+  <g><rect x="395" y="112" width="26" height="58" fill="#52514e"/><rect x="423" y="168" width="26" height="2" fill="#e34948"/><text x="400" y="186" class="t">Sep 13</text></g>
+  <g><rect x="480" y="78" width="26" height="92" fill="#52514e"/><rect x="508" y="88" width="26" height="82" fill="#2a78d6"/><text x="485" y="186" class="t">Sep 20</text></g>
+  <g><rect x="565" y="117" width="26" height="53" fill="#52514e"/><rect x="593" y="121" width="26" height="49" fill="#2a78d6"/><text x="560" y="186" class="t">Sep 27*</text></g>
+  <text x="80" y="36" class="v">.93</text><text x="165" y="47" class="v">.96</text><text x="248" y="66" class="v">1.61</text><text x="335" y="90" class="v">.96</text><text x="420" y="163" class="v">.03</text><text x="505" y="83" class="v">.90</text><text x="590" y="116" class="v">.94</text>
+  <rect x="45" y="198" width="10" height="8" fill="#52514e"/><text x="59" y="206" class="t">Claude weekly meter (final reading)</text>
+  <rect x="260" y="198" width="10" height="8" fill="#2a78d6"/><text x="274" y="206" class="t">fitted estimate from the ledger; the number above is fitted ÷ meter</text>
+</svg>
+<figcaption>Figure 2. The fitted rates reproduce the Claude meter within 4–10% in five of seven weeks. Sep 13 is the known ledger bug (#1658: about 4,500 turns lost to database-lock errors between Sep 2 and 22); the screen shows that week as "Not in the ledger: 37.5 points". In the Aug 30 week the estimate exceeds the meter by 61%, cause unknown, and the screen says the estimates run high. *Sep 27 is the current week, 2.1 days in.</figcaption>
+</figure>
+
+<h3>2. Which ticket a turn belongs to</h3>
+<p>Each model turn and each second of agent time is assigned to one thread by the first rule that applies:</p>
+<ol>
+<li><b>The agent's claims at that minute.</b> If it holds several, the most recently taken wins. A PR claim counts toward the ticket the PR links to.</li>
+<li><b>Its parent agent's claim</b>, by the same rule; this covers helpers that do not claim.</li>
+<li><b>A ticket or PR number in the agent's name</b> (<code>1787-spec-reviewer</code>, <code>sm-1662-spec-author</code>) that exists in that repo. Reviewers and scouts do not claim, so this rule catches most of them.</li>
+<li>Otherwise <b>"No ticket"</b> under the repo of the agent's working folder.</li>
+</ol>
+
+<figure>
+<svg viewBox="0 0 640 150" role="img" aria-label="Attribution of minutes when an agent holds several claims">
+  <style>.a{font:11px -apple-system,Helvetica,Arial,sans-serif;fill:#0b0b0b}.b{font:10px -apple-system,Helvetica,Arial,sans-serif;fill:#52514e}</style>
+  <text x="4" y="22" class="a">#1805</text><rect x="70" y="12" width="560" height="12" fill="#e2e1dc"/>
+  <text x="4" y="42" class="a">#1747</text><rect x="110" y="32" width="520" height="12" fill="#e2e1dc"/>
+  <text x="4" y="62" class="a">#1827</text><rect x="222" y="52" width="120" height="12" fill="#e2e1dc"/>
+  <text x="4" y="82" class="a">PR #1828</text><rect x="238" y="72" width="232" height="12" fill="#e2e1dc"/><text x="476" y="82" class="b">links to #1827</text>
+  <text x="4" y="110" class="a">goes to</text>
+  <rect x="70" y="100" width="40" height="12" fill="#4a3aa7"/><rect x="110" y="100" width="112" height="12" fill="#2a78d6"/><rect x="222" y="100" width="248" height="12" fill="#008300"/><rect x="470" y="100" width="160" height="12" fill="#2a78d6"/>
+  <text x="72" y="128" class="b">#1805</text><text x="140" y="128" class="b">#1747</text><text x="290" y="128" class="b">#1827 (its own claim, then via PR #1828)</text><text x="520" y="128" class="b">#1747</text>
+  <text x="66" y="146" class="b">23:35</text><text x="104" y="146" class="b">23:40</text><text x="216" y="146" class="b">23:54</text><text x="330" y="146" class="b">00:09</text><text x="458" y="146" class="b">00:24</text>
+</svg>
+<figcaption>Figure 3. A Codex engineer from Sunday night holding four claims (times real, links illustrative). Each minute goes to the most recently taken claim still open; after PR #1828 merges, the minutes fall back to #1747. Splitting evenly would have spread 00:30's work across #1805 and #1747 although the agent was working on only one of them.</figcaption>
+</figure>
+
+<p>Claims have been recorded explicitly only since Sep 25. Before that, sm reconstructed PR claims from history, and those stay open until the agent retires, so older weeks attribute less precisely. The rows still add up correctly; only the ticket-level split is rougher.</p>
+
+<h3>3. Time</h3>
+<p>The Time section uses the same drill-down. Each row's bar shows what the agents' active time went to. The header states the parked hours separately, so finished agents left running do not drown out the rest.</p>
+
+<div class="phones">
+  <div class="phone">
+    <div class="tb">←<span>Analytics</span><span class="sp"></span>⋮</div>
+    <div class="seg"><span>Spend</span><span class="on">Time</span><span>Queue</span></div>
+    <div class="chips"><span class="chip">24 h</span><span class="chip on">7 days</span><span class="chip">30 days</span></div>
+    <div class="card">
+      <div class="big num">533 h <span class="dim" style="font-size:11px;font-weight:400">active agent time</span></div>
+      <div class="dim">257 agents · plus 216 h parked</div>
+      <div class="bar" style="height:9px"><i class="c-you" style="width:39.1%"></i><i class="c-queue" style="width:28.9%"></i><i class="c-model" style="width:14.9%"></i><i class="c-tools" style="width:9.5%"></i><i class="c-idle" style="width:4.1%"></i><i class="c-review" style="width:3.3%"></i></div>
+      <div class="leg"><span><i class="c-you"></i>you 39%</span><span><i class="c-queue"></i>queue 29%</span><span><i class="c-model"></i>model 15%</span><span><i class="c-tools"></i>tools 10%</span><span><i class="c-idle"></i>idle 4%</span><span><i class="c-review"></i>review 3%</span></div>
+    </div>
+    <div class="sec">BY REPO</div>
+    <div class="row"><div class="l"><b>fractal-algo-rust</b><span class="num">466 h</span></div>
+      <div class="bar"><i class="c-you" style="width:43%"></i><i class="c-queue" style="width:31%"></i><i class="c-model" style="width:12%"></i><i class="c-tools" style="width:8%"></i><i class="c-idle" style="width:4%"></i><i class="c-review" style="width:2%"></i></div></div>
+    <div class="row"><div class="l"><b>session-manager</b><span class="num">58 h</span></div>
+      <div class="bar"><i class="c-model" style="width:4%"></i><i class="c-queue" style="width:2.2%"></i><i class="c-tools" style="width:2.2%"></i><i class="c-you" style="width:1.6%"></i><i class="c-review" style="width:1.6%"></i><i class="c-idle" style="width:.8%"></i></div></div>
+    <div class="row"><div class="l"><b>4 more repos</b><span class="num">7 h</span></div></div>
+  </div>
+
+  <div class="phone">
+    <div class="tb">←<span>Analytics</span><span class="sp"></span>⋮</div>
+    <div class="seg"><span>Spend</span><span class="on">Time</span><span>Queue</span></div>
+    <div class="crumb">… › #1620 › sm-1637-engineer</div>
+    <div class="card">
+      <div class="big num">2 h 11 m <span class="dim" style="font-size:11px;font-weight:400">active</span></div>
+      <div class="dim">Astra · 53 turns · 6 PRs merged · then parked 8 m</div>
+      <div class="bar" style="height:9px"><i class="c-model" style="width:33%"></i><i class="c-review" style="width:30%"></i><i class="c-queue" style="width:20%"></i><i class="c-idle" style="width:10%"></i><i class="c-tools" style="width:7%"></i></div>
+      <table>
+        <tr><td>Model working</td><td class="num">44 m</td><td class="num">33%</td></tr>
+        <tr><td>Waiting on Codex review</td><td class="num">39 m</td><td class="num">30%</td></tr>
+        <tr><td>Waiting on queue jobs</td><td class="num">27 m</td><td class="num">20%</td></tr>
+        <tr><td>Idle, nothing pending</td><td class="num">14 m</td><td class="num">10%</td></tr>
+        <tr><td>Tools</td><td class="num">8 m</td><td class="num">7%</td></tr>
+        <tr><td class="mut">&nbsp;&nbsp;approval checks</td><td class="num">5 m</td><td></td></tr>
+        <tr><td class="mut">&nbsp;&nbsp;git, reading, sm</td><td class="num">3 m</td><td></td></tr>
+      </table>
+      <span class="btn">Open agent</span>
+    </div>
+  </div>
+
+  <div class="phone">
+    <div class="tb">←<span>Analytics</span><span class="sp"></span>⋮</div>
+    <div class="seg"><span>Spend</span><span>Time</span><span class="on">Queue</span></div>
+    <div class="sec">STOPPED BY THE QUEUE · LAST 24H</div>
+    <div class="row"><div class="l"><b>✕ 1790-rebuild-rty</b><span class="dim">2h ago</span></div><div class="s">1790-engineer · background · ran past its 3600s limit</div></div>
+    <div class="row"><div class="l"><b>⌛ 1812-gate</b><span class="dim">5h ago</span></div><div class="s">1812-engineer · tests · never started; gave up after 300s</div></div>
+    <div class="row"><div class="l"><b>✕ perf-bench</b><span class="dim">9h ago</span></div><div class="s">1771-engineer · perf · over its memory limit</div></div>
+    <div class="sec">HELD BACK?  <span class="chip on" style="font-size:9px">7 d</span></div>
+    <div class="card dim">Limits held jobs 33 h.<br>Perf rules held jobs 38 h (by design).<br>Background jobs peak at 4.1G each (95th percentile).</div>
+    <div class="row"><div class="l"><b>Mac usage over time</b><span>›</span></div></div>
+    <div class="sec" style="margin-top:14px">QUEUE TAB, TOP</div>
+    <div class="card"><div class="dim">MEM ▮▮▮▯ CPU ▮▯▯▯ GPU ▯▯▯▯</div><div style="color:#FBBF24;margin-top:4px">3 stopped in the last 24h ›</div></div>
+  </div>
+</div>
+<p class="small" style="text-align:center">Figure 4. Time for the last 7 days and one Codex engineer (real figures); Analytics › Queue (the rows are illustrative) and the new line on the Queue tab.</p>
+
+<p><b>The buckets and where each comes from.</b></p>
+<table>
+<thead><tr><th style="width:24%">Bucket</th><th>What it means</th><th style="width:30%">Source</th></tr></thead>
+<tbody>
+<tr><td>Model working</td><td>Inside a turn, not running a tool: thinking and writing.</td><td>Transcripts. <b>New: copy into activity.db</b></td></tr>
+<tr><td>Tools, by kind</td><td>Inside a turn, a tool running: reading code, editing, git and GitHub, sm commands, builds and tests run inline, other shell, subagents, web and browser, Codex approval checks.</td><td>Transcripts: exact start and end for every tool call. <b>New: copy</b></td></tr>
+<tr><td>Waiting on queue jobs</td><td>Between turns, while a queue job it submitted is queued or running.</td><td><code>queue_jobs</code> (exists)</td></tr>
+<tr><td>Waiting on Codex review</td><td>Between turns, while a Codex review it requested has not landed.</td><td>Review registrations (exists)</td></tr>
+<tr><td>Waiting on you</td><td>Between turns, while its message to you, its doc review request, or its in-session question is unanswered.</td><td>Owner messages and doc reviews (exist); in-session questions: the next prompt came from you (derived)</td></tr>
+<tr><td>Waiting on agents</td><td>Between turns, while agents it spawned are still working.</td><td>Parent links in the usage DB (exist)</td></tr>
+<tr><td>Idle</td><td>Between turns, holding a claim, with nothing recorded pending.</td><td>Remainder</td></tr>
+<tr><td>Parked <span class="small">(not in the bars)</span></td><td>Between turns after all its claims ended, with nothing pending.</td><td>Remainder</td></tr>
+</tbody>
+</table>
+<p>Two rules keep this honest. A queue job counts as waiting only while the agent is idle between turns: the sample Claude engineer ran 13 test jobs but waited on them for only 3.5 minutes, because it kept working while they ran. When an idle agent waits on two things at once, for example tests and a review, the time goes to the one that finished last.</p>
+<p><b>What is not measured:</b> time a tool spends waiting on your permission prompt counts as that tool's time (the transcripts do not mark it), and time before an agent's first turn (spawn and boot) is not counted.</p>
+
+<h3>4. Queue diagnostics move</h3>
+<p>"Stopped by the queue · last 24h" (up to 50 rows, always expanded) and "Held back?" (shown even when empty, with its 24 h / 7 d / 30 d chips) move unchanged into Analytics › Queue, including the job sheet that opens on tap. The Queue tab keeps the meter, Running and Queued. When at least one job stopped in the last 24 hours, one amber line under the meter reads "<i>N</i> stopped in the last 24h ›" and opens Analytics › Queue. No server change is needed: both cards already have endpoints.</p>
+
+<h3>5. What leaves the current screen</h3>
+<table>
+<thead><tr><th style="width:30%">Card today</th><th>Fate, and why</th></tr></thead>
+<tbody>
+<tr><td>Work overview ("Right now", "Last 24 hours")</td><td>Delete. The right-now counts repeat Queue and Watch; the 24-hour counts become Spend and Time.</td></tr>
+<tr><td>Live load, Provider split, Longest running</td><td>Delete. Watch shows the same live data.</td></tr>
+<tr><td>Reliability and health checks</td><td>Delete. <code>health_checks</code> is hardcoded empty, "attach ready" is hardcoded true, and restarts are counted by grepping a Python-era log line.</td></tr>
+<tr><td>Messaging &amp; dispatches, Throughput</td><td>Delete. Counts sends, spawns and "tracks", a Python-era feature last used in June.</td></tr>
+<tr><td>Repository contribution</td><td>Replaced by Spend.</td></tr>
+<tr><td>Load, Coordination</td><td>Delete. Never shown on screen today.</td></tr>
+</tbody>
+</table>
+
+<h3>6. sm web</h3>
+<p>sm web (Inbox, Watch, History, Guestbook) has no Queue or Analytics page today. I recommend not adding one in this work. The Spend and Time endpoints return plain JSON that a server-rendered page could use later; that would be one ticket if you want it.</p>
+
+<h3>7. Tickets</h3>
+<table>
+<thead><tr><th style="width:5%">#</th><th>Ticket</th><th style="width:22%">Needs first</th><th style="width:18%">Tier</th></tr></thead>
+<tbody>
+<tr><td>1</td><td><b>Server: Spend.</b> Rate table, attribution rules, scaling to the meter, cloud reviews, <code>GET /client/analytics/spend</code>.</td><td>—</td><td>Mid</td></tr>
+<tr><td>2</td><td><b>Server: activity recorder.</b> Reads Claude and Codex transcripts into <code>activity.db</code> (turns and tool spans), incrementally, keeps 90 days, and backfills whatever transcripts still exist.</td><td>—</td><td>Mid</td></tr>
+<tr><td>3</td><td><b>App: Analytics shell and Queue move.</b> Spend / Time / Queue sections, queue cards moved, Queue tab link, old cards deleted.</td><td>#1659 merged</td><td>Mid</td></tr>
+<tr><td>4</td><td><b>Server: Time.</b> Gap classification, waits, <code>GET /client/analytics/time</code>.</td><td>1, 2</td><td>Mid</td></tr>
+<tr><td>5</td><td><b>App: Spend view</b> with the shared drill-down list; deletes the old server endpoint.</td><td>1, 3</td><td>Mid</td></tr>
+<tr><td>6</td><td><b>App: Time view.</b></td><td>4, 5</td><td>Mid</td></tr>
+</tbody>
+</table>
+<p>Tickets 1, 2 and 3 touch separate files and run in parallel. Transcripts older than about 30 days are already gone, and every day before ticket 2 ships loses another day of timing history. Refitting the rates when a new model appears is a small follow-up I recommend deferring: until then, an unknown model is priced like its provider's standard model (Opus or Sol) and the screen says so.</p>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p>This is the first revision.</p>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<div class="toc">
+<div><a href="#a">A. Data sources, verified</a></div>
+<div><a href="#b">B. Converting tokens to percent of the week</a></div>
+<div><a href="#c">C. Attribution rules</a></div>
+<div><a href="#d">D. The activity recorder</a></div>
+<div><a href="#e">E. Classifying time</a></div>
+<div><a href="#f">F. Endpoints and payloads</a></div>
+<div><a href="#g">G. Android</a></div>
+<div><a href="#h">H. Deletions</a></div>
+<div><a href="#i">I. Tickets in full</a></div>
+<div><a href="#j">J. Tests: every behaviour to a test</a></div>
+<div><a href="#z">Z. FAQ</a></div>
+</div>
+
+<h3 id="a">A. Data sources, verified</h3>
+<p>All figures in the memo come from <code>.backup</code> copies of the live databases taken 2026-09-29 12:13 PDT. Paths are under <code>~/.local/share/claude-sessions/</code>.</p>
+<table>
+<thead><tr><th>Store</th><th>Table / file</th><th>Used for</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><td><code>usage.db</code></td><td><code>message_ledger</code></td><td>Spend: one row per model turn</td><td>328,169 rows, 2026-06-05 → now. Columns used: <code>msg_id, seat_id, account_key, project_key, bucket_ts</code> (minute), <code>model, effort, input_tokens, output_tokens, reasoning_tokens</code> (a subset of output), <code>cache_write_5m, cache_write_1h, cache_read_tokens, total_tokens, credit_metered</code>. Exclude <code>model = '&lt;synthetic&gt;'</code>. <code>seat_id = 'unassigned'</code> exists (26 rows last week) and is shown as agent "Unassigned".</td></tr>
+<tr><td></td><td><code>burn_samples</code></td><td>Meter readings</td><td>Weekly meters: <code>window_kind='weekly_all'</code> (Claude) and <code>'codex_10080'</code> (Codex), <code>window_scope IS NULL</code>. <code>weekly_scoped</code> and <code>codex_bengalfox</code> scoped rows are ignored.</td></tr>
+<tr><td></td><td><code>message_window</code></td><td>Which weekly window a turn belongs to</td><td>Keyed <code>(msg_id, window_kind)</code>; same join as <code>usage_report.rs::load_window_rows</code>.</td></tr>
+<tr><td></td><td><code>seat_meta</code></td><td>Agent names and parents</td><td>Latest <code>friendly_name</code> per seat, <code>parent_seat_id</code>.</td></tr>
+<tr><td></td><td><code>seat_sessions</code></td><td>Transcript paths for the recorder</td><td><code>(seat_id, provider, provider_session_id, artifact_path)</code>; providers <code>claude</code>, <code>codex</code>, <code>codex-fork</code>, <code>codex-app</code>.</td></tr>
+<tr><td><code>message_queue.db</code></td><td><code>work_claims</code></td><td>Attribution</td><td>Ignore rows with <code>reserved_at</code> set (spawn reservations; none today). Sources: <code>explicit</code> since 2026-09-25, <code>backfill</code> before.</td></tr>
+<tr><td></td><td><code>work_links</code>, <code>work_items</code></td><td>PR → ticket; titles and states</td><td>As in <code>work_history.rs</code>.</td></tr>
+<tr><td></td><td><code>codex_review_request_registrations</code></td><td>Cloud reviews (Spend); review waits (Time)</td><td>2,766 completed of 2,872.</td></tr>
+<tr><td></td><td><code>owner_messages</code>, <code>owner_message_replies</code></td><td>Waiting on you</td><td></td></tr>
+<tr><td></td><td><code>owner_doc_publishes</code>, <code>owner_doc_reviews</code></td><td>Waiting on you (doc reviews)</td><td></td></tr>
+<tr><td></td><td><code>message_queue</code></td><td>Telling sm deliveries apart from your typing</td><td><code>target_session_id, sender_session_id, delivered_at, message_category</code>.</td></tr>
+<tr><td><code>queue-runner/queue_runner.db</code></td><td><code>queue_jobs</code></td><td>Queue waits</td><td>The live file is under <code>queue-runner/</code>; the top-level <code>queue_runner.db</code> is an empty stub.</td></tr>
+<tr><td>Transcripts</td><td>Claude <code>~/.claude/projects/*/&lt;uuid&gt;.jsonl</code>; Codex rollout <code>~/.codex/sessions/…/rollout-*.jsonl</code>; codex-fork <code>logs/&lt;id&gt;.codex-fork.events.jsonl</code></td><td>Turns and tool timings</td><td>Formats in Appendix D. Claude Code deletes transcripts after about 30 days.</td></tr>
+<tr><td><code>tool_usage.db</code></td><td><code>tool_usage</code></td><td>Not used</td><td>0 rows; no hook posts to <code>/hooks/tool-use</code>. See Z.3.</td></tr>
+</tbody>
+</table>
+
+<h3 id="b">B. Converting tokens to percent of the week</h3>
+<h4>B.1 Rate table</h4>
+<p>A new module <code>crates/sm-server/src/quota_rates.rs</code> holds this table as constants, with <code>FITTED_AT = "2026-09-29"</code>. Model family is the first of these substrings found in the lower-cased model name: <code>fable, opus, sonnet, haiku, astra, sol, terra, luna</code>.</p>
+<table>
+<thead><tr><th>Provider</th><th>Weighted tokens per turn</th><th>Rate: % of a week per million weighted tokens</th></tr></thead>
+<tbody>
+<tr><td>Claude</td><td><code>input + 8·output + 1.25·cache_write_5m + 2·cache_write_1h + 0.02·cache_read</code></td><td>fable 0.648 · opus 0.167 · sonnet 0.100 · haiku 0.033 · any other: opus</td></tr>
+<tr><td>Codex</td><td><code>input + 8·output + 0.10·cache_read</code> (Codex's output already includes reasoning)</td><td>astra 0.683 · sol 0.228 · terra 0.137 · luna 0.030 · any other (<code>unknown</code>, <code>codex-auto-review</code>, new models): sol</td></tr>
+<tr><td>Codex cloud review</td><td>one per registration with <code>review_landed_at</code> set</td><td>0.05 each</td></tr>
+</tbody>
+</table>
+<p>How the rates were fitted: meter increments (per-window running maximum, differenced in 6-hour slices for Claude and 3-hour slices for Codex) were regressed by least squares, without intercept, on weighted tokens per model family, over periods where the ledger is complete (Aug 16 – Sep 2 and Sep 23 on). Claude R² 0.94 at 6 h; Codex R² 0.88 at 3 h. Sonnet, Haiku and Luna have too little volume to fit, so they are set from list-price ratios (Sonnet 0.6× Opus, Haiku 0.2× Opus, Luna about 0.13× Sol). Cloud reviews fitted at 0.049–0.051 ± 0.009.</p>
+<h4>B.2 Scaling to the meter</h4>
+<p>For each account and each weekly window <code>w</code> (from <code>burn_samples</code>: the latest sample's <code>percent</code> is the meter <code>M_w</code>):</p>
+<pre>F_w   = Σ fitted % of every ledger turn of that account in w  (+ 0.05 × cloud reviews landed in w, Codex only)
+s_w   = clamp(M_w / F_w, 0.8, 1.25)          (s_w = 1 when F_w = 0)
+row % = s_w × fitted % of the row's turns in w
+gap_w = M_w − s_w × F_w                      shown as the row "Not in the ledger" when gap_w ≥ 0.1;
+                                             when gap_w ≤ −0.1, a note "Estimates exceed the meter by |gap_w| points"</pre>
+<p>The meter a cloud review counts against is the Codex account active at <code>review_landed_at</code> (<code>account_timeline</code>, provider <code>codex</code>, <code>from_ts ≤ t &lt; to_ts</code>). A turn's window is its <code>message_window</code> row for <code>weekly_all</code> / <code>codex_10080</code>; a turn without one uses the window whose <code>[window_start, resets_at)</code> contains its <code>bucket_ts</code>, and if there is none, <code>s = 1</code>.</p>
+<p><b>Worked example, Claude this week.</b> <code>M = 35.0</code>, <code>F = 32.8</code>, so <code>s = 1.067</code> and the gap is 0. The 1787-spec-author seat has 141 Fable turns: output 0.36M, cache writes 0.9M (mostly 1-hour), cache reads 67M. Weighted tokens are 0.36·8 + 0.9·2 + 67·0.02 ≈ 6.0M. Fitted: 6.0 × 0.648 = 3.9%. Shown: 3.9 × 1.067 ≈ 4.1%.</p>
+<p><b>Worked example, Sep 13 week.</b> <code>M = 39</code>, <code>F = 1.2</code> (turns lost to #1658). <code>s = 1.25</code>, rows add up to 1.5, and "Not in the ledger" shows 37.5.</p>
+<h4>B.3 Ranges</h4>
+<ul>
+<li><b>This week</b>: per account, the current window (<code>resets_at &gt; now</code>). For Codex with two accounts active in overlapping windows, each account's rows are scaled to its own meter and summed. The header lists each account's meter.</li>
+<li><b>Last week</b>: per account, the window immediately before the current one.</li>
+<li><b>4 weeks</b>: turns with <code>bucket_ts</code> in the last 28 days, each scaled by its own window. The total is shown as "% of a week" and can exceed 100.</li>
+</ul>
+<p><b>Header pace line</b> (this week only): burn per second = <code>M / (observed_at − window_start)</code>. If <code>M + rate × (resets_at − observed_at) ≥ 100</code>, show "at this pace runs out &lt;weekday, morning/afternoon/evening&gt;" at the time the meter reaches 100; otherwise show "on pace for N%". Suppress it in the first hour of a window, the same rule as <code>usage_report.rs::build_projection</code>. If the latest sample is more than 10 minutes old, show "meter from &lt;age&gt; ago".</p>
+
+<h3 id="c">C. Attribution rules</h3>
+<p>One module, <code>crates/sm-server/src/work_attribution.rs</code>, used by both Spend and Time. Input: seat id, instant <code>t</code>, the seat's working-folder repo. Output: <code>(repo, thread_number | None, basis)</code>, where <code>basis ∈ {claim, parent, name, none}</code>.</p>
+<ol>
+<li><b>Claim.</b> Active claims of the seat at <code>t</code>: <code>claimed_at ≤ t &lt; ended_at</code> (open claims have no end), <code>reserved_at IS NULL</code>. Pick the one with the greatest <code>claimed_at</code>; on a tie, the greatest <code>id</code>. Map it to a thread: a ticket is its own thread. A PR goes to its linked tickets from <code>work_links</code> (either source); if one of them is also actively claimed by this seat at <code>t</code>, that one, otherwise the lowest-numbered. A PR with no link is its own thread. Repo is the claim's <code>repo</code>.</li>
+<li><b>Parent.</b> Apply rule 1 to the seat's parent (<code>seat_meta.parent_seat_id</code>, latest observation), then its grandparent, up to 5 levels.</li>
+<li><b>Name.</b> Find the first match of <code>(?:^|-)(\d{3,5})(?:-|$)</code> in the seat's latest <code>friendly_name</code>. If <code>work_items</code> has <code>(repo, number)</code> for the working-folder repo, map it as in rule 1 (PR → linked ticket).</li>
+<li><b>None.</b> Thread "No ticket" under the working-folder repo.</li>
+</ol>
+<p><b>Working-folder repo.</b> <code>project_key</code> is the absolute git common dir (worktrees collapse to the main repo) or a plain folder. Resolve it to <code>owner/name</code> once per distinct key with <code>git -C &lt;key&gt; remote get-url origin</code> and the existing GitHub URL parser used by <code>bin/git_repo</code> (move it into the library if needed). If that fails, use the folder's last path component with <code>.git</code> removed. Cache the result for the process lifetime. Repos are compared lower-cased (<code>work_claims::canonical_repo</code>).</p>
+<p><b>Spend granularity.</b> Ledger rows carry a minute (<code>bucket_ts</code>); evaluate the rules at that minute's start. A claim taken at 12:00:40 therefore first owns the 12:01 minute. <b>Time granularity:</b> evaluate at every span boundary and every claim start and end, so each second is exact.</p>
+<p><b>Cloud reviews</b> take the thread of <code>(repo, pr_number)</code> by the rule-1 PR mapping, not the requester's claims. The agent is <code>requester_session_id</code>, or "You" when it is null.</p>
+<h4>Worked examples</h4>
+<table>
+<thead><tr><th>Case</th><th>State at the minute</th><th>Goes to</th></tr></thead>
+<tbody>
+<tr><td>Two tickets</td><td>Holds #1805 (claimed 23:35) and #1747 (23:40); minute 23:45</td><td>#1747, basis claim</td></tr>
+<tr><td>PR linked to a held ticket</td><td>Holds #1827 (23:54) and PR #1828 (23:56), linked to #1827 and #1830; minute 23:58</td><td>#1827 (the linked ticket it also holds)</td></tr>
+<tr><td>PR outlives its ticket</td><td>#1827 closed 00:09; PR #1828 open until 00:24; minute 00:15</td><td>#1827 via the PR's link (the lowest linked ticket, since neither is held)</td></tr>
+<tr><td>Helper agent</td><td>Scout with no claims; parent holds #1662</td><td>#1662, basis parent</td></tr>
+<tr><td>Spec reviewer</td><td><code>1787-spec-reviewer</code>, no claims, parent holds none</td><td>#1787 if <code>work_items</code> knows it, basis name</td></tr>
+<tr><td>Ad-hoc session</td><td><code>comfy-ui</code> in <code>~/Pictures/qwen-image</code></td><td>qwen-image › No ticket</td></tr>
+</tbody>
+</table>
+
+<h3 id="d">D. The activity recorder</h3>
+<p>A new module <code>crates/sm-server/src/activity_ledger.rs</code> and a new SQLite file <code>activity.db</code>, configured as <code>activity.db_path</code> (default <code>~/.local/share/claude-sessions/activity.db</code>; add it to the installed config explicitly, as for the other stores). A separate file keeps its writes away from the usage ledger's lock contention (#1658). It runs on the same background cadence as the usage ledger scan, reading every <code>artifact_path</code> in <code>seat_sessions</code> incrementally by byte offset.</p>
+<pre>CREATE TABLE activity_turns (
+  seat_id TEXT NOT NULL, source_ref TEXT NOT NULL, provider TEXT NOT NULL,
+  started_at_ms INTEGER NOT NULL, ended_at_ms INTEGER NOT NULL,
+  prompt_at_ms INTEGER,            -- timestamp of the prompt line that opened the turn
+  PRIMARY KEY (source_ref, started_at_ms));
+CREATE TABLE activity_spans (
+  seat_id TEXT NOT NULL, source_ref TEXT NOT NULL,
+  started_at_ms INTEGER NOT NULL, ended_at_ms INTEGER NOT NULL,
+  kind TEXT NOT NULL,              -- see D.3
+  tool TEXT,                       -- raw tool name, for audit
+  item_id TEXT NOT NULL,           -- tool_use id / call id / item id: idempotent re-scan
+  PRIMARY KEY (source_ref, item_id));
+CREATE INDEX activity_turns_seat ON activity_turns(seat_id, started_at_ms);
+CREATE INDEX activity_spans_seat ON activity_spans(seat_id, started_at_ms);
+CREATE TABLE activity_scan_offsets (artifact_path TEXT PRIMARY KEY, byte_offset INTEGER NOT NULL,
+  mtime_ns INTEGER NOT NULL, pending_json TEXT, scanned_at TEXT NOT NULL);</pre>
+<p><code>pending_json</code> holds tool calls and turns opened but not yet closed at the offset, so a pair split across scans still joins. Advance the offset only after the batch commits. On a write error, retry next cycle from the old offset; never skip rows (the #1658 lesson). Delete rows with <code>ended_at_ms</code> older than 90 days daily. On first run, scan every existing file (backfill); expect about 20 s of CPU for a week of transcripts (the prototype took 19 s for 257 agents).</p>
+<h4>D.1 Turns</h4>
+<table>
+<thead><tr><th>Provider</th><th>Turn start</th><th>Turn end</th></tr></thead>
+<tbody>
+<tr><td>Claude</td><td><code>end − durationMs</code></td><td>the <code>type:"system", subtype:"turn_duration"</code> line's <code>timestamp</code> (field <code>durationMs</code>)</td></tr>
+<tr><td>Codex rollout</td><td><code>event_msg</code> with <code>payload.type:"task_started"</code></td><td><code>event_msg</code> <code>task_complete</code></td></tr>
+<tr><td>codex-fork events</td><td><code>event_type:"turn_started"</code> (<code>ts</code>)</td><td><code>event_type:"turn_complete"</code></td></tr>
+</tbody>
+</table>
+<p>A Claude turn with no <code>turn_duration</code> line (interrupted or crashed) ends at the last assistant or tool-result line before the next non-meta prompt, and starts at the prompt. <code>prompt_at_ms</code> is the timestamp of the last non-meta user prompt line (string content, or a <code>text</code> block; for Codex a <code>response_item</code> user <code>message</code>, or item type <code>userMessage</code>) at or before <code>start + 5 s</code>. Overlapping turns of one seat (two transcripts at once, e.g. after a fork) are merged at query time.</p>
+<h4>D.2 Tool spans</h4>
+<table>
+<thead><tr><th>Provider</th><th>Span</th></tr></thead>
+<tbody>
+<tr><td>Claude</td><td>assistant <code>tool_use</code> block (line <code>timestamp</code>, <code>id</code>, <code>name</code>, <code>input</code>) → user <code>tool_result</code> block with that <code>tool_use_id</code> (line <code>timestamp</code>).</td></tr>
+<tr><td>Codex rollout</td><td><code>event_msg</code> <code>item_completed</code>: <code>payload.started_at_ms</code> → <code>completed_at_ms</code>, <code>payload.item.type</code> (<code>CommandExecution</code> with <code>command</code> array, etc.); <code>response_item</code> <code>custom_tool_call</code> → <code>custom_tool_call_output</code> by <code>call_id</code> (<code>apply_patch</code>, <code>exec</code>).</td></tr>
+<tr><td>codex-fork</td><td><code>item/completed</code>: <code>payload.startedAtMs</code> (or <code>completedAtMs − item.durationMs</code>) → <code>completedAtMs</code>; <code>item.type</code> <code>commandExecution</code> (<code>command</code> string), <code>mcpToolCall</code>, <code>webSearch</code>, <code>fileChange</code>, <code>subAgentActivity</code>. <code>item/autoApprovalReview/completed</code>: <code>startedAtMs</code> → <code>completedAtMs</code>. Item types <code>reasoning</code>, <code>agentMessage</code>, <code>userMessage</code> and <code>contextCompaction</code> are not spans.</td></tr>
+</tbody>
+</table>
+<h4>D.3 Kinds</h4>
+<table>
+<thead><tr><th>kind</th><th>Label</th><th>Claude tools</th><th>Codex</th></tr></thead>
+<tbody>
+<tr><td><code>read</code></td><td>Reading code</td><td>Read, Grep, Glob, LSP</td><td>shell commands starting <code>cat sed rg grep ls head tail nl find wc</code></td></tr>
+<tr><td><code>edit</code></td><td>Editing</td><td>Edit, Write, NotebookEdit, MultiEdit</td><td><code>apply_patch</code>, <code>fileChange</code></td></tr>
+<tr><td><code>git</code></td><td>Git &amp; GitHub</td><td colspan="2">shell command whose first word is <code>git</code> or <code>gh</code></td></tr>
+<tr><td><code>sm</code></td><td>sm commands</td><td colspan="2">first word <code>sm</code></td></tr>
+<tr><td><code>build</code></td><td>Builds &amp; tests inline</td><td colspan="2">first word matches <code>cargo gradle ./gradlew npm npx pytest make</code>, <code>python -m pytest</code>, or starts <code>scripts/test</code></td></tr>
+<tr><td><code>shell</code></td><td>Other shell</td><td>other Bash</td><td>other commands; <code>exec</code> wrapper time not covered by an inner command</td></tr>
+<tr><td><code>subagent</code></td><td>Subagents</td><td>Agent, Task</td><td><code>subAgentActivity</code></td></tr>
+<tr><td><code>web</code></td><td>Web &amp; browser</td><td>WebFetch, WebSearch, <code>mcp__*</code></td><td><code>webSearch</code>, <code>mcpToolCall</code></td></tr>
+<tr><td><code>approval</code></td><td>Approval checks</td><td>—</td><td><code>autoApprovalReview</code></td></tr>
+<tr><td><code>other</code></td><td>Other tools</td><td>anything else</td><td>anything else</td></tr>
+</tbody>
+</table>
+<p>Shell classification: strip a leading <code>/bin/zsh -lc</code> wrapper and its quotes, strip leading <code>cd … &amp;&amp;</code> / <code>cd …;</code> segments, then take the first word. Store the kind at scan time, so later rule changes apply only to new rows; a <code>kind_version</code> is not needed.</p>
+
+<h3 id="e">E. Classifying time</h3>
+<p>For one seat and a range <code>[R0, R1)</code>:</p>
+<ol>
+<li><b>Timeline.</b> Merge the seat's turns. The timeline runs from the first turn start to the last turn end, or to <code>now</code> if the session is not stopped. Clip everything to the range.</li>
+<li><b>Inside a turn.</b> Each instant covered by tool spans goes to the span with the latest start; on a tie, the latest end. That is the innermost span, so a Codex <code>exec</code> wrapper yields to the command inside it. Everything else is <code>model</code>.</li>
+<li><b>Between turns.</b> Collect the seat's waits (below). Each instant with at least one open wait goes to the open wait with the latest end (a still-open wait ends at +∞); on a tie, in the order you › review › queue › agents.</li>
+<li><b>No wait open.</b> If the seat holds an active claim, the instant is <code>you</code> when the gap ended with a prompt from you, otherwise <code>idle</code>. If it holds no claim now but held one earlier in its life, it is <code>parked</code>. If it never held a claim, the same test applies as with a claim: <code>you</code> or <code>idle</code>.</li>
+</ol>
+<table>
+<thead><tr><th>Wait</th><th>Opens</th><th>Closes</th></tr></thead>
+<tbody>
+<tr><td>queue</td><td><code>queue_jobs.queued_at</code>, jobs with <code>requester_session_id</code> or <code>notify_session_id</code> = seat and <code>type ≠ 'service'</code></td><td><code>completion_notified_at</code>, else <code>finished_at</code>, else open</td></tr>
+<tr><td>review</td><td><code>requested_at</code>, registrations with requester or notify = seat</td><td><code>review_landed_at</code>, else <code>superseded_at</code>, else (<code>is_active = 0</code>) <code>last_polled_at</code>, else open</td></tr>
+<tr><td>you (message)</td><td><code>owner_messages.created_at</code>, sender = seat</td><td>first <code>owner_message_replies.created_at</code>, else <code>handled_at</code>, else open</td></tr>
+<tr><td>you (doc review)</td><td><code>owner_doc_publishes.published_at</code>, <code>session_id</code> = seat, <code>review_requested = 1</code></td><td>first <code>owner_doc_reviews.submitted_at ≥ published_at</code> for the doc, else <code>review_dismissed_at</code>, else open</td></tr>
+<tr><td>agents</td><td>a child seat's (<code>seat_meta.parent_seat_id</code> = seat) first turn start</td><td>its last turn end, or open while it is alive and in a turn</td></tr>
+</tbody>
+</table>
+<p><b>A prompt from you</b>: the turn's <code>prompt_at</code> matches an <code>owner_message_replies</code> row delivered to the seat within 20 s, or matches no <code>message_queue</code> row with <code>target_session_id</code> = seat and <code>delivered_at</code> within 20 s. sm types every delivery into the terminal, so the transcript alone cannot tell them apart.</p>
+<p><b>Thread.</b> Each classified interval is attributed by Appendix C at each instant, so an agent's time splits across the threads it worked on.</p>
+<h4>Worked example (sm-1647-inbox-engineer, 2026-09-29, times UTC)</h4>
+<table>
+<thead><tr><th>Interval</th><th>What happened</th><th>Bucket</th><th>Thread</th></tr></thead>
+<tbody>
+<tr><td>05:30:44–05:36:24</td><td>Turn: reads the review, edits the doc memo</td><td>model + tools</td><td>PR #1646 (claimed 05:31:03)</td></tr>
+<tr><td>05:36:24–05:40:58</td><td>Published the doc with review requested at 05:36:02; you replied at 05:40:58</td><td>you (doc review)</td><td>#1646</td></tr>
+<tr><td>05:42–05:56</td><td>Turn: implements; tests run as queue jobs while it keeps working</td><td>model + tools (not queue)</td><td>#1647 (claimed 05:42:35, latest)</td></tr>
+<tr><td>06:14:08–06:18:13</td><td>Idle; Codex review for PR #1649 requested, lands 06:11; its delivery ends the gap</td><td>idle (the review had landed before the gap began)</td><td>#1647 (via PR #1649)</td></tr>
+<tr><td>06:25:12–06:27:55</td><td>Idle, claims still open (PR #1650 merges 06:27:55)</td><td>you (the next prompt is yours)</td><td>#1648</td></tr>
+<tr><td>06:27:55–17:43:44</td><td>All claims ended; you ask "Ready to retire?" at 17:43</td><td>parked</td><td>session-manager › No ticket</td></tr>
+</tbody>
+</table>
+<p>Totals: 12.2 h timeline = 57 min active + 11.3 h parked. Active: model 29.5 min, tools 12.3 min, you 7.4, review 4.5, queue 3.5, idle 0.3.</p>
+
+<h3 id="f">F. Endpoints and payloads</h3>
+<p>Both are <code>GET</code>, authenticated like <code>/client/queue</code> (mobile Cloudflare Access plus session read), return JSON, and cache the computed result in memory for 60 s per parameter set. Handlers go in a new <code>crates/sm-server/src/http/analytics.rs</code>, with one route line each in the router in <code>http.rs</code>. Target: under 500 ms for a week on live data.</p>
+<h4>F.1 <code>GET /client/analytics/spend?provider=claude|codex&amp;range=week|last_week|4w</code></h4>
+<p>Defaults: <code>provider</code> = the provider whose current weekly meter is higher; <code>range=week</code>. Other values return 400.</p>
+<pre>{
+  "generated_at": "2026-09-29T19:20:00Z",
+  "provider": "claude", "range": "week",
+  "start": "2026-09-27T16:00:00Z", "end": "2026-10-04T16:00:00Z",
+  "meters": [{ "account_key": "claude:0e22…", "label": "rajeshgoli@gmail.com",
+               "percent": 35.0, "observed_at": "…", "resets_at": "…",
+               "fitted_percent": 32.8, "scale": 1.067,
+               "pace": { "kind": "runs_out", "at": "2026-10-03T18:00:00Z" } }],
+  "total": { "percent": 35.0, "tokens": 2674000000 },
+  "basis": { "claim": 29.8, "parent": 0.0, "name": 3.6, "none": 1.6 },
+  "parts_legend": [{ "key": "opus", "label": "Opus" }, { "key": "fable", "label": "Fable" },
+                   { "key": "sonnet", "label": "Sonnet" }, { "key": "review", "label": "Cloud reviews" }],
+  "notes": ["gpt-7-x has no fitted rate; priced as Sol"],
+  "root": Node
+}
+Node = {
+  "id": "r:rajeshgoli/fractal-algo-rust" | "t:rajeshgoli/fractal-algo-rust#1787" | "t:…#none" | "a:6d4cbf0a" | "gap",
+  "kind": "root" | "repo" | "thread" | "agent" | "gap",
+  "label": "fractal-algo-rust" | "#1787 Pivot detector: …" | "1787-spec-author" | "Not in the ledger",
+  "state": "open" | "closed" | "merged" | null,        // thread
+  "history_path": "/t/rajeshgoli/fractal-algo-rust/1787" | null,
+  "session_id": "6d4cbf0a" | null, "session_status": "running" | "stopped" | null,   // agent
+  "percent": 6.17, "tokens": 312000000,
+  "parts": { "fable": 4.12, "opus": 2.05 },            // percent by model family (or "review")
+  "children": [Node],                                    // sorted by percent desc; agents have none
+  "models": [ { "model": "claude-fable-5-1", "effort": "xhigh", "turns": 141, "percent": 4.12,
+                "tokens": { "input": 10000, "output": 360000, "cache_write": 900000, "cache_read": 67000000 } } ]
+}</pre>
+<p>The tree is Root → Repo → Thread → Agent, returned whole (last week: 11 repos, 257 threads, 489 agent nodes). An agent appears under each thread it spent in. The gap node is a child of the root, present only when a gap ≥ 0.1 exists. For Codex, a cloud review adds the model <code>"codex-cloud-review"</code> to the requesting agent (agent "You" when the requester is null, <code>id "a:owner"</code>) with <code>turns</code> = review count and zero tokens.</p>
+<h4>F.2 <code>GET /client/analytics/time?range=24h|7d|30d</code></h4>
+<pre>{
+  "generated_at": "…", "range": "7d", "start": "…", "end": "…",
+  "total": { "active_seconds": 1918800, "parked_seconds": 776880, "agents": 257 },
+  "parts_legend": [ {"key":"model","label":"Model working"}, {"key":"tools","label":"Tools"},
+    {"key":"queue","label":"Waiting on queue"}, {"key":"review","label":"Waiting on review"},
+    {"key":"you","label":"Waiting on you"}, {"key":"agents","label":"Waiting on agents"},
+    {"key":"idle","label":"Idle"} ],
+  "tool_legend": [ {"key":"read","label":"Reading code"}, … as Appendix D.3 ],
+  "root": TNode
+}
+TNode = { "id", "kind", "label", "state", "history_path", "session_id", "session_status",   // as Node
+  "active_seconds": 7860, "parked_seconds": 456,
+  "parts": { "model": 2628, "tools": 474, "queue": 1596, "review": 2322, "you": 0, "agents": 0, "idle": 810 },
+  "tools": { "approval": 312, "git": 78, "read": 42, "sm": 30, "shell": 12 },
+  "turns": 53,                      // agents only
+  "children": [TNode] }</pre>
+<p>Keys with zero seconds are omitted from <code>parts</code> and <code>tools</code>. <code>active_seconds</code> equals the sum of <code>parts</code>. Parked seconds attach to the agent and its thread (usually "No ticket").</p>
+<h4>F.3 Queue: no change</h4>
+<p>Analytics › Queue uses the existing <code>GET /client/queue</code> (its <code>ended</code> array: the 50 most recent jobs whose state is <code>displaced</code>, <code>wait_expired</code>, <code>memory_exceeded</code>, <code>process_limit_exceeded</code> or <code>timed_out</code> in the last 24 h; <code>http.rs:6994</code>) and <code>GET /client/queue/stats?hours=24|168|720</code> (<code>http.rs:2643</code>). The Queue tab's link count is <code>ended.size</code>, shown as "50+" at 50.</p>
+
+<h3 id="g">G. Android</h3>
+<ul>
+<li><b>Navigation.</b> Builds on #1659: <code>AppTopBar(title = "Analytics", onBack = …)</code>. Route <code>Routes.ANALYTICS</code> takes an optional argument <code>section = spend|time|queue</code>. With no argument it opens the last section used, stored in the app's preferences (first run: Spend). The Queue tab's link navigates with <code>section=queue</code>. Delete <code>Routes.ANALYTICS_DETAIL</code>.</li>
+<li><b>Section switch</b>: a three-way segmented control under the top bar.</li>
+<li><b>Spend controls</b>: provider chips Claude / Codex (default from the server when there is no stored choice; the choice is stored); a range chip opening a menu with This week / Last week / 4 weeks (stored). <b>Time controls</b>: 24 h / 7 days / 30 days chips (stored).</li>
+<li><b>Header card</b> at the root: big number (Spend: total percent "of the week used", or "of a week" for 4 weeks; Time: active hours), the pace line or the "N agents · plus H parked" line, a composition bar from <code>root.parts</code>, and a legend with values. For Codex with two meters: one line per account, "a@… 21% · b@… 4%".</li>
+<li><b>Drill-down list</b>: a breadcrumb line "All › repo › #N · value", then the children of the current node. Each row: label (one line, ellipsised), value right-aligned (Spend "6.2%", Time "7 h 12 m" / "44 m"), a 6 dp stacked bar whose width is the row's value ÷ the largest sibling's value and whose segments are <code>parts</code> in legend order, and a subtitle (repo: tokens or hours and thread count; thread: agent count and state; agent: main model and turns). Show at most 30 rows, then a "N more · value" row that expands in place.</li>
+<li><b>Tap</b> a repo or thread row to re-root there. Tap an agent row for the agent card: Spend shows the models table (tokens by type, share of the agent's percent) and siblings on the same thread; Time shows the bucket table with the tool kinds indented under Tools. Buttons: "Open agent" (the existing session detail navigation) and, on thread levels, "Ticket history" (opens <code>history_path</code> in the in-app reader; <code>/t/</code> is already allowed by <code>isOwnerPagePath</code>). Back pops one level before leaving the screen. A "Not in the ledger" row is not tappable.</li>
+<li><b>Colours</b> (from <code>ui/theme/Color.kt</code>). Spend: Opus Cyan, Fable Violet, Sonnet Emerald, Haiku Amber, Astra Fuchsia, Sol Cyan, Terra Emerald, Luna Amber, Cloud reviews Rose, other TextMuted. Time: model Cyan, tools Violet, queue Amber, review Fuchsia, you Rose, agents Emerald, idle BorderStrong.</li>
+<li><b>Refresh</b>: fetch when the section opens and on pull-to-refresh, with no timer. Keep the last payload per (section, parameters) in memory, so switching sections is instant.</li>
+<li><b>States</b>: loading shows the header skeleton; an error shows the existing error banner with Retry; an empty range shows "No agent activity in this range".</li>
+<li><b>Queue section</b>: move <code>SectionHeader("STOPPED BY THE QUEUE · LAST 24H")</code> with its <code>JobRow</code> items, <code>SectionHeader("HELD BACK?")</code> with <code>HeldBackCard</code> and its range chips, and <code>JobSheet</code>, from <code>ui/queue/QueueScreen.kt</code> into the Analytics Queue section, reusing <code>QueueViewModel</code>'s data calls. Add a row "Mac usage over time ›" navigating to <code>Routes.USAGE</code>. Remove both sections from the Queue tab and add the amber link line under <code>MeterPanel</code> when <code>ended</code> is non-empty.</li>
+</ul>
+
+<h3 id="h">H. Deletions</h3>
+<ul>
+<li><b>App (ticket 3)</b>: all of the current <code>ui/analytics/AnalyticsScreen.kt</code> content and <code>AnalyticsDetailScreen</code>; <code>AnalyticsViewModel</code>'s summary fetch; <code>SessionManagerRepository.fetchAnalytics</code>; <code>ApiService.getAnalyticsSummary</code>; <code>ApiModels</code> <code>Analytics*</code> classes and <code>WorkloadMetrics</code>; <code>Routes.ANALYTICS_DETAIL</code>.</li>
+<li><b>Server (ticket 5, after the app no longer calls it)</b>: <code>mobile_analytics.rs</code>, <code>lib.rs</code> module line, the <code>/client/analytics/summary</code> route and <code>client_analytics_summary</code> (<code>http.rs:1506, 2694</code>), its entries at <code>http.rs:11153, 14257, 19945</code> and test <code>mobile_analytics_activity_distribution_matches_workload_totals</code> (<code>http.rs:21154</code>), <code>tests/read_only_http.rs</code> references, and the <code>tests/unit/test_rust_migration_contracts.py</code> entry. <code>config.mobile_analytics</code> is also read at <code>http.rs:16278</code>; keep the config key unless that use goes too. Leave the historical <code>specs/762_*</code> artefacts and <code>scripts/rust_migration/*</code> untouched.</li>
+</ul>
+
+<h3 id="i">I. Tickets in full</h3>
+<table>
+<thead><tr><th>#</th><th>Scope and files</th><th>Done when</th></tr></thead>
+<tbody>
+<tr><td>1<br><small>Mid: Opus 1M high or Terra high</small></td><td>New <code>quota_rates.rs</code> (B.1), <code>work_attribution.rs</code> (C), <code>analytics_spend.rs</code> (B.2, B.3, F.1), <code>http/analytics.rs</code> handler, one route line in <code>http.rs</code>. Reads <code>usage.db</code> and <code>message_queue.db</code> read-only.</td><td>Tests J.1–J.9 pass; the endpoint on live data returns a week tree whose root equals the meter and matches the memo's figures within rounding.</td></tr>
+<tr><td>2<br><small>Mid</small></td><td>New <code>activity_ledger.rs</code> (D), config key <code>activity.db_path</code> (<code>config.rs</code>, installed config), runtime wiring beside the usage ledger scan in <code>runtime.rs</code>.</td><td>Tests J.10–J.15 pass; after restart, <code>activity.db</code> holds turns and spans for every existing transcript; a second scan adds nothing.</td></tr>
+<tr><td>3<br><small>Mid</small></td><td>Android: Analytics shell (G: navigation, sections, Queue section, Queue tab link), deletions H (app). No server change.</td><td>APK built via the queue; on the phone, Analytics › Queue shows the moved cards, the Queue tab shows the link only when a job stopped, and Spend and Time show "Coming soon" placeholders.</td></tr>
+<tr><td>4<br><small>Mid</small></td><td><code>analytics_time.rs</code> (E, F.2) using <code>work_attribution.rs</code>; handler in <code>http/analytics.rs</code>, one route line.</td><td>Tests J.16–J.24 pass; on live data the 7-day totals match Appendix E's method (533 h active in the week to Sep 29, within 5%).</td></tr>
+<tr><td>5<br><small>Mid</small></td><td>Android Spend view (G), including the shared drill-down list; server deletions H.</td><td>On the phone, Spend matches the endpoint; drill, back and agent card work; clippy, fmt and isolated tests pass without the old endpoint.</td></tr>
+<tr><td>6<br><small>Mid</small></td><td>Android Time view (G), reusing the list from 5.</td><td>On the phone, Time matches the endpoint for all three ranges.</td></tr>
+</tbody>
+</table>
+<p>File overlap: 1 and 4 both add a line to the router and a handler to <code>http/analytics.rs</code>; 4 starts after 1 merges. 5 and 6 share the list component; 6 starts after 5 merges. When 6 merges, move this memo to <code>specs/1662_analytics_redesign.html</code>.</p>
+
+<h3 id="j">J. Tests: every behaviour to a test</h3>
+<p>Server tests build small fixture databases in a temp dir (same pattern as <code>work_history/tests.rs</code>).</p>
+<table>
+<thead><tr><th>#</th><th>Behaviour</th><th>Test</th></tr></thead>
+<tbody>
+<tr><td>J.1</td><td>Weighted tokens and rates per family; unknown model falls back and adds a note</td><td><code>quota_rates</code> unit tests</td></tr>
+<tr><td>J.2</td><td>Scale clamps at 0.8 and 1.25; gap row at ≥ 0.1; negative gap gives the note</td><td>Three windows: M/F = 1.07, 30, 0.5</td></tr>
+<tr><td>J.3</td><td>Latest active claim wins; tie by id</td><td>The Figure 3 claims; minutes 23:45, 23:58, 00:15, 00:30</td></tr>
+<tr><td>J.4</td><td>PR → linked ticket held by the seat, else the lowest linked; unlinked PR is its own thread</td><td>Fixtures per case</td></tr>
+<tr><td>J.5</td><td>Parent rule, up to 5 levels</td><td>Grandchild of a claiming seat</td></tr>
+<tr><td>J.6</td><td>Name rule only when <code>work_items</code> knows the number</td><td><code>1787-spec-reviewer</code> known and unknown</td></tr>
+<tr><td>J.7</td><td>Cloud reviews: 0.05 each, requester's thread by PR, owner when null, account at landing time</td><td>Two accounts, a switch mid-week</td></tr>
+<tr><td>J.8</td><td>Ranges: week, last week, 4 weeks across two windows</td><td>Fixture with three windows</td></tr>
+<tr><td>J.9</td><td>Tree shape and sorting, parts sum to percent, pace line</td><td>Snapshot of a small tree</td></tr>
+<tr><td>J.10</td><td>Claude turns from <code>turn_duration</code>; interrupted turn fallback</td><td>Transcript fixture</td></tr>
+<tr><td>J.11</td><td>Claude tool pairs, incl. a pair split across two scans</td><td>Append half, scan, append rest, scan</td></tr>
+<tr><td>J.12</td><td>Codex rollout turns and items; <code>custom_tool_call</code> pairs</td><td>Rollout fixture</td></tr>
+<tr><td>J.13</td><td>codex-fork turns, items, approval reviews, <code>durationMs</code> fallback</td><td>Events fixture</td></tr>
+<tr><td>J.14</td><td>Shell classification table D.3</td><td>Table-driven test</td></tr>
+<tr><td>J.15</td><td>Offset does not advance on write failure; 90-day retention</td><td>Read-only DB then writable; clock injection</td></tr>
+<tr><td>J.16</td><td>Innermost span wins; model is the remainder</td><td><code>exec</code> wrapping two commands</td></tr>
+<tr><td>J.17</td><td>Wait that ends last wins; tie order</td><td>Queue 40 min + review 8 min; equal ends</td></tr>
+<tr><td>J.18</td><td>Queue job while in a turn does not count as waiting</td><td>Job spans a turn and a gap</td></tr>
+<tr><td>J.19</td><td>Prompt from you vs sm delivery (20 s window, inbox replies)</td><td>Three prompts</td></tr>
+<tr><td>J.20</td><td>Idle vs you vs parked by claim state</td><td>The Appendix E worked example, exact seconds</td></tr>
+<tr><td>J.21</td><td>Service jobs excluded</td><td>Service job open across a gap</td></tr>
+<tr><td>J.22</td><td>Waiting on agents from child seats</td><td>Parent idle while its child has turns</td></tr>
+<tr><td>J.23</td><td>Range clipping; live agent extends to now</td><td>Agent spanning the range start</td></tr>
+<tr><td>J.24</td><td>Time attributed per thread within one agent</td><td>Agent switching claims mid-gap</td></tr>
+<tr><td>J.25</td><td>App: Queue link visibility, section argument, stored choices, drill and back</td><td>Android unit tests on the view models; manual check on the phone</td></tr>
+</tbody>
+</table>
+
+<h3 id="z">Z. FAQ</h3>
+<p><b>Z.1 Why not split a turn evenly when an agent holds two claims?</b> Agents work on one thing at a time and claim new work when they start it. Old claims stay open until GitHub closes them, often hours later. An even split would spread a new ticket's work over every ticket still waiting to merge. With latest-claim-wins, once a newer claim ends the minutes fall back to the older one, which is also right.</p>
+<p><b>Z.2 Why not API list prices instead of fitted rates?</b> List prices charge cache re-reads at 10% of fresh input. The meter charges about 2%. Cache reads are 97% of Claude tokens, so list prices would hand most of the quota to agents with long contexts rather than agents that write a lot. The existing <code>sm usage</code> report uses list prices and also has no entries for the gpt-6 models; that is out of scope here.</p>
+<p><b>Z.3 Why not the tool hooks (<code>tool_usage.db</code>)?</b> No hook posts to it today (0 rows). Wiring it means changing your Claude Code settings, it covers Claude only, and it records nothing before the day it is turned on. The transcripts already hold exact tool timings for both providers.</p>
+<p><b>Z.4 Why is parked time outside the bars?</b> Last week it was 216 hours, 29% of all agent time. Mostly these are finished agents that nobody has retired yet. Counting it as "waiting on you" or "idle" would make those buckets mean "finished" instead of "stuck".</p>
+<p><b>Z.5 Does "waiting on you" overstate?</b> It counts wall-clock hours, including nights. An agent that asks you something at 23:00 and gets an answer at 08:00 shows 9 hours. That is the true cost to the work's lead time, which is what the view is for.</p>
+<p><b>Z.6 Why a separate <code>activity.db</code>?</b> The usage ledger lost turns to lock contention (#1658). A second heavy writer in the same file would make that worse.</p>
+<p><b>Z.7 Codex's two accounts.</b> Both are Pro. Each turn is scaled against its own account's meter, and percentages add because each point is a point of one Pro week. The header shows each account's meter.</p>
+<p><b>Z.8 Prototype.</b> The scripts that produced every number in the memo (<code>rates.py</code>, <code>coverage.py</code>, <code>spend_tree.py</code>, <code>walltime.py</code>, <code>walltime_all.py</code>) are in my session's scratchpad. The implementing agents get the rules from Appendices B–E, not from the scripts.</p>
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
