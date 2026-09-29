@@ -1399,3 +1399,49 @@ fn needs_you_counts_until_seen() {
     let seen = needs_you_unseen(&board, &since, Some("2026-09-28T23:00:00Z"));
     assert_eq!(seen.count, 0);
 }
+
+#[test]
+fn partial_graphql_page_is_rejected() {
+    let partial =
+        br#"{"data":{"rateLimit":null,"repository":{"issues":{"pageInfo":{"hasNextPage":false},
+        "nodes":[{"number":1,"title":"t","url":"u","blockedBy":null,"subIssues":null}]}}},
+        "errors":[{"message":"timeout on blockedBy"}]}"#;
+    assert_eq!(
+        parse_issues_page(partial),
+        Err("timeout on blockedBy".to_owned())
+    );
+}
+
+#[test]
+fn lookup_state_reason_keeps_github_casing() {
+    use crate::work_claims::{BatchFetch, GhItem, ItemFetch, WorkKind};
+    let batch: BatchFetch = BTreeMap::from([(
+        5,
+        ItemFetch::Found(Box::new(GhItem {
+            is_draft: false,
+            kind: WorkKind::Ticket,
+            title: "t".into(),
+            state: "closed".into(),
+            state_reason: Some("not_planned".into()),
+            url: "u".into(),
+            head_ref: None,
+            head_sha: None,
+            closed_at: None,
+            merged_at: None,
+            closing_refs: None,
+        })),
+    )]);
+    let node = items_from_batch(REPO, &[5], &batch)[&5].clone().unwrap();
+    assert_eq!(node.state_reason.as_deref(), Some("NOT_PLANNED"));
+    let mut closed = item(&k(5), false);
+    closed.state_reason = Some("not_planned".into());
+    assert_eq!(done_reason(&closed), Some("not_planned"));
+}
+
+#[test]
+fn needs_you_in_the_seen_second_still_counts() {
+    let board = compute(&iteration7(), now());
+    let since = BTreeMap::from([(ko(1813), "2026-09-28T22:40:00Z".to_owned())]);
+    let unseen = needs_you_unseen(&board, &since, Some("2026-09-28T22:40:00Z"));
+    assert_eq!(unseen.count, 1);
+}

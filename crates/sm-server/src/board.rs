@@ -1680,7 +1680,9 @@ pub fn needs_you_unseen(
             }
             let fresh = since
                 .get(&row.key)
-                .is_some_and(|at| seen_at.is_none_or(|seen| at.as_str() > seen));
+                // Seconds resolution: a change in the second the owner
+                // looked still counts, until the next seen.
+                .is_some_and(|at| seen_at.is_none_or(|seen| at.as_str() >= seen));
             if fresh {
                 unseen.lane_ids.insert(view.lane.id);
                 if counted.insert(row.key.clone()) {
@@ -1700,11 +1702,15 @@ fn done_reason(item: &Item) -> Option<&'static str> {
     if item.is_open() {
         return None;
     }
-    Some(match item.state_reason.as_deref() {
-        Some("NOT_PLANNED") => "not_planned",
-        Some("DUPLICATE") => "duplicate",
-        Some("missing") => "missing",
-        _ => "completed",
+    let reason = item.state_reason.as_deref().unwrap_or_default();
+    Some(if reason.eq_ignore_ascii_case("not_planned") {
+        "not_planned"
+    } else if reason.eq_ignore_ascii_case("duplicate") {
+        "duplicate"
+    } else if reason == "missing" {
+        "missing"
+    } else {
+        "completed"
     })
 }
 

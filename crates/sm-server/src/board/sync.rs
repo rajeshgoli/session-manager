@@ -311,9 +311,13 @@ fn more_cursor(connection: &Value) -> Option<String> {
 
 pub fn parse_issues_page(stdout: &[u8]) -> Result<IssuesPage, String> {
     let value = parse_json(stdout)?;
+    // Partial data leaves connections null; applying it would drop links.
+    if let Some(error) = graphql_error(&value) {
+        return Err(error);
+    }
     let issues = &value["data"]["repository"]["issues"];
     if issues.is_null() {
-        return Err(graphql_error(&value).unwrap_or_else(|| "no repository in response".into()));
+        return Err("no repository in response".into());
     }
     let nodes = issues["nodes"]
         .as_array()
@@ -363,9 +367,12 @@ pub fn parse_connection_page(
     connection: IssueConnection,
 ) -> Result<(Vec<RefNode>, Option<String>), String> {
     let value = parse_json(stdout)?;
+    if let Some(error) = graphql_error(&value) {
+        return Err(error);
+    }
     let page = &value["data"]["repository"]["issue"][connection.field()];
     if page.is_null() {
-        return Err(graphql_error(&value).unwrap_or_else(|| "no issue in response".into()));
+        return Err("no issue in response".into());
     }
     let next = (page["pageInfo"]["hasNextPage"].as_bool() == Some(true))
         .then(|| opt_string(&page["pageInfo"]["endCursor"]))
@@ -415,7 +422,7 @@ pub fn items_from_batch(
                     title: item.title.clone(),
                     url: item.url.clone(),
                     state: item.state.to_ascii_lowercase(),
-                    state_reason: item.state_reason.clone(),
+                    state_reason: item.state_reason.as_deref().map(str::to_ascii_uppercase),
                     closed_at: item.closed_at.clone(),
                 }),
                 _ => None,
