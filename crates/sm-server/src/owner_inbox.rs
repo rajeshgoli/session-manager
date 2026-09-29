@@ -29,6 +29,9 @@ pub struct ThreadMarks {
     /// arrived in the same second as Done.
     pub done_items: Option<i64>,
     pub last_read_at: Option<String>,
+    /// Follow results the thread held when last read; more than this is
+    /// new. A count, for the same reason as `done_items`.
+    pub read_follows: Option<i64>,
 }
 
 /// A message the owner started, with no agent message above it.
@@ -50,7 +53,8 @@ pub fn init_owner_inbox_schema(conn: &Connection) -> Result<()> {
             thread_key TEXT PRIMARY KEY,
             done_at TEXT,
             done_items INTEGER,
-            last_read_at TEXT
+            last_read_at TEXT,
+            read_follows INTEGER
         );
         CREATE TABLE IF NOT EXISTS owner_message_notes (
             id TEXT PRIMARY KEY,
@@ -117,7 +121,8 @@ impl OwnerInboxStore {
             return Ok(BTreeMap::new());
         };
         let mut statement = conn.prepare(
-            "SELECT thread_key, done_at, done_items, last_read_at FROM owner_inbox_threads",
+            "SELECT thread_key, done_at, done_items, last_read_at, read_follows \
+                 FROM owner_inbox_threads",
         )?;
         let rows = statement
             .query_map([], |row| {
@@ -127,6 +132,7 @@ impl OwnerInboxStore {
                         done_at: row.get(1)?,
                         done_items: row.get(2)?,
                         last_read_at: row.get(3)?,
+                        read_follows: row.get(4)?,
                     },
                 ))
             })?
@@ -149,11 +155,17 @@ impl OwnerInboxStore {
         Ok(())
     }
 
-    pub fn mark_read(&self, thread_key: &str) -> Result<()> {
+    /// Read, having seen `follows` follow results.
+    pub fn mark_read(&self, thread_key: &str, follows: usize) -> Result<()> {
         self.open_write()?.execute(
-            "INSERT INTO owner_inbox_threads (thread_key, last_read_at) VALUES (?1, ?2) \
-             ON CONFLICT(thread_key) DO UPDATE SET last_read_at = excluded.last_read_at",
-            params![thread_key, now_rfc3339()],
+            "INSERT INTO owner_inbox_threads (thread_key, last_read_at, read_follows) \
+             VALUES (?1, ?2, ?3) ON CONFLICT(thread_key) DO UPDATE \
+             SET last_read_at = excluded.last_read_at, read_follows = excluded.read_follows",
+            params![
+                thread_key,
+                now_rfc3339(),
+                i64::try_from(follows).unwrap_or(i64::MAX)
+            ],
         )?;
         Ok(())
     }
@@ -257,12 +269,13 @@ mod tests {
     fn marks_start_empty_and_keep_both_columns() {
         let (store, dir) = store();
         assert!(store.marks().unwrap().is_empty());
-        store.mark_read("agent:a").unwrap();
+        store.mark_read("agent:a", 2).unwrap();
         store.mark_done("agent:a", 3).unwrap();
         let marks = store.marks().unwrap();
         assert!(marks["agent:a"].done_at.is_some());
         assert_eq!(marks["agent:a"].done_items, Some(3));
         assert!(marks["agent:a"].last_read_at.is_some());
+        assert_eq!(marks["agent:a"].read_follows, Some(2));
         fs::remove_dir_all(dir).unwrap();
     }
 }

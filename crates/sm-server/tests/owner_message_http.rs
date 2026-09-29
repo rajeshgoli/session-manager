@@ -989,4 +989,25 @@ async fn a_fired_follow_is_new_until_its_thread_is_read() {
         row(&inbox(&f, "open").await, "agent:eng00001")["group"],
         "earlier"
     );
+    // A follow that fires in the same second as the read is still new.
+    let (job, _) = store
+        .create_follow(
+            "operator@example.com",
+            &FollowTarget::QueueJob {
+                job_id: "job_1".into(),
+                job_label: "copy-fills".into(),
+                session_id: "eng00001".into(),
+                session_name: "eng00001-agent".into(),
+            },
+            None,
+            now,
+        )
+        .unwrap();
+    store
+        .fire(&job.id, REASON_TASK_COMPLETE, now, None)
+        .unwrap();
+    assert_eq!(
+        row(&inbox(&f, "open").await, "agent:eng00001")["group"],
+        "new"
+    );
 }

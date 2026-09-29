@@ -258,19 +258,20 @@ impl World {
                     items += 1;
                 }
                 let marks = self.marks(&agent_thread_key(session_id));
-                let mut unread_follow = false;
+                let mut follows = 0;
                 for follow in self.follows.iter().filter(|f| f.session_id == session_id) {
                     let fired_at = follow.fired_at.as_deref().unwrap_or(&follow.created_at);
                     consider(fired_at, follow_line(follow).0);
                     items += 1;
-                    if marks
-                        .last_read_at
-                        .as_deref()
-                        .is_none_or(|read| norm(fired_at) > norm(read))
-                    {
-                        unread_follow = true;
-                    }
+                    follows += 1;
                 }
+                // Fired follows are listed oldest first, so any beyond the
+                // count seen at the last read are new.
+                let unread_follow = follows
+                    > marks
+                        .read_follows
+                        .and_then(|seen| usize::try_from(seen).ok())
+                        .unwrap_or(0);
                 let (newest_at, mut preview) = newest.unwrap_or_default();
                 let open_asks = messages
                     .iter()
@@ -855,8 +856,13 @@ pub(super) fn agent_thread_page(
     if !has_items && !world.sessions.contains_key(&session_id) {
         return Err(ApiError::NotFound("Thread not found"));
     }
+    let follows_seen = world
+        .follows
+        .iter()
+        .filter(|f| f.session_id == session_id)
+        .count();
     owner_message_store(state).mark_sender_viewed(&session_id)?;
-    inbox_store(state).mark_read(&agent_thread_key(&session_id))?;
+    inbox_store(state).mark_read(&agent_thread_key(&session_id), follows_seen)?;
     let world = World::load(state)?;
     let replied = world.replied();
     let message_ids: BTreeSet<&str> = world

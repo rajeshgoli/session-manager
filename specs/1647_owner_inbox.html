@@ -375,14 +375,14 @@
 <thead><tr><th>Group</th><th>Agent thread</th><th>Doc thread</th></tr></thead>
 <tbody>
 <tr><td><code>needs_you</code></td><td>Some message is in state needs_you (blocking, no reply, not handled, sender live)</td><td>State review_requested and the latest revision's publisher is live</td></tr>
-<tr><td><code>new</code></td><td>Otherwise, some message is in state new, or a follow fired after the thread's <code>last_read_at</code> (or it was never read)</td><td>State new or updated, or review_requested from an ended publisher</td></tr>
+<tr><td><code>new</code></td><td>Otherwise, some message is in state new, or the thread holds more fired follows than it did when last opened (<code>read_follows</code>; never opened counts as zero)</td><td>State new or updated, or review_requested from an ended publisher</td></tr>
 <tr><td><code>earlier</code></td><td>Everything else</td><td>State read or reviewed</td></tr>
 </tbody>
 </table>
 <p>"Live" means the session is in the registry and its <code>completion_status</code> is neither <code>retired</code> nor <code>killed</code>. Example: an agent sends a plain note, then a blocking question, then retires. Its question is no longer needs_you; the thread is <code>new</code> until opened, then <code>earlier</code>.</p>
 
 <h4>B3. Done</h4>
-<p>Table <code>owner_inbox_threads(thread_key TEXT PRIMARY KEY, done_at TEXT, done_items INTEGER, last_read_at TEXT)</code> in the retained queue DB (<code>sm_send.db_path</code>). Done records the thread's item count. A thread is Done while its item count is at most <code>done_items</code>, so any new item, including your own later reply, brings it back. Counting instead of comparing times keeps a message that lands in the same second as Done from being hidden.</p>
+<p>Table <code>owner_inbox_threads(thread_key TEXT PRIMARY KEY, done_at TEXT, done_items INTEGER, last_read_at TEXT, read_follows INTEGER)</code> in the retained queue DB (<code>sm_send.db_path</code>). Done records the thread's item count. A thread is Done while its item count is at most <code>done_items</code>, so any new item, including your own later reply, brings it back. Counting instead of comparing times keeps a message that lands in the same second as Done from being hidden.</p>
 <p><code>POST /inbox/done</code> with <code>{"thread_key": "…"}</code>:</p>
 <ul>
 <li>Agent thread: every blocking message from the session with no reply and no <code>handled_at</code> gets <code>handled_at</code>; every unread message from it gets <code>first_viewed_at</code>. 404 when the session has no items and is not in the registry.</li>
@@ -429,7 +429,7 @@
 <p>Preview. Agent thread in needs_you: the newest needs_you message's title. Otherwise its newest item: a message's title; <code>You: </code> and the first line of a reply or note (a reply with no text shows its first quote); a follow line (B5). Doc thread: <i>Review requested · revision N</i>; <i>Published · for your information</i> (new, one revision); <i>Revision N published</i> (new or updated); <i>You reviewed · Approved | Changes requested | Commented</i> or <i>Read</i> (read or reviewed).</p>
 
 <h4>B5. <code>GET /inbox/agent/{session_id}</code></h4>
-<p>The agent thread's page, server-rendered in the Watch palette. 404 when the session has no items and is not in the registry. Opening it sets <code>first_viewed_at</code> on every unread message from the session (which withdraws their phone notifications through #1645) and sets the thread's <code>last_read_at</code>. Items in time order:</p>
+<p>The agent thread's page, server-rendered in the Watch palette. 404 when the session has no items and is not in the registry. Opening it sets <code>first_viewed_at</code> on every unread message from the session (which withdraws their phone notifications through #1645) and sets the thread's <code>last_read_at</code> and <code>read_follows</code> (the fired follows it holds). Items in time order:</p>
 <ul>
 <li>Message: a bubble on the left with its title, markdown body (paragraphs carry <code>data-sm-line</code>), relative time and state; a needs_you message has an amber border and a NEEDS YOU chip. The bubble's element id is the message id.</li>
 <li>Reply and note: a bubble on the right with its quotes as blockquotes, its text, and <i>You · 5m ago</i>, plus <i>· to &lt;name&gt;</i> when it went to a parent.</li>
@@ -495,7 +495,7 @@ The month-end recon does.</code></pre>
 <p><b>Why not thread by message, with a <code>--re</code> flag for agents?</b> Agents would have to remember to pass it, and they answer your reply with a fresh <code>sm send</code>. Grouping by agent needs nothing from them and is correct because each agent works one task.</p>
 <p><b>What if one agent raises two unrelated questions?</b> They appear as two message cards in one thread, each with its own title and its own Needs you tag. A send answers the newest open one; Done clears both.</p>
 <p><b>Why is a doc not part of its author's agent thread?</b> A doc can be revised by several agents: the author ends, you review, Assign hands it to a new agent, and that agent publishes the next revision. Keyed by agent, that history would split across two threads. The agent thread keeps a pointer line so its own story still reads in order.</p>
-<p><b>Why does Done count items instead of comparing times?</b> Stored times have one-second precision. A message that arrived in the same second as Done would compare as older and stay hidden.</p>
+<p><b>Why do Done and read count items instead of comparing times?</b> Stored times have one-second precision. A message that arrived in the same second as Done, or a follow that fired in the same second the thread was opened, would compare as older and stay hidden.</p>
 <p><b>Why a separate notes table?</b> Making <code>owner_message_replies.message_id</code> nullable needs a table rebuild in SQLite; a notes table beside it holds the same facts with no migration of live rows.</p>
 <p><b>What happened to the single-message page?</b> Its URL now shows the whole thread, scrolled to the message. Its select-and-comment drafts are replaced by tapping a paragraph to quote it. The drafts endpoints stay for any old page left open.</p>
 <p><b>Revision history.</b> Revision 1 had one conversation per agent, only review requests from docs, and a pointer replacing the Watch card's message list. Revision 2 added doc threads and every doc publish, kept Watch unchanged, and made the Inbox one list across phone and web.</p>
