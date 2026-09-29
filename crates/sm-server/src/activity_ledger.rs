@@ -577,7 +577,8 @@ struct Pending {
     /// codex-fork `item/started` times, by item id.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     started_items: BTreeMap<String, i64>,
-    /// codex-fork threads that sm or Codex started for itself (catch-up summaries, titles).
+    /// codex-fork threads that are not the seat's own work: side threads Codex starts for
+    /// itself (catch-up summaries, titles) and subagent threads.
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     ephemeral_threads: BTreeSet<String>,
     /// Recent non-meta prompt times, oldest first.
@@ -656,6 +657,7 @@ impl Parser {
                 b"\"event_type\":\"item_completed\"",
                 b"\"event_type\":\"item/autoApprovalReview/completed\"",
                 b"\"event_type\":\"thread/started\"",
+                b"\"event_type\":\"thread_started\"",
             ],
         };
         needles.iter().any(|needle| contains(head, needle))
@@ -928,13 +930,18 @@ impl Parser {
             .unwrap_or_default();
         let payload = value.get("payload").cloned().unwrap_or(Value::Null);
         let event_type = value.get("event_type").and_then(Value::as_str);
-        if event_type == Some("thread/started") {
+        if matches!(event_type, Some("thread/started" | "thread_started")) {
             let started = payload.get("thread");
-            if started
-                .and_then(|thread| thread.get("ephemeral"))
-                .and_then(Value::as_bool)
-                == Some(true)
-            {
+            let field = |key: &str| started.and_then(|thread| thread.get(key));
+            // Ephemeral side threads and subagent threads are not the seat's own turns; the
+            // parent's subagent span covers a child's time.
+            let side_thread = field("ephemeral").and_then(Value::as_bool) == Some(true)
+                || field("parentThreadId").is_some_and(|parent| !parent.is_null())
+                || matches!(
+                    field("threadSource").and_then(Value::as_str),
+                    Some("subagent" | "system" | "thread_title")
+                );
+            if side_thread {
                 let id = started
                     .and_then(|thread| thread.get("id"))
                     .and_then(Value::as_str)

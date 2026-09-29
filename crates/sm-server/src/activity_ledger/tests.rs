@@ -482,6 +482,23 @@ fn codex_fork_turns_items_approval_reviews_and_duration_fallback() {
                        "item": {"type": "commandExecution", "id": "exec-e", "durationMs": 10}}),
             ),
             fork(17_000, "eph", "turn_complete", json!({"turn_id": "e1"})),
+            // A subagent thread's work belongs to the parent's subagent span.
+            fork(
+                17_500,
+                "child",
+                "thread/started",
+                json!({"thread": {"id": "child", "parentThreadId": "th",
+                                  "threadSource": "subagent", "ephemeral": false}}),
+            ),
+            fork(17_600, "child", "turn_started", json!({"turn_id": "c1"})),
+            fork(
+                17_800,
+                "child",
+                "item/completed",
+                json!({"completedAtMs": T0 + 17_800,
+                       "item": {"type": "commandExecution", "id": "exec-c", "durationMs": 10}}),
+            ),
+            fork(18_000, "child", "turn_complete", json!({"turn_id": "c1"})),
             item(20_000, "turn_complete", json!({"turn_id": "u1"})),
         ],
     );
