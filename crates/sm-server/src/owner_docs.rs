@@ -852,14 +852,29 @@ impl OwnerDocStore {
         Ok(rows)
     }
 
+    /// Records the owner's view of a blob; `viewed_at` is the latest view.
     pub fn record_view(&self, doc_id: &str, blob_sha: &str) -> Result<()> {
         let conn = self.open_write()?;
         conn.execute(
-            "INSERT OR IGNORE INTO owner_doc_views (doc_id, blob_sha, viewed_at)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO owner_doc_views (doc_id, blob_sha, viewed_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(doc_id, blob_sha) DO UPDATE SET viewed_at = excluded.viewed_at",
             params![doc_id, blob_sha, now_rfc3339()],
         )?;
         Ok(())
+    }
+
+    /// When the owner last viewed this blob of the doc.
+    pub fn last_viewed_at(&self, doc_id: &str, blob_sha: &str) -> Result<Option<String>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        Ok(conn
+            .query_row(
+                "SELECT viewed_at FROM owner_doc_views WHERE doc_id = ?1 AND blob_sha = ?2",
+                params![doc_id, blob_sha],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     pub fn retract(&self, doc_id: &str) -> Result<Option<OwnerDoc>> {
@@ -2073,6 +2088,20 @@ mod tests {
             derive_owner_doc_state(&inputs),
             OwnerDocState::ReviewRequested
         );
+    }
+
+    #[test]
+    fn last_viewed_at_moves_with_each_view() {
+        let (store, dir) = store();
+        assert_eq!(store.last_viewed_at("doc1", "blob").unwrap(), None);
+        store.record_view("doc1", "blob").unwrap();
+        let first = store.last_viewed_at("doc1", "blob").unwrap().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        store.record_view("doc1", "blob").unwrap();
+        let second = store.last_viewed_at("doc1", "blob").unwrap().unwrap();
+        let parse = |at: &str| OffsetDateTime::parse(at, &Rfc3339).unwrap();
+        assert!(parse(&second) > parse(&first), "{first} then {second}");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

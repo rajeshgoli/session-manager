@@ -12,12 +12,17 @@ use serde_json::{json, Value};
 use sm_server::{
     config::{AppConfig, EmailConfig, PathsConfig, SmSendConfig},
     http::{router, AppState},
+    owner_push::{PushError, PushSender},
 };
 use std::{
+    collections::BTreeMap,
     fs,
     net::SocketAddr,
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tower::ServiceExt;
@@ -39,7 +44,20 @@ fn temp_dir() -> PathBuf {
 
 struct Fixture {
     app: axum::Router,
+    state: AppState,
     dir: PathBuf,
+}
+
+#[derive(Default)]
+struct RecordingSender {
+    sent: Mutex<Vec<BTreeMap<String, String>>>,
+}
+
+impl PushSender for RecordingSender {
+    fn send(&self, _token: &str, data: &BTreeMap<String, String>) -> Result<(), PushError> {
+        self.sent.lock().unwrap().push(data.clone());
+        Ok(())
+    }
 }
 
 const BRIDGE: &str = r#"humans:
@@ -56,6 +74,10 @@ const BRIDGE: &str = r#"humans:
 /// Sessions: `eng00001` live; `child001` retired under it; `orphan01`
 /// retired with no parent; `killed01` killed under `orphan01`.
 fn fixture() -> Fixture {
+    fixture_with_push(None)
+}
+
+fn fixture_with_push(sender: Option<Arc<RecordingSender>>) -> Fixture {
     let dir = temp_dir();
     let state_file = dir.join("sessions.json");
     let session = |id: &str, parent: Option<&str>, completion: Option<&str>| {
@@ -101,8 +123,11 @@ fn fixture() -> Fixture {
     config.push.db_path = dir.join("owner_push.db").display().to_string();
     config.rust_core.fixture_writes_enabled = true;
     config.rust_core.log_dir = Some(dir.join("logs").display().to_string());
+    let state =
+        AppState::new(config).with_push_sender(sender.map(|sender| sender as Arc<dyn PushSender>));
     Fixture {
-        app: router(AppState::new(config)),
+        app: router(state.clone()),
+        state,
         dir,
     }
 }
@@ -551,4 +576,71 @@ async fn blocking_message_waits_until_reply_or_handled() {
     let entry = session_feed(&f, "orphan01").await;
     assert_eq!(entry["waiting_on"], json!([]));
     assert_eq!(entry["messages"][0]["state"], "new");
+}
+
+#[tokio::test]
+async fn opening_a_message_withdraws_its_phone_notification() {
+    let sender = Arc::new(RecordingSender::default());
+    let f = fixture_with_push(Some(sender.clone()));
+    let (status, _) = request(
+        &f.app,
+        "PUT",
+        "/client/push-token",
+        Some(json!({"token": "tok1", "device_name": "Pixel"})),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    let id = created_id(
+        &f,
+        "eng00001",
+        "# Keep the old fills table?\nBody",
+        json!({}),
+    )
+    .await;
+    let pass = |f: &Fixture| {
+        let state = f.state.clone();
+        async move {
+            tokio::task::spawn_blocking(move || state.run_follow_pass(false))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    };
+    let kinds = || {
+        sender
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|data| (data["kind"].clone(), data["notice_id"].clone()))
+            .collect::<Vec<_>>()
+    };
+    pass(&f).await;
+    let notice_id = kinds()[0].1.clone();
+    assert_eq!(kinds(), vec![("message".to_owned(), notice_id.clone())]);
+
+    // Shown on the phone but not opened: it stays.
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &format!("/client/notices/{notice_id}/ack"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    pass(&f).await;
+    assert_eq!(kinds().len(), 1);
+
+    // The owner opens the message: the phone is told to remove it, once.
+    let (status, _) = send(&f.app, "GET", &format!("/messages/{id}"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    pass(&f).await;
+    pass(&f).await;
+    assert_eq!(
+        kinds(),
+        vec![
+            ("message".to_owned(), notice_id.clone()),
+            ("withdraw".to_owned(), notice_id),
+        ]
+    );
 }

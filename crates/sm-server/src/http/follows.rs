@@ -583,6 +583,30 @@ impl NoticeWorld for AppNoticeWorld<'_> {
         }
     }
 
+    fn opened(&self, notice: &Notice) -> anyhow::Result<bool> {
+        match notice.kind.as_str() {
+            NOTICE_MESSAGE => Ok(self
+                .message(notice)?
+                .is_some_and(|message| message.first_viewed_at.is_some())),
+            NOTICE_REVIEW_REQUESTED => {
+                let Ok(publish_id) = notice.subject_id.parse::<i64>() else {
+                    return Ok(false);
+                };
+                let store = OwnerDocStore::new(expand_home(&self.state.config.sm_send.db_path));
+                let Some((doc, publish)) = store.publish_by_id(publish_id)? else {
+                    return Ok(false);
+                };
+                Ok(store
+                    .last_viewed_at(&doc.id, &publish.blob_sha)?
+                    .as_deref()
+                    .and_then(owner_push::parse_ts)
+                    .zip(owner_push::parse_ts(&notice.created_at))
+                    .is_some_and(|(viewed_at, created_at)| viewed_at >= created_at))
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn unread_count(&self, notice: &Notice) -> anyhow::Result<i64> {
         let Some(message) = self.message(notice)? else {
             return Ok(0);
@@ -833,6 +857,12 @@ impl AppState {
             &notice_world,
             self.push_sender.as_deref(),
             &AppNoticeMailer { state: self },
+            now,
+        )?);
+        problems.extend(owner_push::withdraw_notices(
+            &store,
+            &notice_world,
+            self.push_sender.as_deref(),
             now,
         )?);
         Ok(problems)

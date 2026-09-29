@@ -6,6 +6,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.Build
+import android.os.Bundle
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import li.rajeshgo.sm.MainActivity
@@ -19,6 +20,10 @@ import li.rajeshgo.sm.R
 object NoticePush {
     const val CHANNEL_ID = "agent_messages"
     val KINDS = setOf("message", "review_requested")
+    /** sm no longer needs the owner to see a shown notice (sm#1643). */
+    const val KIND_WITHDRAW = "withdraw"
+    /** The notice a notification shows, so a withdrawal removes only that one. */
+    private const val EXTRA_NOTICE_ID = "li.rajeshgo.sm.notice_id"
 
     fun createChannel(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
@@ -66,8 +71,22 @@ object NoticePush {
             .setOnlyAlertOnce(true)
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
+            .addExtras(Bundle().apply { putString(EXTRA_NOTICE_ID, message.noticeId) })
             .build()
         return runCatching { NotificationManagerCompat.from(context).notify(message.notificationId, notification) }.isSuccess
+    }
+
+    /**
+     * Removes the notification while it still shows [noticeId]. A newer notice
+     * from the same agent reuses the slot, and stays.
+     */
+    fun withdraw(context: Context, noticeId: String) {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        runCatching {
+            manager.activeNotifications
+                .filter { it.notification.extras.getString(EXTRA_NOTICE_ID) == noticeId }
+                .forEach { manager.cancel(it.tag, it.id) }
+        }
     }
 }
 

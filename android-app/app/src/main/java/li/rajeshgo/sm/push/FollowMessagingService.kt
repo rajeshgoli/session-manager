@@ -23,6 +23,11 @@ class FollowMessagingService : FirebaseMessagingService() {
     }
 
     override fun onMessageReceived(message: RemoteMessage) {
+        // Removing a notification needs no sign-in or setting: it only ever hides.
+        if (message.data["kind"] == NoticePush.KIND_WITHDRAW) {
+            message.data["notice_id"]?.takeIf { it.isNotBlank() }?.let { NoticePush.withdraw(applicationContext, it) }
+            return
+        }
         // Firebase calls this on a background thread; the settings read is local.
         val settings = SettingsRepository(applicationContext)
         val (serverUrl, accessToken, enabled) = runBlocking {

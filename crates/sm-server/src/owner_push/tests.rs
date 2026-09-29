@@ -1077,6 +1077,7 @@ fn concurrent_follows_of_one_target_all_return_the_same_follow() {
 #[derive(Default)]
 struct FakeNoticeWorld {
     answered: Mutex<std::collections::BTreeSet<String>>,
+    opened: Mutex<std::collections::BTreeSet<String>>,
     unread: i64,
     candidates: Vec<NewNotice>,
 }
@@ -1085,11 +1086,17 @@ impl FakeNoticeWorld {
     fn answer(&self, subject_id: &str) {
         self.answered.lock().unwrap().insert(subject_id.to_owned());
     }
+    fn open(&self, subject_id: &str) {
+        self.opened.lock().unwrap().insert(subject_id.to_owned());
+    }
 }
 
 impl NoticeWorld for FakeNoticeWorld {
     fn still_wanted(&self, notice: &Notice) -> Result<bool> {
         Ok(!self.answered.lock().unwrap().contains(&notice.subject_id))
+    }
+    fn opened(&self, notice: &Notice) -> Result<bool> {
+        Ok(self.opened.lock().unwrap().contains(&notice.subject_id))
     }
     fn unread_count(&self, _notice: &Notice) -> Result<i64> {
         Ok(self.unread)
@@ -1246,6 +1253,82 @@ fn create_and_repair_race_leaves_one_notice() {
         )
         .unwrap();
     assert_eq!(rows, 1);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn shown_notices_are_withdrawn_once_answered_or_opened() {
+    let (store, dir) = temp_store();
+    register(&store, "tok1", None);
+    let now = at("2026-09-26T10:00:00Z");
+    let world = FakeNoticeWorld::default();
+    let mailer = FakeNoticeMailer::default();
+    let withdrawals = |sender: &FakeSender| {
+        sender
+            .sent()
+            .into_iter()
+            .filter(|(_, data)| data["kind"] == NOTICE_WITHDRAW)
+            .map(|(_, data)| data["notice_id"].clone())
+            .collect::<Vec<_>>()
+    };
+    for subject in ["msg_answered", "msg_opened", "msg_waiting", "msg_unshown"] {
+        store
+            .create_notice(&message_notice(subject, false), now)
+            .unwrap();
+    }
+    let sender = FakeSender::default();
+    deliver_notices(&store, &world, Some(&sender), &mailer, now).unwrap();
+    // The phone showed all but one.
+    for subject in ["msg_answered", "msg_opened", "msg_waiting"] {
+        let notice = notice_of(&store, NOTICE_MESSAGE, subject);
+        assert!(store.ack_notice(OWNER, &notice.id, now).unwrap());
+    }
+
+    // Nothing answered or opened yet: nothing withdrawn.
+    let sender = FakeSender::default();
+    withdraw_notices(&store, &world, Some(&sender), now).unwrap();
+    assert!(sender.sent().is_empty());
+
+    world.answer("msg_answered");
+    world.open("msg_opened");
+    world.answer("msg_unshown");
+    let flaky = FakeSender::failing("tok1", vec![PushError::Retryable("503".to_owned())]);
+    withdraw_notices(&store, &world, Some(&flaky), now).unwrap();
+    // The first withdrawal failed and is retried; the unshown notice has nothing to take down.
+    assert_eq!(
+        withdrawals(&flaky),
+        vec![notice_of(&store, NOTICE_MESSAGE, "msg_opened").id]
+    );
+    withdraw_notices(&store, &world, Some(&flaky), now).unwrap();
+    assert_eq!(
+        withdrawals(&flaky),
+        vec![
+            notice_of(&store, NOTICE_MESSAGE, "msg_opened").id,
+            notice_of(&store, NOTICE_MESSAGE, "msg_answered").id,
+        ]
+    );
+    // Each goes once.
+    withdraw_notices(&store, &world, Some(&flaky), now).unwrap();
+    assert_eq!(withdrawals(&flaky).len(), 2);
+    // Opened before the first push: never sent, so nothing to withdraw.
+    store
+        .create_notice(&message_notice("msg_early", false), now)
+        .unwrap();
+    world.open("msg_early");
+    let quiet = FakeSender::default();
+    deliver_notices(&store, &world, Some(&quiet), &mailer, now).unwrap();
+    assert!(quiet.sent().is_empty());
+    assert_eq!(
+        notice_of(&store, NOTICE_MESSAGE, "msg_early")
+            .notified_via
+            .as_deref(),
+        Some("resolved")
+    );
+    // Without a push channel there is nothing to do.
+    world.open("msg_waiting");
+    withdraw_notices(&store, &world, None, now).unwrap();
+    withdraw_notices(&store, &world, Some(&flaky), now).unwrap();
+    assert_eq!(withdrawals(&flaky).len(), 3);
     fs::remove_dir_all(dir).unwrap();
 }
 

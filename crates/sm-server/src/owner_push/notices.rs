@@ -8,6 +8,8 @@ use super::*;
 
 pub const NOTICE_MESSAGE: &str = "message";
 pub const NOTICE_REVIEW_REQUESTED: &str = "review_requested";
+/// The push that takes a shown notice's notification off the phone (sm#1643).
+pub const NOTICE_WITHDRAW: &str = "withdraw";
 /// Notices stay listed for the app this long.
 pub const RECENT_NOTICE_WINDOW: Duration = Duration::days(7);
 /// How far back the repair pass looks for subjects without a notice.
@@ -148,6 +150,11 @@ CREATE TABLE IF NOT EXISTS owner_notices (
 );
 CREATE INDEX IF NOT EXISTS owner_notices_pending ON owner_notices(notified_at, notify_after);
 CREATE UNIQUE INDEX IF NOT EXISTS owner_notices_subject ON owner_notices(kind, subject_id);
+-- A shown notice whose notification the phone was told to remove (sm#1643).
+CREATE TABLE IF NOT EXISTS owner_notice_withdrawals (
+  notice_id     TEXT PRIMARY KEY,
+  withdrawn_at  TEXT NOT NULL
+);
 "#;
 
 const NOTICE_COLUMNS: &str = "id, user_id, kind, session_id, session_name, subject_id, title, \
@@ -293,6 +300,26 @@ impl OwnerPushStore {
             .collect())
     }
 
+    /// Notices the phone showed (acknowledged) in the last 7 days and has
+    /// not been told to remove.
+    fn shown_notices(&self, now: OffsetDateTime) -> Result<Vec<Notice>> {
+        self.query_notices(
+            "WHERE acked_at IS NOT NULL AND created_at >= ?1 \
+               AND id NOT IN (SELECT notice_id FROM owner_notice_withdrawals) \
+             ORDER BY created_at, rowid",
+            params![format_ts(now - RECENT_NOTICE_WINDOW)],
+        )
+    }
+
+    fn record_withdrawal(&self, id: &str, now: OffsetDateTime) -> Result<()> {
+        self.open()?.execute(
+            "INSERT OR IGNORE INTO owner_notice_withdrawals (notice_id, withdrawn_at) \
+             VALUES (?1, ?2)",
+            params![id, format_ts(now)],
+        )?;
+        Ok(())
+    }
+
     fn save_notice_delivery(&self, notice: &Notice) -> Result<()> {
         self.open()?.execute(
             "UPDATE owner_notices SET notify_after = ?2, push_attempts = ?3, \
@@ -339,6 +366,9 @@ pub trait NoticeWorld {
     /// message still new, read or needs-you; a review request still the
     /// doc's latest publish and still requested.
     fn still_wanted(&self, notice: &Notice) -> Result<bool>;
+    /// Whether the owner opened the notice's subject after the notice was
+    /// created: the message, or the requested revision of the doc.
+    fn opened(&self, notice: &Notice) -> Result<bool>;
     /// The sender's unread messages to the owner, for `unread_count`.
     fn unread_count(&self, notice: &Notice) -> Result<i64>;
     /// Every message and review-requesting publish created since `since`,
@@ -375,7 +405,7 @@ pub fn deliver_notices(
 ) -> Result<Vec<String>> {
     let mut problems = Vec::new();
     for mut notice in store.pending_notices(now)? {
-        if !world.still_wanted(&notice)? {
+        if !world.still_wanted(&notice)? || world.opened(&notice)? {
             close_resolved(&mut notice, now);
             store.save_notice_delivery(&notice)?;
             continue;
@@ -453,7 +483,7 @@ pub fn deliver_notices(
         store.save_notice_delivery(&notice)?;
     }
     for mut notice in store.notice_ack_fallback_due(now)? {
-        if !world.still_wanted(&notice)? {
+        if !world.still_wanted(&notice)? || world.opened(&notice)? {
             close_resolved(&mut notice, now);
             store.save_notice_delivery(&notice)?;
             continue;
@@ -489,7 +519,51 @@ pub fn deliver_notices(
     Ok(problems)
 }
 
-/// The owner already answered: nothing is sent, now or as a fallback.
+/// Tells the phone to remove each shown notification the owner no longer
+/// needs: its subject was answered or opened (sm#1643). The app removes the
+/// notification only while it still shows that notice, so a newer notice from
+/// the same agent stays. A push that fails retryably is tried on the next pass.
+pub fn withdraw_notices(
+    store: &OwnerPushStore,
+    world: &dyn NoticeWorld,
+    sender: Option<&dyn PushSender>,
+    now: OffsetDateTime,
+) -> Result<Vec<String>> {
+    let mut problems = Vec::new();
+    let Some(sender) = sender else {
+        return Ok(problems);
+    };
+    for notice in store.shown_notices(now)? {
+        if world.still_wanted(&notice)? && !world.opened(&notice)? {
+            continue;
+        }
+        let data = BTreeMap::from([
+            ("kind".to_owned(), NOTICE_WITHDRAW.to_owned()),
+            ("notice_id".to_owned(), notice.id.clone()),
+        ]);
+        let mut retry = false;
+        for token in store.valid_tokens(&notice.user_id)? {
+            match sender.send(&token.token, &data) {
+                Ok(()) => {}
+                Err(PushError::InvalidToken(detail)) => {
+                    store.record_token_error(&token, &detail, Some(now))?;
+                }
+                Err(PushError::Retryable(detail)) => {
+                    store.record_token_error(&token, &detail, None)?;
+                    problems.push(format!("notice {} withdrawal failed: {detail}", notice.id));
+                    retry = true;
+                }
+            }
+        }
+        if !retry {
+            store.record_withdrawal(&notice.id, now)?;
+        }
+    }
+    Ok(problems)
+}
+
+/// The owner already answered or opened it: nothing is sent, now or as a
+/// fallback.
 fn close_resolved(notice: &mut Notice, now: OffsetDateTime) {
     if notice.notified_at.is_none() {
         notice.notified_at = Some(format_ts(now));
