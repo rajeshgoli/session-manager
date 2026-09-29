@@ -2,6 +2,89 @@ use super::*;
 use std::io::Read;
 use std::net::TcpListener;
 
+#[test]
+fn handoff_edits_and_confirmation_target_the_selected_session() {
+    let mut view = View::new(&args());
+    let (worker, actions) = fake_worker();
+    for (text, expected) in [
+        ("on", json!({"enabled":true})),
+        ("off", json!({"enabled":false})),
+        ("default", json!({"use_default":true})),
+        ("45", json!({"threshold_percent":45})),
+    ] {
+        handoff::apply(&worker, &mut view, "a/b", text).unwrap();
+        match actions.try_recv().unwrap() {
+            Work::Action {
+                method, path, body, ..
+            } => {
+                assert_eq!(method, "PUT");
+                assert_eq!(path, "/sessions/a%2Fb/handoff-policy");
+                assert_eq!(body, expected);
+            }
+            _ => panic!("expected action"),
+        }
+        view.busy = false;
+    }
+    for text in ["0", "101", "20.5", "NaN", ""] {
+        assert!(handoff::apply(&worker, &mut view, "a", text).is_err());
+        assert!(actions.try_recv().is_err());
+    }
+    handoff::apply(&worker, &mut view, "a", "now").unwrap();
+    assert!(actions.try_recv().is_err());
+    assert!(!handoff::confirm_now(&worker, &mut view, "b").unwrap());
+    view.handoff = Some(("a".into(), Instant::now() - Duration::from_secs(6)));
+    assert!(!handoff::confirm_now(&worker, &mut view, "a").unwrap());
+    handoff::apply(&worker, &mut view, "a", "now").unwrap();
+    assert!(handoff::confirm_now(&worker, &mut view, "a").unwrap());
+    assert!(
+        matches!(actions.try_recv().unwrap(), Work::Action { body, .. } if body == json!({"ask_now":true}))
+    );
+    assert!(!handoff::confirm_now(&worker, &mut view, "a").unwrap());
+}
+
+#[test]
+fn handoff_defaults_key_opens_without_requiring_an_agent() {
+    let mut view = View::new(&args());
+    let (worker, actions) = fake_worker();
+    handle_key(
+        Key::Char('P'),
+        &mut view,
+        &worker,
+        &Snapshot::default(),
+        &args(),
+    )
+    .unwrap();
+    assert!(view.defaults_open);
+    assert!(
+        matches!(actions.try_recv().unwrap(), Work::Action { method: "GET", path, .. } if path == "/handoff-defaults")
+    );
+    handoff::defaults_key(Key::Down, &worker, &mut view).unwrap();
+    assert_eq!(view.default_index, 1);
+    handoff::defaults_key(Key::Esc, &worker, &mut view).unwrap();
+    assert!(!view.defaults_open);
+}
+
+#[test]
+fn handoff_context_uses_server_states_and_handles_missing_readings() {
+    let mut v = json!({"context_percent":28, "handoff":{"enabled":true,"has_gauge":true,"threshold_percent":35,"state":null}});
+    assert_eq!(handoff::context(&v), "28%/35");
+    v["handoff"]["enabled"] = json!(false);
+    assert_eq!(handoff::context(&v), "28% off");
+    v["context_percent"] = Value::Null;
+    assert_eq!(handoff::context(&v), "?% off");
+    for display in [
+        "asked 14:02",
+        "handoff overdue",
+        "handing off",
+        "handoff failed",
+        "→ next",
+    ] {
+        v["handoff"]["state"] = json!("asked");
+        v["handoff"]["display"] = json!(display);
+        assert_eq!(handoff::context(&v), display);
+    }
+}
+
 fn args() -> WatchArgs {
     WatchArgs {
         repo: None,

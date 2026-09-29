@@ -14481,7 +14481,8 @@ fn ensure_core_runtime_node_supported(node: &str) -> Result<(), ApiError> {
 /// `/history`, `/t/<repo-name>/<n>`, and the web watch (`/`, `/watch`,
 /// `/watch/state`) also accept the owner's interactive
 /// Cloudflare Access login on the browser hostname. Every other route there
-/// still needs the SM Google session (spec 945).
+/// still needs the SM Google session (spec 945), except the handoff owner
+/// controls, which reuse this login and add agent and Origin restrictions.
 /// A present assertion must verify; a verified non-owner email falls through
 /// to the Google session check like a request without one.
 fn ensure_owner_page_read_allowed(state: &AppState, request: &Request) -> Result<(), ApiError> {
@@ -19173,8 +19174,7 @@ mod tests {
         }
     }
 
-    /// The owner's browser login opens the read-only owner pages and
-    /// nothing that writes.
+    /// The owner's browser login does not authorize general write routes.
     #[tokio::test]
     async fn owner_browser_login_is_refused_on_write_routes() {
         let app = owner_doc_browser_access_app();
@@ -22130,5 +22130,100 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["handoff"]["state"], "asked", "{body}");
         assert!(body.get("context_percent").is_some(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn handoff_controls_accept_only_owner_browser_login_and_same_origin() {
+        let mut config = google_auth_config();
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        config.paths.state_file = write_session_state("handoff-browser", "running");
+        config.rust_core.fixture_writes_enabled = true;
+        config.rust_core.runtime_enabled = false;
+        let state = AppState::new(config);
+        seed_cloudflare_access_jwks(&state);
+        let app = router(state);
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let stranger =
+            test_browser_access_assertion("sm-browser-aud", "stranger@example.com", 4_102_444_800);
+        let expired =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 1_700_000_100);
+        let wrong_audience =
+            test_browser_access_assertion("other-app", "rajeshgoli@gmail.com", 4_102_444_800);
+        for uri in [
+            "/handoff-defaults",
+            "/sessions/handoff-browser/handoff-policy",
+        ] {
+            for (assertion, origin, agent, expected) in [
+                (
+                    owner.as_str(),
+                    "https://sm.example.com",
+                    false,
+                    StatusCode::OK,
+                ),
+                (
+                    owner.as_str(),
+                    "https://evil.example",
+                    false,
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    owner.as_str(),
+                    "https://sm.example.com",
+                    true,
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    stranger.as_str(),
+                    "https://sm.example.com",
+                    false,
+                    StatusCode::UNAUTHORIZED,
+                ),
+                (
+                    expired.as_str(),
+                    "https://sm.example.com",
+                    false,
+                    StatusCode::FORBIDDEN,
+                ),
+                (
+                    wrong_audience.as_str(),
+                    "https://sm.example.com",
+                    false,
+                    StatusCode::FORBIDDEN,
+                ),
+            ] {
+                let mut headers = vec![("cf-access-jwt-assertion", assertion), ("origin", origin)];
+                if agent {
+                    headers.push(("x-sm-session", "handoff-browser"));
+                }
+                let request = handoff_json_request(
+                    public_request_with_host(
+                        Method::PUT,
+                        uri,
+                        Body::from(r#"{"threshold_percent":45}"#),
+                        "sm.example.com",
+                    ),
+                    &headers,
+                );
+                let (status, body) =
+                    response_json(app.clone().oneshot(request).await.unwrap()).await;
+                assert_eq!(status, expected, "{uri}: {body}");
+                if expected == StatusCode::OK {
+                    assert_eq!(body["threshold_percent"], 45);
+                }
+            }
+            let (status, body) = browser_host_get(&app, uri, Some(&owner)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["threshold_percent"], 45);
+        }
+        let request =
+            public_request_with_host(Method::GET, "/watch", Body::empty(), "sm.example.com");
+        let request = handoff_json_request(request, &[("cf-access-jwt-assertion", &owner)]);
+        let response = app.oneshot(request).await.unwrap();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(html.contains("Handoff defaults"));
+        assert!(html.contains("data-handoff=\"handoff-browser\""));
+        assert!(html.contains("hands off at 45%") || html.contains("handoff off"));
     }
 }

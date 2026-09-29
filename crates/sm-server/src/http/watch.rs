@@ -1,6 +1,6 @@
 //! Web watch (sm#1452, ticket #1489): `GET /` and `GET /watch`, the
 //! browser version of `sm watch`, and `GET /watch/state`, the JSON it
-//! renders. Read-only and behind the owner page gate. The page is painted
+//! renders. Read-only except handoff policy, behind the owner page gate. The page is painted
 //! on the server, so it works with scripts off; an inline script
 //! (`watch_client.js`) refetches the state and re-renders the cards with
 //! the same markup as [`render_sessions`].
@@ -54,7 +54,7 @@ pub(super) async fn get_watch_page(
     };
     let body = format!(
         r#"<style>{STYLE}</style>
-{bar}<div id="w" data-refresh="{refresh}">{cards}</div>
+{bar}<div id="handoff-defaults" hidden></div><div id="w" data-refresh="{refresh}">{cards}</div>
 <script>{CLIENT_JS}</script>"#,
         bar = filter_bar(path, &params),
         refresh = state.config.web_watch.refresh_seconds(),
@@ -65,7 +65,10 @@ pub(super) async fn get_watch_page(
         page_shell_with_status(
             "sm · Watch",
             "watch",
-            &format!(r#"<span class="m" id="ws">{}</span>"#, summary(&doc)),
+            &format!(
+                r#"<button type="button" id="handoff-defaults-open">Handoff defaults</button> <span class="m" id="ws">{}</span>"#,
+                summary(&doc)
+            ),
             &body,
         ),
     ))
@@ -267,7 +270,12 @@ details.card>summary::-webkit-details-marker{display:none}\
 .dot.waiting{background:var(--ka)}.amb{color:var(--ka)}\
 .grp{font:11px var(--mono);color:var(--kt3);margin:14px 0 6px 2px}\
 .cp{cursor:copy;background:var(--k2);border-radius:5px;padding:1px 6px}\
-.cp.ok{color:var(--kg)}#ws.stale{color:var(--ka)}";
+.cp.ok{color:var(--kg)}#ws.stale{color:var(--ka)}\
+.handoff-panel,#handoff-defaults{padding:12px;margin:8px 0;border:1px solid var(--kt3);border-radius:8px}\
+.handoff-panel input[type=number],#handoff-defaults input[type=number]{width:6em}\
+.handoff-panel button,.handoff-panel label{margin:4px}\
+button[data-handoff]{font:inherit;color:inherit;background:none;border:0;padding:3px 0;cursor:pointer;text-align:left}\
+[role=status]{color:var(--kt2)}";
 
 /// `6 live · 1 waiting on you`.
 fn summary(doc: &Value) -> String {
@@ -477,7 +485,8 @@ fn card(v: &Value, now: i128) -> String {
     };
     let depth = v["depth"].as_u64().unwrap_or(0).min(6);
     format!(
-        r#"<details class="card {edge}" data-id="{id}" style="margin-left:{indent}px"><summary><span class="row"><span class="dot {state}"></span><span class="mt nm">{name}</span><span class="m">{provider} · {state} {age}</span>{chips}</span>{status}</summary>{sections}</details>"#,
+        r#"<details class="card {edge}" data-id="{id}" style="margin-left:{indent}px"><summary><span class="row"><span class="dot {state}"></span><span class="mt nm">{name}</span><span class="m">{provider} · {state} {age}</span>{chips}</span>{status}{handoff}</summary>{sections}</details>"#,
+        handoff = handoff_line(v),
         id = escape_html(s(v, "id")),
         indent = depth * 14,
         state = escape_html(s(v, "state")),
@@ -491,6 +500,22 @@ fn card(v: &Value, now: i128) -> String {
             ("Jobs", jobs_html(v, now)),
             ("Attach", attach_html(v)),
         ]),
+    )
+}
+
+fn handoff_line(v: &Value) -> String {
+    if !v["handoff"].is_object() {
+        return String::new();
+    }
+    let context = v["context_percent"]
+        .as_f64()
+        .map(|p| format!("ctx {p:.0}% · "))
+        .unwrap_or_default();
+    format!(
+        r#"<span class="st"><button type="button" data-handoff="{}">{}{}</button></span>"#,
+        escape_html(s(v, "id")),
+        context,
+        escape_html(s(&v["handoff"], "display"))
     )
 }
 
