@@ -1,3 +1,4 @@
+pub mod analytics_spend;
 pub mod app_artifacts;
 pub mod btw;
 pub mod bug_reports;
@@ -24,6 +25,7 @@ pub mod owner_push;
 pub mod push_fcm;
 pub mod queue;
 pub mod queue_authority;
+pub mod quota_rates;
 pub mod runtime;
 pub mod seat_sessions;
 pub mod sessions;
@@ -36,6 +38,7 @@ pub mod usage_ledger;
 pub mod usage_report;
 pub mod utilization;
 pub mod watch_view;
+pub mod work_attribution;
 pub mod work_claims;
 pub mod work_history;
 

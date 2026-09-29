@@ -141,6 +141,7 @@ use crate::sessions::{
     SubagentStopOutcome, SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest,
     TurnCompleteOutcome, UpdateSessionMetadataRequest,
 };
+use crate::work_attribution::git_origin_github_repo;
 
 use crate::studio_ssh::{self, StudioSshStatus};
 use crate::tool_usage::{
@@ -320,6 +321,7 @@ pub enum GitHubPullRequestState {
 }
 
 mod agent_history;
+mod analytics;
 mod claims;
 mod docs;
 mod follows;
@@ -470,6 +472,8 @@ pub struct AppState {
     owner_doc_pr_cache: Arc<Mutex<docs::DocPullRequestCache>>,
     /// Serializes owner doc review submits and their reconciliation.
     owner_doc_reopen_cache: Arc<Mutex<BTreeMap<String, (std::time::Instant, Value)>>>,
+    /// Analytics payloads per parameter set, cached for 60s.
+    analytics_cache: Arc<Mutex<analytics::AnalyticsCache>>,
     owner_doc_review_lock: Arc<AsyncMutex<()>>,
     /// Serializes owner message replies with their draft writes (sm#1580).
     owner_message_lock: Arc<AsyncMutex<()>>,
@@ -603,6 +607,7 @@ impl AppState {
             owner_doc_source: Arc::new(docs::GhCliDocSource),
             owner_doc_pr_cache: Arc::new(Mutex::new(BTreeMap::new())),
             owner_doc_reopen_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            analytics_cache: Arc::new(Mutex::new(BTreeMap::new())),
             owner_doc_review_lock: Arc::new(AsyncMutex::new(())),
             owner_message_lock: Arc::new(AsyncMutex::new(())),
             work_item_source: Arc::new(claims::GhCliWorkItemSource),
@@ -1397,33 +1402,6 @@ fn gh_repo_view_in_dir(dir: &str) -> Result<String, String> {
     Ok(repo)
 }
 
-fn git_origin_github_repo(dir: &str) -> Option<String> {
-    let mut command = Command::new("git");
-    command.args(["-C", dir, "remote", "get-url", "origin"]);
-    let output = crate::child_output::output_with_timeout(command, Duration::from_secs(5)).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    github_repo_from_remote_url(String::from_utf8_lossy(&output.stdout).trim())
-}
-
-/// `git@github.com:owner/name.git`, `ssh://git@github.com/owner/name`, and
-/// `https://github.com/owner/name.git` all yield `owner/name`.
-fn github_repo_from_remote_url(url: &str) -> Option<String> {
-    let path = [
-        "git@github.com:",
-        "ssh://git@github.com/",
-        "https://github.com/",
-    ]
-    .iter()
-    .find_map(|prefix| url.strip_prefix(prefix))?;
-    let path = path.trim_end_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    let (owner, name) = path.split_once('/')?;
-    (!owner.is_empty() && !name.is_empty() && !name.contains('/'))
-        .then(|| format!("{owner}/{name}"))
-}
-
 fn codex_review_repo_error() -> ApiError {
     ApiError::Status {
         status: StatusCode::BAD_REQUEST,
@@ -1506,6 +1484,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/client/utilization/series", get(client_utilization_series))
         .route("/client/analytics/summary", get(client_analytics_summary))
+        .route(
+            "/client/analytics/spend",
+            get(analytics::client_analytics_spend),
+        )
         .route(
             "/client/push-token",
             put(follows::put_push_token).delete(follows::delete_push_token),
@@ -14193,6 +14175,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/events/state"
         || path == "/apk"
         || path == "/client/analytics/summary"
+        || path == "/client/analytics/spend"
         || path == "/client/session-models"
         || path == "/client/host-status"
         || path == "/client/queue"
@@ -16490,7 +16473,7 @@ mod tests {
             "https://github.com/rajeshgoli/session-manager/",
         ] {
             assert_eq!(
-                github_repo_from_remote_url(url).as_deref(),
+                crate::work_attribution::github_repo_from_remote_url(url).as_deref(),
                 Some("rajeshgoli/session-manager"),
                 "{url}"
             );
@@ -16501,7 +16484,11 @@ mod tests {
             "https://github.com/owner/name/extra",
             "/local/path/repo.git",
         ] {
-            assert_eq!(github_repo_from_remote_url(url), None, "{url}");
+            assert_eq!(
+                crate::work_attribution::github_repo_from_remote_url(url),
+                None,
+                "{url}"
+            );
         }
     }
 
@@ -19875,6 +19862,7 @@ mod tests {
                 true,
             ),
             (Method::GET, "/client/analytics/summary", "", false),
+            (Method::GET, "/client/analytics/spend", "", false),
             (
                 Method::GET,
                 "/client/session-models?provider=claude",
@@ -20815,6 +20803,43 @@ mod tests {
         let (status, body) = response_json(response).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body["ticket_id"].as_str().unwrap().starts_with("att_"));
+    }
+
+    #[tokio::test]
+    async fn analytics_spend_validates_parameters_and_reads_missing_dbs() {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        let dir = std::env::temp_dir().join(format!("sm-analytics-http-{}", std::process::id()));
+        config.usage.db_path = dir.join("usage.db").to_string_lossy().into_owned();
+        config.sm_send.db_path = dir.join("queue.db").to_string_lossy().into_owned();
+        let app = router(AppState::new(config));
+        for (uri, expected) in [
+            ("/client/analytics/spend", StatusCode::OK),
+            (
+                "/client/analytics/spend?provider=codex&range=4w",
+                StatusCode::OK,
+            ),
+            (
+                "/client/analytics/spend?provider=gemini",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/client/analytics/spend?range=year",
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(local_request(Method::GET, uri, Body::empty()))
+                .await
+                .unwrap();
+            let (status, body) = response_json(response).await;
+            assert_eq!(status, expected, "{uri}");
+            if status == StatusCode::OK {
+                assert_eq!(body["total"]["percent"], json!(0.0), "{uri}");
+                assert_eq!(body["root"]["kind"], "root", "{uri}");
+            }
+        }
     }
 
     #[tokio::test]
