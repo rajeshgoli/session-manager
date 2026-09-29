@@ -121,6 +121,7 @@ use crate::runtime::{
 };
 #[cfg(test)]
 use crate::sessions::codex_fork_legacy_event_stream_path_from_log_file;
+use crate::sessions::ReviewAsk;
 use crate::sessions::{
     claude_hook_gate, codex_fork_event_line_matches_root_thread, codex_fork_event_line_starts_turn,
     codex_fork_newest_event_stream_path, codex_fork_status_for_event_line, expand_home,
@@ -322,6 +323,7 @@ mod claims;
 mod docs;
 mod follows;
 mod guestbook_page;
+mod handoff;
 mod history;
 mod inbox;
 mod merge_holds;
@@ -1741,6 +1743,14 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{session_id}/restore", post(restore_session))
         .route("/sessions/{session_id}/clear", post(clear_session))
         .route("/sessions/{session_id}/handoff", post(schedule_handoff))
+        .route(
+            "/sessions/{session_id}/handoff-policy",
+            get(handoff::get_handoff_policy).put(handoff::put_handoff_policy),
+        )
+        .route(
+            "/handoff-defaults",
+            get(handoff::get_handoff_defaults).put(handoff::put_handoff_defaults),
+        )
         .route(
             "/sessions/{session_id}/maintainer",
             put(set_maintainer).delete(clear_maintainer),
@@ -5028,6 +5038,14 @@ async fn create_codex_review_request(
             if existing.requested_head_sha.as_deref() == Some(initial_head_sha.as_str()) {
                 let mut response = codex_review_request_response(&state, existing.clone())?;
                 add_codex_review_claim_warning(&state, &existing, &mut response);
+                handoff::add_review_handoff_ask(
+                    &state,
+                    payload.requester_session_id.as_deref(),
+                    ReviewAsk::Codex {
+                        pr_number: payload.pr_number,
+                    },
+                    &mut response,
+                );
                 spawn_codex_review_request_watcher(state.clone(), existing.id);
                 return Ok(Json(response));
             }
@@ -5101,6 +5119,14 @@ async fn create_codex_review_request(
         })?;
         let mut response = codex_review_request_response(&state, registration.clone())?;
         add_codex_review_claim_warning(&state, &registration, &mut response);
+        handoff::add_review_handoff_ask(
+            &state,
+            payload.requester_session_id.as_deref(),
+            ReviewAsk::Codex {
+                pr_number: payload.pr_number,
+            },
+            &mut response,
+        );
         spawn_codex_review_request_watcher(state.clone(), registration.id);
         Ok(Json(response))
     });
@@ -18582,7 +18608,11 @@ mod tests {
     }
 
     fn google_auth_state() -> AppState {
-        let state = AppState::new(google_auth_config());
+        google_auth_state_with(google_auth_config())
+    }
+
+    fn google_auth_state_with(config: AppConfig) -> AppState {
+        let state = AppState::new(config);
         *state.google_id_token_jwks_cache.lock().unwrap() = Some(GoogleIdTokenJwksCacheEntry {
             jwks: Arc::new(test_google_jwks()),
             fetched_at: Instant::now(),
@@ -21843,5 +21873,218 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
             "user": { "login": "chatgpt-codex-connector[bot]" }
         });
         assert!(!codex_comment_is_bound(&stale_abbreviated, head, Some(77)));
+    }
+
+    fn handoff_json_request(
+        mut request: axum::http::Request<Body>,
+        headers: &[(&str, &str)],
+    ) -> axum::http::Request<Body> {
+        request
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        for (name, value) in headers {
+            request.headers_mut().insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        request
+    }
+
+    #[tokio::test]
+    async fn handoff_policy_routes_are_owner_only() {
+        let session_id = "handoff-agent";
+        let mut config = google_auth_config();
+        let state_file = write_session_state(session_id, "running");
+        let queue_path = PathBuf::from(&state_file).with_file_name("handoff-queue.db");
+        config.paths.state_file = state_file;
+        config.sm_send.db_path = queue_path.display().to_string();
+        config.rust_core.fixture_writes_enabled = true;
+        config.rust_core.runtime_enabled = false;
+        let token = issue_device_access_token(&config, "rajeshgoli@gmail.com", "Rajesh")
+            .unwrap()
+            .access_token;
+        let bearer = format!("Bearer {token}");
+        let app = router(google_auth_state_with(config));
+        let policy_uri = format!("/sessions/{session_id}/handoff-policy");
+        let put = |uri: &str, body: Value, remote: bool| {
+            let body = Body::from(serde_json::to_vec(&body).unwrap());
+            if remote {
+                public_request_with_host(Method::PUT, uri, body, "sm.rajeshgo.li")
+            } else {
+                local_request(Method::PUT, uri, body)
+            }
+        };
+
+        // Local terminal without a session: passes.
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(handoff_json_request(
+                    put(
+                        &policy_uri,
+                        json!({"enabled": true, "threshold_percent": 45}),
+                        false,
+                    ),
+                    &[],
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["display"], "hands off at 45%");
+        assert_eq!(body["source"], "override");
+
+        // Remote owner (the app): passes.
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(handoff_json_request(
+                    put("/handoff-defaults", json!({"reminder_percent": 60}), true),
+                    &[("authorization", &bearer)],
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["reminder_percent"], 60);
+
+        // Remote without auth: refused by the session gate.
+        let (status, _) = response_json(
+            app.clone()
+                .oneshot(handoff_json_request(
+                    put(&policy_uri, json!({"enabled": false}), true),
+                    &[],
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Any managed session, the target included: refused.
+        for headers in [
+            vec![("x-sm-session", session_id)],
+            vec![("x-sm-session", "some-parent")],
+        ] {
+            let (status, body) = response_json(
+                app.clone()
+                    .oneshot(handoff_json_request(
+                        put(&policy_uri, json!({"enabled": false}), false),
+                        &headers,
+                    ))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(body["detail"], "handoff policy is owner-only");
+        }
+        let (status, _) = response_json(
+            app.clone()
+                .oneshot(handoff_json_request(
+                    put(
+                        "/handoff-defaults",
+                        json!({"threshold_percent": 10, "requester_session_id": session_id}),
+                        false,
+                    ),
+                    &[],
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // A browser from another origin: refused; from the page's own: passes.
+        let (status, _) = response_json(
+            app.clone()
+                .oneshot(handoff_json_request(
+                    put(&policy_uri, json!({"ask_now": true}), true),
+                    &[
+                        ("authorization", &bearer),
+                        ("origin", "https://evil.example"),
+                    ],
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(handoff_json_request(
+                    put(&policy_uri, json!({"ask_now": true}), true),
+                    &[
+                        ("authorization", &bearer),
+                        ("origin", "https://sm.rajeshgo.li"),
+                    ],
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "asked");
+
+        // Hand off now again: 409 naming the state.
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(handoff_json_request(
+                    put(&policy_uri, json!({"ask_now": true}), false),
+                    &[],
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["detail"], "handoff already asked");
+
+        // Range errors name the field.
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(handoff_json_request(
+                    put("/handoff-defaults", json!({"threshold_percent": 0}), false),
+                    &[],
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["detail"],
+            "threshold_percent must be a number in (0, 100]"
+        );
+
+        // GET returns the stored defaults and the session JSON carries the view.
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(local_request(
+                    Method::GET,
+                    "/handoff-defaults",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["threshold_percent"], 35);
+        assert_eq!(body["reminder_percent"], 60);
+        let (status, body) = response_json(
+            app.oneshot(local_request(
+                Method::GET,
+                &format!("/sessions/{session_id}"),
+                Body::empty(),
+            ))
+            .await
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["handoff"]["state"], "asked", "{body}");
+        assert!(body.get("context_percent").is_some(), "{body}");
     }
 }

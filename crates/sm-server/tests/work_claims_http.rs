@@ -533,6 +533,84 @@ async fn implicit_claims_from_doc_publish_and_codex_review_and_the_feed() {
     );
 }
 
+/// Context handoff (sm#1651, Appendix C.3): a review request at or above
+/// the review floor carries the ask for the CLI to print.
+#[tokio::test]
+async fn review_requests_carry_the_handoff_ask_above_the_floor() {
+    let f = fixture();
+    let state_file = f.dir.join("sessions.json");
+    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    for session in state["sessions"].as_array_mut().unwrap() {
+        let percent = match session["id"].as_str().unwrap() {
+            "eng00001" => 24.0,
+            "other001" => 30.0,
+            _ => 10.0,
+        };
+        session["context_used_percentage"] = json!(percent);
+    }
+    fs::write(&state_file, state.to_string()).unwrap();
+
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/codex-review-requests",
+        Some(json!({"pr_number": 9, "repo": REPO, "requester_session_id": "eng00001"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["handoff_ask"],
+        "[sm context management] Your context is at 24% and you just requested a review of PR #9, a good point to hand off. Stop at a logical point. sm will move your claims (PR #9) and pending wakes to a fresh agent. Post what the next agent needs in your PR, ticket, or a file, then run `sm handoff --link <url>` or `sm handoff --path <file>` and end your turn."
+    );
+    // A second request in state `asked` does nothing new.
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/codex-review-requests",
+        Some(json!({"pr_number": 9, "repo": REPO, "requester_session_id": "eng00001"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("handoff_ask").is_none(), "{body}");
+
+    // A publish without --review never asks.
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/docs",
+        Some(
+            json!({"repo": REPO, "path": "specs/memo.html", "commit_sha": "c".repeat(40),
+                    "pr_number": 9, "session_id": "other001"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("handoff_ask").is_none(), "{body}");
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/docs",
+        Some(
+            json!({"repo": REPO, "path": "specs/memo.html", "commit_sha": "c".repeat(40),
+                    "pr_number": 9, "session_id": "other001", "review": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ask = body["handoff_ask"].as_str().unwrap_or_default();
+    assert!(
+        ask.starts_with("[sm context management] Your context is at 30% and you just asked ")
+            && ask.contains(" to review ")
+            && ask.contains("His review will wake your successor."),
+        "{body}"
+    );
+    // The requester below the floor is not asked.
+    let (status, body) = request(&f.app, "GET", "/sessions/eng00002", None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["handoff"]["state"], Value::Null, "{body}");
+    assert_eq!(body["context_percent"], 10.0);
+}
+
 #[tokio::test]
 async fn the_sync_pass_backfills_ends_claims_and_skips_closed_items() {
     let f = fixture();
