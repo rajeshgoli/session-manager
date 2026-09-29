@@ -191,7 +191,7 @@
     if (!CONFIG.prNumber) return ['Read-only: no PR', 'ro'];
     if (S.prState === 'open') return [S.canComment ? 'PR open' : 'Read-only', S.canComment ? 'muted' : 'ro'];
     if (S.prState === 'unknown' || !S.prState) return ['Read-only: PR state unknown', 'ro'];
-    return ['Read-only: PR ' + S.prState, 'ro'];
+    return [S.prState === 'merged' ? 'PR merged — commenting opens a new PR' : 'PR closed — commenting reopens it', 'muted'];
   }
 
   function renderBar() {
@@ -210,7 +210,7 @@
     var shas = {};
     (CONFIG.revisions || []).forEach(function (r, i) {
       shas[r.sha] = 1;
-      picker.appendChild(el('option', { value: r.sha, text: sha7(r.sha) + ' · ' + (r.publishedAt || '').slice(0, 16).replace('T', ' ') + (i === 0 ? ' (latest)' : '') }));
+      picker.appendChild(el('option', { value: r.sha, text: (r.prNumber && CONFIG.revisions.some(function (other) {return other.prNumber !== r.prNumber;}) ? '#' + r.prNumber + ' · ' : '') + sha7(r.sha) + ' · ' + (r.publishedAt || '').slice(0, 16).replace('T', ' ') + (i === 0 ? ' (latest)' : '') }));
     });
     var head = S.head;
     if (head && head.pr_head_sha && !shas[head.pr_head_sha] && head.pr_head_blob_sha &&
@@ -348,11 +348,14 @@
     if (MSG || document.visibilityState === 'hidden') return;
     api('GET', '/head?sha=' + CONFIG.sha).then(function (head) {
       S.head = head;
+      if (head.pr_number) {CONFIG.prNumber = head.pr_number; CONFIG.prUrl = head.pr_url;}
+      if (head.revisions) CONFIG.revisions = head.revisions;
+      if (head.pr_state === 'open') S.reopenTarget = null;
       S.agent = head.agent || null; S.mergeHold = head.merge_hold || null;
       if (!agentPanel.hidden) renderAgentPanel();
       if (head.pr_state) {
         S.prState = head.pr_state;
-        if (head.pr_state !== 'unknown') S.canComment = head.pr_state === 'open';
+        if (head.pr_state !== 'unknown') S.canComment = ['open','merged','closed'].indexOf(head.pr_state) >= 0;
       }
       renderBar();
       renderBanner();
@@ -641,7 +644,7 @@
   }
   function openReview() {
     hideChip();
-    refreshDrafts().then(function () { renderReview(''); }, function (err) {
+    Promise.all([refreshDrafts(), (!MSG && S.prState !== 'open') ? api('GET','/reopen-target').then(function(t){S.reopenTarget=t;}) : Promise.resolve()]).then(function () { renderReview(''); }, function (err) {
       renderReview('Could not reload drafts: ' + err.message);
     });
   }
@@ -662,7 +665,7 @@
     });
     var msg = el('div', { class: notice ? 'err' : '', text: notice });
     if (!S.canComment) {
-      sheet.appendChild(el('div', { class: 'ro', text: stateText()[0] + '. These drafts cannot be submitted.' }));
+      sheet.appendChild(el('div', { class: 'ro', text: S.reopenTarget && S.reopenTarget.reason || stateText()[0] + '. These drafts cannot be submitted.' }));
       sheet.appendChild(el('div', { class: 'row' }, [el('button', { text: 'Close', onclick: closeSheet })]));
       sheet.hidden = false;
       return;
@@ -681,7 +684,7 @@
     holdCheck.checked = !!S.mergeHold; holdCheck.disabled = !!S.mergeHold;
     var body = el('textarea', { placeholder: 'Overall comment (optional)' });
     if (attempt) { body.value = attempt.body; body.disabled = true; }
-    var submit = el('button', { class: 'p', text: attempt ? 'Submit again' : 'Submit review', onclick: function () {
+    var submit = el('button', { class: 'p', text: attempt ? 'Submit again' : S.reopenTarget && S.reopenTarget.kind === 'new_pr' ? 'Open PR from ' + S.reopenTarget.base + ' and submit' : S.reopenTarget && S.reopenTarget.kind === 'reopen' ? 'Reopen PR #' + S.reopenTarget.pr + ' and submit' : 'Submit review', onclick: function () {
       var picked = root.querySelector ? root.querySelector('input[name=sm-verdict]:checked') : null;
       submit.disabled = true;
       msg.className = 'muted';
@@ -719,6 +722,7 @@
         renderReview(err.message + (refused ? '' : ' Submitting again is safe.'));
       });
     } });
+    if (S.reopenTarget && S.reopenTarget.kind === 'refused') {submit.disabled = true; msg.className = 'err'; msg.textContent = S.reopenTarget.reason;}
     // Actions above the overall comment, clear of the on-screen keyboard.
     [el('div', { class: 'row' }, radios),
       el('label', {}, [holdCheck, 'Hold merge until I release it']),

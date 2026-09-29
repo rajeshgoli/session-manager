@@ -50,6 +50,7 @@ pub struct OwnerDocPublish {
     pub checkout_root: Option<String>,
     /// Set by No review needed: the owner cleared this review request.
     pub review_dismissed_at: Option<String>,
+    pub pr_number: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -501,6 +502,25 @@ pub fn init_owner_docs_schema(conn: &Connection) -> Result<()> {
     if !present {
         conn.execute_batch("ALTER TABLE owner_doc_reviews ADD COLUMN posted_at TEXT")?;
     }
+    for (table, column, kind) in [
+        ("owner_doc_reviews", "reopen_target", "TEXT"),
+        ("owner_doc_reviews", "target_base", "TEXT"),
+        ("owner_doc_reviews", "target_tip", "TEXT"),
+        ("owner_doc_reviews", "target_pr", "INTEGER"),
+        ("owner_doc_publishes", "pr_number", "INTEGER"),
+    ] {
+        if !conn
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+            ))?
+            .exists(params![column])?
+        {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+            if table == "owner_doc_publishes" {
+                conn.execute_batch("UPDATE owner_doc_publishes SET pr_number = (SELECT pr_number FROM owner_docs WHERE id = doc_id)")?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -558,12 +578,34 @@ impl OwnerDocStore {
         request: PublishOwnerDoc,
         author_is_live: impl FnOnce(&str) -> bool,
     ) -> Result<PublishedOwnerDoc> {
+        self.publish_moving(request, author_is_live, None)
+    }
+
+    pub fn move_candidate(&self, repo: &str, path: &str, pr: i64) -> Result<Option<OwnerDoc>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        if conn
+            .prepare("SELECT 1 FROM owner_docs WHERE repo = ?1 AND path = ?2 AND pr_number = ?3")?
+            .exists(params![repo, path, pr])?
+        {
+            return Ok(None);
+        }
+        Ok(conn.query_row(&format!("SELECT {DOC_COLUMNS} FROM owner_docs WHERE repo = ?1 AND path = ?2 AND pr_number IS NOT NULL ORDER BY updated_at DESC, rowid DESC LIMIT 1"),params![repo,path],doc_from_row).optional()?)
+    }
+
+    pub fn publish_moving(
+        &self,
+        request: PublishOwnerDoc,
+        author_is_live: impl FnOnce(&str) -> bool,
+        move_from: Option<&str>,
+    ) -> Result<PublishedOwnerDoc> {
         validate_repo_slug(&request.repo)?;
         validate_repo_path(&request.path)?;
         let mut conn = self.open_write()?;
         let tx = conn.transaction()?;
         let now = now_rfc3339();
-        let existing = tx
+        let mut existing = tx
             .query_row(
                 &format!(
                     "SELECT {DOC_COLUMNS} FROM owner_docs
@@ -573,6 +615,24 @@ impl OwnerDocStore {
                 doc_from_row,
             )
             .optional()?;
+        if existing.is_none() {
+            if let Some(id) = move_from {
+                if let Some(candidate) = get_doc_conn(&tx, id)? {
+                    anyhow::ensure!(
+                        candidate.repo == request.repo
+                            && candidate.path == request.path
+                            && candidate.pr_number.is_some()
+                            && request.pr_number.is_some(),
+                        "invalid document move"
+                    );
+                    tx.execute(
+                        "UPDATE owner_docs SET pr_number = ?2 WHERE id = ?1",
+                        params![id, request.pr_number],
+                    )?;
+                    existing = Some(candidate);
+                }
+            }
+        }
         let created = existing.is_none();
         let doc_id = match existing {
             Some(doc) => {
@@ -621,8 +681,8 @@ impl OwnerDocStore {
         tx.execute(
             "INSERT INTO owner_doc_publishes
              (doc_id, commit_sha, blob_sha, session_id, review_requested, published_at,
-              checkout_root)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+              checkout_root, pr_number)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 doc_id,
                 request.commit_sha,
@@ -630,7 +690,8 @@ impl OwnerDocStore {
                 request.session_id,
                 request.review_requested,
                 now,
-                request.checkout_root
+                request.checkout_root,
+                request.pr_number
             ],
         )?;
         let publish_id = tx.last_insert_rowid();
@@ -770,6 +831,7 @@ impl OwnerDocStore {
                     published_at: row.get(17)?,
                     checkout_root: row.get(18)?,
                     review_dismissed_at: row.get(19)?,
+                    pr_number: row.get(20)?,
                 };
                 Ok((doc, publish))
             })?
@@ -1151,13 +1213,35 @@ impl OwnerDocStore {
         verdict: OwnerDocVerdict,
         body: Option<&str>,
     ) -> Result<(OwnerDocReview, bool)> {
+        self.begin_review_target(
+            submission_id,
+            doc_id,
+            commit_sha,
+            blob_sha,
+            verdict,
+            body,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // Persist the resolved target with the submission before GitHub mutations.
+    pub fn begin_review_target(
+        &self,
+        submission_id: &str,
+        doc_id: &str,
+        commit_sha: &str,
+        blob_sha: &str,
+        verdict: OwnerDocVerdict,
+        body: Option<&str>,
+        target: Option<&serde_json::Value>,
+    ) -> Result<(OwnerDocReview, bool)> {
         let conn = self.open_write()?;
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO owner_doc_reviews
              (id, status, pending_review_node_id, doc_id, commit_sha, blob_sha, verdict, body,
               line_comment_count, file_comment_count, github_review_id, github_review_url,
-              submitted_at, delivered_to_session_id)
-             VALUES (?1, 'submitting', NULL, ?2, ?3, ?4, ?5, ?6, 0, 0, NULL, NULL, ?7, NULL)",
+              submitted_at, delivered_to_session_id, reopen_target, target_base, target_tip, target_pr)
+             VALUES (?1, 'submitting', NULL, ?2, ?3, ?4, ?5, ?6, 0, 0, NULL, NULL, ?7, NULL, ?8, ?9, ?10, ?11)",
             params![
                 submission_id,
                 doc_id,
@@ -1165,11 +1249,38 @@ impl OwnerDocStore {
                 blob_sha,
                 verdict.as_str(),
                 body,
-                now_rfc3339()
+                now_rfc3339(),
+                target.map(serde_json::Value::to_string),
+                target.and_then(|t|t["base"].as_str()),
+                target.and_then(|t|t["tip_sha"].as_str()),
+                target.and_then(|t|t["target_pr"].as_i64()),
             ],
         )? > 0;
         let review = get_review_conn(&conn, submission_id)?.context("review row vanished")?;
         Ok((review, inserted))
+    }
+
+    pub fn review_target(&self, id: &str) -> Result<Option<serde_json::Value>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(None);
+        };
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT reopen_target FROM owner_doc_reviews WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        raw.map(|s| serde_json::from_str(&s).map_err(Into::into))
+            .transpose()
+    }
+    pub fn set_review_target(&self, id: &str, target: &serde_json::Value) -> Result<()> {
+        self.open_write()?.execute(
+            "UPDATE owner_doc_reviews SET reopen_target = ?2, target_base = ?3, target_tip = ?4, target_pr = ?5 WHERE id = ?1",
+            params![id, target.to_string(),target["base"].as_str(),target["tip_sha"].as_str(),target["target_pr"].as_i64()],
+        )?;
+        Ok(())
     }
 
     pub fn set_pending_review_node_id(
@@ -1376,7 +1487,7 @@ fn random_hex(bytes: usize) -> String {
 const DOC_COLUMNS: &str = "id, repo, path, pr_number, author_session_id, author_session_name, \
      title, note, retracted_at, created_at, updated_at";
 const PUBLISH_COLUMNS: &str = "id, doc_id, commit_sha, blob_sha, session_id, review_requested, \
-     published_at, checkout_root, review_dismissed_at";
+     published_at, checkout_root, review_dismissed_at, pr_number";
 
 fn doc_from_row(row: &Row<'_>) -> rusqlite::Result<OwnerDoc> {
     Ok(OwnerDoc {
@@ -1405,6 +1516,7 @@ fn publish_from_row(row: &Row<'_>) -> rusqlite::Result<OwnerDocPublish> {
         published_at: row.get(6)?,
         checkout_root: row.get(7)?,
         review_dismissed_at: row.get(8)?,
+        pr_number: row.get(9)?,
     })
 }
 
@@ -1928,6 +2040,7 @@ mod tests {
             published_at: at.into(),
             checkout_root: None,
             review_dismissed_at: None,
+            pr_number: None,
         };
         let first = publish("b1", "2026-09-24T10:00:00Z", true);
         let mut inputs = OwnerDocStateInputs {

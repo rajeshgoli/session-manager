@@ -23559,6 +23559,10 @@ struct StubDocSource {
 /// GitHub's pending-review behaviour as the spec's findings record it.
 #[derive(Default)]
 struct FakeGitHub {
+    reopen_info: Option<Value>,
+    branch_state: Option<Value>,
+    review_target: Option<(i64, String)>,
+    lose_pr_response: bool,
     /// pr number -> (state, head sha)
     prs: std::collections::BTreeMap<i64, (String, String)>,
     reviews: Vec<FakeReview>,
@@ -23627,6 +23631,53 @@ impl StubDocSource {
 }
 
 impl OwnerDocSource for StubDocSource {
+    fn doc_pr_info(&self, _: &str, _: i64) -> Result<Value, String> {
+        self.github
+            .lock()
+            .unwrap()
+            .reopen_info
+            .clone()
+            .ok_or("history unavailable".into())
+    }
+    fn doc_branch_state(&self, _: &str, _: &str) -> Result<Value, String> {
+        self.github
+            .lock()
+            .unwrap()
+            .branch_state
+            .clone()
+            .ok_or("branch unavailable".into())
+    }
+    fn ensure_doc_review_pr(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<(i64, String), String> {
+        let mut g = self.github.lock().unwrap();
+        if let Some(target) = g.review_target.clone() {
+            return Ok(target);
+        }
+        g.calls.push("create_review_pr".into());
+        let head = "d".repeat(40);
+        g.set_pr(99, "open", &head);
+        g.review_target = Some((99, head.clone()));
+        if g.lose_pr_response {
+            g.lose_pr_response = false;
+            return Err("lost creation response".into());
+        }
+        Ok((99, head))
+    }
+    fn reopen_doc_pr(&self, _: &str, pr: i64) -> Result<(), String> {
+        let mut g = self.github.lock().unwrap();
+        g.calls.push("reopen_pr".into());
+        g.prs.get_mut(&pr).unwrap().0 = "open".into();
+        Ok(())
+    }
+
     fn fetch_doc(&self, repo: &str, path: &str, sha: &str) -> Result<Vec<u8>, DocFetchError> {
         self.fetches.fetch_add(1, Ordering::SeqCst);
         if let Some(error) = &self.fetch_error {
@@ -24541,7 +24592,7 @@ async fn owner_doc_review_posts_one_github_review_and_wakes_the_author_once() {
     let doc = publish_review_memo(&app, "specs/memo.html", &c2, "author01", true).await;
     assert_eq!(doc["state"], "review_requested");
 
-    // A closed PR is read-only: no review, no review request.
+    // A closed PR with unavailable branch history refuses submission, but permits drafting.
     source.github.lock().unwrap().set_pr(12, "closed", &c2);
     let (status, refused) = post_json(
         app.clone(),
@@ -24561,7 +24612,7 @@ async fn owner_doc_review_posts_one_github_review_and_wakes_the_author_once() {
     let (_, _, page) = get_response(app.clone(), "/docs/widgets/specs/memo.html").await;
     assert!(String::from_utf8(page)
         .unwrap()
-        .contains("\"canComment\":false"));
+        .contains("\"canComment\":true"));
     assert_eq!(source.github.lock().unwrap().reviews.len(), 1);
 }
 
@@ -25611,4 +25662,128 @@ async fn session_root_route_resolves_the_persisted_parent_chain() {
     let (status, payload) = get_json(app, "/sessions/nobody01/root").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(payload["detail"], "Session not found");
+}
+
+#[tokio::test]
+async fn owner_doc_merged_review_retries_creation_without_duplicate_pr_or_publish() {
+    let sha = "a".repeat(40);
+    let tip = "c".repeat(40);
+    let head = "d".repeat(40);
+    let source = review_memo_source(&sha);
+    let (app, dir) = owner_docs_app(source.clone());
+    let id = publish_review_memo(&app, "specs/memo.html", &sha, "author01", true).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    add_draft(&app, &id, &sha, json!(3), "Buy the dip.", "Why now?").await;
+    for rev in [&tip, &head] {
+        source.put("acme/widgets", "specs/memo.html", rev, b"New document");
+    }
+    {
+        let mut g = source.github.lock().unwrap();
+        g.set_pr(12, "merged", &sha);
+        g.reopen_info =
+            Some(json!({"state":"MERGED","baseRefName":"epic","mergedAt":"2026-01-01"}));
+        g.branch_state = Some(json!({"tip":tip,"prs":[]}));
+        g.lose_pr_response = true;
+    }
+    let (status, t) = get_json(app.clone(), &format!("/docs/{id}/reopen-target")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(t["base"], "epic");
+    assert_eq!(t["doc_changed"], true);
+    let payload = json!({"submission_id":"merged-sub-001","sha":sha,"verdict":"comment","body":"Please reconsider"});
+    let (status, _) = post_json(app.clone(), &format!("/docs/{id}/review"), payload.clone()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let store = OwnerDocStore::new(dir.join("message_queue.db"));
+    assert_eq!(
+        store.review_target("merged-sub-001").unwrap().unwrap()["tip_sha"],
+        tip
+    );
+    for _ in 0..2 {
+        let (status, res) =
+            post_json(app.clone(), &format!("/docs/{id}/review"), payload.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["file_comment_count"], 1);
+        assert_eq!(res["line_comment_count"], 0);
+    }
+    let g = source.github.lock().unwrap();
+    assert_eq!(
+        g.calls
+            .iter()
+            .filter(|c| c.as_str() == "create_review_pr")
+            .count(),
+        1
+    );
+    assert_eq!(g.reviews.len(), 1);
+    assert!(g.reviews[0].threads.is_empty());
+    assert_eq!(g.reviews[0].commit, head);
+    assert!(g.reviews[0].body.contains("written against aaaaaaa"));
+    assert!(g.reviews[0].body.contains("Why now?"));
+    assert_eq!(store.get(&id).unwrap().unwrap().pr_number, Some(99));
+    let publishes = store.publishes(&id).unwrap();
+    assert_eq!(publishes.len(), 2);
+    assert_eq!(publishes[0].pr_number, Some(12));
+    assert_eq!(publishes[1].pr_number, Some(99));
+}
+
+#[tokio::test]
+async fn owner_doc_closed_review_reopens_once_and_preserves_original_commit() {
+    let sha = "a".repeat(40);
+    let source = review_memo_source(&sha);
+    let (app, _dir) = owner_docs_app(source.clone());
+    let id = publish_review_memo(&app, "specs/memo.html", &sha, "author01", true).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    {
+        let mut g = source.github.lock().unwrap();
+        g.set_pr(12, "closed", &sha);
+        g.reopen_info = Some(json!({"state":"CLOSED","headRefName":"topic"}));
+        g.branch_state = Some(json!({"tip":sha,"prs":[]}));
+    }
+    let payload = json!({"submission_id":"closed-sub-001","sha":sha,"verdict":"comment"});
+    for _ in 0..2 {
+        let (status, res) =
+            post_json(app.clone(), &format!("/docs/{id}/review"), payload.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+    }
+    let g = source.github.lock().unwrap();
+    assert_eq!(
+        g.calls.iter().filter(|c| c.as_str() == "reopen_pr").count(),
+        1
+    );
+    assert_eq!(g.reviews.len(), 1);
+    assert_eq!(g.reviews[0].commit, sha);
+}
+
+#[tokio::test]
+async fn owner_doc_publish_moves_closed_doc_and_preserves_history_but_not_open_doc() {
+    for old_state in ["merged", "closed", "open"] {
+        let sha = "a".repeat(40);
+        let source = review_memo_source(&sha);
+        let (app, dir) = owner_docs_app(source.clone());
+        let id = publish_review_memo(&app, "specs/memo.html", &sha, "author01", true).await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        {
+            let mut g = source.github.lock().unwrap();
+            g.set_pr(12, old_state, &sha);
+            g.set_pr(13, "open", &sha);
+        }
+        let payload = json!({"repo":"acme/widgets","path":"specs/memo.html","commit_sha":sha,"pr_number":13,"session_id":"author01"});
+        let (status, res) = post_json(app.clone(), "/docs", payload.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        let new_id = res["id"].as_str().unwrap();
+        assert_eq!(new_id == id, old_state != "open");
+        let store = OwnerDocStore::new(dir.join("message_queue.db"));
+        let pubs = store.publishes(new_id).unwrap();
+        assert_eq!(pubs.last().unwrap().pr_number, Some(13));
+        if old_state != "open" {
+            assert_eq!(pubs.len(), 2);
+            assert_eq!(pubs[0].pr_number, Some(12));
+        }
+        let (_, again) = post_json(app.clone(), "/docs", payload).await;
+        assert_eq!(again["id"], new_id);
+    }
 }

@@ -10,6 +10,7 @@ use crate::owner_docs::{
 use axum::http::header::{ETAG, SET_COOKIE, X_CONTENT_TYPE_OPTIONS};
 use axum::http::HeaderValue;
 
+mod reopen;
 mod review;
 pub(super) use review::recover_owner_doc_reviews;
 pub(super) use review::review_wake_recipient;
@@ -34,6 +35,29 @@ impl DocFetchError {
 /// Where doc bytes come from. The live server uses `gh`; tests substitute a
 /// fixture the same way `GitHubReviewPoster` is substituted.
 pub trait OwnerDocSource: Send + Sync {
+    fn doc_pr_info(&self, _repo: &str, _pr: i64) -> Result<Value, String> {
+        Err("PR history unavailable".into())
+    }
+    fn doc_branch_state(&self, _repo: &str, _branch: &str) -> Result<Value, String> {
+        Err("branch history unavailable".into())
+    }
+    #[allow(clippy::too_many_arguments)] // Explicit GitHub destination and owner attribution.
+    fn ensure_doc_review_pr(
+        &self,
+        _repo: &str,
+        _path: &str,
+        _title: &str,
+        _base: &str,
+        _tip: &str,
+        _branch: &str,
+        _owner: &str,
+    ) -> Result<(i64, String), String> {
+        Err("PR creation unavailable".into())
+    }
+    fn reopen_doc_pr(&self, _repo: &str, _pr: i64) -> Result<(), String> {
+        Err("PR reopening unavailable".into())
+    }
+
     /// Raw file bytes at a commit.
     fn fetch_doc(&self, repo: &str, path: &str, commit_sha: &str)
         -> Result<Vec<u8>, DocFetchError>;
@@ -271,6 +295,29 @@ fn gh_api_bytes(args: Vec<String>) -> Result<Vec<u8>, DocFetchError> {
 }
 
 impl OwnerDocSource for GhCliDocSource {
+    fn doc_pr_info(&self, repo: &str, pr: i64) -> Result<Value, String> {
+        reopen::pr_info(repo, pr)
+    }
+    fn doc_branch_state(&self, repo: &str, branch: &str) -> Result<Value, String> {
+        reopen::branch_state(repo, branch)
+    }
+    #[allow(clippy::too_many_arguments)] // Explicit GitHub destination and owner attribution.
+    fn ensure_doc_review_pr(
+        &self,
+        repo: &str,
+        path: &str,
+        title: &str,
+        base: &str,
+        tip: &str,
+        branch: &str,
+        owner: &str,
+    ) -> Result<(i64, String), String> {
+        reopen::ensure_pr(repo, path, title, base, tip, branch, owner)
+    }
+    fn reopen_doc_pr(&self, repo: &str, pr: i64) -> Result<(), String> {
+        reopen::reopen_pr(repo, pr)
+    }
+
     fn fetch_doc(
         &self,
         repo: &str,
@@ -775,7 +822,27 @@ pub(super) async fn publish_owner_doc(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| default_doc_title(&path, &bytes));
     let store = owner_doc_store(&state);
-    let published = store.publish(
+    let candidate = if let Some(pr) = payload.pr_number {
+        store.move_candidate(&repo, &path, pr)?
+    } else {
+        None
+    };
+    let move_from = if let Some(candidate) = candidate {
+        let source = state.owner_doc_source.clone();
+        let d = candidate.clone();
+        let closed = tokio::task::spawn_blocking(move || {
+            source
+                .pull_request(&d.repo, d.pr_number.unwrap())
+                .map(|p| matches!(p.state.as_str(), "merged" | "closed"))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("move lookup failed: {e}"))?
+        .map_err(github_failure)?;
+        closed.then_some(candidate.id)
+    } else {
+        None
+    };
+    let published = store.publish_moving(
         PublishOwnerDoc {
             repo,
             path,
@@ -807,6 +874,7 @@ pub(super) async fn publish_owner_doc(
                 Err(_) => true,
             }
         },
+        move_from.as_deref(),
     )?;
     let summary = store
         .summary(&published.doc.id)?
@@ -1159,6 +1227,7 @@ fn revision_entries(doc: &OwnerDoc, publishes: &[OwnerDocPublish]) -> Vec<Value>
         .rev()
         .map(|publish| {
             json!({
+                "prNumber": publish.pr_number,
                 "sha": publish.commit_sha,
                 "blobSha": publish.blob_sha,
                 "publishedAt": publish.published_at,
@@ -1196,7 +1265,11 @@ async fn view_doc_response(
     let pull_request = doc_pull_request_async(state, doc, false).await;
     let (pr_state, pr_url, can_comment) = match &pull_request {
         None => (Value::Null, Value::Null, false),
-        Some(Ok(pr)) => (json!(pr.state), json!(pr.url), pr.is_open()),
+        Some(Ok(pr)) => (
+            json!(pr.state),
+            json!(pr.url),
+            matches!(pr.state.as_str(), "open" | "merged" | "closed"),
+        ),
         Some(Err(error)) => {
             eprintln!("Owner doc PR lookup failed for {}: {error}", doc.id);
             (json!("unknown"), Value::Null, false)
@@ -1532,6 +1605,9 @@ async fn doc_head_response(
     let mut response = json!({
         "agent": doc_agent(state,doc),
         "merge_hold": doc_hold(state,doc)?,
+        "pr_number": doc.pr_number,
+        "pr_url": doc.pr_number.map(|pr|format!("https://github.com/{}/pull/{pr}",doc.repo)),
+        "revisions": revision_entries(doc,&publishes),
         "latest_published_sha": latest.commit_sha,
         "latest_reader_path": doc_readable_path(&doc.repo, &doc.path, &latest.commit_sha),
         "pr_head_sha": null,
@@ -1632,11 +1708,37 @@ pub(super) async fn get_owner_doc_subpath(
     request: Request,
 ) -> Result<Response, ApiError> {
     // The JSON endpoints also take the page's doc token; pages never do.
-    if let Some(doc) = id_subroute(&state, &first, &rest, &["head", "drafts"])? {
+    if let Some(doc) = id_subroute(&state, &first, &rest, &["head", "drafts", "reopen-target"])? {
         if !doc_token_presented(&state, request.headers(), &doc.id) {
             ensure_owner_page_read_allowed(&state, &request)?;
         }
-        return if rest == "head" {
+        return if rest == "reopen-target" {
+            let cached = state
+                .owner_doc_reopen_cache
+                .lock()
+                .unwrap()
+                .get(&doc.id)
+                .filter(|(at, _)| at.elapsed() < Duration::from_secs(30))
+                .map(|(_, v)| v.clone());
+            let value = if let Some(value) = cached {
+                value
+            } else {
+                let value = match reopen::target(&state, &doc).await {
+                    Ok(t) => t,
+                    Err(ApiError::Status { detail, .. }) => {
+                        json!({"kind":"refused","reason":detail})
+                    }
+                    Err(e) => return Err(e),
+                };
+                state
+                    .owner_doc_reopen_cache
+                    .lock()
+                    .unwrap()
+                    .insert(doc.id.clone(), (std::time::Instant::now(), value.clone()));
+                value
+            };
+            Ok(Json(value).into_response())
+        } else if rest == "head" {
             doc_head_response(&state, &doc, query.sha.as_deref()).await
         } else {
             Ok(Json(json!({ "drafts": owner_doc_store(&state).drafts(&doc.id)? })).into_response())
