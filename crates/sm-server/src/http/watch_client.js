@@ -7,7 +7,7 @@
   if (!W || !window.fetch) return;
   var every = Math.max(2, +W.getAttribute('data-refresh') || 3) * 1000;
   var open = {}, last = null, counts = S ? S.textContent : '', okAt = Date.now(), stale = false, busy = false;
-  var editor = null, latest = null, refreshAgain = false;
+  var editor = null, editorId = null, refreshAgain = false;
   var defaultsPanel = document.getElementById('handoff-defaults');
 
   function e(x) {
@@ -146,7 +146,7 @@
   }
   function closeEditor() {
     if (editor) editor.remove();
-    editor = null; last = null; refresh();
+    editor = null; editorId = null; last = null; refresh();
   }
   function notice(panel, text) { panel.querySelector('[role="status"]').textContent = text; }
   function saving(panel, enabled) {
@@ -177,8 +177,8 @@
       '<label>Threshold (%) <input type="number" min="1" max="100" step="1" data-threshold></label> ' +
       '<button type="button" data-default>Use default</button> <button type="button" data-now>Hand off now</button>' +
       '<span data-confirm hidden> Ask this agent to hand off? <button type="button" data-yes>Confirm handoff</button> <button type="button" data-no>Cancel</button></span></div>';
-    button.closest('details').open = true;
-    button.closest('details').appendChild(panel); editor = panel;
+    button.closest('details').open = true; open[id] = true;
+    button.closest('details').appendChild(panel); editor = panel; editorId = id;
     panel.querySelector('[data-close]').onclick = closeEditor;
     var enabled = panel.querySelector('[data-enabled]'), threshold = panel.querySelector('[data-threshold]');
     function show(value) {
@@ -248,20 +248,23 @@
     fetch('/watch/state' + location.search, { credentials: 'same-origin', cache: 'no-store' })
       .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
       .then(function (doc) {
-        latest = doc;
         var html = render(doc);
-        if (editor) {
-          // Keep the form and focus intact while updating the visible context lines.
-          W.querySelectorAll('[data-handoff]').forEach(function (button) {
-            var v = arr(latest.sessions).filter(function (v) { return v.id === button.getAttribute('data-handoff'); })[0];
-            if (v && v.handoff) button.textContent = handoffText(v);
-          });
-        } else if (html !== last) {
+        if (html !== last) {
+          // Retain the actual form (including draft input and handlers), while
+          // replacing all dashboard data. Restore focus after reattaching it.
+          var focused = editor && editor.contains(document.activeElement) ? document.activeElement : null;
+          var retained = editor;
           last = html;
           W.innerHTML = html;
           W.querySelectorAll('details[data-id]').forEach(function (d) {
             if (open[d.getAttribute('data-id')]) d.open = true;
+            if (retained && d.getAttribute('data-id') === editorId) {
+              d.appendChild(retained); retained = null;
+              if (focused) focused.focus({ preventScroll: true });
+            }
           });
+          // An ended or filtered-out agent must not leave an orphan editor.
+          if (retained) { editor = null; editorId = null; }
         }
         var c = doc.counts || {};
         counts = (c.live || 0) + ' live' + (c.waiting_on_owner ? ' · ' + c.waiting_on_owner + ' waiting on you' : '');
