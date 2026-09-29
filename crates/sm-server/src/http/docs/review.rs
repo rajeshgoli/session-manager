@@ -127,8 +127,8 @@ pub(super) fn is_retired(session: &SessionRecord) -> bool {
 /// message replies use too.
 pub(in crate::http) fn review_wake_recipient(state: &AppState, doc: &OwnerDoc) -> Option<String> {
     if let Some(pr) = doc.pr_number {
-        if let Ok(claims) =
-            super::super::claims::work_claim_store(state).claims_for_item(&doc.repo, pr)
+        if let Ok(claims) = super::super::claims::work_claim_store(state)
+            .claims_for_item(&crate::work_claims::canonical_repo(&doc.repo), pr)
         {
             for claim in claims {
                 if claim.ended_at.is_none()

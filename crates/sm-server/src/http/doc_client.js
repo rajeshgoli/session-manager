@@ -278,8 +278,7 @@
     if (S.prState === 'open') actions.push(el('button', {text:S.mergeHold ? 'Release hold' : 'Hold merge',onclick:function () {action(S.mergeHold ? 'DELETE' : 'POST','/merge-hold',{});} }));
     agentPanel.appendChild(el('div', {class:'row'},actions));
     if (error) agentPanel.appendChild(el('div',{class:'err',text:error}));
-    var vv=window.visualViewport;
-    var top=(vv ? vv.offsetTop : 0) + bar.getBoundingClientRect().height + 8;
+    var top=bar.offsetHeight + 8;
     agentPanel.style.top=top+'px'; agentPanel.style.right='8px';
   }
   document.addEventListener('pointerdown',function (event) {

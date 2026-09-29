@@ -1043,7 +1043,7 @@ async fn merge_hold_owner_alert_retries_after_inbox_cap_and_history_names_hold()
 #[tokio::test]
 async fn doc_agent_claim_precedence_stale_retire_and_owner_hold() {
     let f = fixture();
-    let (status,doc)=request(&f.app,"POST","/docs",Some(json!({"repo":REPO,"path":"memo.html","pr_number":9,"commit_sha":"a".repeat(40),"session_id":"eng00001"}))).await;
+    let (status,doc)=request(&f.app,"POST","/docs",Some(json!({"repo":"Acme/Widgets","path":"memo.html","pr_number":9,"commit_sha":"a".repeat(40),"session_id":"eng00001"}))).await;
     assert_eq!(status, StatusCode::OK, "{doc}");
     let id = doc["id"].as_str().unwrap();
     let head_path = format!("/docs/{id}/head");

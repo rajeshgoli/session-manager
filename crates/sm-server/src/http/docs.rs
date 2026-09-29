@@ -1451,7 +1451,7 @@ fn doc_agent(state: &AppState, doc: &OwnerDoc) -> Option<Value> {
     let session = state.session_store.get_session(&id).ok().flatten()?;
     let via = if doc.pr_number.is_some_and(|pr| {
         super::claims::work_claim_store(state)
-            .claims_for_item(&doc.repo, pr)
+            .claims_for_item(&crate::work_claims::canonical_repo(&doc.repo), pr)
             .is_ok_and(|claims| {
                 claims
                     .iter()
@@ -1464,7 +1464,11 @@ fn doc_agent(state: &AppState, doc: &OwnerDoc) -> Option<Value> {
     } else {
         "parent"
     };
-    let projected = serde_json::to_value(SessionResponse::from(session.clone())).ok()?;
+    let projected = serde_json::to_value(super::session_response_with_live_activity(
+        state,
+        session.clone(),
+    ))
+    .ok()?;
     let activity = if session.is_stopped() {
         "stopped"
     } else {
