@@ -242,23 +242,29 @@ impl SessionStore {
                         }
                     }
                 }
-                // Explicitly setting it off always counts as switching it off.
-                let was_enabled =
-                    context.policy.enabled || update.enabled == policy::FieldChange::Set(false);
-                self.recheck_handoff_policy(&mut state, session_id, was_enabled, runtime.as_ref())?;
-            }
-            if update.ask_now {
-                // A threshold lowered in the same request may already have asked.
-                let still_absent = raw_handoff_context(&state, session_id)
-                    .is_some_and(|context| context.record.is_none());
-                if still_absent {
-                    self.ask_handoff(
+                // Hand off now in the same request is the owner's ask; a
+                // threshold recheck must not claim the absent state first
+                // and record it as a context ask. With ask_now the state was
+                // validated absent above, so there is nothing to withdraw.
+                if !update.ask_now {
+                    // Explicitly setting it off always counts as switching it off.
+                    let was_enabled =
+                        context.policy.enabled || update.enabled == policy::FieldChange::Set(false);
+                    self.recheck_handoff_policy(
                         &mut state,
                         session_id,
-                        &AskReason::Owner { owner_name },
+                        was_enabled,
                         runtime.as_ref(),
                     )?;
                 }
+            }
+            if update.ask_now {
+                self.ask_handoff(
+                    &mut state,
+                    session_id,
+                    &AskReason::Owner { owner_name },
+                    runtime.as_ref(),
+                )?;
             }
             self.write_raw_json_value(&state)?;
         }
@@ -772,6 +778,30 @@ mod tests {
             update(&store, "missing1", json!({"ask_now": true})),
             HandoffPolicyOutcome::NotFound
         ));
+    }
+
+    #[test]
+    fn ask_now_with_a_lowered_threshold_stays_an_owner_ask() {
+        let store = store("asknowlower");
+        sample(&store, "agent001", 30.0);
+        update(
+            &store,
+            "agent001",
+            json!({"ask_now": true, "threshold_percent": 25}),
+        );
+        assert_eq!(
+            record(&store, "agent001").unwrap().trigger,
+            HandoffTrigger::Owner
+        );
+        assert_eq!(
+            queued(&store, "agent001"),
+            vec![format!(
+                "[sm context management] Rajesh asked you to hand off.{ASK_TAIL}"
+            )]
+        );
+        // Raising the threshold later does not withdraw the owner's ask.
+        update(&store, "agent001", json!({"threshold_percent": 60}));
+        assert!(record(&store, "agent001").is_some());
     }
 
     #[test]
