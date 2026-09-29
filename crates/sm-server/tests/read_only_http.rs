@@ -17727,6 +17727,15 @@ async fn runtime_core_claude_spawn_brief_never_retries_an_unobserved_submission(
     let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
     let launch = &state["session_runtime_launches"][0];
     assert_eq!(launch["status"], "failed");
+    let snapshot =
+        Path::new(launch["log_file"].as_str().unwrap()).with_extension("failed-spawn.txt");
+    assert!(fs::read_to_string(&snapshot)
+        .unwrap()
+        .contains("CLAUDE_UNOBSERVED_SENTINEL"));
+    let detail = payload["detail"].as_str().unwrap();
+    assert!(detail.contains(snapshot.to_str().unwrap()));
+    assert!(detail.contains("failed session claudeunobserved"));
+    assert!(detail.contains(launch["provider_resume_id"].as_str().unwrap()));
     let logs = fs::read_to_string(launch["log_file"].as_str().unwrap()).unwrap_or_default();
     assert_eq!(
         logs.matches("received:CLAUDE_UNOBSERVED_SENTINEL").count(),
@@ -17830,7 +17839,7 @@ async fn runtime_core_claude_spawn_brief_accepts_transcript_created_by_the_brief
             "name": "claude-lazy",
             "working_dir": working_dir.display().to_string(),
             "provider": "claude",
-            "initial_message": "CLAUDE_LAZY_SENTINEL",
+            "initial_message": "CLAUDE_LAZY_SENTINEL\n",
             "spawn_prompt_source": {"kind": "positional"}
         }),
     )
