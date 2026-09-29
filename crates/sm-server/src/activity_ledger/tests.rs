@@ -203,6 +203,16 @@ fn claude_turns_come_from_turn_duration_with_an_interrupted_turn_fallback() {
         ]
     );
     assert_eq!(fixture.scan(), ActivityScanSummary::default());
+    // Readers open the database read-only between scans.
+    let reader = Connection::open_with_flags(
+        fixture.root.join("activity.db"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let turns: i64 = reader
+        .query_row("SELECT COUNT(*) FROM activity_turns", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(turns, 4);
 }
 
 #[test]

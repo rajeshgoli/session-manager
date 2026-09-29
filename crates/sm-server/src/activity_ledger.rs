@@ -44,6 +44,9 @@ pub struct ActivityRecorder {
     db_path: PathBuf,
     usage_db_path: PathBuf,
     last_prune_ms: Option<i64>,
+    /// Held open between scans: closing the last connection deletes the WAL files, and a
+    /// read-only reader cannot open a WAL database without them.
+    conn: Option<Connection>,
 }
 
 impl ActivityRecorder {
@@ -52,6 +55,7 @@ impl ActivityRecorder {
             db_path: db_path.into(),
             usage_db_path: usage_db_path.into(),
             last_prune_ms: None,
+            conn: None,
         }
     }
 
@@ -61,12 +65,15 @@ impl ActivityRecorder {
 
     pub fn scan_at(&mut self, now_ms: i64) -> Result<ActivityScanSummary> {
         let artifacts = resolve_artifacts(load_bindings(&self.usage_db_path)?);
-        let mut conn = open_for_write(&self.db_path)?;
+        if self.conn.is_none() {
+            self.conn = Some(open_for_write(&self.db_path)?);
+        }
+        let conn = self.conn.as_mut().expect("activity db opened above");
         let cutoff_ms = now_ms - RETENTION_MS;
         let mut summary = ActivityScanSummary::default();
         let mut errors = Vec::new();
         for artifact in &artifacts {
-            match scan_artifact(&mut conn, artifact, cutoff_ms) {
+            match scan_artifact(conn, artifact, cutoff_ms) {
                 Ok(Some((turns, spans))) => {
                     summary.artifacts_scanned += 1;
                     summary.turns += turns;
@@ -80,10 +87,15 @@ impl ActivityRecorder {
             .last_prune_ms
             .is_none_or(|at| now_ms - at >= PRUNE_INTERVAL_MS)
         {
-            prune(&conn, cutoff_ms)?;
+            if let Err(error) = prune(conn, cutoff_ms) {
+                self.conn = None;
+                return Err(error);
+            }
             self.last_prune_ms = Some(now_ms);
         }
         if !errors.is_empty() {
+            // Reopen next time, in case the file was replaced under the connection.
+            self.conn = None;
             bail!(
                 "{} activity artifact scan(s) failed: {}",
                 errors.len(),
