@@ -4,11 +4,18 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import java.time.OffsetDateTime
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.Json
 import li.rajeshgo.sm.data.model.QueueOverview
 import li.rajeshgo.sm.data.model.QueueStats
 import li.rajeshgo.sm.data.model.SessionJob
@@ -19,8 +26,10 @@ import li.rajeshgo.sm.data.repository.SettingsRepository
 import li.rajeshgo.sm.data.repository.WhatRequestBusyException
 
 /** What the job sheet shows for an Ask agent request. */
+@Serializable
 data class AskState(
     val jobId: String,
+    val question: String,
     val status: String,
     val answer: String? = null,
     val error: String? = null,
@@ -38,7 +47,8 @@ data class QueueUiState(
     val cancelError: String? = null,
     /** Result of Follow for the open sheet: job id to message. */
     val followMessage: Pair<String, String>? = null,
-    val ask: AskState? = null,
+    /** The latest Ask agent request per job id. */
+    val asks: Map<String, AskState> = emptyMap(),
     val usage: UtilizationSeries? = null,
     val usageHours: Int = 24,
     val usageLoading: Boolean = false,
@@ -51,10 +61,16 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
     private var refreshJob: Job? = null
     private var statsJob: Job? = null
     private var usageJob: Job? = null
-    private var askJob: Job? = null
 
     private val _uiState = MutableStateFlow(QueueUiState(usageHours = rememberedUsageHours))
     val uiState: StateFlow<QueueUiState> = _uiState
+
+    init {
+        QueueAsks.attach(settingsRepository)
+        viewModelScope.launch {
+            QueueAsks.state.collect { asks -> _uiState.update { it.copy(asks = asks) } }
+        }
+    }
 
     private suspend fun credentials(): Pair<String, String>? {
         val serverUrl = settingsRepository.serverUrl.first()
@@ -80,6 +96,7 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
             val (url, token) = credentials() ?: return@launch
             runCatching { repository.fetchQueue(url, token) }
                 .onSuccess {
+                    QueueAsks.retain((it.running + it.queued + it.ended).map { job -> job.id }.toSet())
                     _uiState.value = _uiState.value.copy(
                         overview = it,
                         loading = false,
@@ -153,30 +170,26 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
 
     fun ask(job: SessionJob, question: String) {
         val sessionId = job.notifySessionId?.takeIf { it.isNotBlank() } ?: return
-        askJob?.cancel()
-        _uiState.value = _uiState.value.copy(ask = AskState(job.id, "sending"))
-        askJob = viewModelScope.launch {
-            val (url, token) = credentials() ?: return@launch
-            val owner = _uiState.value.overview?.ownerName ?: "The owner"
+        val owner = _uiState.value.overview?.ownerName ?: "The owner"
+        QueueAsks.start(job.id, question) { update ->
+            val (url, token) = credentials() ?: return@start update(AskState(job.id, question, "failed", error = "Sign in to ask the agent"))
             val prompt = askAgentPrompt(owner, job, question, OffsetDateTime.now())
             repository.runWhatRequest(url, token, sessionId, prompt, attachOnConflict = false) { record ->
-                _uiState.value = _uiState.value.copy(
-                    ask = AskState(job.id, record.status, answer = record.result, error = record.error),
-                )
+                update(AskState(job.id, question, record.status, answer = record.result, error = record.error))
             }.onFailure { error ->
-                val message = if (error is WhatRequestBusyException) {
-                    "${jobAgentLabel(job)} is answering another question — try again in a minute"
-                } else {
-                    error.message ?: "Couldn't ask the agent"
+                val message = when (error) {
+                    is WhatRequestBusyException -> "${jobAgentLabel(job)} is answering another question — try again in a minute"
+                    is SessionManagerAuthException -> "Signed out — sign in again to ask the agent"
+                    else -> error.message ?: "Couldn't ask the agent"
                 }
-                _uiState.value = _uiState.value.copy(ask = AskState(job.id, "failed", error = message))
+                update(AskState(job.id, question, "failed", error = message))
             }
         }
     }
 
+    /** Resets what belongs to one opening of the sheet; Ask agent answers are kept. */
     fun clearSheetState() {
-        askJob?.cancel()
-        _uiState.value = _uiState.value.copy(log = null, cancelError = null, ask = null, followMessage = null)
+        _uiState.value = _uiState.value.copy(log = null, cancelError = null, followMessage = null)
     }
 
     fun refreshUsage(hours: Int = _uiState.value.usageHours) {
@@ -203,5 +216,60 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
     private companion object {
         /** The Mac usage range, remembered for the life of the process. */
         var rememberedUsageHours = 24
+    }
+}
+
+/**
+ * Ask agent requests by job id, kept for the life of the process. Polling runs
+ * outside any screen so an answer that lands after the sheet or the Queue tab
+ * closes is there when the job is opened again.
+ */
+internal object QueueAsks {
+    private const val MAX_SAVED = 20
+    private val FINISHED = setOf("completed", "failed", "timed_out")
+    private val codec = ListSerializer(AskState.serializer())
+    private val json = Json { ignoreUnknownKeys = true }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val jobs = mutableMapOf<String, Job>()
+    private var store: SettingsRepository? = null
+    val state = MutableStateFlow<Map<String, AskState>>(emptyMap())
+
+    /** Loads answers saved by an earlier run of the app, once per process. */
+    @Synchronized
+    fun attach(settings: SettingsRepository) {
+        if (store != null) return
+        store = settings
+        scope.launch {
+            val saved = runCatching { json.decodeFromString(codec, settings.loadQueueAsksJson()) }.getOrDefault(emptyList())
+            // Anything asked since launch is newer than what was saved.
+            state.update { current -> saved.associateBy { it.jobId } + current }
+        }
+    }
+
+    @Synchronized
+    fun start(jobId: String, question: String, run: suspend (update: (AskState) -> Unit) -> Unit) {
+        jobs.remove(jobId)?.cancel()
+        set(AskState(jobId, question, "sending"))
+        jobs[jobId] = scope.launch { run(::set) }
+    }
+
+    /** Drops requests for jobs no longer listed. */
+    @Synchronized
+    fun retain(jobIds: Set<String>) {
+        (jobs.keys - jobIds).forEach { jobs.remove(it)?.cancel() }
+        val before = state.value
+        state.update { asks -> asks.filterKeys { it in jobIds } }
+        if (state.value.size != before.size) save()
+    }
+
+    private fun set(ask: AskState) {
+        state.update { it + (ask.jobId to ask) }
+        if (ask.status in FINISHED) save()
+    }
+
+    private fun save() {
+        val settings = store ?: return
+        val finished = state.value.values.filter { it.status in FINISHED }.takeLast(MAX_SAVED)
+        scope.launch { runCatching { settings.saveQueueAsksJson(json.encodeToString(codec, finished)) } }
     }
 }

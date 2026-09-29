@@ -46,6 +46,7 @@ data class SettingsUiState(
     val updateError: String? = null,
     val error: String? = null,
     /** Follow notifications (sm#1569): result of the last test push. */
+    val followPushEnabled: Boolean = true,
     val notificationTestBusy: Boolean = false,
     val notificationTestStatus: String? = null,
 )
@@ -76,6 +77,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 userName = settingsRepository.userName.first(),
                 isLoggedIn = settingsRepository.isLoggedIn.first(),
                 cloudflareDeviceCertificateConfigured = settingsRepository.hasCloudflareDeviceCertificate.first(),
+                followPushEnabled = settingsRepository.followPushEnabled.first(),
             )
             loadMobileDeviceKey()
             refreshBootstrap()
@@ -288,6 +290,28 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     fun reportError(message: String) {
         _uiState.value = _uiState.value.copy(error = message, loading = false)
+    }
+
+    /**
+     * Turns follow notifications on or off for this phone. Off removes the
+     * phone's token from sm, so follows fall back to email.
+     */
+    fun setFollowPushEnabled(enabled: Boolean) {
+        _uiState.value = _uiState.value.copy(followPushEnabled = enabled, notificationTestStatus = null)
+        viewModelScope.launch {
+            settingsRepository.saveFollowPushEnabled(enabled)
+            if (enabled) {
+                FollowPush.registerToken(getApplication())
+            } else {
+                runCatching {
+                    FollowPush.unregisterToken(
+                        getApplication(),
+                        settingsRepository.serverUrl.first(),
+                        settingsRepository.accessToken.first(),
+                    )
+                }
+            }
+        }
     }
 
     /** Asks sm to push a test notification to this account's phones. */
