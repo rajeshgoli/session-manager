@@ -5917,17 +5917,16 @@ async fn run_codex_review_request_watcher(
         };
         let give_up = failure.is_some() && registration.attempt_count >= CODEX_REVIEW_MAX_ATTEMPTS;
         // `next_retry_at` is also set after a failed retry post, so honor it
-        // rather than re-posting on every poll during a GitHub outage.
+        // rather than re-posting on every poll during a GitHub outage. The
+        // no-pickup deadline does not hold back a failure retry: Codex can
+        // fail before it ever reacts with 👀.
         let failure_retry_due = failure.as_ref().is_some_and(|failure| {
             let delay = CODEX_REVIEW_FAILURE_RETRY_DELAY_SECONDS
                 .min(registration.retry_interval_seconds.max(1));
             codex_review_next_retry_at(&failure.created_at, delay)
                 .as_deref()
                 .is_some_and(codex_review_datetime_due)
-        }) && registration
-            .next_retry_at
-            .as_deref()
-            .is_none_or(codex_review_datetime_due);
+        }) && !codex_review_error_backoff_pending(&registration, &since);
         let retry_due = give_up
             || failure_retry_due
             || (registration.pickup_detected_at.is_none()
@@ -6490,6 +6489,28 @@ fn render_codex_review_landed_message(
 
 fn codex_review_datetime_due(value: &str) -> bool {
     parse_github_datetime(value).is_none_or(|value| value <= OffsetDateTime::now_utc())
+}
+
+/// True while `next_retry_at` is a backoff set after a GitHub error, as
+/// opposed to the no-pickup deadline set when the latest request was posted.
+/// A backoff is always scheduled from an error time after that post, so it
+/// lands strictly later than the deadline.
+fn codex_review_error_backoff_pending(
+    registration: &CodexReviewRequestRegistration,
+    latest_request_posted_at: &str,
+) -> bool {
+    let Some(next_retry_at) = registration
+        .next_retry_at
+        .as_deref()
+        .filter(|value| !codex_review_datetime_due(value))
+        .and_then(parse_github_datetime)
+    else {
+        return false;
+    };
+    let Some(posted_at) = codex_review_request_requested_at(latest_request_posted_at) else {
+        return true;
+    };
+    next_retry_at > posted_at + TimeDuration::seconds(registration.retry_interval_seconds.max(1))
 }
 
 fn codex_review_next_retry_at(posted_at: &str, retry_interval_seconds: i64) -> Option<String> {
