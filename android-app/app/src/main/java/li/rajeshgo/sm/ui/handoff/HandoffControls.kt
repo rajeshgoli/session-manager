@@ -9,6 +9,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.text.font.FontWeight
@@ -22,7 +23,9 @@ import kotlinx.serialization.json.*
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
-import li.rajeshgo.sm.ui.theme.Cyan
+import li.rajeshgo.sm.ui.theme.Emerald
+import li.rajeshgo.sm.ui.theme.Amber
+import li.rajeshgo.sm.ui.theme.Rose
 import li.rajeshgo.sm.ui.theme.Border
 import li.rajeshgo.sm.ui.theme.TextMuted
 import li.rajeshgo.sm.ui.theme.TextSecondary
@@ -48,10 +51,13 @@ fun ContextHandoffStatus(session: ClientSession, contextPercent: Double? = sessi
     if (percent == null && display == null) return
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         if (percent != null) {
+            val progress = (contextPercent!! / 100.0).coerceIn(0.0, 1.0).toFloat()
+            val tint = if (progress <= 0.5f) lerp(Emerald, Amber, progress * 2f)
+                else lerp(Amber, Rose, (progress - 0.5f) * 2f)
             Box(Modifier.size(36.dp).clearAndSetSemantics { contentDescription = "Context $percent percent" }, contentAlignment = Alignment.Center) {
                 CircularProgressIndicator(
-                    progress = { (contextPercent!! / 100.0).coerceIn(0.0, 1.0).toFloat() },
-                    modifier = Modifier.fillMaxSize(), color = Cyan, trackColor = Border,
+                    progress = { progress },
+                    modifier = Modifier.fillMaxSize(), color = tint, trackColor = Border,
                     strokeWidth = 3.dp, strokeCap = StrokeCap.Round,
                 )
                 Text("$percent", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = TextSecondary)
