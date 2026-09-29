@@ -1260,6 +1260,8 @@ private fun SessionRow(
     follow: FollowUi,
 ) {
     val followed = session.id in follow.followedSessionIds
+    var showHandoff by remember(session.id) { mutableStateOf(false) }
+    if (showHandoff) li.rajeshgo.sm.ui.handoff.ContextHandoffDialog(session) { showHandoff = false }
     val attachSupported = session.mobileTerminal?.supported == true || session.termuxAttach?.supported == true
     val context = LocalContext.current
     val remoteControlUrl = remoteControlUrl(session)
@@ -1327,8 +1329,8 @@ private fun SessionRow(
                             )
                             Spacer(Modifier.height(6.dp))
                         }
-                        li.rajeshgo.sm.ui.handoff.handoffSummary(session)?.let { summary ->
-                            Text(summary, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                        if (session.handoff != null || session.contextPercent != null || detail?.contextPercentage != null) {
+                            li.rajeshgo.sm.ui.handoff.ContextHandoffStatus(session, session.contextPercent ?: detail?.contextPercentage)
                             Spacer(Modifier.height(6.dp))
                         }
                         val secondaryLine = buildString {
@@ -1378,16 +1380,6 @@ private fun SessionRow(
                         StatusChip(label = projectedStatusLabel(session), tint = statusTint(session))
                         StatusChip(label = session.provider ?: "claude", tint = providerTint(session.provider))
                         if (session.role != null) StatusChip(label = session.role, tint = Violet)
-                        formatContextPercentage(detail?.contextPercentage)?.let { percentage ->
-                            StatusChip(
-                                label = "context $percentage",
-                                tint = when (detail?.contextState) {
-                                    "critical" -> Rose
-                                    "warning" -> Amber
-                                    else -> TextSecondary
-                                },
-                            )
-                        }
                     }
                     var actionsExpanded by remember { mutableStateOf(false) }
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1401,6 +1393,7 @@ private fun SessionRow(
                         Box {
                             IconButton(onClick = { actionsExpanded = true }) { Icon(Icons.Rounded.MoreVert, "Agent actions", tint = TextSecondary) }
                             DropdownMenu(actionsExpanded, { actionsExpanded = false }) {
+                                DropdownMenuItem(text = { Text("Context handoff") }, onClick = { actionsExpanded = false; showHandoff = true })
                                 if (remoteControlUrl != null && attachSupported) DropdownMenuItem(text = { Text("Open terminal") }, onClick = { actionsExpanded = false; onOpenAttach() })
                                 if (attachSupported) DropdownMenuItem(text = { Text("Copy attach command") }, onClick = { actionsExpanded = false; onCopyAttach() })
                                 if (telegramLink(session) != null) DropdownMenuItem(text = { Text("Open in Telegram") }, onClick = { actionsExpanded = false; onOpenTelegram() })
@@ -1413,7 +1406,6 @@ private fun SessionRow(
                             }
                         }
                     }
-                    li.rajeshgo.sm.ui.handoff.ContextHandoffSection(session)
                     AgentWorkSections(session, onOpenPage, follow)
                     if (hasSummary || whatState?.status?.let { it != "idle" } == true) {
                         AgentDisclosure("Summary", relativeSummaryAge(whatState?.entries?.lastOrNull()?.createdAt)) {

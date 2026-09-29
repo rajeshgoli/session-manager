@@ -109,9 +109,6 @@ fun SettingsScreen(
             }
             state.notificationTestStatus?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextMuted) }
         }
-        if (state.isLoggedIn) SettingsGroup("Handoff defaults") {
-            li.rajeshgo.sm.ui.handoff.HandoffDefaultsSection()
-        }
         ConnectionSettings(
             state,
             viewModel,
@@ -128,6 +125,9 @@ fun SettingsScreen(
                 Button(onClick = viewModel::installUpdate, enabled = !state.updateInstalling) { Text(if (state.updateInstalling) "Downloading…" else "Install update") }
             }
             state.updateError?.let { Text(it, color = Rose, style = MaterialTheme.typography.bodySmall) }
+        }
+        if (state.isLoggedIn) SettingsGroup("Handoff defaults") {
+            li.rajeshgo.sm.ui.handoff.HandoffDefaultsSection()
         }
         Row(Modifier.fillMaxWidth().clickable { advanced = !advanced }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("Advanced", Modifier.weight(1f), color = TextMuted, style = MaterialTheme.typography.titleSmall)

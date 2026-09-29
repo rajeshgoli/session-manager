@@ -69,7 +69,7 @@ class HandoffApiTest {
         assertEquals(51.5, session.contextPercent!!, 0.0)
         assertEquals("old", session.handoff!!.predecessor!!.id)
         listOf("hands off at 42.5%", "handoff off", "asked 14:02", "handoff overdue", "handing off", "handoff failed", "→ agent-h2").forEach { display ->
-            assertEquals("ctx 51.5% · $display", handoffSummary(session.copy(handoff = session.handoff.copy(display = display))))
+            assertEquals("Context 52% · $display", handoffSummary(session.copy(handoff = session.handoff.copy(display = display))))
         }
         assertEquals("handoff overdue", handoffSummary(session.copy(contextPercent = null)))
     }
