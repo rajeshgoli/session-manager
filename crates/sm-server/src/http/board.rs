@@ -168,12 +168,14 @@ pub(super) fn run_pass(state: &AppState) -> anyhow::Result<board::Recomputed> {
         .board_lock
         .lock()
         .map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
-    board::run_pass(
+    let recomputed = board::run_pass(
         &board_store(state),
         state.board_source.as_ref(),
         &outside(state)?,
         time::OffsetDateTime::now_utc(),
-    )
+    )?;
+    send_alerts(state, &recomputed);
+    Ok(recomputed)
 }
 
 /// A recompute under the board lock.
@@ -182,7 +184,26 @@ pub(super) fn recompute(state: &AppState) -> anyhow::Result<board::Recomputed> {
         .board_lock
         .lock()
         .map_err(|_| anyhow::anyhow!("board lock poisoned"))?;
-    board_store(state).recompute(&outside(state)?, time::OffsetDateTime::now_utc())
+    let recomputed =
+        board_store(state).recompute(&outside(state)?, time::OffsetDateTime::now_utc())?;
+    send_alerts(state, &recomputed);
+    Ok(recomputed)
+}
+
+/// Appendix I: a recompute's alerts become owner notices. Called under the
+/// board lock after every recompute; a failure is logged and the board
+/// still shows the change.
+fn send_alerts(state: &AppState, recomputed: &board::Recomputed) {
+    let owner = follows::follow_owner_id(&state.config, None);
+    if let Err(error) = board::pushes::send(
+        &board_store(state),
+        &follows::push_store(state),
+        &owner,
+        recomputed,
+        time::OffsetDateTime::now_utc(),
+    ) {
+        eprintln!("board alerts failed: {error:#}");
+    }
 }
 
 /// Schema at startup, then (live server only) the read loop.
@@ -250,27 +271,13 @@ fn unseen(
         if notice.kind != NOTICE_BOARD_READY && notice.kind != NOTICE_BOARD_LANE_DONE {
             continue;
         }
-        // `board:{lane}:{event}`: the event id orders it against the seen.
-        let event_id = notice
-            .subject_id
-            .rsplit(':')
-            .next()
-            .and_then(|id| id.parse::<i64>().ok());
-        let opened = match (event_id, &seen) {
-            (Some(event_id), Some(_)) => event_id <= seen_event_id,
-            (None, Some((seen_at, _))) => seen_at.as_str() > notice.created_at.as_str(),
-            (_, None) => false,
-        };
+        let opened =
+            board::pushes::notice_opened(&notice.subject_id, &notice.created_at, seen.as_ref());
         if notice.acked_at.is_some() || opened {
             continue;
         }
         unseen.count += 1;
-        if let Some(lane_id) = notice
-            .subject_id
-            .strip_prefix("board:")
-            .and_then(|rest| rest.split(':').next())
-            .and_then(|id| id.parse().ok())
-        {
+        if let Some((lane_id, _)) = board::pushes::subject_event(&notice.subject_id) {
             unseen.lane_ids.insert(lane_id);
         }
     }
@@ -446,7 +453,8 @@ pub(super) async fn post_link(
                 time::OffsetDateTime::now_utc(),
             )?
             .map_err(|refusal| refusal_error(refusal, None))?;
-            store.recompute(&outside(state)?, time::OffsetDateTime::now_utc())?;
+            let recomputed = store.recompute(&outside(state)?, time::OffsetDateTime::now_utc())?;
+            send_alerts(state, &recomputed);
             outcome
         };
         request_pass(state);
@@ -498,12 +506,13 @@ fn add_lane(
                 return Err(refusal_error(refusal, lane));
             }
         };
-        board::run_pass(
+        let recomputed = board::run_pass(
             &store,
             state.board_source.as_ref(),
             &outside(state)?,
             time::OffsetDateTime::now_utc(),
         )?;
+        send_alerts(state, &recomputed);
         lane_id
     };
     let lane = board::lane_json(&board_payload(state, None)?, lane_id);
@@ -644,7 +653,9 @@ pub(super) async fn client_delete_lane(
             let store = board_store(state);
             let ended = store.end_lane(lane_id, time::OffsetDateTime::now_utc())?;
             if ended {
-                store.recompute(&outside(state)?, time::OffsetDateTime::now_utc())?;
+                let recomputed =
+                    store.recompute(&outside(state)?, time::OffsetDateTime::now_utc())?;
+                send_alerts(state, &recomputed);
             }
             ended
         };

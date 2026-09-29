@@ -7551,6 +7551,7 @@ async fn queue_runtime_recovery_rejects_live_services_above_reduced_capacity() {
                 cpu_percent: None,
                 gpu_percent: None,
                 memory_bytes: None,
+                rank_tickets: None,
             },
         )
         .unwrap()

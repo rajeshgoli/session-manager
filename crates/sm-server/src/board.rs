@@ -22,6 +22,7 @@ use crate::owner_push::{format_ts, parse_ts};
 use crate::work_claims::{canonical_repo, HolderState, SessionDirectory};
 
 pub mod model;
+pub mod pushes;
 pub mod sync;
 
 use model::{
@@ -281,6 +282,16 @@ pub struct Event {
     pub detail: Option<String>,
 }
 
+/// A ticket's place in the queue (appendix H): the best-ranked active lane
+/// that contains it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketRank {
+    pub rank: i64,
+    pub lane_id: i64,
+    pub goal: Key,
+    pub goal_title: String,
+}
+
 /// A member whose state changed at a recompute: `from` is `None` for a
 /// ticket that joined, `to` is `None` for one that left.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,6 +458,34 @@ impl BoardStore {
                 Ok((
                     (row.get::<_, String>(0)?, row.get::<_, i64>(1)?),
                     row.get(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+        Ok(rows)
+    }
+
+    /// `board_ticket_ranks`, with each lane's goal.
+    pub fn ticket_ranks(&self) -> Result<BTreeMap<Key, TicketRank>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(BTreeMap::new());
+        };
+        let mut statement = conn.prepare(
+            "SELECT r.repo, r.number, r.rank, r.lane_id, l.goal_repo, l.goal_number,
+                    IFNULL(i.title, '')
+             FROM board_ticket_ranks r
+             JOIN board_lanes l ON l.id = r.lane_id
+             LEFT JOIN board_items i ON i.repo = l.goal_repo AND i.number = l.goal_number",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, i64>(1)?),
+                    TicketRank {
+                        rank: row.get(2)?,
+                        lane_id: row.get(3)?,
+                        goal: (row.get(4)?, row.get(5)?),
+                        goal_title: row.get(6)?,
+                    },
                 ))
             })?
             .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;

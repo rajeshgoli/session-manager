@@ -1,5 +1,6 @@
-//! sm board over HTTP (sm#1665, ticket #1681): lane adds, link writes, the
-//! owner-only routes, and Needs you from messages and review requests.
+//! sm board over HTTP (sm#1665, tickets #1681 and #1682): lane adds, link
+//! writes, the owner-only routes, Needs you from messages and review
+//! requests, board alerts, and the queue's lane fields.
 
 use axum::{
     body::{to_bytes, Body},
@@ -16,9 +17,10 @@ use sm_server::{
             ResolvedIssue, WriteError,
         },
     },
-    config::{AppConfig, EmailConfig, PathsConfig, SmSendConfig},
+    config::{AppConfig, EmailConfig, PathsConfig, QueueRunnerConfig, SmSendConfig},
     http::{router, AppState, DocFetchError, DocPullRequest, OwnerDocSource},
     owner_docs::git_blob_sha,
+    owner_push::{PushError, PushSender},
     work_claims::WorkClaimStore,
 };
 use std::{
@@ -154,6 +156,18 @@ impl BoardSource for FakeBoard {
 }
 
 #[derive(Default)]
+struct RecordingSender {
+    sent: Mutex<Vec<BTreeMap<String, String>>>,
+}
+
+impl PushSender for RecordingSender {
+    fn send(&self, _token: &str, data: &BTreeMap<String, String>) -> Result<(), PushError> {
+        self.sent.lock().unwrap().push(data.clone());
+        Ok(())
+    }
+}
+
+#[derive(Default)]
 struct StubDocs;
 
 impl OwnerDocSource for StubDocs {
@@ -218,6 +232,10 @@ fn temp_dir() -> PathBuf {
 /// Tickets: 1 the goal; 2, 3, 4 under it. Sessions: eng00001 and
 /// eng00002 live, gone0001 retired.
 fn fixture() -> Fixture {
+    fixture_with_push(None)
+}
+
+fn fixture_with_push(sender: Option<Arc<RecordingSender>>) -> Fixture {
     let dir = temp_dir();
     let state_file = dir.join("sessions.json");
     let session = |id: &str, completion: Option<&str>| {
@@ -255,6 +273,11 @@ fn fixture() -> Fixture {
         email: EmailConfig {
             bridge_config: bridge.display().to_string(),
         },
+        queue_runner: QueueRunnerConfig {
+            state_dir: dir.join("queue").display().to_string(),
+            configured: true,
+            ..QueueRunnerConfig::default()
+        },
         ..AppConfig::default()
     };
     config.board.repos = vec![REPO.to_owned()];
@@ -272,7 +295,8 @@ fn fixture() -> Fixture {
     }
     let state = AppState::new(config)
         .with_board_source(Arc::new(board.clone()))
-        .with_owner_doc_source(Arc::new(StubDocs));
+        .with_owner_doc_source(Arc::new(StubDocs))
+        .with_push_sender(sender.map(|sender| sender as Arc<dyn PushSender>));
     WorkClaimStore::new(dir.join("message_queue.db"))
         .ensure_schema()
         .unwrap();
@@ -607,4 +631,189 @@ async fn superseded_or_reviewed_publish_clears() {
     // A later revision published without --review is the latest publish.
     f.publish("eng00001", "c", false).await;
     assert_eq!(f.ticket(2).await["state"], "in_progress");
+}
+
+// ---- Alerts and the queue (ticket #1682) -----------------------------------
+
+async fn pass(f: &Fixture) {
+    let state = f.state.clone();
+    tokio::task::spawn_blocking(move || state.run_board_pass().map(|_| ()))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+async fn follow_pass(f: &Fixture) {
+    let state = f.state.clone();
+    tokio::task::spawn_blocking(move || state.run_follow_pass(false))
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+fn close(f: &Fixture, number: i64) {
+    f.board.issues.lock().unwrap().get_mut(&number).unwrap().0 = false;
+}
+
+fn sent_kinds(sender: &RecordingSender) -> Vec<(String, String)> {
+    sender
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|data| (data["kind"].clone(), data["notice_id"].clone()))
+        .collect()
+}
+
+#[tokio::test]
+async fn board_seen_acks_and_withdraws() {
+    let sender = Arc::new(RecordingSender::default());
+    let f = fixture_with_push(Some(sender.clone()));
+    let (status, _) = request(
+        &f.app,
+        "PUT",
+        "/client/push-token",
+        Some(json!({"token": "tok1", "device_name": "Pixel"})),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    // #3 starts after #2.
+    f.board
+        .issues
+        .lock()
+        .unwrap()
+        .get_mut(&3)
+        .unwrap()
+        .1
+        .push(2);
+    f.claim(2, "eng00001");
+    let lane = add_goal(&f).await["lane"]["id"].as_i64().unwrap();
+    assert_eq!(f.badge().await, 0);
+    close(&f, 2);
+    pass(&f).await;
+    // One notice: the Board count and the lane's edge show it.
+    assert_eq!(f.board_notices(), 1);
+    assert_eq!(f.badge().await, 1);
+    let (_, board) = request(&f.app, "GET", "/client/board", None).await;
+    assert_eq!(board["unseen"]["lane_ids"], json!([lane]));
+    assert_eq!(board["lanes"][0]["unseen"], true);
+    // The follow worker pushes it; the phone shows it.
+    follow_pass(&f).await;
+    let kinds = sent_kinds(&sender);
+    assert_eq!(kinds.len(), 1);
+    assert_eq!(kinds[0].0, "board_ready");
+    let notice_id = kinds[0].1.clone();
+    let data = sender.sent.lock().unwrap()[0].clone();
+    assert_eq!(data["title"], "Ready in lane 1, Ticket 1");
+    assert_eq!(data["body"], "#3 can start — #2 closed");
+    assert_eq!(data["reader_path"], format!("/board#lane-{lane}"));
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &format!("/client/notices/{notice_id}/ack"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    follow_pass(&f).await;
+    assert_eq!(sent_kinds(&sender).len(), 1, "shown, not opened: it stays");
+    // Opening the board takes it off the phone.
+    let (status, _) = request(&f.app, "POST", "/client/board/seen", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(f.badge().await, 0);
+    follow_pass(&f).await;
+    follow_pass(&f).await;
+    assert_eq!(
+        sent_kinds(&sender),
+        vec![
+            ("board_ready".to_owned(), notice_id.clone()),
+            ("withdraw".to_owned(), notice_id),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn unseen_count_matches_notices() {
+    let f = fixture();
+    f.board
+        .issues
+        .lock()
+        .unwrap()
+        .get_mut(&3)
+        .unwrap()
+        .1
+        .push(2);
+    f.board
+        .issues
+        .lock()
+        .unwrap()
+        .get_mut(&4)
+        .unwrap()
+        .1
+        .push(2);
+    f.claim(2, "eng00001");
+    add_goal(&f).await;
+    close(&f, 2);
+    pass(&f).await;
+    // #3 and #4 in one alert; a Needs-you ticket adds one more.
+    assert_eq!(f.board_notices(), 1);
+    f.claim(3, "eng00002");
+    f.message("eng00002", "# Which fills table?\nx").await;
+    pass(&f).await;
+    assert_eq!(f.board_notices(), 1, "Needs you creates no notice");
+    assert_eq!(f.badge().await, 2);
+    let (status, _) = request(&f.app, "POST", "/client/board/seen", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(f.badge().await, 0);
+}
+
+#[tokio::test]
+async fn lane_done_notice_survives_lane_end() {
+    let sender = Arc::new(RecordingSender::default());
+    let f = fixture_with_push(Some(sender.clone()));
+    let (status, _) = request(
+        &f.app,
+        "PUT",
+        "/client/push-token",
+        Some(json!({"token": "tok1", "device_name": "Pixel"})),
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    add_goal(&f).await;
+    close(&f, 1);
+    pass(&f).await;
+    let (_, board) = request(&f.app, "GET", "/client/board", None).await;
+    assert_eq!(board["lanes"], json!([]), "the lane ended");
+    follow_pass(&f).await;
+    let sent = sender.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["kind"], "board_lane_done");
+    assert_eq!(sent[0]["title"], "Lane done: Ticket 1");
+    assert_eq!(sent[0]["body"], "widgets#1 closed · lanes below move up");
+    assert_eq!(f.badge().await, 1);
+}
+
+#[tokio::test]
+async fn queue_job_carries_its_lane() {
+    let f = fixture();
+    add_goal(&f).await;
+    f.claim(3, "eng00001");
+    let submit = |requester: &str| {
+        json!({
+            "type": "tests", "argv": ["true"], "cwd": f.dir.display().to_string(),
+            "requester_session_id": requester, "timeout_seconds": 60,
+        })
+    };
+    let (status, job) = request(&f.app, "POST", "/queue-jobs", Some(submit("eng00001"))).await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    assert_eq!(job["lane_rank"], 1);
+    assert_eq!(
+        job["lane_goal"],
+        json!({"repo": REPO, "number": 1, "title": "Ticket 1"})
+    );
+    // No claim, and a cwd in no claimed worktree: no lane.
+    let (status, job) = request(&f.app, "POST", "/queue-jobs", Some(submit("eng00002"))).await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    assert_eq!(job["lane_rank"], Value::Null);
+    assert_eq!(job["lane_goal"], Value::Null);
 }

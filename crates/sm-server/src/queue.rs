@@ -184,6 +184,9 @@ pub struct QueueJobRecord {
     /// When the owner started this run with Start now, past every admission
     /// rule (sm#1627); cleared if host memory pressure puts it back in line.
     pub owner_forced_at: Option<String>,
+    /// The tickets that place the job in a board lane (appendix H).
+    #[serde(skip)]
+    pub rank_tickets: Option<Vec<(String, i64)>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +266,9 @@ struct QueueJobRuntimeRecord {
     process_limit: Option<i64>,
     peak_process_count: Option<i64>,
     owner_forced_at: Option<String>,
+    rank_tickets: Option<Vec<(String, i64)>>,
+    /// The job's lane rank for this admission pass; `i64::MAX` without one.
+    lane_rank: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +291,74 @@ pub struct CreateQueueJob {
     pub cpu_percent: Option<u8>,
     pub gpu_percent: Option<u8>,
     pub memory_bytes: Option<i64>,
+    /// The tickets the job's claimant held at submit (sm board, appendix
+    /// H1); `None` when no claimant was found.
+    pub rank_tickets: Option<Vec<(String, i64)>>,
+}
+
+/// How many parents the submit-time lane lookup climbs (appendix H1).
+pub const QUEUE_RANK_ANCESTOR_HOPS: usize = 8;
+
+/// The tickets that place a new job in a board lane (sm board, appendix
+/// H1): the active claims of the first claimant found. The claimant is the
+/// requester when it holds a claim, else its nearest claiming ancestor
+/// within eight hops, else the holder of the claim whose worktree contains
+/// `cwd` (the longest such worktree). PR claims count as the tickets
+/// `pr_tickets` maps them to. `None` when no claimant is found.
+pub fn queue_rank_tickets(
+    requester: Option<&str>,
+    cwd: &Path,
+    active_claims: &[crate::work_claims::WorkClaim],
+    parent_of: &dyn Fn(&str) -> Option<String>,
+    pr_tickets: &dyn Fn(&str, i64) -> Vec<i64>,
+) -> Option<Vec<(String, i64)>> {
+    let holds = |session: &str| {
+        active_claims
+            .iter()
+            .any(|claim| claim.session_id == session)
+    };
+    let mut claimant = None;
+    let mut current = requester.map(ToOwned::to_owned);
+    for _ in 0..=QUEUE_RANK_ANCESTOR_HOPS {
+        let Some(session) = current.take() else { break };
+        if holds(&session) {
+            claimant = Some(session);
+            break;
+        }
+        current = parent_of(&session);
+    }
+    let claimant = claimant.or_else(|| {
+        active_claims
+            .iter()
+            .filter_map(|claim| {
+                let worktree = Path::new(claim.worktree_path.as_deref()?);
+                let worktree = worktree
+                    .canonicalize()
+                    .unwrap_or_else(|_| worktree.to_path_buf());
+                cwd.starts_with(&worktree)
+                    .then(|| (worktree.components().count(), claim.session_id.clone()))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, session)| session)
+    })?;
+    let mut tickets = BTreeSet::new();
+    for claim in active_claims
+        .iter()
+        .filter(|claim| claim.session_id == claimant)
+    {
+        let repo = crate::work_claims::canonical_repo(&claim.repo);
+        match claim.kind() {
+            crate::work_claims::WorkKind::Ticket => {
+                tickets.insert((repo, claim.number));
+            }
+            crate::work_claims::WorkKind::Pr => {
+                for ticket in pr_tickets(&repo, claim.number) {
+                    tickets.insert((repo.clone(), ticket));
+                }
+            }
+        }
+    }
+    Some(tickets.into_iter().collect())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3290,6 +3364,7 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
     ensure_column(conn, "queue_jobs", "process_limit", "INTEGER")?;
     ensure_column(conn, "queue_jobs", "peak_process_count", "INTEGER")?;
     ensure_column(conn, "queue_jobs", "owner_forced_at", "TEXT")?;
+    ensure_column(conn, "queue_jobs", "rank_tickets", "TEXT")?;
     ensure_column(
         conn,
         "queue_jobs",
@@ -3408,11 +3483,11 @@ fn create_queue_job_conn(
              gpu_percent, memory_bytes, state,
              holding_reason, queued_at, started_at, finished_at, pid,
              process_group_id, exit_code, log_path, exit_code_path, wrapper_path,
-             queued_notified_at, started_notified_at, completion_notified_at)
+             queued_notified_at, started_notified_at, completion_notified_at, rank_tickets)
         VALUES
             (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 'pending',
              NULL, ?15, NULL, NULL, NULL, NULL, NULL, ?16, ?17, ?18,
-             NULL, NULL, NULL)
+             NULL, NULL, NULL, ?19)
         "#,
         params![
             id,
@@ -3433,6 +3508,7 @@ fn create_queue_job_conn(
             log_path.display().to_string(),
             exit_code_path.display().to_string(),
             wrapper_path.display().to_string(),
+            request.rank_tickets.as_deref().map(rank_tickets_json),
         ],
     )?;
     get_queue_job_conn(conn, &id)?.context("created queue job was not persisted")
@@ -3525,7 +3601,8 @@ fn get_queue_job_runtime_conn(
                max_wait_seconds,
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
                exit_code, completion_notified_at, label, termination_detail_json,
-               revived_at, process_limit, peak_process_count, owner_forced_at
+               revived_at, process_limit, peak_process_count, owner_forced_at,
+               rank_tickets
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -3568,6 +3645,8 @@ fn get_queue_job_runtime_conn(
                 process_limit: row.get(23)?,
                 peak_process_count: row.get(24)?,
                 owner_forced_at: row.get(25)?,
+                rank_tickets: parse_rank_tickets(row.get(26)?),
+                lane_rank: i64::MAX,
             })
         })
         .optional()
@@ -3582,7 +3661,8 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                max_wait_seconds,
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
                exit_code, completion_notified_at, label, termination_detail_json,
-               revived_at, process_limit, peak_process_count, owner_forced_at
+               revived_at, process_limit, peak_process_count, owner_forced_at,
+               rank_tickets
         FROM queue_jobs
         ORDER BY queued_at, id
         "#,
@@ -3616,6 +3696,8 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                 process_limit: row.get(23)?,
                 peak_process_count: row.get(24)?,
                 owner_forced_at: row.get(25)?,
+                rank_tickets: parse_rank_tickets(row.get(26)?),
+                lane_rank: i64::MAX,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3674,8 +3756,10 @@ fn admit_pending_queue_jobs_conn(
     // from the connection `start` opens); retrying it would spin while holding
     // the process-wide admission lock until the job's wait expired (sm#1432).
     let mut attempted_candidates = BTreeSet::new();
+    // Read once per pass: reordering lanes applies at the next pass.
+    let ticket_ranks = queue_ticket_ranks(message_queue_db_path);
     loop {
-        let jobs = list_queue_job_runtime_records_conn(conn)?;
+        let jobs = ranked_queue_job_runtime_records_conn(conn, &ticket_ranks)?;
         if expire_pending_queue_jobs_conn(conn, &jobs, message_queue_db_path, admission_policy)? > 0
         {
             continue;
@@ -4075,8 +4159,12 @@ const QUEUE_JOB_TYPE_ORDER: [&str; 4] = ["perf", "tests", "background", "service
 static QUEUE_ADMISSION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Pending job ids in the order admission examines them: perf, tests,
-/// background, service, then oldest first within a type (sm#1609).
-pub fn pending_queue_job_consideration_order(jobs: &[QueueJobRecord]) -> Vec<String> {
+/// background, service, then by board lane rank and oldest first within a
+/// type (sm#1609, sm board appendix H2).
+pub fn pending_queue_job_consideration_order(
+    jobs: &[QueueJobRecord],
+    ticket_ranks: &BTreeMap<(String, i64), i64>,
+) -> Vec<String> {
     let mut pending: Vec<&QueueJobRecord> =
         jobs.iter().filter(|job| job.state == "pending").collect();
     pending.sort_by_key(|job| {
@@ -4085,6 +4173,7 @@ pub fn pending_queue_job_consideration_order(jobs: &[QueueJobRecord]) -> Vec<Str
                 .iter()
                 .position(|job_type| *job_type == job.job_type)
                 .unwrap_or(QUEUE_JOB_TYPE_ORDER.len()),
+            queue_job_lane_rank(job.rank_tickets.as_deref(), ticket_ranks),
             job.queued_at.clone(),
             job.id.clone(),
         )
@@ -4270,10 +4359,7 @@ fn next_admissible_queue_job_id_conn(
         }
         let job = if job_type == "perf" {
             let mut ready = None;
-            for pending in jobs
-                .iter()
-                .filter(|job| job.state == "pending" && job.job_type == "perf")
-            {
+            for pending in pending_queue_jobs_in_order(jobs, "perf") {
                 if let Some(reason) = perf_resource_hold_reason(pending, admission_policy) {
                     summary.held +=
                         mark_pending_queue_jobs_holding_conn(conn, Some(&pending.id), reason)?;
@@ -4477,13 +4563,66 @@ fn displace_background_for_perf_conn(
     Ok(true)
 }
 
+/// The job admission takes next within a type: the highest-ranked board
+/// lane first, then the oldest (sm board, appendix H2).
 fn oldest_pending_queue_job<'a>(
     jobs: &'a [QueueJobRuntimeRecord],
     job_type: &str,
 ) -> Option<&'a QueueJobRuntimeRecord> {
-    jobs.iter()
+    pending_queue_jobs_in_order(jobs, job_type)
+        .into_iter()
+        .next()
+}
+
+fn pending_queue_jobs_in_order<'a>(
+    jobs: &'a [QueueJobRuntimeRecord],
+    job_type: &str,
+) -> Vec<&'a QueueJobRuntimeRecord> {
+    let mut pending: Vec<_> = jobs
+        .iter()
         .filter(|job| job.state == "pending" && job.job_type == job_type)
-        .min_by_key(|job| (&job.queued_at, &job.id))
+        .collect();
+    pending.sort_by_key(|job| (job.lane_rank, &job.queued_at, &job.id));
+    pending
+}
+
+/// Each board ticket's lane rank, from the claims database. A board that
+/// can't be read ranks nothing, so the queue runs in arrival order.
+pub fn queue_ticket_ranks(claims_db_path: &Path) -> BTreeMap<(String, i64), i64> {
+    match crate::board::BoardStore::new(claims_db_path.to_path_buf()).ticket_ranks() {
+        Ok(ranks) => ranks
+            .into_iter()
+            .map(|(ticket, rank)| (ticket, rank.rank))
+            .collect(),
+        Err(error) => {
+            eprintln!("queue admission: board ranks unreadable: {error:#}");
+            BTreeMap::new()
+        }
+    }
+}
+
+/// A job's lane rank: the best rank among its tickets, `i64::MAX` without one.
+pub fn queue_job_lane_rank(
+    tickets: Option<&[(String, i64)]>,
+    ticket_ranks: &BTreeMap<(String, i64), i64>,
+) -> i64 {
+    tickets
+        .into_iter()
+        .flatten()
+        .filter_map(|ticket| ticket_ranks.get(ticket).copied())
+        .min()
+        .unwrap_or(i64::MAX)
+}
+
+fn ranked_queue_job_runtime_records_conn(
+    conn: &Connection,
+    ticket_ranks: &BTreeMap<(String, i64), i64>,
+) -> Result<Vec<QueueJobRuntimeRecord>> {
+    let mut jobs = list_queue_job_runtime_records_conn(conn)?;
+    for job in &mut jobs {
+        job.lane_rank = queue_job_lane_rank(job.rank_tickets.as_deref(), ticket_ranks);
+    }
+    Ok(jobs)
 }
 
 fn running_queue_job_count(jobs: &[QueueJobRuntimeRecord], job_type: Option<&str>) -> usize {
@@ -7182,12 +7321,13 @@ fn list_queue_jobs_conn(
     let resource_columns = queue_job_resource_projection(conn)?;
     let detail_column = queue_job_detail_projection(conn)?;
     let forced_column = queue_job_forced_projection(conn)?;
+    let rank_column = queue_job_rank_projection(conn)?;
     let mut query = format!(
         r#"
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
                argv_json, script_path, timeout_seconds, {resource_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
-               exit_code, log_path, {detail_column}, {forced_column}
+               exit_code, log_path, {detail_column}, {forced_column}, {rank_column}
         FROM queue_jobs
     "#
     );
@@ -7217,12 +7357,13 @@ fn get_queue_job_conn(conn: &Connection, job_id: &str) -> Result<Option<QueueJob
     let resource_columns = queue_job_resource_projection(conn)?;
     let detail_column = queue_job_detail_projection(conn)?;
     let forced_column = queue_job_forced_projection(conn)?;
+    let rank_column = queue_job_rank_projection(conn)?;
     let query = format!(
         r#"
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
                argv_json, script_path, timeout_seconds, {resource_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
-               exit_code, log_path, {detail_column}, {forced_column}
+               exit_code, log_path, {detail_column}, {forced_column}, {rank_column}
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -7273,6 +7414,41 @@ fn queue_job_forced_projection(conn: &Connection) -> Result<&'static str> {
     } else {
         "NULL AS owner_forced_at"
     })
+}
+
+fn queue_job_rank_projection(conn: &Connection) -> Result<&'static str> {
+    Ok(if queue_job_columns(conn)?.contains("rank_tickets") {
+        "rank_tickets"
+    } else {
+        "NULL AS rank_tickets"
+    })
+}
+
+/// `rank_tickets` as stored: a JSON array of `{repo, number}`.
+fn parse_rank_tickets(raw: Option<String>) -> Option<Vec<(String, i64)>> {
+    let value: JsonValue = serde_json::from_str(&raw?).ok()?;
+    Some(
+        value
+            .as_array()?
+            .iter()
+            .filter_map(|ticket| {
+                Some((
+                    ticket.get("repo")?.as_str()?.to_owned(),
+                    ticket.get("number")?.as_i64()?,
+                ))
+            })
+            .collect(),
+    )
+}
+
+fn rank_tickets_json(tickets: &[(String, i64)]) -> String {
+    JsonValue::Array(
+        tickets
+            .iter()
+            .map(|(repo, number)| serde_json::json!({ "repo": repo, "number": number }))
+            .collect(),
+    )
+    .to_string()
 }
 
 fn queue_job_resource_projection(conn: &Connection) -> Result<&'static str> {
@@ -7342,6 +7518,7 @@ fn queue_job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJ
         process_limit: row.get(23)?,
         peak_process_count: row.get(24)?,
         owner_forced_at: row.get(25)?,
+        rank_tickets: parse_rank_tickets(row.get(26)?),
     })
 }
 
@@ -7716,6 +7893,7 @@ mod tests {
                 cpu_percent: Some(100),
                 gpu_percent: Some(0),
                 memory_bytes: Some(i64::MAX),
+                rank_tickets: None,
             },
         )
         .unwrap();
@@ -7734,6 +7912,7 @@ mod tests {
                 cpu_percent: Some(100),
                 gpu_percent: Some(0),
                 memory_bytes: Some(1),
+                rank_tickets: None,
             },
         )
         .unwrap();
@@ -7752,6 +7931,7 @@ mod tests {
                 cpu_percent: None,
                 gpu_percent: None,
                 memory_bytes: None,
+                rank_tickets: None,
             },
         )
         .unwrap();
@@ -7794,6 +7974,7 @@ mod tests {
                 cpu_percent: Some(100),
                 gpu_percent: Some(0),
                 memory_bytes: Some(i64::MAX),
+                rank_tickets: None,
             },
             1,
         )
@@ -7854,6 +8035,7 @@ mod tests {
                 cpu_percent: Some(100),
                 gpu_percent: Some(0),
                 memory_bytes: Some(i64::MAX),
+                rank_tickets: None,
             },
         )
         .unwrap()
@@ -7993,7 +8175,7 @@ mod tests {
         .unwrap();
         let jobs = list_queue_jobs_conn(&conn, QueueJobFilters::default()).unwrap();
         assert_eq!(
-            pending_queue_job_consideration_order(&jobs),
+            pending_queue_job_consideration_order(&jobs, &BTreeMap::new()),
             vec![
                 perf.id.clone(),
                 old_test.id.clone(),
@@ -8151,6 +8333,7 @@ mod tests {
                     cpu_percent: None,
                     gpu_percent: None,
                     memory_bytes: None,
+                    rank_tickets: None,
                 },
                 max_wait_seconds,
             )
@@ -8234,6 +8417,7 @@ mod tests {
                 cpu_percent: None,
                 gpu_percent: None,
                 memory_bytes: None,
+                rank_tickets: None,
             },
             300,
         )
@@ -8362,6 +8546,7 @@ mod tests {
                 cpu_percent: Some(100),
                 gpu_percent: Some(0),
                 memory_bytes: Some(240 * 1024 * 1024 * 1024),
+                rank_tickets: None,
             },
         )
         .unwrap();
@@ -8454,6 +8639,7 @@ mod tests {
                 cpu_percent: None,
                 gpu_percent: None,
                 memory_bytes: None,
+                rank_tickets: None,
             },
         )
         .unwrap();
@@ -8627,6 +8813,7 @@ mod tests {
                 cpu_percent: None,
                 gpu_percent: None,
                 memory_bytes: None,
+                rank_tickets: None,
             },
         )
         .unwrap();
@@ -8693,6 +8880,7 @@ mod tests {
                 cpu_percent: None,
                 gpu_percent: None,
                 memory_bytes: None,
+                rank_tickets: None,
             },
         )
         .unwrap();
@@ -8747,6 +8935,7 @@ mod tests {
                 cpu_percent: None,
                 gpu_percent: None,
                 memory_bytes: None,
+                rank_tickets: None,
             },
         )
         .unwrap()
@@ -8975,6 +9164,7 @@ mod tests {
                 cpu_percent: Some(100),
                 gpu_percent: Some(0),
                 memory_bytes: Some(1024),
+                rank_tickets: None,
             },
         )
         .unwrap();
@@ -9257,6 +9447,8 @@ mod tests {
             process_limit: None,
             peak_process_count: None,
             owner_forced_at: None,
+            lane_rank: i64::MAX,
+            rank_tickets: None,
         };
         // The limit counts every process the user runs, so it must sit above
         // the current total or the job could not fork at all.
@@ -9391,6 +9583,7 @@ mod tests {
             process_limit: None,
             peak_process_count: None,
             owner_forced_at: None,
+            rank_tickets: None,
         };
         let pending = record("new-tests", "tests", "pending", Some("awaiting_tests"));
         let running = record("running-tests", "tests", "running", None);
@@ -9474,6 +9667,7 @@ mod tests {
             cpu_percent: None,
             gpu_percent: None,
             memory_bytes: None,
+            rank_tickets: None,
         };
         let first =
             RetainedQueueStore::create_queue_job_in_state_dir(&root, request.clone()).unwrap();
@@ -9575,6 +9769,8 @@ mod tests {
             process_limit: None,
             peak_process_count: None,
             owner_forced_at: None,
+            lane_rank: i64::MAX,
+            rank_tickets: None,
         };
 
         let failed = queue_job_completion_text_with_policy(
@@ -9630,6 +9826,8 @@ mod tests {
             process_limit: None,
             peak_process_count: None,
             owner_forced_at: None,
+            lane_rank: i64::MAX,
+            rank_tickets: None,
         };
 
         let completion = queue_job_completion_text_with_policy(
@@ -9691,6 +9889,8 @@ mod tests {
             process_limit: None,
             peak_process_count: None,
             owner_forced_at: None,
+            lane_rank: i64::MAX,
+            rank_tickets: None,
         };
 
         let status = spawn_queue_job_process(&job, None).unwrap().wait().unwrap();
@@ -9756,6 +9956,8 @@ mod tests {
             process_limit: None,
             peak_process_count: None,
             owner_forced_at: None,
+            lane_rank: i64::MAX,
+            rank_tickets: None,
         };
 
         let status = spawn_queue_job_process(&job, None).unwrap().wait().unwrap();
@@ -9797,6 +9999,8 @@ mod tests {
             process_limit: None,
             peak_process_count: None,
             owner_forced_at: None,
+            lane_rank: i64::MAX,
+            rank_tickets: None,
         };
         let much_later = OffsetDateTime::parse("2026-08-17T20:00:01Z", &Rfc3339).unwrap();
         assert!(!queue_job_timed_out_at(&job, much_later));
@@ -9824,6 +10028,7 @@ mod tests {
                     cpu_percent: None,
                     gpu_percent: None,
                     memory_bytes: None,
+                    rank_tickets: None,
                 },
             )
             .unwrap()
@@ -9897,6 +10102,7 @@ mod tests {
                     cpu_percent: None,
                     gpu_percent: None,
                     memory_bytes: None,
+                    rank_tickets: None,
                 },
                 300,
             )
@@ -9998,6 +10204,7 @@ mod tests {
                     cpu_percent: None,
                     gpu_percent: None,
                     memory_bytes: None,
+                    rank_tickets: None,
                 },
                 300,
             )
@@ -10057,6 +10264,7 @@ mod tests {
                     cpu_percent: (job_type == "perf").then_some(100),
                     gpu_percent: (job_type == "perf").then_some(0),
                     memory_bytes,
+                    rank_tickets: None,
                 },
             )
             .unwrap()
@@ -10146,6 +10354,7 @@ mod tests {
                     cpu_percent: None,
                     gpu_percent: None,
                     memory_bytes: None,
+                    rank_tickets: None,
                 },
             )
             .unwrap()
@@ -10966,6 +11175,8 @@ mod tests {
             process_limit: None,
             peak_process_count: None,
             owner_forced_at: None,
+            lane_rank: i64::MAX,
+            rank_tickets: None,
         };
 
         assert!(!queue_job_timed_out_at(&job, now_utc));
@@ -11068,5 +11279,320 @@ mod tests {
         // Legacy naive local timestamps have no trustworthy offset.
         let legacy = queued_sm_send(text, Some("2026-09-24T13:00:00.000000"));
         assert_eq!(legacy.delivery_text(now), text);
+    }
+
+    // -----------------------------------------------------------------------
+    // sm board: queue order by lane (spec appendix H, ticket #1682).
+
+    fn claim(
+        session: &str,
+        repo: &str,
+        number: i64,
+        kind: &str,
+        worktree: Option<&str>,
+    ) -> crate::work_claims::WorkClaim {
+        crate::work_claims::WorkClaim {
+            id: format!("{session}-{number}"),
+            repo: repo.into(),
+            number,
+            kind: kind.into(),
+            session_id: session.into(),
+            session_name: None,
+            parent_session_id: None,
+            source: "explicit".into(),
+            worktree_path: worktree.map(Into::into),
+            branch: None,
+            claimed_at: "2026-09-29T10:00:00Z".into(),
+            ended_at: None,
+            end_reason: None,
+            ended_by_session_id: None,
+            nudged_idle_at: None,
+            managed_worktree: false,
+            base_sha: None,
+            reserved_at: None,
+            check_b_due_at: None,
+        }
+    }
+
+    #[test]
+    fn rank_tickets_requester_parent_cwd_none() {
+        let root = unique_temp_path("rank-tickets");
+        let deep = root.join("wt-1654").join("target");
+        fs::create_dir_all(&deep).unwrap();
+        let root = root.canonicalize().unwrap();
+        let wt_outer = root.to_string_lossy().into_owned();
+        let wt_inner = root.join("wt-1654").to_string_lossy().into_owned();
+        let claims = vec![
+            claim("eng", "acme/widgets", 1654, "ticket", None),
+            claim("eng", "acme/widgets", 1700, "pr", None),
+            claim("outer", "acme/widgets", 1500, "ticket", Some(&wt_outer)),
+            claim("inner", "acme/widgets", 1654, "ticket", Some(&wt_inner)),
+        ];
+        let parents = BTreeMap::from([
+            ("helper", "eng"),
+            ("h1", "h2"),
+            ("h2", "h3"),
+            ("h3", "h4"),
+            ("h4", "h5"),
+            ("h5", "h6"),
+            ("h6", "h7"),
+            ("h7", "h8"),
+            ("h8", "eng"),
+            ("far", "h1"),
+        ]);
+        let parent_of = |id: &str| parents.get(id).map(|p| (*p).to_owned());
+        let pr_tickets = |repo: &str, pr: i64| {
+            if repo == "acme/widgets" && pr == 1700 {
+                vec![1653]
+            } else {
+                Vec::new()
+            }
+        };
+        let tickets = |requester: Option<&str>, cwd: &Path| {
+            queue_rank_tickets(requester, cwd, &claims, &parent_of, &pr_tickets)
+        };
+        let eng = Some(vec![
+            ("acme/widgets".to_owned(), 1653),
+            ("acme/widgets".to_owned(), 1654),
+        ]);
+        let elsewhere = Path::new("/nowhere");
+        // The requester's own claims, a PR claim through its closing link.
+        assert_eq!(tickets(Some("eng"), elsewhere), eng);
+        // A helper counts through its parent; eight hops up still counts.
+        assert_eq!(tickets(Some("helper"), elsewhere), eng);
+        assert_eq!(tickets(Some("h1"), elsewhere), eng);
+        // Nine hops is too far, and the cwd matches nothing.
+        assert_eq!(tickets(Some("far"), elsewhere), None);
+        // The deepest worktree holding the cwd wins.
+        assert_eq!(
+            tickets(Some("stranger"), &deep.canonicalize().unwrap()),
+            Some(vec![("acme/widgets".to_owned(), 1654)])
+        );
+        assert_eq!(
+            tickets(None, &root),
+            Some(vec![("acme/widgets".to_owned(), 1500)])
+        );
+        assert_eq!(tickets(None, elsewhere), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A claims database whose board ranks `acme/widgets#N` at `rank`.
+    fn board_ranks(state_dir: &Path, ranks: &[(i64, i64)]) -> PathBuf {
+        let db = state_dir.join("message_queue.db");
+        let store = crate::board::BoardStore::new(db.clone());
+        store.ensure_schema().unwrap();
+        set_board_ranks(&db, ranks);
+        db
+    }
+
+    fn set_board_ranks(db: &Path, ranks: &[(i64, i64)]) {
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch("DELETE FROM board_ticket_ranks; DELETE FROM board_lanes;")
+            .unwrap();
+        for (number, rank) in ranks {
+            conn.execute(
+                "INSERT INTO board_lanes (id, goal_repo, goal_number, rank, added_at, added_by, added_by_name)
+                 VALUES (?1, 'acme/widgets', ?1, ?2, '2026-09-29T00:00:00Z', 'owner', 'Owner')",
+                params![number, rank],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO board_ticket_ranks (repo, number, rank, lane_id)
+                 VALUES ('acme/widgets', ?1, ?2, ?1)",
+                params![number, rank],
+            )
+            .unwrap();
+        }
+    }
+
+    fn ranked_job(
+        state_dir: &Path,
+        job_type: &str,
+        label: &str,
+        ticket: Option<i64>,
+        queued_at: &str,
+    ) -> QueueJobRecord {
+        let perf = job_type == "perf";
+        let job = RetainedQueueStore::create_queue_job_in_state_dir(
+            state_dir,
+            CreateQueueJob {
+                job_type: job_type.into(),
+                label: label.into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["true".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 600,
+                cpu_percent: perf.then_some(50),
+                gpu_percent: perf.then_some(0),
+                memory_bytes: perf.then_some(1024),
+                rank_tickets: ticket.map(|number| vec![("acme/widgets".to_owned(), number)]),
+            },
+        )
+        .unwrap();
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET queued_at = ?2 WHERE id = ?1",
+            params![job.id, queued_at],
+        )
+        .unwrap();
+        job
+    }
+
+    fn next_job(state_dir: &Path, claims_db: &Path) -> Option<String> {
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let ranks = queue_ticket_ranks(claims_db);
+        let jobs = ranked_queue_job_runtime_records_conn(&conn, &ranks).unwrap();
+        let mut summary = QueueAdmissionSummary::default();
+        next_admissible_queue_job_id_conn(
+            &conn,
+            &jobs,
+            QueueAdmissionPolicy::default(),
+            &mut summary,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn admission_orders_by_lane_rank_within_type() {
+        // The memo's example: a side experiment, a lane-2 job, a lane-1 job.
+        let state_dir = unique_temp_path("queue-lane-order");
+        let claims_db = board_ranks(&state_dir, &[(1775, 1), (1654, 2)]);
+        let side = ranked_job(&state_dir, "tests", "side", None, "2026-09-29T09:40:00Z");
+        let lane2 = ranked_job(
+            &state_dir,
+            "tests",
+            "1654",
+            Some(1654),
+            "2026-09-29T09:50:00Z",
+        );
+        let lane1 = ranked_job(
+            &state_dir,
+            "tests",
+            "1775",
+            Some(1775),
+            "2026-09-29T09:58:00Z",
+        );
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let jobs = list_queue_jobs_conn(&conn, QueueJobFilters::default()).unwrap();
+        let ranks = queue_ticket_ranks(&claims_db);
+        assert_eq!(
+            pending_queue_job_consideration_order(&jobs, &ranks),
+            vec![lane1.id.clone(), lane2.id.clone(), side.id.clone()]
+        );
+        assert_eq!(next_job(&state_dir, &claims_db), Some(lane1.id.clone()));
+        // With no board, arrival order.
+        assert_eq!(
+            next_job(&state_dir, &state_dir.join("none.db")),
+            Some(side.id.clone())
+        );
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn unranked_after_ranked() {
+        let state_dir = unique_temp_path("queue-unranked");
+        let claims_db = board_ranks(&state_dir, &[(1654, 3)]);
+        let unranked = ranked_job(&state_dir, "tests", "side", None, "2026-09-29T09:00:00Z");
+        // A ticket in no active lane ranks as none.
+        let off_board = ranked_job(&state_dir, "tests", "off", Some(42), "2026-09-29T09:01:00Z");
+        let ranked = ranked_job(
+            &state_dir,
+            "tests",
+            "1654",
+            Some(1654),
+            "2026-09-29T09:59:00Z",
+        );
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let jobs = list_queue_jobs_conn(&conn, QueueJobFilters::default()).unwrap();
+        assert_eq!(
+            pending_queue_job_consideration_order(&jobs, &queue_ticket_ranks(&claims_db)),
+            vec![ranked.id.clone(), unranked.id.clone(), off_board.id.clone()]
+        );
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn reorder_applies_to_pending() {
+        let state_dir = unique_temp_path("queue-lane-reorder");
+        let claims_db = board_ranks(&state_dir, &[(1775, 1), (1654, 2)]);
+        let a = ranked_job(
+            &state_dir,
+            "tests",
+            "1775",
+            Some(1775),
+            "2026-09-29T09:00:00Z",
+        );
+        let b = ranked_job(
+            &state_dir,
+            "tests",
+            "1654",
+            Some(1654),
+            "2026-09-29T09:30:00Z",
+        );
+        assert_eq!(next_job(&state_dir, &claims_db), Some(a.id.clone()));
+        set_board_ranks(&claims_db, &[(1775, 2), (1654, 1)]);
+        assert_eq!(next_job(&state_dir, &claims_db), Some(b.id.clone()));
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn rank_tickets_fixed_after_claim_change() {
+        // The job's tickets are stored at submit; no claim is consulted later,
+        // so the stored tickets alone rank it.
+        let state_dir = unique_temp_path("queue-lane-fixed");
+        let claims_db = board_ranks(&state_dir, &[(1654, 1)]);
+        let early = ranked_job(&state_dir, "tests", "side", None, "2026-09-29T09:00:00Z");
+        let job = ranked_job(
+            &state_dir,
+            "tests",
+            "1654",
+            Some(1654),
+            "2026-09-29T09:30:00Z",
+        );
+        let stored = get_queue_job_conn(
+            &open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap(),
+            &job.id,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            stored.rank_tickets,
+            Some(vec![("acme/widgets".to_owned(), 1654)])
+        );
+        assert_eq!(next_job(&state_dir, &claims_db), Some(job.id.clone()));
+        // The lane ends: arrival order again.
+        set_board_ranks(&claims_db, &[]);
+        assert_eq!(next_job(&state_dir, &claims_db), Some(early.id.clone()));
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn perf_candidate_by_lane_rank() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        TEST_HOST_MEMORY.with(|host| host.set(Some((256 * GIB, 200 * GIB))));
+        let state_dir = unique_temp_path("queue-lane-perf");
+        let claims_db = board_ranks(&state_dir, &[(1775, 1), (1654, 2)]);
+        let _old = ranked_job(
+            &state_dir,
+            "perf",
+            "1654",
+            Some(1654),
+            "2026-09-29T09:00:00Z",
+        );
+        let top = ranked_job(
+            &state_dir,
+            "perf",
+            "1775",
+            Some(1775),
+            "2026-09-29T09:30:00Z",
+        );
+        assert_eq!(next_job(&state_dir, &claims_db), Some(top.id.clone()));
+        TEST_HOST_MEMORY.with(|host| host.set(None));
+        fs::remove_dir_all(state_dir).unwrap();
     }
 }
