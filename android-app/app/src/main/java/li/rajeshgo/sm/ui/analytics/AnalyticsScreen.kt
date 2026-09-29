@@ -280,6 +280,7 @@ fun AnalyticsDetailScreen(
                     title = detailTitle(section),
                     menu = menu,
                     subtitle = summary?.generatedAt?.let { "Live snapshot ${formatGeneratedAt(it)}" } ?: "No data",
+                    current = Routes.ANALYTICS,
                     onBack = onBack,
                 )
             }
