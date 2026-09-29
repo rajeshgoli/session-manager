@@ -1307,8 +1307,8 @@ impl RetainedQueueStore {
         let raw_detail = detail.map(JsonValue::to_string);
         // Under the admission lock, so admission cannot start a pending job
         // between reading its state and cancelling it (which would leave its
-        // process running unmanaged), and the detail lands in the same
-        // statement as the transition.
+        // process running unmanaged). The lock is released before re-admitting
+        // (admission takes it again) and before any grace wait.
         let running_job = {
             let _admission_guard = QUEUE_ADMISSION_LOCK
                 .lock()
@@ -1319,62 +1319,53 @@ impl RetainedQueueStore {
             if is_terminal_queue_state(&job.state) {
                 return get_queue_job_conn(&conn, job_id);
             }
-            let transition = if job.state == "running" {
-                "UPDATE queue_jobs
-                 SET termination_detail_json = COALESCE(?2, termination_detail_json),
-                     holding_reason = 'cancelling'
-                 WHERE id = ?1 AND state = 'running'"
-            } else {
-                "UPDATE queue_jobs
-                 SET termination_detail_json = COALESCE(?2, termination_detail_json)
-                 WHERE id = ?1 AND state = ?3"
-            };
-            let changed = if job.state == "running" {
-                conn.execute(transition, params![job_id, raw_detail])?
-            } else {
-                conn.execute(transition, params![job_id, raw_detail, job.state])?
-            };
-            if changed == 0 {
-                // It finished on its own a moment ago; nothing to cancel.
-                return get_queue_job_conn(&conn, job_id);
-            }
             if raw_detail.is_some() {
                 job.termination_detail_json = raw_detail.clone();
             }
             if job.state == "running" {
-                job
+                // Detail and the cancelling mark in one statement.
+                let changed = conn.execute(
+                    "UPDATE queue_jobs
+                     SET termination_detail_json = COALESCE(?2, termination_detail_json),
+                         holding_reason = 'cancelling'
+                     WHERE id = ?1 AND state = 'running'",
+                    params![job_id, raw_detail],
+                )?;
+                (changed > 0).then_some(job)
             } else {
+                // Detail and the cancelled state commit together.
+                let tx = conn.unchecked_transaction()?;
+                tx.execute(
+                    "UPDATE queue_jobs
+                     SET termination_detail_json = COALESCE(?2, termination_detail_json)
+                     WHERE id = ?1 AND state = ?3",
+                    params![job_id, raw_detail, job.state],
+                )?;
                 let exit_code = read_exit_code(job.exit_code_path.as_deref());
                 finish_queue_job_conn(
-                    &conn,
+                    &tx,
                     &job,
                     "cancelled",
                     exit_code,
                     Some(message_queue_db_path),
                 )?;
-                return Self::after_cancel(
-                    &conn,
-                    state_dir,
-                    message_queue_db_path,
-                    job_id,
-                    cancel_grace_seconds,
-                    admission_policy,
-                    admit_after_cancel,
-                );
+                tx.commit()?;
+                None
             }
         };
-        // Outside the lock: the grace wait can take seconds.
-        if let Some(pgid) = running_job.process_group_id.or(running_job.pid) {
-            terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+        if let Some(running_job) = running_job {
+            if let Some(pgid) = running_job.process_group_id.or(running_job.pid) {
+                terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+            }
+            let exit_code = read_exit_code(running_job.exit_code_path.as_deref());
+            finish_queue_job_conn(
+                &conn,
+                &running_job,
+                "cancelled",
+                exit_code,
+                Some(message_queue_db_path),
+            )?;
         }
-        let exit_code = read_exit_code(running_job.exit_code_path.as_deref());
-        finish_queue_job_conn(
-            &conn,
-            &running_job,
-            "cancelled",
-            exit_code,
-            Some(message_queue_db_path),
-        )?;
         Self::after_cancel(
             &conn,
             state_dir,
@@ -7092,6 +7083,36 @@ mod tests {
             .text;
         assert!(!plain_text.contains("Cancelled by"), "{plain_text}");
         assert!(!plain_text.contains("Note:"), "{plain_text}");
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn cancelling_a_pending_job_readmits_without_deadlocking() {
+        // Re-admission after a cancel takes the admission lock; the cancel
+        // must have released it by then or the request never returns.
+        let state_dir = unique_temp_path("queue-cancel-readmit");
+        let message_queue_db = state_dir.join("messages.db");
+        let job = create_test_job(&state_dir, "perf", "blocked");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let dir = state_dir.clone();
+        std::thread::spawn(move || {
+            let result = RetainedQueueStore::cancel_queue_job_with_detail_in_state_dir(
+                &dir,
+                &message_queue_db,
+                &job.id,
+                0,
+                QueueAdmissionPolicy::default(),
+                true,
+                Some(&serde_json::json!({"kind": "cancel", "note": "x"})),
+            )
+            .map(|job| job.map(|job| job.state));
+            let _ = sender.send(result);
+        });
+        let state = receiver
+            .recv_timeout(StdDuration::from_secs(30))
+            .expect("cancel with re-admission deadlocked")
+            .unwrap();
+        assert_eq!(state.as_deref(), Some("cancelled"));
         fs::remove_dir_all(state_dir).unwrap();
     }
 
