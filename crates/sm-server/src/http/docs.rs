@@ -2140,9 +2140,12 @@ pub(super) fn end_closed_pr_review_requests(state: &AppState) -> anyhow::Result<
                 let Ok(_guard) = state.owner_doc_review_lock.try_lock() else {
                     continue;
                 };
-                let still_requested = store
-                    .summary(&summary.doc.id)?
-                    .is_some_and(|now| now.state == OwnerDocState::ReviewRequested);
+                // A publish during the lookup may have moved the doc to a new PR.
+                let still_requested = store.summary(&summary.doc.id)?.is_some_and(|now| {
+                    now.state == OwnerDocState::ReviewRequested
+                        && now.doc.pr_number == summary.doc.pr_number
+                        && now.publish_count == summary.publish_count
+                });
                 if still_requested {
                     store.dismiss_review(&summary.doc.id)?;
                 }
