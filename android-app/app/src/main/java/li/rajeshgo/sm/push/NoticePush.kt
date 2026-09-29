@@ -55,6 +55,7 @@ object NoticePush {
             putExtra(FollowPush.EXTRA_SESSION_ID, message.sessionId)
             putExtra(FollowPush.EXTRA_READER_PATH, message.readerPath)
             putExtra(FollowPush.EXTRA_TITLE, message.body)
+            putExtra(FollowPush.EXTRA_INBOX, true)
         }
         val pendingIntent = PendingIntent.getActivity(
             context,

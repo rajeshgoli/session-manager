@@ -94,6 +94,7 @@ internal fun rememberResumed(): Boolean {
 
 @Composable
 fun QueueScreen(
+    onNavigateToInbox: () -> Unit,
     onNavigateToWatch: () -> Unit,
     onNavigateToAnalytics: () -> Unit,
     onOpenUsage: () -> Unit,
@@ -209,6 +210,7 @@ fun QueueScreen(
         ) {
             AppBottomNav(
                 currentRoute = Routes.QUEUE,
+                onInbox = onNavigateToInbox,
                 onWatch = onNavigateToWatch,
                 onQueue = {},
                 onAnalytics = onNavigateToAnalytics,

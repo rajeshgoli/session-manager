@@ -91,6 +91,7 @@ private const val ANALYTICS_AUTO_REFRESH_MS = 10000L
 
 @Composable
 fun AnalyticsScreen(
+    onNavigateToInbox: () -> Unit,
     onNavigateToWatch: () -> Unit,
     onNavigateToSettings: () -> Unit,
     onNavigateToQueue: () -> Unit,
@@ -251,6 +252,7 @@ fun AnalyticsScreen(
         ) {
             AppBottomNav(
                 currentRoute = Routes.ANALYTICS,
+                onInbox = onNavigateToInbox,
                 onWatch = onNavigateToWatch,
                 onQueue = onNavigateToQueue,
                 onAnalytics = {},
@@ -263,6 +265,7 @@ fun AnalyticsScreen(
 fun AnalyticsDetailScreen(
     section: String,
     onBack: () -> Unit,
+    onNavigateToInbox: () -> Unit,
     onNavigateToWatch: () -> Unit,
     onNavigateToAnalytics: () -> Unit,
     onNavigateToSettings: () -> Unit,
@@ -405,6 +408,7 @@ fun AnalyticsDetailScreen(
         ) {
             AppBottomNav(
                 currentRoute = Routes.ANALYTICS,
+                onInbox = onNavigateToInbox,
                 onWatch = onNavigateToWatch,
                 onQueue = onNavigateToQueue,
                 onAnalytics = onNavigateToAnalytics,

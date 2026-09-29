@@ -195,4 +195,12 @@ interface ApiService {
 
     @POST("client/push/test")
     suspend fun sendTestPush(): li.rajeshgo.sm.data.model.TestPushResponse
+
+    /** The owner's Inbox (sm#1647); `filter` is `open`, `docs` or `done`. */
+    @GET("inbox?format=json")
+    suspend fun getInbox(@Query("filter") filter: String): li.rajeshgo.sm.data.model.InboxResponse
+
+    /** Done on a thread: clears its open ask without messaging the agent. */
+    @POST("inbox/done")
+    suspend fun markInboxDone(@Body request: li.rajeshgo.sm.data.model.InboxDoneRequest)
 }

@@ -147,6 +147,7 @@ private const val WATCH_TOAST_MS = 3500L
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun WatchScreen(
+    onNavigateToInbox: () -> Unit,
     onNavigateToSettings: () -> Unit,
     onNavigateToAnalytics: () -> Unit,
     onNavigateToQueue: () -> Unit,
@@ -212,7 +213,8 @@ fun WatchScreen(
     val pendingFollowOpen = li.rajeshgo.sm.push.FollowOpenRequests.pending
     val onFollowOpenConsumed = { li.rajeshgo.sm.push.FollowOpenRequests.pending = null }
     LaunchedEffect(pendingFollowOpen, state.sessions) {
-        val open = pendingFollowOpen ?: return@LaunchedEffect
+        // Message and review notifications open in the Inbox tab.
+        val open = pendingFollowOpen?.takeIf { !it.inbox } ?: return@LaunchedEffect
         val readerPath = open.readerPath
         if (readerPath != null) {
             openPage = ReaderPage(title = open.title.ifBlank { "Completion report" }, subtitle = readerPath, path = readerPath)
@@ -480,6 +482,7 @@ fun WatchScreen(
         ) {
             AppBottomNav(
                 currentRoute = Routes.WATCH,
+                onInbox = onNavigateToInbox,
                 onWatch = {},
                 onQueue = onNavigateToQueue,
                 onAnalytics = onNavigateToAnalytics,

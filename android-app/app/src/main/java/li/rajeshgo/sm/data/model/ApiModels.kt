@@ -903,3 +903,48 @@ data class TestPushResponse(
     val sent: Int = 0,
     val failed: List<TestPushFailure> = emptyList(),
 )
+
+/** `GET /inbox?format=json` (sm#1647): the owner's Inbox, one row per thread. */
+@Serializable
+data class InboxResponse(
+    val filter: String = "open",
+    /** Open rows that need the owner: the tab badge. */
+    @SerialName("needs_you_count") val needsYouCount: Int = 0,
+    /** Any Open row is new: the tab dot. */
+    @SerialName("has_new") val hasNew: Boolean = false,
+    val rows: List<InboxRow> = emptyList(),
+)
+
+/** One Inbox thread: an agent's exchange with the owner, or one doc across its revisions. */
+@Serializable
+data class InboxRow(
+    @SerialName("thread_key") val threadKey: String = "",
+    /** `agent` or `doc`. */
+    val kind: String = "",
+    val title: String = "",
+    val repo: String = "",
+    /** Agent: `live` or `ended`. Doc: its state (`new`, `updated`, `review_requested`, `reviewed`, `read`). */
+    val status: String = "",
+    /** A doc's latest posted verdict: `approve`, `changes_requested` or `comment`. */
+    val verdict: String? = null,
+    @SerialName("pr_number") val prNumber: Long? = null,
+    /** A doc's latest revision's publisher. */
+    val author: String? = null,
+    /** `needs_you`, `new` or `earlier`. */
+    val group: String = "",
+    val preview: String = "",
+    @SerialName("newest_at") val newestAt: String = "",
+    @SerialName("message_count") val messageCount: Int = 0,
+    @SerialName("revision_count") val revisionCount: Int = 0,
+    @SerialName("open_asks") val openAsks: Int = 0,
+    /** The page the row opens: the agent thread, or the doc. */
+    val url: String = "",
+    val done: Boolean = false,
+    @SerialName("session_id") val sessionId: String? = null,
+    @SerialName("doc_id") val docId: String? = null,
+)
+
+@Serializable
+data class InboxDoneRequest(
+    @SerialName("thread_key") val threadKey: String,
+)

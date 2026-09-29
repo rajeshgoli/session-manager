@@ -4,6 +4,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -12,14 +15,20 @@ import li.rajeshgo.sm.data.repository.SettingsRepository
 import li.rajeshgo.sm.push.FollowOpenRequests
 import li.rajeshgo.sm.ui.analytics.AnalyticsDetailScreen
 import li.rajeshgo.sm.ui.analytics.AnalyticsScreen
+import li.rajeshgo.sm.ui.inbox.InboxBadgeRefresher
+import li.rajeshgo.sm.ui.inbox.InboxScreen
+import li.rajeshgo.sm.ui.queue.rememberResumed
 import li.rajeshgo.sm.ui.queue.QueueScreen
 import li.rajeshgo.sm.ui.queue.UsageScreen
 import li.rajeshgo.sm.ui.settings.SettingsScreen
 import li.rajeshgo.sm.ui.watch.WatchScreen
 
+private const val INBOX_BADGE_REFRESH_MS = 60_000L
+
 object Routes {
     const val SETTINGS = "settings"
     const val WATCH = "watch"
+    const val INBOX = "inbox"
     const val ANALYTICS = "analytics"
     const val ANALYTICS_DETAIL = "analytics/detail"
     const val QUEUE = "queue"
@@ -48,15 +57,34 @@ fun AppNavigation() {
         }
     }
 
-    // A tapped follow notification opens on the watch screen when signed in.
+    // A tapped notification opens when signed in: messages and review
+    // requests in the Inbox (sm#1647), follow results on the watch screen.
     val pendingFollowOpen = FollowOpenRequests.pending
     LaunchedEffect(pendingFollowOpen, isLoggedIn) {
+        val route = if (pendingFollowOpen?.inbox == true) Routes.INBOX else Routes.WATCH
         if (pendingFollowOpen != null && isLoggedIn == true &&
-            navController.currentDestination?.route != Routes.WATCH
+            navController.currentDestination?.route != route
         ) {
-            navController.navigate(Routes.WATCH) {
+            navController.navigate(route) {
                 launchSingleTop = true
             }
+        }
+    }
+
+    // The Inbox badge on every screen's bottom nav, while the app is in front.
+    val resumed = rememberResumed()
+    val badgeRefresher = remember { InboxBadgeRefresher(context.applicationContext as android.app.Application) }
+    LaunchedEffect(resumed, isLoggedIn) {
+        if (!resumed || isLoggedIn != true) return@LaunchedEffect
+        while (isActive) {
+            badgeRefresher.refresh()
+            delay(INBOX_BADGE_REFRESH_MS)
+        }
+    }
+    val toInbox = {
+        navController.navigate(Routes.INBOX) {
+            popUpTo(Routes.WATCH) { inclusive = false }
+            launchSingleTop = true
         }
     }
 
@@ -82,8 +110,29 @@ fun AppNavigation() {
                 },
             )
         }
+        composable(Routes.INBOX) {
+            InboxScreen(
+                onNavigateToWatch = {
+                    navController.navigate(Routes.WATCH) {
+                        popUpTo(Routes.WATCH) { inclusive = false }
+                        launchSingleTop = true
+                    }
+                },
+                onNavigateToQueue = {
+                    navController.navigate(Routes.QUEUE) {
+                        launchSingleTop = true
+                    }
+                },
+                onNavigateToAnalytics = {
+                    navController.navigate(Routes.ANALYTICS) {
+                        launchSingleTop = true
+                    }
+                },
+            )
+        }
         composable(Routes.WATCH) {
             WatchScreen(
+                onNavigateToInbox = toInbox,
                 onNavigateToSettings = {
                     navController.navigate(Routes.SETTINGS)
                 },
@@ -101,6 +150,7 @@ fun AppNavigation() {
         }
         composable(Routes.QUEUE) {
             QueueScreen(
+                onNavigateToInbox = toInbox,
                 onNavigateToWatch = {
                     navController.navigate(Routes.WATCH) {
                         popUpTo(Routes.WATCH) { inclusive = false }
@@ -120,6 +170,7 @@ fun AppNavigation() {
         }
         composable(Routes.ANALYTICS) {
             AnalyticsScreen(
+                onNavigateToInbox = toInbox,
                 onNavigateToWatch = {
                     navController.navigate(Routes.WATCH) {
                         popUpTo(Routes.WATCH) { inclusive = false }
@@ -143,6 +194,7 @@ fun AppNavigation() {
             AnalyticsDetailScreen(
                 section = backStackEntry.arguments?.getString("section").orEmpty(),
                 onBack = { navController.popBackStack() },
+                onNavigateToInbox = toInbox,
                 onNavigateToWatch = {
                     navController.navigate(Routes.WATCH) {
                         popUpTo(Routes.WATCH) { inclusive = false }

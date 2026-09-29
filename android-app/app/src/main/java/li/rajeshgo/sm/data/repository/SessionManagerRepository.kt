@@ -477,6 +477,14 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token).ackFollow(followId) }.mapFailure(::classifyWriteFailure)
     }
 
+    suspend fun fetchInbox(baseUrl: String, token: String, filter: String): li.rajeshgo.sm.data.model.InboxResponse = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getInbox(filter) }
+    }
+
+    suspend fun markInboxDone(baseUrl: String, token: String, threadKey: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).markInboxDone(li.rajeshgo.sm.data.model.InboxDoneRequest(threadKey)) }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun ackNotice(baseUrl: String, token: String, noticeId: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching { api(baseUrl, token).ackNotice(noticeId) }.mapFailure(::classifyWriteFailure)
     }

@@ -195,6 +195,15 @@ class DocReaderTest {
         assertTrue(isOwnerPagePath("/messages/msg_3f9a2c1d"))
     }
 
+    @Test fun inboxLinksOpenAndStayInTheReader() {
+        val page = readerPageForLink("https://sm.example.com/inbox/agent/eng00001?at=msg_3f9a2c1d", "sm.example.com")!!
+        assertEquals("/inbox/agent/eng00001?at=msg_3f9a2c1d", page.path)
+        assertEquals("/inbox", readerPageForLink("https://sm.example.com/inbox", "sm.example.com")!!.path)
+        assertTrue(isOwnerPagePath("/inbox"))
+        assertTrue(isOwnerPagePath("/inbox/agent/eng00001"))
+        assertEquals(DocNavigation.Reload, docNavigation(server, "$server/messages/msg_00000001", "$server/inbox"))
+    }
+
     @Test fun otherLinksAreNotReaderLinks() {
         val host = "sm.example.com"
         assertNull(readerPageForLink("https://sm.example.com/watch", host))

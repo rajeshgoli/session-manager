@@ -33,6 +33,8 @@ object FollowPush {
     const val EXTRA_SESSION_ID = "session_id"
     const val EXTRA_READER_PATH = "reader_path"
     const val EXTRA_TITLE = "title"
+    /** Set on message and review notifications: the tap opens in the Inbox tab (sm#1647). */
+    const val EXTRA_INBOX = "inbox"
 
     /** Firebase options come from BuildConfig; any blank value leaves push off and follows fall back to email. */
     val isConfigured: Boolean
@@ -205,6 +207,8 @@ data class FollowOpen(
     val sessionId: String?,
     val readerPath: String?,
     val title: String,
+    /** A message or review notification: the Inbox opens it, not Watch. */
+    val inbox: Boolean = false,
 ) {
     companion object {
         fun fromIntent(intent: Intent?): FollowOpen? {
@@ -212,7 +216,12 @@ data class FollowOpen(
             val sessionId = intent.getStringExtra(FollowPush.EXTRA_SESSION_ID)?.takeIf { it.isNotBlank() }
             val readerPath = intent.getStringExtra(FollowPush.EXTRA_READER_PATH)?.takeIf { it.isNotBlank() }
             if (sessionId == null && readerPath == null) return null
-            return FollowOpen(sessionId, readerPath, intent.getStringExtra(FollowPush.EXTRA_TITLE).orEmpty())
+            return FollowOpen(
+                sessionId,
+                readerPath,
+                intent.getStringExtra(FollowPush.EXTRA_TITLE).orEmpty(),
+                inbox = intent.getBooleanExtra(FollowPush.EXTRA_INBOX, false) && readerPath != null,
+            )
         }
     }
 }
