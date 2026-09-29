@@ -60,7 +60,9 @@ def main() -> int:
         missing = missing_configuration(result.stdout)
         if missing:
             raise RuntimeError("APK has missing configuration: " + ", ".join(missing)
-                               + ". Rebuild with the complete local.defaults.properties before publishing.")
+                               + ". Refusing to deploy an app with disabled features. "
+                               "Copy ~/projects/session-manager/android-app/local.defaults.properties "
+                               "into your worktree's android-app/, rebuild, and deploy again.")
     except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
         print(f"APK verification failed: {error}", file=sys.stderr)
         return 1
