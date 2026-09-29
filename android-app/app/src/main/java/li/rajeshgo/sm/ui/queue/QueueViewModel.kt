@@ -53,6 +53,8 @@ data class QueueUiState(
     val stats: QueueStats? = null,
     val statsHours: Int = 168,
     val loading: Boolean = true,
+    /** A pull-to-refresh in Analytics › Queue is in flight. */
+    val refreshing: Boolean = false,
     val lastUpdated: OffsetDateTime? = null,
     val refreshError: String? = null,
     val signedOut: Boolean = false,
@@ -103,16 +105,18 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
         return true
     }
 
-    /** The 5-second overview refresh; keeps the last data on failure. */
-    fun refresh() {
+    /** The overview refresh (every 5 s on the Queue tab); keeps the last data on failure. */
+    fun refresh(pull: Boolean = false) {
         if (refreshJob?.isActive == true) return
+        if (pull) _uiState.update { it.copy(refreshing = true) }
         refreshJob = viewModelScope.launch {
-            val (url, token) = credentials() ?: return@launch
+            val (url, token) = credentials() ?: return@launch _uiState.update { it.copy(refreshing = false) }
             runCatching { repository.fetchQueue(url, token) }
                 .onSuccess {
                     _uiState.value = _uiState.value.copy(
                         overview = it,
                         loading = false,
+                        refreshing = false,
                         lastUpdated = OffsetDateTime.now(),
                         refreshError = null,
                     )
@@ -121,6 +125,7 @@ class QueueViewModel(application: Application) : AndroidViewModel(application) {
                     if (!handleAuth(error)) {
                         _uiState.value = _uiState.value.copy(loading = false, refreshError = "Couldn't refresh — retrying")
                     }
+                    _uiState.update { it.copy(refreshing = false) }
                 }
         }
     }

@@ -99,6 +99,7 @@ fun QueueScreen(
     onNavigateToInbox: () -> Unit,
     onNavigateToWatch: () -> Unit,
     onOpenUsage: () -> Unit,
+    onOpenStopped: () -> Unit,
     menu: AppMenuActions,
     viewModel: QueueViewModel = viewModel(),
 ) {
@@ -152,6 +153,16 @@ fun QueueScreen(
                             color = TextSecondary,
                             modifier = Modifier.padding(top = 6.dp, start = 2.dp),
                         )
+                        // Stopped jobs are looked at in Analytics › Queue (sm#1677).
+                        stoppedLinkText(overview.ended.size)?.let { link ->
+                            Text(
+                                link,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Amber,
+                                modifier = Modifier.fillMaxWidth().clickable(onClick = onOpenStopped)
+                                    .padding(top = 6.dp, bottom = 2.dp, start = 2.dp),
+                            )
+                        }
                     }
                     if (overview.running.isEmpty() && overview.queued.isEmpty()) {
                         item { Text("Nothing running or waiting.", color = TextMuted, modifier = Modifier.padding(vertical = 16.dp)) }
@@ -181,28 +192,6 @@ fun QueueScreen(
                             )
                         }
                     }
-                    if (overview.ended.isNotEmpty()) {
-                        item { SectionHeader("STOPPED BY THE QUEUE · LAST 24H") }
-                        items(overview.ended, key = { "e-${it.id}" }) { job ->
-                            JobRow(
-                                title = jobTitle(job),
-                                agent = jobAgentLabel(job),
-                                line = endedLine(job, now),
-                                reason = job.endedSummary,
-                                prefix = endedIcon(job.endedReason),
-                                prefixColor = if (job.endedReason == "gave_up") Amber else Rose,
-                                onClick = { sheetJob = job; viewModel.loadLog(job) },
-                            )
-                        }
-                    }
-                    item {
-                        SectionHeader("HELD BACK?")
-                        HeldBackCard(
-                            lines = heldBackLines(state.stats),
-                            hours = state.statsHours,
-                            onHours = { viewModel.refreshStats(it) },
-                        )
-                    }
                 }
             }
         }
@@ -220,38 +209,57 @@ fun QueueScreen(
     }
 
     sheetJob?.let { job ->
-        // Show the freshest copy of the job while the sheet is open.
-        val overview = state.overview
-        val current = overview?.let { (it.running + it.queued + it.ended).firstOrNull { row -> row.id == job.id } } ?: job
-        JobSheet(
-            job = current,
+        QueueJobSheet(
+            job = job,
+            state = state,
             now = now,
-            log = state.log?.takeIf { it.first == job.id }?.second,
-            ask = state.asks[job.id],
-            cancelError = state.cancelError,
-            followMessage = state.followMessage?.takeIf { it.first == job.id }?.second,
-            startNow = state.startNow?.takeIf { it.jobId == job.id },
-            onCheckStartNow = { viewModel.checkStartNow(current) },
-            onStartNow = { viewModel.startNow(current) },
-            onDismissStartNow = viewModel::dismissStartNow,
-            onFollow = { viewModel.follow(current) },
-            onCancel = { note -> viewModel.cancel(current, note) { sheetJob = null; viewModel.clearSheetState() } },
-            onAsk = { question -> viewModel.ask(current, question) },
-            onOpenAgent = current.notifySessionId?.takeIf { it.isNotBlank() }?.let { sessionId ->
-                {
-                    sheetJob = null
-                    viewModel.clearSheetState()
-                    FollowOpenRequests.pending = FollowOpen(sessionId, null, jobAgentLabel(current))
-                    onNavigateToWatch()
-                }
-            },
-            onClose = { sheetJob = null; viewModel.clearSheetState() },
+            viewModel = viewModel,
+            onOpenWatch = onNavigateToWatch,
+            onClose = { sheetJob = null },
         )
     }
 }
 
+/** The job sheet with the freshest copy of [job]; shared by Queue and Analytics › Queue. */
 @Composable
-private fun SectionHeader(text: String) {
+internal fun QueueJobSheet(
+    job: SessionJob,
+    state: QueueUiState,
+    now: OffsetDateTime,
+    viewModel: QueueViewModel,
+    onOpenWatch: () -> Unit,
+    onClose: () -> Unit,
+) {
+    val overview = state.overview
+    val current = overview?.let { (it.running + it.queued + it.ended).firstOrNull { row -> row.id == job.id } } ?: job
+    val close = { onClose(); viewModel.clearSheetState() }
+    JobSheet(
+        job = current,
+        now = now,
+        log = state.log?.takeIf { it.first == job.id }?.second,
+        ask = state.asks[job.id],
+        cancelError = state.cancelError,
+        followMessage = state.followMessage?.takeIf { it.first == job.id }?.second,
+        startNow = state.startNow?.takeIf { it.jobId == job.id },
+        onCheckStartNow = { viewModel.checkStartNow(current) },
+        onStartNow = { viewModel.startNow(current) },
+        onDismissStartNow = viewModel::dismissStartNow,
+        onFollow = { viewModel.follow(current) },
+        onCancel = { note -> viewModel.cancel(current, note) { close() } },
+        onAsk = { question -> viewModel.ask(current, question) },
+        onOpenAgent = current.notifySessionId?.takeIf { it.isNotBlank() }?.let { sessionId ->
+            {
+                close()
+                FollowOpenRequests.pending = FollowOpen(sessionId, null, jobAgentLabel(current))
+                onOpenWatch()
+            }
+        },
+        onClose = close,
+    )
+}
+
+@Composable
+internal fun SectionHeader(text: String) {
     Column(Modifier.padding(top = 18.dp, bottom = 2.dp)) {
         Text(text, style = MaterialTheme.typography.labelSmall, color = TextMuted, fontWeight = FontWeight.Bold)
         HorizontalDivider(color = Border, modifier = Modifier.padding(top = 4.dp))
@@ -301,7 +309,7 @@ internal fun MeterPanel(host: li.rajeshgo.sm.data.model.HostStatus?, onClick: ((
 }
 
 @Composable
-private fun JobRow(
+internal fun JobRow(
     title: String,
     agent: String,
     line: String,
@@ -337,7 +345,7 @@ private fun JobRow(
 }
 
 @Composable
-private fun HeldBackCard(lines: List<String>, hours: Int, onHours: (Int) -> Unit) {
+internal fun HeldBackCard(lines: List<String>, hours: Int, onHours: (Int) -> Unit) {
     Surface(color = Panel, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {

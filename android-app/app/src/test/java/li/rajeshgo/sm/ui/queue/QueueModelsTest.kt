@@ -209,4 +209,11 @@ class QueueModelsTest {
             startNowMemoryLine(check.copy(memoryAvailableBytes = null, memoryEstimateBytes = null)),
         )
     }
+
+    @Test
+    fun stoppedLinkShowsOnlyWhenAJobStopped() {
+        assertEquals(null, stoppedLinkText(0))
+        assertEquals("3 stopped in the last 24h ›", stoppedLinkText(3))
+        assertEquals("50+ stopped in the last 24h ›", stoppedLinkText(50))
+    }
 }

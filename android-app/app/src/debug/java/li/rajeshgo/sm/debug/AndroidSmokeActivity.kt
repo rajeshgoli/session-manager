@@ -131,14 +131,6 @@ class AndroidSmokeActivity : ComponentActivity() {
             JSONObject().put("session_id", session.id).put("display", policy.display)
         }
 
-        step("analytics_summary") {
-            val payload = sessionRepository.fetchAnalytics(serverUrl, accessToken)
-            JSONObject()
-                .put("generated_at_present", payload.generatedAt.isNotBlank())
-                .put("active_sessions", payload.kpis.activeSessions.value)
-                .put("attach_available", payload.attachAvailable)
-        }
-
         step("app_artifact_metadata") {
             val metadata = apiService(serverUrl, settingsRepository).getAppArtifactMetadata("session-manager-android")
             JSONObject()

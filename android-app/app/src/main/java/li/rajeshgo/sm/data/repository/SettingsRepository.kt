@@ -43,6 +43,7 @@ class SettingsRepository(
         val WHAT_SUMMARIES = stringPreferencesKey("what_summaries")
         val QUEUE_ASKS = stringPreferencesKey("queue_asks")
         val FOLLOW_PUSH_ENABLED = booleanPreferencesKey("follow_push_enabled")
+        val ANALYTICS_SECTION = stringPreferencesKey("analytics_section")
     }
 
     val serverUrl: Flow<String> = context.dataStore.data.map { prefs ->
@@ -197,6 +198,13 @@ class SettingsRepository(
 
     suspend fun saveFollowPushEnabled(enabled: Boolean) {
         context.dataStore.edit { prefs -> prefs[Keys.FOLLOW_PUSH_ENABLED] = enabled }
+    }
+
+    /** The Analytics section last shown (spend, time or queue); blank before the first visit. */
+    suspend fun loadAnalyticsSection(): String = context.dataStore.data.first()[Keys.ANALYTICS_SECTION].orEmpty()
+
+    suspend fun saveAnalyticsSection(section: String) {
+        context.dataStore.edit { prefs -> prefs[Keys.ANALYTICS_SECTION] = section }
     }
 
     suspend fun clearAuth() {

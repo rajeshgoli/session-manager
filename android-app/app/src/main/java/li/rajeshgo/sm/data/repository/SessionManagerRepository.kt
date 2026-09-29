@@ -10,7 +10,6 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import li.rajeshgo.sm.data.model.ActivityActionRow
-import li.rajeshgo.sm.data.model.AnalyticsSummary
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.DeviceGoogleAuthResponse
@@ -275,10 +274,6 @@ class SessionManagerRepository(
             val service = api(baseUrl, token, readTimeoutSeconds = 180)
             service.createSession(request)
         }.mapFailure(::classifyWriteFailure)
-    }
-
-    suspend fun fetchAnalytics(baseUrl: String, token: String): AnalyticsSummary = withContext(Dispatchers.IO) {
-        executeReadRequest(baseUrl, token) { it.getAnalyticsSummary() }
     }
 
     suspend fun fetchHandoffPolicy(baseUrl: String, token: String, sessionId: String) = withContext(Dispatchers.IO) {
