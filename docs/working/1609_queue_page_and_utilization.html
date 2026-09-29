@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1609 — Queue page and utilization recorder</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<style>
+  .phone { max-width: 22rem; margin: 0 auto; border: 2px solid var(--ink-3); border-radius: 1.4rem; padding: .9rem .8rem 1rem; background: var(--surface); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .8rem; line-height: 1.35; }
+  .phone .top { display: flex; justify-content: space-between; align-items: baseline; font-weight: 700; font-size: 1rem; margin-bottom: .45rem; }
+  .phone .top small { font-weight: 400; color: var(--ink-2); font-size: .72rem; }
+  .meters { display: grid; grid-template-columns: auto 1fr auto; gap: .2rem .45rem; align-items: center; font-size: .72rem; background: var(--surface-2); border-radius: .5rem; padding: .45rem .55rem; }
+  .meters b { color: var(--ink-2); font-weight: 600; }
+  .track { height: .45rem; background: var(--rule); border-radius: 1rem; overflow: hidden; }
+  .fill { height: 100%; border-radius: 1rem; }
+  .slots { font-size: .72rem; color: var(--ink-2); margin: .35rem .1rem .2rem; }
+  .sec { font-size: .66rem; letter-spacing: .06em; font-weight: 700; color: var(--ink-2); margin: .8rem 0 .25rem; border-bottom: 1px solid var(--rule); padding-bottom: .15rem; }
+  .row { padding: .35rem .1rem; border-bottom: 1px solid var(--rule); }
+  .row:last-child { border-bottom: none; }
+  .row .t { font-weight: 600; } .row .t span { font-weight: 400; color: var(--ink-2); }
+  .row .m { color: var(--ink-2); font-size: .74rem; }
+  .row .why { font-size: .74rem; }
+  .n { display: inline-block; min-width: 1.1rem; font-weight: 700; color: var(--blue); }
+  .prog { height: .3rem; background: var(--rule); border-radius: 1rem; margin-top: .2rem; overflow: hidden; } .prog i { display: block; height: 100%; background: var(--blue); }
+  .card { background: var(--surface-2); border-radius: .5rem; padding: .5rem .6rem; font-size: .76rem; margin-top: .3rem; }
+  .card .chips { float: right; color: var(--ink-2); font-size: .68rem; } .card .chips b { color: var(--ink); }
+  .x { color: var(--red); font-weight: 700; } .hg { color: var(--orange); font-weight: 700; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; } @media (max-width: 40rem) { .two { grid-template-columns: 1fr; } }
+</style>
+
+<h1>1609 — A Queue page, and a record of whether the queue holds the machine back</h1>
+<p class="sans"><small>Author: Claude Opus 5.5 <code>8f069b36</code> (sm-1609-spec-author) · Ticket #1609 · 2026-09-28</small></p>
+
+<h2>Memo</h2>
+
+<p><b>I propose four pieces of work.</b> First, a <b>utilization recorder</b> in the server that writes the machine's memory, CPU and GPU use, and each queue job's memory and CPU, every 5 seconds into its own database. Second, a <b>Queue page</b> in the sm app: a live Memory / CPU / GPU bar, then one list — jobs running, jobs queued behind them in start order, and jobs the queue stopped or gave up on — with every row naming the agent and how long it has waited. Third, a <b>"Held back?" card</b> on that page that answers your question from recorded data: of the time jobs spent waiting on a concurrency limit, how much of it had the machine idle enough to run them. Fourth, a <b>Mac usage screen</b> that charts CPU, GPU, memory and queue jobs over the last hour, day, week or month.</p>
+
+<p>The recorder matters most. Thirty days of job history already say the overall limits are not the constraint, while the 2-slot background limit and perf runs account for nearly all of 107 hours of waiting. What the history cannot say is whether the machine had room during those waits, because utilization recording stopped on June 16 when the server moved from Python to Rust. Nothing has written it since.</p>
+
+<div class="vocab">
+<dl>
+<dt>Queue job</dt><dd>A command an agent submits with <code>sm queue run</code>. The server starts it when the rules allow and wakes the agent when it ends.</dd>
+<dt>Job types</dt><dd><b>tests</b> (builds and checks), <b>perf</b> (measurements that need a quiet machine), <b>background</b> (work that may be interrupted), <b>service</b> (long-lived processes).</dd>
+<dt>Concurrency limit (slot)</dt><dd>The most jobs that may run at once. Your live config: 8 overall (services count), 6 tests, 1 perf, 2 background, 2 service.</dd>
+<dt>Held, hold reason</dt><dd>A submitted job that has not started. The server keeps one current reason, such as "waiting for a free slot". It erases the reason when the job starts.</dd>
+<dt>Perf rules</dt><dd>A perf job waits for running tests to finish, then a 30-second cooldown. While a perf job runs, or waits for that quiet window, every new job is held.</dd>
+<dt>Displaced</dt><dd>A background job killed to make room for a perf run. It is not restarted.</dd>
+<dt>Gave up</dt><dd>A job that waited past its wait limit (5 minutes unless the agent asked for longer) and never started. Its agent is told.</dd>
+<dt>Headroom</dt><dd>A moment when the machine could have taken more work: CPU under 60% busy, at least a quarter of memory available (64 GB), and the kernel reporting normal memory pressure.</dd>
+</dl>
+</div>
+
+<h3>1. The page</h3>
+
+<p><b>Figure 1 shows the page. Top to bottom:</b></p>
+<ul>
+<li><b>Live bar.</b> Memory used of total, CPU busy, GPU busy, refreshed every 5 seconds while the page is open. Below it, how many slots are in use, overall and per type.</li>
+<li><b>Running.</b> Oldest first. Each row shows elapsed time against the job's own time limit.</li>
+<li><b>Queued.</b> The number is the order in which the server considers waiting jobs: perf first, then tests, background, service, and oldest first within each type. The line under each row says why that job is not running. The number is not a promise: if only the background limit is full, a test queued later starts ahead of a waiting background job, and its reason line says so.</li>
+<li><b>Stopped by the queue.</b> Jobs from the last 24 hours that the queue ended without the job finishing on its own: displaced, gave up, over its memory limit, over its process limit, or past its time limit. Cancelled and failed jobs are left out. Someone chose to cancel, and a failure is the job's own result.</li>
+<li><b>Held back?</b> Described in section 4.</li>
+</ul>
+<p><b>Where you reach it.</b> A <i>Queue</i> item in the agents screen's top menu, next to Analytics. A Queue icon also sits in the agents screen's top bar whenever a job is running or waiting, with a badge counting the waiting jobs. The app has no live utilization bar today (only a Settings sheet that updates when you tap Refresh), so this page is where live utilization appears.</p>
+
+<figure>
+<div class="phone">
+  <div class="top">Queue <small>updated 2s ago</small></div>
+  <div class="meters">
+    <b>MEM</b><div class="track"><div class="fill" style="width:34%;background:var(--green)"></div></div><span>87 / 256G</span>
+    <b>CPU</b><div class="track"><div class="fill" style="width:72%;background:var(--orange)"></div></div><span>72%</span>
+    <b>GPU</b><div class="track"><div class="fill" style="width:11%;background:var(--blue)"></div></div><span>11%</span>
+  </div>
+  <div class="slots">3 of 8 slots in use · tests 2/6 · perf 0/1 · background 1/2 · service 0/2</div>
+
+  <div class="sec">RUNNING</div>
+  <div class="row"><div class="t">cargo test <span>· sm-1196-engineer</span></div><div class="m">tests · 4m of 15m</div><div class="prog"><i style="width:27%"></i></div></div>
+  <div class="row"><div class="t">npm test <span>· fractal-rust-port</span></div><div class="m">tests · 1m of 15m</div><div class="prog"><i style="width:7%"></i></div></div>
+  <div class="row"><div class="t">reindex <span>· sm-1400-scout</span></div><div class="m">background · 22m of 60m</div><div class="prog"><i style="width:37%"></i></div></div>
+
+  <div class="sec">QUEUED · IN START ORDER</div>
+  <div class="row"><div class="t"><span class="n">1</span>bench-ledger <span>· sm-1196-engineer</span></div><div class="m">perf · waiting 3m · gives up in 2m</div><div class="why">Waiting for 2 tests to finish, then a 30s cooldown</div></div>
+  <div class="row"><div class="t"><span class="n">2</span>cargo test <span>· pr-cleanup-merge-5</span></div><div class="m">tests · waiting 1m · gives up in 4m</div><div class="why">Held so the perf run gets a quiet machine</div></div>
+
+  <div class="sec">STOPPED BY THE QUEUE · LAST 24H</div>
+  <div class="row"><div class="t"><span class="x">✕</span> index-build <span>· sm-1400-scout</span></div><div class="m">background · 40m ago</div><div class="why">Stopped to make room for a perf run; not restarted</div></div>
+  <div class="row"><div class="t"><span class="hg">⌛</span> cargo test <span>· sm-1388-engineer</span></div><div class="m">tests · 2h ago</div><div class="why">Never started; gave up after 5m</div></div>
+
+  <div class="sec">HELD BACK?</div>
+  <div class="card"><span class="chips">24h · <b>7d</b> · 30d</span>
+  Limits held jobs <b>11.2 h</b>. The machine had headroom for <b>88%</b> of it.<br>
+  Perf rules held jobs <b>20.4 h</b> (by design).<br>
+  Background jobs peak at <b>18 GB</b> each (95th percentile).</div>
+</div>
+<figcaption>Figure 1. The Queue page on a phone. Job names and agents are realistic; the "Held back?" numbers are illustrative, since nothing has been recorded yet. Tapping any row opens a sheet with the command, folder, limits, the full hold explanation, the last 40 log lines, and Cancel / Follow / Open agent.</figcaption>
+</figure>
+
+<h3>2. What 30 days of job history show</h3>
+
+<figure>
+<svg viewBox="0 0 720 260" role="img" aria-label="Daily queue wait hours by cause" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:11px">
+<line x1="40" x2="710" y1="220.0" y2="220.0" stroke="var(--rule)"/><text x="34" y="224.0" text-anchor="end" fill="var(--ink-2)">0h</text>
+<line x1="40" x2="710" y1="151.3" y2="151.3" stroke="var(--rule)"/><text x="34" y="155.3" text-anchor="end" fill="var(--ink-2)">10h</text>
+<line x1="40" x2="710" y1="82.7" y2="82.7" stroke="var(--rule)"/><text x="34" y="86.7" text-anchor="end" fill="var(--ink-2)">20h</text>
+<line x1="40" x2="710" y1="14.0" y2="14.0" stroke="var(--rule)"/><text x="34" y="18.0" text-anchor="end" fill="var(--ink-2)">30h</text>
+<rect x="86.7" y="218.6" width="18.3" height="1.4" fill="var(--blue)"/>
+<text x="95.8" y="235" text-anchor="middle" fill="var(--ink-2)">Sep 1</text>
+<rect x="131.3" y="212.4" width="18.3" height="7.6" fill="var(--blue)"/>
+<rect x="131.3" y="211.8" width="18.3" height="0.7" fill="var(--orange)"/>
+<rect x="131.3" y="207.6" width="18.3" height="4.1" fill="var(--violet)"/>
+<rect x="176.0" y="217.9" width="18.3" height="2.1" fill="var(--blue)"/>
+<rect x="198.3" y="208.3" width="18.3" height="11.7" fill="var(--blue)"/>
+<rect x="198.3" y="207.6" width="18.3" height="0.7" fill="var(--orange)"/>
+<rect x="220.7" y="218.6" width="18.3" height="1.4" fill="var(--blue)"/>
+<rect x="220.7" y="202.1" width="18.3" height="16.5" fill="var(--orange)"/>
+<rect x="220.7" y="200.1" width="18.3" height="2.1" fill="var(--violet)"/>
+<rect x="243.0" y="219.3" width="18.3" height="0.7" fill="var(--orange)"/>
+<text x="252.2" y="235" text-anchor="middle" fill="var(--ink-2)">Sep 8</text>
+<rect x="265.3" y="219.3" width="18.3" height="0.7" fill="var(--orange)"/>
+<rect x="265.3" y="218.6" width="18.3" height="0.7" fill="var(--violet)"/>
+<rect x="287.7" y="199.4" width="18.3" height="20.6" fill="var(--blue)"/>
+<rect x="287.7" y="148.6" width="18.3" height="50.8" fill="var(--orange)"/>
+<rect x="287.7" y="123.9" width="18.3" height="24.7" fill="var(--violet)"/>
+<rect x="310.0" y="212.4" width="18.3" height="7.6" fill="var(--blue)"/>
+<rect x="310.0" y="168.5" width="18.3" height="43.9" fill="var(--orange)"/>
+<rect x="310.0" y="152.0" width="18.3" height="16.5" fill="var(--violet)"/>
+<rect x="332.3" y="204.9" width="18.3" height="15.1" fill="var(--orange)"/>
+<rect x="332.3" y="60.0" width="18.3" height="144.9" fill="var(--violet)"/>
+<rect x="377.0" y="215.2" width="18.3" height="4.8" fill="var(--orange)"/>
+<rect x="377.0" y="209.0" width="18.3" height="6.2" fill="var(--violet)"/>
+<rect x="399.3" y="213.1" width="18.3" height="6.9" fill="var(--orange)"/>
+<rect x="399.3" y="210.4" width="18.3" height="2.7" fill="var(--violet)"/>
+<text x="408.5" y="235" text-anchor="middle" fill="var(--ink-2)">Sep 15</text>
+<rect x="421.7" y="196.7" width="18.3" height="23.3" fill="var(--blue)"/>
+<rect x="466.3" y="209.0" width="18.3" height="11.0" fill="var(--blue)"/>
+<rect x="555.7" y="215.2" width="18.3" height="4.8" fill="var(--orange)"/>
+<rect x="555.7" y="209.0" width="18.3" height="6.2" fill="var(--violet)"/>
+<text x="564.8" y="235" text-anchor="middle" fill="var(--ink-2)">Sep 22</text>
+<rect x="578.0" y="219.3" width="18.3" height="0.7" fill="var(--blue)"/>
+<rect x="578.0" y="214.5" width="18.3" height="4.8" fill="var(--orange)"/>
+<rect x="578.0" y="206.3" width="18.3" height="8.2" fill="var(--violet)"/>
+<rect x="600.3" y="215.2" width="18.3" height="4.8" fill="var(--orange)"/>
+<rect x="600.3" y="213.8" width="18.3" height="1.4" fill="var(--violet)"/>
+<rect x="622.7" y="218.6" width="18.3" height="1.4" fill="var(--orange)"/>
+<rect x="622.7" y="217.3" width="18.3" height="1.4" fill="var(--violet)"/>
+<rect x="645.0" y="178.8" width="18.3" height="41.2" fill="var(--blue)"/>
+<rect x="645.0" y="174.7" width="18.3" height="4.1" fill="var(--orange)"/>
+<rect x="645.0" y="171.2" width="18.3" height="3.4" fill="var(--violet)"/>
+<rect x="667.3" y="143.1" width="18.3" height="76.9" fill="var(--blue)"/>
+<rect x="667.3" y="43.5" width="18.3" height="99.6" fill="var(--orange)"/>
+<rect x="667.3" y="25.7" width="18.3" height="17.9" fill="var(--violet)"/>
+<rect x="689.7" y="196.7" width="18.3" height="23.3" fill="var(--blue)"/>
+<rect x="689.7" y="192.5" width="18.3" height="4.1" fill="var(--orange)"/>
+<rect x="689.7" y="191.8" width="18.3" height="0.7" fill="var(--violet)"/>
+<text x="698.8" y="235" text-anchor="middle" fill="var(--ink-2)">Sep 28</text>
+<rect x="40" y="243" width="10" height="10" fill="var(--blue)"/><text x="54" y="252" fill="var(--ink)">Concurrency limit (mostly background)</text>
+<rect x="275.2" y="243" width="10" height="10" fill="var(--orange)"/><text x="289.2" y="252" fill="var(--ink)">Behind a perf run</text>
+<rect x="398.4" y="243" width="10" height="10" fill="var(--violet)"/><text x="412.4" y="252" fill="var(--ink)">Perf jobs waiting on perf rules</text>
+</svg>
+<figcaption>Figure 2. Hours that submitted jobs spent waiting to start, per day, August 30 – September 28. The cause is inferred from what else was running or queued when each job was submitted, because the server erases a job's hold reason once it starts.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>What held the job</th><th>Jobs that waited &gt; 30 s</th><th>Hours waited</th><th>Average wait</th></tr></thead>
+<tbody>
+<tr><td>Behind a perf run (tests, background, services held while perf ran or waited for its quiet window)</td><td>228</td><td>38.4</td><td>10 min</td></tr>
+<tr><td>Perf jobs waiting on perf rules (another perf run, tests, cooldown, memory)</td><td>132</td><td>35.1</td><td>16 min</td></tr>
+<tr><td>Background limit of 2</td><td>84</td><td>32.9</td><td>23 min</td></tr>
+<tr><td>Overall limit of 8, test limit of 6, service limit of 2</td><td>8</td><td>0.2</td><td>1–2 min</td></tr>
+<tr><td><b>Total</b></td><td><b>~460 of 4,540 jobs</b></td><td><b>107</b></td><td></td></tr>
+</tbody>
+</table>
+
+<p>About 90% of jobs start within 30 seconds. In the same 30 days, 50 jobs gave up without starting, 46 background jobs were displaced, and 8 perf jobs were stopped for exceeding their memory limit.</p>
+<ul>
+<li><b>The overall and test limits are not the constraint.</b> Raising them would change almost nothing.</li>
+<li><b>The background limit is the largest single cost.</b> The heaviest background users run jobs of 35–70 minutes, so two such jobs hold both slots for an hour.</li>
+<li><b>Perf pauses are what perf jobs ask for.</b> Most declare 100% of the CPU and 100–258 GB of the 256 GB of memory. Whether every one of them needs a quiet machine is a question for the agents writing them, not for the queue.</li>
+<li><b>What the history cannot answer:</b> whether the machine had room while jobs waited, and how much memory a background job really uses. Both need the recorder.</li>
+</ul>
+
+<h3>3. The utilization recorder</h3>
+
+<p>Every 5 seconds, while the live server runs the queue, the recorder writes one row for the machine and one row per waiting or running queue job. It writes to its own database, <code>utilization.db</code>, beside the queue's. Its frequent writes therefore never compete with the queue's own bookkeeping.</p>
+
+<table>
+<thead><tr><th>Recorded</th><th>Source</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>CPU busy %, averaged over the 5 seconds</td><td>Kernel CPU counters</td><td>Headroom test; replaces the 1-second glimpse the bar uses today</td></tr>
+<tr><td>Memory: total, used, available, and the raw breakdown (free, active, inactive, wired, compressed)</td><td>Kernel memory counters</td><td>The bar, the headroom test, and later re-analysis under any definition</td></tr>
+<tr><td>Memory pressure (normal / elevated / critical)</td><td>Kernel</td><td>Headroom test</td></tr>
+<tr><td>GPU busy %</td><td>Same source as today's Settings sheet</td><td>The bar; perf GPU budgets</td></tr>
+<tr><td>Jobs running and waiting, by type</td><td>Queue database</td><td>Slot use over time</td></tr>
+<tr><td>Per job: waiting or running, hold reason, memory in use, CPU time, process count</td><td>Queue database, plus one process listing</td><td>Why each job waited; how big each type of job really is</td></tr>
+</tbody>
+</table>
+
+<div class="two">
+<div>
+<p><b>Cost, measured on this machine.</b> The command today's Settings sheet uses (<code>top</code>) costs 1.3 seconds of CPU per reading, which at 5-second sampling would be a quarter of a core. The recorder avoids it. Kernel counters cost next to nothing, the process listing about 10 ms and the GPU reading about 20 ms, for roughly 30 ms per sample. That is about 0.6% of one core.</p>
+<p><b>Size.</b> About 3 MB a day, or about 300 MB when kept for 90 days. The server deletes older rows each hour.</p>
+</div>
+<div>
+<p><b>Memory is measured three ways, all at the same moment:</b></p>
+<table>
+<thead><tr><th>Measure</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td>Used, as <code>top</code> counts it (includes file cache)</td><td>87 GB</td></tr>
+<tr><td>Apps + kernel + compressed</td><td>42 GB</td></tr>
+<tr><td>Available, as the kernel judges it</td><td>96% free</td></tr>
+</tbody>
+</table>
+<p>The bar keeps showing the first figure, so it reads as it always has. The "Held back?" card uses the third, because the queue uses that same figure when it decides whether a perf job may start.</p>
+</div>
+</div>
+
+<h3>4. The "Held back?" card</h3>
+
+<p>The card splits the time jobs spent waiting by why they waited: <b>limits</b> (a concurrency limit was full), <b>perf rules</b>, <b>memory</b> (a perf job waiting for memory to free up), and <b>other</b>. For the limits share, it reports how much of that waiting happened while the machine had <b>headroom</b> as defined above. A high share means the limit, not the machine, was holding work back. It also reports how much memory and CPU each job type really uses at its peak. That is the number the background-limit decision in two weeks needs.</p>
+
+<div class="callout"><b>Worked example.</b> Over one minute (12 samples), two background jobs wait behind the background limit. In 10 samples the machine is 30% busy with 200 GB available and normal pressure; in 2 samples a test build pushes CPU to 90%. Waiting on limits = 2 jobs × 60 s = 2 job-minutes. With headroom = 2 jobs × 10 samples × 5 s = 100 job-seconds = 1.7 job-minutes. The card reads: <i>"Limits held jobs 2 min. The machine had headroom for 83% of it."</i> A sample with a missing CPU or memory reading counts as neither headroom nor its absence; the card reports such time separately as unknown.</div>
+
+<h3>5. The Mac usage screen</h3>
+
+<p>A second screen charts how the Mac has been used over time, using the recorder's samples. You open it by tapping the live bar on the Queue page, or from <i>Mac usage</i> in the agents screen's menu. Range chips switch between the last hour, 24 hours, 7 days and 30 days. The default is 24 hours.</p>
+
+<div class="two">
+<figure style="margin-top:.4rem">
+<div class="phone" style="max-width:21rem">
+  <div class="top">Mac usage <small>1h · <b style="color:var(--ink)">24h</b> · 7d · 30d</small></div>
+  <svg viewBox="0 -4 300 262" style="font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:8px"><text x="0" y="8" fill="var(--ink)" font-weight="700" font-size="9">CPU and GPU %</text><rect x="272.8" y="1" width="7" height="7" fill="var(--blue)"/><text x="282.8" y="8" fill="var(--ink-2)">GPU</text><rect x="245.60000000000002" y="1" width="7" height="7" fill="var(--orange)"/><text x="255.60000000000002" y="8" fill="var(--ink-2)">CPU</text><line x1="0" x2="300" y1="82.0" y2="82.0" stroke="var(--rule)" stroke-width=".6"/><line x1="0" x2="300" y1="47.0" y2="47.0" stroke="var(--rule)" stroke-width=".6"/><line x1="0" x2="300" y1="12.0" y2="12.0" stroke="var(--rule)" stroke-width=".6"/><polygon points="0,82 0.0,76.1 3.2,78.3 6.3,76.7 9.5,70.5 12.6,69.2 15.8,71.2 18.9,68.2 22.1,76.0 25.3,76.8 28.4,70.5 31.6,72.3 34.7,77.5 37.9,68.6 41.1,67.9 44.2,64.7 47.4,67.7 50.5,67.5 53.7,76.4 56.8,77.5 60.0,72.2 63.2,69.1 66.3,70.4 69.5,65.7 72.6,66.4 75.8,66.5 78.9,71.7 82.1,76.6 85.3,77.4 88.4,78.2 91.6,69.6 94.7,71.8 97.9,66.2 101.1,70.2 104.2,71.9 107.4,71.7 110.5,73.0 113.7,44.9 116.8,47.1 120.0,48.3 123.2,43.0 126.3,39.9 129.5,29.5 132.6,29.7 135.8,31.9 138.9,36.7 142.1,35.9 145.3,50.0 148.4,54.7 151.6,48.9 154.7,46.6 157.9,30.4 161.1,22.8 164.2,25.6 167.4,24.1 170.5,39.4 173.7,41.5 176.8,51.6 180.0,44.5 183.2,41.6 186.3,37.3 189.5,12.0 192.6,12.0 195.8,12.0 198.9,12.0 202.1,16.7 205.3,15.5 208.4,20.8 211.6,45.9 214.7,38.1 217.9,29.7 221.1,22.0 224.2,21.3 227.4,34.6 230.5,34.5 233.7,40.2 236.8,49.5 240.0,44.3 243.2,39.3 246.3,32.6 249.5,31.5 252.6,28.7 255.8,23.5 258.9,33.6 262.1,37.8 265.3,48.4 268.4,54.0 271.6,50.6 274.7,39.1 277.9,31.3 281.1,26.1 284.2,23.5 287.4,28.5 290.5,37.9 293.7,71.0 296.8,74.3 300.0,69.5 300,82" fill="var(--orange)" opacity=".22"/><polyline points="0.0,76.1 3.2,78.3 6.3,76.7 9.5,70.5 12.6,69.2 15.8,71.2 18.9,68.2 22.1,76.0 25.3,76.8 28.4,70.5 31.6,72.3 34.7,77.5 37.9,68.6 41.1,67.9 44.2,64.7 47.4,67.7 50.5,67.5 53.7,76.4 56.8,77.5 60.0,72.2 63.2,69.1 66.3,70.4 69.5,65.7 72.6,66.4 75.8,66.5 78.9,71.7 82.1,76.6 85.3,77.4 88.4,78.2 91.6,69.6 94.7,71.8 97.9,66.2 101.1,70.2 104.2,71.9 107.4,71.7 110.5,73.0 113.7,44.9 116.8,47.1 120.0,48.3 123.2,43.0 126.3,39.9 129.5,29.5 132.6,29.7 135.8,31.9 138.9,36.7 142.1,35.9 145.3,50.0 148.4,54.7 151.6,48.9 154.7,46.6 157.9,30.4 161.1,22.8 164.2,25.6 167.4,24.1 170.5,39.4 173.7,41.5 176.8,51.6 180.0,44.5 183.2,41.6 186.3,37.3 189.5,12.0 192.6,12.0 195.8,12.0 198.9,12.0 202.1,16.7 205.3,15.5 208.4,20.8 211.6,45.9 214.7,38.1 217.9,29.7 221.1,22.0 224.2,21.3 227.4,34.6 230.5,34.5 233.7,40.2 236.8,49.5 240.0,44.3 243.2,39.3 246.3,32.6 249.5,31.5 252.6,28.7 255.8,23.5 258.9,33.6 262.1,37.8 265.3,48.4 268.4,54.0 271.6,50.6 274.7,39.1 277.9,31.3 281.1,26.1 284.2,23.5 287.4,28.5 290.5,37.9 293.7,71.0 296.8,74.3 300.0,69.5" fill="none" stroke="var(--orange)" stroke-width="1.4"/><polyline points="0.0,80.5 3.2,78.3 6.3,78.5 9.5,80.9 12.6,76.7 15.8,77.8 18.9,79.1 22.1,76.5 25.3,80.6 28.4,80.3 31.6,79.2 34.7,81.0 37.9,78.9 41.1,78.8 44.2,77.4 47.4,78.4 50.5,79.7 53.7,79.0 56.8,78.6 60.0,77.0 63.2,79.5 66.3,78.1 69.5,76.0 72.6,81.0 75.8,75.7 78.9,79.1 82.1,78.7 85.3,81.0 88.4,79.9 91.6,80.8 94.7,76.4 97.9,79.7 101.1,76.3 104.2,80.3 107.4,78.6 110.5,81.3 113.7,78.1 116.8,78.4 120.0,81.0 123.2,76.4 126.3,79.1 129.5,81.0 132.6,80.4 135.8,81.3 138.9,79.3 142.1,77.9 145.3,79.4 148.4,76.5 151.6,78.6 154.7,79.4 157.9,80.4 161.1,78.3 164.2,81.1 167.4,76.5 170.5,79.2 173.7,78.3 176.8,80.1 180.0,76.5 183.2,77.2 186.3,79.3 189.5,33.5 192.6,29.7 195.8,29.6 198.9,33.9 202.1,34.0 205.3,30.4 208.4,30.6 211.6,76.2 214.7,78.6 217.9,79.4 221.1,79.1 224.2,77.2 227.4,80.5 230.5,80.5 233.7,77.6 236.8,80.6 240.0,77.7 243.2,78.9 246.3,80.1 249.5,80.0 252.6,79.0 255.8,79.3 258.9,76.2 262.1,78.5 265.3,81.2 268.4,81.3 271.6,78.6 274.7,79.5 277.9,76.9 281.1,79.9 284.2,78.5 287.4,76.2 290.5,78.5 293.7,78.8 296.8,76.0 300.0,76.0" fill="none" stroke="var(--blue)" stroke-width="1.4"/><rect x="189.47368421052633" y="100" width="18.94736842105263" height="70" fill="var(--red)" opacity=".12"/><text x="0" y="96" fill="var(--ink)" font-weight="700" font-size="9">Memory used of 256G</text><rect x="211.2" y="89" width="7" height="7" fill="var(--red)"/><text x="221.2" y="96" fill="var(--ink-2)">elevated pressure</text><rect x="179.6" y="89" width="7" height="7" fill="var(--green)"/><text x="189.6" y="96" fill="var(--ink-2)">used</text><line x1="0" x2="300" y1="170.0" y2="170.0" stroke="var(--rule)" stroke-width=".6"/><line x1="0" x2="300" y1="135.0" y2="135.0" stroke="var(--rule)" stroke-width=".6"/><line x1="0" x2="300" y1="100.0" y2="100.0" stroke="var(--rule)" stroke-width=".6"/><polygon points="0,170 0.0,144.9 3.2,146.1 6.3,147.4 9.5,147.2 12.6,147.1 15.8,143.6 18.9,143.5 22.1,146.4 25.3,146.3 28.4,145.2 31.6,145.3 34.7,146.7 37.9,146.3 41.1,146.3 44.2,146.6 47.4,143.9 50.5,143.5 53.7,144.4 56.8,147.4 60.0,145.2 63.2,144.7 66.3,145.7 69.5,145.6 72.6,144.7 75.8,144.1 78.9,144.8 82.1,146.9 85.3,144.4 88.4,146.0 91.6,145.7 94.7,144.2 97.9,145.9 101.1,143.6 104.2,146.6 107.4,145.1 110.5,145.8 113.7,133.1 116.8,134.5 120.0,133.3 123.2,133.7 126.3,136.7 129.5,136.8 132.6,135.7 135.8,136.5 138.9,137.0 142.1,136.5 145.3,135.6 148.4,132.9 151.6,136.7 154.7,136.0 157.9,137.0 161.1,136.5 164.2,134.9 167.4,134.2 170.5,136.4 173.7,133.8 176.8,133.7 180.0,133.7 183.2,136.1 186.3,137.0 189.5,104.5 192.6,103.7 195.8,101.6 198.9,104.6 202.1,103.0 205.3,103.6 208.4,105.2 211.6,133.8 214.7,136.4 217.9,133.7 221.1,135.4 224.2,136.4 227.4,133.3 230.5,133.6 233.7,135.6 236.8,137.0 240.0,134.9 243.2,133.4 246.3,136.0 249.5,134.6 252.6,136.5 255.8,135.2 258.9,135.3 262.1,134.9 265.3,135.3 268.4,133.7 271.6,134.1 274.7,134.9 277.9,136.7 281.1,135.9 284.2,134.7 287.4,135.2 290.5,134.9 293.7,145.4 296.8,144.7 300.0,146.5 300,170" fill="var(--green)" opacity=".22"/><polyline points="0.0,144.9 3.2,146.1 6.3,147.4 9.5,147.2 12.6,147.1 15.8,143.6 18.9,143.5 22.1,146.4 25.3,146.3 28.4,145.2 31.6,145.3 34.7,146.7 37.9,146.3 41.1,146.3 44.2,146.6 47.4,143.9 50.5,143.5 53.7,144.4 56.8,147.4 60.0,145.2 63.2,144.7 66.3,145.7 69.5,145.6 72.6,144.7 75.8,144.1 78.9,144.8 82.1,146.9 85.3,144.4 88.4,146.0 91.6,145.7 94.7,144.2 97.9,145.9 101.1,143.6 104.2,146.6 107.4,145.1 110.5,145.8 113.7,133.1 116.8,134.5 120.0,133.3 123.2,133.7 126.3,136.7 129.5,136.8 132.6,135.7 135.8,136.5 138.9,137.0 142.1,136.5 145.3,135.6 148.4,132.9 151.6,136.7 154.7,136.0 157.9,137.0 161.1,136.5 164.2,134.9 167.4,134.2 170.5,136.4 173.7,133.8 176.8,133.7 180.0,133.7 183.2,136.1 186.3,137.0 189.5,104.5 192.6,103.7 195.8,101.6 198.9,104.6 202.1,103.0 205.3,103.6 208.4,105.2 211.6,133.8 214.7,136.4 217.9,133.7 221.1,135.4 224.2,136.4 227.4,133.3 230.5,133.6 233.7,135.6 236.8,137.0 240.0,134.9 243.2,133.4 246.3,136.0 249.5,134.6 252.6,136.5 255.8,135.2 258.9,135.3 262.1,134.9 265.3,135.3 268.4,133.7 271.6,134.1 274.7,134.9 277.9,136.7 281.1,135.9 284.2,134.7 287.4,135.2 290.5,134.9 293.7,145.4 296.8,144.7 300.0,146.5" fill="none" stroke="var(--green)" stroke-width="1.4"/><text x="0" y="184" fill="var(--ink)" font-weight="700" font-size="9">Queue jobs running</text><rect x="268.4" y="177" width="7" height="7" fill="var(--orange)"/><text x="278.4" y="184" fill="var(--ink-2)">perf</text><rect x="210.39999999999998" y="177" width="7" height="7" fill="var(--violet)"/><text x="220.39999999999998" y="184" fill="var(--ink-2)">background</text><rect x="174.39999999999998" y="177" width="7" height="7" fill="var(--blue)"/><text x="184.39999999999998" y="184" fill="var(--ink-2)">tests</text><rect x="6.2" y="230.0" width="2.5" height="6.0" fill="var(--blue)"/><rect x="9.4" y="230.0" width="2.5" height="6.0" fill="var(--blue)"/><rect x="12.5" y="230.0" width="2.5" height="6.0" fill="var(--blue)"/><rect x="15.6" y="224.0" width="2.5" height="12.0" fill="var(--blue)"/><rect x="18.8" y="224.0" width="2.5" height="12.0" fill="var(--blue)"/><rect x="21.9" y="224.0" width="2.5" height="12.0" fill="var(--blue)"/><rect x="25.0" y="224.0" width="2.5" height="12.0" fill="var(--blue)"/><rect x="28.1" y="224.0" width="2.5" height="12.0" fill="var(--blue)"/><rect x="31.2" y="224.0" width="2.5" height="12.0" fill="var(--blue)"/><rect x="34.4" y="224.0" width="2.5" height="12.0" fill="var(--blue)"/><rect x="37.5" y="230.0" width="2.5" height="6.0" fill="var(--blue)"/><rect x="40.6" y="230.0" width="2.5" height="6.0" fill="var(--blue)"/><rect x="56.2" y="230.0" width="2.5" height="6.0" fill="var(--blue)"/><rect x="59.4" y="230.0" width="2.5" height="6.0" fill="var(--blue)"/><rect x="62.5" y="230.0" width="2.5" height="6.0" fill="var(--blue)"/><rect x="65.6" y="224.0" width="2.5" height="12.0" fill="var(--blue)"/><rect x="68.8" y="224.0" width="2.5" height="12.0" fill="var(--blue)"/><rect x="71.9" y="224.0" width="2.5" height="12.0" fill="var(--blue)"/><rect x="75.0" y="224.0" width="2.5" height="12.0" fill="var(--blue)"/><rect x="78.1" y="224.0" width="2.5" height="12.0" fill="var(--blue)"/><rect x="81.2" y="224.0" width="2.5" height="12.0" fill="var(--blue)"/><rect x="84.4" y="230.0" width="2.5" height="6.0" fill="var(--blue)"/><rect x="87.5" y="230.0" width="2.5" height="6.0" fill="var(--blue)"/><rect x="90.6" y="230.0" width="2.5" height="6.0" fill="var(--blue)"/><rect x="106.2" y="230.0" width="2.5" height="6.0" fill="var(--blue)"/><rect x="109.4" y="230.0" width="2.5" height="6.0" fill="var(--blue)"/><rect x="112.5" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="112.5" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="115.6" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="115.6" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="118.8" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="118.8" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="121.9" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="121.9" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="125.0" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="125.0" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="128.1" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="128.1" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="131.2" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="131.2" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="134.4" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="134.4" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="137.5" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="137.5" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="140.6" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="140.6" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="143.8" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="143.8" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="146.9" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="146.9" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="150.0" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="150.0" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="153.1" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="153.1" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="156.2" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="156.2" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="159.4" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="159.4" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="162.5" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="162.5" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="165.6" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="165.6" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="168.8" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="168.8" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="171.9" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="171.9" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="175.0" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="175.0" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="178.1" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="178.1" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="181.2" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="181.2" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="184.4" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="184.4" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="187.5" y="230.0" width="2.5" height="6.0" fill="var(--orange)"/><rect x="190.6" y="230.0" width="2.5" height="6.0" fill="var(--orange)"/><rect x="193.8" y="230.0" width="2.5" height="6.0" fill="var(--orange)"/><rect x="196.9" y="230.0" width="2.5" height="6.0" fill="var(--orange)"/><rect x="200.0" y="230.0" width="2.5" height="6.0" fill="var(--orange)"/><rect x="203.1" y="230.0" width="2.5" height="6.0" fill="var(--orange)"/><rect x="206.2" y="230.0" width="2.5" height="6.0" fill="var(--orange)"/><rect x="209.4" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="209.4" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="212.5" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="212.5" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="215.6" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="215.6" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="218.8" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="218.8" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="221.9" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="221.9" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="225.0" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="225.0" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="228.1" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="228.1" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="231.2" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="231.2" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="234.4" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="234.4" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="237.5" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="237.5" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="240.6" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="240.6" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="243.8" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="243.8" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="246.9" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="246.9" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="250.0" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="250.0" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="253.1" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="253.1" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="256.2" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="256.2" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="259.4" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="259.4" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="262.5" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="262.5" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="265.6" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="265.6" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="268.8" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="268.8" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="271.9" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="271.9" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="275.0" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="275.0" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="278.1" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="278.1" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="281.2" y="212.0" width="2.5" height="24.0" fill="var(--blue)"/><rect x="281.2" y="200.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="284.4" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="284.4" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><rect x="287.5" y="218.0" width="2.5" height="18.0" fill="var(--blue)"/><rect x="287.5" y="206.0" width="2.5" height="12.0" fill="var(--violet)"/><line x1="0" x2="300" y1="236" y2="236" stroke="var(--ink-3)" stroke-width=".6"/><text x="0.0" y="246" text-anchor="start" fill="var(--ink-2)">00:00</text><text x="101.1" y="246" text-anchor="middle" fill="var(--ink-2)">08:00</text><text x="202.1" y="246" text-anchor="middle" fill="var(--ink-2)">16:00</text><text x="300.0" y="246" text-anchor="end" fill="var(--ink-2)">now</text></svg>
+  <div class="card" style="margin-top:.5rem">CPU averaged <b>41%</b>, over 85% busy for <b>2.3 h</b>.<br>
+  Memory peaked at <b>241G</b>; pressure was elevated for <b>1.5 h</b>.<br>
+  GPU averaged <b>9%</b>. The machine had headroom <b>71%</b> of the time.</div>
+</div>
+<figcaption>Figure 3. The Mac usage screen, last 24 hours (illustrative data). Here a perf run around 16:00 takes the GPU and most of memory while the queue holds everything else.</figcaption>
+</figure>
+<div>
+<p><b>What each chart shows.</b></p>
+<ul>
+<li><b>CPU and GPU %.</b> The average for each time slice. A faint band behind the CPU line shows that slice's peak, so a short spike stays visible in the 7- and 30-day views.</li>
+<li><b>Memory used</b>, out of 256G, the same "used" figure as the live bar. Red shading marks the times the kernel reported elevated or critical memory pressure. Pressure, not the used figure, is what warns of an out-of-memory reboot.</li>
+<li><b>Queue jobs running</b>, stacked by type. Read against the two charts above, it shows what the queue was doing while the machine was busy or idle.</li>
+<li><b>Summary</b> for the chosen range: average and busy time for CPU, peak memory and time under pressure, and how much of the time the machine had headroom as defined above.</li>
+</ul>
+<p>Each chart holds about 240–360 time slices, whatever the range: 15 seconds for the last hour, 5 minutes for a day, 30 minutes for a week, 2 hours for 30 days. Time the server was down shows as a gap, not as zero. Touching a chart shows that slice's time and values.</p>
+</div>
+</div>
+
+<h3>6. Decisions</h3>
+
+<table>
+<thead>
+<tr><th style="width:24%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr>
+</thead>
+<tbody>
+<tr><td>1. How often to sample, and how long to keep it</td><td><b>Every 5 seconds, kept 90 days</b> (~300 MB, ~0.6% of one core).</td><td>Five seconds catches short test bursts; 90 days spans before and after any limit change.</td></tr>
+<tr><td>2. What counts as headroom</td><td><b>CPU under 60% busy, at least 25% of memory available (64 GB), memory pressure normal.</b></td><td>These thresholds decide what the card says; 60% leaves room for a test build's burst.</td></tr>
+<tr><td>3. What the bottom section lists</td><td><b>Displaced, gave up, over memory, over process limit, past time limit — last 24 hours.</b> Not cancelled or failed.</td><td>These are the cases where an agent asked for work and the queue, not the job, ended it.</td></tr>
+<tr><td>4. Cancel from the phone</td><td><b>Yes.</b> Waiting jobs cancel at a tap; running jobs ask to confirm.</td><td>Clearing a stuck job from the phone is the main action this page enables.</td></tr>
+<tr><td>5. Where the page lives</td><td><b>Agents screen: a menu item, plus a top-bar icon with a waiting-job badge when the queue is busy.</b></td><td>The app has no bottom tab bar; the badge gives the glance you asked for.</td></tr>
+</tbody>
+</table>
+
+<div class="ruling"><b>Already decided (2026-09-28).</b> Record utilization every 10 seconds or faster, in its own database. Show live utilization on the Queue page, and chart how the Mac is used over time. Use one list (running, then queued, then stopped). Leave the background limit at 2 until two weeks of recorded data exist, then decide from the card's background line.</div>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p><b>Revision 2 (after your review).</b> Adds section 5, the Mac usage screen, as you asked in your review comment on section 3. It adds one server call and one app screen, and moves the decisions to section 6. Nothing else changed.</p>
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<div class="toc">
+<div><a href="#a">A. Tickets, order and seats</a></div>
+<div><a href="#b">B. Utilization recorder</a></div>
+<div><a href="#c">C. GET /client/queue</a></div>
+<div><a href="#d">D. GET /client/queue/stats</a></div>
+<div><a href="#d2">D2. GET /client/utilization/series</a></div>
+<div><a href="#e">E. /client/host-status reads the recorder</a></div>
+<div><a href="#f">F. Android Queue screen</a></div>
+<div><a href="#g">G. Requirement trace and tests</a></div>
+<div><a href="#h">H. Evidence queries</a></div>
+<div><a href="#z">Z. FAQ</a></div>
+</div>
+
+<h3 id="a">A. Tickets, order and seats</h3>
+<table>
+<thead><tr><th>Ticket</th><th>Scope</th><th>Files</th><th>Seat</th></tr></thead>
+<tbody>
+<tr><td>1. Recorder and stats</td><td>Appendix B, D and D2</td><td>new <code>crates/sm-server/src/utilization.rs</code>; <code>config.rs</code>; <code>main.rs</code> or <code>runtime.rs</code> (start the task); <code>http.rs</code> (one route); <code>queue.rs</code> (expose a read of pending/running jobs under the admission lock)</td><td>Claude Opus 1M, high</td></tr>
+<tr><td>2. Overview endpoint and host-status source</td><td>Appendix C and E</td><td><code>queue.rs</code> (consideration order); <code>http.rs</code>; <code>host_status.rs</code></td><td>Claude Opus 1M, high</td></tr>
+<tr><td>3. Android Queue screen</td><td>Appendix F, including F.5</td><td><code>android-app/…/ui/queue/*</code>; <code>ApiService.kt</code>; <code>ApiModels.kt</code>; <code>SessionManagerRepository.kt</code>; <code>AppNavigation.kt</code>; <code>WatchScreen.kt</code></td><td>Claude Opus 1M, high</td></tr>
+</tbody>
+</table>
+<p>Tickets 1 and 2 both edit <code>http.rs</code> and <code>queue.rs</code>, and ticket 2's host-status change reads ticket 1's recorder, so they run in order: 1, then 2. Ticket 3 touches only the app and can start alongside ticket 2, building against the JSON contracts in Appendices C, D and D2 with fixture files; it merges after ticket 2. Each ticket ships behind no flag: the recorder has its own <code>utilization.enabled</code> switch (Appendix B).</p>
+
+<h3 id="b">B. Utilization recorder</h3>
+<h4>B.1 Configuration</h4>
+<pre><code>utilization:
+  enabled: true                        # default true
+  db_path: ~/.local/share/claude-sessions/utilization.db   # "~" expanded like queue_runner.state_dir
+  sample_interval_seconds: 5           # integer, 1..=60; values outside are a config error at startup
+  retention_days: 90                   # integer, 1..=3650</code></pre>
+<p>The recorder runs only when <code>utilization.enabled</code> is true <b>and</b> <code>rust_core.runtime_enabled</code> is true. Scratch servers run with the runtime disabled so they stay off live queue jobs; they must not double-record either. On any OS other than macOS the recorder does not start and logs one info line saying so.</p>
+
+<h4>B.2 Schema (<code>utilization.db</code>, WAL mode, <code>synchronous=NORMAL</code>)</h4>
+<pre><code>CREATE TABLE IF NOT EXISTS host_samples (
+  sampled_at_ms        INTEGER PRIMARY KEY,   -- unix epoch milliseconds, UTC
+  interval_ms          INTEGER NOT NULL,      -- configured interval when written
+  cpu_busy_pct         REAL,                  -- 0..100; NULL on first sample after start or on read failure
+  gpu_busy_pct         REAL,                  -- 0..100 or NULL
+  mem_total_bytes      INTEGER,
+  mem_used_bytes       INTEGER,               -- total − (free + speculative); matches top's "used"
+  mem_available_bytes  INTEGER,               -- total × kern.memorystatus_level / 100
+  mem_free_bytes       INTEGER,
+  mem_speculative_bytes INTEGER,
+  mem_active_bytes     INTEGER,
+  mem_inactive_bytes   INTEGER,
+  mem_wired_bytes      INTEGER,
+  mem_compressed_bytes INTEGER,               -- pages occupied by the compressor × page size
+  pressure_level       INTEGER,               -- kern.memorystatus_vm_pressure_level: 1 normal, 2 elevated, 4 critical
+  load_1m              REAL,
+  running_tests INTEGER NOT NULL, running_perf INTEGER NOT NULL,
+  running_background INTEGER NOT NULL, running_service INTEGER NOT NULL,
+  pending_tests INTEGER NOT NULL, pending_perf INTEGER NOT NULL,
+  pending_background INTEGER NOT NULL, pending_service INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS job_samples (
+  sampled_at_ms     INTEGER NOT NULL,         -- equals the host_samples row written in the same transaction
+  job_id            TEXT NOT NULL,
+  job_type          TEXT NOT NULL,            -- tests | perf | background | service
+  state             TEXT NOT NULL CHECK (state IN ('pending','running')),
+  holding_reason    TEXT,                     -- pending only; the queue's holding_reason at that instant
+  rss_bytes         INTEGER,                  -- running only; sum over the job's process group
+  cpu_seconds_total REAL,                     -- running only; sum of cumulative CPU time of live processes in the group
+  process_count     INTEGER,                  -- running only
+  PRIMARY KEY (sampled_at_ms, job_id)
+);
+CREATE INDEX IF NOT EXISTS job_samples_by_job ON job_samples (job_id, sampled_at_ms);</code></pre>
+<p>Each sample is one transaction: one <code>host_samples</code> row and zero or more <code>job_samples</code> rows. A job in any state other than <code>pending</code> or <code>running</code> is not written.</p>
+
+<h4>B.3 How each field is measured</h4>
+<ul>
+<li><b>CPU busy.</b> Read the host CPU tick counters (<code>host_statistics(HOST_CPU_LOAD_INFO)</code>) each sample. Busy % = (Δuser + Δsystem + Δnice) ÷ (Δuser + Δsystem + Δnice + Δidle) × 100 between this sample and the previous one. The first sample after start, or after a failed read, writes NULL.</li>
+<li><b>Memory.</b> <code>host_statistics64(HOST_VM_INFO64)</code> page counts × page size; <code>hw.memsize</code> for total; <code>kern.memorystatus_level</code> (the same percentage <code>memory_pressure -Q</code> prints, which queue admission reads today<sup>1</sup>) for available; <code>kern.memorystatus_vm_pressure_level</code> for pressure. <code>vm.loadavg</code> for load.</li>
+<li><b>GPU.</b> The same <code>ioreg -r -c AGXAccelerator -d 1</code> read and "Device Utilization %" parse that <code>host_status.rs</code> uses<sup>2</sup>; move the parser so both call one function.</li>
+<li><b>Jobs.</b> Read every <code>pending</code> and <code>running</code> row of <code>queue_jobs</code> while holding the queue's admission lock<sup>3</sup>, so a sample never sees an admission pass half-way (the pass clears every hold reason, then re-marks them). Release the lock before running any process listing. Then run <code>ps -axo pgid=,rss=,time=</code> once and sum RSS, CPU time and row count for each running job's <code>process_group_id</code>. A running job with no <code>process_group_id</code>, or none of whose processes appear, writes NULLs for those three fields.</li>
+<li><b>No <code>top</code>.</b> The recorder must not run <code>top</code>; it costs 1.3 s of CPU per call on this machine.</li>
+</ul>
+<p><b>Scheduling.</b> A dedicated Tokio task with a <code>tokio::time::interval</code> set to <code>MissedTickBehavior::Delay</code>; each tick does the measurement on <code>spawn_blocking</code>. A tick that fails a measurement writes NULL for that field and carries on. A failed database write logs a warning at most once a minute and carries on. The recorder never blocks queue admission beyond the job-list read.</p>
+<p><b>Pruning.</b> Once an hour, delete rows from both tables with <code>sampled_at_ms</code> older than <code>now − retention_days</code>.</p>
+<p><b>Cost check.</b> Before merging, run the recorder on the studio for 10 minutes and report the server's added CPU time per sample in the PR. The bar is under 50 ms per sample.</p>
+<p><b>The old table.</b> <code>queue_resource_samples</code> in <code>queue_runner.db</code> holds June data from the Python server and has no writer<sup>4</sup>. Leave it untouched.</p>
+
+<h3 id="c">C. <code>GET /client/queue</code></h3>
+<p><b>Auth.</b> The same checks as <code>client_host_status</code><sup>5</sup>: mobile Cloudflare Access, public-edge assertion, session read allowed, actor match. Read-only.</p>
+<p><b>Query.</b> <code>ended_hours</code>, integer 1..=168, default 24. Out of range → 400.</p>
+<pre><code>{
+  "generated_at": "2026-09-28T23:50:02Z",
+  "host": { …same object /client/host-status returns (Appendix E)… },
+  "slots": {
+    "running": 3, "max": 8,
+    "by_type": {
+      "tests":      {"running": 2, "max": 6},
+      "perf":       {"running": 0, "max": 1},
+      "background": {"running": 1, "max": 2},
+      "service":    {"running": 0, "max": 2}
+    }
+  },
+  "running": [Job…],   // state == running, sorted by started_at ascending, then id
+  "queued":  [Job…],   // state == pending, in consideration order, each with "position" 1..n
+  "ended":   [Job…]    // see below; sorted by finished_at descending; at most 50
+}</code></pre>
+<p><code>slots.running</code> counts every running job, services included, because the overall limit does<sup>6</sup>. Maxima come from the live admission policy (<code>queue_admission_policy(&amp;state.config)</code>).</p>
+<p><b>Job object.</b> Exactly the per-job object <code>GET /queue-jobs</code> returns today, built by <code>queue_job_response_with_names</code><sup>7</sup> (so it carries <code>notify_name</code>, <code>holding</code> with <code>summary</code>/<code>detail</code>, <code>holding_reason</code>, times and limits), plus these fields:</p>
+<table>
+<thead><tr><th>Field</th><th>Present on</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td><code>position</code></td><td>queued</td><td>1-based index in consideration order</td></tr>
+<tr><td><code>wait_deadline_at</code></td><td>queued</td><td><code>queued_at + max_wait_seconds</code>, RFC 3339 UTC</td></tr>
+<tr><td><code>ended_reason</code></td><td>ended</td><td><code>displaced</code> | <code>gave_up</code> | <code>over_memory</code> | <code>over_process_limit</code> | <code>timed_out</code></td></tr>
+<tr><td><code>ended_summary</code></td><td>ended</td><td>One line, see table below</td></tr>
+</tbody>
+</table>
+<p><b>Consideration order.</b> Add <code>pub fn pending_queue_job_consideration_order(jobs) -&gt; Vec&lt;String&gt;</code> in <code>queue.rs</code> beside <code>next_admissible_queue_job_id_conn</code><sup>8</sup>. Sort pending jobs by (index of type in <code>QUEUE_JOB_TYPE_ORDER</code> = perf, tests, background, service; then <code>queued_at</code>; then <code>id</code>). This is the order in which admission examines them.</p>
+<p><b>Ended membership and text.</b></p>
+<table>
+<thead><tr><th>Job state</th><th><code>ended_reason</code></th><th><code>ended_summary</code></th></tr></thead>
+<tbody>
+<tr><td><code>displaced</code></td><td>displaced</td><td>Stopped to make room for a perf run; not restarted</td></tr>
+<tr><td><code>wait_expired</code></td><td>gave_up</td><td>Never started; gave up after {finished_at − queued_at, as "5m"}</td></tr>
+<tr><td><code>memory_exceeded</code></td><td>over_memory</td><td>The existing <code>memory_guard_detail_text</code><sup>9</sup> of <code>termination_detail</code> when present, else "Stopped: over its memory limit"</td></tr>
+<tr><td><code>process_limit_exceeded</code></td><td>over_process_limit</td><td>Stopped: over its process limit ({peak_process_count} of {process_limit}); omit the parenthesis when either is null</td></tr>
+<tr><td><code>timed_out</code></td><td>timed_out</td><td>Stopped: ran past its {timeout_seconds, as "15m"} limit</td></tr>
+</tbody>
+</table>
+<p>Every other terminal state (<code>succeeded</code>, <code>failed</code>, <code>cancelled</code>) is excluded. A job is in <code>ended</code> when its state is in the table and <code>finished_at</code> is within <code>ended_hours</code> of now. Durations format as whole minutes (<code>"5m"</code>), or hours and minutes past 60 (<code>"1h 20m"</code>), or seconds under a minute (<code>"40s"</code>).</p>
+<p><b>Example.</b> Two tests running, one perf and one test waiting: <code>queued</code> is [perf <code>bench-ledger</code> position 1, tests <code>cargo test</code> position 2] even though the test was submitted first, because perf is examined first.</p>
+
+<h3 id="d">D. <code>GET /client/queue/stats</code></h3>
+<p><b>Auth.</b> As Appendix C. <b>Query.</b> <code>hours</code> ∈ {24, 168, 720}, default 168; anything else → 400. When the recorder is off or has no rows in the window, return 200 with <code>"available": false</code> and nothing else.</p>
+<pre><code>{
+  "available": true,
+  "hours": 168,
+  "window_seconds": 604800,
+  "covered_seconds": 598210,          // Σ weight over host_samples in the window
+  "thresholds": {"cpu_busy_below_pct": 60, "available_memory_at_least_fraction": 0.25, "pressure": "normal"},
+  "waiting": [
+    {"group": "limits",     "job_seconds": 40320, "headroom_job_seconds": 35480, "unknown_job_seconds": 120},
+    {"group": "perf_rules", "job_seconds": 73440, "headroom_job_seconds": 51000, "unknown_job_seconds": 0},
+    {"group": "memory",     "job_seconds": 600,   "headroom_job_seconds": 0,     "unknown_job_seconds": 0},
+    {"group": "other",      "job_seconds": 45,    "headroom_job_seconds": 45,    "unknown_job_seconds": 0}
+  ],
+  "by_type": [
+    {"type": "background", "jobs": 41, "peak_rss_p50_bytes": 6.1e9, "peak_rss_p95_bytes": 1.8e10,
+     "peak_rss_max_bytes": 2.4e10, "cpu_cores_p95": 5.5}
+  ]
+}</code></pre>
+<p>All four groups are always present, in that order. <code>by_type</code> lists only types with at least one running sample in the window, in <code>QUEUE_JOB_TYPE_ORDER</code>.</p>
+<p><b>Algorithm.</b></p>
+<ol>
+<li><b>Weight.</b> Each host sample stands for <code>min(interval_ms, gap to the next host sample)</code> milliseconds; the last sample in the window uses <code>interval_ms</code>. A server outage therefore adds no phantom time.</li>
+<li><b>Groups.</b> <code>concurrency_cap</code> → limits. <code>perf_running</code>, <code>awaiting_tests</code>, <code>perf_cooldown</code>, <code>displacing</code> → perf_rules. <code>memory_pressure</code>, <code>resource_budget_missing</code> → memory. Anything else, including NULL → other.</li>
+<li><b>Headroom.</b> A host sample has headroom when <code>cpu_busy_pct &lt; 60</code> and <code>mem_available_bytes ≥ 0.25 × mem_total_bytes</code> and <code>pressure_level = 1</code>. It is <i>unknown</i> when any of those three is NULL.</li>
+<li>For every pending <code>job_samples</code> row, add the host sample's weight to its group's <code>job_seconds</code>, and to <code>headroom_job_seconds</code> or <code>unknown_job_seconds</code> as the host sample dictates.</li>
+<li><b>Peaks.</b> For each job with running rows, peak RSS = max <code>rss_bytes</code>. CPU cores for consecutive running rows of one job = Δ<code>cpu_seconds_total</code> ÷ Δ seconds; drop negative deltas (a process exited and took its CPU time with it). Percentiles are nearest-rank over jobs (RSS) or over intervals (CPU).</li>
+</ol>
+<p><b>Worked example</b> (the memo's): 12 host samples at 5 s, all weight 5 s; two background jobs pending with <code>concurrency_cap</code> in all 12; 10 samples at 30% CPU, 200 GB of 256 GB available, pressure 1; 2 samples at 90% CPU. Result for <code>limits</code>: <code>job_seconds</code> 120, <code>headroom_job_seconds</code> 100, <code>unknown_job_seconds</code> 0 → the card shows "2 min … 83%".</p>
+<p><b>Card text</b> (app formats; server returns numbers only): "Limits held jobs {limits job hours}. The machine had headroom for {headroom ÷ (job − unknown)}% of it." — "Perf rules held jobs {perf_rules job hours} (by design)." — "Background jobs peak at {background p95 GB} each (95th percentile)." Omit a line whose group has zero seconds, or whose type is absent. Hours show one decimal; under an hour show minutes.</p>
+
+<h3 id="d2">D2. <code>GET /client/utilization/series</code></h3>
+<p><b>Auth.</b> As Appendix C. <b>Query.</b> <code>hours</code> ∈ {1, 24, 168, 720}, default 24; anything else → 400. The bucket (time slice) width is fixed by the range:</p>
+<table>
+<thead><tr><th><code>hours</code></th><th><code>bucket_seconds</code></th><th>Buckets</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>15</td><td>240</td></tr>
+<tr><td>24</td><td>300</td><td>288</td></tr>
+<tr><td>168</td><td>1800</td><td>336</td></tr>
+<tr><td>720</td><td>7200</td><td>360</td></tr>
+</tbody>
+</table>
+<p>The window ends at the current time floored to a bucket boundary plus one bucket (so the newest, partial bucket is included). It starts <code>buckets × bucket_seconds</code> earlier. Bucket <i>k</i> covers <code>[start + k·bucket, start + (k+1)·bucket)</code> in <code>sampled_at_ms</code>. When the recorder is off, or no host sample falls in the window, return 200 with <code>"available": false</code> only.</p>
+<pre><code>{
+  "available": true,
+  "hours": 24, "bucket_seconds": 300,
+  "start": "2026-09-28T00:05:00Z", "end": "2026-09-29T00:05:00Z",
+  "memory_total_bytes": 274877906944,           // newest non-null mem_total_bytes in the window
+  "buckets": [                                  // always exactly the table's count, oldest first
+    {"start": "2026-09-28T00:05:00Z", "samples": 60,
+     "cpu_avg": 23.4, "cpu_max": 71.0, "gpu_avg": 3.1, "gpu_max": 8.0,
+     "mem_used_avg": 91234567890, "mem_used_max": 95000000000,
+     "mem_available_min": 180000000000, "pressure_max": 1,
+     "running": {"tests": 1.4, "perf": 0.0, "background": 1.0, "service": 0.0},   // average over samples
+     "pending_max": 2},
+    {"start": "2026-09-28T00:10:00Z", "samples": 0}  // no samples: every other field omitted
+  ],
+  "summary": {
+    "covered_seconds": 85210,
+    "cpu_avg": 41.2, "cpu_busy_seconds": 8280,    // Σ weight where cpu_busy_pct &gt; 85
+    "gpu_avg": 9.0,
+    "mem_used_max": 258768000000,
+    "pressure_elevated_seconds": 5400,            // Σ weight where pressure_level ≥ 2
+    "headroom_seconds": 60500, "unknown_seconds": 300
+  }
+}</code></pre>
+<p><b>Rules.</b> Averages are the plain mean over the bucket's samples that have a non-null value for that field. If none do, omit that field in that bucket. Maxima and minima likewise. <code>pressure_max</code> is the largest <code>pressure_level</code> (1, 2, 4). Summary weights use Appendix D's weight rule and headroom test. Summary averages are weight-weighted over non-null samples. Computation is one SQL pass over <code>host_samples</code> grouped by <code>(sampled_at_ms − start_ms) / bucket_ms</code>, then filling the empty buckets in Rust. Performance bar: under 300 ms for the 30-day range on 90 days of data (about 1.5 million rows), measured and reported in the PR.</p>
+<p><b>Example.</b> <code>hours=1</code> at 12:00:07 UTC → <code>end</code> 12:00:15, <code>start</code> 11:00:15, 240 buckets of 15 s. At a 5-second interval, each full bucket has 3 samples. A server restart from 11:30:02 to 11:30:40 leaves the 11:30:15 bucket with <code>samples: 0</code>.</p>
+
+<h3 id="e">E. <code>/client/host-status</code> reads the recorder</h3>
+<p>When the recorder's newest host sample is younger than 3 × interval, return it in today's shape<sup>10</sup>, with these values and two added fields:</p>
+<table>
+<thead><tr><th>Field</th><th>From the sample</th></tr></thead>
+<tbody>
+<tr><td><code>available</code></td><td>true</td></tr>
+<tr><td><code>host</code></td><td>hostname, read once at recorder start</td></tr>
+<tr><td><code>sampled_at</code></td><td><code>sampled_at_ms</code> as RFC 3339</td></tr>
+<tr><td><code>memory_total_bytes</code>, <code>memory_used_bytes</code></td><td><code>mem_total_bytes</code>, <code>mem_used_bytes</code></td></tr>
+<tr><td><code>memory_pressure</code></td><td>"Normal" / "Elevated" / "Critical" from <code>pressure_level</code></td></tr>
+<tr><td><code>cpu_percent</code>, <code>gpu_percent</code></td><td><code>cpu_busy_pct</code>, <code>gpu_busy_pct</code></td></tr>
+<tr><td><code>memory_available_bytes</code> (new)</td><td><code>mem_available_bytes</code></td></tr>
+<tr><td><code>source</code> (new)</td><td><code>"recorder"</code></td></tr>
+</tbody>
+</table>
+<p>Otherwise fall back to today's on-demand <code>top</code> path, adding <code>"source": "live"</code> and <code>"memory_available_bytes": null</code>. Keep the recorder's latest sample in memory (an <code>Arc&lt;RwLock&lt;Option&lt;HostSample&gt;&gt;&gt;</code> or equivalent) so this endpoint does not read the database.</p>
+
+<h3 id="f">F. Android Queue screen</h3>
+<h4>F.1 Wiring</h4>
+<ul>
+<li>Route <code>Routes.QUEUE = "queue"</code> in <code>AppNavigation.kt</code><sup>11</sup>, composable <code>QueueScreen</code> in a new package <code>li.rajeshgo.sm.ui.queue</code> with <code>QueueViewModel</code> and pure formatting functions in <code>QueueModels.kt</code>.</li>
+<li><code>ApiService</code>: <code>@GET("client/queue")</code>, <code>@GET("client/queue/stats")</code> with <code>hours</code>, <code>@DELETE("queue-jobs/{job_id}")</code> (cancel; the same auth the app already uses for <code>sessions/{id}/retire</code><sup>12</sup>), <code>@GET("queue-jobs/{job_id}/log")</code> with <code>lines=40</code> (response <code>{job_id, lines, log_path, text}</code>).</li>
+<li>Models: extend the existing <code>SessionJob</code><sup>13</sup> with <code>position</code>, <code>waitDeadlineAt</code>, <code>endedReason</code>, <code>endedSummary</code>, <code>notifyName</code> (all nullable, default null); add <code>QueueOverview</code>, <code>QueueSlots</code>, <code>QueueStats</code>; extend <code>HostStatus</code> with nullable <code>memoryAvailableBytes</code> and <code>source</code>.</li>
+<li>Entry points on the agents screen (<code>WatchScreen.kt</code>): a "Queue" item in the overflow menu next to Analytics<sup>14</sup>, always present. A top-bar icon button that opens Queue, shown only when the already-fetched jobs include any <code>pending</code> or <code>running</code> job, with a badge counting <code>pending</code> jobs (no badge at zero).</li>
+</ul>
+<h4>F.2 Refresh</h4>
+<ul>
+<li>While the screen is at least <code>RESUMED</code> (<code>repeatOnLifecycle</code>), fetch <code>/client/queue</code> immediately and then every 5 s. Stop when the screen is paused or left. The rest of the app keeps its manual-refresh model.</li>
+<li>Fetch <code>/client/queue/stats</code> on open, when the 24h / 7d / 30d chip changes (default 7d), and on the menu's Refresh. Not on the 5-second loop.</li>
+<li>Header shows "updated Ns ago" from the last successful fetch. On a failed fetch keep the last data and show "Couldn't refresh — retrying" under the header.</li>
+</ul>
+<h4>F.3 Layout (Figure 1)</h4>
+<ul>
+<li><b>Bar.</b> Three rows MEM / CPU / GPU. MEM value "{used}/{total}G" in GiB (2³⁰ bytes), whole numbers, as the Settings sheet and the terminal status bar show it, CPU and GPU "{n}%". Fill colour by fraction: under 60% green, 60–85% orange, over 85% red; GPU uses blue below 60%. When <code>memory_pressure</code> is not Normal, append it in red after MEM. When <code>host.available</code> is false, show "Utilization unavailable" in place of the bar.</li>
+<li><b>Slots line.</b> "{running} of {max} slots in use · tests a/b · perf a/b · background a/b · service a/b".</li>
+<li><b>Running rows.</b> Line 1: label, then " · " and <code>notify_name</code> (else the first 8 characters of <code>notify_session_id</code>, else "no agent"). Line 2: "{type} · {elapsed} of {timeout}". A thin progress bar of elapsed ÷ timeout, capped at 100%.</li>
+<li><b>Queued rows.</b> Line 1: position numeral, label, agent. Line 2: "{type} · waiting {now − queued_at} · gives up in {wait_deadline_at − now}", or "· giving up" once the deadline has passed. Line 3: <code>holding.summary</code>, else the existing <code>jobSummary</code> fallbacks<sup>15</sup>.</li>
+<li><b>Stopped rows.</b> Icon ✕ for displaced, over_memory, over_process_limit, timed_out; ⌛ for gave_up. Line 2: "{type} · {now − finished_at} ago". Line 3: <code>ended_summary</code>.</li>
+<li><b>Empty sections</b> are hidden. When running and queued are both empty: "Nothing running or waiting."</li>
+<li><b>Held back? card</b> as Appendix D's card text. When stats are unavailable: "No utilization recorded yet."</li>
+</ul>
+<h4>F.4 Row sheet</h4>
+<p>Tapping any row opens a <code>ModalBottomSheet</code> (<code>skipPartiallyExpanded = true</code>, as <code>HostStatusSheet</code> does<sup>16</sup>) showing: label, type, state; agent; command (<code>argv</code> joined by spaces, else "script: {script_path}"); <code>cwd</code>; queued / started / finished times; time limit and any CPU, GPU and memory budgets; <code>holding.detail</code> for queued jobs; <code>ended_summary</code> for stopped jobs; the last 40 log lines in monospace (load on open; "No log yet" on 404). Buttons: <b>Cancel</b> (queued and running only; running asks "Stop {label}? The agent will be told it was cancelled." before calling), <b>Follow</b> (existing <code>queue-jobs/{id}/follow</code>), <b>Open agent</b> (when the agent is a known session). After Cancel succeeds, close the sheet and refresh at once.</p>
+
+<h4>F.5 Mac usage screen</h4>
+<ul>
+<li>Route <code>Routes.USAGE = "usage"</code>, composable <code>UsageScreen</code> in <code>li.rajeshgo.sm.ui.queue</code> (shares the package; it reads the same recorder). Entry points: tapping the live bar on the Queue page; a "Mac usage" item in the agents-screen overflow menu next to Queue.</li>
+<li>Range chips 1h · 24h · 7d · 30d, default 24h, remembered for the life of the process. Fetch <code>/client/utilization/series</code> on open and on chip change. While the screen is resumed, refetch every 15 s for 1h and every 60 s for 24h; do not auto-refetch 7d or 30d.</li>
+<li><b>Three stacked charts</b>, drawn with Compose <code>Canvas</code> as <code>AnalyticsScreen</code>'s <code>MultiSeriesChart</code> does<sup>18</sup>, sharing one x axis. Each chart is 120 dp tall; x labels only under the last.
+  <ol>
+  <li><b>CPU and GPU %</b>, y 0–100 fixed. CPU line = <code>cpu_avg</code> (orange); behind it a band from <code>cpu_avg</code> to <code>cpu_max</code> at 15% alpha. GPU line = <code>gpu_avg</code> (blue).</li>
+  <li><b>Memory used</b>, y 0 to <code>memory_total_bytes</code>, label "Memory used of {total}G". Area = <code>mem_used_avg</code> (green). Every bucket with <code>pressure_max ≥ 2</code> gets a full-height red background at 12% alpha, or 24% when it is 4.</li>
+  <li><b>Queue jobs running</b>, stacked bars per bucket of <code>running</code> by type: tests blue, perf orange, background violet, service grey. Y max = max(<code>slots.max</code> from the last overview, the highest stacked value).</li>
+  </ol></li>
+<li>A bucket with <code>samples: 0</code>, or missing the plotted field, breaks the line (no interpolation across it) and draws no bar.</li>
+<li>X labels: 1h every 15 min ("HH:mm"); 24h every 6 h ("HH:mm"); 7d every day ("EEE"); 30d every 7 days ("MMM d"); the rightmost label reads "now". Local time zone.</li>
+<li><b>Touch.</b> Press or drag on any chart shows a vertical rule across all three and a tooltip for that bucket: time range, CPU avg/max, GPU avg, memory used avg and max, pressure word, jobs running by type, max waiting. Release hides it.</li>
+<li><b>Summary card</b> under the charts: "CPU averaged {cpu_avg}%, over 85% busy for {cpu_busy}." / "Memory peaked at {mem_used_max}G; pressure was elevated for {pressure_elevated}." (omit the clause when 0) / "GPU averaged {gpu_avg}%. The machine had headroom {headroom ÷ (covered − unknown)}% of the time." Durations as Appendix C.</li>
+<li><code>available: false</code> → "No utilization recorded yet." in place of the charts.</li>
+</ul>
+
+<h3 id="g">G. Requirement trace and tests</h3>
+<table>
+<thead><tr><th>Memo requirement</th><th>Appendix</th><th>Test (new unless noted)</th></tr></thead>
+<tbody>
+<tr><td>Sample every 5 s into its own database</td><td>B.1, B.2, B.3</td><td><code>utilization.rs</code>: a sample transaction writes one host row and one row per pending/running job; states other than pending/running are skipped</td></tr>
+<tr><td>Only the live queue server records</td><td>B.1</td><td>recorder does not start when <code>runtime_enabled</code> is false or <code>enabled</code> is false</td></tr>
+<tr><td>CPU averaged over the interval</td><td>B.3</td><td>pure fn: busy % from two tick snapshots; NULL for the first</td></tr>
+<tr><td>Three memory measures</td><td>B.3</td><td>pure fn: used = total − free − speculative; available from level; the section 3 readings (87 GiB used, level 96) as fixture</td></tr>
+<tr><td>Hold reason captured consistently</td><td>B.3</td><td>job list read happens under the admission lock (test with a held lock: read waits)</td></tr>
+<tr><td>Per-job memory and CPU</td><td>B.3</td><td>aggregate <code>ps</code> text by pgid (extend the existing <code>parse_process_group_rss_bytes</code> test<sup>17</sup>)</td></tr>
+<tr><td>90-day retention</td><td>B.3</td><td>prune removes rows older than the cutoff in both tables, keeps newer</td></tr>
+<tr><td>Cost under 50 ms per sample</td><td>B.3</td><td>manual measurement reported in ticket 1's PR</td></tr>
+<tr><td>One list: running, queued in order, stopped</td><td>C</td><td>fixture with every state: membership, sort order, <code>position</code>, <code>wait_deadline_at</code>, 24 h window, 50 cap, cancelled/failed/succeeded excluded</td></tr>
+<tr><td>Queued order matches the server</td><td>C</td><td>consideration-order unit test; and with all slots free and no perf rules, admission starts jobs in that order</td></tr>
+<tr><td>Stopped-row wording</td><td>C</td><td>one assertion per <code>ended_reason</code>, including null-field fallbacks</td></tr>
+<tr><td>Held back? card</td><td>D</td><td>the worked example yields 120 / 100 / 0; outage gap weighting; NULL CPU → unknown; percentile fixture</td></tr>
+<tr><td>Live bar without <code>top</code></td><td>E</td><td>fresh sample → <code>source: recorder</code>; stale → <code>source: live</code></td></tr>
+<tr><td>Queue page, refresh, cancel</td><td>F</td><td><code>QueueModelsTest</code>: every formatter (durations, "giving up", agent fallback, colour bands); <code>QueueViewModelTest</code>: polling stops on pause, stats not on the loop, cancel refreshes; manual check on device, screenshot in the PR</td></tr>
+<tr><td>Entry points</td><td>F.1</td><td>menu item present; icon and badge visible only with pending/running jobs (Compose test)</td></tr>
+<tr><td>Mac usage over time (server)</td><td>D2</td><td>bucket count per range; window alignment example; empty bucket omits fields; per-field null handling; summary weights and headroom; 30-day timing reported in PR</td></tr>
+<tr><td>Mac usage screen</td><td>F.5</td><td><code>UsageModelsTest</code>: axis labels per range, gap breaking, pressure shading levels, summary text with zero clauses omitted; manual check on device, screenshot in the PR</td></tr>
+</tbody>
+</table>
+<p>All server tests run under <code>scripts/test-rust-isolated.sh</code>; clippy and fmt per the repo contract.</p>
+
+<h3 id="h">H. Evidence queries</h3>
+<p>Run on a <code>.backup</code> copy of <code>~/.local/share/claude-sessions/queue-runner/queue_runner.db</code> (the live file is often locked). Window: <code>queued_at &gt; datetime('now','-30 days')</code> on 2026-09-28.</p>
+<pre><code>-- Cause of each wait over 30 s, inferred at submit time
+with j as (select id,type,julianday(queued_at) q, julianday(started_at) s,
+                  julianday(coalesce(finished_at,'now')) f
+           from queue_jobs where queued_at &gt; datetime('now','-30 days')),
+w as (select a.*, (a.s-a.q)*86400 wait_s,
+  (select count(*) from j b where b.type='perf' and b.id&lt;&gt;a.id and
+     ((b.s is not null and b.s&lt;=a.q and b.f&gt;a.q) or (b.q&lt;=a.q and (b.s is null or b.s&gt;a.q) and b.f&gt;a.q))) perf_any,
+  (select count(*) from j b where b.s is not null and b.s&lt;=a.q and b.f&gt;a.q) running_all,
+  (select count(*) from j b where b.type=a.type and b.s is not null and b.s&lt;=a.q and b.f&gt;a.q) running_same
+  from j a where a.s is not null and (a.s-a.q)*86400&gt;30)
+select case when type='perf' then 'perf job waiting (perf rules)'
+            when perf_any&gt;0 then 'behind a perf run'
+            when running_all&gt;=8 then 'overall limit of 8'
+            when (type='tests' and running_same&gt;=6) or (type in ('background','service') and running_same&gt;=2) then type||' limit'
+            else 'unexplained' end cause,
+       count(*), round(sum(wait_s)/3600.0,1) hours
+from w group by 1 order by 3 desc;
+
+-- Perf budgets
+select cpu_percent, gpu_percent, round(memory_bytes/1e9) gb, count(*)
+from queue_jobs where type='perf' and started_at is not null
+  and queued_at &gt; datetime('now','-30 days') group by 1,2,3 order by 4 desc;
+
+-- Terminal states
+select state, count(*) from queue_jobs where queued_at &gt; datetime('now','-30 days') group by 1;</code></pre>
+<p>Cost measurements (this machine, 2026-09-28): <code>/usr/bin/time -p top -l 2 -s 1 -n 0</code> → 1.32 s system CPU, 2.6 s wall; <code>ioreg -r -c AGXAccelerator -d 1</code> → 0.02 s; <code>ps -axo pgid=,rss=,time=</code> → 0.01 s; <code>memory_pressure -Q</code> → under 0.01 s.</p>
+
+<h3 id="z">Z. FAQ</h3>
+<p><b>Why 5 seconds and not 1?</b> Test builds last minutes; 5 s resolves them. At 1 s the GPU read alone would cost 2% of a core and storage would be 1.5 GB for 90 days, with no decision that needs the extra detail.</p>
+<p><b>Why a separate database?</b> The queue database is written under the admission lock. A write every 5 seconds there would compete with admission for no benefit; the recorder only ever reads the queue.</p>
+<p><b>Why record pending jobs every sample, when the queue already stores a hold reason?</b> The queue overwrites and then erases the reason. Section 2's analysis had to guess causes from what was running at submit time. Sampled reasons make the card exact.</p>
+<p><b>Why is the queued order "consideration order" rather than a predicted start time?</b> Start times depend on when running jobs finish, which the server cannot know. The order admission examines jobs in is exact, and each row's reason tells you when it will not be the next to go.</p>
+<p><b>Why is the stats call separate from the 5-second overview?</b> It scans up to 30 days of samples; the overview only reads current rows. Polling the scan every 5 s would cost more than the recorder.</p>
+<p><b>Why a fixed bucket width per range rather than a requested point count?</b> Fixed widths make every client, and every refetch, agree on bucket boundaries, so a spike never shifts between slices when the screen refreshes.</p>
+<p><b>Why not also build this in the web client or <code>sm queue</code>?</b> The ask was the app. Both endpoints are plain JSON, so a web page or a <code>sm queue stats</code> command can come later without server changes.</p>
+<p><b>What about Linux?</b> The recorder is macOS-only, like <code>host_status.rs</code>. On Linux the endpoints return <code>available: false</code> where they would have used samples.</p>
+<p><b>Does the memory bar change?</b> No. It shows the same "used" figure as today, now from the recorder instead of <code>top</code>. The kernel's "available" figure is added to the response and used only by the card.</p>
+
+<p class="sans"><small>
+<sup>1</sup> <code>queue.rs</code> <code>host_memory_capacity</code>, <code>parse_macos_memory_pressure</code> ·
+<sup>2</sup> <code>host_status.rs</code> <code>collect_snapshot</code>, <code>gpu_percent</code> ·
+<sup>3</sup> <code>queue.rs</code> <code>QUEUE_ADMISSION_LOCK</code> in <code>admit_pending_queue_jobs_conn</code> ·
+<sup>4</sup> <code>queue.rs</code> schema, <code>CREATE TABLE IF NOT EXISTS queue_resource_samples</code>; last row 2026-06-16 ·
+<sup>5</sup> <code>http.rs</code> <code>client_host_status</code> ·
+<sup>6</sup> <code>queue.rs</code> <code>running_queue_job_count(&amp;jobs, None)</code> ·
+<sup>7</sup> <code>http.rs</code> <code>queue_job_response_with_names</code> ·
+<sup>8</sup> <code>queue.rs</code> <code>next_admissible_queue_job_id_conn</code>, <code>QUEUE_JOB_TYPE_ORDER</code> ·
+<sup>9</sup> <code>queue.rs</code> <code>memory_guard_detail_text</code> ·
+<sup>10</sup> <code>ApiModels.kt</code> <code>HostStatus</code> ·
+<sup>11</sup> <code>AppNavigation.kt</code> <code>object Routes</code> ·
+<sup>12</sup> <code>http.rs</code> <code>retire_session</code> and <code>cancel_queue_job</code> both use <code>ensure_session_allowed_from_parts</code> ·
+<sup>13</sup> <code>ApiModels.kt</code> <code>SessionJob</code> ·
+<sup>14</sup> <code>WatchScreen.kt</code> overflow menu, <code>onNavigateToAnalytics</code> ·
+<sup>15</sup> <code>WatchModels.kt</code> <code>jobSummary</code> ·
+<sup>16</sup> <code>HostStatusSheet.kt</code> ·
+<sup>17</sup> <code>queue.rs</code> <code>parse_process_group_rss_bytes</code> ·
+<sup>18</sup> <code>AnalyticsScreen.kt</code> <code>MultiSeriesChart</code>, <code>drawSeries</code>
+</small></p>
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
