@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1651 — Context handoff</title>
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>1651 — Context handoff: a fresh agent takes over the work</h1>
+<p class="sans"><small>Author: sm-handoff-redesign-spec-author <code>0f52d06d</code> · Ticket #1651 · Revision 2 · 2026-09-29</small></p>
+
+<h2>Memo</h2>
+
+<p><b>I recommend replacing today's <code>sm handoff</code> with a successor model.</b> When an agent reaches a tipping point, sm asks it to stop at a logical point and post a handoff note. The agent then runs <code>sm handoff --link &lt;url&gt;</code> or <code>sm handoff --path &lt;file&gt;</code>. sm starts a fresh agent of the same kind in the same worktree and moves everything addressed to the old agent onto the new one. That covers its tickets and PRs, pending review and queue wakes, reminders, children and registered roles. Then sm retires the old agent. A default policy decides who gets asked and when. You can change every default, and turn the policy off or change the threshold for any one agent, from sm.rajeshgo.li, the sm app, or sm watch.</p>
+
+<p>Today's command asks the agent to write a markdown file, types <code>/clear</code> into the agent's terminal, and pastes <i>“Read &lt;file&gt; and continue”</i> back in. It has three problems. It keeps one session id across many context windows, so the id no longer restores one line of reasoning. It depends on typing into a terminal and confirming the redraw, the most fragile code path sm has, and it has a separate variant for each provider. It does not work at all for codex-app agents. Starting a fresh agent removes all three problems. The cost is the part the old design never needed: sm must move the agent's work across, and the design below does that exhaustively.</p>
+
+<div class="vocab">
+<dl>
+<dt>Context usage</dt>
+<dd>How full the agent's model context window is, as a percent, as the provider reports it. Claude reports it on every status-line update. codex-fork reports it in its token events. codex-app reports nothing, so sm has no reading for it. sm already records this reading for every agent of a provider that reports it.</dd>
+<dt>Handoff</dt>
+<dd>One agent (the <b>predecessor</b>) stops, and sm starts a fresh agent (the <b>successor</b>) that inherits its work.</dd>
+<dt>Handoff note</dt>
+<dd>What the predecessor writes for the successor: a PR comment, a ticket comment, or a file. sm does not read it. sm only passes its location to the successor.</dd>
+<dt>Tipping point</dt>
+<dd>An event that makes sm ask an agent to hand off. There are five. Context usage reaches the <b>threshold</b> (starting value 35%). The agent asks for a review, either from Codex with <code>sm request-codex-review</code> or from you with <code>sm doc publish --review</code>, with context usage at or above the <b>review floor</b> (starting value 20%). You press <b>Hand off now</b>. Or the agent decides on its own.</dd>
+<dt>Handoff policy</dt>
+<dd>The rules that decide whether and when sm asks an agent. The <b>default policy</b> applies to every agent. sm stores it, and you edit it from the web, app, or sm watch. An <b>override</b> is a per-agent on/off or threshold that you set the same way. It beats the default.</dd>
+<dt>Obligations</dt>
+<dd>Everything sm addresses to an agent's session id: ticket and PR claims, children, registered roles such as maintainer, pending <code>sm request-codex-review</code> wakes, <code>sm queue run</code> completion wakes, <code>sm remind</code> reminders, undelivered <code>sm send</code> messages, Inbox threads, doc review wakes, and <code>sm worktree keep</code> marks.</dd>
+</dl>
+</div>
+
+<h3>How a handoff runs</h3>
+
+<figure>
+<svg viewBox="0 0 780 300" role="img" aria-label="Handoff lifecycle: working, asked, handing off, successor starting, work moved, retired">
+<style>
+  .bx { fill: var(--surface-2); stroke: var(--ink-3); stroke-width: 1.2; }
+  .bx-hot { fill: var(--surface-2); stroke: var(--orange); stroke-width: 2; }
+  .bx-ok { fill: var(--surface-2); stroke: var(--green); stroke-width: 2; }
+  .t { font: 600 12.5px -apple-system, Helvetica, Arial, sans-serif; fill: var(--ink); }
+  .s { font: 11px -apple-system, Helvetica, Arial, sans-serif; fill: var(--ink-2); }
+  .a { stroke: var(--ink-2); stroke-width: 1.4; fill: none; marker-end: url(#ah); }
+  .ad { stroke: var(--red); stroke-width: 1.3; fill: none; stroke-dasharray: 5 4; marker-end: url(#ahr); }
+  .ar { stroke: var(--orange); stroke-width: 1.3; fill: none; marker-end: url(#aho); }
+  .lr { font: 11px -apple-system, Helvetica, Arial, sans-serif; fill: var(--red); }
+  .lo { font: 11px -apple-system, Helvetica, Arial, sans-serif; fill: var(--orange); }
+</style>
+<defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)"/></marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--red)"/></marker>
+  <marker id="aho" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--orange)"/></marker>
+</defs>
+<rect class="bx" x="4" y="70" width="112" height="62" rx="7"/>
+<text class="t" x="60" y="96" text-anchor="middle">Working</text>
+<text class="s" x="60" y="114" text-anchor="middle">below tipping point</text>
+
+<rect class="bx-hot" x="136" y="70" width="112" height="62" rx="7"/>
+<text class="t" x="192" y="96" text-anchor="middle">Asked</text>
+<text class="s" x="192" y="114" text-anchor="middle">message sent</text>
+
+<rect class="bx" x="268" y="70" width="112" height="62" rx="7"/>
+<text class="t" x="324" y="96" text-anchor="middle">Handing off</text>
+<text class="s" x="324" y="114" text-anchor="middle">ran sm handoff</text>
+
+<rect class="bx" x="400" y="70" width="112" height="62" rx="7"/>
+<text class="t" x="456" y="96" text-anchor="middle">Successor</text>
+<text class="s" x="456" y="114" text-anchor="middle">starting</text>
+
+<rect class="bx" x="532" y="70" width="112" height="62" rx="7"/>
+<text class="t" x="588" y="96" text-anchor="middle">Work moved</text>
+<text class="s" x="588" y="114" text-anchor="middle">to the successor</text>
+
+<rect class="bx-ok" x="664" y="70" width="112" height="62" rx="7"/>
+<text class="t" x="720" y="96" text-anchor="middle">Retired</text>
+<text class="s" x="720" y="114" text-anchor="middle">successor working</text>
+
+<path class="a" d="M116,101 L134,101"/>
+<path class="a" d="M248,101 L266,101"/>
+<path class="a" d="M380,101 L398,101"/>
+<path class="a" d="M512,101 L530,101"/>
+<path class="a" d="M644,101 L662,101"/>
+
+<!-- reminder loop on Asked -->
+<path class="ar" d="M170,70 C160,30 224,30 214,68"/>
+<text class="lo" x="192" y="22" text-anchor="middle">one reminder at 50%</text>
+
+<!-- failure back to Asked -->
+<path class="ad" d="M404,128 L404,212 L200,212 L200,136"/>
+<text class="lr" x="302" y="228" text-anchor="middle">successor fails to start: the agent is told and keeps its work</text>
+
+<text class="s" x="60" y="150" text-anchor="middle">35% reached,</text>
+<text class="s" x="60" y="164" text-anchor="middle">review requested,</text>
+<text class="s" x="60" y="178" text-anchor="middle">or you press</text>
+<text class="s" x="60" y="192" text-anchor="middle">Hand off now</text>
+
+<text class="s" x="324" y="150" text-anchor="middle">note posted</text>
+<text class="s" x="456" y="150" text-anchor="middle">after the agent's</text>
+<text class="s" x="456" y="164" text-anchor="middle">turn ends</text>
+<text class="s" x="588" y="150" text-anchor="middle">claims, wakes,</text>
+<text class="s" x="588" y="164" text-anchor="middle">children, roles</text>
+<text class="s" x="720" y="150" text-anchor="middle">parent told;</text>
+<text class="s" x="720" y="164" text-anchor="middle">worktree kept</text>
+
+<text class="s" x="4" y="262">An agent can also run sm handoff without being asked (it enters at “Handing off”).</text>
+<text class="s" x="4" y="280">Turning the policy off, or raising the threshold above current usage, withdraws an ask: the agent is told to continue.</text>
+</svg>
+<figcaption>Figure 1. One handoff. sm never retires an agent that has not run <code>sm handoff</code>, and it never retires one mid-turn. It waits for the agent's turn to end, so a <code>git push</code> or PR comment in flight finishes first.</figcaption>
+</figure>
+
+<h3>A worked example</h3>
+<p>You spawned <code>sm-1651-engineer</code> on Claude Opus at high effort for ticket #1651. It opened PR #1660 and has a <code>sm queue run</code> test job running.</p>
+
+<table>
+<thead><tr><th style="width:11%">Time</th><th>What happens</th></tr></thead>
+<tbody>
+<tr><td>14:02</td><td>The agent runs <code>sm request-codex-review 1660</code>. Context usage is 24%, above the 20% review floor. The command prints its usual confirmation plus the ask:<br><code>[sm context management] Your context is at 24% and you just requested a review of PR #1660, a good point to hand off. Stop at a logical point. sm will move your claims (ticket #1651, PR #1660) and pending wakes to a fresh agent. Post what the next agent needs in your PR, ticket, or a file, then run `sm handoff --link &lt;url&gt;` or `sm handoff --path &lt;file&gt;` and end your turn.</code></td></tr>
+<tr><td>14:04</td><td>The agent posts a PR comment and runs <code>sm handoff --link https://github.com/rajeshgoli/session-manager/pull/1660#issuecomment-…</code>, then ends its turn.</td></tr>
+<tr><td>14:04</td><td>sm starts <code>sm-1651-engineer-h2</code>: Claude, same model and effort, same worktree, same parent. sm moves ticket #1651, PR #1660, the pending Codex review wake and the queue job's completion wake onto it. sm retires the old agent and tells the parent <code>[sm handoff] sm-1651-engineer (0f52d06d) handed off to sm-1651-engineer-h2 (7c1e…) at 24% context. Note: &lt;link&gt;</code>. The successor receives a brief with the note link, the worktree, and everything it now holds.</td></tr>
+<tr><td>14:11</td><td>Codex's review lands. <code>[sm review] Codex review for PR #1660 is here.</code> wakes the successor, not the retired agent.</td></tr>
+</tbody>
+</table>
+
+<p>If that agent had not requested a review, the ask would have come when context usage first reached 35%, with the same wording minus the review clause.</p>
+
+<h3>Decision surface</h3>
+<table>
+<thead>
+<tr><th style="width:24%">Question</th><th>Recommendation</th><th style="width:31%">Why, in one line</th></tr>
+</thead>
+<tbody>
+<tr><td>1. Fresh agent, or clear the same agent in place?</td><td><b>Fresh agent. Delete the <code>/clear</code>-and-reinject path.</b> <code>sm handoff FILE</code> keeps working and means <code>--path FILE</code>.</td><td>One id per context window, no terminal typing, and it works for codex-app too.</td></tr>
+<tr><td>2. Starting values of the default policy</td><td><b>On for Claude agents only. Threshold 35%. Both review triggers on, with a 20% floor. Reminder at 50%.</b> You can change each one later from any surface.</td><td>Your stated starting point. Codex agents opt in per agent until we see Claude's results.</td></tr>
+<tr><td>3. Review requests as tipping points</td><td><b>Both <code>sm request-codex-review</code> and <code>sm doc publish --review</code> ask, when context usage is at or above the 20% floor.</b></td><td>An agent that just asked for a review is at a natural stop. A successor picks up the review when it lands. Below 20%, re-reading costs more than it saves.</td></tr>
+<tr><td>4. Agent ignores the ask</td><td><b>One reminder at 50%. After that, sm watch and the app show it as “handoff overdue”. sm never force-retires it.</b></td><td>Forcing a stop mid-work loses more than a long context costs.</td></tr>
+<tr><td>5. What moves to the successor</td><td><b>Every obligation in the vocabulary box, moved in place.</b> The retired agent also keeps a pointer to its successor, and anything that still reaches the old id is forwarded.</td><td>Moving in place means no <code>[sm claim]</code> collisions. The pointer catches anything added to sm later.</td></tr>
+<tr><td>6. Successor's identity</td><td><b>Same provider, model, effort, worktree, machine and parent. Name gets <code>-h2</code>, <code>-h3</code>, … appended.</b></td><td>“Similar agent” means you can't tell the seat changed except by the suffix.</td></tr>
+<tr><td>7. Who can change the policy</td><td><b>Only you, from sm.rajeshgo.li, the sm app, or sm watch. There is no agent command for it.</b></td><td>An agent must not be able to switch off its own handoff, and no agent needs to change it.</td></tr>
+<tr><td>8. Where the default policy lives</td><td><b>sm stores it, and changes apply immediately. It is not in the config file.</b></td><td>You want to tune it on the go, and one source of truth avoids a config value and a stored value disagreeing.</td></tr>
+<tr><td>9. Does an override survive the handoff?</td><td><b>Yes. The successor inherits the predecessor's override.</b></td><td>You set it for that line of work, not for one context window.</td></tr>
+<tr><td>10. A “Hand off now” button</td><td><b>Include it in all three surfaces.</b> It sends the ask immediately, whatever the policy.</td><td>One button. Useful when you see a long-running agent drifting.</td></tr>
+</tbody>
+</table>
+
+<h3>What the agent sees, and what the policy controls</h3>
+
+<p>The ask is deliberately policy-neutral. It says why sm is asking, what sm will do, and the one command to run. It does not tell the agent how to write the note. Every message sm sends in this feature is listed verbatim in Appendix D. The ask arrives like a <code>[sm claim]</code> notice: at the agent's next turn boundary, never mid-tool-call. A review-request ask is printed directly by <code>sm request-codex-review</code> or <code>sm doc publish --review</code>, so the agent sees it in that command's output.</p>
+
+<table>
+<thead><tr><th style="width:26%">Default-policy setting</th><th style="width:15%">Starting value</th><th>Meaning</th><th style="width:17%">Also per agent?</th></tr></thead>
+<tbody>
+<tr><td>On / off, per provider</td><td>on for <code>claude</code>; off for <code>codex-fork</code>, <code>codex-app</code></td><td>Whether sm asks at all. Off never blocks a voluntary <code>sm handoff</code>.</td><td>Yes (on / off)</td></tr>
+<tr><td>Threshold</td><td>35%</td><td>Context usage at which sm asks.</td><td>Yes</td></tr>
+<tr><td>Ask on Codex review request</td><td>on</td><td><code>sm request-codex-review</code> asks when usage ≥ the review floor.</td><td>No</td></tr>
+<tr><td>Ask on doc review request</td><td>on</td><td><code>sm doc publish --review</code> asks when usage ≥ the review floor. Your review then wakes the successor.</td><td>No</td></tr>
+<tr><td>Review floor</td><td>20%</td><td>See decision 3.</td><td>No</td></tr>
+<tr><td>Reminder at</td><td>50%</td><td>The single reminder, then “overdue”.</td><td>No</td></tr>
+</tbody>
+</table>
+
+<p>Every row is editable from all three surfaces, and a change applies to all agents at once, except those with an override. Examples of the effective policy: a Claude agent with no override is asked at 35%. A Claude agent you set to 45% is asked at 45%. A codex-fork agent with no override is never asked. The same codex-fork agent after you switch it on is asked at 35%. A codex-app agent you switch on has no context reading, so only a review request or your button asks it. An agent already at 40% when you switch its policy on is asked immediately.</p>
+
+<h3>What you can do from each surface</h3>
+
+<table>
+<thead><tr><th style="width:18%">Surface</th><th>What you see</th><th>What you can change</th></tr></thead>
+<tbody>
+<tr><td>sm.rajeshgo.li</td><td>Each agent card gains a context line, for example <code>ctx 28% · hands off at 35%</code>, or <code>handoff off</code>, <code>asked 14:02</code>, <code>handoff overdue</code>, <code>→ sm-1651-engineer-h2</code>.</td><td>A small edit control on that line: on / off / threshold / use default, plus Hand off now. A “Handoff defaults” panel, linked from the page header, edits the default policy. These are the page's first write actions. They sit behind the same owner login as the page.</td></tr>
+<tr><td>sm app (Android)</td><td>The same line on the agent row and in the agent sheet.</td><td>A “Context handoff” row in the agent sheet with a switch, a threshold picker in 5% steps, Use default, and Hand off now. A “Handoff defaults” section in Settings edits the default policy. Needs a new APK install.</td></tr>
+<tr><td>sm watch</td><td>The context column shows <code>28%/35</code> and the same states.</td><td>Key <code>H</code> on the selected agent prompts <code>on | off | default | &lt;percent&gt; | now</code>. Key <code>P</code> opens the default policy for editing.</td></tr>
+</tbody>
+</table>
+
+<p>Agents get no command to read or change the policy. A change takes effect immediately. If you switch an asked agent off, or raise its threshold above its current usage, sm withdraws the ask and tells the agent to continue.</p>
+
+<h3>What moves, and what could go wrong</h3>
+
+<p>Today nothing in sm moves work between agents. Retiring an agent ends its claims. Its pending review and queue wakes, reminders and undelivered messages are orphaned. Its children keep a parent that no longer exists. So the transfer is the real engineering in this change. Appendix G lists every obligation and exactly what happens to it. Three risks shape the design:</p>
+
+<ul>
+<li><b>Losing the worktree.</b> Retiring an agent deletes its worktree today. sm moves the claims before it retires the predecessor, so the worktree belongs to the successor at retire time, and a live agent working in it also blocks deletion. A test covers exactly this sequence.</li>
+<li><b>A crash halfway.</b> sm writes “moving work to &lt;successor&gt;” before it moves anything. Every move is safe to repeat, so a server restart finishes the transfer.</li>
+<li><b>Something sm adds later that also addresses a session id.</b> The forwarding pointer catches it at delivery time. A test fails if anyone adds a table with a session-id column without saying whether handoff moves it.</li>
+</ul>
+
+<p>Handoff stays separate from the existing <code>[sm context]</code> gauge alerts, which a parent enables with <code>sm context-monitor</code>. Those keep working unchanged.</p>
+
+<h3>Cost</h3>
+<p>Each handoff costs one successor start-up: reading the note, the PR or ticket, and whatever files it needs. That is roughly what the old <code>/clear</code>-and-reinject cost, since both start from an empty context. The saving is the same as the old design's: a Claude agent at 35% re-reads a third of a large window on every turn, and a fresh one does not.</p>
+
+<h3>Build plan</h3>
+<p>Four tickets, each sized for one agent. Appendix K has the file sets.</p>
+<ol>
+<li><b>Policy and asks</b> (server). The stored default policy, overrides, their owner-only API, the tipping points, the ask, the reminder and the withdrawal, and the new session fields every surface reads.</li>
+<li><b>Handoff execution</b> (server). <code>sm handoff</code>, starting the successor, moving the work, forwarding, retiring, and deleting the old <code>/clear</code> path. Starts after ticket 1.</li>
+<li><b>sm watch and sm.rajeshgo.li controls.</b> Starts after ticket 1. Runs in parallel with ticket 4.</li>
+<li><b>Android controls.</b> Starts after ticket 1. Needs an APK install on your phone.</li>
+</ol>
+<p>When ticket 2 ships I will ask you to try one thing: on a scratch Claude agent, press Hand off now in the app and watch sm watch show it pass through the states in Figure 1.</p>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p><b>Revision 2</b> answers your three comments on revision 1.</p>
+<ul>
+<li><b>Every default is now editable from the surfaces.</b> Revision 1 kept the default policy in the config file. sm now stores it, and each surface has a “Handoff defaults” editor. 35%, 20% and 50% are only starting values (decisions 2 and 8).</li>
+<li><b><code>sm doc publish --review</code> is a tipping point.</b> It works like <code>sm request-codex-review</code>, with the same 20% floor. Your review wakes the successor (decision 3).</li>
+<li><b>The <code>sm handoff-policy</code> command is gone, and so is the parent's right to change an agent's policy.</b> Only you change it, from the three surfaces (decision 7).</li>
+</ul>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<div class="toc">
+<div><a href="#a">A. States and persisted fields</a></div>
+<div><a href="#b">B. Policy: stored defaults and resolution</a></div>
+<div><a href="#c">C. Tipping points: exact rules</a></div>
+<div><a href="#d">D. Messages, verbatim</a></div>
+<div><a href="#e">E. The sm handoff command</a></div>
+<div><a href="#f">F. Starting the successor</a></div>
+<div><a href="#g">G. Moving the work</a></div>
+<div><a href="#h">H. Retire, cleanup, forwarding</a></div>
+<div><a href="#i">I. Owner controls: API and surfaces</a></div>
+<div><a href="#j">J. Removing the old handoff</a></div>
+<div><a href="#k">K. Tickets, file sets, order</a></div>
+<div><a href="#l">L. Test plan</a></div>
+<div><a href="#m">M. Code references</a></div>
+<div><a href="#z">Z. FAQ</a></div>
+</div>
+
+<h3 id="a">A. States and persisted fields</h3>
+
+<p>Session records live in the JSON session store<sup>[1]</sup>. This change adds these keys to a session record. All are absent on existing records. Absent means “working, no override, no lineage”.</p>
+
+<pre><code>"handoff_policy_override": {            // absent = no override
+  "enabled": true | false | null,        // null = inherit default
+  "threshold_percent": 45 | null,        // null = inherit default; (0,100]
+  "set_at": "2026-09-29T14:02:11Z"
+}
+"handoff": {                             // absent = working, never asked
+  "state": "asked" | "accepted" | "spawning" | "transferring" | "done" | "failed",
+  "trigger": "context" | "review_request" | "doc_review" | "owner" | "voluntary",
+  "asked_at": "...", "asked_percent": 36.4 | null,
+  "reminded_at": "..." | null,
+  "note": { "kind": "link" | "path", "value": "https://… | /abs/path" } | null,
+  "accepted_at": "..." | null,
+  "successor_session_id": "..." | null,
+  "error": "..." | null,
+  "failed_at": "..." | null
+}
+"successor_session_id": "..."            // on the predecessor, set at transfer start
+"predecessor_session_id": "..."          // on the successor, set at creation</code></pre>
+
+<table>
+<thead><tr><th style="width:17%">State</th><th>Entered when</th><th>Leaves to</th></tr></thead>
+<tbody>
+<tr><td>(absent)</td><td>Default.</td><td><code>asked</code> on a tipping point. <code>accepted</code> on a voluntary <code>sm handoff</code>.</td></tr>
+<tr><td><code>asked</code></td><td>The ask was queued (or printed, for the two review triggers).</td><td><code>accepted</code> on <code>sm handoff</code>. The key is removed on withdrawal (Appendix C.5).</td></tr>
+<tr><td><code>accepted</code></td><td><code>sm handoff</code> validated and recorded the note.</td><td><code>spawning</code> when the agent's turn ends (Appendix F.1).</td></tr>
+<tr><td><code>spawning</code></td><td>sm started creating the successor.</td><td><code>transferring</code> once the successor record exists. <code>failed</code> if creation fails.</td></tr>
+<tr><td><code>transferring</code></td><td><code>successor_session_id</code> was written on both records.</td><td><code>done</code> after Appendix G completes and the predecessor is retired.</td></tr>
+<tr><td><code>failed</code></td><td>The successor could not be created.</td><td><code>accepted</code> on a new <code>sm handoff</code>. The agent is told (D.6). Its obligations never moved.</td></tr>
+<tr><td><code>done</code></td><td>Terminal. The predecessor is retired.</td><td>—</td></tr>
+</tbody>
+</table>
+
+<p>The successor record starts with no <code>handoff</code> key. It copies <code>handoff_policy_override</code> from the predecessor (decision 9).</p>
+
+<h3 id="b">B. Policy: stored defaults and resolution</h3>
+
+<p>The default policy is a top-level key <code>handoff_defaults</code> in the session store<sup>[1]</sup>, next to <code>agent_registrations</code>. It is not in <code>config.yaml</code>, because config is read once at startup<sup>[2]</sup> and you need to change these on the go. When the key is absent, the built-in starting values apply. The first successful <code>PUT /handoff-defaults</code> writes the full object.</p>
+
+<pre><code>"handoff_defaults": {
+  "providers": { "claude": true, "codex-fork": false, "codex-app": false },  // unknown provider = false
+  "threshold_percent": 35,        // (0,100]
+  "ask_on_codex_review": true,
+  "ask_on_doc_review": true,
+  "review_floor_percent": 20,     // [0,100]
+  "reminder_percent": 50,         // (0,100]; not &gt; effective threshold = no reminder
+  "updated_at": "..."
+}</code></pre>
+
+<p><code>GET /handoff-defaults</code> returns the object, with starting values filled in when absent. <code>PUT /handoff-defaults</code> takes any subset of the fields and merges them. It rejects non-finite or out-of-range values with 400, naming the field, the same rule <code>context_monitor</code> thresholds use<sup>[3]</sup>. Authorization is the same as I.1: owner only. After a successful PUT, sm re-runs the withdrawal check (C.5), and it re-runs the threshold check (C.1) against each running session's latest reading, so lowering the threshold below an agent's current usage asks it immediately.</p>
+
+<p><b>Effective policy</b> for a session <i>S</i>:</p>
+<ul>
+<li><code>enabled</code> = override <code>enabled</code> if not null. Otherwise it is <code>providers[S.provider]</code>, false when absent.</li>
+<li><code>threshold</code> = override <code>threshold_percent</code> if not null. Otherwise the default <code>threshold_percent</code>.</li>
+<li><code>reminder</code> = the default <code>reminder_percent</code> when it is greater than the effective threshold. Otherwise there is no reminder. Example: you override the threshold to 55. The reminder at 50 then does not apply, and there is none.</li>
+<li><code>source</code> = <code>"override"</code> if any override field is non-null, else <code>"default"</code>.</li>
+<li><code>has_gauge</code> = the provider reports context usage (<code>claude</code>, <code>codex-fork</code>)<sup>[4]</sup>.</li>
+</ul>
+
+<table>
+<thead><tr><th>Provider</th><th>Override</th><th>Effective</th></tr></thead>
+<tbody>
+<tr><td>claude</td><td>none</td><td>on, 35%, reminder 50%</td></tr>
+<tr><td>claude</td><td>threshold 45</td><td>on, 45%, reminder 50%</td></tr>
+<tr><td>claude</td><td>enabled false</td><td>off. Voluntary <code>sm handoff</code> still works.</td></tr>
+<tr><td>codex-fork</td><td>none</td><td>off</td></tr>
+<tr><td>codex-fork</td><td>enabled true</td><td>on, 35%, reminder 50%</td></tr>
+<tr><td>codex-app</td><td>enabled true</td><td>on, but <code>has_gauge</code> is false. Only the two review triggers and Hand off now can ask. The review floor is ignored because there is no reading.</td></tr>
+</tbody>
+</table>
+
+<h3 id="c">C. Tipping points: exact rules</h3>
+
+<p><b>C.1 Context threshold.</b> The rule is evaluated after sm stores each accepted context-usage sample. For Claude that is the <code>/hooks/context-usage</code> path. For codex-fork it is the event-stream reader. Both write <code>context_used_percentage</code> before the context-monitor enrolment check<sup>[5]</sup>, so handoff does not depend on <code>sm context-monitor</code> enrolment. The ask fires when all of these hold: the effective policy is on; the <code>handoff</code> key is absent; the session is not stopped; and the sample is ≥ the effective threshold. A sample that jumps from 30% to 41% asks once, and the message says 41%. Stale samples, which today's code already rejects<sup>[6]</sup>, never ask.</p>
+
+<p><b>C.2 Reminder.</b> In state <code>asked</code> with <code>reminded_at</code> null, the first sample ≥ the effective reminder percent queues D.2 and sets <code>reminded_at</code>. There is never a second reminder. From then on the surfaces show <code>overdue</code> (Appendix I.2). A compaction or context reset does not clear <code>asked</code>. The ask stands until the agent hands off or the ask is withdrawn.</p>
+
+<p><b>C.3 Review requests.</b> Two commands trigger this rule with the same logic. <b>Codex review:</b> the rule is evaluated in <code>create_codex_review_request</code><sup>[7]</sup> after the request is registered successfully, for the <code>requester_session_id</code> (not <code>--notify</code>), with trigger <code>review_request</code> and switch <code>ask_on_codex_review</code>. <b>Doc review:</b> it is evaluated in <code>publish_owner_doc</code><sup>[22]</sup> after a publish with <code>"review": true</code> succeeds, for the body's <code>session_id</code>, with trigger <code>doc_review</code> and switch <code>ask_on_doc_review</code>. A publish without <code>--review</code> never asks. The rule fires when the effective policy is on; the command's switch is true; the <code>handoff</code> key is absent; and either <code>has_gauge</code> is false or the latest <code>context_used_percentage</code> is ≥ <code>review_floor_percent</code>. A gauge provider with no reading yet does not ask. When it fires, the response JSON carries <code>"handoff_ask": "&lt;D.1 text&gt;"</code> and state becomes <code>asked</code>. Each CLI (<code>sm request-codex-review</code>, <code>sm doc publish</code>) prints the text on stdout after its existing lines. sm does <i>not</i> also queue it as a message, so the agent never sees it twice. A later review request of either kind, in state <code>asked</code>, does nothing new.</p>
+
+<p><b>C.4 Hand off now.</b> You call the policy API with <code>"ask_now": true</code> (Appendix I.1). If the <code>handoff</code> key is absent, sm queues D.1 with trigger <code>owner</code> regardless of policy or gauge. Otherwise it returns 409 with the current state.</p>
+
+<p><b>C.5 Withdrawal.</b> After any change to an override or to the default policy, sm re-checks every session in state <code>asked</code> whose trigger is <code>context</code>. If the policy is now off, or its current usage is below the new threshold, sm removes the <code>handoff</code> key and queues D.3. It cancels any undelivered ask or reminder first, using the same category-cancel that context alerts use<sup>[8]</sup>. Asks with trigger <code>review_request</code>, <code>doc_review</code> or <code>owner</code> are withdrawn only when the policy is turned off. Setting the policy to off always withdraws an <code>asked</code> state, whatever the trigger. The states <code>accepted</code> and later are never withdrawn: the agent has already committed.</p>
+
+<p><b>Delivery.</b> Asks, reminders and withdrawals are queued with delivery mode <code>important</code> and message category <code>context_handoff</code>. Sender is the session itself, as with context alerts, so a completed handoff can cancel leftovers by category.</p>
+
+<h3 id="d">D. Messages, verbatim</h3>
+
+<p>Placeholders are in angle brackets. <code>&lt;claims&gt;</code> renders as <code>ticket #1651, PR #1660</code>, in claim order, or as <code>none</code>. <code>&lt;pct&gt;</code> is rounded to a whole percent.</p>
+
+<table>
+<thead><tr><th style="width:14%">Id</th><th style="width:14%">To</th><th>Text</th></tr></thead>
+<tbody>
+<tr><td>D.1 ask</td><td>agent</td><td><code>[sm context management] &lt;reason&gt; Stop at a logical point. sm will move your claims (&lt;claims&gt;) and pending wakes to a fresh agent. Post what the next agent needs in your PR, ticket, or a file, then run `sm handoff --link &lt;url&gt;` or `sm handoff --path &lt;file&gt;` and end your turn.</code><br>
+&lt;reason&gt; by trigger:<br>
+context: <code>Your context is at &lt;pct&gt;%.</code><br>
+review_request with reading: <code>Your context is at &lt;pct&gt;% and you just requested a review of PR #&lt;n&gt;, a good point to hand off.</code><br>
+review_request without reading: <code>You just requested a review of PR #&lt;n&gt;, a good point to hand off.</code><br>
+doc_review: <code>Your context is at &lt;pct&gt;% and you just asked Rajesh to review &lt;doc title&gt;, a good point to hand off. His review will wake your successor.</code> Without a reading, it starts at <code>You just asked Rajesh</code>.<br>
+owner: <code>Rajesh asked you to hand off.</code></td></tr>
+<tr><td>D.2 reminder</td><td>agent</td><td><code>[sm context management] Reminder: your context is at &lt;pct&gt;% and sm asked you to hand off at &lt;asked_pct&gt;%. Finish the current step, post your handoff note, and run `sm handoff --link &lt;url&gt;` or `sm handoff --path &lt;file&gt;`.</code></td></tr>
+<tr><td>D.3 withdrawn</td><td>agent</td><td><code>[sm context management] The handoff request is withdrawn. Continue working.</code></td></tr>
+<tr><td>D.4 accepted</td><td>agent (CLI stdout)</td><td><code>Handoff accepted. End your turn now; sm will start your successor when it ends and retire this session.</code></td></tr>
+<tr><td>D.5 successor brief</td><td>successor (first message)</td><td>See F.4.</td></tr>
+<tr><td>D.6 failed</td><td>predecessor</td><td><code>[sm context management] sm could not start your successor: &lt;error&gt;. You still hold all your work. Continue, and run `sm handoff` again to retry.</code></td></tr>
+<tr><td>D.7 parent notice</td><td>parent, if any</td><td><code>[sm handoff] &lt;pred name&gt; (&lt;pred id&gt;) handed off to &lt;succ name&gt; (&lt;succ id&gt;) at &lt;pct&gt;% context. Note: &lt;note&gt;</code>. When there is no reading, <code>at &lt;pct&gt;% context</code> is omitted.</td></tr>
+<tr><td>D.8 forwarded</td><td>sender (CLI stdout)</td><td><code>&lt;pred name&gt; handed off; delivered to &lt;succ name&gt; (&lt;succ id&gt;).</code> This is printed by <code>sm send</code> when the target resolved through forwarding.</td></tr>
+</tbody>
+</table>
+
+<p>Roots (agents with no parent) produce no D.7. You see the handoff on the surfaces. No message reaches your phone for a handoff or a failure. Failure is visible as <code>handoff failed</code> on the agent's line.</p>
+
+<h3 id="e">E. The <code>sm handoff</code> command</h3>
+
+<pre><code>sm handoff --link &lt;url&gt;
+sm handoff --path &lt;file&gt;
+sm handoff &lt;file&gt;            # same as --path &lt;file&gt;</code></pre>
+
+<p>Exactly one of the three forms is required. With no argument the command errors with <code>sm handoff needs --link &lt;url&gt; or --path &lt;file&gt;</code>. The old default of <code>HANDOFF.md</code> is gone. The command must run inside a managed session (<code>SESSION_MANAGER_ID</code> set). It is self-directed only, as today.</p>
+
+<p>Client-side checks: <code>--path</code> must name an existing regular file. The CLI canonicalizes it to an absolute path. <code>--link</code> must parse as an <code>http</code> or <code>https</code> URL. Neither is fetched or read.</p>
+
+<p>Request: <code>POST /sessions/{id}/handoff</code> with <code>{"requester_session_id": id, "note": {"kind": "link"|"path", "value": "..."}}</code>. The server rejects a body that uses the old <code>file_path</code> field with 400 <code>sm handoff was updated; rerun sm handoff --path &lt;file&gt;</code>. That only affects a stale CLI binary.</p>
+
+<table>
+<thead><tr><th style="width:36%">Server outcome</th><th>HTTP / CLI</th></tr></thead>
+<tbody>
+<tr><td>State absent or <code>asked</code> or <code>failed</code></td><td>200. Records the note, sets <code>accepted</code> and <code>accepted_at</code>, sets trigger <code>voluntary</code> if the key was absent. CLI prints D.4. Exit 0.</td></tr>
+<tr><td>State <code>accepted</code></td><td>200. Replaces the note. This lets an agent correct a link. CLI prints D.4.</td></tr>
+<tr><td>State <code>spawning</code> / <code>transferring</code> / <code>done</code></td><td>409 <code>handoff already in progress</code>. Exit 1.</td></tr>
+<tr><td>Requester ≠ target</td><td>403 <code>sm handoff is self-directed only</code>.</td></tr>
+<tr><td>Session stopped</td><td>409 <code>session is not running</code>.</td></tr>
+</tbody>
+</table>
+
+<p>Every provider is accepted, including codex-app.</p>
+
+<h3 id="f">F. Starting the successor</h3>
+
+<p><b>F.1 When.</b> sm starts the successor on the first transition of the predecessor to idle while its state is <code>accepted</code>. That is the existing idle detection that drives <code>[sm task-complete]</code> and stop-notify: the Claude Stop hook, codex-fork turn-complete, and codex-app idle. If the predecessor is already idle when <code>sm handoff</code> returns, for example because the command ran as the turn's final action and the idle event raced ahead, sm starts immediately. There is no timeout. An agent that keeps working after <code>sm handoff</code> keeps showing <code>handing off</code> until its turn ends.</p>
+
+<p><b>F.2 What is copied.</b> The successor copies <code>provider</code>, <code>model</code>, <code>reasoning_effort</code>, <code>working_dir</code>, <code>node</code> and <code>parent_session_id</code> from the predecessor record<sup>[9]</sup>. Model and effort must be passed explicitly. Today's spawn path does not inherit them from anyone<sup>[10]</sup>. A root predecessor gives a root successor, and root retire protection applies to it as before. The successor is created through the same core create path as <code>sm spawn</code>, with no <code>--ticket</code> reservation, because claims move in place (G).</p>
+
+<p><b>F.3 Name.</b> Take the predecessor's name. If it ends in <code>-h&lt;k&gt;</code>, where <i>k</i> is an integer ≥ 2, replace that with <code>-h&lt;k+1&gt;</code>. Otherwise append <code>-h2</code>. Examples: <code>sm-1651-engineer</code> → <code>sm-1651-engineer-h2</code> → <code>sm-1651-engineer-h3</code>. And <code>sm-pr-1660-reviewer-2</code> → <code>sm-pr-1660-reviewer-2-h2</code>. Names are not unique in sm today<sup>[11]</sup>, and this rule does not make them so.</p>
+
+<p><b>F.4 Brief.</b> The successor is created with no initial prompt. sm sends the brief as its first message, with delivery mode <code>important</code>, only after Appendix G completes. That way the successor never acts before it holds the work. Lines whose value is empty are omitted.</p>
+
+<pre><code>[sm handoff] You are taking over from &lt;pred name&gt; (&lt;pred id&gt;), which stopped at &lt;pct&gt;% context.
+Handoff note: &lt;link or absolute path&gt;
+Working directory: &lt;working_dir&gt; (branch &lt;branch of the first claim with a branch&gt;)
+You now hold: &lt;claims&gt;
+Registered roles: &lt;roles, comma-separated&gt;
+Pending for you: &lt;each moved review wake, queue job and reminder, one per line, e.g. "Codex review of PR #1660, requested 14:02"&gt;
+Children: &lt;name (id), comma-separated&gt;
+Original brief: &lt;spawn brief artifact path, when the predecessor line has one&gt;
+Read the handoff note first, then continue the work.</code></pre>
+
+<p>“Original brief” follows the lineage back. sm uses the first ancestor in the predecessor chain that has a spawn-brief artifact<sup>[12]</sup>, so <code>-h3</code> still sees the brief <code>-h1</code> was spawned with.</p>
+
+<p><b>F.5 Failure.</b> If creation fails, sm sets state <code>failed</code>, records the error, queues D.6 to the predecessor, and moves nothing. If the successor record exists but the agent process dies before the brief is delivered, it is handled like any spawned agent that dies. Its work is already moved, and you see it as a stopped agent holding the claims. sm does not retry automatically.</p>
+
+<h3 id="g">G. Moving the work</h3>
+
+<p><b>Order.</b> (1) Write <code>successor_session_id</code> on the predecessor, <code>predecessor_session_id</code> on the successor, and state <code>transferring</code>. (2) Apply every row below. (3) Deliver the brief (F.4). (4) Retire the predecessor (H). (5) Queue D.7 and cancel leftover <code>context_handoff</code> messages from the predecessor. (6) Set state <code>done</code>.</p>
+
+<p><b>Recovery.</b> On startup, any session in state <code>transferring</code> resumes at step 2. Every row is an update of the form <code>WHERE &lt;column&gt; = predecessor</code>, so repeating it is harmless. A session found in <code>spawning</code> at startup, with no successor id written, goes to <code>failed</code> with error <code>server restarted while starting the successor</code>, and D.6 is queued.</p>
+
+<table>
+<thead><tr><th style="width:21%">Obligation</th><th style="width:27%">Stored at</th><th>What handoff does</th></tr></thead>
+<tbody>
+<tr><td>Ticket / PR claims</td><td><code>work_claims.session_id</code> (active rows)<sup>[13]</sup></td><td>Re-point <code>session_id</code> and <code>session_name</code> to the successor in place. Keep <code>claimed_at</code>, <code>source</code>, <code>worktree_path</code>, <code>branch</code>, <code>managed_worktree</code>, <code>base_sha</code>, and <code>parent_session_id</code> (unchanged, since the parent is the same). Write one <code>claim.handed_off</code> event per row. Send no <code>[sm claim]</code> notice. The claim history page shows both holders.</td></tr>
+<tr><td>Worktree keep marks</td><td><code>worktree_keeps.session_id</code></td><td>Re-point to the successor.</td></tr>
+<tr><td>Children</td><td>Each child's <code>parent_session_id</code></td><td>Set to the successor directly. There is no consent flow: this is not a reparent between two live agents. Apply the existing parent-routing retarget for wake and message rows<sup>[14]</sup>. Where a child's <code>context_monitor_notify</code> equals the predecessor, set it to the successor.</td></tr>
+<tr><td>Registered roles</td><td><code>agent_registrations</code><sup>[15]</sup></td><td>Re-point each row's <code>session_id</code>. <code>sm lookup maintainer</code> returns the successor.</td></tr>
+<tr><td>Codex review wakes</td><td><code>codex_review_request_registrations.notify_session_id</code>, <code>requester_session_id</code> (not completed)</td><td>Re-point both. Add each to the brief.</td></tr>
+<tr><td>Queue job wakes</td><td><code>queue_jobs.notify_session_id</code>, <code>requester_session_id</code> (not finished)</td><td>Re-point both. Add each to the brief.</td></tr>
+<tr><td>Reminders</td><td><code>scheduled_reminders.target_session_id</code>; <code>remind_registrations.target_session_id</code> and <code>cancel_on_reply_session_id</code></td><td>Re-point.</td></tr>
+<tr><td>Stop-notify, predecessor watched</td><td><code>rust_stop_notify_states.session_id</code></td><td>Re-point to the successor <i>before</i> retire, so the watcher is told when the successor stops, not when the predecessor retires.</td></tr>
+<tr><td>Stop-notify, predecessor watching</td><td><code>rust_stop_notify_states.sender_session_id</code></td><td>Re-point.</td></tr>
+<tr><td>Undelivered messages</td><td><code>message_queue.target_session_id</code>, <code>delivered_at IS NULL</code></td><td>Re-point, except category <code>context_handoff</code> and <code>context_monitor</code>, which are cancelled. They describe the old context.</td></tr>
+<tr><td>Context monitor on the predecessor itself</td><td><code>context_monitor_*</code> keys on its record</td><td>Copy to the successor. If the notify target was the predecessor, set it to the successor. Reset the reported thresholds.</td></tr>
+<tr><td>Other sessions monitored by the predecessor</td><td>Their <code>context_monitor_notify</code></td><td>Where it equals the predecessor, set it to the successor.</td></tr>
+<tr><td>Doc review wakes</td><td><code>owner_docs.author_session_id</code><sup>[16]</sup></td><td>Re-point for docs with an open review request. Others rely on forwarding.</td></tr>
+<tr><td>Inbox threads, owner replies</td><td><code>owner_messages.sender_session_id</code></td><td>Not rewritten, so the thread keeps its history. Replies reach the successor through forwarding (H.2). The thread shows “continued by &lt;succ name&gt;”.</td></tr>
+<tr><td><code>sm btw</code> requests</td><td><code>btw_requests</code></td><td>Unchanged. Retire fails them as today. They are short-lived questions tied to one context.</td></tr>
+<tr><td>Handoff override</td><td><code>handoff_policy_override</code></td><td>Copy (decision 9).</td></tr>
+</tbody>
+</table>
+
+<p><b>Completeness guard.</b> A unit test lists every SQLite <code>CREATE TABLE</code> column named <code>*session_id</code> across the server's stores. It asserts each one appears either in the transfer list or in an explicit “not moved, because …” list. Adding a column without classifying it fails the build.</p>
+
+<h3 id="h">H. Retire, cleanup, forwarding</h3>
+
+<p><b>H.1 Retire.</b> The predecessor is retired through the core retire path with <code>ServerLifecycle</code> authority. Root protection does not block a server-driven handoff. The terminal provenance reason is <code>handed_off</code>, with the successor id. Claim ending at retire<sup>[17]</sup> finds no active claims, because they have moved. Worktree cleanup<sup>[18]</sup> gathers no candidates from moved claims. As a second guard, cleanup never deletes a path that is the <code>working_dir</code> of a live session. A test checks the whole sequence on a managed worktree.</p>
+
+<p><b>H.2 Forwarding.</b> <code>live_recipient</code><sup>[19]</sup> becomes: the session while it has not ended; else, if it has a <code>successor_session_id</code>, the result of <code>live_recipient</code> on the successor, following the chain; else its parent when that has not ended; else nobody. The same resolution applies when <code>sm send</code>, <code>sm remind</code>, <code>sm request-codex-review --notify</code>, <code>sm queue run --notify</code> or <code>sm context-monitor enable</code> name an ended session by id or by exact name. <code>sm send</code> prints D.8. The chain walk stops after 32 hops. A cycle cannot form, because a successor is always newly created.</p>
+
+<h3 id="i">I. Owner controls: API and surfaces</h3>
+
+<p><b>I.1 API.</b> <code>PUT /sessions/{id}/handoff-policy</code>, body:</p>
+<pre><code>{ "enabled": true | false | null,          // omitted = unchanged, null = inherit
+  "threshold_percent": 45 | null,          // omitted = unchanged, null = inherit
+  "use_default": true,                     // clears the override entirely
+  "ask_now": true }                        // Hand off now (C.4)</code></pre>
+<p>Authorization, for this route and for <code>/handoff-defaults</code>: owner only. The request passes the existing session gate<sup>[20]</sup>. A request that carries a <code>requester_session_id</code>, or an <code>X-SM-Session</code> header, gets 403 <code>handoff policy is owner-only</code>. Ticket 1 makes the <code>sm</code> client send <code>X-SM-Session: &lt;id&gt;</code> on every request whenever <code>SESSION_MANAGER_ID</code> is set. Today it sends no session header. The callers that pass are the web page and the app, both authenticated remotely, and sm watch run from your own terminal, which has no <code>SESSION_MANAGER_ID</code>. Agents are semi-trusted. An agent that deliberately strips its identity on loopback could pass as you, which is accepted, as on every other owner route today. Response: the effective policy object from I.2. The web page's calls also require <code>Origin</code> to match the page's host.</p>
+
+<p><code>GET /sessions/{id}/handoff-policy</code> returns the same object.</p>
+
+<p><b>I.2 Session JSON.</b> Three places add the same object: <code>SessionResponse</code> (and so the app's <code>client/sessions</code>), the web <code>/watch/state</code> session entry, and the sm watch data source. <code>SessionResponse</code> also gains <code>context_percent</code>, which today only <code>/watch/state</code> has.</p>
+<pre><code>"handoff": {
+  "enabled": true, "threshold_percent": 35, "source": "default" | "override",
+  "has_gauge": true,
+  "display": "hands off at 35%" | "handoff off" | "asked 14:02" | "handoff overdue"
+           | "handing off" | "handoff failed" | "→ sm-1651-engineer-h2",
+  "state": null | "asked" | ..., "successor": {"id","name"} | null,
+  "predecessor": {"id","name"} | null
+}</code></pre>
+<p>The server computes <code>display</code>, so the three surfaces never diverge. <code>overdue</code> means state <code>asked</code> with <code>reminded_at</code> set. <code>handing off</code> covers <code>accepted</code>, <code>spawning</code> and <code>transferring</code>.</p>
+
+<p><b>I.3 sm watch</b> (<code>crates/sm-server/src/bin/watch/</code>). The context column renders <code>&lt;pct&gt;%/&lt;threshold&gt;</code> when on and has_gauge. It renders <code>&lt;pct&gt;% off</code> when off, and the <code>display</code> text in any non-null state. Key <code>H</code> opens a prompt modelled on rename (<code>n</code>): <code>on</code>, <code>off</code>, <code>default</code>, an integer 1–100 (sets the threshold), or <code>now</code> (arm then confirm within 5 s, like <code>K</code>). Key <code>P</code> opens the default policy as a list of the B fields. Enter edits the selected field, and each edit is one <code>PUT /handoff-defaults</code>. The help overlay lists <code>H</code> and <code>P</code>.</p>
+
+<p><b>I.4 sm.rajeshgo.li</b> (<code>crates/sm-server/src/http/watch.rs</code>, <code>watch_client.js</code>). The card shows the <code>display</code> text after the context percent. Tapping it opens an inline panel: an on/off switch, a threshold number input (1–100), a Use default button, and a Hand off now button with a confirm step. Each action calls I.1 and refreshes <code>/watch/state</code>. A “Handoff defaults” link in the page header opens a panel with one control per B field. Each change is one <code>PUT /handoff-defaults</code>. The page header comment changes from read-only to “read-only except handoff policy”.</p>
+
+<p><b>I.5 Android</b> (<code>android-app/</code>). <code>ClientSession</code> gains <code>context_percent</code> and <code>handoff</code>. The agent row shows the <code>display</code> text. The agent sheet gains a “Context handoff” section: a switch, a threshold picker (5–95 in steps of 5, plus the current value if it is off-step), Use default, and Hand off now with a confirm dialog. The Settings screen gains a “Handoff defaults” section, modelled on the Studio SSH toggle<sup>[23]</sup>: a switch per provider, number pickers for the three percents, and switches for the two review triggers. <code>ApiService</code> gains <code>PUT sessions/{id}/handoff-policy</code> and <code>GET/PUT handoff-defaults</code>. They use the same host and auth as <code>retireSession</code>.</p>
+
+<p><b>I.6 No agent command.</b> There is no <code>sm</code> subcommand to read or change the policy. Agents learn of it only through the asks.</p>
+
+<h3 id="j">J. Removing the old handoff</h3>
+<p>Delete the <code>/clear</code>-and-reinject machinery. That is: the Claude Stop-hook reservation and worker, the codex-fork <code>/new</code> monitor and offset replay, both startup recovery passes, the conditional-clear helpers in <code>runtime.rs</code> that nothing else calls, and their tests<sup>[21]</sup>. On first start after upgrade, sm removes <code>pending_handoff_path</code>, <code>pending_handoff_recorded_at</code>, <code>claude_handoff_in_progress_at</code> and <code>pending_handoff_event_offset</code> from every record, and it logs each session that had a pending old-style handoff. <code>last_handoff_path</code> is left in place. <code>reset_session_after_clear</code> stays if anything else still calls it; otherwise it goes too. The implementer checks callers.</p>
+
+<h3 id="k">K. Tickets, file sets, order</h3>
+<table>
+<thead><tr><th style="width:6%">#</th><th style="width:26%">Scope</th><th>Files</th><th style="width:15%">After</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Stored defaults, overrides, owner-only API, asks, JSON fields</td><td>new <code>src/handoff/policy.rs</code>, hooks in <code>sessions.rs</code> (context sample), <code>http.rs</code> (Codex review create, routes, <code>SessionResponse</code>), <code>http/docs.rs</code> (doc review publish), <code>http/watch.rs</code> (state JSON only), <code>bin/sm.rs</code> (<code>X-SM-Session</code> header; print <code>handoff_ask</code>) and <code>bin/doc/mod.rs</code> (print <code>handoff_ask</code>)</td><td>—</td></tr>
+<tr><td>2</td><td><code>sm handoff</code>, successor, transfer, forwarding, retire, removal</td><td>new <code>src/handoff/execute.rs</code>, <code>sessions.rs</code>, <code>work_claims.rs</code>, <code>queue.rs</code>, <code>http/messages.rs</code>, <code>http/worktrees.rs</code>, <code>runtime.rs</code>, <code>bin/sm.rs</code> (handoff args)</td><td>1</td></tr>
+<tr><td>3</td><td>sm watch + web controls</td><td><code>bin/watch/</code>, <code>http/watch.rs</code> (render), <code>watch_client.js</code></td><td>1</td></tr>
+<tr><td>4</td><td>Android controls</td><td><code>android-app/</code></td><td>1</td></tr>
+</tbody>
+</table>
+<p>Tickets 2 and 3 both touch <code>http/watch.rs</code>, but ticket 2 does not need to. If it does after all, serialize 3 after 2. Ticket 2 is the largest. If it will not fit one agent, split the removal (J) into its own ticket after 2.</p>
+
+<h3 id="l">L. Test plan</h3>
+<table>
+<thead><tr><th style="width:40%">Behaviour</th><th>Test</th></tr></thead>
+<tbody>
+<tr><td>B resolution table, every row</td><td>unit, <code>handoff::policy</code></td></tr>
+<tr><td><code>/handoff-defaults</code>: starting values when absent, partial merge, range errors, a change re-runs C.1 and C.5</td><td>http test</td></tr>
+<tr><td>C.1 asks once at threshold; jump reports actual; stale ignored; not enrolled in context-monitor still asks</td><td>unit, sessions: synthetic samples</td></tr>
+<tr><td>C.2 single reminder; none when threshold ≥ reminder</td><td>unit</td></tr>
+<tr><td>C.3 review asks, for both commands: above floor, below floor, switch off, codex-app no gauge, gauge with no reading, second request no-op, publish without <code>--review</code> no ask, each CLI prints <code>handoff_ask</code></td><td>http tests on <code>/codex-review-requests</code> and <code>/docs</code> + CLI output tests</td></tr>
+<tr><td>C.4 ask_now in each state</td><td>http test</td></tr>
+<tr><td>C.5 withdrawal rules per trigger; undelivered ask cancelled</td><td>unit</td></tr>
+<tr><td>D texts exactly</td><td>snapshot asserts in the tests above</td></tr>
+<tr><td>E validation and each outcome row; old <code>file_path</code> body rejected</td><td>http test + CLI arg test</td></tr>
+<tr><td>F.1 starts on idle, immediately when already idle, not before</td><td>unit with fake runtime</td></tr>
+<tr><td>F.2 fields copied incl. model/effort; root stays root</td><td>unit</td></tr>
+<tr><td>F.3 name rule examples</td><td>unit</td></tr>
+<tr><td>F.4 brief contents; delivered after transfer</td><td>unit</td></tr>
+<tr><td>F.5 creation failure: state failed, D.6, nothing moved</td><td>unit</td></tr>
+<tr><td>G each row moved; idempotent rerun; recovery from <code>transferring</code> and <code>spawning</code></td><td>unit per row + restart test</td></tr>
+<tr><td>G completeness guard</td><td>unit scanning schemas</td></tr>
+<tr><td>H.1 managed worktree survives the handoff and retire; retire provenance</td><td>integration, <code>scripts/test-rust-isolated.sh</code></td></tr>
+<tr><td>H.2 forwarding chain for reply, doc wake, <code>sm send</code> (D.8)</td><td>unit + http</td></tr>
+<tr><td>I.1 auth matrix for both routes: remote owner, local terminal without session (pass); any managed session incl. the target and its parent (403); Origin check</td><td>http test</td></tr>
+<tr><td>I.2 display strings per state</td><td>unit</td></tr>
+<tr><td>I.3 <code>H</code> and <code>P</code> key flows</td><td><code>bin/watch/tests.rs</code></td></tr>
+<tr><td>I.4 web panel calls and refresh</td><td>http test on page + JS smoke via existing watch client tests</td></tr>
+<tr><td>I.5 Android</td><td>ViewModel unit test + manual install check</td></tr>
+<tr><td>J fields stripped on start; old code gone</td><td>unit on startup migration</td></tr>
+<tr><td>End to end</td><td>scratch server (live-state copy): Claude agent, Hand off now, observe states, claims and review wake on successor</td></tr>
+</tbody>
+</table>
+
+<h3 id="m">M. Code references</h3>
+<p>Paths are under <code>crates/sm-server/src/</code> unless noted. Functions are named because line numbers drift.</p>
+<ol>
+<li>Session store as one JSON file: <code>sessions.rs</code>, <code>load_raw_json_value</code> / <code>write_raw_json_value</code>.</li>
+<li>Config loaded once: <code>main.rs</code> → <code>AppConfig::load_from_path_with_local_env</code>. There is no reload path, which is why the defaults are stored in the session store instead.</li>
+<li><code>resolve_context_monitor_thresholds</code>, <code>sessions.rs</code>. It fails closed on non-finite or out-of-range values.</li>
+<li><code>provider_has_measured_context_gauge</code>, <code>sessions.rs</code>.</li>
+<li><code>apply_context_usage_update</code>, <code>sessions.rs</code>. It stores <code>context_used_percentage</code> before checking <code>context_monitor_enabled</code>. For codex-fork, see <code>codex_fork_context_usage</code> and its event-stream caller.</li>
+<li>Same function: the <code>context_cycle_reset_emitted_at</code> / <code>context_sampled_at</code> staleness check.</li>
+<li><code>create_codex_review_request</code>, <code>http.rs</code>; CLI <code>run_request_codex_review_create</code>, <code>bin/sm.rs</code>.</li>
+<li><code>cancel_context_monitor_alerts</code> → <code>cancel_pending_messages_from_sender_category</code>.</li>
+<li><code>SessionRecord</code>, <code>sessions.rs</code>: <code>provider</code>, <code>model</code>, <code>reasoning_effort</code>, <code>working_dir</code>, <code>node</code>, <code>parent_session_id</code>.</li>
+<li><code>spawn_session</code>, <code>http.rs</code>. Provider, working dir and node fall back to the parent. Model and effort pass through unchanged.</li>
+<li><code>build_core_session_record</code>, <code>sessions.rs</code>. Only session-id uniqueness is enforced.</li>
+<li><code>SpawnLaunchIntentRecord</code> / <code>SpawnBriefArtifact</code>, <code>sessions.rs</code>.</li>
+<li><code>work_claims.rs</code>: schema, <code>end_claims_for_session</code>, <code>queue_notice</code>.</li>
+<li><code>retarget_parent_routing</code>, <code>queue.rs</code>; <code>build_reparent_routing_changes</code>, <code>sessions.rs</code>.</li>
+<li><code>register_agent_role_raw</code>, <code>prune_agent_registrations_raw</code>, <code>sessions.rs</code>.</li>
+<li><code>owner_docs.rs</code>; delivery in <code>http/docs/review.rs</code>.</li>
+<li><code>end_work_claims_after_retire</code>, <code>sessions.rs</code>.</li>
+<li><code>work_claims/worktrees.rs</code>: <code>gather</code>, <code>run_worktree_cleanup</code>. It is called from the retire handler via <code>cleanup_after_retire</code>.</li>
+<li><code>live_recipient</code>, <code>http/messages.rs</code>. Users: <code>http/inbox.rs</code>, <code>http/docs/review.rs</code>.</li>
+<li><code>ensure_session_allowed_from_parts</code>, <code>http.rs</code>.</li>
+<li>Old handoff: <code>schedule_handoff</code>, <code>start_pending_claude_handoff</code>, <code>execute_pending_claude_handoff</code>, <code>execute_pending_codex_fork_handoff</code>, <code>recover_pending_claude_handoffs</code>, <code>recover_pending_codex_fork_handoffs</code> (<code>sessions.rs</code>); <code>clear_claude_session_if</code>, <code>clear_codex_session_confirming_prompt</code> (<code>runtime.rs</code>); route <code>POST /sessions/{id}/handoff</code> (<code>http.rs</code>); <code>HandoffArgs</code> (<code>bin/sm.rs</code>).</li>
+<li><code>publish_owner_doc</code>, <code>http/docs.rs</code> (route <code>POST /docs</code>, body field <code>review</code>); CLI <code>run_doc_publish</code>, <code>bin/doc/mod.rs</code>.</li>
+<li>Studio SSH toggle: <code>android-app/…/ui/settings/SettingsScreen.kt</code>, <code>SettingsViewModel.kt</code>.</li>
+</ol>
+
+<h3 id="z">Z. FAQ</h3>
+
+<p><b>Why not keep <code>/clear</code> and just add the triggers?</b> The triggers would work on it, but everything else argues against it. Restoring an agent by id would bring back a mix of context windows. The <code>/clear</code> path needs a provider-specific confirmation for every provider. codex-app has no clear command sm can drive. And the parent and you cannot tell from sm watch that the agent changed. A fresh agent gets all of these for free. The price is Appendix G, which is written out in full.</p>
+
+<p><b>Why move claims in place instead of having the successor run <code>sm ticket --take</code>?</b> <code>--take</code> ends the old claim with reason <code>taken</code>, sends a <code>[sm claim]</code> notice to an agent that is about to retire, and starts a fresh claim without the worktree path. Moving in place keeps the worktree link, which is what protects the worktree from deletion at retire. It also keeps the claim history continuous.</p>
+
+<p><b>Why wait for the predecessor's turn to end instead of retiring at <code>sm handoff</code>?</b> The command runs inside the agent's turn. Agents often run it just before a final <code>git push</code> or comment. Retiring then would kill the push.</p>
+
+<p><b>What if the successor starts working before it reads the note?</b> Its first message is the brief, and the brief's first instruction is to read the note. It has no other prompt.</p>
+
+<p><b>What about an agent that hands off to itself repeatedly?</b> Each handoff is a new agent with a fresh context. A successor is asked again only when it reaches the threshold again. Repeated review requests from the same agent, or its successor, within one context window ask at most once, because the state is not absent.</p>
+
+<p><b>Why store the defaults in sm rather than in <code>config.yaml</code>?</b> sm reads config only at startup, and changing it means a server restart through the restart script. You want to tune the threshold from your phone. The stored object is small, validated on write, and shown by every surface. Nothing else reads it.</p>
+
+<p><b>Why not a per-model threshold, since 35% of a 1M window is much more than 35% of 200K?</b> You asked for a percentage. Per-agent overrides already cover the model you want to treat differently. If you find yourself overriding by model repeatedly, a per-model threshold in <code>handoff_defaults</code> is a small follow-up.</p>
+
+<p><b>Does this change <code>sm context-monitor</code> or the <code>[sm context]</code> alerts?</b> No. They keep working as today and are independent. A parent that wants gauge alerts for a child still enables them. The only link is that handoff cancels the predecessor's pending <code>[sm context]</code> alerts, and the monitor settings copy to the successor.</p>
+
+<p><b>What if the note path is inside the worktree and uncommitted?</b> That is fine. The successor runs on the same machine in the same working directory, so it can read the file.</p>
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
