@@ -228,6 +228,9 @@ pub(super) async fn create_owner_message(
         }
     };
     super::follows::notice_new_message(&state, &message);
+    if message.blocking {
+        super::board::request_recompute(&state);
+    }
     let reader_path = message_reader_path(&message.id);
     Ok((
         StatusCode::CREATED,
@@ -476,6 +479,7 @@ pub(super) async fn reply_to_owner_message(
         draft_ids: drafts.iter().map(|draft| draft.id.clone()).collect(),
     })?;
     if inserted {
+        super::board::request_recompute(&state);
         deliver_now(&state, &recipient.id, &message.id);
     }
     Ok(Json(reply_response(&state, &reply)))
@@ -524,6 +528,7 @@ pub(super) async fn mark_owner_message_handled(
     }
     let _guard = state.owner_message_lock.lock().await;
     owner_message_store(&state).mark_handled(&message.id)?;
+    super::board::request_recompute(&state);
     Ok(StatusCode::NO_CONTENT)
 }
 

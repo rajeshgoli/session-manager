@@ -723,6 +723,9 @@ fn finish(
             wake,
         },
     )?;
+    if changed {
+        super::super::board::request_recompute(state);
+    }
     if changed && state.config.rust_core.runtime_enabled {
         if let Some(target) = posted.delivered_to_session_id.as_deref() {
             let runtime = TmuxRuntime::from_app_config(&state.config);

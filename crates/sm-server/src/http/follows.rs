@@ -52,7 +52,7 @@ pub(super) fn owner_guard(
     Ok(follow_owner_id(&state.config, actor.as_deref()))
 }
 
-fn follow_owner_id(config: &AppConfig, actor: Option<&str>) -> String {
+pub(super) fn follow_owner_id(config: &AppConfig, actor: Option<&str>) -> String {
     match actor {
         Some(actor) if actor != LOCAL_BYPASS_ACTOR => actor.trim().to_ascii_lowercase(),
         _ => config

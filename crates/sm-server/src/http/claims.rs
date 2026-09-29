@@ -15,7 +15,7 @@ use crate::work_claims::{
 #[derive(Debug)]
 pub(super) struct GhCliWorkItemSource;
 
-fn gh_graphql_stdout(query: &str) -> Result<Vec<u8>, String> {
+pub(super) fn gh_graphql_stdout(query: &str) -> Result<Vec<u8>, String> {
     let mut nonce = [0u8; 8];
     OsRng.fill_bytes(&mut nonce);
     let input = std::env::temp_dir().join(format!(

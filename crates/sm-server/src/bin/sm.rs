@@ -18,6 +18,7 @@ const DEFAULT_API_URL: &str = "http://127.0.0.1:8420";
 const CONTEXT_COMPACT_STALE_SECONDS: i64 = 10 * 60;
 const CLIENT_CONFIG_ENV: &str = "SM_CLIENT_CONFIG";
 const CLIENT_CONFIG_SUBPATH: &str = "session-manager/client.yaml";
+mod board;
 mod claims;
 mod doc;
 mod git_repo;
@@ -115,6 +116,8 @@ enum Command {
     Worktree(claims::worktree::WorktreeArgs),
     /// Tickets and PRs with their agents, PRs, docs and reviews; --item N for one timeline
     History(history::HistoryArgs),
+    /// Ticket order and lanes: print the board, record order, add lanes
+    Board(board::BoardArgs),
 }
 
 #[derive(Args)]
@@ -1332,6 +1335,7 @@ fn run() -> Result<()> {
         Command::Pr(args) => claims::run_pr(&client, args)?,
         Command::Worktree(args) => claims::worktree::run_worktree(&client, args)?,
         Command::History(args) => history::run_history(&client, args)?,
+        Command::Board(args) => board::run_board(&client, args)?,
         _ => bail!("this retained command is not implemented in the Rust core slice yet"),
     }
     Ok(())

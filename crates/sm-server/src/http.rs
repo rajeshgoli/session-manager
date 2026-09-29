@@ -322,6 +322,7 @@ pub enum GitHubPullRequestState {
 
 mod agent_history;
 mod analytics;
+mod board;
 mod claims;
 mod docs;
 mod follows;
@@ -480,6 +481,11 @@ pub struct AppState {
     /// Ticket and PR state for work claims (sm#1452).
     work_item_source: Arc<dyn crate::work_claims::WorkItemSource>,
     merge_hold_source: Arc<dyn crate::work_claims::merge_holds::MergeHoldSource>,
+    /// GitHub for the board (sm#1665).
+    board_source: Arc<dyn crate::board::sync::BoardSource>,
+    /// Serializes board passes, recomputes, and lane and link writes.
+    board_lock: Arc<Mutex<()>>,
+    board_wake: Arc<board::BoardWake>,
     codex_review_creation_locks: Arc<Mutex<BTreeSet<String>>>,
     codex_review_watcher_ids: Arc<Mutex<BTreeSet<String>>>,
     tmux_client_event_state: Arc<Mutex<TmuxClientEventState>>,
@@ -612,6 +618,9 @@ impl AppState {
             owner_message_lock: Arc::new(AsyncMutex::new(())),
             work_item_source: Arc::new(claims::GhCliWorkItemSource),
             merge_hold_source: Arc::new(merge_holds::GhMergeHoldSource),
+            board_source: Arc::new(board::GhCliBoardSource),
+            board_lock: Arc::new(Mutex::new(())),
+            board_wake: Arc::new(board::BoardWake::default()),
             codex_review_creation_locks: Arc::new(Mutex::new(BTreeSet::new())),
             codex_review_watcher_ids: Arc::new(Mutex::new(BTreeSet::new())),
             tmux_client_event_state: Arc::new(Mutex::new(TmuxClientEventState::default())),
@@ -665,6 +674,17 @@ impl AppState {
     ) -> Self {
         self.work_item_source = source;
         self
+    }
+
+    pub fn with_board_source(mut self, source: Arc<dyn crate::board::sync::BoardSource>) -> Self {
+        self.board_source = source;
+        self
+    }
+
+    /// One board read pass (appendix C). The live server runs it on a
+    /// timer; tests call it directly.
+    pub fn run_board_pass(&self) -> anyhow::Result<crate::board::Recomputed> {
+        board::run_pass(self)
     }
 
     /// One work claims sync pass (backfill, recovery, reconciliation, GitHub
@@ -1455,6 +1475,7 @@ pub fn router(state: AppState) -> Router {
     docs::init_owner_docs(&state.config);
     docs::recover_owner_doc_reviews(state.clone());
     claims::init_work_claims(state.clone());
+    board::init_board(state.clone());
     recover_codex_review_request_watchers(state.clone());
     recover_btw_requests(state.clone());
     if state.config.rust_core.runtime_enabled {
@@ -1565,6 +1586,19 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/merge-holds/release", post(merge_holds::release))
         .route("/claims", get(claims::list_claims).post(claims::post_claim))
+        .route("/board", get(board::get_board))
+        .route("/board/links", post(board::post_link))
+        .route("/board/lanes", post(board::post_lane))
+        .route("/client/board", get(board::client_board))
+        .route("/client/board/order", put(board::put_order))
+        .route("/client/board/lanes", post(board::client_post_lane))
+        .route(
+            "/client/board/lanes/{lane_id}",
+            delete(board::client_delete_lane),
+        )
+        .route("/client/board/badge", get(board::client_board_badge))
+        .route("/client/board/seen", post(board::client_board_seen))
+        .route("/client/board/refresh", post(board::client_board_refresh))
         .route("/claims/release", post(claims::release_claim))
         .route("/claims/worktree", post(worktrees::post_claim_worktree))
         .route("/worktrees/keep", post(worktrees::post_worktree_keep))
@@ -14201,6 +14235,9 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path.starts_with("/codex-review-requests/")
         || path == "/session-obligations"
         || path == "/claims"
+        || path == "/board"
+        || path == "/client/board"
+        || path == "/client/board/badge"
         || path == "/history"
         || path == "/history/agents"
         || path == "/guestbook"

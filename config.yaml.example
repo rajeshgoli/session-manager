@@ -476,3 +476,22 @@ sessions:
   naming:
     pattern: "{friendly_name}"               # e.g., task1042-fix
     fallback: "child-{short_id}"             # e.g., child-abc123
+
+# sm board (sm#1665): ticket order read from GitHub's links, lanes you rank.
+board:
+  # Repos read besides those of the lanes; their tickets outside any lane
+  # show under "Not in any lane".
+  repos:
+    - rajeshgoli/session-manager
+    - rajeshgoli/fractal-algo-rust
+  # Seconds between GitHub reads (at least 30).
+  sync_interval_seconds: 60
+  # Where Start runs a new agent, per owner/name. Without an entry sm uses
+  # ~/projects/<name> when its origin names the same repo.
+  checkouts: {}
+  # What the Start sheet preselects. The model must be an identifier the
+  # model catalog returns (GET /client/session-models).
+  start_defaults:
+    provider: claude
+    model: claude-opus-5-5[1m]
+    reasoning_effort: high

@@ -37,6 +37,7 @@ pub const MESSAGE_CATEGORY: &str = "work_claim";
 
 pub fn init_work_claims_schema(conn: &Connection) -> Result<()> {
     merge_holds::init_schema(conn)?;
+    crate::board::init_board_schema(conn)?;
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS work_items (
