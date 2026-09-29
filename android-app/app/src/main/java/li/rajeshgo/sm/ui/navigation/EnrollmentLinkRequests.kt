@@ -20,3 +20,8 @@ object EnrollmentLinkRequests {
 object ReaderLinkRequests {
     var pending by mutableStateOf<ReaderPage?>(null)
 }
+
+/** New session chosen from a screen's menu, waiting for the watch screen's create sheet (sm#1659). */
+object NewSessionRequests {
+    var pending by mutableStateOf(false)
+}

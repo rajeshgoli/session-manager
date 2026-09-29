@@ -49,10 +49,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import java.net.URI
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import li.rajeshgo.sm.data.model.SessionClaim
 import li.rajeshgo.sm.data.model.SessionDoc
 import li.rajeshgo.sm.data.model.SessionMessage
 import li.rajeshgo.sm.data.remote.DeviceClientCertificate
+import li.rajeshgo.sm.data.remote.HttpClientFactory
+import li.rajeshgo.sm.data.repository.SettingsRepository
 import li.rajeshgo.sm.ui.theme.BorderStrong
 import li.rajeshgo.sm.ui.theme.Cyan
 import li.rajeshgo.sm.ui.theme.Panel
@@ -66,6 +69,18 @@ class DocReaderAuth(
     val clientCertificate: DeviceClientCertificate?,
 ) {
     val headers: Map<String, String> get() = mapOf("Authorization" to "Bearer $accessToken")
+}
+
+/** The signed-in device's reader auth, or null when signed out. */
+suspend fun loadDocReaderAuth(settingsRepository: SettingsRepository): DocReaderAuth? {
+    val serverUrl = settingsRepository.serverUrl.first().trim()
+    val accessToken = settingsRepository.accessToken.first().trim()
+    if (serverUrl.isBlank() || accessToken.isBlank()) return null
+    return DocReaderAuth(
+        serverUrl = serverUrl,
+        accessToken = accessToken,
+        clientCertificate = HttpClientFactory(settingsRepository).deviceClientCertificate(),
+    )
 }
 
 private const val DOC_VERSION_LENGTH = 12
@@ -158,9 +173,11 @@ fun ownerReaderPage(title: String, path: String): ReaderPage =
 
 val historyReaderPage: ReaderPage get() = ownerReaderPage("History", "/history")
 
+val guestbookReaderPage: ReaderPage get() = ownerReaderPage("Guestbook", "/guestbook")
+
 /**
  * The reader page for an opened sm link on the owner's browser host
- * (`https://<linkHost>/docs/…`, `/messages/…`, `/t/…` or `/history`), or null when the link
+ * (`https://<linkHost>/docs/…`, `/messages/…`, `/t/…`, `/history` or `/guestbook`), or null when the link
  * is not one. The reader loads the same path and query from the app's server;
  * a doc's link stays the page's shared link.
  */
@@ -181,6 +198,7 @@ fun readerPageForLink(url: String, linkHost: String): ReaderPage? {
         rawPath.startsWith("/t/") -> ownerReaderPage("Ticket", path)
         rawPath == "/inbox" || rawPath.startsWith("/inbox/") -> ownerReaderPage("Inbox", path)
         rawPath == "/history" -> ownerReaderPage("History", path)
+        rawPath == "/guestbook" -> ownerReaderPage("Guestbook", path)
         else -> null
     }
 }
@@ -230,14 +248,14 @@ fun docNavigation(serverUrl: String, currentUrl: String?, targetUrl: String): Do
 }
 
 /**
- * The pages that stay in the reader: docs, owner messages (sm#1580), the Inbox (sm#1647), History, ticket pages, and the web
- * watch at `/` and `/watch`, so the page shell's Watch · History tabs never
+ * The pages that stay in the reader: docs, owner messages (sm#1580), the Inbox (sm#1647), History, the Guestbook, ticket pages,
+ * and the web watch at `/` and `/watch`, so the page shell's Inbox · Watch · History · Guestbook tabs never
  * leave the authenticated web view.
  */
 fun isOwnerPagePath(path: String): Boolean =
     path.startsWith("/docs/") || path.startsWith("/messages/") || path.startsWith("/t/") ||
         path == "/inbox" || path.startsWith("/inbox/") ||
-        path == "/history" || path == "/watch" || path == "/" || path.isEmpty()
+        path == "/history" || path == "/guestbook" || path == "/watch" || path == "/" || path.isEmpty()
 
 private fun sameOrigin(a: URI, b: URI): Boolean =
     a.scheme.equals(b.scheme, ignoreCase = true) &&

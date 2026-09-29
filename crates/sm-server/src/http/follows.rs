@@ -22,9 +22,9 @@ pub(super) fn push_store(state: &AppState) -> OwnerPushStore {
     OwnerPushStore::new(owner_push::push_db_path(&state.config))
 }
 
-/// The same guard chain as `POST /client/request-status`, returning the
-/// follow owner: the signed-in email, or for a local call the first
-/// allowlisted Google email.
+/// The owner write guard chain (Cloudflare Access, public edge assertion,
+/// owner bearer or local), returning the follow owner: the signed-in email,
+/// or for a local call the first allowlisted Google email.
 pub(super) fn owner_guard(
     state: &AppState,
     headers: &HeaderMap,
@@ -256,8 +256,8 @@ pub(super) async fn follow_session(
     Ok((StatusCode::CREATED, Json(follow_json(&follow)?)))
 }
 
-/// Delivers the `[sm follow]` message the way `POST /client/request-status`
-/// delivers its prompt: an important system message with no sender session.
+/// Delivers the `[sm follow]` message as an important system message with no
+/// sender session.
 fn send_follow_message(
     state: &AppState,
     session: &SessionRecord,

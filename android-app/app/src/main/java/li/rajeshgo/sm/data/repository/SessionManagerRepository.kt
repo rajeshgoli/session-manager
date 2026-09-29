@@ -14,9 +14,7 @@ import li.rajeshgo.sm.data.model.AnalyticsSummary
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.DeviceGoogleAuthResponse
-import li.rajeshgo.sm.data.model.EnsureMaintainerResponse
 import li.rajeshgo.sm.data.model.MobileAttachTicketResponse
-import li.rajeshgo.sm.data.model.RequestStatusResponse
 import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.data.model.StudioSshStatusResponse
 import li.rajeshgo.sm.data.model.ToolCallRow
@@ -501,12 +499,6 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token).sendTestPush() }.mapFailure(::classifyWriteFailure)
     }
 
-    suspend fun requestStatus(baseUrl: String, token: String): Result<RequestStatusResponse> = withContext(Dispatchers.IO) {
-        runCatching {
-            api(baseUrl, token).requestStatus()
-        }.mapFailure(::classifyWriteFailure)
-    }
-
     suspend fun fetchStudioSshStatus(baseUrl: String, token: String): StudioSshStatusResponse = withContext(Dispatchers.IO) {
         executeReadRequest(baseUrl, token) { it.getStudioSshStatus() }
     }
@@ -514,12 +506,6 @@ class SessionManagerRepository(
     suspend fun setStudioSsh(baseUrl: String, token: String, enabled: Boolean): Result<StudioSshStatusResponse> = withContext(Dispatchers.IO) {
         runCatching {
             api(baseUrl, token).setStudioSsh(li.rajeshgo.sm.data.model.StudioSshToggleRequest(enabled))
-        }.mapFailure(::classifyWriteFailure)
-    }
-
-    suspend fun ensureMaintainer(baseUrl: String, token: String): Result<EnsureMaintainerResponse> = withContext(Dispatchers.IO) {
-        runCatching {
-            api(baseUrl, token).ensureMaintainer()
         }.mapFailure(::classifyWriteFailure)
     }
 

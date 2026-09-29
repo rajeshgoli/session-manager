@@ -62,6 +62,8 @@ import li.rajeshgo.sm.push.FollowOpen
 import li.rajeshgo.sm.push.FollowOpenRequests
 import li.rajeshgo.sm.ui.watch.MarkdownText
 import li.rajeshgo.sm.ui.navigation.AppBottomNav
+import li.rajeshgo.sm.ui.navigation.AppMenuActions
+import li.rajeshgo.sm.ui.navigation.AppTopBar
 import li.rajeshgo.sm.ui.navigation.Routes
 import li.rajeshgo.sm.ui.theme.Amber
 import li.rajeshgo.sm.ui.theme.Border
@@ -96,8 +98,8 @@ internal fun rememberResumed(): Boolean {
 fun QueueScreen(
     onNavigateToInbox: () -> Unit,
     onNavigateToWatch: () -> Unit,
-    onNavigateToAnalytics: () -> Unit,
     onOpenUsage: () -> Unit,
+    menu: AppMenuActions,
     viewModel: QueueViewModel = viewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -130,14 +132,14 @@ fun QueueScreen(
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 item {
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Bottom) {
-                        Text("Queue", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
-                        Text(
-                            state.lastUpdated?.let { "updated ${shortDuration(Duration.between(it, now).seconds)} ago" } ?: "",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextMuted,
-                        )
-                    }
+                    AppTopBar(
+                        title = "Queue",
+                        menu = menu,
+                        subtitle = state.lastUpdated?.let { "Updated ${shortDuration(Duration.between(it, now).seconds)} ago" },
+                        current = Routes.QUEUE,
+                        onRefresh = { viewModel.refresh(); viewModel.refreshStats() },
+                        modifier = Modifier.padding(bottom = 8.dp),
+                    )
                     state.refreshError?.let { Text(it, color = Amber, style = MaterialTheme.typography.bodySmall) }
                     if (state.signedOut) Text("Sign in to load the queue", color = Rose)
                 }
@@ -213,7 +215,6 @@ fun QueueScreen(
                 onInbox = onNavigateToInbox,
                 onWatch = onNavigateToWatch,
                 onQueue = {},
-                onAnalytics = onNavigateToAnalytics,
             )
         }
     }

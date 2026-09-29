@@ -146,18 +146,6 @@ data class SessionListResponse(
 )
 
 @Serializable
-data class EnsureMaintainerResponse(
-    val created: Boolean = false,
-    val session: ClientSession,
-)
-
-@Serializable
-data class EnsureMaintainerRequest(
-    @SerialName("requester_session_id")
-    val requesterSessionId: String? = null,
-)
-
-@Serializable
 data class WhatRequestBody(
     @SerialName("delivery_mode")
     val deliveryMode: String,
@@ -353,22 +341,6 @@ data class PrimaryAction(
 @Serializable
 data class OutputResponse(
     val output: String? = null,
-)
-
-@Serializable
-data class RequestStatusResponse(
-    val status: String = "requested",
-    val prompt: String,
-    @SerialName("targeted_count")
-    val targetedCount: Int = 0,
-    @SerialName("delivered_count")
-    val deliveredCount: Int = 0,
-    @SerialName("queued_count")
-    val queuedCount: Int = 0,
-    @SerialName("failed_count")
-    val failedCount: Int = 0,
-    @SerialName("targeted_session_ids")
-    val targetedSessionIds: List<String> = emptyList(),
 )
 
 @Serializable

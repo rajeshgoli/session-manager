@@ -1286,13 +1286,6 @@ def test_manifest_covers_native_mobile_support_http_surfaces():
     manifest = ContractManifest.load()
     checks = {check.id: check for check in manifest.checks}
 
-    request_status = checks["http.client_request_status"]
-    assert request_status.classification == "retained"
-    assert request_status.target == "python_and_rust"
-    assert request_status.safety == "mutating"
-    assert request_status.path == "/client/request-status"
-    assert "mutating_opt_in" in request_status.preconditions
-
     bug_report = checks["http.client_bug_report"]
     assert bug_report.classification == "retained"
     assert bug_report.target == "python_and_rust"

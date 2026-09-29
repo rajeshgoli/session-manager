@@ -69,7 +69,8 @@ import li.rajeshgo.sm.data.model.AnalyticsHealthCheck
 import li.rajeshgo.sm.data.model.AnalyticsKpi
 import li.rajeshgo.sm.data.model.AnalyticsSummary
 import li.rajeshgo.sm.data.model.AnalyticsThroughputBucket
-import li.rajeshgo.sm.ui.navigation.AppBottomNav
+import li.rajeshgo.sm.ui.navigation.AppMenuActions
+import li.rajeshgo.sm.ui.navigation.AppTopBar
 import li.rajeshgo.sm.ui.navigation.Routes
 import li.rajeshgo.sm.ui.theme.Amber
 import li.rajeshgo.sm.ui.theme.Border
@@ -91,10 +92,8 @@ private const val ANALYTICS_AUTO_REFRESH_MS = 10000L
 
 @Composable
 fun AnalyticsScreen(
-    onNavigateToInbox: () -> Unit,
-    onNavigateToWatch: () -> Unit,
-    onNavigateToSettings: () -> Unit,
-    onNavigateToQueue: () -> Unit,
+    onBack: () -> Unit,
+    menu: AppMenuActions,
     onOpenDetail: (String) -> Unit,
     viewModel: AnalyticsViewModel = viewModel(),
     updateViewModel: UpdateAvailabilityViewModel = viewModel(),
@@ -144,13 +143,15 @@ fun AnalyticsScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item {
-                AnalyticsHeader(
-                    userEmail = state.userEmail,
-                    generatedAt = state.summary?.generatedAt,
-                    refreshing = state.refreshing,
-                    hasUpdate = updateState.availableUpdate != null,
+                AppTopBar(
+                    title = "Analytics",
+                    menu = menu,
+                    subtitle = state.summary?.generatedAt?.let { "Sync ${formatGeneratedAt(it)}" },
+                    busy = state.refreshing,
+                    current = Routes.ANALYTICS,
+                    onBack = onBack,
                     onRefresh = { viewModel.refresh() },
-                    onOpenSettings = onNavigateToSettings,
+                    updateViewModel = updateViewModel,
                 )
             }
 
@@ -158,7 +159,7 @@ fun AnalyticsScreen(
                 item {
                     UpdateReadyBanner(
                         update = update,
-                        onOpenSettings = onNavigateToSettings,
+                        onOpenSettings = menu.onOpenSettings,
                     )
                 }
             }
@@ -244,20 +245,6 @@ fun AnalyticsScreen(
                 }
             }
         }
-
-        Box(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(horizontal = 16.dp, vertical = 16.dp),
-        ) {
-            AppBottomNav(
-                currentRoute = Routes.ANALYTICS,
-                onInbox = onNavigateToInbox,
-                onWatch = onNavigateToWatch,
-                onQueue = onNavigateToQueue,
-                onAnalytics = {},
-            )
-        }
     }
 }
 
@@ -265,11 +252,7 @@ fun AnalyticsScreen(
 fun AnalyticsDetailScreen(
     section: String,
     onBack: () -> Unit,
-    onNavigateToInbox: () -> Unit,
-    onNavigateToWatch: () -> Unit,
-    onNavigateToAnalytics: () -> Unit,
-    onNavigateToSettings: () -> Unit,
-    onNavigateToQueue: () -> Unit,
+    menu: AppMenuActions,
     viewModel: AnalyticsViewModel = viewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -293,11 +276,11 @@ fun AnalyticsDetailScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item {
-                DetailHeader(
+                AppTopBar(
                     title = detailTitle(section),
+                    menu = menu,
                     subtitle = summary?.generatedAt?.let { "Live snapshot ${formatGeneratedAt(it)}" } ?: "No data",
                     onBack = onBack,
-                    onOpenSettings = onNavigateToSettings,
                 )
             }
             state.error?.takeIf { it.isNotBlank() }?.let { message ->
@@ -397,131 +380,6 @@ fun AnalyticsDetailScreen(
                             )
                         }
                     }
-                }
-            }
-        }
-
-        Box(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(horizontal = 16.dp, vertical = 16.dp),
-        ) {
-            AppBottomNav(
-                currentRoute = Routes.ANALYTICS,
-                onInbox = onNavigateToInbox,
-                onWatch = onNavigateToWatch,
-                onQueue = onNavigateToQueue,
-                onAnalytics = onNavigateToAnalytics,
-            )
-        }
-    }
-}
-
-@Composable
-private fun AnalyticsHeader(
-    userEmail: String,
-    generatedAt: String?,
-    refreshing: Boolean,
-    hasUpdate: Boolean,
-    onRefresh: () -> Unit,
-    onOpenSettings: () -> Unit,
-) {
-    Surface(
-        color = Panel,
-        shape = RoundedCornerShape(8.dp),
-    ) {
-        Column {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 12.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Icon(Icons.Rounded.Analytics, contentDescription = null, tint = Cyan)
-                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Text(
-                            text = "sm analytics",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurface,
-                            fontWeight = FontWeight.Black,
-                            letterSpacing = androidx.compose.ui.unit.TextUnit.Unspecified,
-                        )
-                        val subtitle = listOfNotNull(
-                            userEmail.takeIf { it.isNotBlank() },
-                            generatedAt?.let(::formatGeneratedAt)?.let { "Sync $it" },
-                        ).joinToString("  •  ")
-                        Text(
-                            text = subtitle.ifBlank { "Operational telemetry" },
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (refreshing) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(16.dp),
-                            strokeWidth = 2.dp,
-                            color = Cyan,
-                        )
-                    } else {
-                        IconButton(onClick = onRefresh) {
-                            Icon(Icons.Rounded.Refresh, contentDescription = "Refresh", tint = TextSecondary)
-                        }
-                    }
-                    SettingsIconButtonWithUpdate(hasUpdate = hasUpdate, onClick = onOpenSettings)
-                }
-            }
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(1.dp)
-                    .background(PanelMuted),
-            )
-        }
-    }
-}
-
-@Composable
-private fun DetailHeader(
-    title: String,
-    subtitle: String,
-    onBack: () -> Unit,
-    onOpenSettings: () -> Unit,
-) {
-    Surface(color = Panel, shape = RoundedCornerShape(8.dp)) {
-        Column {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 12.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back", tint = TextSecondary)
-                    }
-                    Column {
-                        Text(
-                            text = title,
-                            style = MaterialTheme.typography.labelLarge,
-                            color = MaterialTheme.colorScheme.onSurface,
-                            fontWeight = FontWeight.Black,
-                        )
-                        Text(
-                            text = subtitle,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = TextSecondary,
-                        )
-                    }
-                }
-                IconButton(onClick = onOpenSettings) {
-                    Icon(Icons.Rounded.Settings, contentDescription = "Settings", tint = TextSecondary)
                 }
             }
         }

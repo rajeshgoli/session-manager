@@ -22,6 +22,8 @@ import li.rajeshgo.sm.ui.queue.QueueScreen
 import li.rajeshgo.sm.ui.queue.UsageScreen
 import li.rajeshgo.sm.ui.settings.SettingsScreen
 import li.rajeshgo.sm.ui.watch.WatchScreen
+import li.rajeshgo.sm.ui.watch.guestbookReaderPage
+import li.rajeshgo.sm.ui.watch.historyReaderPage
 
 private const val INBOX_BADGE_REFRESH_MS = 60_000L
 
@@ -33,6 +35,8 @@ object Routes {
     const val ANALYTICS_DETAIL = "analytics/detail"
     const val QUEUE = "queue"
     const val USAGE = "usage"
+    const val HISTORY = "history"
+    const val GUESTBOOK = "guestbook"
 }
 
 @Composable
@@ -88,6 +92,30 @@ fun AppNavigation() {
         }
     }
 
+    val toWatch = {
+        navController.navigate(Routes.WATCH) {
+            popUpTo(Routes.WATCH) { inclusive = false }
+            launchSingleTop = true
+        }
+    }
+    val toQueue = {
+        navController.navigate(Routes.QUEUE) {
+            popUpTo(Routes.WATCH) { inclusive = false }
+            launchSingleTop = true
+        }
+    }
+    // The three-dots menu every screen shares (sm#1659).
+    val menu = AppMenuActions(
+        onNewSession = {
+            NewSessionRequests.pending = true
+            toWatch()
+        },
+        onOpenHistory = { navController.navigate(Routes.HISTORY) { launchSingleTop = true } },
+        onOpenGuestbook = { navController.navigate(Routes.GUESTBOOK) { launchSingleTop = true } },
+        onOpenAnalytics = { navController.navigate(Routes.ANALYTICS) { launchSingleTop = true } },
+        onOpenSettings = { navController.navigate(Routes.SETTINGS) { launchSingleTop = true } },
+    )
+
     // An opened sm link opens in the watch screen's reader when signed in.
     val pendingReaderLink = ReaderLinkRequests.pending
     LaunchedEffect(pendingReaderLink, isLoggedIn) {
@@ -112,79 +140,39 @@ fun AppNavigation() {
         }
         composable(Routes.INBOX) {
             InboxScreen(
-                onNavigateToWatch = {
-                    navController.navigate(Routes.WATCH) {
-                        popUpTo(Routes.WATCH) { inclusive = false }
-                        launchSingleTop = true
-                    }
-                },
-                onNavigateToQueue = {
-                    navController.navigate(Routes.QUEUE) {
-                        launchSingleTop = true
-                    }
-                },
-                onNavigateToAnalytics = {
-                    navController.navigate(Routes.ANALYTICS) {
-                        launchSingleTop = true
-                    }
-                },
+                onNavigateToWatch = toWatch,
+                onNavigateToQueue = toQueue,
+                menu = menu,
             )
         }
         composable(Routes.WATCH) {
             WatchScreen(
                 onNavigateToInbox = toInbox,
-                onNavigateToSettings = {
-                    navController.navigate(Routes.SETTINGS)
-                },
-                onNavigateToAnalytics = {
-                    navController.navigate(Routes.ANALYTICS) {
-                        launchSingleTop = true
-                    }
-                },
-                onNavigateToQueue = {
-                    navController.navigate(Routes.QUEUE) {
-                        launchSingleTop = true
-                    }
-                },
+                onNavigateToQueue = toQueue,
+                menu = menu,
             )
         }
         composable(Routes.QUEUE) {
             QueueScreen(
                 onNavigateToInbox = toInbox,
-                onNavigateToWatch = {
-                    navController.navigate(Routes.WATCH) {
-                        popUpTo(Routes.WATCH) { inclusive = false }
-                        launchSingleTop = true
-                    }
-                },
-                onNavigateToAnalytics = {
-                    navController.navigate(Routes.ANALYTICS) {
-                        launchSingleTop = true
-                    }
-                },
+                onNavigateToWatch = toWatch,
                 onOpenUsage = { navController.navigate(Routes.USAGE) },
+                menu = menu,
             )
         }
         composable(Routes.USAGE) {
             UsageScreen(onBack = { navController.popBackStack() })
         }
+        composable(Routes.HISTORY) {
+            OwnerPageScreen(page = historyReaderPage, onBack = { navController.popBackStack() })
+        }
+        composable(Routes.GUESTBOOK) {
+            OwnerPageScreen(page = guestbookReaderPage, onBack = { navController.popBackStack() })
+        }
         composable(Routes.ANALYTICS) {
             AnalyticsScreen(
-                onNavigateToInbox = toInbox,
-                onNavigateToWatch = {
-                    navController.navigate(Routes.WATCH) {
-                        popUpTo(Routes.WATCH) { inclusive = false }
-                        launchSingleTop = true
-                    }
-                },
-                onNavigateToSettings = {
-                    navController.navigate(Routes.SETTINGS)
-                },
-                onNavigateToQueue = {
-                    navController.navigate(Routes.QUEUE) {
-                        launchSingleTop = true
-                    }
-                },
+                onBack = { navController.popBackStack() },
+                menu = menu,
                 onOpenDetail = { section ->
                     navController.navigate("${Routes.ANALYTICS_DETAIL}/$section")
                 },
@@ -194,27 +182,7 @@ fun AppNavigation() {
             AnalyticsDetailScreen(
                 section = backStackEntry.arguments?.getString("section").orEmpty(),
                 onBack = { navController.popBackStack() },
-                onNavigateToInbox = toInbox,
-                onNavigateToWatch = {
-                    navController.navigate(Routes.WATCH) {
-                        popUpTo(Routes.WATCH) { inclusive = false }
-                        launchSingleTop = true
-                    }
-                },
-                onNavigateToAnalytics = {
-                    navController.navigate(Routes.ANALYTICS) {
-                        popUpTo(Routes.ANALYTICS) { inclusive = false }
-                        launchSingleTop = true
-                    }
-                },
-                onNavigateToSettings = {
-                    navController.navigate(Routes.SETTINGS)
-                },
-                onNavigateToQueue = {
-                    navController.navigate(Routes.QUEUE) {
-                        launchSingleTop = true
-                    }
-                },
+                menu = menu,
             )
         }
     }

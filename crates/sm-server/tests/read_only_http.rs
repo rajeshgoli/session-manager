@@ -1440,89 +1440,6 @@ async fn client_analytics_summary_rejects_public_host_without_auth() {
 }
 
 #[tokio::test]
-async fn client_request_status_prompts_live_sessions() {
-    let state_file = unique_temp_path();
-    let first_log = unique_temp_path();
-    let second_log = unique_temp_path();
-    let codex_app_log = unique_temp_path();
-    fs::write(
-        &state_file,
-        json!({
-            "sessions": [
-                {
-                    "id": "mobileone",
-                    "name": "claude-mobileone",
-                    "working_dir": "/repo",
-                    "tmux_session": "claude-mobileone",
-                    "log_file": first_log.display().to_string(),
-                    "status": "running",
-                    "created_at": "2026-06-01T00:00:00",
-                    "last_activity": "2026-06-01T00:01:00"
-                },
-                {
-                    "id": "mobiletwo",
-                    "name": "claude-mobiletwo",
-                    "working_dir": "/repo",
-                    "tmux_session": "claude-mobiletwo",
-                    "log_file": second_log.display().to_string(),
-                    "status": "waiting_permission",
-                    "created_at": "2026-06-01T00:00:00",
-                    "last_activity": "2026-06-01T00:01:00"
-                },
-                {
-                    "id": "mobilecodexapp",
-                    "name": "codex-app-mobile",
-                    "working_dir": "/repo",
-                    "tmux_session": "codex-app-mobile",
-                    "provider": "codex-app",
-                    "log_file": codex_app_log.display().to_string(),
-                    "status": "running",
-                    "created_at": "2026-06-01T00:00:00",
-                    "last_activity": "2026-06-01T00:01:00"
-                },
-                {
-                    "id": "mobilestopped",
-                    "name": "claude-mobilestopped",
-                    "working_dir": "/repo",
-                    "tmux_session": "claude-mobilestopped",
-                    "status": "stopped",
-                    "created_at": "2026-06-01T00:00:00",
-                    "last_activity": "2026-06-01T00:01:00"
-                }
-            ]
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let mut config = config_with_state_file(&state_file);
-    config.rust_core.fixture_writes_enabled = true;
-    let app = router(AppState::new(config));
-
-    let (status, payload) = post_json(app, "/client/request-status", json!({})).await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "requested");
-    assert_eq!(
-        payload["prompt"],
-        "[sm] user requests status, please update now using sm status"
-    );
-    assert_eq!(payload["targeted_count"], 3);
-    assert_eq!(payload["delivered_count"], 2);
-    assert_eq!(payload["queued_count"], 0);
-    assert_eq!(payload["failed_count"], 1);
-    assert_eq!(
-        payload["targeted_session_ids"],
-        json!(["mobileone", "mobiletwo", "mobilecodexapp"])
-    );
-    let first_output = fs::read_to_string(first_log).unwrap();
-    assert!(first_output.contains("[sm] user requests status"));
-    let second_output = fs::read_to_string(second_log).unwrap();
-    assert!(second_output.contains("[sm] user requests status"));
-    let codex_app_output = fs::read_to_string(codex_app_log).unwrap_or_default();
-    assert!(!codex_app_output.contains("[sm] user requests status"));
-}
-
-#[tokio::test]
 async fn client_bug_report_persists_sqlite_row_and_debug_state() {
     let state_file = write_session_fixture();
     let bug_db = unique_temp_path();
@@ -9548,11 +9465,7 @@ async fn shadow_http_classifies_core_writes_without_side_effects() {
 #[tokio::test]
 async fn shadow_http_classifies_native_mobile_writes_without_side_effects() {
     let app = router(AppState::new(AppConfig::default()));
-    for path in [
-        "/client/request-status",
-        "/client/bug-reports",
-        "/deploy/session-manager-android",
-    ] {
+    for path in ["/client/bug-reports", "/deploy/session-manager-android"] {
         let (status, payload) = post_json(
             app.clone(),
             "/__shadow/http",

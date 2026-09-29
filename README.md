@@ -465,7 +465,6 @@ backup, restore, freeze/drain, fixture, shadow, and canary evidence.
 | `/sessions/{id}/activity-actions` | GET | Provider-neutral activity projection |
 | `/client/bootstrap` | GET | Native app bootstrap |
 | `/client/sessions` | GET | Native app session list |
-| `/client/request-status` | POST | Ask live agents for status |
 | `/auth/session` | GET | Auth/session status |
 | `/auth/device/google` | POST | Native Google ID-token exchange |
 | `/apps/{name}/meta.json` | GET | App artifact metadata |

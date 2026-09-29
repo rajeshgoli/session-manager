@@ -19,7 +19,6 @@ import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.SessionDetail
 import li.rajeshgo.sm.data.model.SessionJob
-import li.rajeshgo.sm.data.remote.HttpClientFactory
 import li.rajeshgo.sm.data.repository.SessionManagerAuthException
 import li.rajeshgo.sm.data.repository.SessionManagerBackendUnavailableException
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
@@ -80,8 +79,6 @@ data class WatchUiState(
     val whatBySessionId: Map<String, WhatUiState> = emptyMap(),
     val loading: Boolean = true,
     val refreshing: Boolean = false,
-    val requestingStatus: Boolean = false,
-    val ensuringMaintainer: Boolean = false,
     val studioSshEnabled: Boolean = false,
     val studioSshStatus: String = "off",
     val studioSshHost: String = "",
@@ -121,16 +118,7 @@ class WatchViewModel(application: Application, private val savedState: androidx.
     val uiState: StateFlow<WatchUiState> = _uiState
 
     /** Server URL, bearer token and device certificate for the doc reader; null when signed out. */
-    suspend fun docReaderAuth(): DocReaderAuth? {
-        val serverUrl = settingsRepository.serverUrl.first().trim()
-        val accessToken = settingsRepository.accessToken.first().trim()
-        if (serverUrl.isBlank() || accessToken.isBlank()) return null
-        return DocReaderAuth(
-            serverUrl = serverUrl,
-            accessToken = accessToken,
-            clientCertificate = HttpClientFactory(settingsRepository).deviceClientCertificate(),
-        )
-    }
+    suspend fun docReaderAuth(): DocReaderAuth? = loadDocReaderAuth(settingsRepository)
 
     init {
         viewModelScope.launch {
@@ -937,104 +925,6 @@ class WatchViewModel(application: Application, private val savedState: androidx.
             401 -> "Sign in again in Settings to reconnect. Your draft is saved."
             403 -> "Device access was refused. Check device enrollment in Settings. Your draft is saved."
             else -> "Couldn't connect. Retry when your connection is available. Your draft is saved."
-        }
-    }
-
-    fun requestStatus(onComplete: (Result<String>) -> Unit) {
-        viewModelScope.launch {
-            if (_uiState.value.requestingStatus) {
-                return@launch
-            }
-            _uiState.value = _uiState.value.copy(requestingStatus = true)
-            try {
-                val serverUrl = settingsRepository.serverUrl.first()
-                val accessToken = settingsRepository.accessToken.first()
-                if (serverUrl.isBlank() || accessToken.isBlank()) {
-                    onComplete(Result.failure(IllegalStateException("Sign in to request status")))
-                    return@launch
-                }
-
-                val result = sessionRepository.requestStatus(serverUrl, accessToken)
-                    .map { response ->
-                        buildString {
-                            append("Requested status from ")
-                            append(response.targetedCount)
-                            append(" sessions")
-                            if (response.deliveredCount > 0 || response.queuedCount > 0 || response.failedCount > 0) {
-                                append(" • ")
-                                append(response.deliveredCount)
-                                append(" now")
-                                append(" • ")
-                                append(response.queuedCount)
-                                append(" queued")
-                                if (response.failedCount > 0) {
-                                    append(" • ")
-                                    append(response.failedCount)
-                                    append(" failed")
-                                }
-                            }
-                        }
-                    }
-                result.onSuccess {
-                    refresh()
-                }
-                onComplete(result)
-            } finally {
-                _uiState.value = _uiState.value.copy(requestingStatus = false)
-            }
-        }
-    }
-
-    fun ensureMaintainer(onComplete: (Result<String>) -> Unit) {
-        viewModelScope.launch {
-            if (_uiState.value.ensuringMaintainer) {
-                return@launch
-            }
-            _uiState.value = _uiState.value.copy(ensuringMaintainer = true)
-            try {
-                val serverUrl = settingsRepository.serverUrl.first()
-                val accessToken = settingsRepository.accessToken.first()
-                if (serverUrl.isBlank() || accessToken.isBlank()) {
-                    onComplete(Result.failure(IllegalStateException("Sign in to wake maintainer")))
-                    return@launch
-                }
-
-                val result = sessionRepository.ensureMaintainer(serverUrl, accessToken)
-                    .map { response ->
-                        val session = response.session
-                        val nextSessions = _uiState.value.sessions.toMutableList()
-                        val existingIndex = nextSessions.indexOfFirst { it.id == session.id }
-                        if (existingIndex >= 0) {
-                            nextSessions[existingIndex] = session
-                        } else {
-                            nextSessions.add(0, session)
-                        }
-                        _uiState.value = _uiState.value.copy(
-                            sessions = nextSessions,
-                            lastSync = java.time.OffsetDateTime.now().toString(),
-                            error = null,
-                        )
-                        "Maintainer ${if (response.created) "started" else "ready"}: ${sessionDisplayName(session)} [${session.id}]"
-                    }
-
-                if (result.exceptionOrNull() is SessionManagerAuthException) {
-                    settingsRepository.clearAuth()
-                    _uiState.value = _uiState.value.copy(
-                        sessions = emptyList(),
-                        expandedSessionIds = emptySet(),
-                        detailsBySessionId = emptyMap(),
-                        whatBySessionId = emptyMap(),
-                        lastSync = null,
-                        userEmail = "",
-                    )
-                }
-                result.onSuccess {
-                    refresh()
-                }
-                onComplete(result)
-            } finally {
-                _uiState.value = _uiState.value.copy(ensuringMaintainer = false)
-            }
         }
     }
 

@@ -9,14 +9,11 @@ import li.rajeshgo.sm.data.model.ClientSession
 import li.rajeshgo.sm.data.model.ContextSnapshotResponse
 import li.rajeshgo.sm.data.model.DeviceGoogleAuthRequest
 import li.rajeshgo.sm.data.model.DeviceGoogleAuthResponse
-import li.rajeshgo.sm.data.model.EnsureMaintainerRequest
-import li.rajeshgo.sm.data.model.EnsureMaintainerResponse
 import li.rajeshgo.sm.data.model.RetireSessionRequest
 import li.rajeshgo.sm.data.model.RetireSessionResponse
 import li.rajeshgo.sm.data.model.MobileAttachTicketRequest
 import li.rajeshgo.sm.data.model.MobileAttachTicketResponse
 import li.rajeshgo.sm.data.model.OutputResponse
-import li.rajeshgo.sm.data.model.RequestStatusResponse
 import li.rajeshgo.sm.data.model.SessionListResponse
 import li.rajeshgo.sm.data.model.StudioSshStatusResponse
 import li.rajeshgo.sm.data.model.StudioSshToggleRequest
@@ -112,14 +109,6 @@ interface ApiService {
 
     @POST("admin/studio-ssh")
     suspend fun setStudioSsh(@Body request: StudioSshToggleRequest): StudioSshStatusResponse
-
-    @POST("client/request-status")
-    suspend fun requestStatus(): RequestStatusResponse
-
-    @POST("maintainer/ensure")
-    suspend fun ensureMaintainer(
-        @Body request: EnsureMaintainerRequest = EnsureMaintainerRequest(),
-    ): EnsureMaintainerResponse
 
     @GET("sessions/{session_id}/output")
     suspend fun getSessionOutput(
