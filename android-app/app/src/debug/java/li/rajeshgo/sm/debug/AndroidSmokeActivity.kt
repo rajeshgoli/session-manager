@@ -71,6 +71,13 @@ class AndroidSmokeActivity : ComponentActivity() {
                 .put("user_email", userEmail)
         }
 
+        step("push_configuration") {
+            check(li.rajeshgo.sm.push.FollowPush.isConfigured) { "push configuration is missing from this APK" }
+            val options = com.google.firebase.FirebaseApp.getInstance().options
+            check(options.applicationId.isNotBlank() && !options.gcmSenderId.isNullOrBlank())
+            JSONObject().put("configured", true).put("initialized", true)
+        }
+
         step("enroll_device_certificate") {
             val result = DeviceEnrollmentRepository(settingsRepository, deviceKeyManager)
                 .enrollFromQr(enrollmentUrl)

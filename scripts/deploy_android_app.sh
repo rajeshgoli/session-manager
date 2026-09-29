@@ -12,6 +12,9 @@ if [[ ! -f "$APK_PATH" ]]; then
   exit 1
 fi
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+python3 "$SCRIPT_DIR/verify_android_apk.py" "$APK_PATH"
+
 curl_args=(
   --fail
   --show-error

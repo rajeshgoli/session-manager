@@ -40,6 +40,13 @@ SM_VERSION_CODE=2 SM_VERSION_NAME=0.1.1 ./gradlew assembleDebug
 
 Then publish it to the local Session Manager artifact server:
 
+Build with the complete `local.defaults.properties`, including all four
+`SM_FIREBASE_*` values and `SM_LINK_HOST` from the example file. The publish
+script inspects the APK itself and rejects missing server, sign-in, app-link,
+or push configuration. It requires `apkanalyzer` from the Android SDK (on
+`PATH`, under `ANDROID_HOME`, or the `sdk.dir` in `local.properties`) and a
+working JDK through `JAVA_HOME`.
+
 ```
 cd ..
 VERSION_CODE=2 VERSION_NAME=0.1.1 ./scripts/deploy_android_app.sh
