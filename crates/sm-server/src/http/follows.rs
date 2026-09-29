@@ -844,6 +844,82 @@ impl AppState {
     }
 }
 
+/// `GET /client/queue/jobs/{id}/start-check`: what Start now would override
+/// (sm#1627).
+pub(super) async fn queue_job_start_check(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    owner_guard(&state, &headers, peer_addr, "GET", &uri)?;
+    let job =
+        RetainedQueueStore::resolve_queue_job_from_path(&queue_runner_db_path(&state), &identifier)
+            .map_err(queue_lookup_error)?
+            .ok_or(ApiError::NotFound("Queue job not found"))?;
+    let queue_state_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
+    let utilization_db = expand_home(&state.config.utilization.db_path);
+    let check = RetainedQueueStore::start_check_in_state_dir(
+        &queue_state_dir,
+        &job.id,
+        queue_admission_policy(&state.config),
+        |earlier| {
+            crate::utilization::peak_running_rss(&utilization_db, earlier).unwrap_or_else(|error| {
+                eprintln!("start check could not read past runs: {error:#}");
+                None
+            })
+        },
+    )?
+    .ok_or(ApiError::NotFound("Queue job not found"))?;
+    Ok(Json(
+        serde_json::to_value(check).map_err(anyhow::Error::from)?,
+    ))
+}
+
+/// `POST /client/queue/jobs/{id}/start`: the owner starts a queued job now,
+/// past every admission rule (sm#1627). Only a signed-in owner may: agents on
+/// this Mac reach sm as unauthenticated local requests and are refused.
+pub(super) async fn force_start_queue_job(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    owner_guard(&state, &headers, peer_addr, "POST", &uri)?;
+    if authenticated_user(&headers, &state.config).is_none() {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Start now is for the owner, signed in to the sm app".to_owned(),
+        });
+    }
+    if !state.config.rust_core.runtime_enabled {
+        return Err(conflict("the queue runtime is off on this server"));
+    }
+    let job =
+        RetainedQueueStore::resolve_queue_job_from_path(&queue_runner_db_path(&state), &identifier)
+            .map_err(queue_lookup_error)?
+            .ok_or(ApiError::NotFound("Queue job not found"))?;
+    let queue_state_dir = expand_home(&state.config.queue_runner_state_dir().to_string_lossy());
+    let message_queue_db_path = expand_home(&state.config.sm_send.db_path);
+    let started = RetainedQueueStore::force_start_queue_job_in_state_dir(
+        &queue_state_dir,
+        &message_queue_db_path,
+        &job.id,
+        state.config.queue_runner.cancel_grace_seconds,
+        queue_admission_policy(&state.config),
+    )?
+    .ok_or(ApiError::NotFound("Queue job not found"))?;
+    if started.owner_forced_at.is_none() {
+        return Err(conflict(&format!(
+            "job is no longer queued ({})",
+            started.state
+        )));
+    }
+    Ok(Json(queue_job_response(&state, started)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1474,6 +1474,14 @@ pub fn router(state: AppState) -> Router {
         .route("/client/host-status", get(client_host_status))
         .route("/client/queue", get(client_queue))
         .route("/client/queue/stats", get(client_queue_stats))
+        .route(
+            "/client/queue/jobs/{job_id}/start-check",
+            get(follows::queue_job_start_check),
+        )
+        .route(
+            "/client/queue/jobs/{job_id}/start",
+            post(follows::force_start_queue_job),
+        )
         .route("/client/utilization/series", get(client_utilization_series))
         .route("/client/analytics/summary", get(client_analytics_summary))
         .route("/client/request-status", post(client_request_status))
@@ -15782,6 +15790,7 @@ fn queue_job_response_with_names(
         "state": job.state,
         "holding": crate::queue::queue_hold_explanation(&job, active, queue_admission_policy(&state.config)),
         "holding_reason": job.holding_reason,
+        "owner_forced_at": job.owner_forced_at,
         "queued_at": job.queued_at,
         "started_at": job.started_at,
         "finished_at": job.finished_at,
@@ -16030,6 +16039,7 @@ mod tests {
             termination_detail: None,
             process_limit: None,
             peak_process_count: None,
+            owner_forced_at: None,
         };
         let mut completed = review.clone();
         completed.id = "r2".into();

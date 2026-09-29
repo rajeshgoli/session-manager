@@ -491,3 +491,68 @@ async fn follows_carry_owner_name() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["owner_name"], "Owner");
 }
+
+/// Start now (sm#1627): the check lists what the owner would override, and
+/// only a signed-in owner may start; an agent's unauthenticated local
+/// request is refused and the job stays queued.
+#[tokio::test]
+async fn start_now_check_lists_warnings_and_refuses_unauthenticated_local_starts() {
+    let f = fixture(None);
+    let conn = Connection::open(f.dir.join("queue").join("queue_runner.db")).unwrap();
+    conn.execute(
+        "INSERT INTO queue_jobs (id, type, label, requester_session_id, notify_session_id, \
+           cwd, env_json, timeout_seconds, state, holding_reason, queued_at) \
+         VALUES (?1, 'background', ?1, 'eng00001', 'eng00001', '/repo', \
+           '{}', 900, 'pending', 'concurrency_cap', ?2)",
+        params!["job-first", "2026-09-25T10:01:00Z"],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO queue_jobs (id, type, label, requester_session_id, notify_session_id, \
+           cwd, env_json, timeout_seconds, state, holding_reason, queued_at) \
+         VALUES (?1, 'background', ?1, 'eng00001', 'eng00001', '/repo', \
+           '{}', 900, 'pending', 'concurrency_cap', ?2)",
+        params!["job-waiting", "2026-09-25T10:05:00Z"],
+    )
+    .unwrap();
+
+    let (status, check) = request(
+        &f.app,
+        "GET",
+        "/client/queue/jobs/job-waiting/start-check",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{check}");
+    assert_eq!(check["job_id"], "job-waiting");
+    assert_eq!(check["state"], "pending");
+    let warnings = check["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning == "1 queued background job is ahead of this one."),
+        "{check}"
+    );
+    assert!(check["memory_reserve_bytes"].as_i64().unwrap() > 0);
+
+    let (status, body) =
+        request(&f.app, "POST", "/client/queue/jobs/job-waiting/start", None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let state: String = conn
+        .query_row(
+            "SELECT state FROM queue_jobs WHERE id = 'job-waiting'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "pending");
+
+    let (status, _) = request(
+        &f.app,
+        "GET",
+        "/client/queue/jobs/missing/start-check",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

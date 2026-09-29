@@ -181,6 +181,9 @@ pub struct QueueJobRecord {
     pub process_limit: Option<i64>,
     /// Most processes seen at once in the job's process group.
     pub peak_process_count: Option<i64>,
+    /// When the owner started this run with Start now, past every admission
+    /// rule (sm#1627); cleared if host memory pressure puts it back in line.
+    pub owner_forced_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -259,6 +262,7 @@ struct QueueJobRuntimeRecord {
     revived_at: Option<String>,
     process_limit: Option<i64>,
     peak_process_count: Option<i64>,
+    owner_forced_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1205,6 +1209,39 @@ impl RetainedQueueStore {
             );
         });
         started
+    }
+
+    /// Starts a pending job now, past every admission rule, for the owner's
+    /// Start now (sm#1627). The run is marked owner-forced: host memory
+    /// pressure stops it first and puts it back in line. A job that is no
+    /// longer pending is returned as it stands.
+    pub fn force_start_queue_job_in_state_dir(
+        state_dir: &Path,
+        message_queue_db_path: &Path,
+        job_id: &str,
+        cancel_grace_seconds: u64,
+        admission_policy: QueueAdmissionPolicy,
+    ) -> Result<Option<QueueJobRecord>> {
+        // Admission starts jobs under this lock; holding it keeps one run.
+        let _admission_guard = QUEUE_ADMISSION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))?;
+        init_queue_jobs_schema(&conn)?;
+        let marked = conn.execute(
+            "UPDATE queue_jobs SET owner_forced_at = ?2, holding_reason = NULL WHERE id = ?1 AND state = 'pending'",
+            params![job_id, now_rfc3339()],
+        )?;
+        if marked == 0 {
+            return get_queue_job_conn(&conn, job_id);
+        }
+        Self::start_queue_job_in_state_dir_with_policy(
+            state_dir,
+            message_queue_db_path,
+            job_id,
+            cancel_grace_seconds,
+            admission_policy,
+        )
     }
 
     pub fn admit_queue_jobs_in_state_dir(
@@ -2993,6 +3030,7 @@ fn init_queue_jobs_schema(conn: &Connection) -> Result<()> {
     ensure_column(conn, "queue_jobs", "revived_at", "TEXT")?;
     ensure_column(conn, "queue_jobs", "process_limit", "INTEGER")?;
     ensure_column(conn, "queue_jobs", "peak_process_count", "INTEGER")?;
+    ensure_column(conn, "queue_jobs", "owner_forced_at", "TEXT")?;
     ensure_column(
         conn,
         "queue_jobs",
@@ -3228,7 +3266,7 @@ fn get_queue_job_runtime_conn(
                max_wait_seconds,
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
                exit_code, completion_notified_at, label, termination_detail_json,
-               revived_at, process_limit, peak_process_count
+               revived_at, process_limit, peak_process_count, owner_forced_at
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -3270,6 +3308,7 @@ fn get_queue_job_runtime_conn(
                 revived_at: row.get(22)?,
                 process_limit: row.get(23)?,
                 peak_process_count: row.get(24)?,
+                owner_forced_at: row.get(25)?,
             })
         })
         .optional()
@@ -3284,7 +3323,7 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                max_wait_seconds,
                cpu_percent, gpu_percent, memory_bytes, pid, process_group_id,
                exit_code, completion_notified_at, label, termination_detail_json,
-               revived_at, process_limit, peak_process_count
+               revived_at, process_limit, peak_process_count, owner_forced_at
         FROM queue_jobs
         ORDER BY queued_at, id
         "#,
@@ -3317,6 +3356,7 @@ fn list_queue_job_runtime_records_conn(conn: &Connection) -> Result<Vec<QueueJob
                 revived_at: row.get(22)?,
                 process_limit: row.get(23)?,
                 peak_process_count: row.get(24)?,
+                owner_forced_at: row.get(25)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -4152,7 +4192,10 @@ fn displace_background_for_perf_conn(
     }
     let Some(background) = jobs
         .iter()
-        .filter(|job| job.state == "running" && job.job_type == "background")
+        // The owner started a forced run on purpose; perf waits instead.
+        .filter(|job| {
+            job.state == "running" && job.job_type == "background" && job.owner_forced_at.is_none()
+        })
         .min_by_key(|job| (job.started_at.as_deref().unwrap_or(&job.queued_at), &job.id))
         .cloned()
     else {
@@ -4702,8 +4745,9 @@ const HOST_MEMORY_GUARD_STOP_SPACING: StdDuration = StdDuration::from_secs(10);
 const HOST_MEMORY_GUARD_MIN_VICTIM_RSS: i64 = 512 * 1024 * 1024;
 
 /// The running job the host memory guard stops next, with its process group
-/// and resident bytes: the largest job not already being stopped, cancelled,
-/// or displaced, and at least [`HOST_MEMORY_GUARD_MIN_VICTIM_RSS`].
+/// and resident bytes: among jobs not already being stopped, cancelled, or
+/// displaced, and at least [`HOST_MEMORY_GUARD_MIN_VICTIM_RSS`], an
+/// owner-forced run first, then the largest.
 fn host_pressure_victim<'a>(
     jobs: &'a [QueueJobRuntimeRecord],
     rss_by_pgid: &HashMap<i64, i64>,
@@ -4715,7 +4759,14 @@ fn host_pressure_victim<'a>(
             let rss = *rss_by_pgid.get(&pgid)?;
             (rss >= HOST_MEMORY_GUARD_MIN_VICTIM_RSS).then_some((job, pgid, rss))
         })
-        .max_by(|(a, _, a_rss), (b, _, b_rss)| a_rss.cmp(b_rss).then_with(|| b.id.cmp(&a.id)))
+        .max_by(|(a, _, a_rss), (b, _, b_rss)| {
+            // Owner-forced runs go first (sm#1627), then the largest.
+            a.owner_forced_at
+                .is_some()
+                .cmp(&b.owner_forced_at.is_some())
+                .then_with(|| a_rss.cmp(b_rss))
+                .then_with(|| b.id.cmp(&a.id))
+        })
 }
 
 /// One host memory guard check. When available memory is below the reserve,
@@ -5638,6 +5689,132 @@ fn finish_queue_job_conn(
     finish_queue_job_conn_with_policy(conn, job, state, exit_code, message_queue_db_path, None)
 }
 
+/// An owner-forced run stopped for host memory pressure goes back to
+/// `pending` at its original place in line, with its wait clock restarted and
+/// the forced mark cleared, so from then on it is an ordinary queued job
+/// (sm#1627). Its agent is told the next run starts from scratch. Returns
+/// false for any other job or stop, which finishes as usual.
+fn requeue_owner_forced_job_after_host_pressure_conn(
+    conn: &Connection,
+    job_id: &str,
+    message_queue_db_path: Option<&Path>,
+) -> Result<bool> {
+    let Some(job) = get_queue_job_runtime_conn(conn, job_id)? else {
+        return Ok(false);
+    };
+    let detail = job
+        .termination_detail_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<JsonValue>(raw).ok());
+    let host_pressure = detail
+        .as_ref()
+        .and_then(|detail| detail.get("cause"))
+        .and_then(JsonValue::as_str)
+        == Some(MEMORY_GUARD_HOST_PRESSURE);
+    if job.state != "running" || job.owner_forced_at.is_none() || !host_pressure {
+        return Ok(false);
+    }
+    // Keeping queued_at keeps the job's place; stretching the wait limit by
+    // the time already spent gives it the full wait again.
+    let waited = queue_elapsed_since(&job.queued_at, OffsetDateTime::now_utc())
+        .unwrap_or(0)
+        .max(0);
+    let changed = conn.execute(
+        r#"
+        UPDATE queue_jobs
+        SET state = 'pending',
+            holding_reason = NULL,
+            termination_detail_json = NULL,
+            owner_forced_at = NULL,
+            started_at = NULL,
+            pid = NULL,
+            process_group_id = NULL,
+            exit_code = NULL,
+            process_limit = NULL,
+            peak_process_count = NULL,
+            max_wait_seconds = max_wait_seconds + ?2
+        WHERE id = ?1 AND state = 'running'
+        "#,
+        params![job.id, waited],
+    )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    // A stale exit receipt would make recovery finish the next run at once.
+    if let Some(path) = job.exit_code_path.as_deref() {
+        let _ = fs::remove_file(path);
+    }
+    let detail_bytes = |key: &str| {
+        detail
+            .as_ref()
+            .and_then(|detail| detail.get(key))
+            .and_then(JsonValue::as_i64)
+    };
+    let memory_text = match (
+        detail_bytes("host_available_bytes"),
+        detail_bytes("effective_reserve_bytes"),
+    ) {
+        (Some(available), Some(reserve)) => format!(
+            " ({} free, {} reserve)",
+            memory_amount_text(available),
+            memory_amount_text(reserve)
+        ),
+        _ => String::new(),
+    };
+    if let Some(log_path) = job.log_path.as_deref() {
+        if let Ok(mut log) = OpenOptions::new().append(true).open(log_path) {
+            use std::io::Write as _;
+            let _ = writeln!(
+                log,
+                "\n[sm queue] Stopped: the Mac ran low on memory{memory_text}. This run was started early by the owner, so the job is back in the queue; the next run starts from scratch."
+            );
+        }
+    }
+    let label = if job.label.trim().is_empty() {
+        &job.id
+    } else {
+        &job.label
+    };
+    eprintln!(
+        "queue job {} requeued after host memory pressure stopped its owner-forced run",
+        job.id
+    );
+    let target = job
+        .notify_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let (Some(target), Some(message_queue_db_path)) = (target, message_queue_db_path) {
+        let text = format!(
+            "[sm queue] {label} was started early by the owner, and sm stopped it because the Mac ran low on memory{memory_text}. It is back in the queue at its original place and will run again from scratch; you will get its completion as usual. Log: {}. ID: {}",
+            job.log_path.as_deref().unwrap_or("-"),
+            job.id
+        );
+        if let Err(error) = RetainedQueueStore::new(message_queue_db_path.to_path_buf())
+            .enqueue_message_once_with_metadata(
+                &format!(
+                    "queue-requeued-{}-{}",
+                    job.id,
+                    job.owner_forced_at.as_deref().unwrap_or("")
+                ),
+                target,
+                &text,
+                "sequential",
+                QueueMessageMetadata {
+                    message_category: Some("queue-completion".to_owned()),
+                    ..QueueMessageMetadata::default()
+                },
+            )
+        {
+            eprintln!(
+                "queue job {} requeue notice could not be queued: {error:#}",
+                job.id
+            );
+        }
+    }
+    Ok(true)
+}
+
 fn finish_queue_job_conn_with_policy(
     conn: &Connection,
     job: &QueueJobRuntimeRecord,
@@ -5646,6 +5823,11 @@ fn finish_queue_job_conn_with_policy(
     message_queue_db_path: Option<&Path>,
     admission_policy: Option<QueueAdmissionPolicy>,
 ) -> Result<()> {
+    if state == "memory_exceeded"
+        && requeue_owner_forced_job_after_host_pressure_conn(conn, &job.id, message_queue_db_path)?
+    {
+        return Ok(());
+    }
     let finished_at = now_rfc3339();
     let changed = conn.execute(
         r#"
@@ -5792,6 +5974,172 @@ fn queue_job_completion_notified_at(
         },
     )?;
     Ok(Some(now_rfc3339()))
+}
+
+/// What Start now shows before the owner overrides the queue (sm#1627):
+/// every rule that would keep the job waiting, as warnings, with the memory
+/// picture the owner weighs them against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QueueStartCheck {
+    pub job_id: String,
+    pub state: String,
+    pub warnings: Vec<String>,
+    pub memory_available_bytes: Option<i64>,
+    pub memory_reserve_bytes: i64,
+    /// Declared budget, else the most memory past runs with the same label
+    /// and type used.
+    pub memory_estimate_bytes: Option<i64>,
+    /// `declared` or `past_runs`.
+    pub memory_estimate_source: Option<String>,
+    pub past_runs: usize,
+}
+
+impl RetainedQueueStore {
+    /// Builds the Start now check. `past_peak` maps earlier runs' job ids to
+    /// their peak memory and sampled-run count.
+    pub fn start_check_in_state_dir(
+        state_dir: &Path,
+        job_id: &str,
+        policy: QueueAdmissionPolicy,
+        past_peak: impl FnOnce(&[String]) -> Option<(i64, usize)>,
+    ) -> Result<Option<QueueStartCheck>> {
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))?;
+        init_queue_jobs_schema(&conn)?;
+        let Some(job) = get_queue_job_runtime_conn(&conn, job_id)? else {
+            return Ok(None);
+        };
+        let jobs = list_queue_job_runtime_records_conn(&conn)?;
+        let earlier: Vec<String> = {
+            let mut statement = conn.prepare(
+                r#"
+                SELECT id FROM queue_jobs
+                WHERE label = ?1 AND type = ?2 AND id != ?3 AND started_at IS NOT NULL
+                ORDER BY queued_at DESC
+                LIMIT 20
+                "#,
+            )?;
+            let ids = statement
+                .query_map(params![job.label, job.job_type, job.id], |row| row.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            ids
+        };
+        let past = if earlier.is_empty() {
+            None
+        } else {
+            past_peak(&earlier)
+        };
+        Ok(Some(queue_start_check(
+            &job,
+            &jobs,
+            policy,
+            host_memory_capacity().map(|(_, available)| available),
+            past,
+        )))
+    }
+}
+
+fn queue_start_check(
+    job: &QueueJobRuntimeRecord,
+    jobs: &[QueueJobRuntimeRecord],
+    policy: QueueAdmissionPolicy,
+    available: Option<i64>,
+    past: Option<(i64, usize)>,
+) -> QueueStartCheck {
+    let reserve = effective_memory_reserve_bytes(policy.memory_min_free_bytes);
+    let (estimate, source) = match (job.memory_bytes, past) {
+        (Some(declared), _) => (Some(declared), Some("declared")),
+        (None, Some((peak, _))) => (Some(peak), Some("past_runs")),
+        (None, None) => (None, None),
+    };
+    let mut warnings = Vec::new();
+    if job.state == "pending" {
+        let running = running_queue_job_count(jobs, None);
+        if running as i64 >= policy.max_running_jobs {
+            warnings.push(format!(
+                "All {} job slots are in use ({running} running).",
+                policy.max_running_jobs
+            ));
+        }
+        let type_max = policy.max_concurrent_jobs(&job.job_type);
+        if running_queue_job_count(jobs, Some(&job.job_type)) >= type_max {
+            warnings.push(format!("All {type_max} {} slots are in use.", job.job_type));
+        }
+        for perf in jobs
+            .iter()
+            .filter(|other| other.state == "running" && other.job_type == "perf")
+        {
+            warnings.push(format!(
+                "A perf job is running ({}). Starting now shares the machine with its measurement.",
+                perf.label
+            ));
+        }
+        if job.job_type == "perf" {
+            if running_queue_job_count(jobs, Some("tests")) > 0 {
+                warnings.push(
+                    "Tests are running; perf jobs normally wait for a quiet machine.".to_owned(),
+                );
+            }
+            if perf_cooldown_active(jobs, policy) {
+                warnings.push("The machine is cooling down after the last perf job.".to_owned());
+            }
+            if perf_blocked_by_tests_after_perf(jobs) {
+                warnings
+                    .push("Tests queued after the last perf job normally run first.".to_owned());
+            }
+        }
+        match available {
+            None => warnings.push("Free memory is unknown right now.".to_owned()),
+            Some(available) if available < reserve => warnings.push(format!(
+                "The Mac is already below its memory safety reserve ({} free, {} reserve).",
+                memory_amount_text(available),
+                memory_amount_text(reserve)
+            )),
+            Some(available) => match estimate {
+                Some(estimate) if estimate.saturating_add(reserve) > available => {
+                    warnings.push(format!(
+                        "Needs about {} ({}); {} is free and {} is kept in reserve.",
+                        memory_amount_text(estimate),
+                        if source == Some("declared") {
+                            "its declared budget"
+                        } else {
+                            "the most past runs used"
+                        },
+                        memory_amount_text(available),
+                        memory_amount_text(reserve)
+                    ))
+                }
+                Some(_) => {}
+                None => warnings.push(
+                    "Its memory use is unknown: no declared budget and no past runs.".to_owned(),
+                ),
+            },
+        }
+        let ahead = jobs
+            .iter()
+            .filter(|other| {
+                other.state == "pending"
+                    && other.job_type == job.job_type
+                    && (&other.queued_at, &other.id) < (&job.queued_at, &job.id)
+            })
+            .count();
+        if ahead > 0 {
+            warnings.push(format!(
+                "{ahead} queued {} job{} ahead of this one.",
+                job.job_type,
+                if ahead == 1 { " is" } else { "s are" }
+            ));
+        }
+    }
+    QueueStartCheck {
+        job_id: job.id.clone(),
+        state: job.state.clone(),
+        warnings,
+        memory_available_bytes: available,
+        memory_reserve_bytes: reserve,
+        memory_estimate_bytes: estimate,
+        memory_estimate_source: source.map(str::to_owned),
+        past_runs: past.map_or(0, |(_, runs)| runs),
+    }
 }
 
 /// Human-readable scheduler context, shared by enqueue/status responses.
@@ -6574,12 +6922,13 @@ fn list_queue_jobs_conn(
 
     let resource_columns = queue_job_resource_projection(conn)?;
     let detail_column = queue_job_detail_projection(conn)?;
+    let forced_column = queue_job_forced_projection(conn)?;
     let mut query = format!(
         r#"
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
                argv_json, script_path, timeout_seconds, {resource_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
-               exit_code, log_path, {detail_column}
+               exit_code, log_path, {detail_column}, {forced_column}
         FROM queue_jobs
     "#
     );
@@ -6608,12 +6957,13 @@ fn list_queue_jobs_conn(
 fn get_queue_job_conn(conn: &Connection, job_id: &str) -> Result<Option<QueueJobRecord>> {
     let resource_columns = queue_job_resource_projection(conn)?;
     let detail_column = queue_job_detail_projection(conn)?;
+    let forced_column = queue_job_forced_projection(conn)?;
     let query = format!(
         r#"
         SELECT id, type, label, requester_session_id, notify_session_id, cwd,
                argv_json, script_path, timeout_seconds, {resource_columns}, state, holding_reason,
                queued_at, started_at, finished_at, pid, process_group_id,
-               exit_code, log_path, {detail_column}
+               exit_code, log_path, {detail_column}, {forced_column}
         FROM queue_jobs
         WHERE id = ?1
         LIMIT 1
@@ -6655,6 +7005,14 @@ fn queue_job_detail_projection(conn: &Connection) -> Result<&'static str> {
         (false, false) => {
             "NULL AS termination_detail_json, NULL AS process_limit, NULL AS peak_process_count"
         }
+    })
+}
+
+fn queue_job_forced_projection(conn: &Connection) -> Result<&'static str> {
+    Ok(if queue_job_columns(conn)?.contains("owner_forced_at") {
+        "owner_forced_at"
+    } else {
+        "NULL AS owner_forced_at"
     })
 }
 
@@ -6724,6 +7082,7 @@ fn queue_job_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueJ
             .and_then(|raw| serde_json::from_str(&raw).ok()),
         process_limit: row.get(23)?,
         peak_process_count: row.get(24)?,
+        owner_forced_at: row.get(25)?,
     })
 }
 
@@ -8061,6 +8420,316 @@ mod tests {
         let _ = fs::remove_dir_all(state_dir);
     }
 
+    fn pending_job(state_dir: &Path, job_type: &str, label: &str) -> QueueJobRecord {
+        RetainedQueueStore::create_queue_job_in_state_dir(
+            state_dir,
+            CreateQueueJob {
+                job_type: job_type.into(),
+                label: label.into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["sleep".into(), "30".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 600,
+                cpu_percent: None,
+                gpu_percent: None,
+                memory_bytes: None,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn start_now_runs_a_queued_job_past_every_admission_rule() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let state_dir = unique_temp_path("start-now-bypass");
+        let message_queue_db = state_dir.join("messages.db");
+        // A perf job running and every slot full would hold anything else.
+        running_job_with_pgid(&state_dir, "perf", "measurement", 999_991);
+        running_job_with_pgid(&state_dir, "tests", "suite", 999_992);
+        let waiting = pending_job(&state_dir, "tests", "forced");
+        let policy = QueueAdmissionPolicy {
+            max_running_jobs: 2,
+            tests_max_concurrent: 1,
+            ..QueueAdmissionPolicy::default()
+        };
+        // And the host is below its memory reserve.
+        TEST_HOST_MEMORY.with(|host| host.set(Some((256 * GIB, GIB))));
+        let started = RetainedQueueStore::force_start_queue_job_in_state_dir(
+            &state_dir,
+            &message_queue_db,
+            &waiting.id,
+            0,
+            policy,
+        )
+        .unwrap()
+        .unwrap();
+        TEST_HOST_MEMORY.with(|host| host.set(None));
+        assert_eq!(started.state, "running");
+        assert!(started.owner_forced_at.is_some());
+        assert_eq!(started.holding_reason, None);
+
+        // A job that is no longer pending is returned untouched.
+        let again = RetainedQueueStore::force_start_queue_job_in_state_dir(
+            &state_dir,
+            &message_queue_db,
+            &waiting.id,
+            0,
+            policy,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(again.started_at, started.started_at);
+        if let Some(pgid) = started.process_group_id {
+            terminate_process_group(pgid, true);
+        }
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn host_memory_guard_stops_owner_forced_runs_before_larger_jobs() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let state_dir = unique_temp_path("host-memory-guard-forced-first");
+        let large = running_job_with_pgid(&state_dir, "tests", "large", 401);
+        let forced = running_job_with_pgid(&state_dir, "background", "forced", 402);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET owner_forced_at = ?2 WHERE id = ?1",
+            params![forced.id, now_rfc3339()],
+        )
+        .unwrap();
+        let rss: HashMap<i64, i64> = [(401, 40 * GIB), (402, GIB)].into_iter().collect();
+        let host = Some((256 * GIB, 0));
+        assert_eq!(
+            host_memory_guard_pass(&conn, host, 8 * GIB, &rss).unwrap(),
+            Some((forced.id.clone(), 402))
+        );
+        assert_eq!(
+            host_memory_guard_pass(&conn, host, 8 * GIB, &rss).unwrap(),
+            Some((large.id.clone(), 401))
+        );
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn an_owner_forced_run_stopped_for_host_pressure_rejoins_the_queue_once() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let state_dir = unique_temp_path("forced-requeue");
+        let message_queue_db = state_dir.join("messages.db");
+        let job = running_job_with_pgid(&state_dir, "tests", "forced suite", 501);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET owner_forced_at = ?2, queued_at = ?3, max_wait_seconds = 300 WHERE id = ?1",
+            params![job.id, now_rfc3339(), "2026-01-01T00:00:00Z"],
+        )
+        .unwrap();
+        let runtime = get_queue_job_runtime_conn(&conn, &job.id).unwrap().unwrap();
+        let exit_path = PathBuf::from(runtime.exit_code_path.clone().unwrap());
+        fs::create_dir_all(exit_path.parent().unwrap()).unwrap();
+        fs::write(&exit_path, "143").unwrap();
+        let rss: HashMap<i64, i64> = [(501, 4 * GIB)].into_iter().collect();
+        let host = Some((256 * GIB, GIB));
+        host_memory_guard_pass(&conn, host, 8 * GIB, &rss)
+            .unwrap()
+            .unwrap();
+        finish_queue_job_in_state_dir_if_running(
+            &state_dir,
+            &message_queue_db,
+            &job.id,
+            "failed",
+            Some(143),
+            0,
+            QueueAdmissionPolicy {
+                max_running_jobs: 0,
+                ..QueueAdmissionPolicy::default()
+            },
+        )
+        .unwrap();
+
+        let requeued = get_queue_job_runtime_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(requeued.state, "pending");
+        assert_eq!(requeued.owner_forced_at, None);
+        assert_eq!(requeued.started_at, None);
+        assert_eq!(requeued.pid, None);
+        assert_eq!(requeued.termination_detail_json, None);
+        // Same place in line, and the full wait again.
+        assert_eq!(requeued.queued_at, "2026-01-01T00:00:00Z");
+        let remaining = queue_job_wait_remaining_seconds(&requeued).unwrap();
+        assert!((295..=300).contains(&remaining), "{remaining}");
+        assert!(!exit_path.exists());
+        let notices = RetainedQueueStore::new(message_queue_db.clone())
+            .pending_messages_for_target_by_category("notify", "queue-completion", 10)
+            .unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0]
+                .text
+                .contains("back in the queue at its original place"),
+            "{}",
+            notices[0].text
+        );
+
+        // From then on it is ordinary: the next host-pressure stop finishes it.
+        conn.execute(
+            "UPDATE queue_jobs SET state = 'running', holding_reason = NULL, started_at = ?2, pid = 501, process_group_id = 501 WHERE id = ?1",
+            params![job.id, now_rfc3339()],
+        )
+        .unwrap();
+        host_memory_guard_pass(&conn, host, 8 * GIB, &rss)
+            .unwrap()
+            .unwrap();
+        finish_queue_job_in_state_dir_if_running(
+            &state_dir,
+            &message_queue_db,
+            &job.id,
+            "failed",
+            Some(143),
+            0,
+            QueueAdmissionPolicy::default(),
+        )
+        .unwrap();
+        let finished = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(finished.state, "memory_exceeded");
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn an_owner_forced_run_stopped_for_its_own_budget_is_not_requeued() {
+        let state_dir = unique_temp_path("forced-over-budget");
+        let message_queue_db = state_dir.join("messages.db");
+        let job = running_job_with_pgid(&state_dir, "tests", "forced suite", 601);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET owner_forced_at = ?2 WHERE id = ?1",
+            params![job.id, now_rfc3339()],
+        )
+        .unwrap();
+        let trip = PerfMemoryGuardTrip {
+            cause: MEMORY_GUARD_JOB_OVER_BUDGET,
+            sampled_at: now_rfc3339(),
+            process_group_rss_bytes: Some(2),
+            memory_limit_bytes: Some(1),
+            host_available_bytes: None,
+            effective_reserve_bytes: None,
+            failed_host_samples: 0,
+        };
+        mark_queue_job_memory_terminating_conn(&conn, &job.id, &trip).unwrap();
+        finish_queue_job_in_state_dir_if_running(
+            &state_dir,
+            &message_queue_db,
+            &job.id,
+            "failed",
+            None,
+            0,
+            QueueAdmissionPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            get_queue_job_conn(&conn, &job.id).unwrap().unwrap().state,
+            "memory_exceeded"
+        );
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn perf_never_displaces_an_owner_forced_background_run() {
+        let state_dir = unique_temp_path("forced-no-displace");
+        let message_queue_db = state_dir.join("messages.db");
+        let forced = running_job_with_pgid(&state_dir, "background", "forced", 999_993);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET owner_forced_at = ?2 WHERE id = ?1",
+            params![forced.id, now_rfc3339()],
+        )
+        .unwrap();
+        RetainedQueueStore::create_queue_job_in_state_dir(
+            &state_dir,
+            CreateQueueJob {
+                job_type: "perf".into(),
+                label: "bench".into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["true".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 60,
+                cpu_percent: Some(100),
+                gpu_percent: Some(0),
+                memory_bytes: Some(1024),
+            },
+        )
+        .unwrap();
+        let jobs = list_queue_job_runtime_records_conn(&conn).unwrap();
+        assert!(!displace_background_for_perf_conn(
+            &conn,
+            &jobs,
+            &message_queue_db,
+            0,
+            QueueAdmissionPolicy::default(),
+        )
+        .unwrap());
+        assert_eq!(
+            get_queue_job_conn(&conn, &forced.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "running"
+        );
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn start_check_names_what_start_now_would_override() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let state_dir = unique_temp_path("start-check");
+        running_job_with_pgid(&state_dir, "perf", "measurement", 999_994);
+        let earlier = pending_job(&state_dir, "tests", "suite");
+        let job = pending_job(&state_dir, "tests", "suite");
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        // One earlier run of the same label has started and been sampled.
+        conn.execute(
+            "UPDATE queue_jobs SET started_at = ?2 WHERE id = ?1",
+            params![earlier.id, now_rfc3339()],
+        )
+        .unwrap();
+        let policy = QueueAdmissionPolicy {
+            max_running_jobs: 1,
+            ..QueueAdmissionPolicy::default()
+        };
+        TEST_HOST_MEMORY.with(|host| host.set(Some((256 * GIB, 20 * GIB))));
+        let mut asked = Vec::new();
+        let check =
+            RetainedQueueStore::start_check_in_state_dir(&state_dir, &job.id, policy, |ids| {
+                asked = ids.to_vec();
+                Some((30 * GIB, 1))
+            })
+            .unwrap()
+            .unwrap();
+        TEST_HOST_MEMORY.with(|host| host.set(None));
+        assert_eq!(asked, vec![earlier.id.clone()]);
+        assert_eq!(check.memory_estimate_bytes, Some(30 * GIB));
+        assert_eq!(check.memory_estimate_source.as_deref(), Some("past_runs"));
+        assert_eq!(check.past_runs, 1);
+        assert_eq!(
+            check.warnings,
+            vec![
+                "All 1 job slots are in use (1 running).".to_owned(),
+                "A perf job is running (measurement). Starting now shares the machine with its measurement.".to_owned(),
+                "Needs about 30.0 GiB (the most past runs used); 20.0 GiB is free and 8.0 GiB is kept in reserve.".to_owned(),
+                "1 queued tests job is ahead of this one.".to_owned(),
+            ]
+        );
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
     #[test]
     fn rss_listing_sums_each_process_group() {
         let totals = parse_rss_bytes_by_process_group("  10 100\n 10 50\n 11 7\nbad line\n");
@@ -8274,6 +8943,7 @@ mod tests {
             revived_at: None,
             process_limit: None,
             peak_process_count: None,
+            owner_forced_at: None,
         };
         // The limit counts every process the user runs, so it must sit above
         // the current total or the job could not fork at all.
@@ -8407,6 +9077,7 @@ mod tests {
             termination_detail: None,
             process_limit: None,
             peak_process_count: None,
+            owner_forced_at: None,
         };
         let pending = record("new-tests", "tests", "pending", Some("awaiting_tests"));
         let running = record("running-tests", "tests", "running", None);
@@ -8590,6 +9261,7 @@ mod tests {
             revived_at: None,
             process_limit: None,
             peak_process_count: None,
+            owner_forced_at: None,
         };
 
         let failed = queue_job_completion_text_with_policy(
@@ -8644,6 +9316,7 @@ mod tests {
             revived_at: None,
             process_limit: None,
             peak_process_count: None,
+            owner_forced_at: None,
         };
 
         let completion = queue_job_completion_text_with_policy(
@@ -8704,6 +9377,7 @@ mod tests {
             revived_at: None,
             process_limit: None,
             peak_process_count: None,
+            owner_forced_at: None,
         };
 
         let status = spawn_queue_job_process(&job, None).unwrap().wait().unwrap();
@@ -8768,6 +9442,7 @@ mod tests {
             revived_at: None,
             process_limit: None,
             peak_process_count: None,
+            owner_forced_at: None,
         };
 
         let status = spawn_queue_job_process(&job, None).unwrap().wait().unwrap();
@@ -8808,6 +9483,7 @@ mod tests {
             revived_at: None,
             process_limit: None,
             peak_process_count: None,
+            owner_forced_at: None,
         };
         let much_later = OffsetDateTime::parse("2026-08-17T20:00:01Z", &Rfc3339).unwrap();
         assert!(!queue_job_timed_out_at(&job, much_later));
@@ -9976,6 +10652,7 @@ mod tests {
             revived_at: None,
             process_limit: None,
             peak_process_count: None,
+            owner_forced_at: None,
         };
 
         assert!(!queue_job_timed_out_at(&job, now_utc));

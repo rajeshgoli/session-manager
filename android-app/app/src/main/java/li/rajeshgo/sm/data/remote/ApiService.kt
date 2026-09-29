@@ -46,6 +46,12 @@ interface ApiService {
     @GET("client/utilization/series")
     suspend fun getUtilizationSeries(@Query("hours") hours: Int): li.rajeshgo.sm.data.model.UtilizationSeries
 
+    @GET("client/queue/jobs/{job_id}/start-check")
+    suspend fun getQueueStartCheck(@Path("job_id") jobId: String): li.rajeshgo.sm.data.model.QueueStartCheck
+
+    @POST("client/queue/jobs/{job_id}/start")
+    suspend fun forceStartQueueJob(@Path("job_id") jobId: String): li.rajeshgo.sm.data.model.SessionJob
+
     @POST("queue-jobs/{job_id}/cancel")
     suspend fun cancelQueueJob(
         @Path("job_id") jobId: String,
