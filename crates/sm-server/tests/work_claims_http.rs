@@ -1039,3 +1039,51 @@ async fn merge_hold_owner_alert_retries_after_inbox_cap_and_history_names_hold()
     assert_eq!(count(), 1);
     fs::remove_dir_all(f.dir).unwrap();
 }
+
+#[tokio::test]
+async fn doc_agent_claim_precedence_stale_retire_and_owner_hold() {
+    let f = fixture();
+    let (status,doc)=request(&f.app,"POST","/docs",Some(json!({"repo":"Acme/Widgets","path":"memo.html","pr_number":9,"commit_sha":"a".repeat(40),"session_id":"eng00001"}))).await;
+    assert_eq!(status, StatusCode::OK, "{doc}");
+    let id = doc["id"].as_str().unwrap();
+    let head_path = format!("/docs/{id}/head");
+    let (_, head) = request(&f.app, "GET", &head_path, None).await;
+    assert_eq!(head["agent"]["session_id"], "eng00001");
+    claim(&f, "eng00002", "pr", 9, json!({"take":true})).await;
+    let (_, head) = request(&f.app, "GET", &head_path, None).await;
+    assert_eq!(head["agent"]["session_id"], "eng00002");
+    assert_eq!(head["agent"]["via"], "claim");
+    assert_eq!(head["agent"]["turns"], 0);
+    let (status, _) = request(
+        &f.app,
+        "POST",
+        &format!("/docs/{id}/agent/retire"),
+        Some(json!({"session_id":"eng00001"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, held) = request(
+        &f.app,
+        "POST",
+        &format!("/docs/{id}/merge-hold"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{held}");
+    let (_, head) = request(&f.app, "GET", &head_path, None).await;
+    assert!(head["merge_hold"].is_object());
+    let (status, _) = request(&f.app, "DELETE", &format!("/docs/{id}/merge-hold"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, result) = request(
+        &f.app,
+        "POST",
+        &format!("/docs/{id}/agent/retire"),
+        Some(json!({"session_id":"eng00002"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert!(result["error"].is_null(), "{result}");
+    let (_, head) = request(&f.app, "GET", &head_path, None).await;
+    assert_eq!(head["agent"]["session_id"], "eng00001");
+    fs::remove_dir_all(f.dir).unwrap();
+}

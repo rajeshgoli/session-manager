@@ -13,6 +13,8 @@
     drafts: (CONFIG.drafts || []).slice(),
     replies: (CONFIG.replies || []).slice(),
     head: null,
+    agent: CONFIG.agent || null,
+    mergeHold: CONFIG.mergeHold || null,
     canComment: MSG ? MODE === 'reply' : !!CONFIG.canComment,
     prState: CONFIG.prState,
     // A reloaded page resumes the server's unfinished submission.
@@ -86,14 +88,17 @@
     '.reply{position:fixed;left:0;right:0;bottom:0;background:#fff;color:#111827;box-shadow:0 -2px 12px rgba(0,0,0,.3);padding:8px 10px;display:flex;flex-direction:column;gap:6px}',
     '.reply textarea{min-height:0;resize:none;overflow-y:auto}',
     '*{box-sizing:border-box;font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
-    '.bar{position:fixed;top:0;left:0;right:0;display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:6px 10px;background:#111827;color:#f9fafb;box-shadow:0 1px 4px rgba(0,0,0,.3)}',
-    '.bar .t{font-weight:600;max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+    '.bar{position:fixed;top:0;left:0;right:0;display:flex;flex-wrap:nowrap;align-items:center;gap:6px 10px;padding:6px 10px;background:#111827;color:#f9fafb;box-shadow:0 1px 4px rgba(0,0,0,.3)}',
+    '.bar .t{min-width:0;flex:0 1 auto;font-weight:600;max-width:40vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     '.bar a{color:#93c5fd;text-decoration:none}',
     '.bar select{background:#1f2937;color:#f9fafb;border:1px solid #374151;border-radius:4px;padding:2px 4px;max-width:46vw}',
     '.muted{color:#9ca3af}.ro{color:#fbbf24}.sp{flex:1}',
     'button{cursor:pointer;border:0;border-radius:6px;padding:6px 12px;background:#e5e7eb;color:#111827}',
     'button.p{background:#2563eb;color:#fff}button.d{background:#fee2e2;color:#991b1b}button:disabled{opacity:.5;cursor:default}',
     '.bar button{padding:3px 10px}',
+    '.bar>button,.bar>a{flex-shrink:0;white-space:nowrap}.bar .agent{display:flex;gap:4px;align-items:center;min-width:28px;flex:0 1 auto;max-width:180px}.agent .name{overflow:hidden;text-overflow:ellipsis;min-width:1ch;white-space:nowrap}.agent.done{outline:1px solid #16a34a}.agent .mark{flex-shrink:0}.agent-panel{position:fixed;width:min(310px,calc(100vw - 16px));padding:12px;background:#fff;color:#111827;border:1px solid #d1d5db;border-radius:8px;box-shadow:0 3px 15px #0004;display:flex;flex-direction:column;gap:8px;pointer-events:auto;max-height:80vh;overflow:auto}.agent-panel .row{justify-content:space-between}',
+    '@media(max-width:480px){.bar{gap:4px;padding:6px 4px}.bar *{font-size:12px}.bar .t{max-width:0}.bar select{max-width:64px;min-width:0}.bar .state{max-width:50px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.bar .agent{max-width:75px}.bar button{padding:4px}.bar .sp{min-width:0}}',
+
     '.pill{position:fixed;top:6px;right:8px;padding:4px 10px;border-radius:14px;background:#111827;color:#f9fafb;box-shadow:0 1px 4px rgba(0,0,0,.3)}',
     '.ban{position:fixed;left:0;right:0;padding:6px 10px;background:#fef3c7;color:#78350f;display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center}',
     '.ban a,.ban .lk{color:#1d4ed8;text-decoration:underline;cursor:pointer;background:none;padding:0}',
@@ -221,7 +226,8 @@
       el('span', { class: 't', title: CONFIG.title, text: CONFIG.title }),
       picker,
       CONFIG.prUrl ? el('a', { href: CONFIG.prUrl, target: '_blank', rel: 'noopener', text: 'PR #' + CONFIG.prNumber }) : null,
-      el('span', { class: st[1], text: st[0] }),
+      el('span', { class: st[1] + ' state', text: st[0] + (S.mergeHold ? ' · ⏸' : ''), title: S.mergeHold ? 'merge hold by ' + S.mergeHold.placed_by : '' }),
+      MSG ? null : agentChip(),
       el('span', { class: 'sp' }),
       S.docState === 'review_requested' ? el('button', { text: 'No review needed', onclick: function (e) {
         var b = e.currentTarget; b.disabled = true;
@@ -233,6 +239,53 @@
     ].forEach(function (c) { if (c) bar.appendChild(c); });
     layout();
   }
+
+  // The panel targets the same session as review delivery.
+  var agentPanel = el('div', { class: 'agent-panel' });
+  agentPanel.hidden = true; ui.appendChild(agentPanel);
+  var retireUntil = 0;
+  function agentChip() {
+    var a = S.agent;
+    var mark = a && a.task_completed_at ? '✓' : '●';
+    var button = el('button', { class: 'agent' + (a && a.task_completed_at ? ' done' : ''),
+      title: a ? a.name + ' · ' + a.state + ' · ' + (a.turns == null ? '—' : a.turns) + ' turns · ctx ' + (a.context_percent == null ? '—' : a.context_percent + '%') : 'No agent',
+      onclick: function () { agentPanel.hidden = !agentPanel.hidden; retireUntil = 0; if (!agentPanel.hidden) renderAgentPanel(); }
+    }, [a ? el('span', { class: 'mark ' + (a.task_completed_at || a.state === 'working' ? 'ok' : 'muted'), text: mark }) : null,
+      el('span', { class: 'name', text: a ? a.name : 'No agent' })]);
+    return button;
+  }
+  function renderAgentPanel(error) {
+    clear(agentPanel);
+    var a = S.agent;
+    function row(k, v) { agentPanel.appendChild(el('div', { class: 'row' }, [el('span', {text:k}), el('span', {text:v})])); }
+    row(a ? a.name : 'No agent', a ? a.state : '');
+    if (a) {
+      row('Turns', a.turns == null ? '—' : String(a.turns));
+      if (a.context_percent != null) row('Context', Math.round(a.context_percent) + '%');
+      if (a.task_completed_at) row('Task', '✓ complete ' + Math.max(0, Math.floor((Date.now() - Date.parse(a.task_completed_at)) / 60000)) + 'm ago');
+    }
+    row('Merge', S.mergeHold ? '⏸ held by ' + S.mergeHold.placed_by : 'not held');
+    if (S.mergeHold && S.mergeHold.reason) agentPanel.appendChild(el('div', {text:S.mergeHold.reason}));
+    function action(method, path, body) {
+      api(method,path,body).then(function (res) { if (res && res.error) throw new Error(res.error); agentPanel.hidden = true; pollHead(); })
+        .catch(function (err) { renderAgentPanel(err.message); if (err.status === 409) pollHead(); });
+    }
+    var actions = [];
+    if (a) actions.push(el('button', {class:a.task_completed_at ? 'p' : '',text:Date.now() < retireUntil ? 'Tap again to retire' : 'Retire',onclick:function () {
+      if (Date.now() < retireUntil) { retireUntil = 0; action('POST','/agent/retire',{session_id:a.session_id}); }
+      else { retireUntil = Date.now() + 4000; renderAgentPanel(); setTimeout(function () { retireUntil = 0; if (!agentPanel.hidden) renderAgentPanel(); },4000); }
+    }}));
+    if (S.prState === 'open') actions.push(el('button', {text:S.mergeHold ? 'Release hold' : 'Hold merge',onclick:function () {action(S.mergeHold ? 'DELETE' : 'POST','/merge-hold',{});} }));
+    agentPanel.appendChild(el('div', {class:'row'},actions));
+    if (error) agentPanel.appendChild(el('div',{class:'err',text:error}));
+    var top=bar.offsetHeight + 8;
+    agentPanel.style.top=top+'px'; agentPanel.style.right='8px';
+  }
+  document.addEventListener('pointerdown',function (event) {
+    var path=event.composedPath ? event.composedPath() : [];
+    if (path.indexOf(agentPanel)<0 && !path.some(function (e) {return e.classList && e.classList.contains('agent');})) agentPanel.hidden=true;
+  });
+  document.addEventListener('keydown',function (event) {if (event.key==='Escape') agentPanel.hidden=true;});
 
   // ---- banners ---------------------------------------------------------
   var discardArmed = {};
@@ -256,7 +309,7 @@
       else parts.push(el('button', { class: 'lk', text: 'Assign to a new agent', onclick: function (e) {
         var b = e.currentTarget; b.disabled = true;
         api('POST', '/assign', { review_id: S.undelivered.id }).then(function (res) {
-          S.assigned = 'Assigned to ' + (res.name || res.session_id);
+          S.assigned = 'Assigned to ' + (res.name || res.session_id); pollHead();
           renderBanner();
         }, function (err) { S.assigned = err.message; renderBanner(); });
       } }));
@@ -295,6 +348,8 @@
     if (MSG || document.visibilityState === 'hidden') return;
     api('GET', '/head?sha=' + CONFIG.sha).then(function (head) {
       S.head = head;
+      S.agent = head.agent || null; S.mergeHold = head.merge_hold || null;
+      if (!agentPanel.hidden) renderAgentPanel();
       if (head.pr_state) {
         S.prState = head.pr_state;
         if (head.pr_state !== 'unknown') S.canComment = head.pr_state === 'open';
@@ -622,6 +677,8 @@
       r.disabled = !!attempt;
       return el('label', {}, [r, v[1]]);
     });
+    var holdCheck = el('input', {type:'checkbox'});
+    holdCheck.checked = !!S.mergeHold; holdCheck.disabled = !!S.mergeHold;
     var body = el('textarea', { placeholder: 'Overall comment (optional)' });
     if (attempt) { body.value = attempt.body; body.disabled = true; }
     var submit = el('button', { class: 'p', text: attempt ? 'Submit again' : 'Submit review', onclick: function () {
@@ -634,11 +691,11 @@
           renderReview('The drafts changed on another device. Check them, then submit.');
           return;
         }
-        if (!S.attempt) S.attempt = { id: newId(), verdict: picked ? picked.value : 'comment', body: body.value };
-        return api('POST', '/review', { submission_id: S.attempt.id, sha: CONFIG.sha, verdict: S.attempt.verdict, body: S.attempt.body })
+        if (!S.attempt) S.attempt = { id: newId(), verdict: picked ? picked.value : 'comment', body: body.value, hold: holdCheck.checked };
+        return api('POST', '/review', { submission_id: S.attempt.id, sha: CONFIG.sha, verdict: S.attempt.verdict, body: S.attempt.body, hold: !!S.attempt.hold })
           .then(function (res) {
             S.attempt = null;
-            S.docState = 'reviewed';
+            S.docState = 'reviewed'; pollHead();
             if (res.delivered_to_session_id == null) { S.undelivered = { id: res.submission_id, url: res.github_review_url }; S.assigned = ''; renderBanner(); }
             S.drafts = S.drafts.filter(function (d) { return d.commit_sha !== CONFIG.sha; });
             markers(); renderBar();
@@ -664,6 +721,7 @@
     } });
     // Actions above the overall comment, clear of the on-screen keyboard.
     [el('div', { class: 'row' }, radios),
+      el('label', {}, [holdCheck, 'Hold merge until I release it']),
       el('div', { class: 'row' }, [el('button', { text: 'Cancel', onclick: closeSheet }), submit]),
       msg,
       attempt ? el('div', { class: 'muted', text: 'Retrying your earlier submission with its verdict and text.' }) : null,
