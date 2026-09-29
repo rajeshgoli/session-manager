@@ -87,7 +87,10 @@ impl ActivityRecorder {
             .last_prune_ms
             .is_none_or(|at| now_ms - at >= PRUNE_INTERVAL_MS)
         {
-            prune(conn, cutoff_ms)?;
+            if let Err(error) = prune(conn, cutoff_ms) {
+                self.conn = None;
+                return Err(error);
+            }
             self.last_prune_ms = Some(now_ms);
         }
         if !errors.is_empty() {
