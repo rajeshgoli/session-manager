@@ -113,6 +113,8 @@ results not yet pushed), run `sm worktree keep --reason "<why>"`.
   ticket closes, and run `sm task-complete`. If not, comment on the ticket what
   remains, then continue or stand by.
 
+**Record ticket order where sm can read it.** When you file the tickets for a plan, record each one's order with `sm board after <ticket> <ticket it starts after>...`, and put every ticket of the plan under the plan's goal ticket with `sm board under <ticket> <goal>`. When you find work that must land before your ticket, file it and run `sm board after <your ticket> <new ticket>`. When a ticket needed only part of yours and you have delivered that part, remove its link with `sm board after <that ticket> <yours> --remove`. Keep "Starts after #N" in the ticket text for people; the link is what sm reads. Only Rajesh orders or ends lanes.
+
  Workflow as usual:
  1. Rebuild and restart session manager as required. If it's pure sm app update, you don't need to restart session manager, otherwise you may need to. Restart using `scripts/restart-rust-server.sh`. Follow other maintainer lessons from `docs/product/lessons.md` as needed. 
  2. If I need to test something let me know. For example, if something can be tested with sm cli or sm app, let me know exactly what to try out.  If you can test directly that's preferred. For example, if you can reliable reproduce the issue I reported and you can verify it no longer occurs, you can tell me what you did and ask me to try it optionally.

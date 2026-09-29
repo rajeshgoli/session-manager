@@ -1,6 +1,7 @@
 pub mod activity_ledger;
 pub mod analytics_spend;
 pub mod app_artifacts;
+pub mod board;
 pub mod btw;
 pub mod bug_reports;
 pub mod child_output;

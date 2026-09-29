@@ -56,6 +56,7 @@ pub struct AppConfig {
     pub rust_shadow: RustShadowConfig,
     pub rust_core: RustCoreConfig,
     pub work_claims: WorkClaimsConfig,
+    pub board: BoardConfig,
     pub web_watch: WebWatchConfig,
     pub push: PushConfig,
     pub utilization: UtilizationConfig,
@@ -127,6 +128,7 @@ impl Default for AppConfig {
             rust_shadow: RustShadowConfig::default(),
             rust_core: RustCoreConfig::default(),
             work_claims: WorkClaimsConfig::default(),
+            board: BoardConfig::default(),
             web_watch: WebWatchConfig::default(),
             push: PushConfig::default(),
             utilization: UtilizationConfig::default(),
@@ -1830,6 +1832,89 @@ fn default_work_claims_idle_nudge_minutes() -> u64 {
     30
 }
 
+/// `board`: ticket order, lanes and states (sm#1665).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BoardConfig {
+    /// Repos the board reads besides those of its lanes (`owner/name`). A
+    /// loaded config without the key reads the owner's two repos; a bare
+    /// `AppConfig::default()` (tests) reads none, so nothing calls GitHub.
+    #[serde(default = "default_board_repos")]
+    pub repos: Vec<String>,
+    /// Seconds between GitHub reads; at least 30.
+    #[serde(default = "default_board_sync_interval_seconds")]
+    pub sync_interval_seconds: u64,
+    /// Where Start runs a new agent, per `owner/name`.
+    #[serde(default)]
+    pub checkouts: BTreeMap<String, String>,
+    /// What the Start sheet preselects.
+    #[serde(default)]
+    pub start_defaults: BoardStartDefaults,
+}
+
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct BoardStartDefaults {
+    #[serde(default = "default_board_start_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default = "default_board_start_effort")]
+    pub reasoning_effort: String,
+}
+
+impl Default for BoardStartDefaults {
+    fn default() -> Self {
+        Self {
+            provider: default_board_start_provider(),
+            model: None,
+            reasoning_effort: default_board_start_effort(),
+        }
+    }
+}
+
+impl Default for BoardConfig {
+    fn default() -> Self {
+        Self {
+            repos: Vec::new(),
+            sync_interval_seconds: default_board_sync_interval_seconds(),
+            checkouts: BTreeMap::new(),
+            start_defaults: BoardStartDefaults::default(),
+        }
+    }
+}
+
+impl BoardConfig {
+    /// `board` absent from a loaded config file.
+    fn loaded_default() -> Self {
+        Self {
+            repos: default_board_repos(),
+            ..Self::default()
+        }
+    }
+
+    pub fn sync_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.sync_interval_seconds.max(30))
+    }
+}
+
+fn default_board_repos() -> Vec<String> {
+    vec![
+        "rajeshgoli/session-manager".to_owned(),
+        "rajeshgoli/fractal-algo-rust".to_owned(),
+    ]
+}
+
+fn default_board_sync_interval_seconds() -> u64 {
+    60
+}
+
+fn default_board_start_provider() -> String {
+    "claude".to_owned()
+}
+
+fn default_board_start_effort() -> String {
+    "high".to_owned()
+}
+
 /// `web_watch`: the browser watch at `/` and `/watch` (sm#1452).
 #[derive(Debug, Clone, Deserialize)]
 pub struct WebWatchConfig {
@@ -2058,6 +2143,8 @@ struct RawConfig {
     rust_core: RustCoreConfig,
     #[serde(default)]
     work_claims: WorkClaimsConfig,
+    #[serde(default = "BoardConfig::loaded_default")]
+    board: BoardConfig,
     #[serde(default)]
     web_watch: WebWatchConfig,
     #[serde(default)]
@@ -2174,6 +2261,7 @@ impl From<RawConfig> for AppConfig {
             rust_shadow: raw.rust_shadow,
             rust_core,
             work_claims: raw.work_claims,
+            board: raw.board,
             web_watch: raw.web_watch,
             push: raw.push,
             utilization: raw.utilization,

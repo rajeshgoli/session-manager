@@ -882,6 +882,7 @@ pub(super) async fn publish_owner_doc(
     if published.publish.review_requested {
         super::follows::notice_review_publish(&state, &published.doc, &published.publish);
     }
+    super::board::request_recompute(&state);
     let mut response = summary_json(&state.config, &summary, &headers)?;
     response["created"] = json!(published.created);
     response["publish"] = serde_json::to_value(&published.publish)?;
@@ -2037,6 +2038,7 @@ async fn dismiss_review(state: &AppState, doc: &OwnerDoc) -> Result<(), ApiError
             detail: "No review is requested on this doc".to_owned(),
         });
     }
+    super::board::request_recompute(state);
     Ok(())
 }
 
