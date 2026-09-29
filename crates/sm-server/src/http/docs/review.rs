@@ -122,9 +122,9 @@ pub(super) fn is_retired(session: &SessionRecord) -> bool {
     super::super::messages::session_ended(session)
 }
 
-/// The author if it still exists (a stopped session gets the queued message
-/// on restore), else the retired author's parent, else nobody: the rule
-/// message replies use too.
+/// Prefer the PR claimant, then the author or live parent, then the latest
+/// review recipient. Assign records that recipient before the new agent
+/// has had a chance to claim the PR.
 pub(in crate::http) fn review_wake_recipient(state: &AppState, doc: &OwnerDoc) -> Option<String> {
     if let Some(pr) = doc.pr_number {
         if let Ok(claims) = super::super::claims::work_claim_store(state)
@@ -144,7 +144,19 @@ pub(in crate::http) fn review_wake_recipient(state: &AppState, doc: &OwnerDoc) -
             }
         }
     }
-    super::super::messages::live_recipient(state, &doc.author_session_id).map(|session| session.id)
+    super::super::messages::live_recipient(state, &doc.author_session_id)
+        .map(|session| session.id)
+        .or_else(|| assigned_review_recipient(state, doc))
+}
+
+pub(super) fn assigned_review_recipient(state: &AppState, doc: &OwnerDoc) -> Option<String> {
+    let review = owner_doc_store(state)
+        .reviews(&doc.id)
+        .ok()?
+        .into_iter()
+        .rfind(|r| r.status == "posted")?;
+    let id = review.delivered_to_session_id?;
+    super::super::messages::live_recipient(state, &id).map(|s| s.id)
 }
 
 #[derive(Debug, Deserialize)]
@@ -840,6 +852,7 @@ pub(super) async fn assign_review(
     Ok(json!({
         "session_id": session.id,
         "name": session_display_name(session.clone()),
+        "agent": super::doc_agent(state, doc),
     }))
 }
 

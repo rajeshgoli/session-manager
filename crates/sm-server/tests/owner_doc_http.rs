@@ -339,6 +339,13 @@ async fn assign_undelivered_review_spawns_agent() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let session_id = body["session_id"].as_str().unwrap().to_owned();
+    // Assignment must reach the reader before the agent claims its PR.
+    assert_eq!(body["agent"]["session_id"], session_id);
+    assert_eq!(body["agent"]["via"], "assignment");
+    let (status, head) = request(&f.app, "GET", &format!("/docs/{id}/head"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(head["agent"]["session_id"], session_id);
+    assert_eq!(head["agent"]["via"], "assignment");
     // The new agent: same provider, model and effort as the ended author,
     // in the newest checkout that still exists, no parent.
     let sessions: Value =
