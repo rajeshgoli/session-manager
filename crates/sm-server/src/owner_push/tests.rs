@@ -1310,6 +1310,20 @@ fn shown_notices_are_withdrawn_once_answered_or_opened() {
     // Each goes once.
     withdraw_notices(&store, &world, Some(&flaky), now).unwrap();
     assert_eq!(withdrawals(&flaky).len(), 2);
+    // Opened before the first push: never sent, so nothing to withdraw.
+    store
+        .create_notice(&message_notice("msg_early", false), now)
+        .unwrap();
+    world.open("msg_early");
+    let quiet = FakeSender::default();
+    deliver_notices(&store, &world, Some(&quiet), &mailer, now).unwrap();
+    assert!(quiet.sent().is_empty());
+    assert_eq!(
+        notice_of(&store, NOTICE_MESSAGE, "msg_early")
+            .notified_via
+            .as_deref(),
+        Some("resolved")
+    );
     // Without a push channel there is nothing to do.
     world.open("msg_waiting");
     withdraw_notices(&store, &world, None, now).unwrap();

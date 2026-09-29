@@ -405,7 +405,7 @@ pub fn deliver_notices(
 ) -> Result<Vec<String>> {
     let mut problems = Vec::new();
     for mut notice in store.pending_notices(now)? {
-        if !world.still_wanted(&notice)? {
+        if !world.still_wanted(&notice)? || world.opened(&notice)? {
             close_resolved(&mut notice, now);
             store.save_notice_delivery(&notice)?;
             continue;
@@ -483,7 +483,7 @@ pub fn deliver_notices(
         store.save_notice_delivery(&notice)?;
     }
     for mut notice in store.notice_ack_fallback_due(now)? {
-        if !world.still_wanted(&notice)? {
+        if !world.still_wanted(&notice)? || world.opened(&notice)? {
             close_resolved(&mut notice, now);
             store.save_notice_delivery(&notice)?;
             continue;
@@ -562,7 +562,8 @@ pub fn withdraw_notices(
     Ok(problems)
 }
 
-/// The owner already answered: nothing is sent, now or as a fallback.
+/// The owner already answered or opened it: nothing is sent, now or as a
+/// fallback.
 fn close_resolved(notice: &mut Notice, now: OffsetDateTime) {
     if notice.notified_at.is_none() {
         notice.notified_at = Some(format_ts(now));
