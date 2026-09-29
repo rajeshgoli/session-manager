@@ -15,11 +15,11 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import li.rajeshgo.sm.data.model.InboxResponse
 import li.rajeshgo.sm.data.model.InboxRow
-import li.rajeshgo.sm.data.remote.HttpClientFactory
 import li.rajeshgo.sm.data.repository.SessionManagerAuthException
 import li.rajeshgo.sm.data.repository.SessionManagerRepository
 import li.rajeshgo.sm.data.repository.SettingsRepository
 import li.rajeshgo.sm.ui.watch.DocReaderAuth
+import li.rajeshgo.sm.ui.watch.loadDocReaderAuth
 
 /**
  * The Inbox tab's badge, shared by every screen's bottom nav (sm#1647):
@@ -78,16 +78,7 @@ class InboxViewModel(application: Application) : AndroidViewModel(application) {
         return serverUrl to token
     }
 
-    suspend fun docReaderAuth(): DocReaderAuth? {
-        val serverUrl = settingsRepository.serverUrl.first().trim()
-        val accessToken = settingsRepository.accessToken.first().trim()
-        if (serverUrl.isBlank() || accessToken.isBlank()) return null
-        return DocReaderAuth(
-            serverUrl = serverUrl,
-            accessToken = accessToken,
-            clientCertificate = HttpClientFactory(settingsRepository).deviceClientCertificate(),
-        )
-    }
+    suspend fun docReaderAuth(): DocReaderAuth? = loadDocReaderAuth(settingsRepository)
 
     fun setFilter(filter: InboxFilter) {
         if (filter == _uiState.value.filter) return

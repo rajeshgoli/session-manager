@@ -54,6 +54,7 @@
                 <data android:pathPrefix="/docs/" />
                 <data android:pathPrefix="/t/" />
                 <data android:path="/history" />
+                <data android:path="/guestbook" />
             </intent-filter>
         </activity>
         <service

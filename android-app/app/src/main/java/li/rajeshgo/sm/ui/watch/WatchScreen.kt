@@ -45,17 +45,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
 import androidx.compose.material.icons.rounded.ContentCopy
-import androidx.compose.material.icons.rounded.Campaign
-import androidx.compose.material.icons.rounded.History
-import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.NotificationsNone
 import androidx.compose.material.icons.rounded.QuestionAnswer
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.RestartAlt
-import androidx.compose.material.icons.rounded.Add
-import androidx.compose.material.icons.rounded.SupportAgent
+import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Terminal
 import androidx.compose.material.icons.rounded.UnfoldLess
 import androidx.compose.material.icons.rounded.UnfoldMore
@@ -120,6 +116,8 @@ import li.rajeshgo.sm.data.model.SessionDoc
 import li.rajeshgo.sm.data.model.SessionMessage
 import li.rajeshgo.sm.data.model.SessionJob
 import li.rajeshgo.sm.ui.navigation.AppBottomNav
+import li.rajeshgo.sm.ui.navigation.AppMenuActions
+import li.rajeshgo.sm.ui.navigation.AppTopBar
 import li.rajeshgo.sm.ui.navigation.Routes
 import li.rajeshgo.sm.ui.theme.Amber
 import li.rajeshgo.sm.ui.theme.Border
@@ -134,7 +132,6 @@ import li.rajeshgo.sm.ui.theme.Rose
 import li.rajeshgo.sm.ui.theme.TextMuted
 import li.rajeshgo.sm.ui.theme.TextSecondary
 import li.rajeshgo.sm.ui.theme.Violet
-import li.rajeshgo.sm.ui.update.SettingsIconButtonWithUpdate
 import li.rajeshgo.sm.ui.update.UpdateAvailabilityViewModel
 import li.rajeshgo.sm.ui.update.UpdateReadyBanner
 import li.rajeshgo.sm.ui.queue.waitingJobCount
@@ -148,9 +145,8 @@ private const val WATCH_TOAST_MS = 3500L
 @Composable
 fun WatchScreen(
     onNavigateToInbox: () -> Unit,
-    onNavigateToSettings: () -> Unit,
-    onNavigateToAnalytics: () -> Unit,
     onNavigateToQueue: () -> Unit,
+    menu: AppMenuActions,
     viewModel: WatchViewModel = viewModel(),
     updateViewModel: UpdateAvailabilityViewModel = viewModel(),
 ) {
@@ -230,6 +226,15 @@ fun WatchScreen(
         }
         onFollowOpenConsumed()
     }
+    // New session from any screen's menu opens the create sheet here.
+    val pendingNewSession = li.rajeshgo.sm.ui.navigation.NewSessionRequests.pending
+    LaunchedEffect(pendingNewSession) {
+        if (!pendingNewSession) return@LaunchedEffect
+        cloneSource = null
+        createError = null
+        creating = true
+        li.rajeshgo.sm.ui.navigation.NewSessionRequests.pending = false
+    }
     // An opened sm link: show it in the reader.
     val pendingReaderLink = li.rajeshgo.sm.ui.navigation.ReaderLinkRequests.pending
     LaunchedEffect(pendingReaderLink) {
@@ -306,27 +311,18 @@ fun WatchScreen(
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             item {
-                HeaderBar(
-                    userEmail = state.userEmail,
-                    lastSync = state.lastSync,
-                    refreshing = state.refreshing,
-                    requestingStatus = state.requestingStatus,
-                    ensuringMaintainer = state.ensuringMaintainer,
-                    hasUpdate = updateState.availableUpdate != null,
+                AppTopBar(
+                    title = "Watch",
+                    menu = menu,
+                    subtitle = buildString {
+                        append("Last sync ")
+                        append(formatDateTime(state.lastSync))
+                        if (state.userEmail.isNotBlank()) append(" • ${state.userEmail}")
+                    },
+                    busy = state.refreshing,
+                    current = Routes.WATCH,
                     onRefresh = { viewModel.refresh() },
-                    onRequestStatus = {
-                        viewModel.requestStatus { result ->
-                            toast = result.exceptionOrNull()?.message ?: result.getOrNull()
-                        }
-                    },
-                    onEnsureMaintainer = {
-                        viewModel.ensureMaintainer { result ->
-                            toast = result.exceptionOrNull()?.message ?: result.getOrNull()
-                        }
-                    },
-                    onOpenSettings = onNavigateToSettings,
-                    onNewSession = { cloneSource = null; createError = null; creating = true },
-                    onOpenHistory = { openPage = historyReaderPage },
+                    updateViewModel = updateViewModel,
                 )
             }
 
@@ -344,7 +340,7 @@ fun WatchScreen(
                 item {
                     UpdateReadyBanner(
                         update = update,
-                        onOpenSettings = onNavigateToSettings,
+                        onOpenSettings = menu.onOpenSettings,
                     )
                 }
             }
@@ -485,7 +481,6 @@ fun WatchScreen(
                 onInbox = onNavigateToInbox,
                 onWatch = {},
                 onQueue = onNavigateToQueue,
-                onAnalytics = onNavigateToAnalytics,
                 queueBadge = waitingJobCount(state.sessions),
             )
         }
@@ -1111,128 +1106,6 @@ private fun studioSshStatusTint(status: String): Color = when (status.lowercase(
     "starting" -> Amber
     "error" -> Rose
     else -> TextMuted
-}
-
-@Composable
-private fun HeaderBar(
-    userEmail: String,
-    lastSync: String?,
-    refreshing: Boolean,
-    requestingStatus: Boolean,
-    ensuringMaintainer: Boolean,
-    hasUpdate: Boolean,
-    onRefresh: () -> Unit,
-    onRequestStatus: () -> Unit,
-    onEnsureMaintainer: () -> Unit,
-    onOpenSettings: () -> Unit,
-    onNewSession: () -> Unit,
-    onOpenHistory: () -> Unit,
-) {
-    var menuExpanded by remember { mutableStateOf(false) }
-
-    Surface(
-        shape = RoundedCornerShape(18.dp),
-        color = Panel,
-        border = androidx.compose.foundation.BorderStroke(1.dp, Border),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 10.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(Modifier.weight(1f)) {
-                Text("sm watch", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.onSurface)
-                val statusLine = buildString {
-                    append("Last sync ")
-                    append(formatDateTime(lastSync))
-                    if (userEmail.isNotBlank()) {
-                        append(" • ")
-                        append(userEmail)
-                    }
-                }
-                Spacer(Modifier.height(2.dp))
-                Text(
-                    text = statusLine,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = if (refreshing) Cyan else TextMuted,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = onOpenHistory) {
-                    Icon(Icons.Rounded.History, contentDescription = "History", tint = TextSecondary)
-                }
-                Box {
-                    IconButton(onClick = { menuExpanded = true }) {
-                        Icon(
-                            Icons.Rounded.MoreVert,
-                            contentDescription = "Watch actions",
-                            tint = if (refreshing || requestingStatus || ensuringMaintainer) Cyan else TextSecondary,
-                        )
-                    }
-                    DropdownMenu(
-                        expanded = menuExpanded,
-                        onDismissRequest = { menuExpanded = false },
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("New session") },
-                            leadingIcon = { Icon(Icons.Rounded.Add, contentDescription = null) },
-                            onClick = { menuExpanded = false; onNewSession() },
-                            enabled = userEmail.isNotBlank(),
-                        )
-                        DropdownMenuItem(
-                            text = { Text(if (ensuringMaintainer) "Wake maintainer (starting...)" else "Wake maintainer") },
-                            onClick = {
-                                menuExpanded = false
-                                onEnsureMaintainer()
-                            },
-                            enabled = !ensuringMaintainer,
-                            leadingIcon = {
-                                Icon(
-                                    Icons.Rounded.SupportAgent,
-                                    contentDescription = null,
-                                    tint = if (ensuringMaintainer) Cyan else TextSecondary,
-                                )
-                            },
-                        )
-                        DropdownMenuItem(
-                            text = { Text(if (requestingStatus) "Request status (sending...)" else "Request status") },
-                            onClick = {
-                                menuExpanded = false
-                                onRequestStatus()
-                            },
-                            enabled = !requestingStatus,
-                            leadingIcon = {
-                                Icon(
-                                    Icons.Rounded.Campaign,
-                                    contentDescription = null,
-                                    tint = if (requestingStatus) Cyan else TextSecondary,
-                                )
-                            },
-                        )
-                        DropdownMenuItem(
-                            text = { Text(if (refreshing) "Refresh (running...)" else "Refresh") },
-                            onClick = {
-                                menuExpanded = false
-                                onRefresh()
-                            },
-                            enabled = !refreshing,
-                            leadingIcon = {
-                                Icon(
-                                    Icons.Rounded.Refresh,
-                                    contentDescription = null,
-                                    tint = if (refreshing) Cyan else TextSecondary,
-                                )
-                            },
-                        )
-
-                    }
-                }
-                SettingsIconButtonWithUpdate(hasUpdate = hasUpdate, onClick = onOpenSettings)
-            }
-        }
-    }
 }
 
 @OptIn(ExperimentalLayoutApi::class)

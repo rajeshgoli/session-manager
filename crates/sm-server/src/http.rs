@@ -166,7 +166,6 @@ const CODEX_REVIEW_LOCAL_RECONCILE_INTERVAL_SECONDS: u64 = 30;
 // give up once this many `@codex review` comments have been posted.
 const CODEX_REVIEW_FAILURE_RETRY_DELAY_SECONDS: i64 = 120;
 const CODEX_REVIEW_MAX_ATTEMPTS: i64 = 3;
-const REQUEST_STATUS_PROMPT: &str = "[sm] user requests status, please update now using sm status";
 const BUG_REPORT_MAX_TEXT_CHARS: usize = 4000;
 const BUG_REPORT_MAX_CLIENT_STATE_CHARS: usize = 100_000;
 const BUG_REPORT_MAX_SERVER_STATE_CHARS: usize = 200_000;
@@ -1504,7 +1503,6 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/client/utilization/series", get(client_utilization_series))
         .route("/client/analytics/summary", get(client_analytics_summary))
-        .route("/client/request-status", post(client_request_status))
         .route(
             "/client/push-token",
             put(follows::put_push_token).delete(follows::delete_push_token),
@@ -2722,94 +2720,6 @@ async fn client_analytics_summary(
     summary["state_distribution"] = json!(["working", "thinking", "waiting", "idle"]
         .map(|key| json!({"key": key, "label": key, "count": counts.get(key).unwrap_or(&0)})));
     Ok(Json(summary))
-}
-
-async fn client_request_status(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    uri: Uri,
-    headers: HeaderMap,
-) -> Result<Json<ClientRequestStatusResponse>, ApiError> {
-    let request_target = request_target_from_uri(&uri);
-    let access_context =
-        ensure_mobile_cloudflare_access_from_parts(&state, &headers, Some(peer_addr))?;
-    ensure_public_edge_assertion_from_parts(
-        &state,
-        &headers,
-        Some(peer_addr),
-        "POST",
-        &request_target,
-    )?;
-    ensure_session_allowed_from_parts(
-        &state.config,
-        &headers,
-        Some(peer_addr),
-        "/client/request-status",
-    )?;
-    ensure_mobile_cloudflare_access_context_matches_optional_actor(
-        &state,
-        access_context.as_ref(),
-        request_actor_email_from_parts(&state.config, &headers, Some(peer_addr)).as_deref(),
-    )?;
-    ensure_core_writes_enabled(&state)?;
-    let sessions = state.session_store.list_sessions(false)?;
-    let runtime = state
-        .config
-        .rust_core
-        .runtime_enabled
-        .then(|| TmuxRuntime::from_app_config(&state.config));
-    let mut delivered_count = 0;
-    let mut queued_count = 0;
-    let mut failed_count = 0;
-    let mut targeted_session_ids = Vec::with_capacity(sessions.len());
-    for session in sessions {
-        targeted_session_ids.push(session.id.clone());
-        if session.provider == "codex-app" {
-            failed_count += 1;
-            continue;
-        }
-        let payload = SendCoreInputRequest {
-            text: REQUEST_STATUS_PROMPT.to_owned(),
-            delivery_mode: "important".to_owned(),
-            sender_session_id: None,
-            from_sm_send: false,
-            timeout_seconds: None,
-            notify_on_delivery: false,
-            notify_after_seconds: None,
-            notify_on_stop: false,
-            remind_soft_threshold: None,
-            remind_hard_threshold: None,
-            remind_cancel_on_reply_session_id: None,
-            parent_session_id: None,
-        };
-        let outcome = if let Some(runtime) = runtime.as_ref() {
-            if !is_primary_node(&session.node) {
-                failed_count += 1;
-                continue;
-            }
-            state
-                .session_store
-                .send_core_input_with_runtime(&session.id, payload, runtime)?
-        } else {
-            state.session_store.send_core_input(&session.id, payload)?
-        };
-        match outcome {
-            Some(result) if result.delivered => delivered_count += 1,
-            Some(result) if !matches!(result.status.as_str(), "stopped" | "retired" | "killed") => {
-                queued_count += 1
-            }
-            _ => failed_count += 1,
-        }
-    }
-    Ok(Json(ClientRequestStatusResponse {
-        status: "requested",
-        prompt: REQUEST_STATUS_PROMPT,
-        targeted_count: targeted_session_ids.len(),
-        delivered_count,
-        queued_count,
-        failed_count,
-        targeted_session_ids,
-    }))
 }
 
 async fn submit_client_bug_report(
@@ -14158,7 +14068,7 @@ fn is_static_sessions_path(path: &str) -> bool {
 }
 
 fn is_retained_write_surface(method: &str, path: &str) -> bool {
-    if method == "POST" && (path == "/client/request-status" || path == "/client/bug-reports") {
+    if method == "POST" && path == "/client/bug-reports" {
         return true;
     }
     if method == "POST" && path.starts_with("/deploy/") {
@@ -15457,17 +15367,6 @@ struct NodePingResponse {
 struct NodeRestoreCandidatesResponse {
     node: String,
     sessions: Vec<Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct ClientRequestStatusResponse {
-    status: &'static str,
-    prompt: &'static str,
-    targeted_count: usize,
-    delivered_count: usize,
-    queued_count: usize,
-    failed_count: usize,
-    targeted_session_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -19949,7 +19848,6 @@ mod tests {
                 "",
                 false,
             ),
-            (Method::POST, "/client/request-status", "", false),
             (
                 Method::POST,
                 "/client/bug-reports",
@@ -20651,39 +20549,6 @@ mod tests {
             body["detail"],
             "Public edge assertion is enabled but incomplete"
         );
-    }
-
-    #[tokio::test]
-    async fn public_edge_assertion_binds_post_request_status_query_target() {
-        let app = router(AppState::new(public_edge_config()));
-        let target = "/client/request-status?source=mobile";
-        let mut signed_full_target = public_request(Method::POST, target, Body::empty());
-        add_public_edge_headers(
-            &mut signed_full_target,
-            "edge-secret",
-            "POST",
-            target,
-            "edge-nonce-full-target",
-        );
-
-        let response = app.clone().oneshot(signed_full_target).await.unwrap();
-        let (status, body) = response_json(response).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body["detail"], "Rust core writes are disabled");
-
-        let mut signed_bare_path = public_request(Method::POST, target, Body::empty());
-        add_public_edge_headers(
-            &mut signed_bare_path,
-            "edge-secret",
-            "POST",
-            "/client/request-status",
-            "edge-nonce-bare-path",
-        );
-
-        let response = app.oneshot(signed_bare_path).await.unwrap();
-        let (status, body) = response_json(response).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(body["detail"], "Invalid public edge assertion");
     }
 
     #[tokio::test]

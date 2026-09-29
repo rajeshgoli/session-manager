@@ -56,6 +56,8 @@ import li.rajeshgo.sm.data.model.InboxRow
 import li.rajeshgo.sm.push.FollowOpen
 import li.rajeshgo.sm.push.FollowOpenRequests
 import li.rajeshgo.sm.ui.navigation.AppBottomNav
+import li.rajeshgo.sm.ui.navigation.AppMenuActions
+import li.rajeshgo.sm.ui.navigation.AppTopBar
 import li.rajeshgo.sm.ui.navigation.Routes
 import li.rajeshgo.sm.ui.queue.rememberResumed
 import li.rajeshgo.sm.ui.queue.shortDuration
@@ -107,7 +109,7 @@ fun inboxRowDetail(row: InboxRow): String {
 fun InboxScreen(
     onNavigateToWatch: () -> Unit,
     onNavigateToQueue: () -> Unit,
-    onNavigateToAnalytics: () -> Unit,
+    menu: AppMenuActions,
     viewModel: InboxViewModel = viewModel(),
 ) {
     val state by viewModel.uiState.collectAsState()
@@ -156,8 +158,20 @@ fun InboxScreen(
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 item {
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text("Inbox", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+                    AppTopBar(
+                        title = "Inbox",
+                        menu = menu,
+                        busy = state.refreshing,
+                        current = Routes.INBOX,
+                        onRefresh = { viewModel.refresh(pull = true) },
+                    )
+                }
+                item {
+                    Row(
+                        Modifier.fillMaxWidth().padding(top = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
                         InboxFilter.entries.forEach { filter ->
                             FilterChip(filter.label, selected = filter == state.filter) { viewModel.setFilter(filter) }
                         }
@@ -225,7 +239,6 @@ fun InboxScreen(
                 onInbox = {},
                 onWatch = onNavigateToWatch,
                 onQueue = onNavigateToQueue,
-                onAnalytics = onNavigateToAnalytics,
             )
         }
 

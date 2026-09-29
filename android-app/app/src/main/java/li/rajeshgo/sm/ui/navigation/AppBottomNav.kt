@@ -10,7 +10,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ViewList
-import androidx.compose.material.icons.rounded.Analytics
 import androidx.compose.material.icons.rounded.HourglassTop
 import androidx.compose.material.icons.rounded.Inbox
 import androidx.compose.material3.Icon
@@ -35,7 +34,6 @@ fun AppBottomNav(
     onInbox: () -> Unit,
     onWatch: () -> Unit,
     onQueue: () -> Unit,
-    onAnalytics: () -> Unit,
     modifier: Modifier = Modifier,
     queueBadge: Int = 0,
 ) {
@@ -74,12 +72,6 @@ fun AppBottomNav(
                 selected = currentRoute == Routes.QUEUE,
                 icon = { Icon(Icons.Rounded.HourglassTop, contentDescription = null, modifier = Modifier.size(18.dp)) },
                 onClick = onQueue,
-            )
-            AppBottomNavItem(
-                label = "Analytics",
-                selected = currentRoute == Routes.ANALYTICS,
-                icon = { Icon(Icons.Rounded.Analytics, contentDescription = null, modifier = Modifier.size(18.dp)) },
-                onClick = onAnalytics,
             )
         }
     }

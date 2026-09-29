@@ -71,6 +71,8 @@ class DocReaderTest {
         listOf(
             "$server/history",
             "$server/history?agent=1490-engineer&open=1",
+            "$server/guestbook",
+            "$server/guestbook?repo=rajeshgoli/session-manager",
             "$server/t/session-manager/1452",
             "$server/watch",
             "$server/",
@@ -79,6 +81,7 @@ class DocReaderTest {
         ).forEach { assertEquals(it, DocNavigation.Reload, docNavigation(server, current, it)) }
         listOf(
             "$server/historyx",
+            "$server/guestbookx",
             "$server/client/sessions",
             "$server/session-obligations",
             "https://sm.example.com/history",
@@ -165,6 +168,7 @@ class DocReaderTest {
         assertEquals("/t/session-manager/1575", ticket.path)
         assertTrue(ticket.followsPage)
         assertEquals("/history", readerPageForLink("https://sm.example.com/history", host)!!.path)
+        assertEquals("/guestbook", readerPageForLink("https://sm.example.com/guestbook", host)!!.path)
     }
 
     @Test fun obligationsWithAndWithoutMessagesParse() {
