@@ -3461,6 +3461,141 @@ async fn codex_review_request_watcher_retries_after_codex_failure_comment() {
 }
 
 #[tokio::test]
+async fn codex_review_request_watcher_retries_codex_failure_without_pickup_before_pickup_deadline()
+{
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("codex-review-failure-no-pickup.db");
+    let poster = StubGitHubReviewPoster::successful().with_fresh_review(GitHubReviewMatch {
+        source: "comment".to_owned(),
+        created_at: "2026-06-14T02:40:00Z".to_owned(),
+        id: Some(json!(4701300002_i64)),
+        url: Some(
+            "https://github.com/rajeshgoli/session-manager/pull/971#issuecomment-4701300002"
+                .to_owned(),
+        ),
+        head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
+    });
+    // Codex fails before it reacts with 👀, so the no-pickup deadline set at
+    // post time is still pending when the failure comment lands.
+    poster.set_pickup_detected(false);
+    poster.set_review_failure(codex_review_failure_comment(), 1);
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 971,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "run12345",
+            "poll_interval_seconds": 1,
+            "retry_interval_seconds": 1200
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let request_id = payload["id"].as_str().unwrap().to_owned();
+
+    let mut completed = None;
+    for _ in 0..60 {
+        let current: (String, i64) = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state, attempt_count FROM codex_review_request_registrations WHERE id = ?1",
+                [&request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        if current.0 == "completed" {
+            completed = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let completed = completed.expect(
+        "a Codex failure comment must trigger a fresh request before the no-pickup deadline",
+    );
+    assert_eq!(completed.1, 2);
+    assert_eq!(poster.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn codex_review_request_watcher_honors_retry_post_backoff_without_pickup() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("codex-review-failure-no-pickup-backoff.db");
+    let poster = StubGitHubReviewPoster::successful();
+    poster.set_pickup_detected(false);
+    poster.set_review_failure(codex_review_failure_comment(), 1);
+    poster.fail_posts_after(Some(1));
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+
+    let (status, payload) = post_json(
+        app,
+        "/codex-review-requests",
+        json!({
+            "pr_number": 971,
+            "repo": "rajeshgoli/session-manager",
+            "notify_target": "run12345",
+            "poll_interval_seconds": 1,
+            "retry_interval_seconds": 1200
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let request_id = payload["id"].as_str().unwrap().to_owned();
+    let read_retry = || -> (Option<String>, Option<String>) {
+        Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT last_error, next_retry_at FROM codex_review_request_registrations WHERE id = ?1",
+                [&request_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+
+    let mut backoff = None;
+    for _ in 0..40 {
+        let (last_error, next_retry_at) = read_retry();
+        if last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("review retry post failed"))
+        {
+            backoff = next_retry_at;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let backoff = backoff.expect("the failed retry post must schedule a backoff");
+
+    // Each further retry post would fail and push the backoff later; three
+    // polls without movement show the watcher is waiting it out.
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    assert_eq!(read_retry().1.as_deref(), Some(backoff.as_str()));
+    assert_eq!(poster.calls().len(), 1);
+}
+
+#[tokio::test]
 async fn codex_review_request_watcher_survives_failed_retry_post() {
     let state_file = write_session_fixture();
     let queue_db = state_file.with_extension("codex-review-retry-post-fails.db");
