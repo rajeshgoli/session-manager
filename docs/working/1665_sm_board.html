@@ -141,16 +141,24 @@
   .phone { max-width: 20rem; margin: 0 auto; border-radius: 18px; border-width: 2px; }
   .phone .nav { display: flex; justify-content: space-around; border-top: 1px solid var(--rule); background: var(--surface-2); padding: .4rem 0; color: var(--ink-2); font-size: .72rem; }
   .phone .nav u { text-decoration: none; color: var(--ink); font-weight: 700; }
+  .four { display: grid; grid-template-columns: 1fr 1fr; gap: .8rem; align-items: start; }
+  .four .phone { max-width: none; font-size: .72rem; }
+  .four .cap { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .78rem; color: var(--ink-2); margin: .3rem .2rem 0; line-height: 1.4; }
+  .mock .c-you { color: var(--orange); border: 1px solid var(--orange); }
+  .mock .new { color: var(--violet); font-size: .66rem; font-weight: 700; }
+  .mock .badge { background: var(--orange); color: #fff; border-radius: 999px; padding: 0 .35rem; font-size: .66rem; font-weight: 700; margin-left: .15rem; }
+  .mock .hl { background: var(--surface-2); border-left: 3px solid var(--orange); }
+  @media (max-width: 40rem) { .four { grid-template-columns: 1fr; } }
   .two { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; align-items: start; }
   @media (max-width: 40rem) { .two { grid-template-columns: 1fr; } }
 </style>
 
 <h1>1665 — sm board: ticket order, ranked lanes, and starting agents from the board</h1>
-<p class="sans"><small>Author: Claude Opus 5.5 <code>8922dc75</code> (sm-board-spec-author) · Ticket #1665 · 2026-09-29 · Revision 1</small></p>
+<p class="sans"><small>Author: Claude Opus 5.5 <code>8922dc75</code> (sm-board-spec-author) · Ticket #1665 · 2026-09-29 · Revision 2</small></p>
 
 <h2>Memo</h2>
 
-<p><b>sm reads the order of your tickets from GitHub, groups them into lanes that you rank, and shows you what can start right now.</b> Agents record "#1654 starts after #1653" with one command. The command writes GitHub's own "blocked by" link, so the order is visible on GitHub and survives anything that happens to sm. You rank lanes in one list across all repos: fractal iteration 7 first, then context handoff, then this work. The board on <code>sm.rajeshgo.li/board</code> and a new Board tab in the app show every ticket as Ready, In progress, Blocked or Done. A Ready ticket has a Start button that opens the new-agent sheet with the ticket filled in. Your phone buzzes within about a minute of a ticket becoming Ready. The queue runs jobs from the higher-ranked lane first within each job type. sm never starts an agent by itself.</p>
+<p><b>sm reads the order of your tickets from GitHub, groups them into lanes that you rank, and shows you what can start right now.</b> Agents record "#1654 starts after #1653" with one command. The command writes GitHub's own "blocked by" link, so the order is visible on GitHub and survives anything that happens to sm. You rank lanes in one list across all repos: fractal iteration 7 first, then context handoff, then this work. The board on <code>sm.rajeshgo.li/board</code> and a new Board tab in the app show every ticket as Ready, In progress, Blocked or Done. A Ready ticket has a Start button that opens the new-agent sheet with the ticket filled in. Within about a minute of a ticket becoming Ready, your phone buzzes and the Board tab on the web and in the app shows a count. Seeing it in any one of those places clears it in all of them. A ticket waiting on your ruling or approval shows as Needs you, at the top of its lane. The queue runs jobs from the higher-ranked lane first within each job type. sm never starts an agent by itself.</p>
 
 <p>The work is four tickets. After the first one lands, agents can record order and <code>sm board</code> prints the lanes. The web page, and the queue order with phone alerts, then follow in parallel. The Android tab comes last and needs an APK install.</p>
 
@@ -163,6 +171,7 @@
   <dt>Lane rank</dt><dd>The lane's position in your single list across all repos. 1 is the most important. Ranks are always 1, 2, 3 … with no gaps.</dd>
   <dt>Longest chain</dt><dd>The longest run of open tickets in a lane where each ticket waits on the one before it, ending at the goal. With no time estimates, this is the critical path: the lane needs at least this many more tickets merged, one after another.</dd>
   <dt>Start</dt><dd>The new-agent sheet with a ticket filled in. The new agent starts out holding the ticket's claim (the claim <code>sm ticket</code> records).</dd>
+  <dt>Needs you</dt><dd>An open ticket assigned to you on GitHub: a ruling, a purchase approval, a review. The agent waiting on you sets it with one command and clears it once you have answered.</dd>
 </dl>
 
 <h3>1. What goes wrong today</h3>
@@ -205,12 +214,13 @@
 <thead><tr><th style="width:14%">State</th><th>Rule</th><th style="width:30%">On the board</th></tr></thead>
 <tbody>
 <tr><td><b>Done</b></td><td>The ticket is closed, whether completed or not planned.</td><td>Folded under the lane, most recent first</td></tr>
+<tr><td><b>Needs you</b></td><td>Open and assigned to you on GitHub, whoever else is on it.</td><td>Top of the lane, with the reason, and counted on the Board tab</td></tr>
 <tr><td><b>In progress</b></td><td>A live agent holds the ticket's claim (<code>sm ticket</code>), or an open pull request will close it.</td><td>The agent's name and whether it is working, idle or stopped</td></tr>
 <tr><td><b>Ready</b></td><td>Open, no one on it, and everything it waits on is closed.</td><td>Start button</td></tr>
 <tr><td><b>Blocked</b></td><td>Open, no one on it, and it waits on at least one open ticket.</td><td>"waits on #…"</td></tr>
 </tbody>
 </table>
-<p>A row also shows a warning in these cases:</p>
+<p>When two rules match, the higher row wins: a ticket an agent holds but that waits on your ruling shows Needs you. A row also shows a warning in these cases:</p>
 <ul>
   <li>An agent is working a ticket that is still Blocked.</li>
   <li>The agent holding the ticket has stopped.</li>
@@ -256,53 +266,128 @@
 </svg>
 <figcaption><b>Figure 2.</b> The context-handoff lane. Each arrow points from a ticket to the ticket that waits on it. Solid arrows are starts-after links; dashed arrows lead into the goal from its sub-issues. Before: the longest chain is #1653 → #1654 → #1651, three tickets. After: three tickets are Ready at once, and your phone shows "Ready in lane 2, Context handoff: #1654, #1656, #1657 can start — #1653 closed."</figcaption>
 </figure>
-<p><b>When the plan grows.</b> Say the agent on #1656 finds that the web controls need a new settings endpoint that the Android controls will also use. It files #1660 and runs <code>sm board after 1657 1660</code>. On the next read, #1660 joins the lane as Ready and is marked "new" for a day. #1657 goes back to Blocked and shows "waits on #1660". The lane now has five open tickets instead of four. There is no push, because nothing new can start that wasn't startable before. If you want #1660 worked, you see it on the board and press Start.</p>
+<p><b>When the plan grows.</b> Section 5 replays a real case. On its first day, iteration 7 found a defect in the detector. The lane grew from 18 tickets to 21, its longest chain went from 5 tickets to 6, and the new chain started with a ticket waiting on your ruling. There is no push when a lane grows, because nothing new can start. The new tickets carry a "new" mark on the board for a day.</p>
 
-<h3>5. What you see</h3>
+<h3>5. What you see: iteration 7, replayed</h3>
+<p>Iteration 7 of fractal-algo-rust ran from 27 to 29 September. Its plan's dispatch board was rewritten by hand four times. Below is the same lane as sm would have drawn it, assuming the plan's author put every ticket under the goal #1775 and recorded each "starts after" as a link. Ticket numbers, order and status come from the plan's revisions; agent names and the moments of each push are illustrative.</p>
 <figure>
 <div class="mock">
-  <div class="bar"><b>sm</b> Inbox · Watch · <u>Board</u> · History · Guestbook</div>
-  <div class="tools"><span class="btn">+ Add lane</span><span class="btn">Refresh</span><span class="muted">read from GitHub 20 s ago</span></div>
-  <div class="lane">
+  <div class="bar"><b>sm</b> Inbox · Watch · <u>Board</u><span class="badge">1</span> · History · Guestbook</div>
+  <div class="tools"><span class="btn">+ Add lane</span><span class="btn">Refresh</span><span class="muted">read from GitHub 20 s ago · Sun 28 Sep, 22:40</span></div>
+  <div class="lane hl">
     <div class="lh"><span class="rk">1</span><span>fractal-algo-rust · <b>#1775 Iter7: scoring, money and the readout</b></span><span class="sp"></span><span class="btn">↑</span><span class="btn">↓</span><span class="btn">End</span></div>
-    <div class="sub">1 ready · 0 in progress · 0 blocked · 5 done · longest chain 1</div>
-    <div class="row"><span class="chip c-ready">READY</span><span>#1775 Iter7: scoring, money and the readout</span><span class="sp"></span><span class="btn go">Start</span></div>
-    <div class="row muted">▸ Done (5): #1774 Iter7: the run …</div>
+    <div class="sub">1 needs you · 2 ready · 4 in progress · 5 blocked · 20 done · longest chain 5: #1813 → #1763 → #1805 → #1774 → #1775</div>
+    <div class="row"><span class="chip c-you">NEEDS YOU</span><span>#1813 NQ 5m passes the 128-frame limit <span class="muted">— spec PR #1814 waits for your ruling on a 150-frame bound · heads the longest chain</span></span></div>
+    <div class="row"><span class="chip c-ready">READY</span><span>#1747 HK, Nikkei, FTSE, CAC chains <span class="muted">— #1790's records are posted</span></span><span class="sp"></span><span class="btn go">Start</span></div>
+    <div class="row"><span class="chip c-ready">READY</span><span>#1818 compact inputs, CPU-pod prep <span class="new">NEW</span></span><span class="sp"></span><span class="btn go">Start</span></div>
+    <div class="row"><span class="chip c-prog">IN PROGRESS</span><span>#1790 rebuild ES/NQ/YM <span class="muted">fractal-1790 (working)</span> <span class="warn">! working while blocked — waits on #1813</span></span></div>
+    <div class="row"><span class="chip c-prog">IN PROGRESS</span><span>#1807 price-precision fix <span class="muted">fractal-1807 (working)</span></span></div>
+    <div class="row"><span class="chip c-prog">IN PROGRESS</span><span>#1772 RTX 5090 route <span class="muted">fractal-1772 (idle) · PR open</span></span></div>
+    <div class="row"><span class="chip c-prog">IN PROGRESS</span><span>#1815 data path <span class="new">NEW</span> <span class="muted">fractal-1815 (working)</span></span></div>
+    <div class="row"><span class="chip c-block">BLOCKED</span><span>#1763 NQ 1-min chain and labels <span class="muted">waits on #1813</span></span></div>
+    <div class="row"><span class="chip c-block">BLOCKED</span><span>#1805 rebuild RTY/EMD/stocks/funds <span class="muted">waits on #1807, #1790, #1763</span></span></div>
+    <div class="row"><span class="chip c-block">BLOCKED</span><span>#1766 NQ 1-min chart <span class="muted">waits on #1763</span></span></div>
+    <div class="row"><span class="chip c-block">BLOCKED</span><span>#1774 the run <span class="muted">waits on #1790, #1805, #1763, #1772, #1815</span></span></div>
+    <div class="row"><span class="chip c-block">BLOCKED</span><span>#1775 scoring, money and the readout <span class="muted">waits on #1774</span></span></div>
+    <div class="row muted">▸ Done (20) · ▸ Recent changes: "#1747 no longer starts after #1790 (fractal-1790)" · "#1790 now starts after #1813 (fractal-1790)" · "#1818 joined"</div>
   </div>
-  <div class="lane">
-    <div class="lh"><span class="rk">2</span><span>session-manager · <b>#1651 Context handoff</b></span><span class="sp"></span><span class="btn">↑</span><span class="btn">↓</span><span class="btn">End</span></div>
-    <div class="sub">3 ready · 0 in progress · 1 blocked · 1 done · longest chain 2: #1654 → #1651</div>
-    <div class="row"><span class="chip c-ready">READY</span><span>#1654 sm handoff, successor start, work transfer</span><span class="sp"></span><span class="btn go">Start</span></div>
-    <div class="row"><span class="chip c-ready">READY</span><span>#1656 sm watch and sm.rajeshgo.li controls</span><span class="sp"></span><span class="btn go">Start</span></div>
-    <div class="row"><span class="chip c-ready">READY</span><span>#1657 Android controls</span><span class="sp"></span><span class="btn go">Start</span></div>
-    <div class="row"><span class="chip c-block">BLOCKED</span><span>#1651 Context handoff <span class="muted">waits on #1654, #1656, #1657</span></span></div>
-    <div class="row muted">▸ Done (1): #1653 stored default policy …</div>
-  </div>
-  <div class="lane">
-    <div class="lh"><span class="rk">3</span><span>session-manager · <b>#1665 sm board</b></span><span class="sp"></span><span class="muted">▸ 0 ready · 1 in progress · 4 blocked</span></div>
-  </div>
-  <div class="lane"><div class="lh muted">▸ Not in any lane — session-manager: 1 open · fractal-algo-rust: 2 open</div></div>
+  <div class="lane"><div class="lh"><span class="rk">2</span><span>session-manager · <b>#1651 Context handoff</b></span><span class="sp"></span><span class="muted">▸ 1 ready · 0 in progress · 3 blocked</span></div></div>
+  <div class="lane"><div class="lh muted">▸ Not in any lane — session-manager: 1 open · fractal-algo-rust: 1 open</div></div>
 </div>
-<figcaption><b>Figure 3.</b> The board at <code>sm.rajeshgo.li/board</code>, a new tab next to Watch. Lanes appear in rank order. Rows go Ready, then In progress, then Blocked, with Done folded away. Within each group, the ticket that starts the longest chain comes first. ↑ and ↓ change the rank, and End removes the lane. The lane-1 row is illustrative.</figcaption>
+<figcaption><b>Figure 3.</b> The web board on the evening of 28 September. #1747 has just turned Ready: the #1790 agent posted the records #1747 needed and removed the link, so the phone got "Ready in lane 1, Iter7: #1747 can start — a link was removed", and the Board tab shows 1 until you open it. Your ruling on #1813 heads the longest chain and holds up #1790's NQ part, #1763 and everything after it.</figcaption>
 </figure>
 
-<div class="two">
 <figure>
+<div class="four">
+<div>
 <div class="mock phone">
-  <div class="bar"><b>Board</b> <span class="muted">20 s ago</span></div>
-  <div class="lane"><div class="lh"><span class="rk">1</span><span>#1775 Iter7 readout</span><span class="sp"></span><span class="muted">1 ready ▸</span></div></div>
+  <div class="bar"><b>Board</b> <span class="muted">Sat 27 Sep, 10:00</span></div>
   <div class="lane">
-    <div class="lh"><span class="rk">2</span><span><b>#1651 Context handoff</b></span><span class="sp"></span><span class="muted">⋮</span></div>
-    <div class="row"><span class="chip c-ready">READY</span><span>#1654 sm handoff…</span><span class="sp"></span><span class="btn go">Start</span></div>
-    <div class="row"><span class="chip c-ready">READY</span><span>#1656 web controls</span><span class="sp"></span><span class="btn go">Start</span></div>
-    <div class="row"><span class="chip c-ready">READY</span><span>#1657 Android…</span><span class="sp"></span><span class="btn go">Start</span></div>
-    <div class="row"><span class="chip c-block">BLOCKED</span><span>#1651 <span class="muted">3 open</span></span></div>
+    <div class="lh"><span class="rk">1</span><span><b>#1775 Iter7 readout</b></span><span class="sp"></span><span class="muted">⋮</span></div>
+    <div class="sub">4 ready · 4 in progress · 8 blocked · chain 5</div>
+    <div class="row"><span class="chip c-ready">READY</span><span>#1760 packed inputs</span><span class="sp"></span><span class="btn go">Start</span></div>
+    <div class="row"><span class="chip c-ready">READY</span><span>#1761 1-min bundles</span><span class="sp"></span><span class="btn go">Start</span></div>
+    <div class="row"><span class="chip c-ready">READY</span><span>#1762 NQ invariant</span><span class="sp"></span><span class="btn go">Start</span></div>
+    <div class="row"><span class="chip c-ready">READY</span><span>#1771 reader memo</span><span class="sp"></span><span class="btn go">Start</span></div>
+    <div class="row"><span class="chip c-prog">IN PROG</span><span>#1754 lean chain</span></div>
+    <div class="row"><span class="chip c-prog">IN PROG</span><span>#1759 Databento buy</span></div>
+    <div class="row"><span class="chip c-prog">IN PROG</span><span>#1764 cross-width</span></div>
+    <div class="row"><span class="chip c-prog">IN PROG</span><span>#1758 iter6 money</span></div>
+    <div class="row muted">▸ Blocked (8) #1765 #1772 #1774 …</div>
+    <div class="row muted">▸ Done (2)</div>
   </div>
-  <div class="lane"><div class="lh"><span class="rk">3</span><span>#1665 sm board</span><span class="sp"></span><span class="muted">1 in progress ▸</span></div></div>
   <div class="nav"><span>Inbox</span><span>Watch</span><u>Board</u><span>Queue</span><span>Analytics</span></div>
 </div>
-<figcaption><b>Figure 4.</b> The app's Board tab has the same content. The ⋮ menu moves a lane up or down, or ends it. A push opens this tab at the lane it names.</figcaption>
+<p class="cap"><b>A. Plan approved.</b> Lane added with 18 tickets. Longest chain #1760 → #1765 → #1772 → #1774 → #1775, so #1760 is first among the Ready. No push: a new lane is not news.</p>
+</div>
+<div>
+<div class="mock phone">
+  <div class="bar"><b>Board</b> <span class="muted">Sat 27 Sep, 21:00</span></div>
+  <div class="lane">
+    <div class="lh"><span class="rk">1</span><span><b>#1775 Iter7 readout</b></span><span class="sp"></span><span class="muted">⋮</span></div>
+    <div class="sub">1 needs you · 1 ready · 2 in progress · 9 blocked · chain 6</div>
+    <div class="row"><span class="chip c-you">NEEDS YOU</span><span>#1787 detector fix <span class="new">NEW</span><br><span class="muted">memo PR #1789 waits for your ruling</span></span></div>
+    <div class="row"><span class="chip c-ready">READY</span><span>#1792 money across rolls <span class="new">NEW</span></span><span class="sp"></span><span class="btn go">Start</span></div>
+    <div class="row"><span class="chip c-prog">IN PROG</span><span>#1765 views in trainer</span></div>
+    <div class="row"><span class="chip c-prog">IN PROG</span><span>#1771 reader memo</span></div>
+    <div class="row muted">▸ Blocked (9) #1790 NEW #1763 #1764 …</div>
+    <div class="row muted">▸ Done (8)</div>
+  </div>
+  <div class="nav"><span>Inbox</span><span>Watch</span><u>Board</u><span>Queue</span><span>Analytics</span></div>
+</div>
+<p class="cap"><b>B. Detector defect found.</b> #1787, the rebuild #1790 and #1792 join. The longest chain grows to 6: #1787 → #1790 → #1763 → #1764 → #1774 → #1775. It starts with your ruling.</p>
+</div>
+<div>
+<div class="mock phone">
+  <div class="bar"><b>Board</b><span class="badge">2</span> <span class="muted">Sun 28 Sep, 13:00</span></div>
+  <div class="lane hl">
+    <div class="lh"><span class="rk">1</span><span><b>#1775 Iter7 readout</b></span><span class="sp"></span><span class="muted">⋮</span></div>
+    <div class="sub">1 needs you · 4 ready · 1 in progress · 7 blocked · chain 5</div>
+    <div class="row"><span class="chip c-you">NEEDS YOU</span><span>#1791 price precision <span class="new">NEW</span><br><span class="muted">memo PR #1798 waits for your ruling</span></span></div>
+    <div class="row"><span class="chip c-ready">READY</span><span>#1790 rebuild ES/NQ/YM</span><span class="sp"></span><span class="btn go">Start</span></div>
+    <div class="row"><span class="chip c-ready">READY</span><span>#1773 sector meters</span><span class="sp"></span><span class="btn go">Start</span></div>
+    <div class="row"><span class="chip c-ready">READY</span><span>#1804 CAC check <span class="new">NEW</span></span><span class="sp"></span><span class="btn go">Start</span></div>
+    <div class="row"><span class="chip c-ready">READY</span><span>#1796 money inputs <span class="new">NEW</span></span><span class="sp"></span><span class="btn go">Start</span></div>
+    <div class="row"><span class="chip c-prog">IN PROG</span><span>#1771 reader memo</span></div>
+    <div class="row muted">▸ Blocked (7) #1763 #1805 NEW #1747 …</div>
+    <div class="row muted">▸ Done (15)</div>
+  </div>
+  <div class="nav"><span>Inbox</span><span>Watch</span><u>Board</u><span>Queue</span><span>Analytics</span></div>
+</div>
+<p class="cap"><b>C. Detector merged.</b> Push: "Ready in lane 1, Iter7: #1790, #1773 can start — #1787 closed". #1804 and #1796 are new, so they are marked rather than pushed. The rebuild splits: #1805 waits on your precision ruling's fix.</p>
+</div>
+<div>
+<div class="mock phone">
+  <div class="bar"><b>Board</b><span class="badge">1</span> <span class="muted">Sun 28 Sep, 22:40</span></div>
+  <div class="lane hl">
+    <div class="lh"><span class="rk">1</span><span><b>#1775 Iter7 readout</b></span><span class="sp"></span><span class="muted">⋮</span></div>
+    <div class="sub">1 needs you · 2 ready · 4 in progress · 5 blocked · chain 5</div>
+    <div class="row"><span class="chip c-you">NEEDS YOU</span><span>#1813 128-frame limit<br><span class="muted">spec PR #1814 waits for your ruling</span></span></div>
+    <div class="row"><span class="chip c-ready">READY</span><span>#1747 HK/Nikkei/FTSE/CAC</span><span class="sp"></span><span class="btn go">Start</span></div>
+    <div class="row"><span class="chip c-ready">READY</span><span>#1818 compact inputs <span class="new">NEW</span></span><span class="sp"></span><span class="btn go">Start</span></div>
+    <div class="row"><span class="chip c-prog">IN PROG</span><span>#1790 rebuild <span class="warn">! waits on #1813</span></span></div>
+    <div class="row"><span class="chip c-prog">IN PROG</span><span>#1807 precision fix</span></div>
+    <div class="row"><span class="chip c-prog">IN PROG</span><span>#1772 RTX 5090 route</span></div>
+    <div class="row"><span class="chip c-prog">IN PROG</span><span>#1815 data path <span class="new">NEW</span></span></div>
+    <div class="row muted">▸ Blocked (5) #1763 #1805 #1766 …</div>
+    <div class="row muted">▸ Done (20)</div>
+  </div>
+  <div class="nav"><span>Inbox</span><span>Watch</span><u>Board</u><span>Queue</span><span>Analytics</span></div>
+</div>
+<p class="cap"><b>D. Frame limit.</b> The same moment as Figure 3, on the phone. By 29 September every ticket but #1775 closed; #1775 is Ready.</p>
+</div>
+</div>
+<figcaption><b>Figure 4.</b> The iteration 7 lane on the phone at four moments. The phone keeps Needs you, Ready and In progress open and folds Blocked and Done into one line each; a tap unfolds them. The web keeps Blocked open because it has the room. The orange edge marks a lane with an alert you have not seen.</figcaption>
 </figure>
+
+<p>What the board says that the hand-kept table could only say in prose:</p>
+<ul>
+  <li><b>Your decisions on the critical path.</b> On 27 September the detector memo, on the 28th the price-precision memo and then the 150-frame bound: each was the first link of the longest chain, and each shows as Needs you at the top of the lane.</li>
+  <li><b>Partial waits.</b> "#1763 starts after #1790's records" is not "after #1790 closes". The agent removes the link when the records are posted, and the waiting ticket turns Ready with a push.</li>
+  <li><b>Growth.</b> Fourteen of the lane's 32 tickets were discovered after the plan was approved. Each joined with a "new" mark and a line in Recent changes, without you reconciling a table.</li>
+</ul>
+
+
 <figure>
 <div class="mock phone">
   <div class="bar"><b>Start #1654</b></div>
@@ -318,7 +403,6 @@
 </div>
 <figcaption><b>Figure 5.</b> Start reuses the app's existing new-agent sheet. The repo checkout, the ticket, the name and the brief come filled in, and you choose the agent and the model. The agent starts out holding the ticket, makes its own worktree, and follows the repo's <code>CLAUDE.md</code>.</figcaption>
 </figure>
-</div>
 
 <h3>6. What agents do</h3>
 <table>
@@ -327,10 +411,11 @@
 <tr><td><code>sm board</code></td><td>Prints every lane and its tickets, the same content as the page.</td></tr>
 <tr><td><code>sm board after 1654 1653</code></td><td>Records on GitHub that #1654 starts after #1653. <code>--remove</code> undoes it. Tickets in another repo are written <code>fractal-algo-rust#1774</code>.</td></tr>
 <tr><td><code>sm board under 1654 1651</code></td><td>Makes #1654 a sub-issue of #1651. <code>--remove</code> undoes it.</td></tr>
+<tr><td><code>sm board needs-you 1813</code></td><td>Assigns #1813 to you on GitHub while the agent waits on your ruling or approval. <code>--remove</code> clears it once you have answered.</td></tr>
 <tr><td><code>sm board lane add 1665</code></td><td>Adds a lane with goal #1665 at the bottom of your list. Only you move or end lanes.</td></tr>
 </tbody>
 </table>
-<p>One paragraph in the repo's <code>CLAUDE.md</code> tells agents when to use these. When they file the tickets for a plan, they record the order. When they discover work that has to land first, they file it and link it. Plain text such as "Starts after #1774" stays for people to read; the link is what sm reads. The exact paragraph is in Appendix L.</p>
+<p>One paragraph in the repo's <code>CLAUDE.md</code> tells agents when to use these. When they file the tickets for a plan, they record the order. When they discover work that has to land first, they file it and link it. When a ticket needed only part of another (#1763 needed #1790's records, not all of #1790), the agent that delivers that part removes the link, and the waiting ticket turns Ready. Plain text such as "Starts after #1774" stays for people to read; the link is what sm reads. The exact paragraph is in Appendix L.</p>
 
 <h3>7. Queue order</h3>
 <p>Within each job type, the queue runs the job from the highest-ranked lane first. Jobs from the same lane run in arrival order. A job belongs to a lane when the agent that queued it holds a ticket in that lane. A helper agent counts through its parent, and a job run from a ticket's worktree counts too. Jobs with no lane run after every lane's jobs. Nothing else about the queue changes:</p>
@@ -353,12 +438,14 @@
 <table>
 <thead><tr><th style="width:30%">What happens</th><th style="width:18%">You get</th><th>Example</th></tr></thead>
 <tbody>
-<tr><td>Tickets in a lane become Ready (their last blocker closed, or a link was removed)</td><td>Phone push, one per lane per read</td><td>"Ready in lane 2, Context handoff: #1654, #1656, #1657 can start — #1653 closed"</td></tr>
-<tr><td>A lane's goal closes</td><td>Phone push. The lane ends and the lanes below move up.</td><td>"Lane done: Iter7: scoring, money and the readout"</td></tr>
+<tr><td>Tickets in a lane become Ready (their last blocker closed, or a link was removed)</td><td>Phone push, one per lane per read, and a count on the Board tab on the web and in the app</td><td>"Ready in lane 2, Context handoff: #1654, #1656, #1657 can start — #1653 closed"</td></tr>
+<tr><td>A lane's goal closes</td><td>Phone push and Board count. The lane ends and the lanes below move up.</td><td>"Lane done: Iter7: scoring, money and the readout"</td></tr>
+<tr><td>A ticket becomes Needs you</td><td>Board only: top of the lane, and in the Board count</td><td>No push, because the agent's own message to you already asked. "#1813: spec PR #1814 waits for your ruling"</td></tr>
 <tr><td>A ticket joins or leaves a lane, a link changes, or an agent adds a lane</td><td>Board only: "new" marker for 24 h and the lane's recent-changes list</td><td>"#1660 joined, added by sm-1656-engineer"</td></tr>
 <tr><td>Tickets wait on each other in a loop</td><td>Board only: a warning on the lane, and none of those tickets shows Ready</td><td>"#1660 and #1657 wait on each other"</td></tr>
 </tbody>
 </table>
+<p><b>The web and the phone show the same alerts.</b> Each push is one record in sm's existing notice store, the store behind your message notifications. That one record produces the phone notification, the count on the Board tab of <code>sm.rajeshgo.li</code> and of the app, and the orange edge on its lane. When you open the board on either one, the count clears on both and the phone notification is taken back, as already happens with messages.</p>
 
 <h3>9. The tickets</h3>
 <table>
@@ -382,16 +469,23 @@
 <tr><td>2. What a lane is and who ranks it</td><td><b>One goal per lane, one ranked list across all repos, ranked by you.</b> (You confirmed this in chat.)</td><td>The machine and the queue are shared across repos.</td></tr>
 <tr><td>3. Who may change lanes</td><td><b>Agents may add a lane (at the bottom) and record links. Only you, on the page or in the app, move or end a lane.</b> A lane ends by itself when its goal closes.</td><td>Rank moves queue priority, so it stays with you.</td></tr>
 <tr><td>4. Queue fairness</td><td><b>Strict: lower lanes wait while a higher lane has jobs of the same type waiting.</b> No catch-up rule.</td><td>You said iteration 7 comes before everything. A catch-up rule (say, after two hours of waiting) is easy to add if lower lanes starve.</td></tr>
-<tr><td>5. Pushes</td><td><b>Only "ready" and "lane done".</b> Everything else shows on the board.</td><td>These two are the only events that ask you to act.</td></tr>
+<tr><td>5. Alerts</td><td><b>Only "ready" and "lane done" push, and the same two show as a Board count on the web and in the app. Seeing them in one place clears them everywhere.</b> Everything else shows on the board.</td><td>These two are the only board events that ask you to act.</td></tr>
 <tr><td>6. Starting agents</td><td><b>Only you, with Start. The sheet defaults to Claude Opus 1M, high effort.</b></td><td>That is the middle tier in your seat table. Starting agents automatically can come later as an opt-in.</td></tr>
 <tr><td>7. Plans already written as text</td><td><b>No product feature. When you add a lane whose order exists only as text, an inexpensive agent (Sonnet) turns it into links once.</b> #1651 is the first, as part of ticket 1's live check.</td><td>New plans get links as they are written, so the conversion is rare.</td></tr>
 <tr><td>8. The agent paragraph in fractal-algo-rust</td><td><b>Ticket 1 also opens a PR there adding the same paragraph to its <code>CLAUDE.md</code>.</b> Confirm.</td><td>Without it, iteration 8's plan stays text only.</td></tr>
 <tr><td>9. Which repos the board shows</td><td><b>Every repo with a lane, plus a configured list, starting with session-manager and fractal-algo-rust.</b> Tickets outside any lane sit folded at the bottom.</td><td>You can see what is waiting without starting a lane.</td></tr>
+<tr><td>10. Waiting on you</td><td><b>A ticket assigned to you on GitHub shows as Needs you at the top of its lane and in the Board count, with no push.</b> Agents set and clear it with <code>sm board needs-you</code>.</td><td>In iteration 7 your rulings headed the longest chain three times. The agent's own message already reaches you, so a push would be a duplicate.</td></tr>
 </tbody>
 </table>
 
 <h3>FAQ — what changed since the last revision</h3>
-<p>This is the first revision.</p>
+<ul>
+  <li><b>The web shows the same alerts as the phone.</b> Alerts use sm's existing notice store. The Board tab on the web and in the app shows the count, and seeing it anywhere clears it everywhere (sections 8 and 10, decision 5).</li>
+  <li><b>Section 5 now replays iteration 7</b> on the web (Figure 3) and at four moments on the phone (Figure 4), in place of the earlier illustrative board.</li>
+  <li><b>New state: Needs you</b> (decision 10), because the replay showed your rulings at the head of the longest chain. It comes with <code>sm board needs-you</code>.</li>
+  <li><b>Partial waits:</b> the agent that delivers the part removes the link (section 6).</li>
+  <li><b>The phone folds Blocked and Done</b> into one line each (Figure 4).</li>
+</ul>
 
 <!-- memo-print-scope keys on this divider: everything after it is hidden when printing
      "memo only". Keep it immediately before the appendices, or the toggle prints everything. -->
@@ -448,6 +542,7 @@ board_items(
   state TEXT NOT NULL,               -- 'open' | 'closed'
   state_reason TEXT,                 -- GitHub's: 'COMPLETED' | 'NOT_PLANNED' | 'DUPLICATE' | 'REOPENED' | 'missing'
   closed_at TEXT, updated_at TEXT, first_seen_at TEXT NOT NULL, synced_at TEXT NOT NULL,
+  assignees TEXT NOT NULL DEFAULT '[]',  -- JSON array of GitHub logins, lower case
   PRIMARY KEY(repo, number)
 )
 
@@ -465,7 +560,7 @@ board_prs(repo TEXT, issue_number INTEGER, pr_repo TEXT, pr_number INTEGER,
           url TEXT, PRIMARY KEY(repo, issue_number, pr_repo, pr_number))
 
 board_members(lane_id INTEGER, repo TEXT, number INTEGER,
-              state TEXT,             -- 'ready' | 'in_progress' | 'blocked' | 'done'
+              state TEXT,             -- 'needs_you' | 'ready' | 'in_progress' | 'blocked' | 'done'
               joined_at TEXT NOT NULL, PRIMARY KEY(lane_id, repo, number))
 
 board_ticket_ranks(repo TEXT, number INTEGER, rank INTEGER NOT NULL,
@@ -477,18 +572,21 @@ board_events(id INTEGER PRIMARY KEY, ts TEXT NOT NULL, kind TEXT NOT NULL,
              actor TEXT, actor_name TEXT, detail TEXT)
 
 board_repo_sync(repo TEXT PRIMARY KEY, last_ok_at TEXT, last_error TEXT, last_error_at TEXT,
-                rate_limited_until TEXT)</code></pre>
+                rate_limited_until TEXT)
+
+board_seen(user_id TEXT PRIMARY KEY, seen_at TEXT NOT NULL)   -- when the owner last opened the board</code></pre>
 <ul>
   <li><b>Lane ranks.</b> Active lanes' ranks are exactly 1..n. Adding a lane gives it n+1. Ending a lane sets <code>rank</code> to NULL and renumbers the rest in their existing order, in one transaction.</li>
   <li><b><code>board_members</code></b> holds each active lane's members and their state as of the last recompute. Pushes and the "new" marker compare against it (D, I). It is rewritten for a lane on every recompute; <code>joined_at</code> keeps its first value while the ticket stays a member.</li>
   <li><b><code>board_ticket_ranks</code></b> holds every open member of an active lane with the best (lowest) rank among the lanes containing it. It is rewritten on every recompute, and the queue reads it (H).</li>
-  <li><b><code>board_events</code></b> kinds: <code>lane_added</code>, <code>lane_moved</code>, <code>lane_ended</code>, <code>link_added</code>, <code>link_removed</code>, <code>ticket_joined</code>, <code>ticket_left</code>, <code>became_ready</code>, <code>ticket_closed</code>, <code>cycle_found</code>, <code>agent_started</code>, <code>push_sent</code>, <code>push_failed</code>, <code>sync_failed</code>. Rows older than 90 days are deleted at the end of each read pass.</li>
+  <li><b><code>board_events</code></b> kinds: <code>lane_added</code>, <code>lane_moved</code>, <code>lane_ended</code>, <code>link_added</code>, <code>link_removed</code>, <code>ticket_joined</code>, <code>ticket_left</code>, <code>became_ready</code>, <code>needs_you_set</code>, <code>needs_you_cleared</code>, <code>ticket_closed</code>, <code>cycle_found</code>, <code>agent_started</code>, <code>push_sent</code>, <code>push_failed</code>, <code>sync_failed</code>. Rows older than 90 days are deleted at the end of each read pass.</li>
   <li><b>Queue.</b> The queue job table in <code>queue_runner.db</code> gains a nullable <code>rank_session_id TEXT</code> column, added with the existing add-column helper (<code>queue.rs:7226</code>).</li>
 </ul>
 
 <h3 id="c">C. Reading and writing GitHub</h3>
 <h4>C1. Which repos, how often</h4>
 <ul>
+  <li>Config keys under <code>board</code>: <code>repos</code>, <code>sync_interval_seconds</code>, <code>checkouts</code>, <code>start_defaults</code>, <code>owner_github_login</code> (default <code>rajeshgoli</code>).</li>
   <li>The repos read are the distinct <code>goal_repo</code> of active lanes, plus <code>board.repos</code> from config (default <code>["rajeshgoli/session-manager", "rajeshgoli/fractal-algo-rust"]</code>).</li>
   <li>A pass runs every <code>board.sync_interval_seconds</code> (default 60, floor 30). The loop is started next to <code>claims::init_work_claims</code> (<code>http.rs:1477</code>) with a <code>tokio</code> interval and <code>spawn_blocking</code>, like the claims loop (<code>http/claims.rs:637–666</code>).</li>
   <li>An extra pass runs right after a link write, a lane add, and <code>POST /client/board/refresh</code>. At most one pass runs at a time, and at most one waits behind it; further requests fold into the waiting pass.</li>
@@ -502,6 +600,7 @@ board_repo_sync(repo TEXT PRIMARY KEY, last_ok_at TEXT, last_error TEXT, last_er
       pageInfo { hasNextPage endCursor }
       nodes {
         number title url updatedAt
+        assignees(first: 10) { nodes { login } }
         parent { number title url state stateReason closedAt repository { nameWithOwner } }
         blockedBy(first: 50) { totalCount nodes { ...Ref } }
         subIssues(first: 50) { totalCount nodes { ...Ref } }
@@ -511,7 +610,8 @@ board_repo_sync(repo TEXT PRIMARY KEY, last_ok_at TEXT, last_error TEXT, last_er
     }
   }
 }
-fragment Ref on Issue { number title url state stateReason closedAt repository { nameWithOwner } }</code></pre>
+fragment Ref on Issue { number title url state stateReason closedAt repository { nameWithOwner }
+                         assignees(first: 10) { nodes { login } } }</code></pre>
 <p>This query was run against fractal-algo-rust on 2026-09-29 and cost 2 points. If <code>blockedBy.totalCount</code> or <code>subIssues.totalCount</code> exceeds 50 for an issue, a follow-up query pages that connection for that issue alone. GitHub caps an issue at 50 blocked-by links and a parent at 100 sub-issues, so this is rare.</p>
 <h4>C3. What a pass writes</h4>
 <ol>
@@ -536,10 +636,12 @@ fragment Ref on Issue { number title url state stateReason closedAt repository {
       <li>after <code>--remove</code>: <code>removeBlockedBy(input:{issueId: waiter, blockingIssueId: blocker})</code></li>
       <li>under: <code>addSubIssue(input:{issueId: parent, subIssueId: child, replaceParent: false})</code></li>
       <li>under <code>--remove</code>: <code>removeSubIssue(input:{issueId: parent, subIssueId: child})</code></li>
+      <li>needs-you: <code>addAssigneesToAssignable(input:{assignableId: issue, assigneeIds: [owner]})</code>, where <code>owner</code> is the node id from <code>user(login: board.owner_github_login){id}</code></li>
+      <li>needs-you <code>--remove</code>: <code>removeAssigneesFromAssignable</code> with the same input</li>
     </ul>
   </li>
   <li>If the child already has a different parent, sm writes nothing and returns 422 "#N already sits under owner/name#P; remove that first with sm board under N P --remove". sm never replaces a parent silently.</li>
-  <li>On success, sm inserts or deletes the <code>board_edges</code> row at once, with <code>source = 'sm:&lt;session id&gt;'</code> for an agent or <code>'sm:owner'</code>. It records <code>link_added</code> or <code>link_removed</code> with the actor, and requests a pass (C1).</li>
+  <li>On success, sm updates <code>board_edges</code> (or <code>board_items.assignees</code>) at once, with <code>source = 'sm:&lt;session id&gt;'</code> for an agent or <code>'sm:owner'</code>. It records <code>link_added</code>, <code>link_removed</code>, <code>needs_you_set</code> or <code>needs_you_cleared</code> with the actor, and requests a pass (C1). A needs-you write takes an optional <code>reason</code> (one line, at most 120 characters), which sm posts as a GitHub comment on the ticket ("Waiting on Rajesh: &lt;reason&gt;") and shows on the row.</li>
   <li>Any GitHub refusal (limits, permission) returns 422 with GitHub's message verbatim. A transport failure returns 502.</li>
 </ol>
 
@@ -552,6 +654,7 @@ fragment Ref on Issue { number title url state stateReason closedAt repository {
   <li><b>State</b>, first match wins:
     <ol>
       <li><code>done</code>: the item is <code>closed</code>.</li>
+      <li><code>needs_you</code>: <code>assignees</code> contains <code>board.owner_github_login</code> (default <code>rajeshgoli</code>). The row keeps the holder and PR details and shows the latest needs-you reason, or "assigned to you" when none was given.</li>
       <li><code>in_progress</code>: an active ticket claim exists whose holder is not Retired, or a <code>board_prs</code> row is <code>OPEN</code>.</li>
       <li><code>ready</code>: every <i>b</i> in waits_on(<i>t</i>) is closed. This includes having no <i>b</i>, and it requires <i>t</i> not to be in a cycle (D3).</li>
       <li><code>blocked</code>: anything else.</li>
@@ -568,10 +671,10 @@ fragment Ref on Issue { number title url state stateReason closedAt repository {
   </li>
   <li><b>chain(t)</b>, for open members. First remove every edge between two tickets of the same cycle (D3). Then chain(<i>g</i>) = 1, and chain(<i>t</i>) = 1 + max chain(<i>w</i>) over open members <i>w</i> with <i>t</i> ∈ waits_on(<i>w</i>).</li>
   <li><b>Longest chain.</b> The start <i>s</i> is the open member with the highest chain. Ties go to the lower repo, then the lower number. Each next step is the open member <i>w</i> that waits on the current ticket and has the highest chain, with the same tie-break. The chain ends at <i>g</i>. The lane's "longest chain N" is chain(<i>s</i>).</li>
-  <li><b>Row order.</b> Groups come in the order ready, in_progress, blocked, done. Within the first three groups, rows sort by chain descending, then by fan-out descending (the number of open members that wait on the ticket directly), then by repo and number ascending. Done rows sort by <code>closed_at</code> descending.</li>
+  <li><b>Row order.</b> Groups come in the order needs_you, ready, in_progress, blocked, done. Within the first four groups, rows sort by chain descending, then by fan-out descending (the number of open members that wait on the ticket directly), then by repo and number ascending. Done rows sort by <code>closed_at</code> descending.</li>
   <li><b>also_in</b>: the other active lanes that contain the ticket. A ticket's queue rank is the lowest rank among its lanes (<code>board_ticket_ranks</code>).</li>
   <li><b>new</b>: <code>joined_at</code> is within the last 24 hours and the ticket was not a member when the lane was added.</li>
-  <li><b>Not in any lane</b>: for each repo read, the open issues in that repo that belong to no active lane, with their states. Rows are ordered ready, in_progress, blocked, then by number.</li>
+  <li><b>Not in any lane</b>: for each repo read, the open issues in that repo that belong to no active lane, with their states. Rows are ordered needs_you, ready, in_progress, blocked, then by number.</li>
 </ul>
 <h4>D2. Worked examples</h4>
 <table>
@@ -583,6 +686,7 @@ fragment Ref on Issue { number title url state stateReason closedAt repository {
 <tr><td>Loop</td><td>1660 after 1657, 1657 after 1660</td><td>Both are blocked with the <code>cycle</code> warning, even when every outside blocker is closed. The lane shows "#1657 and #1660 wait on each other". One <code>cycle_found</code> event is recorded per new cycle.</td></tr>
 <tr><td>Blocker dropped</td><td>1654 after 1653; 1653 closed as not planned</td><td>1654 is ready (any closed blocker counts). The done row for 1653 says "not planned".</td></tr>
 <tr><td>Epic ticket merged, not closed</td><td>fractal #1774's PR merged into <code>epic/1746-iter7</code>; issue still open, no claim</td><td>in_progress is false (no claim, no open PR), and #1774 is open with no blockers, so it is ready with the <code>merged_not_closed</code> warning. The row shows "PR merged — close the ticket" instead of Start.</td></tr>
+<tr><td>Iteration 7, 28 Sep 22:40 (Figure 3)</td><td>1790 after 1813; 1763 after 1813; 1805 after 1807, 1790, 1763; 1766 after 1763; 1774 after 1790, 1805, 1763, 1772, 1815; 1775 after 1774; 1747's link to 1790 removed; 1813 assigned to rajeshgoli; all under 1775</td><td>1813 needs_you; 1790 in_progress with <code>working_while_blocked</code>; 1747 and 1818 ready. Chains: 1775 = 1; 1774, 1766 = 2; 1805 = 3; 1763, 1790, 1807 = 4; 1813 = 5. Longest: #1813 → #1763 → #1805 → #1774 → #1775 (1763 beats 1790 on the lower number).</td></tr>
 <tr><td>Cross-repo blocker</td><td>fractal #1830 after session-manager #1654</td><td>#1654 is a member of the fractal lane, read from the embedded node's state. It counts toward the fractal lane's rank in the queue.</td></tr>
 </tbody>
 </table>
@@ -609,12 +713,14 @@ fragment Ref on Issue { number title url state stateReason closedAt repository {
 <tr><td><code>sm board [--lane REF] [--json]</code></td><td><code>GET /board</code></td><td>See the format below. <code>--json</code> prints the F JSON unchanged.</td></tr>
 <tr><td><code>sm board after TICKET BLOCKER... [--repo R] [--remove]</code></td><td><code>POST /board/links</code>, once per blocker</td><td><code>Recorded: #1654 starts after #1653.</code> · <code>Already recorded: #1654 starts after #1653.</code> · <code>Removed: #1654 no longer starts after #1653.</code> · <code>Not linked: #1654 does not start after #1653.</code></td></tr>
 <tr><td><code>sm board under TICKET PARENT [--repo R] [--remove]</code></td><td><code>POST /board/links</code></td><td><code>Recorded: #1654 is under #1651.</code> and the three matching variants</td></tr>
+<tr><td><code>sm board needs-you TICKET [--reason TEXT] [--repo R] [--remove]</code></td><td><code>POST /board/needs-you</code></td><td><code>Recorded: #1813 needs Rajesh.</code> · <code>Already recorded: …</code> · <code>Cleared: #1813 no longer needs Rajesh.</code> · <code>Not set: …</code></td></tr>
 <tr><td><code>sm board lane add GOAL [--repo R]</code></td><td><code>POST /board/lanes</code></td><td><code>Lane 3: rajeshgoli/session-manager#1665 sm board. Added at the bottom; Rajesh sets the order.</code></td></tr>
 </tbody>
 </table>
 <p>Exit codes: 0 for success, including already and absent; 1 when GitHub or sm refuses (the server's message is printed); 2 for a usage error. <code>sm board</code> text format, one block per lane, then the rest:</p>
-<pre><code>Lane 2  rajeshgoli/session-manager#1651  Context handoff   (read 20s ago)
-  3 ready · 0 in progress · 1 blocked · 1 done · longest chain 2: #1654 → #1651
+<pre><code>Board: 1 unseen alert
+Lane 2  rajeshgoli/session-manager#1651  Context handoff   (read 20s ago)
+  0 needs you · 3 ready · 0 in progress · 1 blocked · 1 done · longest chain 2: #1654 → #1651
   ready        #1654  sm handoff, successor start, work transfer
   ready        #1656  sm watch and sm.rajeshgo.li controls
   ready        #1657  Android controls
@@ -631,11 +737,13 @@ Not in any lane
 <tbody>
 <tr><td><code>GET /board</code> with <code>Accept: application/json</code> or <code>?format=json</code>; optional <code>lane=owner/name#N</code></td><td><code>ensure_session_allowed_from_parts</code>, as <code>/claims</code> uses</td><td>The board JSON. Without JSON requested, a browser gets the page (J) behind the owner page gate.</td></tr>
 <tr><td><code>POST /board/links</code> <code>{repo, number, target_repo, target_number, kind: "after"|"under", remove: bool, session_id?}</code></td><td>same</td><td>C5. Returns 200 <code>{outcome: "recorded"|"already"|"removed"|"absent", message}</code>, or 404, 422 or 502 <code>{detail}</code>. For <code>under</code>, <code>number</code> is the child and <code>target</code> the parent.</td></tr>
+<tr><td><code>POST /board/needs-you</code> <code>{repo, number, reason?, remove: bool, session_id?}</code></td><td>same</td><td>C5. Returns 200 <code>{outcome: "recorded"|"already"|"removed"|"absent", message}</code>, or 404, 422 or 502.</td></tr>
 <tr><td><code>POST /board/lanes</code> <code>{repo, number, session_id?}</code></td><td>same</td><td>D4. Returns 200 <code>{lane}</code> with the lane object from the board JSON, or 404, 409 or 422.</td></tr>
 <tr><td><code>GET /client/board</code></td><td><code>owner_guard</code> (<code>http/follows.rs:28</code>)</td><td>The board JSON, for the app.</td></tr>
 <tr><td><code>PUT /client/board/order</code> <code>{lane_ids: [..]}</code></td><td><code>owner_guard</code> + <code>authenticated_user</code>, as <code>force_start_queue_job</code> (<code>http/follows.rs:920</code>)</td><td>The full new order of active lanes. Returns 409 if the set differs from the active set. Records <code>lane_moved</code> for each lane whose rank changed.</td></tr>
 <tr><td><code>POST /client/board/lanes</code> <code>{repo, number}</code></td><td>same</td><td>Same as <code>/board/lanes</code>, with <code>added_by = "owner"</code>.</td></tr>
 <tr><td><code>DELETE /client/board/lanes/{id}</code></td><td>same</td><td>Ends the lane (<code>owner</code>). 404 if the lane is not active.</td></tr>
+<tr><td><code>POST /client/board/seen</code></td><td>same</td><td>Sets <code>board_seen.seen_at = now</code> and acks every unacked board notice (I). The page and the app send it whenever the board is shown and on each refresh while visible. Returns 204.</td></tr>
 <tr><td><code>POST /client/board/refresh</code></td><td>same</td><td>Requests a pass (C1) and returns 202.</td></tr>
 <tr><td><code>POST /client/board/start</code></td><td>same</td><td>G.</td></tr>
 </tbody>
@@ -643,18 +751,21 @@ Not in any lane
 <p>The agent-facing routes never move or end lanes; that is decision 3. Ranking needs a signed-in owner, as Start Now on the queue does.</p>
 <pre><code>{
   "generated_at": "2026-09-29T17:02:11Z",
+  "unseen": {"count": 1, "lane_ids": [7]},        // unacked board notices (I); the tab badge
   "repos": [{"repo": "rajeshgoli/session-manager", "last_ok_at": "…", "stale": false, "error": null}],
   "lanes": [{
     "id": 7, "rank": 2,
     "goal": {"repo": "rajeshgoli/session-manager", "number": 1651, "title": "Context handoff: …", "url": "…"},
     "added_at": "…", "added_by_name": "Rajesh",
-    "counts": {"ready": 3, "in_progress": 0, "blocked": 1, "done": 1},
+    "counts": {"needs_you": 0, "ready": 3, "in_progress": 0, "blocked": 1, "done": 1},
+    "unseen": false,                                // the lane has an unacked board notice
     "longest_chain": [{"repo": "rajeshgoli/session-manager", "number": 1654}, {"repo": "…", "number": 1651}],
     "stale": false,
     "cycles": [],                                   // each: [{repo, number}, …]
     "tickets": [{
       "repo": "rajeshgoli/session-manager", "number": 1654, "title": "…", "url": "…",
-      "state": "ready", "done_reason": null,        // done only: "completed" | "not_planned" | "duplicate" | "missing"
+      "state": "ready", "done_reason": null,        // state: "needs_you" | "ready" | "in_progress" | "blocked" | "done"
+      "needs_you_reason": null,                     // needs_you only: the latest reason, or null        // done only: "completed" | "not_planned" | "duplicate" | "missing"
       "waits_on": [{"repo": "…", "number": 1653, "state": "done"}],
       "holder": null,                               // {session_id, name, state: "working"|"idle"|"stopped"}
       "prs": [],                                    // [{repo, number, state, url}]
@@ -675,6 +786,7 @@ Not in any lane
   <li>link added: "#A now starts after #B (X)"</li>
   <li>link removed: "#A no longer starts after #B (X)"</li>
   <li>ready: "#N ready"</li>
+  <li>needs you set / cleared: "#N needs you: REASON (X)" / "#N no longer needs you (X)"</li>
   <li>closed: "#N closed"</li>
   <li>moved: "moved to lane R"</li>
   <li>agent started: "Started NAME on #N"</li>
@@ -686,6 +798,7 @@ Not in any lane
 <ol>
   <li><b>Guard:</b> the owner guard as in F.</li>
   <li><b>Open ticket:</b> the ticket must be in <code>board_items</code> and open. Otherwise 422 "#N is closed" or 404.</li>
+  <li><b>Not waiting on you:</b> a <code>needs_you</code> ticket returns 409 "#N is waiting on you". Start is shown on ready rows only.</li>
   <li><b>Not held:</b> if an active ticket claim with a non-Retired holder exists, the result is 409 <code>{detail: "#N is held by NAME (state)"}</code>.</li>
   <li><b>Checkout:</b> <code>board.checkouts[repo]</code> if set. Otherwise <code>~/projects/&lt;name&gt;</code>, if it is a git checkout whose <code>origin</code> URL names the same <code>owner/name</code>. Otherwise 422 "sm doesn't know where owner/name is checked out; set board.checkouts in config".</li>
   <li><b>Name:</b> defaults to <code>&lt;name&gt;-&lt;number&gt;</code>, cut to 32 characters.</li>
@@ -722,38 +835,54 @@ You already hold the claim on #{number}. Run `sm ticket {number} --setup-worktre
 <h4>H3. Display</h4>
 <p>Queue job JSON (<code>/queue-jobs</code>, <code>client/queue</code>) gains <code>lane_rank</code> (integer or null) and <code>lane_goal</code> (<code>{repo, number, title}</code> or null), computed when read. Showing them in the queue page and the app's queue sheet is not in scope.</p>
 
-<h3 id="i">I. Pushes</h3>
+<h3 id="i">I. Pushes and the Board count</h3>
 <ul>
   <li><b>When they are decided.</b> At the end of every recompute, sm compares the new member states with <code>board_members</code> before it is rewritten.</li>
-  <li><b>Ready push.</b> One push per lane per recompute, listing the members whose previous state was <code>blocked</code> and whose new state is <code>ready</code>. Excluded:
+  <li><b>Ready alert.</b> One per lane per recompute, listing the members whose previous state was <code>blocked</code> and whose new state is <code>ready</code>. Excluded:
     <ul>
       <li>tickets whose repo is stale that pass;</li>
       <li>lanes added since the previous recompute;</li>
       <li>tickets that were not members before.</li>
     </ul>
     The title is <code>Ready in lane {rank}, {goal title}</code>. The body is <code>#a, #b, #c can start — #x closed</code>: up to four numbers, then "+N more". The cause names the waits_on tickets that closed since the last recompute, or reads "a link was removed". <code>kind = "board_ready"</code>, and <code>reader_path = "/board#lane-{id}"</code>.</li>
-  <li><b>Lane-done push.</b> Sent when a lane ends because its goal closed. The title is <code>Lane done: {goal title}</code>. The body is <code>{repo short}#{n} closed · lanes below move up</code>. <code>kind = "board_lane_done"</code>, <code>reader_path = "/board"</code>.</li>
-  <li><b>Delivery.</b> Pushes go to every valid token of <code>follow_owner_id(config, None)</code> (<code>http/follows.rs:55</code>), through the same <code>PushSender</code> the owner-push worker uses, following <code>send_test</code> (<code>owner_push.rs:1100</code>), with the data from <code>Notification::data(None)</code>. Each attempt records <code>push_sent</code> or <code>push_failed</code>. There are no retries and no email.</li>
-  <li><b>Nothing else pushes</b> (memo section 8).</li>
+  <li><b>Lane-done alert.</b> Sent when a lane ends because its goal closed. The title is <code>Lane done: {goal title}</code>. The body is <code>{repo short}#{n} closed · lanes below move up</code>. <code>kind = "board_lane_done"</code>, <code>reader_path = "/board"</code>.</li>
+  <li><b>One record per alert.</b> Each alert is an owner notice created with <code>create_notice</code> (<code>owner_push/notices.rs:190</code>). The fields are:
+    <ul>
+      <li><code>user_id = follow_owner_id(config, None)</code> (<code>http/follows.rs:55</code>);</li>
+      <li><code>session_id = "board"</code>, <code>session_name = "sm board"</code>;</li>
+      <li><code>subject_id = "board:{lane_id}:{board_events.id}"</code>, using the event recorded for the alert;</li>
+      <li><code>blocking = false</code>.</li>
+    </ul>
+    The follow worker delivers it with the notice rules of <code>specs/1580_app_messages_replace_email.html</code> (push, retry, and fallback), unchanged.</li>
+  <li><b>Clearing.</b> The <code>NoticeWorld</code> implementation (<code>owner_push/notices.rs:364</code>) answers for the two board kinds:
+    <ul>
+      <li><code>opened</code> is true once <code>board_seen.seen_at</code> is later than the notice's <code>created_at</code>;</li>
+      <li><code>still_wanted</code> is true while the lane is active and, for <code>board_ready</code>, while at least one listed ticket is still ready and unheld.</li>
+    </ul>
+    So opening the board on the web or in the app withdraws the phone notification through the existing withdrawal pass (sm#1643). <code>notice_candidates</code> returns nothing for board kinds, because the board creates its notices directly.</li>
+  <li><b>The count.</b> The Board count is the number of board-kind notices for the owner that are unacked and not yet opened. <code>POST /client/board/seen</code> acks them. The web nav (J) and the app's bottom bar (K) show it; 0 shows nothing.</li>
+  <li><b>No other alerts.</b> Needs you, lane growth, link changes and loops show on the board only (memo section 8).</li>
 </ul>
 
 <h3 id="j">J. Web board page</h3>
 <h4>J1. Serving and refresh</h4>
 <ul>
   <li><code>GET /board</code> uses the owner page gate that <code>/history</code> uses.</li>
-  <li>It is painted on the server with <code>page_shell_with_status</code>. A new "Board" tab goes between Watch and History (<code>owner_docs.rs:1883–1893</code>).</li>
+  <li>It is painted on the server with <code>page_shell_with_status</code>. A new "Board" tab goes between Watch and History (<code>owner_docs.rs:1883–1893</code>). On every owner page, the tab carries the Board count (I) as a badge when it is above 0.</li>
+  <li>While the page is visible, it sends <code>POST /client/board/seen</code> on load, on each refresh, and on focus.</li>
   <li><code>board_client.js</code> refetches <code>GET /client/board</code> every 30 seconds and on window focus, and re-renders the same markup, following <code>watch.rs</code>.</li>
   <li>Reading works with scripts off; actions need scripts.</li>
 </ul>
 <h4>J2. Layout</h4>
 <ul>
   <li><b>Toolbar:</b> Add lane (repo picker of the repos read plus free text, and a goal number), Refresh, "read from GitHub N ago", and a stale banner for each failing repo.</li>
-  <li><b>Lane block:</b> <code>id="lane-{id}"</code>. The header has the rank, repo short name, goal link and title, counts, and longest chain, plus the controls ↑, ↓ and End. End asks inline "End lane 2? Yes / No". Blocks collapse; the choice is kept in <code>localStorage</code>, and lane 1 starts expanded, the others collapsed.</li>
+  <li><b>Lane block:</b> <code>id="lane-{id}"</code>. A lane with <code>unseen: true</code> in the fetch before the seen call gets an orange left edge until the next refresh. The header has the rank, repo short name, goal link and title, counts, and longest chain, plus the controls ↑, ↓ and End. End asks inline "End lane 2? Yes / No". Blocks collapse; the choice is kept in <code>localStorage</code>, and lane 1 starts expanded, the others collapsed.</li>
   <li><b>Row:</b>
     <ul>
-      <li>a state chip;</li>
+      <li>a state chip (NEEDS YOU in orange, READY in green, IN PROGRESS in blue, BLOCKED in grey);</li>
       <li><code>#N</code> linking to GitHub, and the title;</li>
       <li>detail: the holder's name and state, linking to <code>/watch</code>; "waits on #a, #b"; PR links;</li>
+      <li>for needs_you rows, the reason, and "heads the longest chain" when the ticket starts it;</li>
       <li>warnings in words: "working while blocked", "agent stopped", "PR merged — close the ticket", "waits in a loop", "stale";</li>
       <li>"new", and "also in lane N";</li>
       <li>Start on ready rows without <code>merged_not_closed</code>.</li>
@@ -774,10 +903,12 @@ You already hold the claim on #{number}. Run `sm ticket {number} --setup-worktre
 
 <h3 id="k">K. Android Board tab</h3>
 <ul>
-  <li><b>Navigation:</b> the bottom bar becomes Inbox, Watch, Board, Queue, Analytics (<code>AppBottomNav.kt:32–86</code>). Add <code>Routes.BOARD</code> (<code>AppNavigation.kt:26–34</code>) and pass the new callback to every screen that draws the bar.</li>
+  <li><b>Navigation:</b> the bottom bar becomes Inbox, Watch, Board, Queue, Analytics (<code>AppBottomNav.kt:32–86</code>). Board carries the count from <code>unseen.count</code>, as Queue carries its waiting-job badge today. Add <code>Routes.BOARD</code> (<code>AppNavigation.kt:26–34</code>) and pass the new callback to every screen that draws the bar.</li>
   <li><b>Screen:</b> <code>ui/board/BoardScreen.kt</code> and <code>BoardViewModel.kt</code>. It reads <code>GET client/board</code> on open, on pull-to-refresh (which first sends <code>POST client/board/refresh</code>), and every 30 seconds while visible. It renders what J2 describes.
     <ul>
       <li>Lane cards collapse, with lane 1 expanded by default.</li>
+      <li>Inside a lane, Needs you, Ready and In progress rows are shown. Blocked and Done fold into one line each: "▸ Blocked (n) #a #b #c …" (the first three by row order, with NEW after new ones) and "▸ Done (n)". A tap unfolds them.</li>
+      <li>While the tab is visible, it sends <code>POST client/board/seen</code> on open and on each refresh. A lane that was unseen gets an orange left edge until the next refresh.</li>
       <li>The ⋮ menu has Move up, Move down and End lane. Moves send the full order to <code>PUT client/board/order</code>.</li>
       <li>A top-bar + adds a lane (repo menu of the repos read, and a number).</li>
     </ul>
@@ -797,7 +928,7 @@ You already hold the claim on #{number}. Run `sm ticket {number} --setup-worktre
       <li>The Board tab shows the lanes.</li>
       <li>Move a lane down and up; the web page agrees.</li>
       <li>Start a named Ready ticket; the agent appears in Watch holding the claim.</li>
-      <li>Tapping a ready push opens that lane.</li>
+      <li>Tapping a ready push opens that lane, and the web Board badge clears.</li>
       <li>The tab renders correctly in dark theme.</li>
     </ol>
   </li>
@@ -805,7 +936,7 @@ You already hold the claim on #{number}. Run `sm ticket {number} --setup-worktre
 
 <h3 id="l">L. Agent paragraph and converting text plans</h3>
 <p>Ticket 1 adds this paragraph to section 3 of session-manager's <code>CLAUDE.md</code> and <code>AGENTS.md</code>, and opens a PR adding it to fractal-algo-rust's (decision 8):</p>
-<div class="callout"><b>Record ticket order where sm can read it.</b> When you file the tickets for a plan, record each one's order with <code>sm board after &lt;ticket&gt; &lt;ticket it starts after&gt;...</code>, and put them under the plan's parent ticket with <code>sm board under &lt;ticket&gt; &lt;parent&gt;</code>. When you find work that must land before your ticket, file it and run <code>sm board after &lt;your ticket&gt; &lt;new ticket&gt;</code>. Keep "Starts after #N" in the ticket text for people; the link is what sm reads. Only Rajesh orders or ends lanes.</div>
+<div class="callout"><b>Record ticket order where sm can read it.</b> When you file the tickets for a plan, record each one's order with <code>sm board after &lt;ticket&gt; &lt;ticket it starts after&gt;...</code>, and put every ticket of the plan under the plan's goal ticket with <code>sm board under &lt;ticket&gt; &lt;goal&gt;</code>. When you find work that must land before your ticket, file it and run <code>sm board after &lt;your ticket&gt; &lt;new ticket&gt;</code>. When a ticket needed only part of yours and you have delivered that part, remove its link with <code>sm board after &lt;that ticket&gt; &lt;yours&gt; --remove</code>. While you wait on Rajesh for a ruling, approval or review, run <code>sm board needs-you &lt;ticket&gt; --reason "&lt;one line&gt;"</code>, and clear it with <code>--remove</code> once he has answered. Keep "Starts after #N" in the ticket text for people; the link is what sm reads. Only Rajesh orders or ends lanes.</div>
 <p><b>Converting a lane whose order exists only as text</b> (decision 7). Brief a Sonnet 1M agent at high effort with this text:</p>
 <ol>
   <li>Read the goal ticket, the plan document it names, and every ticket the plan names.</li>
@@ -820,10 +951,11 @@ You already hold the claim on #{number}. Run `sm ticket {number} --setup-worktre
 <tbody>
 <tr><td>Order lives in GitHub; sm reads every 60 s</td><td>C</td><td><code>sync_upserts_open_issues_and_edges</code>, <code>sync_marks_missing_issue_closed</code>, <code>sync_pages_connections_over_50</code>, <code>sync_failure_keeps_rows_and_marks_stale</code>, <code>sync_skips_while_rate_limited</code>, <code>parent_field_becomes_sub_issue_edge</code> (1)</td></tr>
 <tr><td>Agents record links with one command</td><td>C5, E</td><td><code>link_add_writes_mutation_and_edge</code>, <code>link_add_existing_is_already</code>, <code>link_remove_absent_is_absent</code>, <code>under_refuses_to_replace_parent</code>, <code>ticket_ref_parsing</code>, <code>cli_output_lines</code> (1)</td></tr>
-<tr><td>Lanes, states, longest chain, row order</td><td>D</td><td><code>membership_follows_both_kinds</code>, <code>membership_stops_at_closed</code>, <code>state_rules</code> (table-driven over D1), <code>retired_holder_is_not_in_progress</code>, <code>chain_example_1651</code>, <code>row_order</code>, <code>cycle_flagged_never_ready</code>, <code>not_planned_blocker_counts_closed</code>, <code>merged_not_closed_warning</code>, <code>two_lanes_min_rank</code>, <code>cross_repo_blocker_member</code> (1)</td></tr>
+<tr><td>Lanes, states, longest chain, row order</td><td>D</td><td><code>membership_follows_both_kinds</code>, <code>membership_stops_at_closed</code>, <code>state_rules</code> (table-driven over D1), <code>retired_holder_is_not_in_progress</code>, <code>chain_example_1651</code>, <code>row_order</code>, <code>cycle_flagged_never_ready</code>, <code>not_planned_blocker_counts_closed</code>, <code>merged_not_closed_warning</code>, <code>iteration7_stage_d_example</code>, <code>two_lanes_min_rank</code>, <code>cross_repo_blocker_member</code> (1)</td></tr>
 <tr><td>You rank lanes; agents only add</td><td>D4, D5, F</td><td><code>lane_add_bottom_rank</code>, <code>lane_add_duplicate_409</code>, <code>order_put_requires_full_set</code>, <code>owner_routes_reject_agent_callers</code>, <code>goal_closed_ends_lane_and_renumbers</code> (1)</td></tr>
 <tr><td>Queue: lane rank first within a type</td><td>H</td><td><code>rank_session_requester_parent_cwd_none</code>, <code>admission_orders_by_lane_rank_within_type</code>, <code>perf_candidate_by_lane_rank</code>, <code>unranked_after_ranked</code>, <code>reorder_applies_to_pending</code>, the extended <code>pending_jobs_are_ordered_as_admission_examines_them</code> (2)</td></tr>
-<tr><td>Pushes: ready and lane done only</td><td>I</td><td><code>ready_push_once_per_lane_pass</code>, <code>no_push_when_repo_stale</code>, <code>no_push_for_new_member_or_new_lane</code>, <code>lane_done_push</code>, <code>push_failure_records_event</code> (2)</td></tr>
+<tr><td>Alerts: ready and lane done only, same on web and phone</td><td>I</td><td><code>ready_notice_once_per_lane_pass</code>, <code>no_notice_when_repo_stale</code>, <code>no_notice_for_new_member_or_new_lane</code>, <code>lane_done_notice</code>, <code>board_seen_acks_and_withdraws</code>, <code>still_wanted_false_once_started</code>, <code>unseen_count_matches_notices</code> (2); <code>nav_board_badge</code> (3)</td></tr>
+<tr><td>Needs you</td><td>C5, D1, E, F</td><td><code>assignee_owner_is_needs_you</code>, <code>needs_you_beats_in_progress</code>, <code>needs_you_write_assigns_and_comments</code>, <code>start_refuses_needs_you</code>, <code>no_notice_for_needs_you</code> (1, 3 for start)</td></tr>
 <tr><td>Board page with Start</td><td>G, J</td><td><code>board_page_renders_lanes_server_side</code>, <code>nav_has_board_tab</code>, <code>start_resolves_checkout</code> (config, convention, missing), <code>start_rejects_held_ticket</code>, <code>start_reserves_claim_and_creates_root_session</code>, <code>start_drops_reservation_on_failure</code>, <code>holder_setup_worktree_after_start</code> (3)</td></tr>
 <tr><td>App Board tab</td><td>K</td><td>The K checklist on the phone (4)</td></tr>
 <tr><td>Agent paragraph; text-plan conversion</td><td>L</td><td>Live check in ticket 1: #1651's links are recorded and <code>sm board</code> matches GitHub</td></tr>
@@ -838,6 +970,8 @@ You already hold the claim on #{number}. Run `sm ticket {number} --setup-worktre
 <p><b>Why is a ticket with an open PR "in progress" even when no agent holds it?</b> A PR that will close the ticket is work under way. The ticket should not tempt you to Start a second agent on it.</p>
 <p><b>What about a parent ticket with no work of its own, like #1651?</b> It becomes Ready when its last sub-issue closes, and its row suggests closing it. If its PR is the last step (as with fractal's readout ticket), Start is right.</p>
 <p><b>Why store <code>rank_session_id</code> on the job instead of the rank?</b> The rank changes when you reorder or a lane ends. The link from job to agent does not.</p>
+<p><b>Why is Needs you an assignee and not a label?</b> An assignee is the GitHub meaning of "this is on this person". It shows in your GitHub views too, and a ticket can carry it with no new label to create in each repo.</p>
+<p><b>Why no push for Needs you?</b> The agent waiting on you already sends an <code>sm send rajesh</code> message, which notifies you. The board adds the part the message cannot: where the wait sits on the lane's longest chain.</p>
 <p><b>Does the board replace <code>sm ticket</code> claims?</b> No. Claims say who is on a ticket. The board reads them to decide In progress.</p>
 <!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
      The block is self-contained and appended to every memo that uses the house tokens;
