@@ -123,7 +123,7 @@ pub(super) fn is_retired(session: &SessionRecord) -> bool {
 }
 
 /// Prefer the PR claimant, then the author or live parent, then the latest
-/// review recipient. Assign records that recipient before the new agent
+/// explicitly assigned agent. Assign records that agent before the new agent
 /// has had a chance to claim the PR.
 pub(in crate::http) fn review_wake_recipient(state: &AppState, doc: &OwnerDoc) -> Option<String> {
     if let Some(pr) = doc.pr_number {
@@ -150,13 +150,11 @@ pub(in crate::http) fn review_wake_recipient(state: &AppState, doc: &OwnerDoc) -
 }
 
 pub(super) fn assigned_review_recipient(state: &AppState, doc: &OwnerDoc) -> Option<String> {
-    let review = owner_doc_store(state)
-        .reviews(&doc.id)
-        .ok()?
-        .into_iter()
-        .rfind(|r| r.status == "posted")?;
-    let id = review.delivered_to_session_id?;
-    super::super::messages::live_recipient(state, &id).map(|s| s.id)
+    let id = owner_doc_store(state)
+        .assigned_doc_session(&doc.id)
+        .ok()??;
+    let session = state.session_store.get_session(&id).ok()??;
+    (!session.is_stopped() && !is_retired(&session)).then_some(id)
 }
 
 #[derive(Debug, Deserialize)]

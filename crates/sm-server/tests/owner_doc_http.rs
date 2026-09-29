@@ -630,3 +630,32 @@ async fn doc_cat_metadata_selects_unpublished_pr_head() {
     assert_eq!(meta["latest_commit_sha"], "b".repeat(40));
     fs::remove_dir_all(f.dir).unwrap();
 }
+
+#[tokio::test]
+async fn ordinary_review_delivery_is_not_a_document_assignment() {
+    let f = fixture();
+    let doc = publish(&f, "retired1", "a", false, None).await;
+    let id = doc["id"].as_str().unwrap();
+    post_review(&f, id, "sub-delivery-only", Some("author01"));
+    let (_, head) = request(&f.app, "GET", &format!("/docs/{id}/head"), None).await;
+    assert!(head["agent"].is_null(), "{head}");
+    let store = OwnerDocStore::new(f.dir.join("message_queue.db"));
+    post_review(&f, id, "sub-explicit-assign", None);
+    assert!(store
+        .assign_review("sub-explicit-assign", "author01")
+        .unwrap());
+    let (_, head) = request(&f.app, "GET", &format!("/docs/{id}/head"), None).await;
+    assert_eq!(head["agent"]["session_id"], "author01");
+    // A later normal delivery keeps the explicit assignment available.
+    post_review(&f, id, "sub-later-delivery", Some("author01"));
+    assert_eq!(
+        store.assigned_doc_session(id).unwrap().as_deref(),
+        Some("author01")
+    );
+    let mut sessions: Value =
+        serde_json::from_str(&fs::read_to_string(&f.state_file).unwrap()).unwrap();
+    sessions["sessions"][0]["status"] = json!("stopped");
+    fs::write(&f.state_file, sessions.to_string()).unwrap();
+    let (_, head) = request(&f.app, "GET", &format!("/docs/{id}/head"), None).await;
+    assert!(head["agent"].is_null(), "{head}");
+}
