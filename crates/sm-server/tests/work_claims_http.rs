@@ -1007,6 +1007,17 @@ async fn merge_hold_owner_alert_retries_after_inbox_cap_and_history_names_hold()
         "{history}"
     );
     assert!(history.to_string().contains("placed_by"), "{history}");
+    for path in ["/t/widgets/9", "/history"] {
+        let mut req = Request::builder().uri(path).body(Body::empty()).unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))));
+        let res = f.app.clone().oneshot(req).await.unwrap();
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).contains("⏸ held by"),
+            "{path}"
+        );
+    }
     f.items.merge(9, 0);
     f.state.run_work_claims_sync_pass().unwrap();
     assert!(f.store().merge_holds(None).unwrap().is_empty());

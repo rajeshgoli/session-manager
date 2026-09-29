@@ -375,6 +375,24 @@ fn agents_html(row: &HistoryRow) -> String {
         .join(" ")
 }
 
+fn row_state_html(row: &HistoryRow) -> String {
+    let mut html = state_chip(&row.state);
+    if row.kind == "pr" {
+        if let Some(hold) = row
+            .prs
+            .iter()
+            .find(|pr| pr.number == row.number)
+            .and_then(|pr| pr.merge_hold.as_ref())
+        {
+            html.push_str(&format!(
+                " ⏸ held by {}",
+                escape_html(hold["placed_by"].as_str().unwrap_or("unknown"))
+            ));
+        }
+    }
+    html
+}
+
 fn prs_html(row: &HistoryRow) -> String {
     row.prs
         .iter()
@@ -512,7 +530,7 @@ fn render_list(params: &HistoryParams, page: &HistoryPage) -> String {
             href = escape_html(&row.history_path),
             number = row.number,
             title = title_html(row),
-            state = state_chip(&row.state),
+            state = row_state_html(row),
             flags = flag_chips(row),
             sections = sections(&[
                 ("Agents", agents_html(row)),
@@ -581,7 +599,7 @@ fn render_timeline(timeline: &Timeline) -> String {
     html.push_str(&format!(
         r#"<div class="strip"><div class="row">{} {} {prs} {linked}</div></div>
 "#,
-        state_chip(&row.state),
+        row_state_html(row),
         flag_chips(row),
     ));
     html.push_str(&sections(&[
