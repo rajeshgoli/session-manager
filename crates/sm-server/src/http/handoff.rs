@@ -249,8 +249,9 @@ pub(super) fn kick_handoff(state: Arc<AppState>, session_id: String) {
 }
 
 /// Every two seconds: start accepted handoffs whose agent went idle (the
-/// codex-fork and codex-app idle signals arrive here), and resume transfers
-/// a restart interrupted. The Claude Stop hook and `sm handoff` itself kick
+/// codex-fork and codex-app idle signals arrive here), resume transfers a
+/// restart interrupted, and move messages that reached a predecessor after
+/// its handoff. The Claude Stop hook and `sm handoff` itself kick
 /// a handoff directly, so this is the backstop, not the fast path.
 pub(super) fn spawn_handoff_sweeper(state: Arc<AppState>) {
     tokio::spawn(async move {
@@ -258,6 +259,19 @@ pub(super) fn spawn_handoff_sweeper(state: Arc<AppState>) {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            match state.session_store.stranded_handoff_messages() {
+                Ok(stranded) => {
+                    for (predecessor, successor) in stranded {
+                        if let Err(error) = state
+                            .session_store
+                            .hand_off_pending_messages(&predecessor, &successor)
+                        {
+                            eprintln!("moving late messages of {predecessor} failed: {error:#}");
+                        }
+                    }
+                }
+                Err(error) => eprintln!("handoff message sweep failed: {error:#}"),
+            }
             let work = match state.session_store.pending_handoff_work() {
                 Ok(work) => work,
                 Err(error) => {
@@ -383,15 +397,24 @@ async fn complete_handoff(
     let task_state = state.clone();
     let brief =
         tokio::task::spawn_blocking(move || move_work(&task_state, &store, &pred, &succ)).await??;
-    // Step 3: the successor never acts before it holds the work.
+    // Step 3: the successor never acts before it holds the work, and reads
+    // the brief before any message it inherits.
     state.session_store.queue_handoff_notice(
         predecessor_id,
         successor_id,
         &brief.text,
-        execute::BRIEF_QUEUED_KEY,
+        &execute::brief_message_id(predecessor_id),
+        &[successor_id, predecessor_id],
     )?;
-    // Step 4.
+    state
+        .session_store
+        .hand_off_pending_messages(predecessor_id, successor_id)?;
+    // Step 4. Sends resolve to the successor once the predecessor has
+    // stopped; anything that reached it before then moves now.
     retire_predecessor(state, predecessor_id, successor_id).await?;
+    state
+        .session_store
+        .hand_off_pending_messages(predecessor_id, successor_id)?;
     // Step 5.
     if let Some(parent_id) = brief.parent_session_id.as_deref() {
         let notice = execute::parent_notice_text(
@@ -404,7 +427,8 @@ async fn complete_handoff(
             predecessor_id,
             parent_id,
             &notice,
-            execute::PARENT_NOTIFIED_KEY,
+            &execute::parent_notice_message_id(predecessor_id),
+            &[],
         )?;
     }
     // Steps 5 (leftover asks) and 6.

@@ -2426,8 +2426,9 @@ impl RetainedQueueStore {
     /// Context handoff (sm#1651, Appendix G): re-point every wake this
     /// database addresses to the predecessor onto the successor. Undelivered
     /// context alerts and handoff asks are dropped: they describe the old
-    /// context. Every statement is `WHERE <column> = predecessor`, so a rerun
-    /// after a crash is harmless.
+    /// context. Messages waiting for the predecessor move later, with
+    /// [`Self::hand_off_messages`], so the brief goes first. Every statement
+    /// is `WHERE <column> = predecessor`, so a rerun after a crash is harmless.
     pub fn hand_off_rows(&self, predecessor_id: &str, successor_id: &str) -> Result<()> {
         self.with_connection(|conn| {
             with_immediate_transaction(conn, |conn| {
@@ -2439,8 +2440,6 @@ impl RetainedQueueStore {
                     params![predecessor_id],
                 )?;
                 for statement in [
-                    "UPDATE message_queue SET target_session_id = ?2
-                      WHERE target_session_id = ?1 AND delivered_at IS NULL",
                     "UPDATE message_queue SET remind_cancel_on_reply_session_id = ?2
                       WHERE remind_cancel_on_reply_session_id = ?1 AND delivered_at IS NULL",
                     "UPDATE message_queue SET parent_session_id = ?2
@@ -2473,6 +2472,102 @@ impl RetainedQueueStore {
                     params![predecessor_id],
                 )?;
                 Ok(())
+            })
+        })
+    }
+
+    /// Messages still waiting for the predecessor go to the successor, minus
+    /// its old context alerts and asks. Run after the brief is queued and
+    /// again after the predecessor retires, so a message sent mid-handoff is
+    /// never stranded. Returns how many moved.
+    pub fn hand_off_messages(&self, predecessor_id: &str, successor_id: &str) -> Result<usize> {
+        self.with_connection(|conn| {
+            with_immediate_transaction(conn, |conn| {
+                conn.execute(
+                    "DELETE FROM message_queue WHERE target_session_id = ?1
+                       AND delivered_at IS NULL
+                       AND message_category IN ('context_handoff', 'context_monitor')",
+                    params![predecessor_id],
+                )?;
+                Ok(conn.execute(
+                    "UPDATE message_queue SET target_session_id = ?2
+                      WHERE target_session_id = ?1 AND delivered_at IS NULL",
+                    params![predecessor_id, successor_id],
+                )?)
+            })
+        })
+    }
+
+    /// Sessions with undelivered messages: the sweep's candidates for
+    /// messages that reached a predecessor after its handoff.
+    pub fn undelivered_targets(&self) -> Result<BTreeSet<String>> {
+        self.with_connection(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT DISTINCT target_session_id FROM message_queue WHERE delivered_at IS NULL",
+            )?;
+            let targets = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+            Ok(targets)
+        })
+    }
+
+    /// Queue a handoff notice under a stable `id`, once: false when a row
+    /// with that id already exists. Its `queued_at` sorts ahead of every
+    /// undelivered message for `ahead_of`, so the successor reads its brief
+    /// before anything it inherited.
+    pub fn enqueue_handoff_notice(
+        &self,
+        id: &str,
+        target_session_id: &str,
+        text: &str,
+        delivery_mode: &str,
+        metadata: QueueMessageMetadata,
+        ahead_of: &[&str],
+    ) -> Result<bool> {
+        self.with_connection(|conn| {
+            with_immediate_transaction(conn, |conn| {
+                let exists = conn
+                    .query_row(
+                        "SELECT 1 FROM message_queue WHERE id = ?1",
+                        params![id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if exists {
+                    return Ok(false);
+                }
+                enqueue_message_with_id_and_metadata_conn(
+                    conn,
+                    id,
+                    target_session_id,
+                    text,
+                    delivery_mode,
+                    metadata,
+                )?;
+                let mut earliest: Option<OffsetDateTime> = None;
+                for target in ahead_of {
+                    let queued: Option<String> = conn.query_row(
+                        "SELECT MIN(queued_at) FROM message_queue
+                          WHERE target_session_id = ?1 AND delivered_at IS NULL AND id != ?2",
+                        params![target, id],
+                        |row| row.get(0),
+                    )?;
+                    if let Some(at) =
+                        queued.and_then(|at| OffsetDateTime::parse(&at, &Rfc3339).ok())
+                    {
+                        earliest = Some(earliest.map_or(at, |current| current.min(at)));
+                    }
+                }
+                if let Some(earliest) = earliest {
+                    let ahead = (earliest - Duration::milliseconds(1)).format(&Rfc3339)?;
+                    conn.execute(
+                        "UPDATE message_queue SET queued_at = ?2 WHERE id = ?1 AND queued_at > ?2",
+                        params![id, ahead],
+                    )?;
+                }
+                Ok(true)
             })
         })
     }

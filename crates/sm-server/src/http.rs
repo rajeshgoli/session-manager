@@ -1480,8 +1480,8 @@ pub fn router(state: AppState) -> Router {
     recover_btw_requests(state.clone());
     if state.config.rust_core.runtime_enabled {
         spawn_scheduled_reminder_dispatcher(state.clone());
-        handoff::spawn_handoff_sweeper(state.clone());
     }
+    handoff::spawn_handoff_sweeper(state.clone());
     let mut app = Router::new()
         .route("/health", get(health))
         .route("/health/detailed", get(health_detailed))

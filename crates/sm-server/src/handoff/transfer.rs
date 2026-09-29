@@ -402,37 +402,130 @@ impl SessionStore {
     }
 
     /// Queue the brief to the successor (G step 3) or the parent notice
-    /// (step 5), once: `stamp` on the predecessor record marks it queued, so
-    /// a resumed transfer never sends it twice. Both come from the
-    /// predecessor.
+    /// (step 5) under the stable queue id `id`, so a resumed transfer never
+    /// sends it twice. It sorts ahead of every undelivered message for
+    /// `ahead_of`. Both come from the predecessor.
     pub fn queue_handoff_notice(
         &self,
         predecessor_id: &str,
         target_session_id: &str,
         text: &str,
-        stamp: &str,
+        id: &str,
+        ahead_of: &[&str],
     ) -> Result<()> {
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let Some(predecessor) = session_object_mut(sessions, predecessor_id) else {
+        let Some(queue) = &self.queue_store else {
             return Ok(());
         };
-        if json_text(predecessor.get(stamp)).is_some() {
+        let _guard = self.write_guard()?;
+        let mut state = self.load_raw_json_value()?;
+        if raw_session_object(&state, target_session_id).is_none() {
             return Ok(());
         }
-        predecessor.insert(stamp.to_owned(), Value::String(now_rfc3339()));
-        let runtime = self.delivery_runtime.clone();
-        self.queue_parent_message(
-            &mut state,
-            predecessor_id,
+        let inserted = queue.enqueue_handoff_notice(
+            id,
             target_session_id,
             text,
             policy::DELIVERY_MODE,
-            execute::NOTICE_CATEGORY,
-            runtime.as_ref(),
+            QueueMessageMetadata {
+                sender_session_id: Some(predecessor_id.to_owned()),
+                message_category: Some(execute::NOTICE_CATEGORY.to_owned()),
+                ..QueueMessageMetadata::default()
+            },
+            ahead_of,
+        )?;
+        if !inserted {
+            return Ok(());
+        }
+        self.drain_after_handoff_raw(&mut state, target_session_id, Some(id))?;
+        push_retained_message_raw(
+            &mut state,
+            target_session_id,
+            text,
+            policy::DELIVERY_MODE,
+            Some(execute::NOTICE_CATEGORY),
         )?;
         self.write_raw_json_value(&state)
+    }
+
+    /// Move messages still waiting for the predecessor to the successor and
+    /// deliver what it can. Returns how many moved.
+    pub fn hand_off_pending_messages(
+        &self,
+        predecessor_id: &str,
+        successor_id: &str,
+    ) -> Result<usize> {
+        let Some(queue) = &self.queue_store else {
+            return Ok(0);
+        };
+        let moved = queue.hand_off_messages(predecessor_id, successor_id)?;
+        if moved > 0 {
+            let _guard = self.write_guard()?;
+            let mut state = self.load_raw_json_value()?;
+            self.drain_after_handoff_raw(&mut state, successor_id, None)?;
+            self.write_raw_json_value(&state)?;
+        }
+        Ok(moved)
+    }
+
+    /// Messages that reached a predecessor after its handoff finished, as
+    /// (predecessor, successor) pairs for the sweep to move.
+    pub fn stranded_handoff_messages(&self) -> Result<Vec<(String, String)>> {
+        // The sweep never creates the queue database.
+        let Some(queue) = self
+            .queue_store
+            .as_ref()
+            .filter(|queue| queue.db_path().exists())
+        else {
+            return Ok(Vec::new());
+        };
+        let targets = queue.undelivered_targets()?;
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let parsed_state = self.load_parsed_state()?;
+        Ok(targets
+            .into_iter()
+            .filter_map(|target| {
+                let session = raw_session_object(&parsed_state.raw, &target)?;
+                let record = raw_handoff_record(session)?;
+                if record.state != HandoffPhase::Done {
+                    return None;
+                }
+                let successor = record
+                    .successor_session_id
+                    .or_else(|| json_text(session.get("successor_session_id")))?;
+                Some((target, successor))
+            })
+            .collect())
+    }
+
+    fn drain_after_handoff_raw(
+        &self,
+        state: &mut Value,
+        target_session_id: &str,
+        stop_after_message_id: Option<&str>,
+    ) -> Result<()> {
+        let (Some(queue), Some(runtime)) = (&self.queue_store, self.delivery_runtime.clone())
+        else {
+            return Ok(());
+        };
+        let node = raw_session_object(state, target_session_id)
+            .and_then(|session| json_text(session.get("node")))
+            .unwrap_or_else(default_node);
+        if is_primary_node(&node) {
+            drain_pending_runtime_messages_raw(
+                self,
+                state,
+                target_session_id,
+                &runtime,
+                queue,
+                None,
+                None,
+                stop_after_message_id,
+                false,
+            )?;
+        }
+        Ok(())
     }
 
     /// G step 6. Leftover asks and reminders from the predecessor go first.
@@ -956,23 +1049,68 @@ mod tests {
     }
 
     #[test]
-    fn a_resumed_transfer_queues_each_notice_once() {
+    fn a_resumed_transfer_queues_each_notice_once_ahead_of_inherited_messages() {
         let store = store("notice", "idle");
+        let queue = store.queue_store.as_ref().unwrap();
+        queue
+            .enqueue_message_with_metadata(
+                "pred0001",
+                "older",
+                "sequential",
+                QueueMessageMetadata::default(),
+            )
+            .unwrap();
+        let brief_id = execute::brief_message_id("pred0001");
         for _ in 0..2 {
             store
-                .queue_handoff_notice("pred0001", "succ0001", "brief", execute::BRIEF_QUEUED_KEY)
+                .queue_handoff_notice(
+                    "pred0001",
+                    "succ0001",
+                    "brief",
+                    &brief_id,
+                    &["succ0001", "pred0001"],
+                )
                 .unwrap();
             store
                 .queue_handoff_notice(
                     "pred0001",
                     "lead0001",
                     "notice",
-                    execute::PARENT_NOTIFIED_KEY,
+                    &execute::parent_notice_message_id("pred0001"),
+                    &[],
                 )
                 .unwrap();
         }
-        assert_eq!(queued(&store, "succ0001"), ["brief"]);
         assert_eq!(queued(&store, "lead0001"), ["notice"]);
+        assert_eq!(
+            store
+                .hand_off_pending_messages("pred0001", "succ0001")
+                .unwrap(),
+            1
+        );
+        assert_eq!(queued(&store, "succ0001"), ["brief", "older"]);
+        assert!(store.stranded_handoff_messages().unwrap().is_empty());
+
+        // A message reaching the predecessor after `done` is found and moved.
+        set_record(&store, "pred0001", "transferring");
+        store.transfer_handoff_json("pred0001", "succ0001").unwrap();
+        store.finish_handoff("pred0001").unwrap();
+        queue
+            .enqueue_message_with_metadata(
+                "pred0001",
+                "late",
+                "sequential",
+                QueueMessageMetadata::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            store.stranded_handoff_messages().unwrap(),
+            [("pred0001".to_owned(), "succ0001".to_owned())]
+        );
+        store
+            .hand_off_pending_messages("pred0001", "succ0001")
+            .unwrap();
+        assert_eq!(queued(&store, "succ0001"), ["brief", "older", "late"]);
     }
 
     #[test]
@@ -1086,6 +1224,7 @@ mod tests {
         .unwrap();
         for _ in 0..2 {
             queue.hand_off_rows("pred0001", "succ0001").unwrap();
+            queue.hand_off_messages("pred0001", "succ0001").unwrap();
         }
         let rows = |sql: &str| -> Vec<String> {
             let mut statement = conn.prepare(sql).unwrap();
