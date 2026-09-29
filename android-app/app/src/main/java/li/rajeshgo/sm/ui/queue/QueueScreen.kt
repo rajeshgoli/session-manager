@@ -227,6 +227,10 @@ fun QueueScreen(
             ask = state.asks[job.id],
             cancelError = state.cancelError,
             followMessage = state.followMessage?.takeIf { it.first == job.id }?.second,
+            startNow = state.startNow?.takeIf { it.jobId == job.id },
+            onCheckStartNow = { viewModel.checkStartNow(current) },
+            onStartNow = { viewModel.startNow(current) },
+            onDismissStartNow = viewModel::dismissStartNow,
             onFollow = { viewModel.follow(current) },
             onCancel = { note -> viewModel.cancel(current, note) { sheetJob = null; viewModel.clearSheetState() } },
             onAsk = { question -> viewModel.ask(current, question) },
@@ -361,6 +365,10 @@ private fun JobSheet(
     ask: AskState?,
     cancelError: String?,
     followMessage: String?,
+    startNow: StartNowState?,
+    onCheckStartNow: () -> Unit,
+    onStartNow: () -> Unit,
+    onDismissStartNow: () -> Unit,
     onFollow: () -> Unit,
     onCancel: (String?) -> Unit,
     onAsk: (String) -> Unit,
@@ -389,6 +397,10 @@ private fun JobSheet(
             )
             jobLimits(job).takeIf { it.isNotBlank() }?.let { Detail("Limits", it) }
             if (job.state == "pending") job.holding?.detail?.let { Detail("Why it is waiting", it) }
+            if (job.state == "running" && job.ownerForcedAt != null) {
+                Detail("Started", "Early, by you. If the Mac runs low on memory, sm stops this run first and puts the job back in line.")
+            }
+            if (job.state == "pending") startNow?.let { StartNowCard(it, onStartNow, onDismissStartNow) }
             job.endedSummary?.let { Detail("What happened", it) }
 
             // Also on stopped jobs: "why did it stop?" is worth asking.
@@ -431,6 +443,9 @@ private fun JobSheet(
             cancelError?.let { Text(it, color = Rose) }
             followMessage?.let { Text(it, color = TextSecondary) }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 24.dp)) {
+                if (job.state == "pending" && startNow == null) {
+                    OutlinedButton(onClick = onCheckStartNow) { Text("Start now") }
+                }
                 if (active) {
                     OutlinedButton(onClick = { confirming = true }) { Text("Cancel", color = Rose) }
                     // The server follows only jobs that have not finished.
@@ -446,6 +461,35 @@ private fun JobSheet(
             onConfirm = { note -> confirming = false; onCancel(note) },
             onDismiss = { confirming = false },
         )
+    }
+}
+
+/** The warnings the owner weighs before overriding the queue (sm#1627). */
+@Composable
+private fun StartNowCard(state: StartNowState, onStart: () -> Unit, onDismiss: () -> Unit) {
+    Surface(color = Amber.copy(alpha = 0.08f), shape = RoundedCornerShape(12.dp)) {
+        Column(Modifier.fillMaxWidth().padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Start now?", style = MaterialTheme.typography.titleSmall, color = Amber)
+            val check = state.check
+            when {
+                check == null && state.error == null -> Text("Checking what this skips…", color = TextMuted)
+                check != null && check.warnings.isEmpty() -> Text("Nothing is holding it back right now.", color = TextSecondary)
+                check != null -> check.warnings.forEach { Text("• $it", color = Amber, style = MaterialTheme.typography.bodyMedium) }
+            }
+            check?.let { Text(startNowMemoryLine(it), style = MaterialTheme.typography.bodySmall, color = TextSecondary) }
+            Text(
+                "If the Mac runs low on memory, sm stops this run first and puts the job back in line.",
+                style = MaterialTheme.typography.bodySmall,
+                color = TextMuted,
+            )
+            state.error?.let { Text(it, color = Rose, style = MaterialTheme.typography.bodySmall) }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = onStart, enabled = check != null && !state.starting) {
+                    Text(if (state.starting) "Starting…" else "Start anyway")
+                }
+                OutlinedButton(onClick = onDismiss) { Text("Keep waiting") }
+            }
+        }
     }
 }
 

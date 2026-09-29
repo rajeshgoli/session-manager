@@ -59,6 +59,16 @@ fun secondsBetween(from: String?, to: OffsetDateTime): Long? =
 /** Whole GiB, as the terminal status bar and the Settings sheet show memory. */
 fun gib(bytes: Long?): String? = bytes?.let { (it / GIB).roundToLong().toString() }
 
+/** "Free now 20 GiB · 8 GiB reserve · needs ~30 GiB (past runs)". */
+fun startNowMemoryLine(check: li.rajeshgo.sm.data.model.QueueStartCheck): String = listOfNotNull(
+    "Free now ${gib(check.memoryAvailableBytes)?.let { "$it GiB" } ?: "unknown"}",
+    "${gib(check.memoryReserveBytes)} GiB reserve",
+    check.memoryEstimateBytes?.let { bytes ->
+        val source = if (check.memoryEstimateSource == "declared") "declared" else "most past runs used"
+        "needs ~${gib(bytes)} GiB ($source)"
+    },
+).joinToString(" · ")
+
 /** The agent a job reports to, by name when known. */
 fun jobAgentLabel(job: SessionJob): String =
     job.notifyName?.takeIf { it.isNotBlank() }

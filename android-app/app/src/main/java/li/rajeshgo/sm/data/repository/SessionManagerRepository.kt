@@ -378,6 +378,14 @@ class SessionManagerRepository(
         }.mapFailure(::classifyWriteFailure)
     }
 
+    suspend fun fetchQueueStartCheck(baseUrl: String, token: String, jobId: String): li.rajeshgo.sm.data.model.QueueStartCheck = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getQueueStartCheck(jobId) }
+    }
+
+    suspend fun forceStartQueueJob(baseUrl: String, token: String, jobId: String): Result<li.rajeshgo.sm.data.model.SessionJob> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).forceStartQueueJob(jobId) }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun createMobileAttachTicket(
         baseUrl: String,
         token: String,

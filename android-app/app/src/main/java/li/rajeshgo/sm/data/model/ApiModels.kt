@@ -677,6 +677,8 @@ data class SessionJob(
     @SerialName("notify_session_id") val notifySessionId: String? = null,
     @SerialName("holding_reason") val holdingReason: String? = null,
     val holding: JobHolding? = null,
+    /** Set while the owner's Start now run is going (sm#1627). */
+    @SerialName("owner_forced_at") val ownerForcedAt: String? = null,
     @SerialName("queued_at") val queuedAt: String? = null,
     @SerialName("started_at") val startedAt: String? = null,
     @SerialName("finished_at") val finishedAt: String? = null,
@@ -732,6 +734,19 @@ data class HostStatus(
     @SerialName("gpu_percent") val gpuPercent: Double? = null,
     @SerialName("memory_available_bytes") val memoryAvailableBytes: Long? = null,
     val source: String? = null,
+)
+
+/** `GET /client/queue/jobs/{id}/start-check`: what Start now overrides (sm#1627). */
+@Serializable
+data class QueueStartCheck(
+    @SerialName("job_id") val jobId: String,
+    val state: String,
+    val warnings: List<String> = emptyList(),
+    @SerialName("memory_available_bytes") val memoryAvailableBytes: Long? = null,
+    @SerialName("memory_reserve_bytes") val memoryReserveBytes: Long = 0,
+    @SerialName("memory_estimate_bytes") val memoryEstimateBytes: Long? = null,
+    @SerialName("memory_estimate_source") val memoryEstimateSource: String? = null,
+    @SerialName("past_runs") val pastRuns: Int = 0,
 )
 
 /** `GET /client/queue` (sm#1609). */

@@ -695,6 +695,26 @@ fn round1(value: f64) -> f64 {
 }
 
 /// `GET /client/queue/stats` (Appendix D).
+/// The most memory any of these queue jobs used while running, with how many
+/// of them were sampled; `None` when none were (sm#1627).
+pub fn peak_running_rss(db_path: &Path, job_ids: &[String]) -> Result<Option<(i64, usize)>> {
+    let Some(conn) = open_for_read(db_path)? else {
+        return Ok(None);
+    };
+    let mut statement = conn.prepare(
+        "SELECT MAX(rss_bytes) FROM job_samples WHERE job_id = ?1 AND state = 'running'",
+    )?;
+    let mut peak: Option<i64> = None;
+    let mut runs = 0;
+    for job_id in job_ids {
+        if let Some(max) = statement.query_row([job_id], |row| row.get::<_, Option<i64>>(0))? {
+            runs += 1;
+            peak = Some(peak.map_or(max, |peak| peak.max(max)));
+        }
+    }
+    Ok(peak.map(|peak| (peak, runs)))
+}
+
 pub fn queue_stats(db_path: &Path, hours: i64) -> Result<Value> {
     queue_stats_at(db_path, hours, now_ms())
 }
