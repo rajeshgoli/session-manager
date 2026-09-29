@@ -1439,3 +1439,32 @@ fn lookup_state_reason_keeps_github_casing() {
     closed.state_reason = Some("not_planned".into());
     assert_eq!(done_reason(&closed), Some("not_planned"));
 }
+
+#[test]
+fn resolve_rejects_partial_but_reads_missing_issue() {
+    let missing = br#"{"data":{"r0":{"issue":null}},
+        "errors":[{"type":"NOT_FOUND","message":"Could not resolve"}]}"#;
+    assert_eq!(parse_resolve(missing, 1), Ok(vec![None]));
+    let partial = br#"{"data":{"r0":{"issue":{"id":"I","number":1,"state":"OPEN",
+        "repository":{"nameWithOwner":"acme/widgets"},"blockedBy":null}}},
+        "errors":[{"type":"INTERNAL","message":"blockedBy timed out"}]}"#;
+    assert_eq!(
+        parse_resolve(partial, 1),
+        Err("blockedBy timed out".to_owned())
+    );
+}
+
+#[test]
+fn rate_limited_read_leaves_repo_stale() {
+    let (store, _dir) = temp_store();
+    let github = FakeGitHub::new();
+    handoff(&github);
+    *github.rate_remaining.lock().unwrap() = Some(150);
+    let result = run_pass(&store, &github, &outside(), now()).unwrap();
+    assert!(store.repo_syncs().unwrap().iter().any(RepoSync::stale));
+    assert!(result
+        .board
+        .facts
+        .values()
+        .all(|facts| facts.state != TicketState::Ready));
+}

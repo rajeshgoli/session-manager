@@ -385,6 +385,19 @@ pub fn parse_resolve(stdout: &[u8], count: usize) -> Result<Vec<Option<ResolvedI
     if value["data"].is_null() {
         return Err(graphql_error(&value).unwrap_or_else(|| "no data in response".into()));
     }
+    // A missing issue is a NOT_FOUND error and a null alias; any other error
+    // may have left a connection empty, and links read from it would lie.
+    let other_error = value["errors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|error| error["type"].as_str() != Some("NOT_FOUND"));
+    if let Some(error) = other_error {
+        return Err(error["message"]
+            .as_str()
+            .unwrap_or("GraphQL error")
+            .to_owned());
+    }
     let key_of = |node: &Value| Some((node_repo(node)?, node["number"].as_i64()?));
     Ok((0..count)
         .map(|index| {

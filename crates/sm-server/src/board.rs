@@ -1486,6 +1486,8 @@ pub fn run_pass(
             read.insert(repo.clone());
             match read_one(store, source, &repo, now) {
                 Ok(Some(reset_at)) => {
+                    // Nothing was applied: stale until a full read lands.
+                    store.mark_repo_failed(&repo, "GitHub rate limit", now)?;
                     let mut all = store.read_set(outside)?;
                     all.extend(read.iter().cloned());
                     store.set_rate_limited(&all, &reset_at)?;
