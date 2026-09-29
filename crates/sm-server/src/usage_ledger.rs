@@ -640,8 +640,8 @@ impl UsageLedgerStore {
     /// That parser rejected a line for an explicit null anywhere in it, and Claude Code 2.1.25x
     /// writes `usage.iterations[].model: null` on every turn, so scans advanced past those turns
     /// without booking them. Clearing the saved offset of each bound Claude transcript that
-    /// contains a null model makes the next scan re-read it; turns already booked dedupe as
-    /// ignored. Runs once, recorded in `usage_repairs`.
+    /// contains a null in any field the old parser checked makes the next scan re-read it;
+    /// turns already booked dedupe as ignored. Runs once, recorded in `usage_repairs`.
     fn rescan_nested_null_claude_artifacts(&self, bindings: &[ArtifactBinding]) -> Result<()> {
         let connection = self.open()?;
         let applied = connection
@@ -656,15 +656,24 @@ impl UsageLedgerStore {
             return Ok(());
         }
         drop(connection);
+        // Every field the old parser rejected when null at any depth.
+        let nulls = ROOT_NULL_REJECT_FIELDS
+            .iter()
+            .chain(&MESSAGE_NULL_REJECT_FIELDS)
+            .chain(&USAGE_NULL_REJECT_FIELDS)
+            .map(|field| format!("\"{field}\":null").into_bytes())
+            .collect::<Vec<_>>();
         let paths = expand_artifacts(bindings)
             .into_iter()
             .filter(|artifact| artifact.provider == "claude")
             .map(|artifact| artifact.path)
             .filter(|path| {
                 fs::read(path).is_ok_and(|bytes| {
-                    bytes
-                        .windows(b"\"model\":null".len())
-                        .any(|window| window == b"\"model\":null")
+                    nulls.iter().any(|null| {
+                        bytes
+                            .windows(null.len())
+                            .any(|window| window == null.as_slice())
+                    })
                 })
             })
             .collect::<Vec<_>>();
@@ -1591,6 +1600,7 @@ struct Artifact {
 
 fn expand_artifacts(bindings: &[ArtifactBinding]) -> Vec<Artifact> {
     let mut artifacts = BTreeMap::<(String, PathBuf), BTreeMap<String, String>>::new();
+    let mut transcripts_by_root = BTreeMap::new();
     for binding in bindings {
         let mut paths = vec![binding.artifact_path.clone()];
         if binding.provider == "claude" {
@@ -1598,6 +1608,17 @@ fn expand_artifacts(bindings: &[ArtifactBinding]) -> Vec<Artifact> {
                 &binding.artifact_path,
                 &binding.provider_session_id,
             ));
+            if let Some(main) = claude_main_transcript(
+                &binding.artifact_path,
+                &binding.provider_session_id,
+                &mut transcripts_by_root,
+            ) {
+                paths.extend(claude_sibling_artifacts(
+                    &main,
+                    &binding.provider_session_id,
+                ));
+                paths.push(main);
+            }
         }
         for path in paths {
             artifacts
@@ -1662,6 +1683,56 @@ fn codex_artifact_project_key(path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// The session's main transcript when a binding names a different file: a subagent file that
+/// transcript discovery met first, or a path under the seat's starting directory after Claude
+/// Code moved into a worktree and filed the transcript under that project folder instead.
+fn claude_main_transcript(
+    path: &Path,
+    session_id: &str,
+    transcripts_by_root: &mut BTreeMap<PathBuf, BTreeMap<String, PathBuf>>,
+) -> Option<PathBuf> {
+    let file_name = format!("{session_id}.jsonl");
+    let expected = if path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|value| value.to_str())
+        == Some("subagents")
+    {
+        path.parent()?.parent()?.with_file_name(&file_name)
+    } else if path.file_name().and_then(|value| value.to_str()) == Some(file_name.as_str()) {
+        path.to_path_buf()
+    } else {
+        return None;
+    };
+    let main = if expected.is_file() {
+        expected
+    } else {
+        let projects_root = expected.parent()?.parent()?.to_path_buf();
+        transcripts_by_root
+            .entry(projects_root)
+            .or_insert_with_key(|root| claude_transcripts_by_session(root))
+            .get(session_id)?
+            .clone()
+    };
+    (main != path).then_some(main)
+}
+
+fn claude_transcripts_by_session(projects_root: &Path) -> BTreeMap<String, PathBuf> {
+    let Ok(projects) = fs::read_dir(projects_root) else {
+        return BTreeMap::new();
+    };
+    projects
+        .flatten()
+        .filter_map(|project| fs::read_dir(project.path()).ok())
+        .flat_map(|entries| entries.flatten().map(|entry| entry.path()))
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
+        .filter_map(|path| {
+            let session_id = path.file_stem()?.to_str()?.to_owned();
+            Some((session_id, path))
+        })
+        .collect()
 }
 
 fn claude_sibling_artifacts(path: &Path, session_id: &str) -> Vec<PathBuf> {
@@ -5552,6 +5623,97 @@ mod tests {
 
         // Recorded once: a later scan does not re-read the transcript.
         assert_eq!(store.scan(&[]).unwrap().artifacts_scanned, 0);
+    }
+
+    #[test]
+    fn claude_binding_to_a_subagent_or_missing_path_scans_the_main_transcript() {
+        let dir = TestDir::new("claude-main-transcript");
+        let db_path = dir.0.join("usage.db");
+        let account = identity(Provider::Claude, "account-one", "max");
+        UsageIdentityStore::new(&db_path)
+            .unwrap()
+            .record_observation(
+                Provider::Claude,
+                Some(&account),
+                at("2026-09-07T15:00:00Z"),
+                None,
+                None,
+            )
+            .unwrap();
+        UsageBurnStore::new(&db_path).unwrap();
+        let projects = dir.0.join("projects");
+        let write = |path: PathBuf, session: &str, id: &str| {
+            let line = json!({
+                "timestamp": "2026-09-07T16:00:00Z",
+                "sessionId": session,
+                "requestId": format!("request-{id}"),
+                "cwd": "/repo",
+                "version": "2.1.200",
+                "message": {
+                    "id": format!("message-{id}"),
+                    "model": "claude-opus-5-5",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0
+                    }
+                }
+            });
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, format!("{line}\n")).unwrap();
+            path
+        };
+        // Discovery met the subagent file first and bound it instead of the main transcript.
+        write(
+            projects.join("-repo/session-sub.jsonl"),
+            "session-sub",
+            "sub-main",
+        );
+        let subagent = write(
+            projects.join("-repo/session-sub/subagents/agent-one.jsonl"),
+            "session-sub",
+            "sub-agent",
+        );
+        // Claude Code moved into a worktree, so the transcript is not where the seat's
+        // starting directory puts it.
+        write(
+            projects.join("-repo--claude-worktrees-fix/session-moved.jsonl"),
+            "session-moved",
+            "moved-main",
+        );
+        let seats = SeatSessionStore::new(&db_path);
+        seats
+            .append("seat-sub", "claude", "session-sub", subagent.to_str())
+            .unwrap();
+        seats
+            .append(
+                "seat-moved",
+                "claude",
+                "session-moved",
+                projects.join("-repo/session-moved.jsonl").to_str(),
+            )
+            .unwrap();
+        UsageLedgerStore::new(&db_path).unwrap().scan(&[]).unwrap();
+
+        let connection = Connection::open(db_path).unwrap();
+        let booked = connection
+            .prepare("SELECT message_id, seat_id FROM message_ledger ORDER BY message_id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            booked,
+            vec![
+                ("message-moved-main".to_owned(), "seat-moved".to_owned()),
+                ("message-sub-agent".to_owned(), "seat-sub".to_owned()),
+                ("message-sub-main".to_owned(), "seat-sub".to_owned()),
+            ]
+        );
     }
 
     #[test]
