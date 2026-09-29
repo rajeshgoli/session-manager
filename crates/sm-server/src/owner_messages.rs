@@ -425,8 +425,32 @@ impl OwnerMessageStore {
     /// unread messages to the same human. The check and the insert share
     /// one write transaction, so two racing sends cannot both pass it.
     pub fn create(&self, message: NewOwnerMessage) -> Result<CreateOwnerMessage> {
+        self.create_once(message, None)
+    }
+
+    /// A durable producer retries with the same key until its notification is accepted.
+    pub fn create_once(
+        &self,
+        message: NewOwnerMessage,
+        key: Option<&str>,
+    ) -> Result<CreateOwnerMessage> {
         let mut conn = self.open_write()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS owner_message_delivery_keys (key TEXT PRIMARY KEY, message_id TEXT NOT NULL)")?;
+        if let Some(key) = key {
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT message_id FROM owner_message_delivery_keys WHERE key=?1",
+                    [key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(id) = existing {
+                return Ok(CreateOwnerMessage::Created(Box::new(
+                    get_message_conn(&tx, &id)?.context("delivered message missing")?,
+                )));
+            }
+        }
         let unread: i64 = tx.query_row(
             "SELECT COUNT(*) FROM owner_messages \
              WHERE sender_session_id = ?1 AND human = ?2 AND first_viewed_at IS NULL",
@@ -452,6 +476,12 @@ impl OwnerMessageStore {
                 now_rfc3339()
             ],
         )?;
+        if let Some(key) = key {
+            tx.execute(
+                "INSERT INTO owner_message_delivery_keys(key,message_id) VALUES (?1,?2)",
+                params![key, id],
+            )?;
+        }
         let created = get_message_conn(&tx, &id)?.context("inserted message vanished")?;
         tx.commit()?;
         Ok(CreateOwnerMessage::Created(Box::new(created)))

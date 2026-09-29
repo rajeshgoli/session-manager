@@ -967,3 +967,64 @@ async fn merge_holds_http_authority_recipients_projection_and_sync() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     fs::remove_dir_all(f.dir).unwrap();
 }
+
+#[tokio::test]
+async fn merge_hold_owner_alert_retries_after_inbox_cap_and_history_names_hold() {
+    use sm_server::owner_messages::{
+        CreateOwnerMessage, NewOwnerMessage, OwnerMessageStore, UNREAD_CAP,
+    };
+    let f = fixture();
+    claim(&f, "eng00001", "pr", 9, json!({})).await;
+    let inbox = OwnerMessageStore::new(f.dir.join("message_queue.db"));
+    let mut ids = Vec::new();
+    for _ in 0..UNREAD_CAP {
+        let CreateOwnerMessage::Created(message) = inbox
+            .create(NewOwnerMessage {
+                human: AppConfig::default().owner_name,
+                sender_session_id: "sm".into(),
+                sender_session_name: "Session Manager".into(),
+                title: "Earlier alert".into(),
+                body_markdown: "Earlier alert".into(),
+                blocking: false,
+            })
+            .unwrap()
+        else {
+            panic!("unexpected cap")
+        };
+        ids.push(message.id);
+    }
+    let (status, body) = request(
+        &f.app,
+        "POST",
+        "/merge-holds",
+        Some(json!({"repo":REPO,"pr":9})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, history) = request(&f.app, "GET", "/t/widgets/9?format=json", None).await;
+    assert!(
+        history.to_string().contains("merge hold placed by"),
+        "{history}"
+    );
+    assert!(history.to_string().contains("placed_by"), "{history}");
+    f.items.merge(9, 0);
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert!(f.store().merge_holds(None).unwrap().is_empty());
+    assert_eq!(f.store().pending_merge_hold_notices().unwrap().len(), 1);
+    inbox.mark_viewed(&ids[0]).unwrap();
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert!(f.store().pending_merge_hold_notices().unwrap().is_empty());
+    let conn = rusqlite::Connection::open(f.dir.join("message_queue.db")).unwrap();
+    let count = || {
+        conn.query_row(
+            "SELECT count(*) FROM owner_messages WHERE title LIKE '%merged while held%'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(count(), 1);
+    f.state.run_work_claims_sync_pass().unwrap();
+    assert_eq!(count(), 1);
+    fs::remove_dir_all(f.dir).unwrap();
+}

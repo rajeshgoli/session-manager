@@ -314,7 +314,7 @@ async fn history_json_rows_carry_agents_prs_reviews_and_docs() {
         one["prs"],
         json!([{"number": 9, "title": "Item <9>", "state": "open",
                 "url": "https://github.com/acme/widgets/pull/9",
-                "codex_requested": 1, "codex_landed": 0}])
+                "codex_requested": 1, "codex_landed": 0, "merge_hold": null}])
     );
     assert_eq!(one["docs"][0]["title"], "Memo <draft>");
     assert_eq!(one["docs"][0]["state"], "review_requested");

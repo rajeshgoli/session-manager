@@ -11,10 +11,11 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         made_draft INTEGER NOT NULL, placed_at TEXT NOT NULL, ended_at TEXT,
         ended_by_session_id TEXT, ended_by_name TEXT, end_reason TEXT);
         CREATE UNIQUE INDEX IF NOT EXISTS merge_holds_active ON merge_holds(repo,pr) WHERE ended_at IS NULL;")?;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS merge_hold_owner_notices (hold_id TEXT PRIMARY KEY, payload TEXT NOT NULL)")?;
     Ok(())
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct MergeHold {
     pub id: String,
     pub repo: String,
@@ -145,6 +146,25 @@ impl MergeHold {
     }
 }
 impl WorkClaimStore {
+    pub fn pending_merge_hold_notices(&self) -> Result<Vec<MergeHold>> {
+        let conn = self.open_write()?;
+        let mut stmt =
+            conn.prepare("SELECT payload FROM merge_hold_owner_notices ORDER BY hold_id")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.iter()
+            .map(|s| serde_json::from_str(s).map_err(Into::into))
+            .collect()
+    }
+    pub fn finish_merge_hold_notice(&self, id: &str) -> Result<()> {
+        self.open_write()?.execute(
+            "DELETE FROM merge_hold_owner_notices WHERE hold_id=?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
     pub fn merge_holds(&self, repo: Option<&str>) -> Result<Vec<MergeHold>> {
         match self.open_read()? {
             Some(conn) => active(&conn, repo, None),
@@ -330,6 +350,7 @@ impl WorkClaimStore {
                 &targets,
             )?;
             if pr.state == "merged" && hold.placed_by_session_id.is_none() {
+                tx.execute("INSERT OR IGNORE INTO merge_hold_owner_notices(hold_id,payload) VALUES (?1,?2)", params![hold.id,serde_json::to_string(&hold).map_err(anyhow::Error::from)?])?;
                 owner_notice = Some(hold);
             }
         } else if !pr.is_draft {

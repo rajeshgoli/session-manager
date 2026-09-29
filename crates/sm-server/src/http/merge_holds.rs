@@ -200,25 +200,26 @@ pub(super) fn sync(state: &AppState) -> anyhow::Result<()> {
             state.merge_hold_source.as_ref(),
             &recipients(state, &hold.repo, hold.pr)?,
         ) {
-            Ok((notified, owner_notice)) => {
-                claims::deliver_claim_notices(state, &notified);
-                if let Some(hold) = owner_notice {
-                    use crate::owner_messages::{CreateOwnerMessage, NewOwnerMessage};
-                    if let CreateOwnerMessage::Created(message) =
-                        messages::owner_message_store(state).create(NewOwnerMessage {
-                            human: state.config.owner_name.clone(),
-                            sender_session_id: "sm".into(),
-                            sender_session_name: "Session Manager".into(),
-                            title: format!("PR #{} merged while held", hold.pr),
-                            body_markdown: hold.merged_message(),
-                            blocking: false,
-                        })?
-                    {
-                        follows::notice_new_message(state, &message);
-                    }
-                }
-            }
+            Ok((notified, _)) => claims::deliver_claim_notices(state, &notified),
             Err(e) => eprintln!("merge hold sync failed: {e:?}"),
+        }
+    }
+    for hold in store.pending_merge_hold_notices()? {
+        use crate::owner_messages::{CreateOwnerMessage, NewOwnerMessage};
+        let result = messages::owner_message_store(state).create_once(
+            NewOwnerMessage {
+                human: state.config.owner_name.clone(),
+                sender_session_id: "sm".into(),
+                sender_session_name: "Session Manager".into(),
+                title: format!("PR #{} merged while held", hold.pr),
+                body_markdown: hold.merged_message(),
+                blocking: false,
+            },
+            Some(&format!("merge-hold:{}", hold.id)),
+        )?;
+        if let CreateOwnerMessage::Created(message) = result {
+            follows::notice_new_message(state, &message);
+            store.finish_merge_hold_notice(&hold.id)?;
         }
     }
     Ok(())

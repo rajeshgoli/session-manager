@@ -388,9 +388,16 @@ fn prs_html(row: &HistoryRow) -> String {
                 String::new()
             };
             format!(
-                "<span>{} {}{codex}</span>",
+                "<span>{} {}{codex}{}</span>",
                 external(&pr.url, &format!("PR #{}", pr.number), "mt lk"),
-                state_chip(&pr.state)
+                state_chip(&pr.state),
+                pr.merge_hold
+                    .as_ref()
+                    .map(|hold| format!(
+                        " ⏸ held by {}",
+                        escape_html(hold["placed_by"].as_str().unwrap_or("unknown"))
+                    ))
+                    .unwrap_or_default()
             )
         })
         .collect::<Vec<_>>()
