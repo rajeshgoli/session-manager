@@ -3,6 +3,7 @@ package li.rajeshgo.sm.data.repository
 import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -40,6 +41,8 @@ class SettingsRepository(
             stringPreferencesKey("cloudflare_device_private_key_pkcs8_wrapped")
         val DISMISSED_UPDATE_ARTIFACT_HASH = stringPreferencesKey("dismissed_update_artifact_hash")
         val WHAT_SUMMARIES = stringPreferencesKey("what_summaries")
+        val QUEUE_ASKS = stringPreferencesKey("queue_asks")
+        val FOLLOW_PUSH_ENABLED = booleanPreferencesKey("follow_push_enabled")
     }
 
     val serverUrl: Flow<String> = context.dataStore.data.map { prefs ->
@@ -178,6 +181,22 @@ class SettingsRepository(
                 prefs[Keys.WHAT_SUMMARIES] = json.encodeToString(summaries)
             }
         }
+    }
+
+    /** Answered Ask agent requests from the Queue tab, as the queue screen encodes them. */
+    suspend fun loadQueueAsksJson(): String = context.dataStore.data.first()[Keys.QUEUE_ASKS].orEmpty()
+
+    suspend fun saveQueueAsksJson(encoded: String) {
+        context.dataStore.edit { prefs -> prefs[Keys.QUEUE_ASKS] = encoded }
+    }
+
+    /** Whether this phone takes follow notifications; on unless turned off in Settings. */
+    val followPushEnabled: Flow<Boolean> = context.dataStore.data.map { prefs ->
+        prefs[Keys.FOLLOW_PUSH_ENABLED] ?: true
+    }
+
+    suspend fun saveFollowPushEnabled(enabled: Boolean) {
+        context.dataStore.edit { prefs -> prefs[Keys.FOLLOW_PUSH_ENABLED] = enabled }
     }
 
     suspend fun clearAuth() {

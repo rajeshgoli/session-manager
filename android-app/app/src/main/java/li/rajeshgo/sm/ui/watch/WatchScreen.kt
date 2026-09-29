@@ -1899,7 +1899,7 @@ private fun WhatSummarySection(
 }
 
 @Composable
-private fun MarkdownText(markdown: String) {
+internal fun MarkdownText(markdown: String) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val markwon = remember(context) { io.noties.markwon.Markwon.create(context) }
     val textColor = MaterialTheme.colorScheme.onSurface.toArgb()

@@ -84,13 +84,28 @@ fun SettingsScreen(
             state.error?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = Rose); TextButton(onClick = viewModel::refreshBootstrap) { Text("Retry connection") } }
         }
         if (state.isLoggedIn) SettingsGroup("Notifications") {
-            Text(
-                if (li.rajeshgo.sm.push.FollowPush.isConfigured) "Followed agents and jobs notify this phone" else "Push is not set up in this build; follows arrive by email",
-                style = MaterialTheme.typography.bodyMedium,
-                color = TextSecondary,
-            )
-            TextButton(onClick = sendTestNotification, enabled = !state.notificationTestBusy) {
-                Text(if (state.notificationTestBusy) "Sending…" else "Send test notification")
+            if (li.rajeshgo.sm.push.FollowPush.isConfigured) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Notify this phone", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            if (state.followPushEnabled) "Follows, agent messages and review requests" else "Off — sm emails you instead",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = TextMuted,
+                        )
+                    }
+                    Switch(checked = state.followPushEnabled, onCheckedChange = viewModel::setFollowPushEnabled)
+                }
+                if (state.followPushEnabled) {
+                    Text(
+                        if (state.notificationTestBusy) "Sending test…" else "Send a test",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextMuted,
+                        modifier = Modifier.clickable(enabled = !state.notificationTestBusy) { sendTestNotification() },
+                    )
+                }
+            } else {
+                Text("Push is not set up in this build; follows arrive by email", style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
             }
             state.notificationTestStatus?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextMuted) }
         }

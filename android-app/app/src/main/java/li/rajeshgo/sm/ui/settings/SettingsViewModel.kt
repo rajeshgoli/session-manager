@@ -8,6 +8,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import li.rajeshgo.sm.data.model.ClientBootstrapResponse
 import li.rajeshgo.sm.data.repository.AppUpdateRepository
 import li.rajeshgo.sm.data.repository.AvailableAppUpdate
@@ -46,6 +48,7 @@ data class SettingsUiState(
     val updateError: String? = null,
     val error: String? = null,
     /** Follow notifications (sm#1569): result of the last test push. */
+    val followPushEnabled: Boolean = true,
     val notificationTestBusy: Boolean = false,
     val notificationTestStatus: String? = null,
 )
@@ -76,6 +79,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 userName = settingsRepository.userName.first(),
                 isLoggedIn = settingsRepository.isLoggedIn.first(),
                 cloudflareDeviceCertificateConfigured = settingsRepository.hasCloudflareDeviceCertificate.first(),
+                followPushEnabled = settingsRepository.followPushEnabled.first(),
             )
             loadMobileDeviceKey()
             refreshBootstrap()
@@ -289,6 +293,44 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun reportError(message: String) {
         _uiState.value = _uiState.value.copy(error = message, loading = false)
     }
+
+    /**
+     * Turns follow notifications on or off for this phone. Off removes the
+     * phone's token from sm, so follows fall back to email.
+     */
+    fun setFollowPushEnabled(enabled: Boolean) {
+        _uiState.value = _uiState.value.copy(followPushEnabled = enabled, notificationTestStatus = null)
+        viewModelScope.launch {
+            // One change at a time, and only the latest tap is applied, so a
+            // slow "off" can never land after a newer "on".
+            followPushSwitchLock.withLock {
+                if (_uiState.value.followPushEnabled != enabled) return@withLock
+                applyFollowPushEnabled(enabled)
+            }
+        }
+    }
+
+    private suspend fun applyFollowPushEnabled(enabled: Boolean) {
+        settingsRepository.saveFollowPushEnabled(enabled)
+        if (enabled) {
+            // App start registers again, so a failure here is only reported.
+            FollowPush.registerToken(getApplication()).onFailure {
+                _uiState.value = _uiState.value.copy(
+                    notificationTestStatus = "Couldn't reach sm; this phone registers next time the app starts",
+                )
+            }
+        } else {
+            runCatching {
+                FollowPush.unregisterToken(
+                    getApplication(),
+                    settingsRepository.serverUrl.first(),
+                    settingsRepository.accessToken.first(),
+                )
+            }
+        }
+    }
+
+    private val followPushSwitchLock = Mutex()
 
     /** Asks sm to push a test notification to this account's phones. */
     fun sendTestNotification() {

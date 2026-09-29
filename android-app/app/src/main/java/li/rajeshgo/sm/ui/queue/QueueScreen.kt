@@ -60,6 +60,7 @@ import kotlinx.coroutines.isActive
 import li.rajeshgo.sm.data.model.SessionJob
 import li.rajeshgo.sm.push.FollowOpen
 import li.rajeshgo.sm.push.FollowOpenRequests
+import li.rajeshgo.sm.ui.watch.MarkdownText
 import li.rajeshgo.sm.ui.navigation.AppBottomNav
 import li.rajeshgo.sm.ui.navigation.Routes
 import li.rajeshgo.sm.ui.theme.Amber
@@ -223,7 +224,7 @@ fun QueueScreen(
             job = current,
             now = now,
             log = state.log?.takeIf { it.first == job.id }?.second,
-            ask = state.ask?.takeIf { it.jobId == job.id },
+            ask = state.asks[job.id],
             cancelError = state.cancelError,
             followMessage = state.followMessage?.takeIf { it.first == job.id }?.second,
             onFollow = { viewModel.follow(current) },
@@ -410,8 +411,9 @@ private fun JobSheet(
                     Text(if (asking) "Asking…" else "Send")
                 }
                 ask?.let {
+                    Text("You asked: ${it.question}", style = MaterialTheme.typography.bodySmall, color = TextMuted)
                     when {
-                        it.answer != null -> Text(it.answer)
+                        it.answer != null -> MarkdownText(it.answer)
                         it.error != null -> Text(it.error, color = Rose)
                         else -> Text("Waiting for ${jobAgentLabel(job)} (${it.status})…", color = TextMuted)
                     }

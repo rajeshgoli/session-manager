@@ -79,9 +79,10 @@ object FollowPush {
         }
     }
 
-    /** Sends this phone's push token to sm; a no-op when signed out or push is off. */
+    /** Sends this phone's push token to sm; a no-op when signed out, push is off, or the owner turned it off. */
     suspend fun registerToken(context: Context, token: String? = null): Result<Unit> {
         val settings = SettingsRepository(context)
+        if (!settings.followPushEnabled.first()) return Result.success(Unit)
         val serverUrl = settings.serverUrl.first().trim()
         val accessToken = settings.accessToken.first().trim()
         if (serverUrl.isBlank() || accessToken.isBlank()) return Result.success(Unit)
