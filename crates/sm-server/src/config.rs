@@ -332,6 +332,11 @@ impl AppConfig {
         )?;
         self.push.db_path =
             isolate_default_data_path(&self.push.db_path, &default_push_db_path(), &instance)?;
+        self.utilization.db_path = isolate_default_data_path(
+            &self.utilization.db_path,
+            &default_utilization_db_path(),
+            &instance,
+        )?;
         // Tests never send real pushes with the live key.
         self.push.fcm.service_account_path = None;
         self.bug_reports.db_path = isolate_path_from_protected_root(
@@ -2747,6 +2752,7 @@ mod tests {
             &config.mobile_terminal.device_enrollment_db_path,
             &config.bug_reports.db_path,
             &config.app_artifacts.root_dir,
+            &config.utilization.db_path,
         ];
         for path in durable_paths {
             assert!(

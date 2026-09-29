@@ -2578,6 +2578,10 @@ async fn read_utilization(
     state: &AppState,
     read: impl FnOnce(&std::path::Path) -> anyhow::Result<Value> + Send + 'static,
 ) -> Result<Json<Value>, ApiError> {
+    // Turning the recorder off retires its history from the app too.
+    if !state.config.utilization.enabled {
+        return Ok(Json(json!({"available": false})));
+    }
     let db_path = expand_home(&state.config.utilization.db_path);
     let body = tokio::task::spawn_blocking(move || read(&db_path))
         .await
@@ -20602,6 +20606,8 @@ mod tests {
         let mut config = mobile_ticket_config(&signing_key);
         let dir = std::env::temp_dir().join(format!("sm-utilization-http-{}", std::process::id()));
         config.utilization.db_path = dir.join("absent.db").to_string_lossy().into_owned();
+        let mut disabled = config.clone();
+        disabled.utilization.enabled = false;
         let app = router(AppState::new(config));
         for (uri, expected) in [
             ("/client/queue/stats", StatusCode::OK),
@@ -20625,6 +20631,42 @@ mod tests {
                 assert_eq!(body, json!({"available": false}), "{uri}");
             }
         }
+        // Disabled answers unavailable even where samples exist.
+        let dir = std::env::temp_dir().join(format!(
+            "sm-utilization-http-disabled-{}",
+            std::process::id()
+        ));
+        let db_path = dir.join("utilization.db");
+        let mut conn = crate::utilization::open_for_write(&db_path).unwrap();
+        let now_ms = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+        crate::utilization::write_sample(
+            &mut conn,
+            &crate::utilization::HostSample {
+                sampled_at_ms: now_ms - 1000,
+                interval_ms: 5000,
+                cpu_busy_pct: Some(10.0),
+                ..Default::default()
+            },
+            &[],
+        )
+        .unwrap();
+        disabled.utilization.db_path = db_path.to_string_lossy().into_owned();
+        let mut enabled = disabled.clone();
+        enabled.utilization.enabled = true;
+        for (config, available) in [(enabled, true), (disabled, false)] {
+            let response = router(AppState::new(config))
+                .oneshot(local_request(
+                    Method::GET,
+                    "/client/utilization/series?hours=1",
+                    Body::empty(),
+                ))
+                .await
+                .unwrap();
+            let (status, body) = response_json(response).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["available"], available);
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
