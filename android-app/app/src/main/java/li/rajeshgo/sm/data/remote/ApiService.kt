@@ -94,6 +94,21 @@ interface ApiService {
     @GET("client/sessions/{session_id}")
     suspend fun getClientSession(@Path("session_id") sessionId: String): ClientSession
 
+    @GET("sessions/{session_id}/handoff-policy")
+    suspend fun getHandoffPolicy(@Path("session_id") sessionId: String): li.rajeshgo.sm.data.model.HandoffPolicy
+
+    @retrofit2.http.PUT("sessions/{session_id}/handoff-policy")
+    suspend fun setHandoffPolicy(
+        @Path("session_id") sessionId: String,
+        @Body patch: kotlinx.serialization.json.JsonObject,
+    ): li.rajeshgo.sm.data.model.HandoffPolicy
+
+    @GET("handoff-defaults")
+    suspend fun getHandoffDefaults(): li.rajeshgo.sm.data.model.HandoffDefaults
+
+    @retrofit2.http.PUT("handoff-defaults")
+    suspend fun setHandoffDefaults(@Body patch: kotlinx.serialization.json.JsonObject): li.rajeshgo.sm.data.model.HandoffDefaults
+
     @POST("client/sessions/{session_id}/attach-ticket")
     suspend fun createMobileAttachTicket(
         @Path("session_id") sessionId: String,

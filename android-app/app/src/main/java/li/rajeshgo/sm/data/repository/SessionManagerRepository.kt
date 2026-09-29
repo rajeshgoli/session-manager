@@ -281,6 +281,22 @@ class SessionManagerRepository(
         executeReadRequest(baseUrl, token) { it.getAnalyticsSummary() }
     }
 
+    suspend fun fetchHandoffPolicy(baseUrl: String, token: String, sessionId: String) = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getHandoffPolicy(sessionId) }
+    }
+
+    suspend fun setHandoffPolicy(baseUrl: String, token: String, sessionId: String, patch: kotlinx.serialization.json.JsonObject) = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).setHandoffPolicy(sessionId, patch) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun fetchHandoffDefaults(baseUrl: String, token: String) = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getHandoffDefaults() }
+    }
+
+    suspend fun setHandoffDefaults(baseUrl: String, token: String, patch: kotlinx.serialization.json.JsonObject) = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).setHandoffDefaults(patch) }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun retireSession(baseUrl: String, token: String, sessionId: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             val response = api(baseUrl, token).retireSession(sessionId)

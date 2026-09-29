@@ -113,6 +113,21 @@ class AndroidSmokeActivity : ComponentActivity() {
                 .put("mobile_terminal_supported_count", sessions.count { it.mobileTerminal?.supported == true })
         }
 
+        step("handoff_defaults") {
+            val defaults = sessionRepository.fetchHandoffDefaults(serverUrl, accessToken)
+            check(defaults.thresholdPercent > 0 && defaults.thresholdPercent <= 100)
+            JSONObject().put("provider_count", defaults.providers.size)
+                .put("threshold_percent", defaults.thresholdPercent)
+        }
+
+        step("handoff_policy") {
+            val session = sessions.firstOrNull { it.handoff != null }
+                ?: error("no session advertises handoff policy")
+            val policy = sessionRepository.fetchHandoffPolicy(serverUrl, accessToken, session.id)
+            check(policy.display.isNotBlank())
+            JSONObject().put("session_id", session.id).put("display", policy.display)
+        }
+
         step("analytics_summary") {
             val payload = sessionRepository.fetchAnalytics(serverUrl, accessToken)
             JSONObject()
