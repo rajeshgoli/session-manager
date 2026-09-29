@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1612 — Long-running docs: merge hold, the doc's agent, reviewing a merged doc, sm doc cat</title>
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;
+    --orange:     #eb6834;
+    --red:        #e34948;
+    --green:      #008300;
+    --violet:     #4a3aa7;
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  /* figures */
+  .fig text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: 12px; fill: var(--ink); }
+  .fig .dim { fill: var(--ink-2); font-size: 11px; }
+  .fig .lane { fill: var(--surface-2); stroke: var(--rule); }
+  .fig .pr { fill: var(--blue); }
+  .fig .prlong { fill: none; stroke: var(--blue); stroke-width: 10; }
+  .fig .hold { fill: var(--orange); }
+  .fig .merge { fill: var(--green); }
+  .fig .rev { fill: var(--violet); }
+  .fig .axis { stroke: var(--ink-3); stroke-width: 1; }
+  .fig .box { fill: var(--surface-2); stroke: var(--ink-3); }
+  .fig .boxlive { fill: var(--surface-2); stroke: var(--green); stroke-width: 2; }
+  .fig .arrow { stroke: var(--ink-2); stroke-width: 1.5; fill: none; marker-end: url(#ah); }
+  .fig .ahead { fill: var(--ink-2); }
+  /* session card mock */
+  .mock { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .8rem; border: 1px solid var(--ink-3); border-radius: 8px; background: var(--surface-2); padding: .5rem .7rem; display: flex; flex-wrap: wrap; gap: .35rem .9rem; align-items: center; }
+  .mock .t { font-weight: 700; }
+  .mock .chip { border: 1px solid var(--rule); border-radius: 999px; padding: .05rem .5rem; background: var(--surface); }
+  .mock .held { border-color: var(--orange); color: var(--orange); }
+  .mock .ok { color: var(--green); }
+  .mock .btn { border: 1px solid var(--ink-3); border-radius: 5px; padding: .1rem .5rem; background: var(--surface); }
+  .mock .btnp { border-color: var(--green); color: var(--green); font-weight: 700; }
+  .mock .sep { color: var(--ink-3); }
+  @media print {
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>1612 — Long-running docs: merge hold, the doc's agent, reviewing a merged doc, and <code>sm doc cat</code></h1>
+<p class="sans"><small>Author: sm-1612-spec-author <code>541d1e04</code> · Ticket #1612 · Revision 1 · 2026-09-28</small></p>
+
+<h2>Memo</h2>
+
+<p><b>Four small primitives let a document that changes for days or weeks, such as an iteration plan, live on one pull request (PR) that merges once at the end. You direct its agent from the doc itself.</b> None of the four is specific to plans:</p>
+<ol>
+  <li><b>Merge hold.</b> You, or an agent, put a hold on any PR. <code>sm</code> keeps it from merging until the hold is released, and tells the agents working on it.</li>
+  <li><b>The doc's agent, on the doc.</b> The reader's header shows which agent is working the doc: whether it is busy, how many turns it has run, how full its context is, and whether it has marked its task complete. A Retire button sits alongside.</li>
+  <li><b>Reviewing a merged or closed doc.</b> When the doc's PR is already merged, you still select text and comment. On Submit, <code>sm</code> opens a new PR from wherever the doc now lives, posts your review there, and wakes the doc's agent. If none is live, the existing <b>Assign to a new agent</b> button appears.</li>
+  <li><b><code>sm doc cat</code>.</b> Any agent prints a published doc, or any local HTML file, as Markdown in one command. The conversion is compiled into <code>sm</code>; nothing gets installed.</li>
+</ol>
+<p>Most of the machinery already exists. The doc reader already turns a selection into a GitHub review and wakes the agent. <code>sm</code> already knows which agent holds each PR, and already offers "Assign to a new agent" when the author has ended. This memo connects those pieces and adds one GitHub-side lock.</p>
+
+<h3>Terms</h3>
+<dl class="vocab">
+  <dt>Doc</dt><dd>A file an agent published for you with <code>sm doc publish</code>. <code>sm</code> stores where it is in git (repo, path, PR number, commit), never the file itself. You read it in the <b>reader</b>, the page at <code>sm.rajeshgo.li/docs/&lt;repo&gt;/&lt;path&gt;</code>, in a browser or the app.</dd>
+  <dt>Publish, revision</dt><dd>Each <code>sm doc publish</code> records one revision of the doc: the commit it was published at. The reader opens the latest revision.</dd>
+  <dt>Author</dt><dd>The agent that last published the doc. If it has ended, the next agent to publish becomes the author.</dd>
+  <dt>Claim</dt><dd>Existing (#1452). A record that one live agent is working a ticket or a PR, made by <code>sm ticket</code> or <code>sm pr</code>. It ends when the agent is retired or the PR closes.</dd>
+  <dt>Review wake</dt><dd>Existing. When you submit a review in the reader, <code>sm</code> posts it to GitHub and sends the agent a <code>[sm review]</code> message. If nobody can receive it, the reader offers <b>Assign to a new agent</b> (#1580), which starts a fresh agent with the review as its task.</dd>
+  <dt>Draft PR</dt><dd>A GitHub PR state meaning "not ready". GitHub refuses to merge a draft by any route, whether the web button, <code>gh pr merge</code> or the API.</dd>
+  <dt>Merge hold</dt><dd>New. A record in <code>sm</code> that a PR must not merge until whoever placed the hold, or you, releases it. It is enforced by making the PR a draft.</dd>
+  <dt>The doc's agent</dt><dd>New name for an existing idea: the live agent a review of this doc goes to. Today that is the author, or the author's parent if the author has ended. This memo adds one rule on top: the agent holding the claim on the doc's PR comes first.</dd>
+  <dt>Turn</dt><dd>One stretch of agent work, from a prompt or a delivered message until the agent goes idle.</dd>
+</dl>
+
+<h3>What goes wrong today</h3>
+<p>The iteration 7 plan (<code>fractal-algo-rust</code>, <code>docs/working/1746_iter7_plan.html</code>) went through four update PRs in 28 hours, each opened, reviewed, merged and cleaned up by an agent: #1756, #1793, #1806 and #1819. A feature PR, #1820, then edited the plan once more on the epic branch without republishing it. Three things follow:</p>
+<ul>
+  <li><b>Churn.</b> Every table update is a new branch, a new PR, a merge and a cleanup. Every future plan will do the same.</li>
+  <li><b>The doc goes read-only between updates.</b> Commenting needs an open PR. Once #1819 merged, the reader says "Read-only: PR merged", and the next round of comments has to wait until you ask an agent to open another PR.</li>
+  <li><b>You can't see the agent from the doc.</b> To know whether the agent that did the update is finished, or how full its context is, you leave the doc and find the agent in the app. To retire it, you do it by hand.</li>
+</ul>
+
+<figure>
+<svg class="fig" viewBox="0 0 760 190" role="img" aria-label="Today versus with a merge hold">
+  <text x="0" y="18" style="font-weight:700">Today: one PR per update</text>
+  <rect class="lane" x="0" y="26" width="760" height="44" rx="4"/>
+  <rect class="pr" x="40" y="38" width="70" height="20" rx="3"/><text x="44" y="52" style="fill:#fff">#1756</text>
+  <rect class="merge" x="110" y="38" width="6" height="20"/>
+  <rect class="pr" x="250" y="38" width="70" height="20" rx="3"/><text x="254" y="52" style="fill:#fff">#1793</text>
+  <rect class="merge" x="320" y="38" width="6" height="20"/>
+  <rect class="pr" x="470" y="38" width="70" height="20" rx="3"/><text x="474" y="52" style="fill:#fff">#1806</text>
+  <rect class="merge" x="540" y="38" width="6" height="20"/>
+  <rect class="pr" x="600" y="38" width="70" height="20" rx="3"/><text x="604" y="52" style="fill:#fff">#1819</text>
+  <rect class="merge" x="670" y="38" width="6" height="20"/>
+  <text class="dim" x="120" y="84">green = merge; the doc is read-only between one merge and the next PR</text>
+
+  <text x="0" y="116" style="font-weight:700">With a merge hold: one PR for the life of the plan</text>
+  <rect class="lane" x="0" y="124" width="760" height="44" rx="4"/>
+  <line class="prlong" x1="40" y1="146" x2="700" y2="146"/>
+  <rect class="hold" x="40" y="134" width="8" height="24"/><text class="dim" x="36" y="182">hold placed</text>
+  <circle class="rev" cx="160" cy="146" r="6"/><circle class="rev" cx="300" cy="146" r="6"/><circle class="rev" cx="420" cy="146" r="6"/><circle class="rev" cx="560" cy="146" r="6"/>
+  <text class="dim" x="250" y="182">violet = your review → agent pushes → republishes</text>
+  <rect class="hold" x="690" y="134" width="4" height="24"/><rect class="merge" x="700" y="134" width="8" height="24"/>
+  <text class="dim" x="640" y="182">release · squash</text>
+</svg>
+<figcaption>Figure 1. Top: the iteration 7 plan's update PRs from 27–28 September. Bottom: the same work on one held PR. The doc stays open for comments throughout, and one squash at the end carries the current record.</figcaption>
+</figure>
+
+<h3>1 · Merge hold</h3>
+<p><b>A hold is a fact <code>sm</code> records and enforces. It is not an instruction to agents.</b> Anyone can place one:</p>
+<ul>
+  <li>You: the <b>Hold merge</b> button in the doc header, or a checkbox on the review you are submitting.</li>
+  <li>An agent: <code>sm merge-hold &lt;PR&gt;</code>. For example, a spec waiting on your ruling.</li>
+</ul>
+<p>When a hold is placed, <code>sm</code> does three things:</p>
+<ol>
+  <li>It makes the PR a draft on GitHub, so nothing can merge it. I verified this on a throwaway PR: the merge API, <code>gh pr merge</code> and the GraphQL merge all refuse with "Pull Request is still a draft".</li>
+  <li>It tells the agent working the PR, in plain facts:<br>
+    <code>[sm hold] Merge hold on PR #1830 (fractal-algo-rust) requested by Rajesh: do not merge until released.</code><br>
+    If the hold rides on your review, this line goes inside the <code>[sm review]</code> message rather than as a separate message.</li>
+  <li>It shows the hold everywhere the PR shows: the reader header, the agent's claims in the app and <code>sm watch</code>, and the ticket history page. When the agent runs <code>sm task-complete</code>, <code>sm</code> lists the PR as <code>PR #1830 (merge hold by Rajesh)</code>. The agent can mark its task complete without merging, and you retire it.</li>
+</ol>
+<p>On release, <code>sm</code> takes the PR out of draft, if the hold is what put it there, and sends <code>[sm hold] Merge hold on PR #1830 (fractal-algo-rust) released by Rajesh.</code> What the agent does next is up to its brief. The message carries no instruction.</p>
+<p>Two guards keep the hold honest:</p>
+<ul>
+  <li>If anyone marks a held PR ready for review, <code>sm</code> puts it back to draft at its next regular check of open PRs (every five minutes by default, <code>work_claims.sync_interval_seconds</code>), and says so.</li>
+  <li>If a held PR merges anyway, for example before that check, <code>sm</code> tells whoever placed the hold.</li>
+</ul>
+<p>A manual Codex review (<code>sm request-codex-review</code>) still runs on a draft. I checked on a second throwaway PR and Codex posted its review. Codex's <i>automatic</i> reviews do skip drafts, but this setup asks for Codex reviews by hand.</p>
+<p>A hold ends when it is released, or when the PR closes or merges. Only two parties can release a hold: you, and the agent that placed it. An agent cannot lift your hold.</p>
+
+<h3>2 · The doc's agent, on the doc</h3>
+<p>The reader header gains one line, the <b>session card</b>:</p>
+<div class="mock" role="img" aria-label="Session card mock">
+  <span class="t">1746 — Iteration 7 plan</span><span class="sep">·</span><span>d2d566e</span><span class="sep">·</span><span>PR #1830</span>
+  <span class="chip held">⏸ merge hold · Rajesh</span>
+  <span class="sep">│</span>
+  <span class="t">sm-iter7-plan</span><span>● idle</span><span>14 turns</span><span>ctx 38%</span><span class="ok">✓ task complete 12m ago</span>
+  <span class="btn btnp">Retire</span><span class="btn">Release hold</span>
+</div>
+<p class="sans"><small>Figure 2. The session card in the reader header, with a held PR and an agent that has finished.</small></p>
+<ul>
+  <li><b>Which agent it shows:</b> the live agent holding the claim on the doc's PR. Failing that, today's rule applies: the author, or the author's parent if the author has ended. Reviews go to the same agent, so the card always names who will receive your next review. The claim rule matters when an agent takes over a PR (<code>sm pr</code>) before it republishes. Today your review would go to the old author's parent instead.</li>
+  <li><b>What it shows:</b> working or idle; turns run since the agent started; context used, as a percent; and "task complete" with its time once the agent runs <code>sm task-complete</code>. <code>sm</code> already records all of this except the turn count, which is a new counter.</li>
+  <li><b>Retire:</b> always available, highlighted once the agent has marked its task complete. Two taps, like Delete on a draft comment. It retires only the agent on the card; if a different agent has taken over since the page loaded, it refuses and refreshes.</li>
+  <li><b>No agent:</b> the card reads "No agent". Your next review is then undelivered, and the existing <b>Assign to a new agent</b> button starts one with the same kind of agent and model as the author, in the repo's checkout.</li>
+</ul>
+<p>The card rides on the check the reader already makes every 60 seconds for newer revisions, so it adds no new polling.</p>
+
+<h3>3 · Reviewing a merged or closed doc</h3>
+<p>The reader keeps commenting on when the doc's PR is no longer open. The Submit button says what will happen:</p>
+<table>
+<thead><tr><th style="width:22%">PR state</th><th>Submit becomes</th><th style="width:36%">What <code>sm</code> does</th></tr></thead>
+<tbody>
+<tr><td>Open</td><td>Submit (unchanged)</td><td>Posts the review; wakes the doc's agent.</td></tr>
+<tr><td>Closed, not merged</td><td><b>Reopen PR and submit</b></td><td>Reopens the same PR on GitHub, then as above. If the branch is gone, the doc stays read-only.</td></tr>
+<tr><td>Merged</td><td><b>Open PR and submit</b>, naming the branch, e.g. "from <code>epic/1746-iter7</code>"</td><td>Opens a new PR from wherever the doc now lives (below), republishes the doc on it, posts the review, and wakes the doc's agent. If nobody is live, you get the Assign button.</td></tr>
+</tbody>
+</table>
+<p><b>Where the doc now lives.</b> <code>sm</code> starts at the branch the doc's last PR merged into. It follows that branch's own merges for as long as the branch saw no new work after merging, and stops at the first branch still in use. That tip is the base for the new PR.</p>
+<p>It follows GitHub's PR records rather than git history. A squash merge leaves no ancestry, so asking git "which branch contains this commit" loses the doc after the first squash.</p>
+
+<figure>
+<svg class="fig" viewBox="0 0 760 120" role="img" aria-label="Following merges to find where the doc lives">
+  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path class="ahead" d="M0,0 L10,5 L0,10 z"/></marker></defs>
+  <rect class="box" x="0" y="30" width="140" height="44" rx="6"/><text x="12" y="50">doc PR #1819</text><text class="dim" x="12" y="66">merged</text>
+  <rect class="box" x="195" y="30" width="150" height="44" rx="6"/><text x="207" y="50">ticket branch</text><text class="dim" x="207" y="66">merged, no work since</text>
+  <rect class="boxlive" x="400" y="30" width="150" height="44" rx="6"/><text x="412" y="50">epic branch</text><text class="dim" x="412" y="66">new commits since → stop</text>
+  <rect class="box" x="605" y="30" width="150" height="44" rx="6"/><text x="617" y="50">main</text><text class="dim" x="617" y="66">not reached</text>
+  <path class="arrow" d="M140,52 L193,52"/><path class="arrow" d="M345,52 L398,52"/><path class="arrow" d="M550,52 L603,52" style="stroke-dasharray:4 4"/>
+  <text class="dim" x="150" y="100">follow while the branch is unchanged since it merged; stop at the first branch still in use</text>
+</svg>
+<figcaption>Figure 3. The new PR branches from the green box.</figcaption>
+</figure>
+
+<table>
+<thead><tr><th>What happened after the doc's PR merged</th><th>Path <code>sm</code> follows</th><th>New PR's base</th></tr></thead>
+<tbody>
+<tr><td>Merged into <code>main</code></td><td><code>main</code></td><td><code>main</code></td></tr>
+<tr><td>Merged into <code>epic</code>, which is still in use (the iteration 7 plan today)</td><td><code>epic/1746-iter7</code></td><td><code>epic/1746-iter7</code></td></tr>
+<tr><td>Merged into <code>ticket</code>; <code>ticket</code> merged into <code>epic</code></td><td><code>ticket</code> → <code>epic</code></td><td><code>epic</code></td></tr>
+<tr><td>Merged into <code>epic</code>; <code>epic</code> merged into <code>main</code> by an integration PR; no epic work since</td><td><code>epic</code> → <code>main</code></td><td><code>main</code></td></tr>
+<tr><td>Same, but <code>epic</code> kept getting commits</td><td><code>epic</code></td><td><code>epic</code>, which holds the newest state</td></tr>
+<tr><td>A branch merged into two places, or a branch deleted without a merged PR, or the doc missing at the tip</td><td>—</td><td>Refused with the reason. Your comments go to the doc's agent as a message instead.</td></tr>
+</tbody>
+</table>
+
+<p><b>What the agent receives.</b> GitHub accepts line and file comments only on files the PR changes. I verified that anything else fails silently. The new PR starts with one empty commit, because GitHub needs a commit to open a PR and <code>sm</code> must not edit your doc. So your comments go into the review's overall text as a numbered list, each quoting the text you selected. The agent works from the quotes, as it does today for any comment that can't sit on its line.</p>
+<p>If the doc at the new base differs from the revision you commented on, the message says so. On the iteration 7 plan it does today: #1820 edited the plan on the epic after its last publish.</p>
+<p><b>The doc follows onto the new PR.</b> Today a doc is keyed by repo, path and PR, so a new PR would start a second doc with its own history. Instead, when a doc's PR is merged or closed and a new PR publishes the same path, the existing doc moves to the new PR and keeps its revisions and reviews. Two PRs that are both open still make two docs, because they are genuinely different edits.</p>
+
+<h3>4 · <code>sm doc cat</code></h3>
+<p><code>sm doc cat &lt;doc or local path&gt;</code> prints the doc as Markdown. It takes a doc name or link (latest revision, or <code>--version</code>), or a local file, which covers unpublished specs. <code>--raw</code> prints the original. The reader's address also serves Markdown with <code>?format=markdown</code>, so agents on other machines get the same result.</p>
+<p><b>Converter: htmd, a Rust library compiled into <code>sm</code></b>, plus three house rules:</p>
+<ul>
+  <li><b>Diagrams.</b> Each SVG diagram becomes one line: its accessible name and its text labels, e.g. <code>[figure: Who reads whom in the iteration 7 run] Labels: ES 5-minute · 479 updates a pass · …</code>.</li>
+  <li><b>Definitions.</b> Definition terms become bold.</li>
+  <li><b>Tables.</b> Tables drop column padding.</li>
+</ul>
+<p>I tested three libraries on three real docs: the iteration 7 plan and memos #1452 and #1182.</p>
+<table>
+<thead><tr><th>Option</th><th>Result on the three docs</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td><b>htmd + house rules</b></td><td>67 / 78 / 113 KB of Markdown from 88 / 114 / 138 KB of HTML; about 3 ms each. Diagram labels readable; tables compact.</td><td><b>Use.</b> Adds about 20 small crates (the html5ever parser).</td></tr>
+<tr><td>htmd as shipped</td><td>Pads every table cell to the widest in its column. A 102 KB file is one-third spaces.</td><td>Fixed by the table rule.</td></tr>
+<tr><td>html-to-markdown-rs</td><td>Has a compact-table switch, but embeds each diagram as a base64 image even with image capture off, which is unreadable and expensive for an agent.</td><td>No. It also adds about 55 crates and needs a newer Rust than the repo's minimum.</td></tr>
+<tr><td>html2md (Rust)</td><td>Padded tables, right-aligned cells, stray <code>###</code> on headings.</td><td>No.</td></tr>
+<tr><td>pandoc, html2text, lynx</td><td>Not installed on the studio; each would be a system install on every machine that runs <code>sm</code>.</td><td>No.</td></tr>
+</tbody>
+</table>
+<p>Markdown is 16–33% smaller than the HTML, but size isn't the main gain. These memos are mostly prose, so the HTML was never mostly markup. The gain is that the whole doc reads in one command with its structure intact. My first pass at this design read memo #1452 by grepping its headings, and never saw the body.</p>
+
+<h3>How the iteration 7 plan runs with these</h3>
+<ol>
+  <li>The next time you comment on the plan, its PR (#1819) is merged. You select a row in section 9, write the change, tick "Hold merge until I release it", and press <b>Open PR and submit</b>, which names <code>epic/1746-iter7</code>.</li>
+  <li><code>sm</code> opens the PR, say #1830, makes it a draft under your hold, posts your review and wakes the plan's agent. If none is live, you tap <b>Assign to a new agent</b>.</li>
+  <li>The agent pushes to #1830 and republishes. The card shows it working, then idle with its turn count. You comment again as needed, and each round lands on the same PR.</li>
+  <li>When the agent marks its task complete, the card shows ✓ and you tap Retire. With no agent left, your next review offers Assign again, and the new agent lands on the same held PR.</li>
+  <li>When iteration 7 closes, you tap <b>Release hold</b>. The agent's brief, or you, merges #1830. One squash carries the final plan.</li>
+</ol>
+<p>Meanwhile, any agent running the plan reads the current version with <code>sm doc cat fractal-algo-rust/docs/working/1746_iter7_plan.html</code>, not a stale copy on its branch.</p>
+
+<h3>What I'm leaving out</h3>
+<ul>
+  <li><b>A separate "ask the agent" command.</b> Reviews already reach the doc's agent. With the PR held open, the existing review loop does the job.</li>
+  <li><b>Auto-retire on task complete.</b> The card makes retiring one tap, and the decision stays yours.</li>
+  <li><b>Chat inside the doc, or a plan-specific agent type.</b> Both would lock in today's workflow.</li>
+  <li><b>Docs published without a PR</b> (commit-only). They stay read-only. Nothing in them records which branch to open a PR from, and the agents that write them can open a PR themselves.</li>
+</ul>
+
+<h3>Decision surface</h3>
+<table>
+<thead><tr><th style="width:22%">Question</th><th>Recommendation</th><th style="width:32%">Why, in one line</th></tr></thead>
+<tbody>
+<tr><td>1. How does a hold stop a merge?</td><td><b>Make the PR a draft, and record the hold in <code>sm</code>.</b> Put it back to draft if anyone marks it ready.</td><td>The only lock GitHub enforces on this private repo. Branch protection needs a paid plan (checked: 403), and a label stops nothing.</td></tr>
+<tr><td>2. Who can release a hold?</td><td><b>You, for any hold; an agent, only for a hold it placed.</b></td><td>Otherwise an agent could lift your hold, and the lock would mean nothing.</td></tr>
+<tr><td>3. Reviewing a merged doc</td><td><b><code>sm</code> opens a PR from where the doc now lives, and your comments go into the review's overall text with their quotes.</b></td><td>No wait for an agent. Your comments couldn't sit on their lines anyway, because they were written against an older revision.</td></tr>
+<tr><td>4. Reviewing a closed, unmerged doc</td><td><b>Reopen the same PR.</b></td><td>The edits were never merged; the old PR is where they live.</td></tr>
+<tr><td>5. A doc and its next PR</td><td><b>The doc moves to the new PR once its old PR is merged or closed.</b></td><td>One history per doc; the header and card keep working.</td></tr>
+<tr><td>6. Who receives a review</td><td><b>The live agent holding the PR's claim, then today's author rule.</b></td><td>The agent that took over the PR is the one doing the work.</td></tr>
+<tr><td>7. Converter for <code>sm doc cat</code></td><td><b>htmd, compiled in, with the three house rules.</b></td><td>Readable diagrams, compact tables, smallest dependency cost, no install.</td></tr>
+<tr><td>8. What "turns" counts</td><td><b>Turns finished since the agent started.</b> It doesn't reset on <code>/clear</code>; context % already shows that.</td><td>It measures how much work this agent has done.</td></tr>
+<tr><td>9. Order of work</td><td><b><code>sm doc cat</code> and merge hold in parallel, then the session card, then reviewing a merged doc.</b></td><td>Smallest standalone wins first. The last two share the reader's code, so they run one after the other.</td></tr>
+</tbody>
+</table>
+
+<h3>Tickets</h3>
+<table>
+<thead><tr><th style="width:6%">#</th><th>Ticket</th><th style="width:22%">Seat</th><th style="width:22%">Depends on</th></tr></thead>
+<tbody>
+<tr><td>A</td><td><code>sm doc cat</code> and <code>?format=markdown</code>, with the converter and house rules (appendix E)</td><td>Opus, high</td><td>—</td></tr>
+<tr><td>B</td><td>Merge hold: storage, <code>sm merge-hold</code>, the API, GitHub draft handling, messages, drift guard, task-complete wording (appendix B)</td><td>Opus, high</td><td>—</td></tr>
+<tr><td>C</td><td>The doc's agent and the session card: the claim-first rule, turn counter, header card, Retire, hold controls in the reader (appendices C and B.7)</td><td>Opus, high</td><td>B</td></tr>
+<tr><td>D</td><td>Reviewing a merged or closed doc: finding where the doc lives, the empty-commit PR, the doc moving to the new PR, the review text, reopening (appendix D)</td><td>Opus, high</td><td>C</td></tr>
+</tbody>
+</table>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p>This is the first revision. The design follows our discussion of 28 September:</p>
+<ul>
+  <li>The separate "ask the agent" command is gone; reviews already carry the conversation.</li>
+  <li>Hold messages state facts with no instructions.</li>
+  <li><code>sm</code> opens the PR itself rather than waking an agent to do it.</li>
+  <li>The new PR's base follows the doc's merges rather than assuming <code>main</code>.</li>
+</ul>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<div class="toc">
+  <div><a href="#a">A. Existing machinery this builds on</a></div>
+  <div><a href="#b">B. Merge hold</a></div>
+  <div><a href="#c">C. The doc's agent and the session card</a></div>
+  <div><a href="#d">D. Reviewing a merged or closed doc</a></div>
+  <div><a href="#e">E. <code>sm doc cat</code></a></div>
+  <div><a href="#f">F. GitHub findings (verified 2026-09-28)</a></div>
+  <div><a href="#g">G. Requirement trace</a></div>
+  <div><a href="#h">H. Tickets in detail</a></div>
+  <div><a href="#z">Z. FAQ</a></div>
+</div>
+
+<h3 id="a">A. Existing machinery this builds on</h3>
+<table>
+<thead><tr><th>Piece</th><th>Where</th><th>What it does today</th></tr></thead>
+<tbody>
+<tr><td>Doc store</td><td><code>crates/sm-server/src/owner_docs.rs</code>; spec <code>specs/1447_owner_docs.md</code></td><td>Tables <code>owner_docs</code> (unique on repo, path, PR), <code>owner_doc_publishes</code>, <code>owner_doc_views</code>, <code>owner_doc_drafts</code>, <code>owner_doc_reviews</code>.</td></tr>
+<tr><td>Reader page and review client</td><td><code>owner_doc_render.rs</code>, <code>http/docs.rs</code>, <code>http/doc_client.js</code></td><td>Renders the file at a commit, injects the client (header bar, drafts, Submit panel), and polls <code>GET /docs/{id}/head</code> every 60 s. "Read-only: PR &lt;state&gt;" comes from <code>doc_client.js:186-189</code>.</td></tr>
+<tr><td>Review submission</td><td><code>http/docs/review.rs</code></td><td>GraphQL pending review; line threads, falling back to file threads; submits as COMMENT with the verdict in the body and the marker <code>&lt;!-- sm-review:&lt;id&gt; --&gt;</code>; idempotent through <code>submission_id</code>.</td></tr>
+<tr><td>Review recipient</td><td><code>review.rs:128</code> <code>review_wake_recipient</code> → <code>http/messages.rs:34</code> <code>live_recipient</code></td><td>The author if live, else the author's live parent, else none, in which case the review is "undelivered".</td></tr>
+<tr><td>Assign to a new agent</td><td><code>review.rs:662</code> <code>assign_review</code>; client <code>doc_client.js:253-261</code></td><td>For an undelivered latest review: starts a root session with the ended author's provider, model and effort, in the newest recorded checkout, with the review as its task.</td></tr>
+<tr><td>Claims</td><td><code>work_claims.rs</code>, <code>work_claims/checks.rs</code>, <code>http/claims.rs</code></td><td>Ticket and PR claims, a GitHub sync of tracked items every <code>work_claims.sync_interval</code> (at least 60 s), task-complete and idle checks (<code>checks.rs:170</code>, <code>:235</code>).</td></tr>
+<tr><td>Session state</td><td><code>sessions.rs</code></td><td><code>agent_task_completed_at</code>, set by <code>task_complete</code> (<code>:8438</code>) and cleared when a new prompt or tool use starts; the context percent comes from the context monitor (<code>http/watch.rs:195</code>); retirement goes through <code>POST /sessions/{id}/retire</code> (<code>http.rs:9767</code>).</td></tr>
+</tbody>
+</table>
+
+<h3 id="b">B. Merge hold</h3>
+
+<h4>B.1 Storage</h4>
+<p>This lives in the work-claims database, next to the PR items the sync already tracks. Follow that module's schema pattern (<code>init_work_claims_schema</code>).</p>
+<pre><code>CREATE TABLE merge_holds (
+  id TEXT PRIMARY KEY,                 -- 8 hex chars
+  repo TEXT NOT NULL,                  -- owner/name, canonical (canonical_repo)
+  pr INTEGER NOT NULL,
+  placed_by_session_id TEXT,           -- NULL = the owner
+  placed_by_name TEXT NOT NULL,        -- "Rajesh" or the session's display name at the time
+  reason TEXT,
+  made_draft INTEGER NOT NULL,         -- 1 if placing the hold converted the PR to draft
+  placed_at TEXT NOT NULL,
+  ended_at TEXT,
+  ended_by_session_id TEXT,            -- NULL with end_reason 'released' = the owner
+  ended_by_name TEXT,
+  end_reason TEXT                      -- released | pr_merged | pr_closed
+);
+CREATE UNIQUE INDEX merge_holds_active ON merge_holds(repo, pr) WHERE ended_at IS NULL;</code></pre>
+<p>Every change also appends to the claims <code>events</code> table: <code>hold.placed</code>, <code>hold.released</code>, <code>hold.ended</code> and <code>hold.redrafted</code>, with <code>{by, reason}</code> as the payload. That puts holds on the ticket and PR history page (<code>/t/&lt;repo&gt;/&lt;N&gt;</code>) with no further work.</p>
+
+<h4>B.2 Who is acting</h4>
+<ul>
+  <li>A request carrying <code>requester_session_id</code> (every CLI call from an agent, via <code>CLAUDE_SESSION_MANAGER_ID</code>) acts as that session.</li>
+  <li>A request from the reader, the app, or the CLI with no session id, run by the owner at the studio, acts as <b>the owner</b>. Its display name is <code>config.owner_name</code>.</li>
+</ul>
+<table>
+<thead><tr><th>Action</th><th>Owner</th><th>A session</th></tr></thead>
+<tbody>
+<tr><td>Place a hold on an open PR</td><td>Yes</td><td>Yes</td></tr>
+<tr><td>Release a hold the owner placed</td><td>Yes</td><td>No: 403 "Merge hold on PR #N was placed by Rajesh; only Rajesh can release it."</td></tr>
+<tr><td>Release a hold a session placed</td><td>Yes</td><td>Only that same session. Any other gets 403 "… placed by &lt;name&gt;; only &lt;name&gt; or Rajesh can release it."</td></tr>
+</tbody>
+</table>
+
+<h4>B.3 Placing a hold</h4>
+<ol>
+  <li>Fetch the PR (<code>gh pr view N --repo R --json state,isDraft,id,headRefOid</code>, through the existing <code>gh</code> helper). Not found → 404 "PR #N not found in R". Merged or closed → 409 "PR #N is &lt;state&gt;".</li>
+  <li>If an active hold exists, return it with <code>already_held: true</code>. This does nothing else: no GitHub call and no message.</li>
+  <li>If the PR is not a draft, run <code>convertPullRequestToDraft(input:{pullRequestId})</code> and set <code>made_draft = 1</code>. If it is already a draft, set <code>made_draft = 0</code>.</li>
+  <li>Insert the row and the event, and send the placed message (B.5) in one transaction after the GitHub call succeeds. If GitHub fails, write no row and return 502 with GitHub's error.</li>
+</ol>
+
+<h4>B.4 Releasing a hold</h4>
+<ol>
+  <li>Check authority (B.2). No active hold → 404 "No merge hold on PR #N".</li>
+  <li>If <code>made_draft = 1</code> and the PR is open and still a draft, run <code>markPullRequestReadyForReview</code>. If <code>made_draft = 0</code>, leave the draft alone: someone else made it a draft for their own reasons.</li>
+  <li>End the row with <code>end_reason = released</code>, write the event, and send the released message.</li>
+</ol>
+<p>If the ready-for-review call fails, the release still ends the hold. The reply includes <code>warning: "PR is still a draft: &lt;error&gt;"</code>, because a hold that cannot be released is worse than a draft someone has to un-draft by hand.</p>
+
+<h4>B.5 Messages</h4>
+<p>Messages go out on the normal durable <code>sm send</code> path, as <code>[sm hold]</code>. They state facts and carry no instruction.</p>
+<table>
+<thead><tr><th>Event</th><th>Text</th></tr></thead>
+<tbody>
+<tr><td>Placed</td><td><code>[sm hold] Merge hold on PR #1830 (fractal-algo-rust) requested by Rajesh: do not merge until released.</code> Adds <code>Reason: …</code> on a second line when one is given.</td></tr>
+<tr><td>Released</td><td><code>[sm hold] Merge hold on PR #1830 (fractal-algo-rust) released by Rajesh.</code></td></tr>
+<tr><td>Marked ready while held</td><td><code>[sm hold] PR #1830 (fractal-algo-rust) was marked ready for review while a merge hold by Rajesh is in place; sm returned it to draft.</code></td></tr>
+<tr><td>Merged while held</td><td><code>[sm hold] PR #1830 (fractal-algo-rust) merged while a merge hold by Rajesh was in place.</code></td></tr>
+</tbody>
+</table>
+<p><b>Recipients</b> of placed, released and marked-ready messages:</p>
+<ul>
+  <li>the live holder of an active claim on the PR, if there is one; otherwise</li>
+  <li>for each doc on that PR, the doc's agent (appendix C.1).</li>
+</ul>
+<p>Two exceptions:</p>
+<ul>
+  <li>The acting session never receives its own event.</li>
+  <li>A hold placed with a review submission (B.7) sends no separate message. Its line goes inside the <code>[sm review]</code> message.</li>
+</ul>
+<p>The merged-while-held message goes to whoever placed the hold. If you placed it, it goes to your inbox through the owner-message path (<code>sm send rajesh</code>, #1580).</p>
+<p>Repo in messages is the repo name without the owner, as in doc URLs.</p>
+
+<h4>B.6 Drift guard and lifecycle</h4>
+<ul>
+  <li>Every PR with an active hold is a tracked item for the claims sync, even with no claim on it. Add it in <code>tracked_items</code>.</li>
+  <li>Add <code>isDraft</code> to the PR fields in <code>ITEM_FRAGMENT</code> (<code>work_claims.rs:303</code>) and to the stored item.</li>
+  <li>On each sync, for each active hold:
+    <ul>
+      <li>The PR is open and not a draft: convert it to draft, write <code>hold.redrafted</code>, and send the marked-ready message.</li>
+      <li>The PR merged: end the hold with <code>pr_merged</code>, and send the merged-while-held message.</li>
+      <li>The PR closed: end the hold with <code>pr_closed</code>. No message.</li>
+    </ul>
+  </li>
+  <li>The window between someone marking the PR ready and the next sync is at most one sync interval, five minutes by default. That is accepted (appendix Z).</li>
+</ul>
+
+<h4>B.7 Surfaces</h4>
+<table>
+<thead><tr><th>Surface</th><th>Behaviour</th></tr></thead>
+<tbody>
+<tr><td>CLI</td><td><code>sm merge-hold &lt;N&gt; [--repo R] [--reason "…"]</code> places a hold. <code>sm merge-hold --release &lt;N&gt; [--repo R]</code> releases one. <code>sm merge-hold [--json]</code> lists active holds in every repo. The <code>--repo</code> rules match <code>sm pr</code> (the cwd's repo by default; a bare name takes the cwd's owner). Output: <code>Merge hold on PR #1830 (fractal-algo-rust) placed; the PR is now a draft.</code> / <code>… already held by Rajesh since 2026-09-28 14:02.</code> / <code>… released; the PR is ready for review again.</code></td></tr>
+<tr><td>HTTP</td><td><code>GET /merge-holds[?repo=R]</code> → <code>{holds:[{repo, pr, placed_by, reason, placed_at, made_draft}]}</code>. <code>POST /merge-holds {repo, pr, reason?, requester_session_id?}</code>. <code>POST /merge-holds/release {repo, pr, requester_session_id?}</code>. Normal auth.</td></tr>
+<tr><td>Reader</td><td><code>POST</code> and <code>DELETE /docs/{id}/merge-hold</code> act on the doc's PR, as the owner, and accept the doc token (<code>X-SM-Doc-Token</code>). The header shows the chip <code>⏸ merge hold · &lt;placed_by&gt;</code> when held, and a <b>Hold merge</b> or <b>Release hold</b> button while the PR is open. Release is shown only when the owner may release, which is always the case for the owner. The Submit panel gains a checkbox, <b>Hold merge until I release it</b>, sent as <code>hold: true</code> with the review. The server places the hold before posting, and the <code>[sm review]</code> wake gains the placed line (B.5). An existing hold makes the checkbox show as checked and disabled.</td></tr>
+<tr><td><code>GET /docs/{id}/head</code></td><td>Adds <code>merge_hold: {placed_by, placed_at, reason} | null</code>.</td></tr>
+<tr><td>Session projections</td><td>Each PR claim entry in <code>/session-obligations</code> and the watch projection gains <code>merge_hold</code> (same shape). Android and web watch show a ⏸ chip on that PR row. <code>sm watch</code> appends <code>⏸</code> to the PR.</td></tr>
+<tr><td>Task-complete and idle checks</td><td>In the held-work list (<code>checks.rs:170</code>, <code>:235</code>), a held PR prints as <code>PR #1830 (merge hold by Rajesh)</code>. Nothing else in those messages changes.</td></tr>
+</tbody>
+</table>
+
+<h4>B.8 Examples</h4>
+<table>
+<thead><tr><th>Situation</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>You tap Hold merge on a doc whose PR #1830 is open and not a draft</td><td>#1830 becomes a draft (<code>made_draft=1</code>); the claim holder gets the placed message; the chip appears.</td></tr>
+<tr><td><code>sm-1813-engineer</code> runs <code>sm merge-hold 1814 --reason "waiting on the 150-frame ruling"</code></td><td>#1814 becomes a draft; the placed message names <code>sm-1813-engineer</code> and carries the reason; the engineer itself gets no message.</td></tr>
+<tr><td><code>sm-1813-engineer</code> runs <code>sm merge-hold --release 1830</code> (your hold)</td><td>403; the hold stands.</td></tr>
+<tr><td>An agent runs <code>gh pr ready 1830</code> while held</td><td>At the next sync: back to draft, <code>hold.redrafted</code>, and the marked-ready message.</td></tr>
+<tr><td>Hold placed on a PR that was already a draft; later released</td><td>The draft stays a draft (<code>made_draft=0</code>).</td></tr>
+<tr><td>A held PR is closed</td><td>The hold ends with <code>pr_closed</code>; no message.</td></tr>
+</tbody>
+</table>
+
+<h4>B.9 Tests</h4>
+<ul>
+  <li>Store: one active hold per PR; ending sets every end field; events written.</li>
+  <li>Authority table B.2, all six cells.</li>
+  <li>Place and release with a fake <code>gh</code> recording the mutations: draft only when not already a draft; ready only when <code>made_draft=1</code>; a GitHub failure leaves no row.</li>
+  <li>Sync: marked-ready redrafts and messages; merged ends and messages the placer; closed ends silently; a held, unclaimed PR is tracked.</li>
+  <li>Message recipients: claim holder first; the doc's agent otherwise; never the actor; the review-borne hold sends no separate message.</li>
+  <li>Task-complete check text for a held PR.</li>
+  <li>CLI argument parsing and output lines.</li>
+</ul>
+
+<h3 id="c">C. The doc's agent and the session card</h3>
+
+<h4>C.1 Which agent</h4>
+<p>Replace the body of <code>review_wake_recipient</code> (<code>review.rs:128</code>) with this, first match wins:</p>
+<ol>
+  <li>The doc has a PR, and a live session holds an active claim on (repo, PR) in the claims store: that session.</li>
+  <li><code>live_recipient(author)</code> as today: the author if it hasn't ended, else its live parent.</li>
+  <li>None.</li>
+</ol>
+<p>Every place that asks "who receives this doc's review" uses this one function: the review wake, <code>assign_review</code>'s "the doc has an agent again" check, the undelivered state, and the session card. The card can therefore never name a different agent from the one that receives the review.</p>
+<p>Example: <code>1797-revision</code> published the plan and was retired, and <code>sm-plan-2</code> checked out the PR and ran <code>sm pr 1830</code> but hasn't republished yet. Today the review goes to <code>1797-revision</code>'s parent. Under C.1 it goes to <code>sm-plan-2</code>.</p>
+
+<h4>C.2 Turn counter</h4>
+<p>Add <code>turns_completed</code>, an integer defaulting to 0, to the session record. Increment it on the event that already marks a turn finished:</p>
+<ul>
+  <li>the Claude <code>Stop</code> hook;</li>
+  <li>the codex-fork <code>turn_complete</code> event (<code>sessions.rs:7735</code>).</li>
+</ul>
+<p>Rules:</p>
+<ul>
+  <li>Never reset it: not on clear, not on handoff, not on restore.</li>
+  <li>A provider with no turn-end signal reports <code>null</code>, and the card shows "—".</li>
+  <li>Duplicate <code>Stop</code> deliveries for one turn must not double count. Use the same de-duplication the idle transition uses.</li>
+</ul>
+
+<h4>C.3 Card data</h4>
+<p><code>GET /docs/{id}/head</code> adds <code>agent</code>, and the initial page config carries the same object:</p>
+<pre><code>"agent": {
+  "session_id": "4090858d",
+  "name": "sm-iter7-plan",
+  "via": "claim" | "author" | "parent",
+  "state": "working" | "idle" | "waiting" | "stopped",   // from activity_state, as sm watch shows it
+  "turns": 14 | null,
+  "context_percent": 38 | null,
+  "task_completed_at": "2026-09-28T22:40:11Z" | null
+} | null</code></pre>
+
+<h4>C.4 Card rendering</h4>
+<ul>
+  <li>The card sits in the existing header bar, after the PR link and hold chip. Order: <code>name · ● state · N turns · ctx P% · ✓ task complete &lt;relative&gt;</code>. Omit a field that is null, except turns, which shows "—".</li>
+  <li><b>Retire</b> is always shown when <code>agent</code> is non-null. The first tap changes the button to <b>Tap again to retire</b> for 4 s; the second tap sends <code>POST /docs/{id}/agent/retire {session_id}</code>. When <code>task_completed_at</code> is set, the button uses the primary style.</li>
+  <li>When <code>agent</code> is null, show "No agent". The undelivered-review banner and <b>Assign to a new agent</b> behave as today.</li>
+  <li>The card refreshes from each <code>/head</code> reply every 60 s, and immediately after Submit, Assign, Retire, Hold or Release.</li>
+</ul>
+
+<h4>C.5 Retire from the reader</h4>
+<p><code>POST /docs/{id}/agent/retire {session_id}</code> accepts normal auth or the doc token.</p>
+<ul>
+  <li>If <code>session_id</code> is not the doc's current agent (C.1): 409 "The doc's agent changed; reload".</li>
+  <li>Otherwise, retire through the same code as <code>POST /sessions/{id}/retire</code>, acting as the owner.</li>
+</ul>
+<p>This route keeps the doc token's scope to "act on this doc's agent", rather than letting the doc page retire any session.</p>
+
+<h4>C.6 Tests</h4>
+<ul>
+  <li>Recipient order: claim over live author; live author with no claim; ended author with a live parent; none.</li>
+  <li>Turn counter: increments per Stop; a duplicate Stop is not counted; codex-fork turn_complete counts; unchanged across clear and restore.</li>
+  <li><code>/head</code> agent object for each <code>via</code>; null when no agent.</li>
+  <li>Retire route: the right session is retired; a stale <code>session_id</code> gets 409; the doc token is accepted; a token for another doc is rejected.</li>
+  <li>Client: two-tap confirm; primary style when task complete; "No agent" with and without an undelivered review.</li>
+</ul>
+
+<h3 id="d">D. Reviewing a merged or closed doc</h3>
+
+<h4>D.1 When it applies</h4>
+<p>The doc has a PR and the PR's state is merged or closed. Commit-only docs (no PR) are out of scope and stay read-only. In the reader:</p>
+<ul>
+  <li><code>canComment</code> is true for merged and closed PR docs, so drafts work as for an open PR.</li>
+  <li>The header reads <code>PR merged — commenting opens a new PR</code> or <code>PR closed — commenting reopens it</code>.</li>
+  <li>When the Submit panel opens, it calls <code>GET /docs/{id}/reopen-target</code> (D.2). The button reads <b>Open PR from &lt;branch&gt; and submit</b> or <b>Reopen PR #N and submit</b>. On a refusal, the button is disabled and the reason is shown.</li>
+</ul>
+
+<h4>D.2 Finding the base (merged PR)</h4>
+<p>Inputs: the doc's repo, path and PR number <code>P</code>. It uses GitHub's PR records only, never local git.</p>
+<pre><code>B := baseRefName of P
+visited := {}
+loop (at most 10 steps):
+  if B in visited: refuse "merge history loops at &lt;B&gt;"
+  visited += B
+  merged := PRs with headRefName = B, state MERGED, mergedAt after the previous step's merge
+  open   := PRs with headRefName = B, state OPEN
+  tip    := current commit of refs/heads/B, or none if the branch is deleted
+  if open is non-empty: stop at B                      # still in use
+  if merged is empty:
+     if tip is none: refuse "&lt;B&gt; was deleted without a merged PR"
+     stop at B                                          # never merged onward
+  if len(merged) > 1: refuse "&lt;B&gt; merged into more than one branch (#x, #y)"
+  M := the one merged PR
+  if tip is not none and tip != M.headRefOid: stop at B # new commits after merging
+  B := M.baseRefName                                    # fully merged onward; follow
+if the loop ends without stopping: refuse "merge history is longer than 10 steps"
+then: the doc must exist at B's tip (contents API); else refuse "&lt;path&gt; is not on &lt;B&gt;"</code></pre>
+<p>GraphQL for one step (the verified shape):</p>
+<pre><code>repository(owner:$o, name:$n) {
+  pullRequests(headRefName:$b, first:10, states:[MERGED, OPEN]) {
+    nodes { number state baseRefName headRefOid mergedAt } }
+  ref(qualifiedName: "refs/heads/$b") { target { oid } } }</code></pre>
+<p>The result also returns <code>tip_sha</code> and whether the file's blob at the tip equals the latest publish's blob (<code>doc_changed</code>).</p>
+<p><code>GET /docs/{id}/reopen-target</code> returns one of three shapes:</p>
+<ul>
+  <li><code>{kind:"new_pr", base, tip_sha, doc_changed}</code></li>
+  <li><code>{kind:"reopen", pr}</code></li>
+  <li><code>{kind:"refused", reason}</code></li>
+</ul>
+<p>Cache it for 30 s per doc. Worked example, the iteration 7 plan on 2026-09-28:</p>
+<ul>
+  <li>PR #1819's base is <code>epic/1746-iter7</code>.</li>
+  <li>No PR has that branch as its head, so the rule stops at <code>epic/1746-iter7</code>, whose tip is <code>fc37cdc</code>.</li>
+  <li>The plan's blob there is <code>acfbe98</code>; the last publish is <code>f021e04</code>. So <code>doc_changed = true</code>, because #1820 edited the plan.</li>
+</ul>
+
+<h4>D.3 Closed, not merged</h4>
+<p>If the PR's head branch still exists, return <code>{kind:"reopen", pr}</code>, and on submit run <code>gh pr reopen</code> before the normal flow. If the branch was deleted, return refused with "PR #N is closed and its branch was deleted".</p>
+
+<h4>D.4 Submitting (merged)</h4>
+<p>This extends <code>POST /docs/{id}/review</code>. The body is unchanged, plus <code>hold</code> (B.7). The existing <code>submission_id</code> idempotency covers every step. Each step first checks whether it already happened, so a retry or crash recovery resumes rather than repeats.</p>
+<ol>
+  <li><b>Resolve the base</b> (D.2). Store <code>target_base</code> and <code>target_tip</code> on the review row. A refusal fails the submit with the reason and keeps the drafts.</li>
+  <li><b>Create the branch.</b> Name it <code>sm-doc/&lt;file stem&gt;-&lt;first 8 of submission_id&gt;</code>, e.g. <code>sm-doc/1746_iter7_plan-3f2a91c0</code>. If it already exists, reuse it. Otherwise create one commit with parent <code>target_tip</code>, the tip's own tree (no file changes), and the message <code>Open &lt;path&gt; for review</code>, then create the branch at that commit.</li>
+  <li><b>Open the PR.</b> If an open PR already has this head, reuse it. Otherwise create it with base <code>target_base</code>, title <code>(Docs) &lt;doc title&gt;: review</code>, and body <code>sm opened this PR for Rajesh's review of &lt;path&gt;, from &lt;base&gt; at &lt;sha7&gt;.</code> Store <code>target_pr</code>.</li>
+  <li><b>Place the hold</b> if <code>hold: true</code> (B.3).</li>
+  <li><b>Publish the doc on the new PR</b> at its head commit, with the author unchanged. This triggers the doc move (D.5).</li>
+  <li><b>Post the review</b> with the existing pending-review flow, but add no threads (F.2). The body:
+<pre><code>**Verdict: Changes requested**
+
+&lt;your overall text&gt;
+
+Comments on docs/working/1746_iter7_plan.html, written against d2d566e:
+
+1. &gt; &lt;quote 1&gt;
+
+   &lt;comment 1&gt;
+
+2. &gt; &lt;quote 2&gt;
+
+   &lt;comment 2&gt;
+
+&lt;!-- sm-review:&lt;submission_id&gt; --&gt;</code></pre>
+    Count every draft as a file comment. The row records <code>line_comment_count = 0</code> and <code>file_comment_count = N</code>.</li>
+  <li><b>Wake</b> the doc's agent (C.1) as today. The <code>[sm review]</code> message gains lines:
+<pre><code>[sm review] Rajesh's review of "1746 — Iteration 7 plan" (PR #1830 @ 1a2b3c4) is here: &lt;url&gt;
+Verdict: changes requested · 4 comments in the review text
+sm opened PR #1830 from epic/1746-iter7 for this review.
+The doc on epic/1746-iter7 differs from the revision reviewed (d2d566e).
+Merge hold on PR #1830 requested by Rajesh: do not merge until released.</code></pre>
+    Include the "differs" line only when <code>doc_changed</code> is true, and the hold line only when a hold was placed. With no recipient, the review is undelivered and Assign works as today; its task text names the new PR.</li>
+</ol>
+<p>Drafts are tied to the old commit. Submitting posts every draft on that commit, as today.</p>
+
+<h4>D.5 A doc moving to its next PR</h4>
+<p>At publish time, for (repo, path, PR <code>N</code>) with no existing doc for that key: look up the most recently updated doc for (repo, path) with a non-null PR <code>M</code>.</p>
+<ul>
+  <li><b>Move it</b> if <code>M</code>'s PR is merged or closed: set <code>pr_number = N</code> on that doc and keep its id, publishes, views and reviews.</li>
+  <li>Otherwise (none exists, or <code>M</code> is open), create a new doc as today.</li>
+</ul>
+<p>Mechanics:</p>
+<ul>
+  <li>Add <code>pr_number</code> to <code>owner_doc_publishes</code>, and backfill existing rows from their doc, so each revision remembers the PR it was published on. The revision picker shows <code>#N</code> next to each revision when a doc spans more than one PR.</li>
+  <li>The author rule is unchanged.</li>
+  <li>A <code>sm doc publish --pr N</code> by an agent triggers the same move, so an agent that opens its own next PR gets it too.</li>
+</ul>
+<p>Examples:</p>
+<table>
+<thead><tr><th>Before</th><th>Publish</th><th>After</th></tr></thead>
+<tbody>
+<tr><td>Doc on #1819 (merged)</td><td>path on #1830</td><td>Same doc, now #1830; the revision picker lists revisions from #1819 and #1830.</td></tr>
+<tr><td>Doc on #1819 (open)</td><td>path on #1830</td><td>Two docs; the readable URL shows the newest publish, as today.</td></tr>
+<tr><td>No PR doc; a commit-only doc</td><td>path on #1830</td><td>New PR doc; the commit-only doc is untouched.</td></tr>
+</tbody>
+</table>
+
+<h4>D.6 Tests</h4>
+<ul>
+  <li>Base resolution against a fake GitHub: every row of the memo's table, plus the loop, over-10-steps and deleted-branch refusals, and the doc missing at the tip.</li>
+  <li>Merged submit end to end with a fake <code>gh</code>: branch, empty commit, PR, publish, review body and wake text. Crash after each step, then retry: no second branch, PR, publish or review.</li>
+  <li>Closed PR: reopen, then the normal flow; deleted branch refused.</li>
+  <li>Doc move: the three example rows; <code>pr_number</code> per publish; the picker label.</li>
+  <li>Client: header text per state; the button label from reopen-target; disabled with the reason on refusal.</li>
+</ul>
+
+<h3 id="e">E. <code>sm doc cat</code></h3>
+
+<h4>E.1 CLI</h4>
+<pre><code>sm doc cat &lt;doc | path&gt; [--version SHA] [--raw]</code></pre>
+<p>How the argument resolves, first match wins:</p>
+<ol>
+  <li>It starts with <code>http://</code> or <code>https://</code>: a doc URL, parsed as the other <code>sm doc</code> commands parse one.</li>
+  <li>A file exists at that path, relative to the cwd: a local file, converted in the CLI process, with no server call.</li>
+  <li>Otherwise: a doc name, <code>&lt;repo-name&gt;/&lt;path in repo&gt;</code>.</li>
+</ol>
+<p>Options and output:</p>
+<ul>
+  <li><code>--version</code> is only valid for docs; with a local file it fails with "--version needs a published doc".</li>
+  <li>Output goes to stdout. <code>.html</code> and <code>.htm</code> are converted (E.3). Anything else prints as stored. <code>--raw</code> prints the stored bytes for any type.</li>
+  <li>Exit status 1 with a message on "Doc not found", "Version not found" or a conversion error.</li>
+</ul>
+
+<h4>E.2 Server</h4>
+<p><code>GET /docs/&lt;repo-name&gt;/&lt;path&gt;?format=markdown[&amp;version=…]</code> returns <code>text/markdown; charset=utf-8</code>. It uses the same resolution as the readable URL (latest publish, or the version), the same auth, and the same content cache. The CLI uses it for docs, so agents on remote nodes need no local checkout. <code>format=raw</code> returns the stored bytes. It never records a view, because a view means Rajesh read it.</p>
+
+<h4>E.3 Conversion rules</h4>
+<p>Put the conversion in one module (for example <code>crates/sm-server/src/doc_markdown.rs</code>) that both the server and the CLI call. Use <code>htmd = "0.5.5"</code>. Its edition 2024 needs Rust 1.85, within the repo's 1.86.</p>
+<table>
+<thead><tr><th>Rule</th><th>Behaviour</th><th>Example</th></tr></thead>
+<tbody>
+<tr><td>R1 Drop</td><td><code>script</code>, <code>style</code>, <code>head</code> and their contents.</td><td>The memo stylesheet and dark-mode script vanish; the <code>h1</code> carries the title.</td></tr>
+<tr><td>R2 Diagrams</td><td>Each <code>svg</code> becomes its own paragraph: <code>[figure: NAME]</code>, plus <code> Labels: a · b · c</code> when it has text. NAME is the <code>aria-label</code>, else its first <code>title</code> child's text, else <code>untitled</code>. Labels are the text of each <code>text</code> element in document order, with whitespace collapsed and blank ones dropped.</td><td><code>[figure: Who reads whom in the iteration 7 run] Labels: Traded views: read each other · ES 5-minute · 479 updates a pass · …</code></td></tr>
+<tr><td>R3 Definitions</td><td><code>dt</code> becomes a paragraph <code>**term**</code>; <code>dd</code> becomes a paragraph.</td><td><code>**Claim**</code> then its definition.</td></tr>
+<tr><td>R4 Tables</td><td>No column padding. Rows are <code>| a | b |</code>, cells trimmed; the separator is <code>| --- | --- |</code>; escaped pipes <code>\|</code> inside cells are preserved; lines inside fenced code blocks are untouched.</td><td><code>| #1807 · Price precision fix (#1791 option b) | Running | — | … |</code></td></tr>
+<tr><td>R5 Everything else</td><td>htmd defaults: ATX headings, fenced code blocks, <code>*</code> bullets, inline links.</td><td>—</td></tr>
+</tbody>
+</table>
+<p>The prototype below is what produced the measurements in the memo: htmd with handlers for <code>svg</code> and <code>dt</code>, <code>skip_tags</code> for R1, and a line pass for R4. Treat it as a reference, not code to paste; tests (E.5) are the contract.</p>
+<pre><code>HtmlToMarkdown::builder()
+    .skip_tags(vec!["script", "style", "head"])
+    .add_handler(vec!["svg"], |_h: &amp;dyn Handlers, el: Element| {
+        // walk el.node: collect &lt;text&gt; contents (labels) and the first &lt;title&gt;
+        // name = aria-label | title | "untitled"
+        Some(format!("\n\n[figure: {name}]{labels}\n\n").into())
+    })
+    .add_handler(vec!["dt"], |h: &amp;dyn Handlers, el: Element| {
+        let inner = h.walk_children(el.node).content;
+        Some(format!("\n\n**{}**\n", inner.trim()).into())
+    })
+    .build()
+    .convert(html)
+// then: for each line outside ``` fences that starts with '|', split on unescaped
+// '|', trim cells, write "| a | b |"; an all-dash/colon row becomes "| --- | --- |".</code></pre>
+
+<h4>E.4 Measurements (2026-09-28, release build, Apple silicon)</h4>
+<table>
+<thead><tr><th>Doc</th><th>HTML</th><th>htmd + rules</th><th>htmd as shipped</th><th>html-to-markdown-rs (compact)</th><th>html2md</th></tr></thead>
+<tbody>
+<tr><td>iteration 7 plan</td><td>88 KB</td><td>67 KB, 2.2 ms</td><td>102 KB</td><td>74 KB + 2 base64 images</td><td>109 KB</td></tr>
+<tr><td>#1452 memo</td><td>114 KB</td><td>78 KB, 2.8 ms</td><td>104 KB</td><td>82 KB + 1 base64 image</td><td>116 KB</td></tr>
+<tr><td>#1182 memo</td><td>138 KB</td><td>113 KB, 3.3 ms</td><td>142 KB</td><td>113 KB</td><td>144 KB</td></tr>
+</tbody>
+</table>
+<p>For scale, the visible text alone (outside <code>style</code>, <code>script</code> and <code>svg</code>) is 63, 72 and 104 KB. These docs are mostly prose. Dependencies new to sm-server: htmd brings 20 crates (the html5ever and phf stack); html-to-markdown-rs brings 55 (adding regex, url/idna and the ICU Unicode tables) and needs Rust 1.88.</p>
+
+<h4>E.5 Tests</h4>
+<ul>
+  <li>One fixture per rule, R1–R4, including an <code>svg</code> with an <code>aria-label</code>, one with only a <code>title</code>, one with neither, and one with no text; a table with an escaped pipe; a table-like line inside a code fence.</li>
+  <li>A golden test on a trimmed copy of <code>docs/memo_template.html</code>.</li>
+  <li>CLI resolution order (URL, then existing file, then doc name); <code>--version</code> with a local file fails; <code>--raw</code>; a Markdown doc prints unchanged.</li>
+  <li>Server <code>format=markdown</code>/<code>raw</code>: content type, version selection, and no view recorded.</li>
+</ul>
+
+<h3 id="f">F. GitHub findings (verified 2026-09-28)</h3>
+<p>These were checked on the throwaway PRs #1614 and #1615 in this repo, both closed and their branches deleted, and with read-only calls on <code>fractal-algo-rust</code>.</p>
+<table>
+<thead><tr><th>#</th><th>Check</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>F.1</td><td>Open a PR whose only commit is empty: same tree as its parent, made through the git data API.</td><td><b>Works.</b> #1614 opened with <code>changedFiles: 0</code>.</td></tr>
+<tr><td>F.2</td><td>In a pending review on that PR, <code>addPullRequestReviewThread</code> with <code>subjectType: FILE</code>, and with <code>LINE</code>, on a file the PR does not change.</td><td><b>Both return <code>thread: null</code> with no error.</b> Comments must go in the review body.</td></tr>
+<tr><td>F.3</td><td><code>addPullRequestReview</code> with a body only, then <code>submitPullRequestReview(event: COMMENT)</code>, on a PR opened by the same account.</td><td><b>Works:</b> state <code>COMMENTED</code>, 0 comments.</td></tr>
+<tr><td>F.4</td><td>Merge a draft: REST <code>PUT /pulls/N/merge</code>, and <code>gh pr merge --squash</code>.</td><td><b>Refused by both:</b> REST 405 "Pull Request is still a draft"; gh "Pull Request is still a draft (mergePullRequest)".</td></tr>
+<tr><td>F.5</td><td>Manual <code>@codex review</code> on a draft (#1615, one-line change).</td><td><b>Codex reviewed it</b> ("Didn't find any major issues"). Automatic reviews skip drafts per OpenAI's docs; manual ones do not. openai/codex#40721 claims otherwise and is out of date.</td></tr>
+<tr><td>F.6</td><td>Rulesets on <code>fractal-algo-rust</code> (private).</td><td><b>403</b> "Upgrade to GitHub Pro or make this repository public". Branch protection is unavailable too, so a required status check can't block merges there.</td></tr>
+<tr><td>F.7</td><td>The merge-chain query (D.2) on <code>epic/1746-iter7</code>.</td><td>No PR has that branch as its head; tip <code>fc37cdc</code>; the plan's blob at the tip is <code>acfbe98</code>, against <code>f021e04</code> last published.</td></tr>
+</tbody>
+</table>
+<p>Not re-verified here, but standard: <code>convertPullRequestToDraft</code> and <code>markPullRequestReadyForReview</code>, which <code>gh pr ready --undo</code> and <code>gh pr ready</code> use.</p>
+
+<h3 id="g">G. Requirement trace</h3>
+<table>
+<thead><tr><th>Memo requirement</th><th>Appendix</th><th>Code location or test</th></tr></thead>
+<tbody>
+<tr><td>A hold blocks merging on any PR</td><td>B.3, F.4</td><td>New <code>merge_holds</code> module; B.9 place/release tests</td></tr>
+<tr><td>Hold messages state facts only</td><td>B.5</td><td>B.9 recipient and text tests</td></tr>
+<tr><td>A hold rides with a review</td><td>B.7, D.4 step 4</td><td><code>http/docs/review.rs</code>; B.9 "review-borne hold"</td></tr>
+<tr><td>Marked ready while held is reverted</td><td>B.6</td><td><code>http/claims.rs</code> sync; B.9 sync tests</td></tr>
+<tr><td>Task-complete lists held PRs</td><td>B.7</td><td><code>work_claims/checks.rs:170</code>; B.9</td></tr>
+<tr><td>Only the placer or you release</td><td>B.2</td><td>B.9 authority tests</td></tr>
+<tr><td>Codex review still works while held</td><td>F.5</td><td>No code; verified</td></tr>
+<tr><td>Card shows agent, state, turns, context, task complete</td><td>C.2–C.4</td><td><code>sessions.rs</code>, <code>http/docs.rs</code> head, <code>doc_client.js</code>; C.6</td></tr>
+<tr><td>Card and review go to the same agent; claim first</td><td>C.1</td><td><code>review.rs:128</code>; C.6 recipient order</td></tr>
+<tr><td>Retire from the doc</td><td>C.5</td><td>New route in <code>http/docs.rs</code>; C.6</td></tr>
+<tr><td>No new polling</td><td>C.4</td><td>Rides on <code>/head</code>; C.6</td></tr>
+<tr><td>Comment on a merged doc; <code>sm</code> opens the PR</td><td>D.1, D.4</td><td><code>review.rs</code>; D.6 end to end</td></tr>
+<tr><td>Base follows merges, not <code>main</code></td><td>D.2</td><td>D.6 base resolution</td></tr>
+<tr><td>Comments survive as quoted text</td><td>D.4 step 6, F.2</td><td>D.6 review body</td></tr>
+<tr><td>"Doc changed since the reviewed revision" noted</td><td>D.2, D.4 step 7</td><td>D.6 wake text</td></tr>
+<tr><td>Closed PR is reopened</td><td>D.3</td><td>D.6</td></tr>
+<tr><td>Doc keeps one history across PRs</td><td>D.5</td><td><code>owner_docs.rs</code>; D.6 doc move</td></tr>
+<tr><td>No agent → Assign</td><td>C.4, D.4 step 7</td><td>Existing <code>assign_review</code>; C.6</td></tr>
+<tr><td><code>sm doc cat</code> for docs and local files</td><td>E.1, E.2</td><td><code>bin/doc/mod.rs</code>, <code>http/docs.rs</code>; E.5</td></tr>
+<tr><td>Converter compiled in, three rules</td><td>E.3</td><td><code>doc_markdown.rs</code>; E.5</td></tr>
+<tr><td>Commit-only docs stay read-only</td><td>D.1</td><td>Dropped: no branch to open a PR from (memo, "What I'm leaving out")</td></tr>
+<tr><td>Separate "ask the agent" command, auto-retire</td><td>—</td><td>Dropped with reasons (memo, "What I'm leaving out")</td></tr>
+</tbody>
+</table>
+
+<h3 id="h">H. Tickets in detail</h3>
+<p>Each ticket fits one agent without compaction. A and B touch separate files and can run in parallel. C and D both edit <code>http/docs/review.rs</code> and <code>doc_client.js</code>, so D waits for C.</p>
+<table>
+<thead><tr><th>Ticket</th><th>Files</th><th>Done when</th></tr></thead>
+<tbody>
+<tr><td>A <code>sm doc cat</code></td><td>new <code>doc_markdown.rs</code>; <code>bin/doc/mod.rs</code>; <code>http/docs.rs</code> (format param); <code>Cargo.toml</code></td><td>E.5 passes; <code>sm doc cat fractal-algo-rust/docs/working/1746_iter7_plan.html</code> prints the plan with compact tables and two figure lines.</td></tr>
+<tr><td>B Merge hold</td><td>new <code>merge_holds.rs</code>; <code>work_claims.rs</code> (schema, tracked items, fragment); <code>http/claims.rs</code> (sync); <code>work_claims/checks.rs</code>; <code>bin/sm.rs</code> + a CLI module; <code>http.rs</code> routes; projections in <code>http/watch.rs</code></td><td>B.9 passes; a live hold on a throwaway PR in this repo makes it a draft, messages the claim holder, and releases cleanly.</td></tr>
+<tr><td>C Session card</td><td><code>http/docs/review.rs</code> (recipient); <code>sessions.rs</code> (turn counter); <code>http/docs.rs</code> (<code>/head</code>, retire and hold routes); <code>doc_client.js</code>/<code>.css</code></td><td>C.6 passes; the iteration 7 plan's header shows the card, and Retire works from the phone.</td></tr>
+<tr><td>D Merged or closed doc</td><td><code>http/docs/review.rs</code>; <code>owner_docs.rs</code> (move, publish PR column); <code>http/docs.rs</code> (<code>reopen-target</code>); <code>doc_client.js</code></td><td>D.6 passes; a review on the merged iteration 7 plan opens a PR from <code>epic/1746-iter7</code> with the review and wakes an agent, or offers Assign.</td></tr>
+</tbody>
+</table>
+
+<h3 id="z">Z. FAQ</h3>
+<p><b>Why not a GitHub label for the hold?</b> A label stops nothing. An agent following its standing "merge once clean" brief merges anyway. The draft makes GitHub refuse.</p>
+<p><b>Why not a required status check?</b> It needs branch protection or rulesets, which the private repo can't have on the current plan (F.6). On repos that can, it would also make <code>sm</code> a gate on every PR, so nothing could merge while <code>sm</code> was down.</p>
+<p><b>What if an agent marks a held PR ready and merges before the next check?</b> The merge succeeds, and <code>sm</code> tells whoever placed the hold. Agents are semi-trusted, and the placed message is explicit, so the draft is a guard against a stale brief, not against an agent determined to merge.</p>
+<p><b>Does a draft stop Codex review?</b> Only automatic reviews. A manual <code>@codex review</code>, which is what <code>sm request-codex-review</code> posts, runs on drafts (F.5).</p>
+<p><b>Why doesn't a hold carry "merge when released"?</b> That is policy. What the agent does on release belongs in its brief. The primitive records who held, who released, and when.</p>
+<p><b>Why an empty commit rather than having the agent open the PR?</b> <code>sm</code> can do it in a few API calls, and your review lands immediately. Waiting for an agent would add a round trip and would still leave most comments off their lines.</p>
+<p><b>Why not branch from <code>main</code>?</b> Docs often merge into an epic or ticket branch first. The iteration 7 plan lives on <code>epic/1746-iter7</code> today.</p>
+<p><b>Why follow PR records rather than <code>git branch --contains</code>?</b> Squash merges create a new commit with no ancestry link to the branch, so git can't see that the branch was merged.</p>
+<p><b>Why does the doc move to the new PR rather than stay one doc per PR?</b> The header, card, revision picker and review history all hang off the doc. Splitting at each PR recreates the fragmentation the hold removes.</p>
+<p><b>Why count turns and not tokens?</b> You asked for turns. Tokens per session are already on the usage page, and context % covers "how full is it".</p>
+<p><b>Why not pandoc?</b> It's a large system install (a compiled Haskell program) on every machine running <code>sm</code>, including remote nodes, for a job a compiled-in library does in 3 ms.</p>
+<p><b>Why does <code>sm doc cat</code> not record a view?</b> Views drive the "Read" state of a doc for you. An agent reading it must not mark it read.</p>
+<p><b>Can a hold be placed on a PR that has no doc?</b> Yes. The hold is about PRs. Docs are one place its controls appear.</p>
+
+<!-- memo-dark-mode -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
