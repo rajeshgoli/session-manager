@@ -161,6 +161,7 @@
 <li><b>Stopped by the queue.</b> Jobs from the last 24 hours that the queue ended without the job finishing on its own: displaced, gave up, over its memory limit, over its process limit, or past its time limit. Cancelled and failed jobs are left out. Someone chose to cancel, and a failure is the job's own result.</li>
 <li><b>Held back?</b> Described in section 4.</li>
 </ul>
+<p><b>Acting on a job.</b> The row sheet has two actions that reach the agent. <b>Cancel</b> takes an optional note. The agent's completion notice then says you cancelled the job from the sm app and quotes your note, so it neither resubmits blindly nor mistakes the cancel for a fault. Today the notice says only "cancelled". <b>Ask agent</b> sends a question to the job's agent, for example "How long do you expect this to run?", with the job's name, type and elapsed time attached. It uses the same side channel as the app's "what is it doing" request, which answers from the agent's context without interrupting its work. The answer appears in the sheet.</p>
 <p><b>Where you reach it.</b> A <i>Queue</i> item in the agents screen's top menu, next to Analytics. A Queue icon also sits in the agents screen's top bar whenever a job is running or waiting, with a badge counting the waiting jobs. The app has no live utilization bar today (only a Settings sheet that updates when you tap Refresh), so this page is where live utilization appears.</p>
 
 <figure>
@@ -192,7 +193,7 @@
   Perf rules held jobs <b>20.4 h</b> (by design).<br>
   Background jobs peak at <b>18 GB</b> each (95th percentile).</div>
 </div>
-<figcaption>Figure 1. The Queue page on a phone. Job names and agents are realistic; the "Held back?" numbers are illustrative, since nothing has been recorded yet. Tapping any row opens a sheet with the command, folder, limits, the full hold explanation, the last 40 log lines, and Cancel / Follow / Open agent.</figcaption>
+<figcaption>Figure 1. The Queue page on a phone. Job names and agents are realistic; the "Held back?" numbers are illustrative, since nothing has been recorded yet. Tapping any row opens a sheet with the command, folder, limits, the full hold explanation, the last 40 log lines, and Cancel / Ask agent / Follow / Open agent.</figcaption>
 </figure>
 
 <h3>2. What 30 days of job history show</h3>
@@ -357,7 +358,7 @@
 <tr><td>1. How often to sample, and how long to keep it</td><td><b>Every 5 seconds, kept 90 days</b> (~300 MB, ~0.6% of one core).</td><td>Five seconds catches short test bursts; 90 days spans before and after any limit change.</td></tr>
 <tr><td>2. What counts as headroom</td><td><b>CPU under 60% busy, at least 25% of memory available (64 GB), memory pressure normal.</b></td><td>These thresholds decide what the card says; 60% leaves room for a test build's burst.</td></tr>
 <tr><td>3. What the bottom section lists</td><td><b>Displaced, gave up, over memory, over process limit, past time limit — last 24 hours.</b> Not cancelled or failed.</td><td>These are the cases where an agent asked for work and the queue, not the job, ended it.</td></tr>
-<tr><td>4. Cancel from the phone</td><td><b>Yes.</b> Waiting jobs cancel at a tap; running jobs ask to confirm.</td><td>Clearing a stuck job from the phone is the main action this page enables.</td></tr>
+<tr><td>4. Cancel from the phone</td><td><b>Yes, with an optional note to the agent.</b> Cancel opens a short dialog, the same for waiting and running jobs, with the optional note; one more tap confirms. The agent is told you cancelled it, and why if you say.</td><td>Clearing a stuck job from the phone is the main action this page enables; the note stops the agent resubmitting it.</td></tr>
 <tr><td>5. Where the page lives</td><td><b>Agents screen: a menu item, plus a top-bar icon with a waiting-job badge when the queue is busy.</b></td><td>The app has no bottom tab bar; the badge gives the glance you asked for.</td></tr>
 </tbody>
 </table>
@@ -365,6 +366,7 @@
 <div class="ruling"><b>Already decided (2026-09-28).</b> Record utilization every 10 seconds or faster, in its own database. Show live utilization on the Queue page, and chart how the Mac is used over time. Use one list (running, then queued, then stopped). Leave the background limit at 2 until two weeks of recorded data exist, then decide from the card's background line.</div>
 
 <h3>FAQ — what changed since the last revision</h3>
+<p><b>Revision 3.</b> Cancel takes an optional note to the agent, and the row sheet gains <b>Ask agent</b> (section 1, "Acting on a job"; decision 4), as you asked while the build started.</p>
 <p><b>Revision 2 (after your review).</b> Adds section 5, the Mac usage screen, as you asked in your review comment on section 3. It adds one server call and one app screen, and moves the decisions to section 6. Nothing else changed.</p>
 <hr class="appendix-divider">
 <h2>Appendices</h2>
@@ -387,7 +389,7 @@
 <thead><tr><th>Ticket</th><th>Scope</th><th>Files</th><th>Seat</th></tr></thead>
 <tbody>
 <tr><td>1. Recorder and stats</td><td>Appendix B, D and D2</td><td>new <code>crates/sm-server/src/utilization.rs</code>; <code>config.rs</code>; <code>main.rs</code> or <code>runtime.rs</code> (start the task); <code>http.rs</code> (one route); <code>queue.rs</code> (expose a read of pending/running jobs under the admission lock)</td><td>Claude Opus 1M, high</td></tr>
-<tr><td>2. Overview endpoint and host-status source</td><td>Appendix C and E</td><td><code>queue.rs</code> (consideration order); <code>http.rs</code>; <code>host_status.rs</code></td><td>Claude Opus 1M, high</td></tr>
+<tr><td>2. Overview endpoint and host-status source</td><td>Appendix C (with C.1) and E</td><td><code>queue.rs</code> (consideration order); <code>http.rs</code>; <code>host_status.rs</code></td><td>Claude Opus 1M, high</td></tr>
 <tr><td>3. Android Queue screen</td><td>Appendix F, including F.5</td><td><code>android-app/…/ui/queue/*</code>; <code>ApiService.kt</code>; <code>ApiModels.kt</code>; <code>SessionManagerRepository.kt</code>; <code>AppNavigation.kt</code>; <code>WatchScreen.kt</code></td><td>Claude Opus 1M, high</td></tr>
 </tbody>
 </table>
@@ -496,6 +498,14 @@ CREATE INDEX IF NOT EXISTS job_samples_by_job ON job_samples (job_id, sampled_at
 <p>Every other terminal state (<code>succeeded</code>, <code>failed</code>, <code>cancelled</code>) is excluded. A job is in <code>ended</code> when its state is in the table and <code>finished_at</code> is within <code>ended_hours</code> of now. Durations format as whole minutes (<code>"5m"</code>), or hours and minutes past 60 (<code>"1h 20m"</code>), or seconds under a minute (<code>"40s"</code>).</p>
 <p><b>Example.</b> Two tests running, one perf and one test waiting: <code>queued</code> is [perf <code>bench-ledger</code> position 1, tests <code>cargo test</code> position 2] even though the test was submitted first, because perf is examined first.</p>
 
+<h4>C.1 Cancel with a note: <code>POST /queue-jobs/{job_id}/cancel</code></h4>
+<p>Body <code>{"note": "optional text"}</code>; the body may be empty or omitted. The note is trimmed, and an empty note counts as absent. A note longer than 1,000 characters → 400. Auth and write checks are exactly those of <code>DELETE /queue-jobs/{job_id}</code><sup>12</sup>, and so is the effect and the response (the job object). <code>DELETE</code> keeps working unchanged.</p>
+<p><b>Who cancelled.</b> When the request carries an authenticated owner actor (the app's requests do; <code>request_actor_email</code>), the canceller is <code>"{owner_name} from the sm app"</code>, with <code>owner_name</code> from config ("Rajesh"). Otherwise, when the request names a session (<code>X-SM-Session-Id</code> or the equivalent header the CLI sends), it is <code>"{that session's friendly name}"</code>. Otherwise it is absent.</p>
+<p><b>Persisted before the state change.</b> Write <code>termination_detail</code> = <code>{"kind": "cancel", "cancelled_by": "...", "note": "..."}</code>, omitting absent fields, on the job row in the same transaction that marks it cancelling or cancelled. A running job's completion notice is sent after the grace period, and it must still find the note.</p>
+<p><b>Completion notice.</b> For state <code>cancelled</code> with that detail, the existing notice line gains, before <code>" Log:"</code>: <code>" Cancelled by {cancelled_by}."</code> when known, then <code>" Note: {note}"</code> when present.</p>
+<div class="callout"><b>Example.</b> <code>[sm queue] bench-ledger completed: cancelled runtime=4m12s queue=3s. Cancelled by Rajesh from the sm app. Note: machine needed for a demo, rerun after 3pm. Log: … ID: job_9f1c…</code></div>
+<p><b>Row sheet.</b> The <code>ended_summary</code> of a cancelled job is not shown (cancelled jobs are not listed), but <code>GET /queue-jobs/{id}</code> returns the detail.</p>
+
 <h3 id="d">D. <code>GET /client/queue/stats</code></h3>
 <p><b>Auth.</b> As Appendix C. <b>Query.</b> <code>hours</code> ∈ {24, 168, 720}, default 168; anything else → 400. When the recorder is off or has no rows in the window, return 200 with <code>"available": false</code> and nothing else.</p>
 <pre><code>{
@@ -586,7 +596,7 @@ CREATE INDEX IF NOT EXISTS job_samples_by_job ON job_samples (job_id, sampled_at
 <h4>F.1 Wiring</h4>
 <ul>
 <li>Route <code>Routes.QUEUE = "queue"</code> in <code>AppNavigation.kt</code><sup>11</sup>, composable <code>QueueScreen</code> in a new package <code>li.rajeshgo.sm.ui.queue</code> with <code>QueueViewModel</code> and pure formatting functions in <code>QueueModels.kt</code>.</li>
-<li><code>ApiService</code>: <code>@GET("client/queue")</code>, <code>@GET("client/queue/stats")</code> with <code>hours</code>, <code>@DELETE("queue-jobs/{job_id}")</code> (cancel; the same auth the app already uses for <code>sessions/{id}/retire</code><sup>12</sup>), <code>@GET("queue-jobs/{job_id}/log")</code> with <code>lines=40</code> (response <code>{job_id, lines, log_path, text}</code>).</li>
+<li><code>ApiService</code>: <code>@GET("client/queue")</code>, <code>@GET("client/queue/stats")</code> with <code>hours</code>, <code>@POST("queue-jobs/{job_id}/cancel")</code> with body <code>CancelQueueJobBody(note: String? = null)</code> returning the job object as <code>SessionJob</code> (cancel with an optional note, Appendix C.1; the same auth the app already uses for <code>sessions/{id}/retire</code><sup>12</sup>). The app does not use the legacy <code>DELETE /queue-jobs/{job_id}</code>, which stays for the CLI, <code>@GET("queue-jobs/{job_id}/log")</code> with <code>lines=40</code> (response <code>{job_id, lines, log_path, text}</code>).</li>
 <li>Models: extend the existing <code>SessionJob</code><sup>13</sup> with <code>position</code>, <code>waitDeadlineAt</code>, <code>endedReason</code>, <code>endedSummary</code>, <code>notifyName</code> (all nullable, default null); add <code>QueueOverview</code>, <code>QueueSlots</code>, <code>QueueStats</code>; extend <code>HostStatus</code> with nullable <code>memoryAvailableBytes</code> and <code>source</code>.</li>
 <li>Entry points on the agents screen (<code>WatchScreen.kt</code>): a "Queue" item in the overflow menu next to Analytics<sup>14</sup>, always present. A top-bar icon button that opens Queue, shown only when the already-fetched jobs include any <code>pending</code> or <code>running</code> job, with a badge counting <code>pending</code> jobs (no badge at zero).</li>
 </ul>
@@ -607,7 +617,7 @@ CREATE INDEX IF NOT EXISTS job_samples_by_job ON job_samples (job_id, sampled_at
 <li><b>Held back? card</b> as Appendix D's card text. When stats are unavailable: "No utilization recorded yet."</li>
 </ul>
 <h4>F.4 Row sheet</h4>
-<p>Tapping any row opens a <code>ModalBottomSheet</code> (<code>skipPartiallyExpanded = true</code>, as <code>HostStatusSheet</code> does<sup>16</sup>) showing: label, type, state; agent; command (<code>argv</code> joined by spaces, else "script: {script_path}"); <code>cwd</code>; queued / started / finished times; time limit and any CPU, GPU and memory budgets; <code>holding.detail</code> for queued jobs; <code>ended_summary</code> for stopped jobs; the last 40 log lines in monospace (load on open; "No log yet" on 404). Buttons: <b>Cancel</b> (queued and running only; running asks "Stop {label}? The agent will be told it was cancelled." before calling), <b>Follow</b> (existing <code>queue-jobs/{id}/follow</code>), <b>Open agent</b> (when the agent is a known session). After Cancel succeeds, close the sheet and refresh at once.</p>
+<p>Tapping any row opens a <code>ModalBottomSheet</code> (<code>skipPartiallyExpanded = true</code>, as <code>HostStatusSheet</code> does<sup>16</sup>) showing: label, type, state; agent; command (<code>argv</code> joined by spaces, else "script: {script_path}"); <code>cwd</code>; queued / started / finished times; time limit and any CPU, GPU and memory budgets; <code>holding.detail</code> for queued jobs; <code>ended_summary</code> for stopped jobs; the last 40 log lines in monospace (load on open; "No log yet" on 404). Buttons: <b>Cancel</b> (queued and running only): opens a small dialog titled "Cancel {label}?" with a text field "Note to {agent} (optional)" and buttons "Keep running" / "Cancel job"; it calls <code>POST /queue-jobs/{id}/cancel</code> with the note. The same dialog serves queued jobs, titled "Cancel {label}?" with "Keep waiting". <b>Ask agent</b> (shown when the job's agent is a known, non-stopped session): a text field with three suggestion chips that fill it — "How long do you expect this to run?", "What is this job for?", "Is it safe to cancel this?" — and a Send button. Send calls the existing <code>runWhatRequest</code><sup>19</sup> with <code>session_id</code> = the job's <code>notify_session_id</code> and prompt = <code>"Rajesh is asking from the sm app about your queue job {label} (ID {id}, type {type}, {state}, {running for / waiting} {duration}): {question}"</code>, with <code>owner_name</code> in place of "Rajesh" from <code>/client/bootstrap</code> when it provides one. The sheet shows the request status while it runs and then the answer text. When the agent is already answering another request (the server answers 409), the sheet does <b>not</b> attach to that request, whose question is someone else's: it shows "{agent} is answering another question — try again in a minute" and keeps the typed question. Add an <code>attachOnConflict</code> parameter (default true, today's behaviour) to <code>runWhatRequest</code>; Ask agent passes false. <b>Follow</b> (existing <code>queue-jobs/{id}/follow</code>), <b>Open agent</b> (when the agent is a known session). After Cancel succeeds, close the sheet and refresh at once.</p>
 
 <h4>F.5 Mac usage screen</h4>
 <ul>
@@ -644,6 +654,8 @@ CREATE INDEX IF NOT EXISTS job_samples_by_job ON job_samples (job_id, sampled_at
 <tr><td>Held back? card</td><td>D</td><td>the worked example yields 120 / 100 / 0; outage gap weighting; NULL CPU → unknown; percentile fixture</td></tr>
 <tr><td>Live bar without <code>top</code></td><td>E</td><td>fresh sample → <code>source: recorder</code>; stale → <code>source: live</code></td></tr>
 <tr><td>Queue page, refresh, cancel</td><td>F</td><td><code>QueueModelsTest</code>: every formatter (durations, "giving up", agent fallback, colour bands); <code>QueueViewModelTest</code>: polling stops on pause, stats not on the loop, cancel refreshes; manual check on device, screenshot in the PR</td></tr>
+<tr><td>Cancel note reaches the agent</td><td>C.1</td><td>cancel a pending and a running job with a note: detail persisted before the state change; notice text matches the example; no note → no "Note:" clause; 1,001 chars → 400; DELETE unchanged</td></tr>
+<tr><td>Ask agent</td><td>F.4</td><td><code>QueueModelsTest</code>: prompt text for running and waiting jobs; repository test: a 409 with <code>attachOnConflict = false</code> fails with the busy message and never polls the other request; manual check on device with a real agent, screenshot in the PR</td></tr>
 <tr><td>Entry points</td><td>F.1</td><td>menu item present; icon and badge visible only with pending/running jobs (Compose test)</td></tr>
 <tr><td>Mac usage over time (server)</td><td>D2</td><td>bucket count per range; window alignment example; empty bucket omits fields; per-field null handling; summary weights and headroom; 30-day timing reported in PR</td></tr>
 <tr><td>Mac usage screen</td><td>F.5</td><td><code>UsageModelsTest</code>: axis labels per range, gap breaking, pressure shading levels, summary text with zero clauses omitted; manual check on device, screenshot in the PR</td></tr>
@@ -709,7 +721,8 @@ select state, count(*) from queue_jobs where queued_at &gt; datetime('now','-30 
 <sup>15</sup> <code>WatchModels.kt</code> <code>jobSummary</code> ·
 <sup>16</sup> <code>HostStatusSheet.kt</code> ·
 <sup>17</sup> <code>queue.rs</code> <code>parse_process_group_rss_bytes</code> ·
-<sup>18</sup> <code>AnalyticsScreen.kt</code> <code>MultiSeriesChart</code>, <code>drawSeries</code>
+<sup>18</sup> <code>AnalyticsScreen.kt</code> <code>MultiSeriesChart</code>, <code>drawSeries</code> ·
+<sup>19</sup> <code>SessionManagerRepository.kt</code> <code>runWhatRequest</code>; server <code>POST /sessions/{id}/what</code>, <code>btw.rs</code>
 </small></p>
 
 <!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.

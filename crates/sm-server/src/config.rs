@@ -58,6 +58,7 @@ pub struct AppConfig {
     pub work_claims: WorkClaimsConfig,
     pub web_watch: WebWatchConfig,
     pub push: PushConfig,
+    pub utilization: UtilizationConfig,
     /// How sm names the owner in text it writes to agents (sm#1580): the
     /// reply header, `[sm review]`, the waiting label. Trimmed, 1-40
     /// characters; [`DEFAULT_OWNER_NAME`] when absent or blank.
@@ -127,6 +128,7 @@ impl Default for AppConfig {
             work_claims: WorkClaimsConfig::default(),
             web_watch: WebWatchConfig::default(),
             push: PushConfig::default(),
+            utilization: UtilizationConfig::default(),
             owner_name: DEFAULT_OWNER_NAME.to_owned(),
         }
     }
@@ -196,6 +198,7 @@ impl AppConfig {
 
         config.validate_queue_runner_capacity()?;
         config.validate_codex_fork_create_startup_timeout()?;
+        config.utilization.validate()?;
 
         Ok(config)
     }
@@ -329,6 +332,11 @@ impl AppConfig {
         )?;
         self.push.db_path =
             isolate_default_data_path(&self.push.db_path, &default_push_db_path(), &instance)?;
+        self.utilization.db_path = isolate_default_data_path(
+            &self.utilization.db_path,
+            &default_utilization_db_path(),
+            &instance,
+        )?;
         // Tests never send real pushes with the live key.
         self.push.fcm.service_account_path = None;
         self.bug_reports.db_path = isolate_path_from_protected_root(
@@ -1841,6 +1849,57 @@ fn default_web_watch_refresh_seconds() -> u64 {
     3
 }
 
+/// `utilization`: the host and queue-job sampler behind the Queue page's
+/// "Held back?" card and the Mac usage charts (sm#1609).
+#[derive(Debug, Clone, Deserialize)]
+pub struct UtilizationConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_utilization_db_path")]
+    pub db_path: String,
+    /// Seconds between samples, 1-60.
+    #[serde(default = "default_utilization_sample_interval_seconds")]
+    pub sample_interval_seconds: u64,
+    /// Days of samples kept, 1-3650.
+    #[serde(default = "default_utilization_retention_days")]
+    pub retention_days: i64,
+}
+
+impl Default for UtilizationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            db_path: default_utilization_db_path(),
+            sample_interval_seconds: default_utilization_sample_interval_seconds(),
+            retention_days: default_utilization_retention_days(),
+        }
+    }
+}
+
+impl UtilizationConfig {
+    fn validate(&self) -> Result<()> {
+        if !(1..=60).contains(&self.sample_interval_seconds) {
+            bail!("utilization.sample_interval_seconds must be between 1 and 60");
+        }
+        if !(1..=3650).contains(&self.retention_days) {
+            bail!("utilization.retention_days must be between 1 and 3650");
+        }
+        Ok(())
+    }
+}
+
+fn default_utilization_db_path() -> String {
+    "~/.local/share/claude-sessions/utilization.db".to_owned()
+}
+
+fn default_utilization_sample_interval_seconds() -> u64 {
+    5
+}
+
+fn default_utilization_retention_days() -> i64 {
+    90
+}
+
 /// `push`: owner follows and phone notifications (sm#1569).
 #[derive(Debug, Clone, Deserialize)]
 pub struct PushConfig {
@@ -1978,6 +2037,8 @@ struct RawConfig {
     #[serde(default)]
     push: PushConfig,
     #[serde(default)]
+    utilization: UtilizationConfig,
+    #[serde(default)]
     owner_name: Option<String>,
 }
 
@@ -2087,6 +2148,7 @@ impl From<RawConfig> for AppConfig {
             work_claims: raw.work_claims,
             web_watch: raw.web_watch,
             push: raw.push,
+            utilization: raw.utilization,
             owner_name: normalize_owner_name(raw.owner_name.as_deref())
                 .unwrap_or_else(|_| DEFAULT_OWNER_NAME.to_owned()),
         }
@@ -2690,6 +2752,7 @@ mod tests {
             &config.mobile_terminal.device_enrollment_db_path,
             &config.bug_reports.db_path,
             &config.app_artifacts.root_dir,
+            &config.utilization.db_path,
         ];
         for path in durable_paths {
             assert!(
@@ -3690,6 +3753,29 @@ queue_runner:
             .unwrap_err()
             .to_string()
             .contains("cannot consume the entire global queue capacity"));
+    }
+
+    #[test]
+    fn utilization_defaults_and_bounds() {
+        let config = AppConfig::default();
+        assert!(config.utilization.enabled);
+        assert_eq!(config.utilization.sample_interval_seconds, 5);
+        assert_eq!(config.utilization.retention_days, 90);
+        assert!(config.utilization.validate().is_ok());
+        let raw: RawConfig = serde_yaml::from_str(
+            "utilization:\n  sample_interval_seconds: 10\n  db_path: /tmp/u.db\n",
+        )
+        .unwrap();
+        let parsed = AppConfig::from(raw);
+        assert_eq!(parsed.utilization.sample_interval_seconds, 10);
+        assert_eq!(parsed.utilization.db_path, "/tmp/u.db");
+        assert_eq!(parsed.utilization.retention_days, 90);
+        for (interval, retention) in [(0, 90), (61, 90), (5, 0), (5, 3651)] {
+            let mut invalid = config.utilization.clone();
+            invalid.sample_interval_seconds = interval;
+            invalid.retention_days = retention;
+            assert!(invalid.validate().is_err(), "{interval} {retention}");
+        }
     }
 
     #[test]

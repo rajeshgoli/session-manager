@@ -134,6 +134,21 @@ async fn main() -> Result<()> {
     );
     authority_server.spawn();
 
+    // Only the live queue server records: scratch servers run with the
+    // runtime off so they stay clear of live queue state (sm#1609).
+    if config.rust_core.runtime_enabled && config.utilization.enabled {
+        if cfg!(target_os = "macos") {
+            sm_server::utilization::spawn_recorder(sm_server::utilization::RecorderSettings {
+                db_path: expand_home(&config.utilization.db_path),
+                queue_db_path: queue_state_dir.join("queue_runner.db"),
+                interval: Duration::from_secs(config.utilization.sample_interval_seconds),
+                retention_days: config.utilization.retention_days,
+            });
+        } else {
+            eprintln!("utilization recorder: host sampling is only available on macOS");
+        }
+    }
+
     if config.rust_core.runtime_enabled {
         let message_queue_db_path = expand_home(&config.sm_send.db_path);
         let cancel_grace_seconds = config.queue_runner.cancel_grace_seconds;
