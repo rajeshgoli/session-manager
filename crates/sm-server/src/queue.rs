@@ -143,6 +143,9 @@ pub struct QueueJobFilters {
     pub job_type: Option<String>,
     pub state: Option<String>,
     pub include_terminal: bool,
+    /// Active jobs plus jobs that finished at or after this time (RFC 3339);
+    /// overrides `include_terminal`. The Queue page's refresh (sm#1609).
+    pub finished_since: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1275,14 +1278,47 @@ impl RetainedQueueStore {
         admission_policy: QueueAdmissionPolicy,
         admit_after_cancel: bool,
     ) -> Result<Option<QueueJobRecord>> {
+        Self::cancel_queue_job_with_detail_in_state_dir(
+            state_dir,
+            message_queue_db_path,
+            job_id,
+            cancel_grace_seconds,
+            admission_policy,
+            admit_after_cancel,
+            None,
+        )
+    }
+
+    /// Cancel, first recording who cancelled and why so the completion
+    /// notice can say so (sm#1609). `detail` is
+    /// `{"kind": "cancel", "cancelled_by"?, "note"?}`.
+    pub fn cancel_queue_job_with_detail_in_state_dir(
+        state_dir: &Path,
+        message_queue_db_path: &Path,
+        job_id: &str,
+        cancel_grace_seconds: u64,
+        admission_policy: QueueAdmissionPolicy,
+        admit_after_cancel: bool,
+        detail: Option<&JsonValue>,
+    ) -> Result<Option<QueueJobRecord>> {
         let db_path = state_dir.join("queue_runner.db");
         let conn = open_queue_jobs_connection(&db_path)?;
         init_queue_jobs_schema(&conn)?;
-        let Some(job) = get_queue_job_runtime_conn(&conn, job_id)? else {
+        let Some(mut job) = get_queue_job_runtime_conn(&conn, job_id)? else {
             return Ok(None);
         };
         if is_terminal_queue_state(&job.state) {
             return get_queue_job_conn(&conn, job_id);
+        }
+        if let Some(detail) = detail {
+            // Before the state change: a running job may be finished by its
+            // monitor, which reads the row, not this record.
+            let raw = detail.to_string();
+            conn.execute(
+                "UPDATE queue_jobs SET termination_detail_json = ?2 WHERE id = ?1",
+                params![job_id, raw],
+            )?;
+            job.termination_detail_json = Some(raw);
         }
         if job.state == "running" {
             mark_queue_job_cancelling_conn(&conn, job_id)?;
@@ -3679,6 +3715,104 @@ pub const DEFAULT_QUEUE_MAX_WAIT_SECONDS: i64 = 5 * 60;
 const QUEUE_JOB_TYPE_ORDER: [&str; 4] = ["perf", "tests", "background", "service"];
 static QUEUE_ADMISSION_LOCK: Mutex<()> = Mutex::new(());
 
+/// Pending job ids in the order admission examines them: perf, tests,
+/// background, service, then oldest first within a type (sm#1609).
+pub fn pending_queue_job_consideration_order(jobs: &[QueueJobRecord]) -> Vec<String> {
+    let mut pending: Vec<&QueueJobRecord> =
+        jobs.iter().filter(|job| job.state == "pending").collect();
+    pending.sort_by_key(|job| {
+        (
+            QUEUE_JOB_TYPE_ORDER
+                .iter()
+                .position(|job_type| *job_type == job.job_type)
+                .unwrap_or(QUEUE_JOB_TYPE_ORDER.len()),
+            job.queued_at.clone(),
+            job.id.clone(),
+        )
+    });
+    pending.into_iter().map(|job| job.id.clone()).collect()
+}
+
+/// Whole-unit duration for the phone: "40s", "5m", "1h 20m" (sm#1609).
+pub fn queue_short_duration(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m", seconds / 60),
+        _ if seconds % 3600 < 60 => format!("{}h", seconds / 3600),
+        _ => format!("{}h {}m", seconds / 3600, seconds % 3600 / 60),
+    }
+}
+
+pub fn parse_queue_timestamp(value: &str) -> Option<OffsetDateTime> {
+    parse_queue_datetime(value)
+}
+
+/// Why the queue, not the job, ended a job, with one line for the Queue
+/// page's "stopped" section; `None` for states that section leaves out.
+pub fn queue_job_ended_reason(job: &QueueJobRecord) -> Option<(&'static str, String)> {
+    let elapsed = || {
+        let start = parse_queue_datetime(&job.queued_at)?;
+        let end = parse_queue_datetime(job.finished_at.as_deref()?)?;
+        Some((end - start).whole_seconds())
+    };
+    let detail_bytes = |key: &str| {
+        job.termination_detail
+            .as_ref()
+            .and_then(|detail| detail.get(key))
+            .and_then(JsonValue::as_i64)
+    };
+    Some(match job.state.as_str() {
+        "displaced" => (
+            "displaced",
+            "Stopped to make room for a perf run; not restarted".to_owned(),
+        ),
+        "wait_expired" => (
+            "gave_up",
+            elapsed().map_or_else(
+                || "Never started; gave up".to_owned(),
+                |seconds| {
+                    format!(
+                        "Never started; gave up after {}",
+                        queue_short_duration(seconds)
+                    )
+                },
+            ),
+        ),
+        "memory_exceeded" => (
+            "over_memory",
+            match (
+                detail_bytes("process_group_rss_bytes"),
+                detail_bytes("memory_limit_bytes"),
+            ) {
+                (Some(rss), Some(limit)) => format!(
+                    "Stopped: used {} against its {} memory limit",
+                    memory_amount_text(rss),
+                    memory_amount_text(limit)
+                ),
+                _ => "Stopped: over its memory limit".to_owned(),
+            },
+        ),
+        "process_limit_exceeded" => (
+            "over_process_limit",
+            match (job.peak_process_count, job.process_limit) {
+                (Some(peak), Some(limit)) => {
+                    format!("Stopped: over its process limit ({peak} of {limit})")
+                }
+                _ => "Stopped: over its process limit".to_owned(),
+            },
+        ),
+        "timed_out" => (
+            "timed_out",
+            format!(
+                "Stopped: ran past its {} limit",
+                queue_short_duration(job.timeout_seconds)
+            ),
+        ),
+        _ => return None,
+    })
+}
+
 /// A pending or running job as the utilization recorder sees it (sm#1609).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveQueueJob {
@@ -5294,7 +5428,7 @@ fn finish_queue_job_conn_with_policy(
         SET state = ?2,
             holding_reason = CASE WHEN ?2 = 'wait_expired' THEN holding_reason ELSE NULL END,
             termination_detail_json = CASE
-                WHEN ?2 IN ('memory_exceeded', 'process_limit_exceeded', 'wait_expired') THEN termination_detail_json
+                WHEN ?2 IN ('memory_exceeded', 'process_limit_exceeded', 'wait_expired', 'cancelled') THEN termination_detail_json
                 ELSE NULL
             END,
             finished_at = ?3,
@@ -5694,8 +5828,17 @@ fn queue_job_completion_text_with_policy(
     } else {
         ""
     };
+    let cancel_text = if state == "cancelled" {
+        job.termination_detail_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<JsonValue>(raw).ok())
+            .map(|detail| queue_cancel_text(&detail))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     format!(
-        "[sm queue] {} completed: {}{}{}{}{} runtime={} queue={}. Log: {}. ID: {}{}{}",
+        "[sm queue] {} completed: {}{}{}{}{} runtime={} queue={}.{cancel_text} Log: {}. ID: {}{}{}",
         if job.label.trim().is_empty() {
             &job.id
         } else {
@@ -5713,6 +5856,27 @@ fn queue_job_completion_text_with_policy(
         wait_note,
         revived_text
     )
+}
+
+/// " Cancelled by X. Note: Y." from a cancel detail; empty for any other kind.
+fn queue_cancel_text(detail: &JsonValue) -> String {
+    if detail.get("kind").and_then(JsonValue::as_str) != Some("cancel") {
+        return String::new();
+    }
+    let mut text = String::new();
+    if let Some(by) = detail.get("cancelled_by").and_then(JsonValue::as_str) {
+        text.push_str(&format!(" Cancelled by {by}."));
+    }
+    if let Some(note) = detail.get("note").and_then(JsonValue::as_str) {
+        let note = note.split_whitespace().collect::<Vec<_>>().join(" ");
+        let stop = if note.ends_with(['.', '!', '?']) {
+            ""
+        } else {
+            "."
+        };
+        text.push_str(&format!(" Note: {note}{stop}"));
+    }
+    text
 }
 
 fn queue_duration_text(start: Option<&str>, end: Option<&str>) -> String {
@@ -6162,6 +6326,9 @@ fn list_queue_jobs_conn(
             where_clauses.push("state = ?");
             values.push(value.into());
         }
+    } else if let Some(since) = filters.finished_since {
+        where_clauses.push("(state IN ('pending', 'running') OR finished_at >= ?)");
+        values.push(since.into());
     } else if !filters.include_terminal {
         where_clauses.push("state IN ('pending', 'running')");
     }
@@ -6759,6 +6926,237 @@ mod tests {
             .contains("wait_reason=memory_pressure"));
         assert!(notifications[0].text.contains("safety_reserve=12.0 GiB"));
         drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    fn create_test_job(state_dir: &Path, job_type: &str, label: &str) -> QueueJobRecord {
+        RetainedQueueStore::create_queue_job_in_state_dir(
+            state_dir,
+            CreateQueueJob {
+                job_type: job_type.into(),
+                label: label.into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["true".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 900,
+                cpu_percent: Some(100),
+                gpu_percent: Some(0),
+                memory_bytes: Some(i64::MAX),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cancel_note_reaches_the_agent_with_who_cancelled() {
+        let state_dir = unique_temp_path("queue-cancel-note");
+        let message_queue_db = state_dir.join("messages.db");
+        let noted = create_test_job(&state_dir, "perf", "bench-ledger");
+        let plain = create_test_job(&state_dir, "perf", "plain");
+        let detail = serde_json::json!({
+            "kind": "cancel",
+            "cancelled_by": "Rajesh from the sm app",
+            "note": "machine needed\n  for a demo, rerun after 3pm",
+        });
+        let cancelled = RetainedQueueStore::cancel_queue_job_with_detail_in_state_dir(
+            &state_dir,
+            &message_queue_db,
+            &noted.id,
+            0,
+            QueueAdmissionPolicy::default(),
+            false,
+            Some(&detail),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cancelled.state, "cancelled");
+        assert_eq!(cancelled.termination_detail, Some(detail));
+        RetainedQueueStore::cancel_queue_job_in_state_dir(
+            &state_dir,
+            &message_queue_db,
+            &plain.id,
+            0,
+            QueueAdmissionPolicy::default(),
+            false,
+        )
+        .unwrap();
+        let notifications = RetainedQueueStore::new(message_queue_db)
+            .pending_messages_for_target_by_category("notify", "queue-completion", 10)
+            .unwrap();
+        assert_eq!(notifications.len(), 2);
+        let noted_text = &notifications
+            .iter()
+            .find(|message| message.text.contains("bench-ledger"))
+            .unwrap()
+            .text;
+        assert!(
+            noted_text.contains(
+                ". Cancelled by Rajesh from the sm app. Note: machine needed for a demo, rerun after 3pm. Log: "
+            ),
+            "{noted_text}"
+        );
+        let plain_text = &notifications
+            .iter()
+            .find(|message| message.text.contains("plain"))
+            .unwrap()
+            .text;
+        assert!(!plain_text.contains("Cancelled by"), "{plain_text}");
+        assert!(!plain_text.contains("Note:"), "{plain_text}");
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn cancel_text_ignores_other_details_and_adds_a_full_stop() {
+        assert_eq!(
+            queue_cancel_text(&serde_json::json!({"kind": "cancel", "note": "done!"})),
+            " Note: done!"
+        );
+        assert_eq!(
+            queue_cancel_text(
+                &serde_json::json!({"kind": "cancel", "cancelled_by": "sm-1400-scout"})
+            ),
+            " Cancelled by sm-1400-scout."
+        );
+        assert_eq!(
+            queue_cancel_text(&serde_json::json!({"process_group_rss_bytes": 1})),
+            ""
+        );
+    }
+
+    #[test]
+    fn pending_jobs_are_ordered_as_admission_examines_them() {
+        let state_dir = unique_temp_path("queue-consideration-order");
+        let old_test = create_test_job(&state_dir, "tests", "old test");
+        let background = create_test_job(&state_dir, "background", "bg");
+        let perf = create_test_job(&state_dir, "perf", "perf");
+        let new_test = create_test_job(&state_dir, "tests", "new test");
+        let running = create_test_job(&state_dir, "perf", "running");
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        for (id, queued_at) in [
+            (&old_test.id, "2026-01-01T00:00:01Z"),
+            (&background.id, "2026-01-01T00:00:00Z"),
+            (&perf.id, "2026-01-01T00:00:09Z"),
+            (&new_test.id, "2026-01-01T00:00:05Z"),
+        ] {
+            conn.execute(
+                "UPDATE queue_jobs SET queued_at = ?2 WHERE id = ?1",
+                params![id, queued_at],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE queue_jobs SET state = 'running' WHERE id = ?1",
+            params![running.id],
+        )
+        .unwrap();
+        let jobs = list_queue_jobs_conn(&conn, QueueJobFilters::default()).unwrap();
+        assert_eq!(
+            pending_queue_job_consideration_order(&jobs),
+            vec![
+                perf.id.clone(),
+                old_test.id.clone(),
+                new_test.id.clone(),
+                background.id.clone()
+            ]
+        );
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn finished_since_lists_active_jobs_and_recent_finishes_only() {
+        let state_dir = unique_temp_path("queue-finished-since");
+        let active = create_test_job(&state_dir, "tests", "active");
+        let recent = create_test_job(&state_dir, "tests", "recent");
+        let old = create_test_job(&state_dir, "tests", "old");
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        for (id, finished_at) in [
+            (&recent.id, "2026-09-28T10:00:00.5Z"),
+            (&old.id, "2026-09-26T10:00:00"),
+        ] {
+            conn.execute(
+                "UPDATE queue_jobs SET state = 'displaced', finished_at = ?2 WHERE id = ?1",
+                params![id, finished_at],
+            )
+            .unwrap();
+        }
+        let listed: Vec<String> = list_queue_jobs_conn(
+            &conn,
+            QueueJobFilters {
+                finished_since: Some("2026-09-27T10:00:00".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|job| job.id)
+        .collect();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.contains(&active.id) && listed.contains(&recent.id));
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn ended_reasons_explain_what_the_queue_stopped() {
+        let state_dir = unique_temp_path("queue-ended-reasons");
+        let base = create_test_job(&state_dir, "background", "job");
+        let with = |state: &str| QueueJobRecord {
+            state: state.into(),
+            queued_at: "2026-09-28T10:00:00Z".into(),
+            finished_at: Some("2026-09-28T10:05:30Z".into()),
+            ..base.clone()
+        };
+        assert_eq!(
+            queue_job_ended_reason(&with("displaced")),
+            Some((
+                "displaced",
+                "Stopped to make room for a perf run; not restarted".into()
+            ))
+        );
+        assert_eq!(
+            queue_job_ended_reason(&with("wait_expired")),
+            Some(("gave_up", "Never started; gave up after 5m".into()))
+        );
+        let mut memory = with("memory_exceeded");
+        assert_eq!(
+            queue_job_ended_reason(&memory).unwrap().1,
+            "Stopped: over its memory limit"
+        );
+        memory.termination_detail = Some(serde_json::json!({
+            "process_group_rss_bytes": 241_i64 * 1024 * 1024 * 1024,
+            "memory_limit_bytes": 200_i64 * 1024 * 1024 * 1024,
+        }));
+        assert_eq!(
+            queue_job_ended_reason(&memory).unwrap().1,
+            "Stopped: used 241.0 GiB against its 200.0 GiB memory limit"
+        );
+        let mut processes = with("process_limit_exceeded");
+        assert_eq!(
+            queue_job_ended_reason(&processes).unwrap().1,
+            "Stopped: over its process limit"
+        );
+        processes.peak_process_count = Some(2049);
+        processes.process_limit = Some(2048);
+        assert_eq!(
+            queue_job_ended_reason(&processes).unwrap().1,
+            "Stopped: over its process limit (2049 of 2048)"
+        );
+        assert_eq!(
+            queue_job_ended_reason(&with("timed_out")),
+            Some(("timed_out", "Stopped: ran past its 15m limit".into()))
+        );
+        for state in ["succeeded", "failed", "cancelled", "pending", "running"] {
+            assert_eq!(queue_job_ended_reason(&with(state)), None, "{state}");
+        }
+        assert_eq!(queue_short_duration(40), "40s");
+        assert_eq!(queue_short_duration(300), "5m");
+        assert_eq!(queue_short_duration(3600), "1h");
+        assert_eq!(queue_short_duration(4800), "1h 20m");
+        assert_eq!(queue_short_duration(-5), "0s");
         fs::remove_dir_all(state_dir).unwrap();
     }
 
