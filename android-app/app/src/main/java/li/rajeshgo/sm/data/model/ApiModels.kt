@@ -673,6 +673,21 @@ data class SessionJob(
     @SerialName("started_at") val startedAt: String? = null,
     @SerialName("finished_at") val finishedAt: String? = null,
     @SerialName("exit_code") val exitCode: Int? = null,
+    // Queue page fields (sm#1609); absent from older servers.
+    val type: String? = null,
+    @SerialName("notify_name") val notifyName: String? = null,
+    val cwd: String? = null,
+    val argv: List<String>? = null,
+    @SerialName("script_path") val scriptPath: String? = null,
+    @SerialName("timeout_seconds") val timeoutSeconds: Long? = null,
+    @SerialName("max_wait_seconds") val maxWaitSeconds: Long? = null,
+    @SerialName("cpu_percent") val cpuPercent: Int? = null,
+    @SerialName("gpu_percent") val gpuPercent: Int? = null,
+    @SerialName("memory_bytes") val memoryBytes: Long? = null,
+    val position: Int? = null,
+    @SerialName("wait_deadline_at") val waitDeadlineAt: String? = null,
+    @SerialName("ended_reason") val endedReason: String? = null,
+    @SerialName("ended_summary") val endedSummary: String? = null,
 ) {
     fun isAwaitedBy(sessionId: String): Boolean =
         (notifySessionId?.takeIf(String::isNotBlank) ?: requesterSessionId) == sessionId
@@ -707,6 +722,108 @@ data class HostStatus(
     @SerialName("memory_pressure") val memoryPressure: String? = null,
     @SerialName("cpu_percent") val cpuPercent: Double? = null,
     @SerialName("gpu_percent") val gpuPercent: Double? = null,
+    @SerialName("memory_available_bytes") val memoryAvailableBytes: Long? = null,
+    val source: String? = null,
+)
+
+/** `GET /client/queue` (sm#1609). */
+@Serializable
+data class QueueOverview(
+    @SerialName("generated_at") val generatedAt: String? = null,
+    @SerialName("owner_name") val ownerName: String? = null,
+    val host: HostStatus? = null,
+    val slots: QueueSlots = QueueSlots(),
+    val running: List<SessionJob> = emptyList(),
+    val queued: List<SessionJob> = emptyList(),
+    val ended: List<SessionJob> = emptyList(),
+)
+
+@Serializable
+data class SlotCount(val running: Int = 0, val max: Int = 0)
+
+@Serializable
+data class QueueSlots(
+    val running: Int = 0,
+    val max: Int = 0,
+    @SerialName("by_type") val byType: Map<String, SlotCount> = emptyMap(),
+)
+
+/** `GET /client/queue/stats`: the "Held back?" card. */
+@Serializable
+data class QueueStats(
+    val available: Boolean = false,
+    val hours: Int = 0,
+    val waiting: List<QueueWaitingGroup> = emptyList(),
+    @SerialName("by_type") val byType: List<QueueTypeStats> = emptyList(),
+)
+
+@Serializable
+data class QueueWaitingGroup(
+    val group: String = "",
+    @SerialName("job_seconds") val jobSeconds: Long = 0,
+    @SerialName("headroom_job_seconds") val headroomJobSeconds: Long = 0,
+    @SerialName("unknown_job_seconds") val unknownJobSeconds: Long = 0,
+)
+
+@Serializable
+data class QueueTypeStats(
+    val type: String = "",
+    val jobs: Int = 0,
+    @SerialName("peak_rss_p50_bytes") val peakRssP50Bytes: Long? = null,
+    @SerialName("peak_rss_p95_bytes") val peakRssP95Bytes: Long? = null,
+    @SerialName("peak_rss_max_bytes") val peakRssMaxBytes: Long? = null,
+    @SerialName("cpu_cores_p95") val cpuCoresP95: Double? = null,
+)
+
+/** `GET /client/utilization/series`: the Mac usage charts. */
+@Serializable
+data class UtilizationSeries(
+    val available: Boolean = false,
+    val hours: Int = 0,
+    @SerialName("bucket_seconds") val bucketSeconds: Long = 0,
+    val start: String? = null,
+    val end: String? = null,
+    @SerialName("memory_total_bytes") val memoryTotalBytes: Long? = null,
+    val buckets: List<UtilizationBucket> = emptyList(),
+    val summary: UtilizationSummary? = null,
+)
+
+@Serializable
+data class UtilizationBucket(
+    val start: String = "",
+    val samples: Int = 0,
+    @SerialName("cpu_avg") val cpuAvg: Double? = null,
+    @SerialName("cpu_max") val cpuMax: Double? = null,
+    @SerialName("gpu_avg") val gpuAvg: Double? = null,
+    @SerialName("gpu_max") val gpuMax: Double? = null,
+    @SerialName("mem_used_avg") val memUsedAvg: Long? = null,
+    @SerialName("mem_used_max") val memUsedMax: Long? = null,
+    @SerialName("mem_available_min") val memAvailableMin: Long? = null,
+    @SerialName("pressure_max") val pressureMax: Int? = null,
+    val running: Map<String, Double> = emptyMap(),
+    @SerialName("pending_max") val pendingMax: Int? = null,
+)
+
+@Serializable
+data class UtilizationSummary(
+    @SerialName("covered_seconds") val coveredSeconds: Long = 0,
+    @SerialName("cpu_avg") val cpuAvg: Double? = null,
+    @SerialName("cpu_busy_seconds") val cpuBusySeconds: Long = 0,
+    @SerialName("gpu_avg") val gpuAvg: Double? = null,
+    @SerialName("mem_used_max") val memUsedMax: Long? = null,
+    @SerialName("pressure_elevated_seconds") val pressureElevatedSeconds: Long = 0,
+    @SerialName("headroom_seconds") val headroomSeconds: Long = 0,
+    @SerialName("unknown_seconds") val unknownSeconds: Long = 0,
+)
+
+/** Body of `POST /queue-jobs/{id}/cancel`; a null note cancels silently. */
+@Serializable
+data class CancelQueueJobBody(val note: String? = null)
+
+@Serializable
+data class QueueJobLog(
+    @SerialName("job_id") val jobId: String = "",
+    val text: String = "",
 )
 
 /** Body of `POST /sessions/{id}/follow`; a null or blank message follows silently. */

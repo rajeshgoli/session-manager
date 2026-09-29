@@ -37,6 +37,27 @@ interface ApiService {
     @GET("client/host-status")
     suspend fun getHostStatus(): li.rajeshgo.sm.data.model.HostStatus
 
+    @GET("client/queue")
+    suspend fun getQueue(): li.rajeshgo.sm.data.model.QueueOverview
+
+    @GET("client/queue/stats")
+    suspend fun getQueueStats(@Query("hours") hours: Int): li.rajeshgo.sm.data.model.QueueStats
+
+    @GET("client/utilization/series")
+    suspend fun getUtilizationSeries(@Query("hours") hours: Int): li.rajeshgo.sm.data.model.UtilizationSeries
+
+    @POST("queue-jobs/{job_id}/cancel")
+    suspend fun cancelQueueJob(
+        @Path("job_id") jobId: String,
+        @Body request: li.rajeshgo.sm.data.model.CancelQueueJobBody,
+    ): li.rajeshgo.sm.data.model.SessionJob
+
+    @GET("queue-jobs/{job_id}/log")
+    suspend fun getQueueJobLog(
+        @Path("job_id") jobId: String,
+        @Query("lines") lines: Int,
+    ): li.rajeshgo.sm.data.model.QueueJobLog
+
     @GET("client/session-models")
     suspend fun getSessionModels(@Query("provider") provider: String, @Query("working_dir") workingDir: String): li.rajeshgo.sm.data.model.SessionModelsResponse
 
