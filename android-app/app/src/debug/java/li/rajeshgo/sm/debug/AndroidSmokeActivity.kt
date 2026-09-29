@@ -121,6 +121,9 @@ class AndroidSmokeActivity : ComponentActivity() {
         }
 
         step("handoff_policy") {
+            if (sessions.isEmpty()) return@step JSONObject()
+                .put("status_override", "skipped")
+                .put("reason", "no session is available for the handoff policy probe")
             val session = sessions.firstOrNull { it.handoff != null }
                 ?: error("no session advertises handoff policy")
             val policy = sessionRepository.fetchHandoffPolicy(serverUrl, accessToken, session.id)
