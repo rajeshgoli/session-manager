@@ -1,12 +1,17 @@
 package li.rajeshgo.sm.debug
 
 import android.os.Bundle
+import android.content.Context
+import android.content.Intent
 import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import com.jakewharton.retrofit2.converter.kotlinx.serialization.asConverterFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -34,19 +39,30 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 class AndroidSmokeActivity : ComponentActivity() {
-    private val steps = JSONArray()
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Log.i("SM_ADB_SMOKE", "android_smoke_activity_created restored=${savedInstanceState != null}")
+        // Enrollment consumes a one-time token. A configuration change must
+        // observe the existing run, never cancel it and start another POST.
+        val model = ViewModelProvider(this)[AndroidSmokeViewModel::class.java]
+        val runner = AndroidSmokeRunner(applicationContext, Intent(intent))
+        val run = model.start(runner::runSmoke)
         lifecycleScope.launch {
-            runSmoke()
+            run.join()
             finish()
         }
     }
+}
 
-    private suspend fun runSmoke() {
+private class AndroidSmokeRunner(
+    private val applicationContext: Context,
+    private val intent: Intent,
+) {
+    private val steps = JSONArray()
+
+    suspend fun runSmoke() {
         val reportFileName = requiredExtra("report_file", DEFAULT_REPORT_FILE)
-        val reportFile = File(filesDir, reportFileName)
+        val reportFile = File(applicationContext.filesDir, reportFileName)
         reportFile.delete()
 
         val serverUrl = requiredExtra("server_url").trim().trimEnd('/')
@@ -221,6 +237,8 @@ class AndroidSmokeActivity : ComponentActivity() {
         val payload = try {
             block()
         } catch (error: Throwable) {
+            // A step-local timeout is reportable; cancellation of the run is not.
+            currentCoroutineContext().ensureActive()
             val result = JSONObject()
                 .put("id", id)
                 .put("status", "blocked")
@@ -280,6 +298,7 @@ class AndroidSmokeActivity : ComponentActivity() {
             try {
                 return block()
             } catch (error: Throwable) {
+                currentCoroutineContext().ensureActive()
                 lastError = error
                 if (attempt < SMOKE_READ_ATTEMPTS - 1) {
                     delay(SMOKE_READ_RETRY_DELAY_MS)
