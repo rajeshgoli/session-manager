@@ -4,6 +4,7 @@
 //! path and the commit the owner will read. The server only stores pointers.
 
 use super::*;
+mod cat;
 #[cfg(test)]
 use crate::git_repo::{parse_github_remote, ToolOutput};
 use crate::git_repo::{resolve_repo_slug, run_ok, DocTools, ProcessTools};
@@ -16,6 +17,8 @@ pub(crate) struct DocArgs {
 
 #[derive(Subcommand)]
 enum DocCommand {
+    /// Print a published doc or local file as compact Markdown
+    Cat(cat::DocCatArgs),
     /// Publish a committed, pushed doc for the owner to read
     Publish(DocPublishArgs),
     /// List docs (default: your session and its descendants)
@@ -76,6 +79,7 @@ struct DocRetractArgs {
 
 pub(crate) fn run_doc(client: &ApiClient, args: DocArgs) -> Result<()> {
     match args.command {
+        DocCommand::Cat(args) => cat::run(client, args),
         DocCommand::Publish(args) => run_doc_publish(client, args),
         DocCommand::List(args) => run_doc_list(client, args),
         DocCommand::Show(args) => run_doc_show(client, args),
@@ -635,6 +639,7 @@ fn review_line(review: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::{cell::RefCell, collections::VecDeque};
 
     #[test]

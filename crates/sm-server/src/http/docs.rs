@@ -1611,7 +1611,29 @@ pub(super) async fn get_owner_doc_subpath(
     if query.format.as_deref() == Some("json") {
         return doc_metadata_response(&state, &doc, request.headers());
     }
-    view_doc_response(&state, &doc, &commit_sha).await
+    match query.format.as_deref() {
+        Some("raw") => raw_doc_response(&state, &doc, &commit_sha).await,
+        Some("markdown") => {
+            let bytes = load_doc_bytes_async(&state, &doc, &commit_sha).await?;
+            let bytes = if crate::doc_markdown::is_html(&doc.path) {
+                crate::doc_markdown::convert(
+                    std::str::from_utf8(&bytes).map_err(|error| bad_request(error.to_string()))?,
+                )?
+                .into_bytes()
+            } else {
+                bytes
+            };
+            Ok((
+                [
+                    (CONTENT_TYPE, "text/markdown; charset=utf-8"),
+                    (CACHE_CONTROL, "private, no-cache"),
+                ],
+                bytes,
+            )
+                .into_response())
+        }
+        _ => view_doc_response(&state, &doc, &commit_sha).await,
+    }
 }
 
 fn readable_not_found(error: ReadableDocError) -> ApiError {

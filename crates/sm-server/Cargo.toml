@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+htmd = "=0.5.5"
+markup5ever_rcdom = "0.38"
 anyhow = { workspace = true }
 axum = { workspace = true, features = ["multipart", "ws"] }
 base64 = { workspace = true }
