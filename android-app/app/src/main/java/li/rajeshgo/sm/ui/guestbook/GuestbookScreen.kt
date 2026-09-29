@@ -263,25 +263,24 @@ private fun GuestbookCard(
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column(Modifier.padding(horizontal = 14.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            // Name on its own line: sharing a row with the id and time cut it to a few letters.
+            Column {
                 Text(
                     entry.sessionName.ifBlank { entry.sessionId.take(8) },
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = 1,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false),
                 )
                 Text(
-                    "  " + entry.sessionId.take(8),
+                    "${entry.sessionId.take(8)} · ${signedLabel(entry.signedAt, now)}",
                     style = MaterialTheme.typography.labelSmall,
                     fontFamily = FontFamily.Monospace,
                     color = TextMuted,
                     maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
-                Box(Modifier.weight(1f))
-                Text(signedLabel(entry.signedAt, now), style = MaterialTheme.typography.labelSmall, color = TextMuted, maxLines = 1)
             }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Pill(guestbookModelLabel(entry), Violet)
