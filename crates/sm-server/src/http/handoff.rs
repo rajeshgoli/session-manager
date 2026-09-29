@@ -53,7 +53,7 @@ fn ensure_owner(
 
 /// `https://sm.example.com` matches host `sm.example.com`. Non-browser
 /// clients (the app, sm watch) send no Origin and skip this check.
-fn origin_matches_host(origin: &str, host: Option<&str>) -> bool {
+pub(super) fn origin_matches_host(origin: &str, host: Option<&str>) -> bool {
     let Some(host) = host else {
         return false;
     };

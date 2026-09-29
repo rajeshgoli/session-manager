@@ -236,6 +236,17 @@ fn fixture() -> Fixture {
 }
 
 fn fixture_with_push(sender: Option<Arc<RecordingSender>>) -> Fixture {
+    fixture_options(sender, |_| {})
+}
+
+fn fixture_config(configure: impl FnOnce(&mut AppConfig)) -> Fixture {
+    fixture_options(None, configure)
+}
+
+fn fixture_options(
+    sender: Option<Arc<RecordingSender>>,
+    configure: impl FnOnce(&mut AppConfig),
+) -> Fixture {
     let dir = temp_dir();
     let state_file = dir.join("sessions.json");
     let session = |id: &str, completion: Option<&str>| {
@@ -293,7 +304,9 @@ fn fixture_with_push(sender: Option<Arc<RecordingSender>>) -> Fixture {
         }
         issues.insert(9, (false, Vec::new(), None));
     }
+    configure(&mut config);
     let state = AppState::new(config)
+        .with_work_item_source(Arc::new(BoardClaimItems))
         .with_board_source(Arc::new(board.clone()))
         .with_owner_doc_source(Arc::new(StubDocs))
         .with_push_sender(sender.map(|sender| sender as Arc<dyn PushSender>));
@@ -816,4 +829,296 @@ async fn queue_job_carries_its_lane() {
     assert_eq!(status, StatusCode::OK, "{job}");
     assert_eq!(job["lane_rank"], Value::Null);
     assert_eq!(job["lane_goal"], Value::Null);
+}
+
+struct BoardClaimItems;
+impl sm_server::work_claims::WorkItemSource for BoardClaimItems {
+    fn fetch(
+        &self,
+        repo: &str,
+        numbers: &[i64],
+    ) -> Result<sm_server::work_claims::BatchFetch, String> {
+        use sm_server::work_claims::{GhItem, ItemFetch, WorkKind};
+        Ok(numbers
+            .iter()
+            .map(|n| {
+                (
+                    *n,
+                    ItemFetch::Found(Box::new(GhItem {
+                        kind: WorkKind::Ticket,
+                        title: format!("Ticket {n}"),
+                        state: "open".into(),
+                        state_reason: None,
+                        url: format!("https://github.com/{repo}/issues/{n}"),
+                        head_ref: None,
+                        head_sha: None,
+                        closed_at: None,
+                        merged_at: None,
+                        closing_refs: None,
+                        is_draft: false,
+                    })),
+                )
+            })
+            .collect())
+    }
+}
+
+fn start_fixture() -> Fixture {
+    fixture_config(|config| {
+        config.google_auth.session_cookie_secret = Some("board-test-secret".into());
+        config.google_auth.allowlist_emails = vec!["owner@example.com".into()];
+        config.board.checkouts.insert(REPO.into(), "/tmp".into());
+    })
+}
+
+fn owner_token() -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let body = URL_SAFE_NO_PAD.encode(json!({"v":1,"type":"device_access","email":"owner@example.com","name":"Owner","iat":now,"exp":now+3600}).to_string());
+    let mut mac = Hmac::<Sha256>::new_from_slice(b"board-test-secret").unwrap();
+    mac.update(body.as_bytes());
+    format!(
+        "smat_{body}.{}",
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    )
+}
+
+async fn owner_request(
+    f: &Fixture,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {}", owner_token()))
+        .header("content-type", "application/json")
+        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))))
+        .body(body.map_or_else(Body::empty, |v| Body::from(v.to_string())))
+        .unwrap();
+    let response = f.app.clone().oneshot(req).await.unwrap();
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+fn start_body(number: i64) -> Value {
+    json!({"repo":REPO,"number":number,"provider":"claude","model":"opus[1m]","reasoning_effort":"high"})
+}
+
+#[tokio::test]
+async fn board_page_renders_lanes_server_side_and_nav_has_board_tab() {
+    let f = fixture();
+    add_goal(&f).await;
+    let request = Request::builder()
+        .uri("/board")
+        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 49152))))
+        .body(Body::empty())
+        .unwrap();
+    let response = f.app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers()["content-type"]
+        .to_str()
+        .unwrap()
+        .contains("text/html"));
+    let html = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("Ticket 1"));
+    assert!(html.contains("Ticket 2"));
+    assert!(html.contains("data-start=\"2\""));
+    assert!(html.contains("href=\"/board\""));
+    assert!(html.contains("id=board-badge"));
+    let (_, json) = request_json_board(&f).await;
+    assert_eq!(json["lanes"][0]["goal"]["number"], 1);
+}
+
+async fn request_json_board(f: &Fixture) -> (StatusCode, Value) {
+    request(&f.app, "GET", "/board?format=json", None).await
+}
+
+#[tokio::test]
+async fn start_refuses_needs_you_and_held_ticket() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    f.claim(2, "eng00001");
+    let (status, body) =
+        owner_request(&f, "POST", "/client/board/start", Some(start_body(2))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["detail"].as_str().unwrap().contains("eng00001-agent"));
+    f.message("eng00001", "Please decide").await;
+    let (status, body) =
+        owner_request(&f, "POST", "/client/board/start", Some(start_body(2))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["detail"], "#2 is waiting on you");
+}
+
+#[tokio::test]
+async fn start_reserves_claim_and_creates_root_session_and_holder_can_setup() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    let (status, body) =
+        owner_request(&f, "POST", "/client/board/start", Some(start_body(2))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["name"], "widgets-2");
+    let id = body["session_id"].as_str().unwrap();
+    let (_, session) = request(&f.app, "GET", &format!("/sessions/{id}"), None).await;
+    assert!(session["parent_session_id"].is_null(), "{session}");
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    let (holder,source): (String,String) = conn.query_row("SELECT session_id,source FROM work_claims WHERE repo=?1 AND number=2 AND ended_at IS NULL",[REPO],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!(holder, id);
+    assert_eq!(source, "spawn");
+    // The CLI starts --setup-worktree by claiming again. It must get AlreadyHeld,
+    // with the same claim id, then be allowed to record its worktree.
+    let (status, claim) = request(
+        &f.app,
+        "POST",
+        "/claims",
+        Some(json!({"requester_session_id":id,"repo":REPO,"number":2,"kind":"ticket"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{claim}");
+    assert_eq!(claim["outcome"], "already_held");
+    assert!(claim["worktree_naming"]["root"].is_string(), "{claim}");
+    for state in ["intent", "created"] {
+        let (status, recorded) = request(
+            &f.app,
+            "POST",
+            "/claims/worktree",
+            Some(json!({
+                "requester_session_id": id, "claim_id": claim["claim"]["id"], "state": state,
+                "worktree_path": f.dir.join("worktrees/widgets-2").to_string_lossy(),
+                "branch": "2-ticket", "base_sha": "a".repeat(40),
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{recorded}");
+    }
+
+    let (status, again) =
+        owner_request(&f, "POST", "/client/board/start", Some(start_body(2))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{again}");
+    let (_, board) = request_json_board(&f).await;
+    assert!(board["lanes"][0]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["text"] == "Started widgets-2 on #2"));
+}
+
+#[tokio::test]
+async fn start_drops_reservation_on_failure() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    // Make the log directory a file: session creation fails after reservation.
+    fs::write(f.dir.join("logs"), "not a directory").unwrap();
+    let body = start_body(2);
+    let (status, result) = owner_request(&f, "POST", "/client/board/start", Some(body)).await;
+    assert!(!status.is_success(), "{result}");
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM work_claims WHERE repo=?1 AND number=2 AND ended_at IS NULL",
+            [REPO],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn start_rejects_missing_closed_and_unsigned() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    let (status, _) = request(&f.app, "POST", "/client/board/start", Some(start_body(2))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = owner_request(&f, "POST", "/client/board/start", Some(start_body(999))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    f.board.issues.lock().unwrap().get_mut(&2).unwrap().0 = false;
+    f.state.run_board_pass().unwrap();
+    let (status, body) =
+        owner_request(&f, "POST", "/client/board/start", Some(start_body(2))).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+#[tokio::test]
+async fn start_rejects_new_blockers_cycles_and_merged_unclosed_tickets() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    for cycle in [false, true] {
+        f.board.issues.lock().unwrap().get_mut(&2).unwrap().1 = vec![3];
+        if cycle {
+            f.board.issues.lock().unwrap().get_mut(&3).unwrap().1 = vec![2];
+        }
+        pass(&f).await;
+        let (status, body) =
+            owner_request(&f, "POST", "/client/board/start", Some(start_body(2))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    }
+    f.board
+        .issues
+        .lock()
+        .unwrap()
+        .get_mut(&2)
+        .unwrap()
+        .1
+        .clear();
+    f.board
+        .issues
+        .lock()
+        .unwrap()
+        .get_mut(&3)
+        .unwrap()
+        .1
+        .clear();
+    pass(&f).await;
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    conn.execute("INSERT INTO board_prs (repo,issue_number,pr_repo,pr_number,pr_state,url) VALUES (?1,2,?1,99,'MERGED','https://github.com/acme/widgets/pull/99')",[REPO]).unwrap();
+    let (status, body) =
+        owner_request(&f, "POST", "/client/board/start", Some(start_body(2))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM work_claims", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn start_rechecks_readiness_after_github_fetch_before_claiming() {
+    use sm_server::work_claims::{BatchFetch, WorkItemSource};
+    struct LateBlocker(PathBuf);
+    impl WorkItemSource for LateBlocker {
+        fn fetch(&self, repo: &str, numbers: &[i64]) -> Result<BatchFetch, String> {
+            Connection::open(&self.0).unwrap().execute("INSERT INTO board_edges (waiter_repo,waiter_number,blocker_repo,blocker_number,kind,source,first_seen_at) VALUES (?1,2,?1,3,'after','github','2026-09-29T00:00:00Z')",[REPO]).unwrap();
+            BoardClaimItems.fetch(repo, numbers)
+        }
+    }
+    let mut f = start_fixture();
+    add_goal(&f).await;
+    f.state = f
+        .state
+        .clone()
+        .with_work_item_source(Arc::new(LateBlocker(f.dir.join("message_queue.db"))));
+    f.app = router(f.state.clone());
+    let (status, body) =
+        owner_request(&f, "POST", "/client/board/start", Some(start_body(2))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM work_claims", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
 }

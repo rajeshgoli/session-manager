@@ -368,8 +368,9 @@ pub(super) struct BoardQuery {
     #[serde(default)]
     lane: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)] // The page (ticket #1683) answers requests without it.
     format: Option<String>,
+    #[serde(default)]
+    html: bool,
 }
 
 fn lane_filter(query: &BoardQuery) -> Result<Option<Key>, ApiError> {
@@ -386,20 +387,42 @@ fn lane_filter(query: &BoardQuery) -> Result<Option<Key>, ApiError> {
     }
 }
 
-/// `GET /board`: the board JSON.
+/// `GET /board`: the owner page, or board JSON when explicitly requested.
 pub(super) async fn get_board(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
     Query(query): Query<BoardQuery>,
-) -> Result<Json<Value>, ApiError> {
-    ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/board")?;
+    request: Request,
+) -> Result<Response, ApiError> {
+    let wants_json = query.format.as_deref() == Some("json")
+        || request
+            .headers()
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("application/json"));
+    if wants_json {
+        ensure_session_allowed_from_parts(
+            &state.config,
+            request.headers(),
+            Some(peer_addr),
+            "/board",
+        )?;
+    } else {
+        ensure_owner_page_read_allowed(&state, &request)?;
+    }
     let filter = lane_filter(&query)?;
     let payload = blocking(&state, move |state| {
         Ok(board_payload(state, filter.as_ref())?)
     })
     .await?;
-    Ok(Json(payload))
+    if wants_json {
+        Ok(Json(payload).into_response())
+    } else {
+        Ok(super::history::html_response(
+            StatusCode::OK,
+            super::board_page::page(&payload),
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -547,7 +570,79 @@ pub(super) async fn post_lane(
     Ok(Json(body))
 }
 
-/// The owner's write guard: a signed-in owner, as Start now on the queue.
+/// Board and its model picker accept either verified browser-owner login or
+/// the existing mobile owner guard. Browser writes also require same-origin.
+pub(super) fn owner_guard(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_addr: SocketAddr,
+    method: &str,
+    uri: &Uri,
+    signed_write: bool,
+) -> Result<String, ApiError> {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
+    *request.headers_mut() = headers.clone();
+    request.extensions_mut().insert(ConnectInfo(peer_addr));
+    if request_cloudflare_access_application(state, &request)
+        == Some(CloudflareAccessApplication::Browser)
+        && !is_request_local_bypass(state, &request)
+    {
+        let assertion =
+            header_text(headers, "cf-access-jwt-assertion").ok_or_else(|| ApiError::Status {
+                status: StatusCode::FORBIDDEN,
+                detail: "Browser owner login required".into(),
+            })?;
+        let context = classify_cloudflare_access_assertion_cached(
+            state,
+            CloudflareAccessApplication::Browser,
+            &assertion,
+        )
+        .map_err(cloudflare_access_error)?;
+        let email = context
+            .email
+            .as_deref()
+            .filter(|email| allowlisted_google_email(&state.config, email))
+            .ok_or_else(|| ApiError::Status {
+                status: StatusCode::UNAUTHORIZED,
+                detail: "Owner login required".into(),
+            })?;
+        if method != "GET" {
+            if header_text(headers, handoff::SESSION_HEADER).is_some() {
+                return Err(ApiError::Status {
+                    status: StatusCode::FORBIDDEN,
+                    detail: "Board actions are owner-only".into(),
+                });
+            }
+            let origin = header_text(headers, "origin");
+            let host =
+                header_text(headers, "x-forwarded-host").or_else(|| header_text(headers, "host"));
+            if !origin
+                .as_deref()
+                .is_some_and(|origin| handoff::origin_matches_host(origin, host.as_deref()))
+            {
+                return Err(ApiError::Status {
+                    status: StatusCode::FORBIDDEN,
+                    detail: "Origin does not match host".into(),
+                });
+            }
+        }
+        return Ok(follows::follow_owner_id(&state.config, Some(email)));
+    }
+    let owner = follows::owner_guard(state, headers, peer_addr, method, uri)?;
+    if signed_write && authenticated_user(headers, &state.config).is_none() {
+        return Err(ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Only the owner, signed in to sm, changes the board or starts agents"
+                .to_owned(),
+        });
+    }
+    Ok(owner)
+}
+
 fn owner_write_guard(
     state: &AppState,
     headers: &HeaderMap,
@@ -555,25 +650,22 @@ fn owner_write_guard(
     method: &str,
     uri: &Uri,
 ) -> Result<(), ApiError> {
-    follows::owner_guard(state, headers, peer_addr, method, uri)?;
-    if authenticated_user(headers, &state.config).is_none() {
-        return Err(ApiError::Status {
-            status: StatusCode::FORBIDDEN,
-            detail: "Only the owner, signed in to sm, orders or ends lanes".to_owned(),
-        });
-    }
-    Ok(())
+    owner_guard(state, headers, peer_addr, method, uri, true).map(|_| ())
 }
 
 /// `GET /client/board`: the board JSON, for the app.
 pub(super) async fn client_board(
     State(state): State<Arc<AppState>>,
+    Query(query): Query<BoardQuery>,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    follows::owner_guard(&state, &headers, peer_addr, "GET", &uri)?;
-    let payload = blocking(&state, |state| Ok(board_payload(state, None)?)).await?;
+    owner_guard(&state, &headers, peer_addr, "GET", &uri, false)?;
+    let mut payload = blocking(&state, |state| Ok(board_payload(state, None)?)).await?;
+    if query.html {
+        payload["html"] = json!(super::board_page::render(&payload));
+    }
     Ok(Json(payload))
 }
 
@@ -675,7 +767,7 @@ pub(super) async fn client_board_badge(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    follows::owner_guard(&state, &headers, peer_addr, "GET", &uri)?;
+    owner_guard(&state, &headers, peer_addr, "GET", &uri, false)?;
     let count = blocking(&state, |state| {
         let store = board_store(state);
         let (board, _) = store.board(&outside(state)?, time::OffsetDateTime::now_utc())?;
@@ -693,7 +785,7 @@ pub(super) async fn client_board_seen(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let owner = follows::owner_guard(&state, &headers, peer_addr, "POST", &uri)?;
+    let owner = owner_guard(&state, &headers, peer_addr, "POST", &uri, false)?;
     blocking(&state, move |state| {
         let now = time::OffsetDateTime::now_utc();
         board_store(state).set_seen(&owner, now)?;
@@ -718,7 +810,254 @@ pub(super) async fn client_board_refresh(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    follows::owner_guard(&state, &headers, peer_addr, "POST", &uri)?;
+    owner_guard(&state, &headers, peer_addr, "POST", &uri, false)?;
     request_pass(&state);
     Ok(StatusCode::ACCEPTED)
+}
+
+/// Resolve once on the server so both the model catalog and Start use the same checkout.
+fn checkout(config: &AppConfig, repo: &str) -> Result<String, ApiError> {
+    checkout_in(config, repo, &expand_home("~/projects"))
+}
+
+fn checkout_in(
+    config: &AppConfig,
+    repo: &str,
+    projects: &std::path::Path,
+) -> Result<String, ApiError> {
+    if let Some(path) = config.board.checkouts.get(repo) {
+        return Ok(expand_home(path).to_string_lossy().into_owned());
+    }
+    let path = projects.join(repo.rsplit('/').next().unwrap_or(repo));
+    let path = path.to_string_lossy().into_owned();
+    if git_origin_github_repo(&path).as_deref() == Some(repo) {
+        return Ok(path);
+    }
+    Err(ApiError::Status {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        detail: format!(
+            "sm doesn't know where {repo} is checked out; set board.checkouts in config"
+        ),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct StartOptionsQuery {
+    repo: String,
+    number: i64,
+}
+
+fn start_options_payload(state: &AppState, key: &Key) -> Result<Value, ApiError> {
+    let input = board_store(state).input(&outside(state)?)?;
+    let item = input
+        .items
+        .get(key)
+        .ok_or(ApiError::NotFound("Ticket not on the board"))?;
+    Ok(json!({
+        "working_dir": checkout(&state.config, &key.0)?,
+        "name": format!("{}-{}", key.0.rsplit('/').next().unwrap_or(&key.0), key.1).chars().take(32).collect::<String>(),
+        "brief": format!("Work ticket #{} in {}: {}\n{}\n\nYou already hold the claim on #{}. Run `sm ticket {} --setup-worktree` and work in the worktree it prints, then follow this repo's CLAUDE.md.", key.1, key.0, item.title, item.url, key.1, key.1),
+    }))
+}
+
+pub(super) async fn start_options(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Query(query): Query<StartOptionsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    owner_guard(&state, &headers, peer_addr, "GET", &uri, false)?;
+    let key = ticket_key(&query.repo, query.number)?;
+    Ok(Json(
+        blocking(&state, move |state| start_options_payload(state, &key)).await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct StartRequest {
+    repo: String,
+    number: i64,
+    provider: String,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    name: Option<String>,
+    brief: Option<String>,
+}
+
+pub(super) async fn client_start(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(payload): Json<StartRequest>,
+) -> Result<Json<Value>, ApiError> {
+    owner_write_guard(&state, &headers, peer_addr, "POST", &uri)?;
+    ensure_core_writes_enabled(&state)?;
+    start(state, payload).await.map(Json)
+}
+
+/// Called again under the board lock immediately before reserving the claim.
+pub(super) fn validate_start(state: &AppState, key: &Key) -> Result<Vec<i64>, ApiError> {
+    let (board, input) =
+        board_store(state).board(&outside(state)?, time::OffsetDateTime::now_utc())?;
+    let item = input
+        .items
+        .get(key)
+        .ok_or(ApiError::NotFound("Ticket not on the board"))?;
+    if !item.is_open() {
+        return Err(ApiError::Status {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail: format!("#{} is closed", key.1),
+        });
+    }
+    if let Some(facts) = board.facts.get(key) {
+        if facts.needs_you.is_some() {
+            return Err(ApiError::Status {
+                status: StatusCode::CONFLICT,
+                detail: format!("#{} is waiting on you", key.1),
+            });
+        }
+        if let Some(holder) = &facts.holder {
+            return Err(ApiError::Status {
+                status: StatusCode::CONFLICT,
+                detail: format!(
+                    "#{} is held by {} ({})",
+                    key.1,
+                    holder.name,
+                    holder.state.as_str()
+                ),
+            });
+        }
+    }
+    let facts = board
+        .facts
+        .get(key)
+        .ok_or(ApiError::NotFound("Ticket not on the board"))?;
+    if facts.state != crate::board::model::TicketState::Ready
+        || facts.warnings.contains(&"merged_not_closed")
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: format!("#{} is no longer ready to start; refresh the board", key.1),
+        });
+    }
+    let lanes: Vec<i64> = board
+        .lanes
+        .iter()
+        .filter(|lane| lane.contains(key))
+        .map(|lane| lane.lane.id)
+        .collect();
+    Ok(lanes)
+}
+
+async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, ApiError> {
+    if !matches!(payload.provider.as_str(), "claude" | "codex-fork") {
+        return Err(bad_request("provider must be claude or codex-fork"));
+    }
+    let key = ticket_key(&payload.repo, payload.number)?;
+    let checked_key = key.clone();
+    let (options, lanes) = blocking(&state, move |state| {
+        let lanes = validate_start(state, &checked_key)?;
+        Ok((start_options_payload(state, &checked_key)?, lanes))
+    })
+    .await?;
+    let id = state.session_store.allocate_session_id()?;
+    let name = trimmed(&payload.name)
+        .unwrap_or_else(|| options["name"].as_str().unwrap_or_default().to_owned());
+    let reservation = claims::reserve_spawn_ticket(&state, claims::SpawnTicket {
+        session_id: &id, check_board: true, name: Some(&name), parent: None, ticket: key.1, repo: &key.0,
+        worktree_path: None, branch: None,
+    }).await.map_err(|error| match error {
+        ApiError::StatusBody { status: StatusCode::CONFLICT, body } => ApiError::StatusBody {
+            status: StatusCode::CONFLICT,
+            body: json!({"detail": format!("#{} was claimed while starting; refresh the board", key.1), "holders": body["holders"]}),
+        },
+        other => other,
+    })?;
+    let created = create_session_from_request(
+        state.clone(),
+        CreateCoreSessionRequest {
+            id: Some(id),
+            name: Some(name.clone()),
+            working_dir: options["working_dir"].as_str().map(str::to_owned),
+            provider: Some(payload.provider),
+            model: payload.model,
+            reasoning_effort: payload.reasoning_effort,
+            initial_message: Some(
+                trimmed(&payload.brief)
+                    .unwrap_or_else(|| options["brief"].as_str().unwrap_or_default().to_owned()),
+            ),
+            parent_session_id: None,
+            node: None,
+            wait: None,
+            spawn_prompt_source: None,
+            spawn_brief: None,
+        },
+    )
+    .await;
+    claims::finish_spawn_ticket(&state, &reservation, created.is_ok());
+    let session = created?;
+    // Session creation is committed. A reporting failure must not invite a duplicate Start.
+    for lane in lanes {
+        if let Err(error) = board::record_event(
+            &board_store(&state),
+            "agent_started",
+            Some(lane),
+            Some(&key),
+            Some((&session.id, &name)),
+            Some(&name),
+            time::OffsetDateTime::now_utc(),
+        ) {
+            eprintln!("board agent_started event failed: {error:#}");
+        }
+    }
+    request_pass(&state);
+    Ok(json!({"session_id": session.id, "name": name}))
+}
+
+#[cfg(test)]
+mod start_tests {
+    use super::*;
+
+    #[test]
+    fn start_resolves_checkout() {
+        let root = std::env::temp_dir().join(format!(
+            "board-checkout-{}-{}",
+            std::process::id(),
+            time::OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.as_path().join("widgets");
+        std::fs::create_dir(&path).unwrap();
+        let mut config = AppConfig::default();
+        assert!(checkout_in(&config, "acme/widgets", root.as_path()).is_err());
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args(["remote", "add", "origin", "git@github.com:acme/widgets.git"])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            checkout_in(&config, "acme/widgets", root.as_path()).unwrap(),
+            path.to_string_lossy()
+        );
+        assert!(checkout_in(&config, "other/widgets", root.as_path()).is_err());
+        config.board.checkouts.insert(
+            "acme/widgets".into(),
+            root.as_path().to_string_lossy().into_owned(),
+        );
+        assert_eq!(
+            checkout_in(&config, "acme/widgets", root.as_path()).unwrap(),
+            root.as_path().to_string_lossy()
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

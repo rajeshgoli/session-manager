@@ -323,6 +323,7 @@ pub enum GitHubPullRequestState {
 mod agent_history;
 mod analytics;
 mod board;
+mod board_page;
 mod claims;
 mod docs;
 mod follows;
@@ -1594,6 +1595,8 @@ pub fn router(state: AppState) -> Router {
         .route("/board/links", post(board::post_link))
         .route("/board/lanes", post(board::post_lane))
         .route("/client/board", get(board::client_board))
+        .route("/client/board/start", post(board::client_start))
+        .route("/client/board/start-options", get(board::start_options))
         .route("/client/board/order", put(board::put_order))
         .route("/client/board/lanes", post(board::client_post_lane))
         .route(
@@ -2603,14 +2606,15 @@ async fn client_session_models(
     Query(query): Query<SessionModelsQuery>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-    ensure_public_edge_assertion_for_request(&state, &request)?;
-    ensure_session_read_allowed(&state, &request)?;
-    ensure_mobile_cloudflare_access_context_matches_optional_actor(
-        &state,
-        access_context.as_ref(),
-        request_actor_email(&state.config, &request).as_deref(),
-    )?;
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|p| p.0)
+        .ok_or_else(|| ApiError::Status {
+            status: StatusCode::FORBIDDEN,
+            detail: "Missing peer address".into(),
+        })?;
+    board::owner_guard(&state, request.headers(), peer, "GET", request.uri(), false)?;
     if !matches!(query.provider.as_str(), "claude" | "codex" | "codex-fork") {
         return Err(ApiError::Status {
             status: StatusCode::BAD_REQUEST,
@@ -4244,8 +4248,9 @@ async fn spawn_session(
                 &state,
                 claims::SpawnTicket {
                     session_id: &id,
+                    check_board: false,
                     name: payload.name.as_deref(),
-                    parent: &parent,
+                    parent: Some(&parent),
                     ticket,
                     repo: &ticket_repo,
                     worktree_path: trimmed(&payload.ticket_worktree_path),
@@ -14284,6 +14289,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/board"
         || path == "/client/board"
         || path == "/client/board/badge"
+        || path == "/client/board/start-options"
         || path == "/history"
         || path == "/history/agents"
         || path == "/guestbook"
@@ -22274,6 +22280,100 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["handoff"]["state"], "asked", "{body}");
         assert!(body.get("context_percent").is_some(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn board_apis_accept_browser_owner_and_reject_other_origins_and_agents() {
+        let mut config = google_auth_config();
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        config.paths.state_file = write_session_state("board-browser", "running");
+        config.rust_core.fixture_writes_enabled = true;
+        config.rust_core.runtime_enabled = false;
+        let state = AppState::new(config);
+        seed_cloudflare_access_jwks(&state);
+        let app = router(state);
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        for uri in [
+            "/client/board?html=true",
+            "/client/board/badge",
+            "/client/session-models?provider=claude",
+        ] {
+            let (status, body) = browser_host_get(&app, uri, Some(&owner)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        }
+        let (status, _) = browser_host_get(
+            &app,
+            "/client/board/start-options?repo=acme/widgets&number=999",
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        for (uri, body, success) in [
+            ("/client/board/seen", json!({}), StatusCode::NO_CONTENT),
+            ("/client/board/refresh", json!({}), StatusCode::ACCEPTED),
+            (
+                "/client/board/start",
+                json!({"repo":"acme/widgets","number":999,"provider":"claude"}),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            for (origin, agent, expected) in [
+                ("https://sm.example.com", false, success),
+                ("https://evil.example", false, StatusCode::FORBIDDEN),
+                ("https://sm.example.com", true, StatusCode::FORBIDDEN),
+            ] {
+                let mut headers = vec![
+                    ("cf-access-jwt-assertion", owner.as_str()),
+                    ("origin", origin),
+                ];
+                if agent {
+                    headers.push(("x-sm-session", "board-browser"));
+                }
+                let request = handoff_json_request(
+                    public_request_with_host(
+                        Method::POST,
+                        uri,
+                        Body::from(body.to_string()),
+                        "sm.example.com",
+                    ),
+                    &headers,
+                );
+                let response = app.clone().oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                assert_eq!(
+                    status,
+                    expected,
+                    "{uri}: {}",
+                    String::from_utf8_lossy(&bytes)
+                );
+            }
+        }
+        for (aud, email, exp, expected) in [
+            (
+                "sm-browser-aud",
+                "stranger@example.com",
+                4_102_444_800,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "wrong-audience",
+                "rajeshgoli@gmail.com",
+                4_102_444_800,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "sm-browser-aud",
+                "rajeshgoli@gmail.com",
+                1_700_000_100,
+                StatusCode::FORBIDDEN,
+            ),
+        ] {
+            let token = test_browser_access_assertion(aud, email, exp);
+            let (status, _) = browser_host_get(&app, "/client/board", Some(&token)).await;
+            assert_eq!(status, expected);
+        }
     }
 
     #[tokio::test]

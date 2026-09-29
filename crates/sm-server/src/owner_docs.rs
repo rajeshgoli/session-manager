@@ -1863,7 +1863,7 @@ body {{ margin: 0; background: var(--k0); color: var(--kt); font: 14px/1.45 var(
 a {{ color: inherit; text-decoration: none; }}
 .wrap {{ max-width: 60rem; margin: 0 auto; padding: 0 12px 48px; }}
 .top {{ position: sticky; top: 0; z-index: 1; background: var(--k0); display: flex;
-  align-items: center; gap: 16px; padding: 12px 4px 10px; margin-bottom: 12px;
+  align-items: center; flex-wrap: wrap; gap: 16px; padding: 12px 4px 10px; margin-bottom: 12px;
   border-bottom: 1px solid var(--kl); }}
 .brand {{ font: 700 15px var(--mono); color: var(--kc); }}
 .tab {{ color: var(--kt3); padding-bottom: 2px; }}
@@ -1915,15 +1915,39 @@ h2.lbl {{ margin: 18px 0 4px; font-weight: 400; }}
 </head>
 <body>
 <div class="wrap">
-<nav class="top"><a class="brand" href="/">sm</a>{inbox}{watch}{history}{guestbook}<span class="sp"></span>{status}</nav>
+<nav class="top"><a class="brand" href="/">sm</a>{inbox}{watch}{board}{history}{guestbook}<span class="sp"></span>{status}</nav>
 {body}
 </div>
+<script>
+(() => {{
+  const badge = document.getElementById('board-badge');
+  async function update() {{
+    if (document.hidden) return;
+    try {{
+      const response = await fetch('/client/board/badge', {{credentials:'same-origin'}});
+      if (!response.ok) return;
+      const value = await response.json();
+      badge.textContent = String(value.count || '');
+      badge.hidden = !value.count;
+    }} catch (_) {{}}
+  }}
+  window.addEventListener('sm-board-seen', update);
+  window.addEventListener('focus', update);
+  setInterval(update, 30000);
+  update();
+}})();
+</script>
 </body>
 </html>
 "#,
         title = escape_html(title),
         inbox = tab("inbox", "/inbox", "Inbox"),
         watch = tab("watch", "/", "Watch"),
+        board = tab(
+            "board",
+            "/board",
+            "Board<span id=board-badge class=chip hidden></span>"
+        ),
         history = tab("history", "/history", "History"),
         guestbook = tab("guestbook", "/guestbook", "Guestbook"),
     )
