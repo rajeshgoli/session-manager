@@ -280,13 +280,19 @@ pub(super) async fn submit_owner_doc_review(
     .await
     .map_err(|error| anyhow::anyhow!("PR lookup task failed: {error}"))?
     .map_err(github_failure)?;
-    if !pr.is_open() {
-        return Err(conflict(format!(
-            "PR #{pr_number} is {}, so the doc is read-only",
-            pr.state
-        )));
-    }
-    if payload.hold {
+    let mut target = if !pr.is_open() {
+        Some(super::reopen::target(state, doc).await?)
+    } else {
+        None
+    };
+    if let Some(target) = target.as_mut() {
+        let stem = StdPath::new(&doc.path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("doc");
+        target["branch"] = json!(format!("sm-doc/{stem}-{}", &submission_id[..8]));
+        target["hold"] = json!(payload.hold);
+    } else if payload.hold {
         super::super::merge_holds::change(
             state.clone(),
             super::super::merge_holds::HoldRequest {
@@ -301,15 +307,16 @@ pub(super) async fn submit_owner_doc_review(
         .await?;
     }
     let bytes = load_doc_bytes_async(state, doc, &sha).await?;
-    let (review, inserted) = store.begin_review(
+    let (review, inserted) = store.begin_review_target(
         &submission_id,
         &doc.id,
         &sha,
         &git_blob_sha(&bytes),
         verdict,
         body.as_deref(),
+        target.as_ref(),
     )?;
-    run_blocking(state, review, inserted.then_some(pr)).await
+    run_blocking(state, review, (inserted && target.is_none()).then_some(pr)).await
 }
 
 async fn run_blocking(
@@ -317,6 +324,7 @@ async fn run_blocking(
     review: OwnerDocReview,
     fresh: Option<DocPullRequest>,
 ) -> Result<Value, ApiError> {
+    super::reopen::prepare(state, &review).await?;
     let state = state.clone();
     let result = tokio::task::spawn_blocking(move || run_submission(&state, review, fresh))
         .await
@@ -333,9 +341,14 @@ fn run_submission(
     fresh: Option<DocPullRequest>,
 ) -> Result<OwnerDocReview, ApiError> {
     let store = owner_doc_store(state);
-    let doc = store
+    let mut doc = store
         .get(&review.doc_id)?
         .ok_or(ApiError::NotFound("Doc not found"))?;
+    let target = store.review_target(&review.id)?;
+    if let Some(pr) = target.as_ref().and_then(|t| t["target_pr"].as_i64()) {
+        doc.pr_number = Some(pr);
+    }
+    let body_only = target.as_ref().is_some_and(|t| t["kind"] == "new_pr");
     let pr_number = doc
         .pr_number
         .ok_or_else(|| conflict("This doc has no PR, so it is read-only"))?;
@@ -345,7 +358,22 @@ fn run_submission(
         .filter(|draft| draft.commit_sha == review.commit_sha)
         .collect();
     let verdict = OwnerDocVerdict::parse(&review.verdict).unwrap_or(OwnerDocVerdict::Comment);
-    let body = review_body(verdict, review.body.as_deref(), &review.id);
+    let mut body = review_body(verdict, review.body.as_deref(), &review.id);
+    if body_only && !drafts.is_empty() {
+        body.push_str(&format!(
+            "\n\nComments on {}, written against {}:\n",
+            doc.path,
+            &review.commit_sha[..7]
+        ));
+        for (i, draft) in drafts.iter().enumerate() {
+            body.push_str(&format!(
+                "\n{}.\n> {}\n\n{}\n",
+                i + 1,
+                draft.quote.replace('\n', "\n> "),
+                draft.body
+            ));
+        }
+    }
     let marker = review_marker(&review.id);
     let source = state.owner_doc_source.as_ref();
 
@@ -396,7 +424,8 @@ fn run_submission(
     // checked: an older one resolves against the diff at that commit, which
     // may still hold the doc (spec F7). A failed lookup leaves the answer to
     // GitHub.
-    if !drafts.is_empty()
+    if !body_only
+        && !drafts.is_empty()
         && review.commit_sha == pr.head_sha
         && matches!(
             source.pr_changes_path(&doc.repo, pr_number, &doc.path),
@@ -409,7 +438,15 @@ fn run_submission(
             doc_not_in_pr_diff(pr_number, &doc.path)
         )));
     }
-    let pending_id = match source.add_pending_review(&pr.node_id, &review.commit_sha, &body) {
+    let pending_id = match source.add_pending_review(
+        &pr.node_id,
+        if body_only {
+            &pr.head_sha
+        } else {
+            &review.commit_sha
+        },
+        &body,
+    ) {
         Ok(id) => id,
         // The review may exist even though the response was lost: look for
         // it by marker before calling the attempt failed.
@@ -460,7 +497,13 @@ fn post_and_submit(
     let source = state.owner_doc_source.as_ref();
     let mut existing = existing;
     let (mut line_comments, mut file_comments) = (0i64, 0i64);
-    for draft in drafts {
+    let body_only = owner_doc_store(state)
+        .review_target(&review.id)?
+        .is_some_and(|t| t["kind"] == "new_pr");
+    if body_only {
+        file_comments = drafts.len() as i64;
+    }
+    for draft in drafts.iter().filter(|_| !body_only) {
         let text = comment_body(draft);
         if let Some(position) = existing.iter().position(|(posted, _)| *posted == text) {
             let (_, has_line) = existing.remove(position);
@@ -593,8 +636,16 @@ fn finish_from_github(
     drafts: &[OwnerDocDraft],
     submitted: &DocReviewOnGitHub,
 ) -> Result<OwnerDocReview, ApiError> {
+    let body_only = owner_doc_store(state)
+        .review_target(&review.id)?
+        .is_some_and(|t| t["kind"] == "new_pr");
     let line_comments = submitted.comments.iter().filter(|(_, line)| *line).count() as i64;
     let file_comments = submitted.comments.len() as i64 - line_comments;
+    let (line_comments, file_comments) = if body_only {
+        (0, drafts.len() as i64)
+    } else {
+        (line_comments, file_comments)
+    };
     finish(
         state,
         doc,
@@ -629,6 +680,7 @@ fn finish(
                 .flatten()
         })
         .map(|h| h.placed_message());
+    let target = owner_doc_store(state).review_target(&review.id)?;
     let wake = review_wake_recipient(state, doc).map(|session_id| {
         (session_id, {
             let mut text = render_owner_review_wake(
@@ -639,6 +691,10 @@ fn finish(
                 line_comments,
                 file_comments,
             );
+            if let Some(t) = target.as_ref().filter(|t|t["kind"] == "new_pr") {
+                text.push_str(&format!("\nOpened PR #{} from {} for this review.",t["target_pr"],t["base"].as_str().unwrap_or("")));
+                if t["doc_changed"] == true {text.push_str("\nThe document changed since the reviewed revision; comments quote the original text.");}
+            }
             if let Some(line) = &hold_line {
                 text.push_str(&format!("\n{line}"));
             }
@@ -813,13 +869,9 @@ pub(in crate::http) fn recover_owner_doc_reviews(state: Arc<AppState>) {
         };
         for review in pending {
             let id = review.id.clone();
-            let task_state = state.clone();
-            match tokio::task::spawn_blocking(move || run_submission(&task_state, review, None))
-                .await
-            {
-                Ok(Ok(review)) => eprintln!("Owner doc review {id} recovered: {}", review.status),
-                Ok(Err(error)) => eprintln!("Owner doc review {id} recovery failed: {error:?}"),
-                Err(error) => eprintln!("Owner doc review {id} recovery task failed: {error}"),
+            match run_blocking(&state, review, None).await {
+                Ok(_) => eprintln!("Owner doc review {id} recovered"),
+                Err(error) => eprintln!("Owner doc review {id} recovery failed: {error:?}"),
             }
         }
     });

@@ -466,6 +466,7 @@ pub struct AppState {
     /// PR state and head per `(repo, pr)` for owner docs, cached for 30s.
     owner_doc_pr_cache: Arc<Mutex<docs::DocPullRequestCache>>,
     /// Serializes owner doc review submits and their reconciliation.
+    owner_doc_reopen_cache: Arc<Mutex<BTreeMap<String, (std::time::Instant, Value)>>>,
     owner_doc_review_lock: Arc<AsyncMutex<()>>,
     /// Serializes owner message replies with their draft writes (sm#1580).
     owner_message_lock: Arc<AsyncMutex<()>>,
@@ -598,6 +599,7 @@ impl AppState {
             github_review_poster: Arc::new(GhCliReviewPoster),
             owner_doc_source: Arc::new(docs::GhCliDocSource),
             owner_doc_pr_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            owner_doc_reopen_cache: Arc::new(Mutex::new(BTreeMap::new())),
             owner_doc_review_lock: Arc::new(AsyncMutex::new(())),
             owner_message_lock: Arc::new(AsyncMutex::new(())),
             work_item_source: Arc::new(claims::GhCliWorkItemSource),
