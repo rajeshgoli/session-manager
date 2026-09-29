@@ -2578,8 +2578,13 @@ async fn read_utilization(
     state: &AppState,
     read: impl FnOnce(&std::path::Path) -> anyhow::Result<Value> + Send + 'static,
 ) -> Result<Json<Value>, ApiError> {
-    // Turning the recorder off retires its history from the app too.
-    if !state.config.utilization.enabled {
+    // Only a server that records may serve the history: turning the recorder
+    // off retires it, and a scratch (runtime off) or non-macOS server never
+    // records, so it must not present another server's samples.
+    if !state.config.utilization.enabled
+        || !state.config.rust_core.runtime_enabled
+        || !cfg!(target_os = "macos")
+    {
         return Ok(Json(json!({"available": false})));
     }
     let db_path = expand_home(&state.config.utilization.db_path);
@@ -20653,7 +20658,10 @@ mod tests {
         disabled.utilization.db_path = db_path.to_string_lossy().into_owned();
         let mut enabled = disabled.clone();
         enabled.utilization.enabled = true;
-        for (config, available) in [(enabled, true), (disabled, false)] {
+        enabled.rust_core.runtime_enabled = true;
+        let mut scratch = enabled.clone();
+        scratch.rust_core.runtime_enabled = false;
+        for (config, available) in [(enabled, true), (disabled, false), (scratch, false)] {
             let response = router(AppState::new(config))
                 .oneshot(local_request(
                     Method::GET,
