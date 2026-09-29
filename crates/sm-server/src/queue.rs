@@ -1,7 +1,7 @@
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs::{self, OpenOptions},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -4509,14 +4509,18 @@ fn finish_live_queue_job_until_recorded(
 }
 
 fn process_group_rss_bytes(pgid: i64) -> Option<i64> {
+    parse_process_group_rss_bytes(&process_group_rss_listing()?, pgid)
+}
+
+fn process_group_rss_listing() -> Option<String> {
     let output = Command::new("ps")
         .args(["-axo", "pgid=,rss="])
         .output()
         .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_process_group_rss_bytes(&String::from_utf8_lossy(&output.stdout), pgid)
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn parse_process_group_rss_bytes(text: &str, pgid: i64) -> Option<i64> {
@@ -4529,6 +4533,23 @@ fn parse_process_group_rss_bytes(text: &str, pgid: i64) -> Option<i64> {
         })
         .try_fold(0i64, |total, rss_kib| total.checked_add(rss_kib))?
         .checked_mul(1024)
+}
+
+/// Resident bytes per process group, from one `ps` listing.
+fn parse_rss_bytes_by_process_group(text: &str) -> HashMap<i64, i64> {
+    let mut totals = HashMap::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(Ok(pgid)), Some(Ok(rss_kib))) = (
+            fields.next().map(str::parse::<i64>),
+            fields.next().map(str::parse::<i64>),
+        ) else {
+            continue;
+        };
+        let total: &mut i64 = totals.entry(pgid).or_default();
+        *total = total.saturating_add(rss_kib.saturating_mul(1024));
+    }
+    totals
 }
 
 /// The sample that made the perf memory guard stop a job. It is persisted
@@ -4581,9 +4602,10 @@ impl PerfMemoryGuardTrip {
     }
 }
 
-/// Returns the trip when this sample requires termination. When several
-/// conditions hold, the job's own overrun wins, then host pressure, then
-/// missing telemetry; the recorded measurements show the others.
+/// Returns the trip when this sample requires termination: the job's own
+/// overrun wins over missing telemetry, and the recorded measurements show
+/// the other. Host pressure is not a per-job trip; the host memory guard
+/// picks one job for every type (sm#1626).
 fn perf_memory_sample_trip(
     memory_limit: i64,
     rss: Option<i64>,
@@ -4600,8 +4622,6 @@ fn perf_memory_sample_trip(
     let available = host.map(|(_, available)| available);
     let cause = if rss.is_some_and(|rss| rss > memory_limit) {
         MEMORY_GUARD_JOB_OVER_BUDGET
-    } else if available.is_some_and(|available| available < reserve) {
-        MEMORY_GUARD_HOST_PRESSURE
     } else if *failed_host_samples >= 2 {
         MEMORY_GUARD_HOST_UNAVAILABLE
     } else {
@@ -4626,10 +4646,7 @@ fn mark_queue_job_memory_terminating_conn(
     job_id: &str,
     trip: &PerfMemoryGuardTrip,
 ) -> Result<()> {
-    eprintln!(
-        "queue perf memory guard stopping {job_id}: {}",
-        trip.to_json()
-    );
+    eprintln!("queue memory guard stopping {job_id}: {}", trip.to_json());
     conn.execute(
         r#"
         UPDATE queue_jobs
@@ -4651,6 +4668,113 @@ fn mark_queue_job_memory_terminating_in_state_dir(
     let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db"))?;
     init_queue_jobs_schema(&conn)?;
     mark_queue_job_memory_terminating_conn(&conn, job_id, trip)
+}
+
+/// How often the host memory guard reads available memory.
+const HOST_MEMORY_GUARD_INTERVAL: StdDuration = StdDuration::from_secs(1);
+/// After one stop, memory gets this long to come back before another.
+const HOST_MEMORY_GUARD_STOP_SPACING: StdDuration = StdDuration::from_secs(10);
+/// Jobs below this resident size are never stopped for host pressure:
+/// stopping them frees nothing that matters.
+const HOST_MEMORY_GUARD_MIN_VICTIM_RSS: i64 = 512 * 1024 * 1024;
+
+/// The running job the host memory guard stops next, with its process group
+/// and resident bytes: the largest job not already being stopped, cancelled,
+/// or displaced, and at least [`HOST_MEMORY_GUARD_MIN_VICTIM_RSS`].
+fn host_pressure_victim<'a>(
+    jobs: &'a [QueueJobRuntimeRecord],
+    rss_by_pgid: &HashMap<i64, i64>,
+) -> Option<(&'a QueueJobRuntimeRecord, i64, i64)> {
+    jobs.iter()
+        .filter(|job| job.state == "running" && job.holding_reason.is_none())
+        .filter_map(|job| {
+            let pgid = job.process_group_id.or(job.pid)?;
+            let rss = *rss_by_pgid.get(&pgid)?;
+            (rss >= HOST_MEMORY_GUARD_MIN_VICTIM_RSS).then_some((job, pgid, rss))
+        })
+        .max_by(|(a, _, a_rss), (b, _, b_rss)| a_rss.cmp(b_rss).then_with(|| b.id.cmp(&a.id)))
+}
+
+/// One host memory guard check. When available memory is below the reserve,
+/// records the chosen job as `memory_terminating` with cause
+/// `host_memory_pressure` and returns it with its process group to stop.
+/// The job's own watcher then finishes it as `memory_exceeded`.
+fn host_memory_guard_pass(
+    conn: &Connection,
+    host: Option<(i64, i64)>,
+    configured_reserve: i64,
+    rss_by_pgid: &HashMap<i64, i64>,
+) -> Result<Option<(String, i64)>> {
+    let reserve = effective_memory_reserve_bytes(configured_reserve);
+    let Some(available) = host
+        .map(|(_, available)| available)
+        .filter(|available| *available < reserve)
+    else {
+        return Ok(None);
+    };
+    let jobs = list_queue_job_runtime_records_conn(conn)?;
+    let Some((job, pgid, rss)) = host_pressure_victim(&jobs, rss_by_pgid) else {
+        return Ok(None);
+    };
+    let trip = PerfMemoryGuardTrip {
+        cause: MEMORY_GUARD_HOST_PRESSURE,
+        sampled_at: now_rfc3339(),
+        process_group_rss_bytes: Some(rss),
+        memory_limit_bytes: job.memory_bytes,
+        host_available_bytes: Some(available),
+        effective_reserve_bytes: Some(reserve),
+        failed_host_samples: 0,
+    };
+    mark_queue_job_memory_terminating_conn(conn, &job.id, &trip)?;
+    // A cancel or displacement that won the race keeps the job.
+    let marked = get_queue_job_runtime_conn(conn, &job.id)?
+        .is_some_and(|job| job.holding_reason.as_deref() == Some("memory_terminating"));
+    Ok(marked.then(|| (job.id.clone(), pgid)))
+}
+
+/// Stops sm jobs of every type, one at a time, while the host is below its
+/// memory reserve, so agents' jobs never run the machine out of memory.
+pub fn spawn_host_memory_guard(
+    state_dir: PathBuf,
+    cancel_grace_seconds: u64,
+    admission_policy: QueueAdmissionPolicy,
+) {
+    thread::spawn(move || {
+        let reserve = effective_memory_reserve_bytes(admission_policy.memory_min_free_bytes);
+        let mut last_stop: Option<Instant> = None;
+        loop {
+            thread::sleep(HOST_MEMORY_GUARD_INTERVAL);
+            if last_stop.is_some_and(|stopped| stopped.elapsed() < HOST_MEMORY_GUARD_STOP_SPACING) {
+                continue;
+            }
+            let host = host_memory_capacity();
+            if host.is_none_or(|(_, available)| available >= reserve) {
+                continue;
+            }
+            let Some(listing) = process_group_rss_listing() else {
+                continue;
+            };
+            let rss_by_pgid = parse_rss_bytes_by_process_group(&listing);
+            let outcome =
+                open_queue_jobs_connection(&state_dir.join("queue_runner.db")).and_then(|conn| {
+                    host_memory_guard_pass(
+                        &conn,
+                        host,
+                        admission_policy.memory_min_free_bytes,
+                        &rss_by_pgid,
+                    )
+                });
+            match outcome {
+                Ok(Some((job_id, pgid))) => {
+                    last_stop = Some(Instant::now());
+                    eprintln!("queue host memory guard stopping {job_id} (process group {pgid})");
+                    terminate_process_group_with_grace(pgid, cancel_grace_seconds);
+                }
+                Ok(None) => {}
+                Err(error) => eprintln!("queue host memory guard check failed: {error:#}"),
+            }
+        }
+    });
 }
 
 /// Caller-facing termination reason. For `memory_exceeded` it names the
@@ -7481,22 +7605,19 @@ mod tests {
         assert_eq!(both.cause, "memory_budget");
         assert_eq!(both.host_available_bytes, Some(reserve - 1));
 
-        let pressure = perf_memory_sample_trip(
+        // Host pressure alone is the host memory guard's call, not this job's.
+        assert!(perf_memory_sample_trip(
             240 * GIB,
             Some(20 * GIB),
             pressured_host,
             8 * GIB,
-            &mut failed,
+            &mut failed
         )
-        .unwrap();
-        assert_eq!(pressure.cause, "host_memory_pressure");
-        assert_eq!(pressure.process_group_rss_bytes, Some(20 * GIB));
-
-        // Process inspection can fail without hiding host pressure.
-        let pressure_no_rss =
-            perf_memory_sample_trip(240 * GIB, None, pressured_host, 8 * GIB, &mut failed).unwrap();
-        assert_eq!(pressure_no_rss.cause, "host_memory_pressure");
-        assert_eq!(pressure_no_rss.process_group_rss_bytes, None);
+        .is_none());
+        assert!(
+            perf_memory_sample_trip(240 * GIB, None, pressured_host, 8 * GIB, &mut failed)
+                .is_none()
+        );
 
         assert!(perf_memory_sample_trip(
             240 * GIB,
@@ -7603,6 +7724,254 @@ mod tests {
         assert!(!text.contains("termination=memory_budget"), "{text}");
         drop(conn);
         fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    fn running_job_with_pgid(
+        state_dir: &Path,
+        job_type: &str,
+        label: &str,
+        pgid: i64,
+    ) -> QueueJobRecord {
+        let job = RetainedQueueStore::create_queue_job_in_state_dir(
+            state_dir,
+            CreateQueueJob {
+                job_type: job_type.into(),
+                label: label.into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec!["true".into()]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 600,
+                cpu_percent: None,
+                gpu_percent: None,
+                memory_bytes: None,
+            },
+        )
+        .unwrap();
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET state = 'running', started_at = ?2, pid = ?3, process_group_id = ?3 WHERE id = ?1",
+            params![job.id, now_rfc3339(), pgid],
+        )
+        .unwrap();
+        job
+    }
+
+    #[test]
+    fn host_memory_guard_stops_the_largest_job_of_any_type_only_under_pressure() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        const MIB: i64 = 1024 * 1024;
+        let state_dir = unique_temp_path("host-memory-guard-victim");
+        let tests = running_job_with_pgid(&state_dir, "tests", "big tests", 101);
+        let background = running_job_with_pgid(&state_dir, "background", "small bg", 102);
+        let service = running_job_with_pgid(&state_dir, "service", "tiny svc", 103);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let reserve = effective_memory_reserve_bytes(8 * GIB);
+        let rss: HashMap<i64, i64> = [(101, 30 * GIB), (102, 2 * GIB), (103, 100 * MIB)]
+            .into_iter()
+            .collect();
+
+        // Enough headroom: nothing is stopped.
+        assert_eq!(
+            host_memory_guard_pass(&conn, Some((256 * GIB, reserve)), 8 * GIB, &rss).unwrap(),
+            None
+        );
+        // Unknown host memory: nothing is stopped either.
+        assert_eq!(
+            host_memory_guard_pass(&conn, None, 8 * GIB, &rss).unwrap(),
+            None
+        );
+
+        // Under pressure the largest job goes first, whatever its type.
+        let host = Some((256 * GIB, reserve - 1));
+        assert_eq!(
+            host_memory_guard_pass(&conn, host, 8 * GIB, &rss).unwrap(),
+            Some((tests.id.clone(), 101))
+        );
+        let marked = get_queue_job_conn(&conn, &tests.id).unwrap().unwrap();
+        assert_eq!(marked.holding_reason.as_deref(), Some("memory_terminating"));
+        let detail = marked.termination_detail.unwrap();
+        assert_eq!(detail["cause"], "host_memory_pressure");
+        assert_eq!(detail["process_group_rss_bytes"], 30 * GIB);
+        assert_eq!(detail["host_available_bytes"], reserve - 1);
+
+        // A job already being stopped is not picked again; the next largest is.
+        assert_eq!(
+            host_memory_guard_pass(&conn, host, 8 * GIB, &rss).unwrap(),
+            Some((background.id.clone(), 102))
+        );
+        // Jobs under 512 MiB are never stopped for host pressure.
+        assert_eq!(
+            host_memory_guard_pass(&conn, host, 8 * GIB, &rss).unwrap(),
+            None
+        );
+        assert_eq!(
+            get_queue_job_conn(&conn, &service.id)
+                .unwrap()
+                .unwrap()
+                .holding_reason,
+            None
+        );
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn host_memory_guard_leaves_a_job_that_is_already_being_cancelled() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let state_dir = unique_temp_path("host-memory-guard-cancel-race");
+        let job = running_job_with_pgid(&state_dir, "background", "cancelling", 201);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        conn.execute(
+            "UPDATE queue_jobs SET holding_reason = 'cancelling' WHERE id = ?1",
+            params![job.id],
+        )
+        .unwrap();
+        let rss: HashMap<i64, i64> = [(201, 40 * GIB)].into_iter().collect();
+        let host = Some((256 * GIB, 0));
+        assert_eq!(
+            host_memory_guard_pass(&conn, host, 8 * GIB, &rss).unwrap(),
+            None
+        );
+        assert_eq!(
+            get_queue_job_conn(&conn, &job.id)
+                .unwrap()
+                .unwrap()
+                .holding_reason
+                .as_deref(),
+            Some("cancelling")
+        );
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn host_memory_guard_stop_finishes_a_tests_job_as_memory_exceeded_with_host_pressure() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let state_dir = unique_temp_path("host-memory-guard-tests-job");
+        let message_queue_db = state_dir.join("messages.db");
+        let job = running_job_with_pgid(&state_dir, "tests", "suite", 301);
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let rss: HashMap<i64, i64> = [(301, 12 * GIB)].into_iter().collect();
+        host_memory_guard_pass(&conn, Some((256 * GIB, GIB)), 8 * GIB, &rss)
+            .unwrap()
+            .unwrap();
+        // The job's own watcher sees its process exit and records the outcome.
+        finish_queue_job_in_state_dir_if_running(
+            &state_dir,
+            &message_queue_db,
+            &job.id,
+            "failed",
+            Some(143),
+            0,
+            QueueAdmissionPolicy::default(),
+        )
+        .unwrap();
+        let finished = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+        assert_eq!(finished.state, "memory_exceeded");
+        assert_eq!(
+            queue_job_termination_reason(&finished.state, finished.termination_detail.as_ref())
+                .as_deref(),
+            Some("host_memory_pressure")
+        );
+        let notifications = RetainedQueueStore::new(message_queue_db)
+            .pending_messages_for_target_by_category("notify", "queue-completion", 10)
+            .unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(
+            notifications[0]
+                .text
+                .contains("termination=host_memory_pressure"),
+            "{}",
+            notifications[0].text
+        );
+        drop(conn);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    /// Real processes end to end: a job holding 700 MiB is found by the real
+    /// `ps` listing, stopped by process group, and finished by its own
+    /// monitor as host-pressure `memory_exceeded`. Needs python3; run with
+    /// `--ignored host_memory_guard_stops_a_real_job`.
+    #[test]
+    #[ignore]
+    fn host_memory_guard_stops_a_real_job() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let state_dir = unique_temp_path("host-memory-guard-real");
+        let message_queue_db = state_dir.join("messages.db");
+        let job = RetainedQueueStore::create_queue_job_in_state_dir(
+            &state_dir,
+            CreateQueueJob {
+                job_type: "tests".into(),
+                label: "memory hog".into(),
+                requester_session_id: Some("requester".into()),
+                notify_session_id: "notify".into(),
+                cwd: "/tmp".into(),
+                argv: Some(vec![
+                    "python3".into(),
+                    "-c".into(),
+                    "import time; b = b'x' * (700 * 2**20); time.sleep(120)".into(),
+                ]),
+                script: None,
+                env: BTreeMap::new(),
+                timeout_seconds: 300,
+                cpu_percent: None,
+                gpu_percent: None,
+                memory_bytes: None,
+            },
+        )
+        .unwrap();
+        let started = RetainedQueueStore::start_queue_job_in_state_dir(
+            &state_dir,
+            &message_queue_db,
+            &job.id,
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(started.state, "running");
+        let conn = open_queue_jobs_connection(&state_dir.join("queue_runner.db")).unwrap();
+        let deadline = Instant::now() + StdDuration::from_secs(30);
+        let (job_id, pgid) = loop {
+            let rss = parse_rss_bytes_by_process_group(&process_group_rss_listing().unwrap());
+            if let Some(victim) =
+                host_memory_guard_pass(&conn, Some((256 * GIB, 0)), 8 * GIB, &rss).unwrap()
+            {
+                break victim;
+            }
+            assert!(Instant::now() < deadline, "job never reached 512 MiB");
+            thread::sleep(StdDuration::from_millis(200));
+        };
+        assert_eq!(job_id, job.id);
+        terminate_process_group_with_grace(pgid, 2);
+        let deadline = Instant::now() + StdDuration::from_secs(30);
+        let finished = loop {
+            let row = get_queue_job_conn(&conn, &job.id).unwrap().unwrap();
+            if row.state != "running" {
+                break row;
+            }
+            assert!(Instant::now() < deadline, "monitor never finished the job");
+            thread::sleep(StdDuration::from_millis(200));
+        };
+        assert_eq!(finished.state, "memory_exceeded");
+        assert_eq!(
+            queue_job_termination_reason(&finished.state, finished.termination_detail.as_ref())
+                .as_deref(),
+            Some("host_memory_pressure")
+        );
+        assert!(!process_group_exists(pgid));
+        drop(conn);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn rss_listing_sums_each_process_group() {
+        let totals = parse_rss_bytes_by_process_group("  10 100\n 10 50\n 11 7\nbad line\n");
+        assert_eq!(totals.get(&10), Some(&(150 * 1024)));
+        assert_eq!(totals.get(&11), Some(&(7 * 1024)));
+        assert_eq!(totals.len(), 2);
     }
 
     #[test]
