@@ -332,7 +332,12 @@ impl World {
             .summaries(None, false)?
             .iter()
             .map(|summary| {
-                let fact = facts.get(&summary.doc.id).cloned().unwrap_or_default();
+                let mut fact = facts.get(&summary.doc.id).cloned().unwrap_or_default();
+                // A verdict describes the revision it was given on; a newer
+                // revision the owner only read has none.
+                if summary.state != OwnerDocState::Reviewed {
+                    fact.latest_verdict = None;
+                }
                 let mut newest_at = norm(&summary.published_at);
                 if let Some(at) = fact.latest_review_at.as_deref().map(norm) {
                     newest_at = newest_at.max(at);

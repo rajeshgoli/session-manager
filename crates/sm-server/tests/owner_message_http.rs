@@ -778,6 +778,69 @@ async fn inbox_groups_threads_by_what_they_need() {
 }
 
 #[tokio::test]
+async fn a_verdict_shows_only_while_the_latest_revision_has_it() {
+    use sm_server::owner_docs::{
+        git_blob_sha, OwnerDocStore, OwnerDocVerdict, PostedOwnerDocReview, PublishOwnerDoc,
+    };
+    let f = fixture();
+    let doc = publish_doc(&f, "eng00001", "docs/memo.md", true);
+    let store = OwnerDocStore::new(f.dir.join("message_queue.db"));
+    store
+        .begin_review(
+            "sub-verdict-1",
+            &doc,
+            &"a".repeat(40),
+            &"b".repeat(40),
+            OwnerDocVerdict::Approve,
+            None,
+        )
+        .unwrap();
+    store
+        .finish_review(
+            "sub-verdict-1",
+            &PostedOwnerDocReview {
+                github_review_id: Some(1),
+                github_review_url: "https://github.com/acme/widgets/pull/12#r1".into(),
+                posted_at: None,
+                line_comment_count: 0,
+                file_comment_count: 0,
+                draft_ids: Vec::new(),
+                wake: None,
+            },
+        )
+        .unwrap();
+    let key = format!("doc:{doc}");
+    let reviewed = row(&inbox(&f, "docs").await, &key);
+    assert_eq!(reviewed["status"], "reviewed");
+    assert_eq!(reviewed["verdict"], "approve");
+    assert_eq!(reviewed["preview"], "You reviewed · Approved");
+    // A newer revision, then read: no verdict for it.
+    store
+        .publish(
+            PublishOwnerDoc {
+                repo: "acme/widgets".into(),
+                path: "docs/memo.md".into(),
+                pr_number: Some(12),
+                session_id: "eng00001".into(),
+                session_name: Some("eng00001-agent".into()),
+                title: "Queue memo".into(),
+                note: None,
+                commit_sha: "c".repeat(40),
+                blob_sha: git_blob_sha(b"v2"),
+                review_requested: false,
+                checkout_root: None,
+            },
+            |_| true,
+        )
+        .unwrap();
+    store.record_view(&doc, &git_blob_sha(b"v2")).unwrap();
+    let read = row(&inbox(&f, "docs").await, &key);
+    assert_eq!(read["status"], "read");
+    assert_eq!(read["verdict"], Value::Null);
+    assert_eq!(read["preview"], "Read");
+}
+
+#[tokio::test]
 async fn a_review_request_from_an_ended_agent_is_new_not_needs_you() {
     let f = fixture();
     let doc = publish_doc(&f, "orphan01", "docs/memo.md", true);
