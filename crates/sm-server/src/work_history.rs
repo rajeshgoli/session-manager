@@ -632,23 +632,30 @@ impl HistoryData {
                 history_path: history_path(repo, number),
             });
         }
-        let mut docs: Vec<(&str, &HistoryDoc)> = Vec::new();
+        // Each agent's docs order by its own latest publish; an author with
+        // no publish of its own falls back to the doc's creation.
+        let mut docs: Vec<(&str, &HistoryDoc, i128)> = Vec::new();
         for doc in &self.docs {
-            let mut sessions: BTreeSet<&str> = doc
-                .publishes
-                .iter()
-                .map(|p| p.session_id.as_str())
-                .collect();
-            sessions.insert(doc.summary.doc.author_session_id.as_str());
+            let mut latest: BTreeMap<&str, i128> = BTreeMap::new();
+            for publish in &doc.publishes {
+                let at = nanos(&publish.published_at);
+                latest
+                    .entry(publish.session_id.as_str())
+                    .and_modify(|best| *best = (*best).max(at))
+                    .or_insert(at);
+            }
+            latest
+                .entry(doc.summary.doc.author_session_id.as_str())
+                .or_insert_with(|| nanos(&doc.summary.doc.created_at));
             docs.extend(
-                sessions
+                latest
                     .into_iter()
-                    .filter(|id| session_ids.contains(id))
-                    .map(|id| (id, doc)),
+                    .filter(|(id, _)| session_ids.contains(id))
+                    .map(|(id, at)| (id, doc, at)),
             );
         }
-        docs.sort_by_key(|(_, doc)| std::cmp::Reverse(nanos(&doc.summary.published_at)));
-        for (session, doc) in docs {
+        docs.sort_by_key(|(_, _, at)| std::cmp::Reverse(*at));
+        for (session, doc, _) in docs {
             let entry = work.entry(session.to_owned()).or_default();
             if entry.docs.len() < AGENT_WORK_LIMIT {
                 entry.docs.push(row_doc(doc));

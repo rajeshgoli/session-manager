@@ -994,6 +994,17 @@ fn agent_work_gathers_claims_reviews_and_docs_newest_first() {
             params!["d".repeat(40)],
         )
         .unwrap();
+    // eng1's own doc, after its revision of d1; eng2 republishing d1 later
+    // must not lift d1 above it in eng1's list.
+    db.doc("d2", None, "eng1", "2026-09-24T04:30:00Z");
+    db.conn
+        .execute(
+            "INSERT INTO owner_doc_publishes (doc_id, commit_sha, blob_sha, session_id,
+                review_requested, published_at)
+             VALUES ('d1', ?1, 'b3', 'eng2', 0, '2026-09-24T06:00:00Z')",
+            params!["e".repeat(40)],
+        )
+        .unwrap();
     let data = db.load();
     let work = data.agent_work(&["eng1", "eng2", "asleep"].into_iter().collect());
     let eng1 = &work["eng1"];
@@ -1004,7 +1015,10 @@ fn agent_work_gathers_claims_reviews_and_docs_newest_first() {
     assert_eq!(eng1.prs[0].url, "https://github.com/acme/widgets/pull/12");
     assert_eq!(eng1.prs[1].state, "merged");
     assert_eq!(eng1.prs[1].history_path, "/t/widgets/9");
-    assert_eq!(eng1.docs.len(), 1);
+    // eng1 last touched d2 at 04:30 and d1 at 03:40; eng2's 06:00 revision
+    // of d1 does not count for eng1.
+    let doc_ids = |docs: &[RowDoc]| docs.iter().map(|d| d.id.clone()).collect::<Vec<_>>();
+    assert_eq!(doc_ids(&eng1.docs), vec!["d2", "d1"]);
     assert_eq!(work["eng2"].docs[0].id, "d1");
     assert!(work["eng2"].tickets.is_empty());
     // Sessions outside the set, or with nothing, are absent.
