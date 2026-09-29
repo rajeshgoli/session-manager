@@ -203,6 +203,9 @@ data class ClientSession(
     val parentSessionId: String? = null,
     @SerialName("last_handoff_path")
     val lastHandoffPath: String? = null,
+    @SerialName("context_percent")
+    val contextPercent: Double? = null,
+    val handoff: HandoffPolicy? = null,
     @SerialName("agent_status_text")
     val agentStatusText: String? = null,
     @SerialName("agent_status_at")

@@ -1327,6 +1327,10 @@ private fun SessionRow(
                             )
                             Spacer(Modifier.height(6.dp))
                         }
+                        li.rajeshgo.sm.ui.handoff.handoffSummary(session)?.let { summary ->
+                            Text(summary, style = MaterialTheme.typography.bodySmall, color = TextSecondary)
+                            Spacer(Modifier.height(6.dp))
+                        }
                         val secondaryLine = buildString {
                             if (parentLabel != "-") {
                                 append("Parent ")
@@ -1409,6 +1413,7 @@ private fun SessionRow(
                             }
                         }
                     }
+                    li.rajeshgo.sm.ui.handoff.ContextHandoffSection(session)
                     AgentWorkSections(session, onOpenPage, follow)
                     if (hasSummary || whatState?.status?.let { it != "idle" } == true) {
                         AgentDisclosure("Summary", relativeSummaryAge(whatState?.entries?.lastOrNull()?.createdAt)) {

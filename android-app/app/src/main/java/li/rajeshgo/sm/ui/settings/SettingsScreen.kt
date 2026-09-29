@@ -109,6 +109,9 @@ fun SettingsScreen(
             }
             state.notificationTestStatus?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextMuted) }
         }
+        if (state.isLoggedIn) SettingsGroup("Handoff defaults") {
+            li.rajeshgo.sm.ui.handoff.HandoffDefaultsSection()
+        }
         ConnectionSettings(
             state,
             viewModel,
