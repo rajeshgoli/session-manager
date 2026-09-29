@@ -1472,6 +1472,7 @@ pub fn router(state: AppState) -> Router {
         .route("/client/bootstrap", get(client_bootstrap))
         .route("/client/session-models", get(client_session_models))
         .route("/client/host-status", get(client_host_status))
+        .route("/client/queue", get(client_queue))
         .route("/client/queue/stats", get(client_queue_stats))
         .route("/client/utilization/series", get(client_utilization_series))
         .route("/client/analytics/summary", get(client_analytics_summary))
@@ -1529,6 +1530,10 @@ pub fn router(state: AppState) -> Router {
             get(get_queue_job).delete(cancel_queue_job),
         )
         .route("/queue-jobs/{job_id}/log", get(get_queue_job_log))
+        .route(
+            "/queue-jobs/{job_id}/cancel",
+            post(cancel_queue_job_with_note),
+        )
         .route(
             "/codex-review-requests",
             get(list_codex_review_requests).post(create_codex_review_request),
@@ -6821,6 +6826,7 @@ async fn list_queue_jobs(
                 .as_ref()
                 .and_then(|value| trimmed(&Some(value.clone()))),
             include_terminal: query.include_terminal,
+            finished_since: None,
         },
     )?;
     // Include all active jobs even for a filtered listing: another agent's
@@ -6828,10 +6834,49 @@ async fn list_queue_jobs(
     let active =
         RetainedQueueStore::list_queue_jobs_from_path(&queue_db_path, QueueJobFilters::default())?;
     let jobs = limit_terminal_jobs_per_session(jobs, query.terminal_limit_per_session);
-    // Resolve names from one registry snapshot, not two full reads per job.
-    let sessions = state
-        .session_store
-        .list_sessions(!query.current_sessions_only)?;
+    let (names, current_session_ids) = queue_session_names(&state, !query.current_sessions_only)?;
+    let mut response_jobs = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        if query.current_sessions_only {
+            let recipient = job
+                .notify_session_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+                .or(job.requester_session_id.as_deref());
+            if !recipient.is_some_and(|id| current_session_ids.contains(id.trim())) {
+                continue;
+            }
+        }
+        response_jobs.push(queue_job_response_named(&state, job, &active, &names)?);
+    }
+    Ok(Json(json!({ "jobs": response_jobs })))
+}
+
+fn queue_job_response_named(
+    state: &AppState,
+    job: QueueJobRecord,
+    active: &[QueueJobRecord],
+    names: &BTreeMap<String, String>,
+) -> Result<Value, ApiError> {
+    let requester_name = job
+        .requester_session_id
+        .as_ref()
+        .and_then(|id| names.get(id.trim()))
+        .cloned();
+    let notify_name = job
+        .notify_session_id
+        .as_ref()
+        .map(|id| names.get(id.trim()).unwrap_or(id).clone());
+    queue_job_response_with_names(state, job, active, requester_name, notify_name)
+}
+
+/// Display names for session ids, aliases and names, from one registry
+/// snapshot rather than two full reads per job; plus the listed session ids.
+fn queue_session_names(
+    state: &AppState,
+    include_stopped: bool,
+) -> Result<(BTreeMap<String, String>, BTreeSet<String>), ApiError> {
+    let sessions = state.session_store.list_sessions(include_stopped)?;
     let current_session_ids: BTreeSet<_> =
         sessions.iter().map(|session| session.id.clone()).collect();
     let mut names = BTreeMap::new();
@@ -6860,36 +6905,202 @@ async fn list_queue_jobs(
                 .or_insert_with(|| session_display_name(session.clone()));
         }
     }
-    let mut response_jobs = Vec::with_capacity(jobs.len());
-    for job in jobs {
-        if query.current_sessions_only {
-            let recipient = job
-                .notify_session_id
-                .as_deref()
-                .filter(|id| !id.trim().is_empty())
-                .or(job.requester_session_id.as_deref());
-            if !recipient.is_some_and(|id| current_session_ids.contains(id.trim())) {
-                continue;
-            }
-        }
-        let requester_name = job
-            .requester_session_id
-            .as_ref()
-            .and_then(|id| names.get(id.trim()))
-            .cloned();
-        let notify_name = job
-            .notify_session_id
-            .as_ref()
-            .map(|id| names.get(id.trim()).unwrap_or(id).clone());
-        response_jobs.push(queue_job_response_with_names(
+    Ok((names, current_session_ids))
+}
+
+#[derive(Debug, Deserialize)]
+struct ClientQueueQuery {
+    ended_hours: Option<i64>,
+}
+
+/// Maximum jobs in the Queue page's "stopped by the queue" section.
+const CLIENT_QUEUE_ENDED_LIMIT: usize = 50;
+
+/// The Queue page: running, queued in the order admission examines them, and
+/// jobs the queue itself ended recently (sm#1609).
+async fn client_queue(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ClientQueueQuery>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_client_read(&state, &request)?;
+    let ended_hours = query.ended_hours.unwrap_or(24);
+    if !(1..=168).contains(&ended_hours) {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: "ended_hours must be between 1 and 168".into(),
+        });
+    }
+    let host = crate::host_status::snapshot().await;
+    let now = time::OffsetDateTime::now_utc();
+    let since = now - time::Duration::hours(ended_hours);
+    // Lexically comparable with both stored timestamp styles.
+    let since_text = since
+        .format(time::macros::format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second]"
+        ))
+        .map_err(|error| ApiError::from(anyhow::anyhow!(error)))?;
+    let queue_db_path = expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
+        .join("queue_runner.db");
+    let jobs = RetainedQueueStore::list_queue_jobs_from_path(
+        &queue_db_path,
+        QueueJobFilters {
+            finished_since: Some(since_text),
+            ..Default::default()
+        },
+    )?;
+    let active: Vec<QueueJobRecord> = jobs
+        .iter()
+        .filter(|job| matches!(job.state.as_str(), "pending" | "running"))
+        .cloned()
+        .collect();
+    let (names, _) = queue_session_names(&state, true)?;
+    let policy = queue_admission_policy(&state.config);
+
+    let mut running: Vec<&QueueJobRecord> =
+        active.iter().filter(|job| job.state == "running").collect();
+    running.sort_by_key(|job| (job.started_at.clone(), job.id.clone()));
+    let mut running_json = Vec::with_capacity(running.len());
+    for job in &running {
+        running_json.push(queue_job_response_named(
             &state,
-            job,
+            (*job).clone(),
             &active,
-            requester_name,
-            notify_name,
+            &names,
         )?);
     }
-    Ok(Json(json!({ "jobs": response_jobs })))
+
+    let mut queued_json = Vec::new();
+    for (index, id) in crate::queue::pending_queue_job_consideration_order(&active)
+        .iter()
+        .enumerate()
+    {
+        let job = active
+            .iter()
+            .find(|job| &job.id == id)
+            .expect("ordered ids come from the active list");
+        let deadline = crate::queue::parse_queue_timestamp(&job.queued_at)
+            .map(|queued| queued + time::Duration::seconds(job.max_wait_seconds))
+            .and_then(|at| {
+                at.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            });
+        let mut value = queue_job_response_named(&state, job.clone(), &active, &names)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("position".into(), json!(index + 1));
+            object.insert("wait_deadline_at".into(), json!(deadline));
+        }
+        queued_json.push(value);
+    }
+
+    let mut ended: Vec<(time::OffsetDateTime, &QueueJobRecord, &'static str, String)> = jobs
+        .iter()
+        .filter_map(|job| {
+            let finished = crate::queue::parse_queue_timestamp(job.finished_at.as_deref()?)?;
+            if finished < since {
+                return None;
+            }
+            let (reason, summary) = crate::queue::queue_job_ended_reason(job)?;
+            Some((finished, job, reason, summary))
+        })
+        .collect();
+    ended.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
+    let mut ended_json = Vec::new();
+    for (_, job, reason, summary) in ended.into_iter().take(CLIENT_QUEUE_ENDED_LIMIT) {
+        let mut value = queue_job_response_named(&state, job.clone(), &active, &names)?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert("ended_reason".into(), json!(reason));
+            object.insert("ended_summary".into(), json!(summary));
+        }
+        ended_json.push(value);
+    }
+
+    let count = |job_type: &str| {
+        running
+            .iter()
+            .filter(|job| job.job_type == job_type)
+            .count()
+    };
+    Ok(Json(json!({
+        "generated_at": now
+            .format(&time::format_description::well_known::Rfc3339)
+            .ok(),
+        "owner_name": state.config.owner_name,
+        "host": host,
+        "slots": {
+            "running": running.len(),
+            "max": policy.max_running_jobs,
+            "by_type": {
+                "tests": {"running": count("tests"), "max": policy.tests_max_concurrent},
+                "perf": {"running": count("perf"), "max": policy.perf_max_concurrent},
+                "background": {"running": count("background"), "max": policy.background_max_concurrent},
+                "service": {"running": count("service"), "max": policy.service_max_concurrent},
+            },
+        },
+        "running": running_json,
+        "queued": queued_json,
+        "ended": ended_json,
+    })))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct CancelQueueJobBody {
+    note: Option<String>,
+}
+
+const MAX_CANCEL_NOTE_CHARS: usize = 1000;
+
+/// Cancel with an optional note; the agent's completion notice names who
+/// cancelled and quotes the note (sm#1609). Otherwise identical to DELETE.
+async fn cancel_queue_job_with_note(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Option<Json<CancelQueueJobBody>>,
+) -> Result<Json<Value>, ApiError> {
+    let note = body
+        .and_then(|Json(body)| body.note)
+        .map(|note| note.trim().to_owned())
+        .filter(|note| !note.is_empty());
+    if note
+        .as_ref()
+        .is_some_and(|note| note.chars().count() > MAX_CANCEL_NOTE_CHARS)
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::BAD_REQUEST,
+            detail: format!("note must be at most {MAX_CANCEL_NOTE_CHARS} characters"),
+        });
+    }
+    let actor = request_actor_email_from_parts(&state.config, &headers, Some(peer_addr));
+    let cancelled_by = if actor.is_some_and(|actor| actor != LOCAL_BYPASS_ACTOR) {
+        Some(format!("{} from the sm app", state.config.owner_name))
+    } else if let Some(session_id) = header_text(&headers, "x-sm-session-id") {
+        Some(
+            state
+                .session_store
+                .get_session(&session_id)?
+                .map(session_display_name)
+                .unwrap_or(session_id),
+        )
+    } else {
+        None
+    };
+    let mut detail = serde_json::Map::new();
+    detail.insert("kind".into(), json!("cancel"));
+    if let Some(by) = cancelled_by {
+        detail.insert("cancelled_by".into(), json!(by));
+    }
+    if let Some(note) = note {
+        detail.insert("note".into(), json!(note));
+    }
+    cancel_queue_job_inner(
+        &state,
+        &job_id,
+        peer_addr,
+        &headers,
+        Some(&Value::Object(detail)),
+    )
 }
 
 fn limit_terminal_jobs_per_session(
@@ -7160,35 +7371,46 @@ async fn cancel_queue_job(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
+    cancel_queue_job_inner(&state, &job_id, peer_addr, &headers, None)
+}
+
+fn cancel_queue_job_inner(
+    state: &AppState,
+    job_id: &str,
+    peer_addr: SocketAddr,
+    headers: &HeaderMap,
+    detail: Option<&Value>,
+) -> Result<Json<Value>, ApiError> {
     ensure_session_allowed_from_parts(
         &state.config,
-        &headers,
+        headers,
         Some(peer_addr),
         &format!("/queue-jobs/{job_id}"),
     )?;
-    ensure_core_writes_enabled(&state)?;
+    ensure_core_writes_enabled(state)?;
     let queue_state_dir_config = state.config.queue_runner_state_dir();
     let queue_state_dir = expand_home(&queue_state_dir_config.to_string_lossy());
     let message_queue_db_path = expand_home(&state.config.sm_send.db_path);
     let job_id = RetainedQueueStore::resolve_queue_job_from_path(
         &queue_state_dir.join("queue_runner.db"),
-        &job_id,
+        job_id,
     )
     .map_err(queue_lookup_error)?
     .ok_or(ApiError::NotFound("Queue job not found"))?
     .id;
-    let Some(job) = RetainedQueueStore::cancel_queue_job_in_state_dir(
+    let Some(job) = RetainedQueueStore::cancel_queue_job_with_detail_in_state_dir(
         &queue_state_dir,
         &message_queue_db_path,
         &job_id,
         state.config.queue_runner.cancel_grace_seconds,
         queue_admission_policy(&state.config),
         state.config.rust_core.runtime_enabled,
+        detail,
     )?
     else {
         return Err(ApiError::NotFound("Queue job not found"));
     };
-    Ok(Json(queue_job_response(&state, job)?))
+    Ok(Json(queue_job_response(state, job)?))
 }
 
 fn resolve_session_or_registry_role(
@@ -13952,6 +14174,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/client/analytics/summary"
         || path == "/client/session-models"
         || path == "/client/host-status"
+        || path == "/client/queue"
         || path == "/client/queue/stats"
         || path == "/client/utilization/series"
         || path == "/codex-review-requests"
@@ -15549,6 +15772,9 @@ fn queue_job_response_with_names(
         "memory_guard": job.termination_detail.as_ref().filter(|_| job.state == "memory_exceeded"),
         "process_guard": job.termination_detail.as_ref().filter(|_| job.state == "process_limit_exceeded"),
         "wait_blockers": job.termination_detail.as_ref().filter(|_| job.state == "wait_expired"),
+        "cancel_detail": job.termination_detail.as_ref().filter(|detail| {
+            job.state == "cancelled" && detail.get("kind").and_then(Value::as_str) == Some("cancel")
+        }),
         "process_limit": job.process_limit,
         "peak_process_count": job.peak_process_count,
         "readable_log_path": job.log_path.as_deref().and_then(|p| std::path::Path::new(p).parent()).map(|p| p.join(crate::queue::queue_log_filename(&job.label, &job.id)).display().to_string()).filter(|p| std::path::Path::new(p).exists()),
@@ -19620,6 +19846,7 @@ mod tests {
         let routes = [
             (Method::GET, "/client/bootstrap", "", false),
             (Method::GET, "/client/host-status", "", false),
+            (Method::GET, "/client/queue", "", false),
             (Method::GET, "/client/queue/stats", "", false),
             (Method::GET, "/client/utilization/series", "", false),
             (
@@ -20675,6 +20902,165 @@ mod tests {
             assert_eq!(body["available"], available);
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn client_queue_lists_running_queued_in_order_and_recent_stops() {
+        use crate::queue::CreateQueueJob;
+        let signing_key = SigningKey::random(&mut OsRng);
+        let mut config = mobile_ticket_config(&signing_key);
+        let state_dir =
+            std::env::temp_dir().join(format!("sm-client-queue-{}", std::process::id()));
+        config.queue_runner.state_dir = state_dir.to_string_lossy().into_owned();
+        config.queue_runner.configured = true;
+        config.rust_core.fixture_writes_enabled = true;
+        config.rust_core.runtime_enabled = false;
+        config.utilization.enabled = false;
+        let create = |job_type: &str, label: &str| {
+            RetainedQueueStore::create_queue_job_in_state_dir(
+                &state_dir,
+                CreateQueueJob {
+                    job_type: job_type.into(),
+                    label: label.into(),
+                    requester_session_id: None,
+                    notify_session_id: "notify".into(),
+                    cwd: "/tmp".into(),
+                    argv: Some(vec!["true".into()]),
+                    script: None,
+                    env: BTreeMap::new(),
+                    timeout_seconds: 900,
+                    cpu_percent: Some(100),
+                    gpu_percent: Some(0),
+                    memory_bytes: Some(1),
+                },
+            )
+            .unwrap()
+        };
+        let waiting_test = create("tests", "waiting test");
+        let waiting_perf = create("perf", "waiting perf");
+        let running = create("tests", "running test");
+        let displaced = create("background", "displaced bg");
+        let old = create("background", "old displaced");
+        let failed = create("tests", "failed test");
+        let conn = rusqlite::Connection::open(state_dir.join("queue_runner.db")).unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let at = |offset: time::Duration| {
+            (now + offset)
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        for (sql, id, value) in [
+            (
+                "UPDATE queue_jobs SET queued_at = ?2 WHERE id = ?1",
+                &waiting_test.id,
+                at(time::Duration::minutes(-3)),
+            ),
+            (
+                "UPDATE queue_jobs SET queued_at = ?2 WHERE id = ?1",
+                &waiting_perf.id,
+                at(time::Duration::minutes(-1)),
+            ),
+            (
+                "UPDATE queue_jobs SET state = 'running', started_at = ?2 WHERE id = ?1",
+                &running.id,
+                at(time::Duration::minutes(-4)),
+            ),
+            (
+                "UPDATE queue_jobs SET state = 'displaced', finished_at = ?2 WHERE id = ?1",
+                &displaced.id,
+                at(time::Duration::minutes(-40)),
+            ),
+            (
+                "UPDATE queue_jobs SET state = 'displaced', finished_at = ?2 WHERE id = ?1",
+                &old.id,
+                at(time::Duration::hours(-30)),
+            ),
+            (
+                "UPDATE queue_jobs SET state = 'failed', finished_at = ?2 WHERE id = ?1",
+                &failed.id,
+                at(time::Duration::minutes(-5)),
+            ),
+        ] {
+            conn.execute(sql, rusqlite::params![id, value]).unwrap();
+        }
+        drop(conn);
+        let app = router(AppState::new(config));
+        let response = app
+            .clone()
+            .oneshot(local_request(Method::GET, "/client/queue", Body::empty()))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["running"].as_array().unwrap().len(), 1);
+        assert_eq!(body["running"][0]["id"], running.id);
+        let queued = body["queued"].as_array().unwrap();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[0]["id"], waiting_perf.id);
+        assert_eq!(queued[0]["position"], 1);
+        assert_eq!(queued[1]["id"], waiting_test.id);
+        assert_eq!(queued[1]["position"], 2);
+        assert!(queued[1]["wait_deadline_at"].is_string());
+        let ended = body["ended"].as_array().unwrap();
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        assert_eq!(ended[0]["id"], displaced.id);
+        assert_eq!(ended[0]["ended_reason"], "displaced");
+        assert_eq!(body["slots"]["running"], 1);
+        assert_eq!(body["slots"]["by_type"]["tests"]["running"], 1);
+        assert!(body["host"].is_object());
+        assert!(body["owner_name"].is_string());
+
+        let response = app
+            .clone()
+            .oneshot(local_request(
+                Method::GET,
+                "/client/queue?ended_hours=48",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (_, body) = response_json(response).await;
+        assert_eq!(body["ended"].as_array().unwrap().len(), 2);
+        let response = app
+            .clone()
+            .oneshot(local_request(
+                Method::GET,
+                "/client/queue?ended_hours=169",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Cancel with a note; a plain local request names nobody.
+        let long_note = "x".repeat(1001);
+        let mut request = local_request(
+            Method::POST,
+            &format!("/queue-jobs/{}/cancel", waiting_test.id),
+            Body::from(json!({ "note": long_note }).to_string()),
+        );
+        request
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let mut request = local_request(
+            Method::POST,
+            &format!("/queue-jobs/{}/cancel", waiting_test.id),
+            Body::from(json!({ "note": "  not needed  " }).to_string()),
+        );
+        request
+            .headers_mut()
+            .insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        let response = app.clone().oneshot(request).await.unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["state"], "cancelled");
+        assert_eq!(
+            body["cancel_detail"],
+            json!({"kind": "cancel", "note": "not needed"})
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[tokio::test]

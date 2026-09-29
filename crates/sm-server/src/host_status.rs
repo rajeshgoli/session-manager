@@ -51,8 +51,62 @@ static SNAPSHOT_CACHE: SnapshotCache = SnapshotCache {
     ttl: Duration::from_secs(5),
 };
 
+/// The live bar's reading: the utilization recorder's newest sample while it
+/// is fresh (sm#1609), otherwise an on-demand `top` reading.
 pub async fn snapshot() -> Value {
-    SNAPSHOT_CACHE.get(collect_snapshot).await
+    let now_ms = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
+    if let Some(sample) =
+        crate::utilization::latest_host_sample().filter(|sample| is_fresh(sample, now_ms))
+    {
+        return recorder_snapshot(&sample, hostname().await);
+    }
+    let mut value = SNAPSHOT_CACHE.get(collect_snapshot).await;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("source".into(), json!("live"));
+        object.insert("memory_available_bytes".into(), Value::Null);
+    }
+    value
+}
+
+fn is_fresh(sample: &crate::utilization::HostSample, now_ms: i64) -> bool {
+    let age = now_ms - sample.sampled_at_ms;
+    (0..3 * sample.interval_ms.max(1000)).contains(&age)
+}
+
+async fn hostname() -> Option<String> {
+    static HOSTNAME: tokio::sync::OnceCell<Option<String>> = tokio::sync::OnceCell::const_new();
+    HOSTNAME
+        .get_or_init(|| async {
+            read_command("/bin/hostname", &[])
+                .await
+                .map(|s| s.trim().to_owned())
+        })
+        .await
+        .clone()
+}
+
+fn recorder_snapshot(sample: &crate::utilization::HostSample, host: Option<String>) -> Value {
+    let sampled_at = time::OffsetDateTime::from_unix_timestamp_nanos(
+        i128::from(sample.sampled_at_ms) * 1_000_000,
+    )
+    .ok()
+    .and_then(|at| {
+        at.format(&time::format_description::well_known::Rfc3339)
+            .ok()
+    });
+    json!({
+        // A fresh sample is a reading; a failed measurement is its own null.
+        "available": true,
+        "host": host,
+        "sampled_at": sampled_at,
+        "memory_total_bytes": sample.mem_total_bytes,
+        "memory_used_bytes": sample.mem_used_bytes,
+        "memory_available_bytes": sample.mem_available_bytes,
+        "memory_pressure": sample.pressure_level.and_then(|level| pressure_label(&level.to_string())),
+        "cpu_percent": sample.cpu_busy_pct,
+        "gpu_percent": sample.gpu_busy_pct,
+        "source": "recorder",
+    })
 }
 
 async fn collect_snapshot() -> Value {
@@ -177,6 +231,36 @@ mod tests {
             cache.get(|| async { json!({"sample": 1}) }).await,
             json!({"sample": 1})
         );
+    }
+
+    #[test]
+    fn recorder_samples_answer_while_fresh() {
+        let sample = crate::utilization::HostSample {
+            sampled_at_ms: 1_000_000,
+            interval_ms: 5000,
+            cpu_busy_pct: Some(42.5),
+            mem_total_bytes: Some(256),
+            mem_used_bytes: Some(87),
+            mem_available_bytes: Some(200),
+            pressure_level: Some(2),
+            ..Default::default()
+        };
+        assert!(is_fresh(&sample, 1_000_000 + 14_999));
+        assert!(!is_fresh(&sample, 1_000_000 + 15_000));
+        assert!(!is_fresh(&sample, 999_000));
+        let value = recorder_snapshot(&sample, Some("studio".into()));
+        assert_eq!(value["source"], "recorder");
+        assert_eq!(value["memory_pressure"], "Elevated");
+        assert_eq!(value["memory_available_bytes"], 200);
+        assert_eq!(value["cpu_percent"], 42.5);
+        assert_eq!(value["sampled_at"], "1970-01-01T00:16:40Z");
+        assert_eq!(value["gpu_percent"], Value::Null);
+        let empty = crate::utilization::HostSample {
+            sampled_at_ms: 1_000_000,
+            interval_ms: 5000,
+            ..Default::default()
+        };
+        assert_eq!(recorder_snapshot(&empty, None)["available"], true);
     }
 
     #[test]
