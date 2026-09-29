@@ -2404,7 +2404,18 @@ fn run_request_codex_review_create(client: &ApiClient, args: RequestCodexReviewA
     if let Some(head_sha) = response["requested_head_sha"].as_str() {
         println!("  Head: {head_sha}");
     }
+    if let Some(ask) = handoff_ask(&response) {
+        println!("{ask}");
+    }
     Ok(())
+}
+
+/// A review request can be a handoff tipping point (sm#1651, Appendix C.3):
+/// the server returns the ask for the command to print after its own lines.
+fn handoff_ask(response: &Value) -> Option<&str> {
+    response["handoff_ask"]
+        .as_str()
+        .filter(|ask| !ask.trim().is_empty())
 }
 
 fn run_request_codex_review_list(client: &ApiClient, args: RequestCodexReviewArgs) -> Result<()> {
@@ -5225,6 +5236,14 @@ impl ApiClient {
         body: Option<Value>,
         headers: &[(&str, &str)],
     ) -> Result<ApiResponse> {
+        // Identify the calling agent, so owner-only routes can refuse it
+        // (sm#1651, Appendix I.1).
+        let session_id = optional_current_session_id();
+        let mut headers = headers.to_vec();
+        if let Some(session_id) = session_id.as_deref() {
+            headers.push(("X-SM-Session", session_id));
+        }
+        let headers = headers.as_slice();
         if self.scheme == "https" {
             return self.request_https(method, path, body, headers);
         }
@@ -6316,6 +6335,32 @@ mod tests {
                 .command,
             Command::Adopt(AdoptArgs { child }) if child == "child"
         ));
+    }
+
+    #[test]
+    fn managed_sessions_identify_themselves_on_every_request() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
+        env::set_var("SESSION_MANAGER_ID", "managed001");
+        let (client, handle) = single_request_server(200, r#"{}"#);
+        client.put_json("/handoff-defaults", json!({})).unwrap();
+        assert!(handle.join().unwrap()[0].contains("X-SM-Session: managed001\r\n"));
+
+        env::remove_var("SESSION_MANAGER_ID");
+        env::remove_var("CLAUDE_SESSION_MANAGER_ID");
+        let (client, handle) = single_request_server(200, r#"{}"#);
+        client.put_json("/handoff-defaults", json!({})).unwrap();
+        assert!(!handle.join().unwrap()[0].contains("X-SM-Session:"));
+    }
+
+    #[test]
+    fn review_commands_print_the_handoff_ask_only_when_present() {
+        assert_eq!(
+            handoff_ask(&json!({"id": "r1", "handoff_ask": "[sm context management] ask"})),
+            Some("[sm context management] ask")
+        );
+        assert_eq!(handoff_ask(&json!({"id": "r1"})), None);
+        assert_eq!(handoff_ask(&json!({"handoff_ask": null})), None);
     }
 
     #[test]

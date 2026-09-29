@@ -898,6 +898,17 @@ pub(super) async fn publish_owner_doc(
             response["claim_warning"] = json!(warning);
         }
     }
+    if published.publish.review_requested {
+        super::handoff::add_review_handoff_ask(
+            &state,
+            Some(&published.publish.session_id),
+            crate::sessions::ReviewAsk::Doc {
+                doc_title: &published.doc.title,
+                owner_name: &state.config.owner_name,
+            },
+            &mut response,
+        );
+    }
     Ok(Json(response))
 }
 

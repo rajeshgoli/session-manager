@@ -47,6 +47,12 @@ use crate::{
     usage_report::{UsageReport, UsageReportOptions, UsageReportStore, UsageReportTarget},
 };
 
+#[path = "handoff/store.rs"]
+mod handoff_store;
+use crate::handoff::policy::HandoffDefaults;
+use handoff_store::{handoff_session_ref, handoff_view_for_record};
+pub use handoff_store::{HandoffPolicyOutcome, ReviewAsk};
+
 const DEFAULT_SESSION_STATE_FILE: &str = "~/.local/share/claude-sessions/sessions.json";
 const LEGACY_TMP_SESSION_STATE_FILE: &str = "/tmp/claude-sessions/sessions.json";
 const OUTPUT_TAIL_BYTES_PER_LINE: u64 = 4096;
@@ -6674,19 +6680,23 @@ impl SessionStore {
                     changed = true;
                 }
             }
-            if !enabled {
-                if changed {
-                    self.write_raw_json_value(state)?;
-                }
-                return Ok(ContextUsageOutcome::NotRegistered);
-            }
-            (
-                self.latch_context_alert(session, session_id, used_percentage, tokens_used),
-                changed,
-            )
+            let alert = if enabled {
+                self.latch_context_alert(session, session_id, used_percentage, tokens_used)
+            } else {
+                None
+            };
+            (alert, changed)
         };
 
-        let mut changed = changed;
+        // Handoff asks do not depend on `sm context-monitor` enrolment.
+        let mut changed =
+            self.evaluate_handoff_sample(state, session_id, used_percentage, runtime)? || changed;
+        if !enabled {
+            if changed {
+                self.write_raw_json_value(state)?;
+            }
+            return Ok(ContextUsageOutcome::NotRegistered);
+        }
         if let Some(alert) = alert {
             self.queue_context_monitor_message(
                 state,
@@ -9163,8 +9173,10 @@ impl SessionStore {
         // `/hooks/context-usage` usage update. The snapshot is always cached;
         // provider capability and registration only control warning/critical alerts.
         let mut context_alert = None;
+        let mut handoff_sample = None;
         if codex_fork_event_matches_root_thread(event, root_provider_resume_id.as_deref()) {
             if let Some(usage) = codex_fork_context_usage(event) {
+                handoff_sample = Some(usage.used_percentage);
                 let previous_used = session.get("tokens_used").and_then(Value::as_i64);
                 let previous_pct = session
                     .get("context_used_percentage")
@@ -9231,6 +9243,16 @@ impl SessionStore {
                     );
                 }
             }
+        }
+
+        if let Some(used_percentage) = handoff_sample {
+            let runtime = self.delivery_runtime.clone();
+            changed |= self.evaluate_handoff_sample(
+                &mut state,
+                session_id,
+                used_percentage,
+                runtime.as_ref(),
+            )?;
         }
 
         if let Some(alert) = context_alert {
@@ -9400,8 +9422,13 @@ impl SessionStore {
             context_monitor_critical_percentage: None,
             context_warning_sent: false,
             context_critical_sent: false,
+            handoff_policy_override: None,
+            handoff: None,
+            successor_session_id: None,
+            predecessor_session_id: None,
             aliases: Vec::new(),
             pending_adoption_proposals: Vec::new(),
+            handoff_view: None,
         })
     }
 }
@@ -16010,6 +16037,8 @@ struct StateSnapshot {
     #[serde(default)]
     sessions: Vec<SessionRecord>,
     #[serde(default)]
+    handoff_defaults: Option<Value>,
+    #[serde(default)]
     maintainer_session_id: Option<String>,
     #[serde(default)]
     agent_registrations: Vec<AgentRegistrationRecord>,
@@ -16021,6 +16050,8 @@ struct StateSnapshot {
 struct RawStateSnapshot {
     #[serde(default)]
     sessions: Vec<Value>,
+    #[serde(default)]
+    handoff_defaults: Option<Value>,
     #[serde(default)]
     maintainer_session_id: Option<String>,
     #[serde(default)]
@@ -16043,6 +16074,7 @@ impl TryFrom<RawStateSnapshot> for StateSnapshot {
         Ok(Self {
             sessions,
             maintainer_session_id: raw.maintainer_session_id,
+            handoff_defaults: raw.handoff_defaults,
             agent_registrations: raw.agent_registrations,
             adoption_proposals: raw.adoption_proposals,
         })
@@ -16075,6 +16107,16 @@ impl StateSnapshot {
         for session in &mut self.sessions {
             session.pending_adoption_proposals =
                 proposal_map.remove(&session.id).unwrap_or_default();
+        }
+
+        let defaults = HandoffDefaults::from_stored(self.handoff_defaults.as_ref());
+        let session_refs = self
+            .sessions
+            .iter()
+            .map(|session| (session.id.clone(), handoff_session_ref(session)))
+            .collect::<BTreeMap<_, _>>();
+        for session in &mut self.sessions {
+            session.handoff_view = Some(handoff_view_for_record(session, &defaults, &session_refs));
         }
 
         self.sessions
@@ -16870,10 +16912,24 @@ pub struct SessionRecord {
     pub context_warning_sent: bool,
     #[serde(default)]
     pub context_critical_sent: bool,
+    /// Per-agent handoff override, owner-set only (sm#1651, Appendix A).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_policy_override: Option<Value>,
+    /// Handoff state (sm#1651, Appendix A). Absent means working, never asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub successor_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor_session_id: Option<String>,
     #[serde(skip)]
     pub aliases: Vec<String>,
     #[serde(skip)]
     pub pending_adoption_proposals: Vec<AdoptionProposalResponse>,
+    /// The session JSON `handoff` object (Appendix I.2), resolved against the
+    /// stored default policy when the snapshot loads.
+    #[serde(skip)]
+    pub handoff_view: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -17098,10 +17154,13 @@ pub struct SessionResponse {
     last_action_summary: Option<String>,
     last_action_at: Option<String>,
     tokens_used: i64,
+    context_percent: Option<f64>,
     context_monitor_enabled: bool,
     pending_adoption_proposals: Vec<AdoptionProposalResponse>,
     aliases: Vec<String>,
     is_maintainer: bool,
+    /// Effective handoff policy and state (sm#1651, Appendix I.2).
+    handoff: Option<Value>,
 }
 
 impl From<SessionRecord> for SessionResponse {
@@ -17151,10 +17210,12 @@ impl From<SessionRecord> for SessionResponse {
             last_action_summary: None,
             last_action_at: None,
             tokens_used: session.tokens_used,
+            context_percent: session.context_used_percentage,
             context_monitor_enabled: session.context_monitor_enabled,
             pending_adoption_proposals: session.pending_adoption_proposals,
             aliases: session.aliases,
             is_maintainer,
+            handoff: session.handoff_view,
         }
     }
 }
@@ -20074,8 +20135,13 @@ sleep 30
             context_monitor_critical_percentage: None,
             context_warning_sent: false,
             context_critical_sent: false,
+            handoff_policy_override: None,
+            handoff: None,
+            successor_session_id: None,
+            predecessor_session_id: None,
             aliases: Vec::new(),
             pending_adoption_proposals: Vec::new(),
+            handoff_view: None,
         }
     }
 
@@ -23774,6 +23840,7 @@ sleep 30
     #[test]
     fn snapshot_projects_aliases_and_pending_adoption_proposals() {
         let snapshot = StateSnapshot {
+            handoff_defaults: None,
             sessions: vec![
                 SessionRecord {
                     id: "em123456".to_owned(),
@@ -23837,6 +23904,7 @@ sleep 30
     #[test]
     fn snapshot_prunes_stopped_aliases_even_when_restorable() {
         let snapshot = StateSnapshot {
+            handoff_defaults: None,
             sessions: vec![
                 SessionRecord {
                     id: "dead001".to_owned(),

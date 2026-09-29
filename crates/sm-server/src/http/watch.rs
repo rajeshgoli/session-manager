@@ -193,6 +193,7 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
             "repo": repo(v),
             "node": s(v, "node"),
             "context_percent": context.get(id).copied().flatten(),
+            "handoff": v["handoff"].clone(),
             "claims": field("claims"),
             "docs": field("docs"),
             "waiting_on": waiting_on,
