@@ -25,7 +25,7 @@ use crate::owner_docs::{
 };
 use crate::work_claims::{
     claim_from_row, history_path, item_from_row, HolderState, SessionDirectory, StoredEvent,
-    WorkClaim, WorkItem, CLAIM_COLUMNS, ITEM_COLUMNS,
+    WorkClaim, WorkItem, WorkKind, CLAIM_COLUMNS, ITEM_COLUMNS,
 };
 
 pub const HISTORY_SCHEMA_VERSION: u32 = 1;
@@ -150,6 +150,33 @@ pub struct RowDoc {
     pub owner_reviews: usize,
     pub author_session_id: String,
     pub published_at: String,
+}
+
+/// `(session, "ticket" | "pr", repo, number)`: one agent's touch on one item.
+type WorkTouch<'a> = (&'a str, &'a str, &'a str, i64);
+
+/// At most this many tickets, PRs and docs each per agent in [`HistoryData::agent_work`].
+pub const AGENT_WORK_LIMIT: usize = 20;
+
+/// A ticket or PR an agent worked on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentItem {
+    /// Lowercase `owner/name`.
+    pub repo: String,
+    pub number: i64,
+    /// Empty while sm has not fetched the item.
+    pub title: String,
+    pub state: String,
+    pub url: String,
+    /// The item's history page, `/t/<repo-name>/<n>`.
+    pub history_path: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AgentWork {
+    pub tickets: Vec<AgentItem>,
+    pub prs: Vec<AgentItem>,
+    pub docs: Vec<RowDoc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -539,6 +566,104 @@ impl HistoryData {
         ids
     }
 
+    /// What each of `session_ids` worked on, for the agent list (sm#1661):
+    /// tickets and PRs it claimed or requested a Codex review on, and docs it
+    /// authored or published. Newest first, at most [`AGENT_WORK_LIMIT`] of
+    /// each kind; a session with none is absent.
+    pub fn agent_work(&self, session_ids: &BTreeSet<&str>) -> BTreeMap<String, AgentWork> {
+        // Each touch at a time; the latest touch wins.
+        let mut touches: Vec<(WorkTouch, i128)> = Vec::new();
+        for claim in &self.claims {
+            if session_ids.contains(claim.session_id.as_str()) {
+                let kind = match claim.kind() {
+                    WorkKind::Pr => "pr",
+                    WorkKind::Ticket => "ticket",
+                };
+                let key = (
+                    claim.session_id.as_str(),
+                    kind,
+                    claim.repo.as_str(),
+                    claim.number,
+                );
+                touches.push((key, nanos(&claim.claimed_at)));
+            }
+        }
+        for review in &self.reviews {
+            if let Some(session) = review
+                .requester_session_id
+                .as_deref()
+                .filter(|id| session_ids.contains(id))
+            {
+                let key = (session, "pr", review.repo.as_str(), review.pr);
+                touches.push((key, nanos(&review.requested_at)));
+            }
+        }
+        let mut touched: BTreeMap<WorkTouch, i128> = BTreeMap::new();
+        for (key, at) in touches {
+            touched
+                .entry(key)
+                .and_modify(|best| *best = (*best).max(at))
+                .or_insert(at);
+        }
+        let mut work: BTreeMap<String, AgentWork> = BTreeMap::new();
+        let mut ordered: Vec<_> = touched.into_iter().collect();
+        ordered.sort_by_key(|(key, at)| (std::cmp::Reverse(*at), key.2, key.3));
+        for ((session, kind, repo, number), _) in ordered {
+            let entry = work.entry(session.to_owned()).or_default();
+            let list = if kind == "pr" {
+                &mut entry.prs
+            } else {
+                &mut entry.tickets
+            };
+            if list.len() >= AGENT_WORK_LIMIT {
+                continue;
+            }
+            let item = self.items.get(&(repo.to_owned(), number));
+            let noun = if kind == "pr" { "pull" } else { "issues" };
+            list.push(AgentItem {
+                repo: repo.to_owned(),
+                number,
+                title: item.map(|i| i.title.clone()).unwrap_or_default(),
+                state: item.map(|i| i.state.clone()).unwrap_or_default(),
+                url: item
+                    .map(|i| i.url.clone())
+                    .filter(|url| !url.is_empty())
+                    .unwrap_or_else(|| format!("https://github.com/{repo}/{noun}/{number}")),
+                history_path: history_path(repo, number),
+            });
+        }
+        // Each agent's docs order by its own latest publish; an author with
+        // no publish of its own falls back to the doc's creation.
+        let mut docs: Vec<(&str, &HistoryDoc, i128)> = Vec::new();
+        for doc in &self.docs {
+            let mut latest: BTreeMap<&str, i128> = BTreeMap::new();
+            for publish in &doc.publishes {
+                let at = nanos(&publish.published_at);
+                latest
+                    .entry(publish.session_id.as_str())
+                    .and_modify(|best| *best = (*best).max(at))
+                    .or_insert(at);
+            }
+            latest
+                .entry(doc.summary.doc.author_session_id.as_str())
+                .or_insert_with(|| nanos(&doc.summary.doc.created_at));
+            docs.extend(
+                latest
+                    .into_iter()
+                    .filter(|(id, _)| session_ids.contains(id))
+                    .map(|(id, at)| (id, doc, at)),
+            );
+        }
+        docs.sort_by_key(|(_, _, at)| std::cmp::Reverse(*at));
+        for (session, doc, _) in docs {
+            let entry = work.entry(session.to_owned()).or_default();
+            if entry.docs.len() < AGENT_WORK_LIMIT {
+                entry.docs.push(row_doc(doc));
+            }
+        }
+        work
+    }
+
     /// The list: one row per thread, newest activity first.
     pub fn list(
         &self,
@@ -862,23 +987,7 @@ impl HistoryData {
             })
             .collect::<Vec<_>>();
 
-        let row_docs = docs
-            .iter()
-            .map(|doc| RowDoc {
-                id: doc.summary.doc.id.clone(),
-                name: doc_name(&doc.summary.doc.repo, &doc.summary.doc.path),
-                title: doc.summary.doc.title.clone(),
-                state: doc.summary.state.as_str().to_owned(),
-                reader_path: doc_readable_path(
-                    &doc.summary.doc.repo,
-                    &doc.summary.doc.path,
-                    &doc.summary.latest_commit_sha,
-                ),
-                owner_reviews: doc.reviews.len(),
-                author_session_id: doc.summary.doc.author_session_id.clone(),
-                published_at: doc.summary.published_at.clone(),
-            })
-            .collect::<Vec<_>>();
+        let row_docs = docs.iter().copied().map(row_doc).collect::<Vec<_>>();
 
         let flags = self.flags(thread, &claims, &prs, sessions, now);
         let mut latest: Option<(i128, String)> = None;
@@ -1416,6 +1525,23 @@ pub fn parse_time(value: &str) -> Option<OffsetDateTime> {
 }
 
 /// Sort key for an RFC 3339 time; unparseable sorts first.
+fn row_doc(doc: &HistoryDoc) -> RowDoc {
+    RowDoc {
+        id: doc.summary.doc.id.clone(),
+        name: doc_name(&doc.summary.doc.repo, &doc.summary.doc.path),
+        title: doc.summary.doc.title.clone(),
+        state: doc.summary.state.as_str().to_owned(),
+        reader_path: doc_readable_path(
+            &doc.summary.doc.repo,
+            &doc.summary.doc.path,
+            &doc.summary.latest_commit_sha,
+        ),
+        owner_reviews: doc.reviews.len(),
+        author_session_id: doc.summary.doc.author_session_id.clone(),
+        published_at: doc.summary.published_at.clone(),
+    }
+}
+
 fn nanos(value: &str) -> i128 {
     parse_time(value).map_or(i128::MIN, OffsetDateTime::unix_timestamp_nanos)
 }

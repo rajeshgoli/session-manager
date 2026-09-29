@@ -319,6 +319,7 @@ pub enum GitHubPullRequestState {
     Closed { state: String },
 }
 
+mod agent_history;
 mod claims;
 mod docs;
 mod follows;
@@ -1585,6 +1586,7 @@ pub fn router(state: AppState) -> Router {
         .route("/claims/worktree", post(worktrees::post_claim_worktree))
         .route("/worktrees/keep", post(worktrees::post_worktree_keep))
         .route("/history", get(history::get_history))
+        .route("/history/agents", get(agent_history::get_agent_history))
         .route("/guestbook", get(guestbook_page::get_guestbook))
         .route("/t/{repo}/{number}", get(history::get_timeline))
         .route("/", get(watch::get_watch_page))
@@ -14201,6 +14203,7 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/session-obligations"
         || path == "/claims"
         || path == "/history"
+        || path == "/history/agents"
         || path == "/guestbook"
         || path.starts_with("/t/")
         || path == "/"
@@ -19123,7 +19126,7 @@ mod tests {
             test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 1_700_000_100);
         let stranger =
             test_browser_access_assertion("sm-browser-aud", "stranger@example.com", 4_102_444_800);
-        for uri in ["/history", "/t/widgets/1", "/guestbook"] {
+        for uri in ["/history", "/history/agents", "/t/widgets/1", "/guestbook"] {
             let (status, _) = browser_host_get(&app, uri, Some(&expired)).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
             for assertion in [Some(stranger.as_str()), None] {

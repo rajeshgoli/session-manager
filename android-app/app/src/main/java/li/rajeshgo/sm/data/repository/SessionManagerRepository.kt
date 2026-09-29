@@ -483,6 +483,15 @@ class SessionManagerRepository(
         executeReadRequest(baseUrl, token) { it.getGuestbook(repo, before) }
     }
 
+    suspend fun fetchAgentHistory(baseUrl: String, token: String, query: String?, before: String?): li.rajeshgo.sm.data.model.AgentHistoryResponse = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getAgentHistory(query, before) }
+    }
+
+    /** Restores an agent; the failure carries the server's reason (not stopped, no resume id, …). */
+    suspend fun restoreSession(baseUrl: String, token: String, sessionId: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token, readTimeoutSeconds = 120).restoreSession(sessionId); Unit }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun markInboxDone(baseUrl: String, token: String, threadKey: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching { api(baseUrl, token).markInboxDone(li.rajeshgo.sm.data.model.InboxDoneRequest(threadKey)) }.mapFailure(::classifyWriteFailure)
     }

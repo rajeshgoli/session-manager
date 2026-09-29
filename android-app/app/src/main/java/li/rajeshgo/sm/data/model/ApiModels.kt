@@ -954,3 +954,61 @@ data class GuestbookClaim(
     val kind: String = "",
     val title: String = "",
 )
+
+/** `GET /history/agents` (sm#1661): agents no longer live, newest first. */
+@Serializable
+data class AgentHistoryResponse(
+    val agents: List<AgentHistoryRow> = emptyList(),
+    /** The `before` cursor for the next older page; null on the last page. */
+    @SerialName("next_before") val nextBefore: String? = null,
+    /** Agents matching the search across every page. */
+    val total: Int = 0,
+)
+
+@Serializable
+data class AgentHistoryRow(
+    val id: String = "",
+    val name: String = "",
+    val provider: String = "",
+    val model: String? = null,
+    val role: String? = null,
+    @SerialName("working_dir") val workingDir: String = "",
+    val node: String = "",
+    @SerialName("parent_session_id") val parentSessionId: String? = null,
+    /** `retired` or `stopped`. */
+    val state: String = "",
+    @SerialName("ended_at") val endedAt: String = "",
+    @SerialName("last_status") val lastStatus: String? = null,
+    val restorable: Boolean = true,
+    @SerialName("unrestorable_reason") val unrestorableReason: String? = null,
+    val work: AgentWork = AgentWork(),
+)
+
+/** What an agent worked on, newest first, at most 20 of each. */
+@Serializable
+data class AgentWork(
+    val tickets: List<AgentWorkItem> = emptyList(),
+    val prs: List<AgentWorkItem> = emptyList(),
+    val docs: List<AgentWorkDoc> = emptyList(),
+)
+
+@Serializable
+data class AgentWorkItem(
+    val repo: String = "",
+    val number: Long = 0,
+    val title: String = "",
+    val state: String = "",
+    val url: String = "",
+    /** `/t/<repo-name>/<n>`. */
+    @SerialName("history_path") val historyPath: String = "",
+)
+
+@Serializable
+data class AgentWorkDoc(
+    val id: String = "",
+    /** `<repo-name>/<path>`. */
+    val name: String = "",
+    val title: String = "",
+    val state: String = "",
+    @SerialName("reader_path") val readerPath: String = "",
+)

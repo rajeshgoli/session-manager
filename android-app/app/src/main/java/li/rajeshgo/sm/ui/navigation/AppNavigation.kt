@@ -16,6 +16,7 @@ import li.rajeshgo.sm.push.FollowOpenRequests
 import li.rajeshgo.sm.ui.analytics.AnalyticsDetailScreen
 import li.rajeshgo.sm.ui.analytics.AnalyticsScreen
 import li.rajeshgo.sm.ui.guestbook.GuestbookScreen
+import li.rajeshgo.sm.ui.history.HistoryScreen
 import li.rajeshgo.sm.ui.inbox.InboxBadgeRefresher
 import li.rajeshgo.sm.ui.inbox.InboxScreen
 import li.rajeshgo.sm.ui.queue.rememberResumed
@@ -23,7 +24,6 @@ import li.rajeshgo.sm.ui.queue.QueueScreen
 import li.rajeshgo.sm.ui.queue.UsageScreen
 import li.rajeshgo.sm.ui.settings.SettingsScreen
 import li.rajeshgo.sm.ui.watch.WatchScreen
-import li.rajeshgo.sm.ui.watch.historyReaderPage
 
 private const val INBOX_BADGE_REFRESH_MS = 60_000L
 
@@ -164,7 +164,7 @@ fun AppNavigation() {
             UsageScreen(onBack = { navController.popBackStack() })
         }
         composable(Routes.HISTORY) {
-            OwnerPageScreen(page = historyReaderPage, onBack = { navController.popBackStack() })
+            HistoryScreen(onBack = { navController.popBackStack() }, onOpenWatch = toWatch, menu = menu)
         }
         composable(Routes.GUESTBOOK) {
             GuestbookScreen(onBack = { navController.popBackStack() }, menu = menu)
