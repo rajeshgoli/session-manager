@@ -4,7 +4,9 @@ import kotlinx.serialization.json.Json
 import li.rajeshgo.sm.data.model.SessionClaim
 import li.rajeshgo.sm.data.model.SessionDoc
 import li.rajeshgo.sm.data.model.SessionObligationsResponse
+import android.webkit.WebViewClient
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -201,5 +203,25 @@ class DocReaderTest {
         assertNull(readerPageForLink("https://evil.example.com/docs/widgets/memo.md", host))
         assertNull(readerPageForLink("https://sm.example.com/docs/widgets/memo.md", ""))
         assertNull(readerPageForLink("sm-enroll://enroll?url=x", host))
+    }
+
+    @Test fun serverDownStatusesAreCloudflareOriginFailuresOnly() {
+        listOf(502, 503, 504, 530).forEach { assertTrue("$it", isServerDownStatus(it)) }
+        listOf(200, 401, 403, 404, 500, 501).forEach { assertFalse("$it", isServerDownStatus(it)) }
+    }
+
+    @Test fun serverDownErrorsAreConnectivityFailuresOnly() {
+        listOf(WebViewClient.ERROR_CONNECT, WebViewClient.ERROR_HOST_LOOKUP, WebViewClient.ERROR_TIMEOUT, WebViewClient.ERROR_IO)
+            .forEach { assertTrue("$it", isServerDownError(it)) }
+        listOf(WebViewClient.ERROR_BAD_URL, WebViewClient.ERROR_UNSUPPORTED_SCHEME, WebViewClient.ERROR_FAILED_SSL_HANDSHAKE)
+            .forEach { assertFalse("$it", isServerDownError(it)) }
+    }
+
+    @Test fun readerRetryBacksOffForAboutThirtySecondsThenStops() {
+        assertEquals(0L, readerRetryDelayMs(0))
+        val schedule = (1..6).map { readerRetryDelayMs(it) }
+        assertEquals(listOf(1_000L, 2_000L, 4_000L, 8_000L, 8_000L, 8_000L), schedule)
+        assertEquals(31_000L, schedule.sumOf { it!! })
+        assertNull(readerRetryDelayMs(7))
     }
 }

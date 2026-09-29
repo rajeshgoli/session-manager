@@ -5,7 +5,9 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
 import android.webkit.ClientCertRequest
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
@@ -32,6 +34,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -45,6 +48,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import java.net.URI
+import kotlinx.coroutines.delay
 import li.rajeshgo.sm.data.model.SessionClaim
 import li.rajeshgo.sm.data.model.SessionDoc
 import li.rajeshgo.sm.data.model.SessionMessage
@@ -247,6 +251,45 @@ private fun effectivePort(uri: URI): Int = when {
 
 private fun withoutFragment(uri: URI): String = uri.toString().substringBefore('#')
 
+/**
+ * The statuses Cloudflare answers with while sm-server is down, which it is for a few
+ * seconds on every restart (sm#1622): origin refused (502), unavailable (503), timed
+ * out (504) and tunnel unreachable (530). Anything else is the server's own answer.
+ */
+fun isServerDownStatus(status: Int): Boolean = status == 502 || status == 503 || status == 504 || status == 530
+
+/** WebView load errors that mean the server could not be reached, rather than a bad page. */
+fun isServerDownError(errorCode: Int): Boolean = errorCode == WebViewClient.ERROR_CONNECT ||
+    errorCode == WebViewClient.ERROR_HOST_LOOKUP || errorCode == WebViewClient.ERROR_TIMEOUT ||
+    errorCode == WebViewClient.ERROR_IO
+
+private val READER_RETRY_DELAYS_MS = listOf(1_000L, 2_000L, 4_000L, 8_000L, 8_000L, 8_000L)
+
+/**
+ * How long to wait before reloading a page after [failures] failed loads in a row: 0 for a
+ * manual Retry (no failures since), then 1, 2, 4, 8, 8, 8 s, about 30 s in all. Null once
+ * that is spent: the reader stops and says the server is unreachable.
+ */
+fun readerRetryDelayMs(failures: Int): Long? =
+    if (failures <= 0) 0L else READER_RETRY_DELAYS_MS.getOrNull(failures - 1)
+
+/** A page the server could not serve: [failures] loads of [url] have failed since the last manual Retry. */
+private data class ReaderOutage(val url: String, val failures: Int)
+
+/**
+ * Whether the main-frame load in flight has failed. WebView can report an HTTP error before
+ * `onPageStarted`, so the flag is reset where the reader starts each load ([loadOwnerPage]),
+ * not in a page callback.
+ */
+private class ReaderLoad {
+    var failed = false
+}
+
+private fun WebView.loadOwnerPage(url: String, auth: DocReaderAuth, load: ReaderLoad) {
+    load.failed = false
+    loadUrl(url, auth.headers)
+}
+
 @Composable
 fun DocReaderOverlay(
     page: ReaderPage,
@@ -261,17 +304,30 @@ fun DocReaderOverlay(
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     var loading by remember { mutableStateOf(true) }
     var loadedTitle by remember(page) { mutableStateOf<String?>(null) }
+    var outage by remember(page) { mutableStateOf<ReaderOutage?>(null) }
+    val readerLoad = remember(page) { ReaderLoad() }
     val readyAuth = auth?.getOrNull()
     val currentPath = history.lastOrNull()?.let { runCatching { URI(it).rawPath }.getOrNull() }
     // A doc opened from a link has no known title until the page loads.
     val title = if (page.followsPage || page.title.isBlank()) loadedTitle ?: page.title.ifBlank { page.subtitle } else page.title
     val subtitle = if (page.followsPage) currentPath?.takeIf(String::isNotEmpty) ?: page.subtitle else page.subtitle
 
+    // Reload a page the server could not serve, backing off; keyed on the outage so a Retry
+    // tap cancels the pending wait, and a second tap before the load answers is a no-op.
+    LaunchedEffect(outage) {
+        val down = outage ?: return@LaunchedEffect
+        val wait = readerRetryDelayMs(down.failures) ?: return@LaunchedEffect
+        delay(wait)
+        val webView = webViewRef ?: return@LaunchedEffect
+        if (readyAuth != null) webView.loadOwnerPage(down.url, readyAuth, readerLoad)
+    }
+
     BackHandler {
         val webView = webViewRef
         if (readyAuth != null && webView != null && history.size > 1) {
             history.removeAt(history.lastIndex)
-            webView.loadUrl(history.last(), readyAuth.headers)
+            outage = null
+            webView.loadOwnerPage(history.last(), readyAuth, readerLoad)
         } else {
             onClose()
         }
@@ -333,14 +389,30 @@ fun DocReaderOverlay(
                 }
                 else -> {
                     if (loading) LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Cyan)
-                    DocReaderWebView(
-                        auth = readyAuth,
-                        initialUrl = readerUrl(readyAuth.serverUrl, page.path),
-                        history = history,
-                        onWebView = { webViewRef = it },
-                        onLoading = { loading = it },
-                        onTitle = { loadedTitle = it },
-                    )
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        DocReaderWebView(
+                            auth = readyAuth,
+                            initialUrl = readerUrl(readyAuth.serverUrl, page.path),
+                            history = history,
+                            load = readerLoad,
+                            onWebView = { webViewRef = it },
+                            onLoading = { loading = it },
+                            onLoaded = { pageTitle ->
+                                outage = null
+                                loadedTitle = pageTitle
+                            },
+                            onServerDown = { url ->
+                                val failures = outage?.takeIf { it.url == url }?.failures ?: 0
+                                outage = ReaderOutage(url, failures + 1)
+                            },
+                        )
+                        outage?.let { down ->
+                            ReaderOutagePanel(
+                                gaveUp = readerRetryDelayMs(down.failures) == null,
+                                onRetry = { outage = down.copy(failures = 0) },
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -353,9 +425,11 @@ private fun DocReaderWebView(
     auth: DocReaderAuth,
     initialUrl: String,
     history: MutableList<String>,
+    load: ReaderLoad,
     onWebView: (WebView?) -> Unit,
     onLoading: (Boolean) -> Unit,
-    onTitle: (String?) -> Unit,
+    onLoaded: (title: String?) -> Unit,
+    onServerDown: (url: String) -> Unit,
 ) {
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     DisposableEffect(Unit) {
@@ -388,7 +462,7 @@ private fun DocReaderWebView(
                                 // redirects, so every owner page is loaded again with them.
                                 if (request.isRedirect && history.isNotEmpty()) history[history.lastIndex] = target
                                 else history.add(target)
-                                view.loadUrl(target, auth.headers)
+                                view.loadOwnerPage(target, auth, load)
                                 true
                             }
                             DocNavigation.External -> {
@@ -410,20 +484,60 @@ private fun DocReaderWebView(
                         }
                     }
 
+                    // Cloudflare's error page while sm-server restarts (sm#1622): the reader
+                    // covers it and reloads instead of leaving a bare "Bad gateway" on screen.
+                    override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, errorResponse: WebResourceResponse) {
+                        if (request.isForMainFrame && isServerDownStatus(errorResponse.statusCode)) {
+                            load.failed = true
+                            onServerDown(request.url.toString())
+                        }
+                    }
+
+                    override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                        if (request.isForMainFrame && isServerDownError(error.errorCode)) {
+                            load.failed = true
+                            onServerDown(request.url.toString())
+                        }
+                    }
+
                     override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) = onLoading(true)
 
                     override fun onPageFinished(view: WebView, url: String?) {
                         onLoading(false)
                         // WebView reports the URL as the title of a page without one.
-                        onTitle(view.title?.takeIf { it.isNotBlank() && it != url })
+                        if (!load.failed) onLoaded(view.title?.takeIf { it.isNotBlank() && it != url })
                     }
                 }
                 history.clear()
                 history.add(initialUrl)
-                loadUrl(initialUrl, auth.headers)
+                loadOwnerPage(initialUrl, auth, load)
                 webViewRef = this
                 onWebView(this)
             }
         },
     )
+}
+
+/** Covers the WebView while the server is down: retrying on its own until [gaveUp], and a Retry button throughout. */
+@Composable
+private fun ReaderOutagePanel(gaveUp: Boolean, onRetry: () -> Unit) {
+    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterVertically),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = if (gaveUp) "sm server unreachable" else "sm server is restarting",
+                style = MaterialTheme.typography.titleMedium,
+                color = if (gaveUp) Rose else MaterialTheme.colorScheme.onSurface,
+            )
+            Text(
+                text = if (gaveUp) "Stopped retrying. Tap Retry to try again." else "Retrying…",
+                style = MaterialTheme.typography.bodyMedium,
+                color = TextMuted,
+            )
+            OutlinedButton(onClick = onRetry, shape = RoundedCornerShape(10.dp)) { Text("Retry") }
+        }
+    }
 }
