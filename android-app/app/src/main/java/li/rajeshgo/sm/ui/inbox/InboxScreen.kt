@@ -282,16 +282,26 @@ private fun FilterChip(label: String, selected: Boolean, onClick: () -> Unit) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SwipeToDone(onDone: () -> Unit, content: @Composable () -> Unit) {
+    // The swipe never settles dismissed: on Open the row leaves with the list update,
+    // and a failed Done (or a Docs row, which stays listed) springs back.
+    // One Done per swipe: the callback can repeat while the swipe settles.
+    var sent by remember { mutableStateOf(false) }
     val dismissState = rememberSwipeToDismissBoxState(
         confirmValueChange = { value ->
-            if (value == SwipeToDismissBoxValue.StartToEnd) {
+            if (value == SwipeToDismissBoxValue.StartToEnd && !sent) {
+                sent = true
                 onDone()
-                true
-            } else {
-                false
             }
+            false
         },
     )
+    // A row still listed a moment later (Docs, or Done failed) can be swiped again.
+    LaunchedEffect(sent) {
+        if (sent) {
+            delay(1_000)
+            sent = false
+        }
+    }
     SwipeToDismissBox(
         state = dismissState,
         enableDismissFromEndToStart = false,

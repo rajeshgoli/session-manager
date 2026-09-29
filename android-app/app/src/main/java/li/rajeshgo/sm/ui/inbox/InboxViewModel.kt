@@ -6,6 +6,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -112,6 +113,9 @@ class InboxViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
                 .onFailure { error ->
+                    // A filter change cancelled this load; the new one owns the state.
+                    if (error is CancellationException) throw error
+                    if (_uiState.value.filter != filter) return@onFailure
                     if (error is SessionManagerAuthException) {
                         settingsRepository.clearAuth()
                         _uiState.update { it.copy(loading = false, refreshing = false, signedOut = true) }
