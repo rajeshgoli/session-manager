@@ -323,7 +323,7 @@
 </style>
 
 <h1>1782 — Fit and finish: sm web and the phone app</h1>
-<p class="sans"><small>Author: Claude (design) <code>sm-1782</code> · Ticket #1782 · Revision 1, 30 September 2026 (later revisions add a “what changed” FAQ here) · screens drawn from live sm data at 12:47 pm PT that day</small></p>
+<p class="sans"><small>Author: Claude (design) <code>sm-1782</code> · Ticket #1782 · Revision 2, 30 September 2026 · screens drawn from live sm data at 12:47 pm PT that day</small></p>
 
 <h2>Memo</h2>
 
@@ -335,39 +335,33 @@
 <table class="map">
 <thead><tr><th>Your note</th><th>What changes</th></tr></thead>
 <tbody>
-<tr><td>Fonts one or two sizes too small</td><td>Base text 13.5 → 15 px, all sizes scaled; Larger and Largest in Settings. Scenario 1.</td></tr>
+<tr><td>Fonts one or two sizes too small; Terminal button on Claude cards</td><td>Base text 13.5 → 15 px, adjustable in Settings on the web and the phone; Claude cards get both icons. Scenario 1.</td></tr>
 <tr><td>Typing in the web terminal did not clear “waiting on me”; no way to clear it after typing elsewhere</td><td>Enter in sm's terminal clears it, as does a prompt you type into a Claude agent anywhere. ✓ clears it by hand. Scenario 2.</td></tr>
-<tr><td>Terminal button for Claude agents too</td><td>Both icons on Claude cards. Scenario 1.</td></tr>
-<tr><td>One chip cannot show working, jobs and waiting-on-me together</td><td>Three separate facts per agent. Scenario 1 shows the five overlaps you listed.</td></tr>
+<tr><td>One chip cannot show working, jobs and waiting-on-me together</td><td>Three separate facts per agent. Scenario 1 shows your overlaps, plus waiting on a review.</td></tr>
 <tr><td>Esc, Tab and Shift-Tab buttons on the web terminal</td><td>Gone on computers, since the keyboard reaches the terminal directly. Kept on phones. Scenario 2.</td></tr>
 <tr><td>With a terminal open, show other agents in attention order and switch fast</td><td>A switcher column in attention order, with ✓. The Agents page uses the same order. Scenarios 1, 2.</td></tr>
-<tr><td>Terminal latency on the home network</td><td>On the Studio it connects directly, skipping Cloudflare; the MacBook can too, with a certificate (decision 4). The bar shows route and round-trip time. Scenario 2.</td></tr>
-<tr><td>Top bar: memory, CPU, GPU; redder when busier; queue share</td><td>That order, in the phone's colours (green, amber above 60%, red above 85%), queue share solid. Queue page too. Scenario 1.</td></tr>
+<tr><td>Terminal latency on the home network</td><td>sm's relay stops adding up to 25 ms per key, and at home the terminal skips Cloudflare (decision 4). The bar shows route and round-trip time. Scenario 2.</td></tr>
+<tr><td>Top bar and Queue tab: memory, CPU, GPU; redder when busier; queue share</td><td>That order, in the phone's colours (green, amber above 60%, red above 85%), queue share solid. Queue page too. Scenario 1.</td></tr>
 <tr><td>Side panel feels far away and outlives page changes</td><td>Details open under the card you clicked. The right pane is for reading only and closes on page change. Scenario 3.</td></tr>
 <tr><td>Inbox: show a finished agent's last message</td><td>A Finished group, below Needs you, shows the last turn message. Scenario 5.</td></tr>
 <tr><td>Board: ticket, PR, agent, terminal, inbox one click away</td><td>A links line on every ticket, agent, job, thread and History row. sm shows GitHub text itself, since GitHub cannot be embedded. Scenario 4.</td></tr>
 <tr><td>Board hides lanes and groups it has room for</td><td>Nothing folds while it fits, and a needs-you ticket never hides. Scenario 4.</td></tr>
 <tr><td>Container tickets show Start when all their parts are done</td><td>“All parts done” and Close, which closes the GitHub issue. Scenario 4.</td></tr>
 <tr><td>Blocked tickets cannot be started</td><td>Start anyway; the agent is told to build on the blockers' partial output. Scenario 4.</td></tr>
-<tr><td>Queue tab colours</td><td>The same colours as the top bar. Scenario 1.</td></tr>
 <tr><td>History: what is it for; fonts and colours</td><td>It opens on “Bring back an agent”, with last words and Restore. Scenario 6.</td></tr>
-<tr><td>Settings: toggles, not checkboxes</td><td>Every on/off becomes a toggle. Scenario 7.</td></tr>
+<tr><td>Settings: toggles; About is colourless</td><td>Toggles everywhere; About gets coloured status rows. Scenario 7.</td></tr>
 <tr><td>Context handoff: progressive disclosure; Claude and Codex need different thresholds</td><td>Thresholds appear once a provider is on, per provider, in tokens and percent (decision 7). Scenario 7.</td></tr>
-<tr><td>About is colourless</td><td>Status rows with coloured dots. Scenario 7.</td></tr>
-<tr><td>Phone: Watch looks different from Board and Inbox</td><td>Watch and History take the Board and Inbox style. Scenario 8.</td></tr>
-<tr><td>Phone: an opened inbox item shows web tabs</td><td>Native threads; docs without web tabs. Scenario 8.</td></tr>
-<tr><td>Phone: Board always spins</td><td>Tabs keep their last data and refresh quietly. Scenario 8.</td></tr>
-<tr><td>The phone showed #1784 and a needs-you the web did not</td><td>The web hid both in a closed “Other tickets” box, and reads needs-you from a slower feed. Both apps will draw the same server-computed fields. Roll-ins below.</td></tr>
-<tr><td>Phone: carry over the web changes</td><td>All of the above ship on the phone too. Appendix J.</td></tr>
+<tr><td>Phone: Watch style differs; inbox items show web tabs; Board spins; carry over the web changes</td><td>One style, native threads, tabs keep their data, and every change above ships on the phone. Scenario 8, appendix J.</td></tr>
+<tr><td>The phone showed #1784 and a needs-you the web did not</td><td>The web hid both in a closed “Other tickets” box, and reads needs-you from a slower feed. Both apps will draw the same server-computed fields. Appendices B, H1.</td></tr>
 <tr><td>New agents are named <code>claude-&lt;id&gt;</code></td><td>Your ticket pattern, else a poem (Claude) or a star (Codex). Scenario 9.</td></tr>
 </tbody>
 </table>
 
-<p><b>Roll-ins I found while reading the code</b>, all in the plan: the “need you” count misses agents' blocking questions (<code>http/watch.rs:206</code>); the web and the phone each work out status and folding on their own, which is why #1784 and #1771 showed only on the phone; Settings offers a handoff toggle for plain Codex, which has no context gauge; History shows no last words, because retired agents' status is cleared; and <code>sm spawn --ticket</code> does not use your name pattern.</p>
+<p><b>Roll-ins found in the code</b>, all in the plan: the “need you” count misses blocking questions; Settings offers a handoff toggle for plain Codex, which has no gauge; History shows no last words; <code>sm spawn --ticket</code> ignores your name pattern.</p>
 
 <div class="scen">Scenario 1 · You sit down at the laptop</div>
 <h3>“Who needs me, who is done, and what is moving?”</h3>
-<p>The Agents page lists agents in attention order, in sections. Each card shows three facts: <b>Agent</b> (working or idle) and <b>Jobs</b> (its queue jobs) side by side, and <b>You</b> (needs you, or its finished summary) on its own line when there is something. The colour on the card's left edge is its section. The top bar reads Memory, CPU, GPU, and each meter turns amber and then red as it fills.</p>
+<p>The Agents page lists agents in attention order, in sections. Each card shows three facts: <b>Agent</b> (working or idle) and <b>Jobs</b> (its queue jobs and Codex reviews) side by side, and <b>You</b> (needs you, or its finished summary) on its own line when there is something. The colour on the card's left edge is its section. The top bar reads Memory, CPU, GPU, and each meter turns amber and then red as it fills.</p>
 <div class="scrwrap"><div class="scr">
  <div class="rail"><div class="brand">sm</div><a class="on">Agents <b>10</b></a><a>Board <b>1</b></a><a>Queue <b>2</b></a><a>Inbox <b class="hot" style="color:var(--m-mag)">1</b></a><a>Analytics</a><a>History</a><span class="grow"></span><a>Settings</a></div>
  <div class="main">
@@ -412,7 +406,7 @@
 <li><b>✓ clears “needs you”</b> when you answered somewhere sm cannot see. <b>By repo</b> brings back today's grouping.</li>
 <li><b>Memory reads 115 of 256 GB, and queue jobs hold 98 GB of it.</b> The solid part of each bar is the queue's share and the tinted part is everything else. That matches the phone's Queue screen.</li>
 </ul>
-<p>The five overlaps you listed, and what each shows:</p>
+<p>The overlaps you listed, and what each shows:</p>
 <table>
 <thead><tr><th>Situation</th><th>Agent</th><th>Jobs</th><th>You</th><th>Section</th></tr></thead>
 <tbody>
@@ -420,6 +414,7 @@
 <tr><td>Idle, waiting for its running job</td><td class="mu">○ Idle 40m</td><td class="gr">▶ Tests running 38m of 3h</td><td>—</td><td>Moving</td></tr>
 <tr><td>Idle, waiting for a job still in the queue</td><td class="mu">○ Idle 1h 5m</td><td class="am">⏸ Waiting 1h 2m · 3rd in line</td><td>—</td><td>Waiting long (after 30 min)</td></tr>
 <tr><td>Working, with a job running</td><td class="gr">● Working 2m</td><td class="gr">▶ Background running 1h 9m</td><td>—</td><td>Moving</td></tr>
+<tr><td>Idle, waiting for a Codex review</td><td class="mu">○ Idle 12m</td><td class="am">⏸ Codex review on PR #1790 · 12m</td><td>—</td><td>Waiting (Waiting long after 30 min)</td></tr>
 <tr><td>Working, with a job queued</td><td class="gr">● Working 2m</td><td class="am">⏸ Waiting 8m · 1st in line</td><td>—</td><td>Moving</td></tr>
 </tbody>
 </table>
@@ -453,7 +448,8 @@
  </div>
 </div></div>
 <ul class="does">
-<li><b>Keys go straight to the terminal.</b> Esc, Tab, Shift-Tab, arrows and Ctrl-C all work from the keyboard, so the key buttons show only on phone-sized screens. ⌘⌥↑ and ⌘⌥↓ move through the switcher, and ⌘\ hides it.</li>
+<li><b>Keys go straight to the terminal</b>, so the key buttons show only on phone-sized screens. ⌘⌥↑ and ⌘⌥↓ move through the switcher.</li>
+<li><b>Why typing lags today.</b> The web terminal always goes through Cloudflare, even on the Studio, and sm's relay checks for the agent's output only every 25 ms, adding up to 25 ms to every echo. The relay will pass output on the moment it appears.</li>
 <li><b>Direct · 3 ms</b> means the terminal is connected straight to the server, skipping Cloudflare. Over Cloudflare the bar reads, for example, “Cloudflare · 45 ms”. Chrome asks once for permission to reach the local server, and if you decline, sm uses Cloudflare as today.</li>
 </ul>
 
@@ -567,8 +563,9 @@
    <div><span class="l">Your review of a doc</span><span><span class="toggle on"></span> ask the agent to hand off first</span></div></div>
  </div></div></div></div></div>
 <ul class="does">
-<li>Turning Codex on reveals its own rows, which start at 60% (155k of 258k tokens). The review toggles show only while at least one provider hands off.</li>
-<li>Every checkbox becomes a toggle. Appearance gains Text size (15, 16 or 17 px). About gains coloured status rows: server version, uptime and health, web build, latest phone build.</li>
+<li>Turning Codex on reveals its own rows, which start at 80% (207k of 258k tokens). The review toggles show only while at least one provider hands off.</li>
+<li><b>To try handoff on one agent or one ticket</b>, leave the defaults off and use Hand off in that agent's details, or in a ticket's ⋯ on the Board. A ticket setting also covers the agents that take over from its first one.</li>
+<li>Every checkbox becomes a toggle. Appearance gains a Text size slider. About gains coloured status rows: server version, uptime and health, web build, latest phone build.</li>
 </ul>
 
 <div class="scen">Scenario 8 · The phone</div>
@@ -599,15 +596,12 @@
 
 <div class="scen">Scenario 9 · Starting an agent without a name</div>
 <h3>“Give it a name I can say.”</h3>
-<table>
-<thead><tr><th>How it starts</th><th>Name today</th><th>Name after</th></tr></thead>
-<tbody>
-<tr><td>Board Start, or <code>sm spawn --ticket 1782</code></td><td><code>sm-1782</code> from the board; <code>claude-48ab12cd</code> from the CLI</td><td><code>sm-1782</code> from both (your pattern)</td></tr>
-<tr><td>New agent on the web, <code>sm claude</code>, or <code>sm spawn</code> without a ticket, Claude</td><td><code>claude-48ab12cd</code></td><td>A poem's name: <code>kubla-khan</code>, <code>ozymandias</code>, <code>dover-beach</code></td></tr>
-<tr><td>The same, Codex</td><td><code>codex-fork-9f31c2d0</code></td><td>A star's name: <code>vega</code>, <code>rigel</code>, <code>altair</code></td></tr>
-</tbody>
-</table>
-<p>Names in use, live or retired, are skipped. <code>sm me</code> marks generated names, so agents still rename themselves (decision 9).</p>
+<ul class="does">
+<li><b>With a ticket</b> (Board Start or <code>sm spawn --ticket 1782</code>): your pattern, <code>sm-1782</code>. Today the CLI gives <code>claude-48ab12cd</code>.</li>
+<li><b>Without one, Claude:</b> a poem's name, such as <code>kubla-khan</code>, <code>ozymandias</code> or <code>dover-beach</code>.</li>
+<li><b>Without one, Codex:</b> a star's name, such as <code>vega</code>, <code>rigel</code> or <code>altair</code>.</li>
+</ul>
+<p>A name is skipped while a live agent holds it, or one that retired less than a week ago; older names are reused. Most agents then need no rename, so the naming paragraph leaves CLAUDE.md (decision 9).</p>
 
 <h3>Decisions</h3>
 <table>
@@ -616,18 +610,20 @@
 <tr><td>1. Show three facts per agent and order by attention?</td><td><b>Yes.</b> Sections: Needs you, Finished, Waiting long, Moving, Waiting, Idle.</td><td>A single colour hides overlaps you run into daily.</td></tr>
 <tr><td>2. What clears “needs you”?</td><td><b>Your answer:</b> Enter in sm's terminal, a prompt you type into a Claude agent, a reply in the Inbox, or ✓. Never the agent working again on its own.</td><td>An agent can work while it waits on you.</td></tr>
 <tr><td>3. Where do details open?</td><td><b>Under the card or row you clicked.</b> The right pane is for reading only, and everything closes on page change.</td><td>Controls sit next to the thing you chose.</td></tr>
-<tr><td>4. Terminal skips Cloudflare at home?</td><td><b>Yes on the Studio now.</b> On the MacBook, <b>yes, with a certificate</b>: sm adds the DNS name <code>studio-lan.rajeshgo.li</code> for the Studio's home address and gets a free certificate through Cloudflare. That needs a Cloudflare API token that can edit DNS. Please confirm.</td><td>An https page can reach its own machine freely, but another machine only over a certified connection.</td></tr>
+<tr><td>4. Terminal skips Cloudflare at home?</td><td><b>Accepted.</b> Nothing is direct yet; the lag you saw on the Studio is Cloudflare plus sm's 25 ms relay check. The plan fixes the relay, connects directly on the Studio, and gives the MacBook <code>studio-lan.rajeshgo.li</code> with a certificate. sm reuses its Cloudflare token; if it cannot edit DNS, the ticket asks you to add that permission.</td><td>An https page can reach its own machine freely, but another machine only over a certified connection.</td></tr>
 <tr><td>5. Close container tickets from the board?</td><td><b>Yes.</b> “All parts done” plus Close, which closes the GitHub issue with a comment.</td><td>They are bookkeeping; one click ends them.</td></tr>
 <tr><td>6. Start blocked tickets?</td><td><b>Yes, as Start anyway</b>, with a confirm.</td><td>You did this by hand this morning to use the idle machine.</td></tr>
-<tr><td>7. Handoff thresholds</td><td><b>Per provider, shown in tokens.</b> Claude stays at 35% (350k tokens). Codex starts off; if you turn it on, it starts at 60% (155k of 258k).</td><td>The same percent means four times more tokens on Claude.</td></tr>
+<tr><td>7. Handoff thresholds</td><td><b>Per provider, shown in tokens</b>, plus per agent and per ticket. Claude stays at 35% (350k tokens). Codex starts off, at 80% (207k of 258k) once on.</td><td>The same percent means four times more tokens on Claude.</td></tr>
 <tr><td>8. Finished rows in the Inbox</td><td><b>Only after <code>sm task-complete</code>.</b></td><td>That is the agent saying “read this”.</td></tr>
-<tr><td>9. Generated names</td><td><b>Poems for Claude, stars for Codex; your ticket pattern first.</b> Change CLAUDE.md §3 to: “If <code>sm me</code> marks your name as generated, run <code>sm name sm-&lt;newname&gt;</code>…”</td><td>Names you can say and remember; agents still rename to <code>sm-…</code>.</td></tr>
-<tr><td>10. Type and phone style</td><td><b>15 px base</b>, with Larger and Largest in Settings. On the phone, <b>the Board and Inbox style everywhere</b>.</td><td>Two sizes up, as you asked; one look on the phone.</td></tr>
+<tr><td>9. Generated names</td><td><b>Poems for Claude, stars for Codex; your ticket pattern first.</b> Names free up a week after retirement. Remove “Name yourself once…” from CLAUDE.md §3.</td><td>Names you can say and remember, without agents renaming.</td></tr>
+<tr><td>10. Type and phone style</td><td><b>15 px base, adjustable</b>: a Text size slider on the web (13 to 19 px) and on the phone (85% to 130%). On the phone, <b>the Board and Inbox style everywhere</b>.</td><td>Two sizes up by default; you set the rest.</td></tr>
 <tr><td>11. Plan</td><td><b>Fourteen tickets</b> (appendix L): seven server, five web, two phone.</td><td>Each fits one agent without compaction.</td></tr>
 </tbody>
 </table>
 
 
+<h3>FAQ — what changed since revision 1</h3>
+<p>The Jobs fact now shows pending Codex reviews. The terminal lag has a second cause, sm's 25 ms relay check, which gets fixed first, and decision 4 is accepted. Codex hands off at 80%, and handoff can be set for one agent or one ticket. Names free up a week after retirement, and the naming paragraph leaves CLAUDE.md. Text size is a slider on the web and the phone.</p>
 <hr class="appendix-divider">
 <h2>Appendices</h2>
 
@@ -636,16 +632,17 @@
 <h3>A. Type and colour</h3>
 <h4>A1. Type scale (web)</h4>
 <ul>
-<li>The root font size is set on <code>&lt;html&gt;</code> from <code>localStorage["sm-text-size"]</code>: <code>standard</code> 15 px (default), <code>larger</code> 16 px, <code>largest</code> 17 px. An inline script in the shell sets it before first paint, beside the theme script. Text size is per browser, like theme, because it depends on the screen.</li>
+<li>The root font size is set on <code>&lt;html&gt;</code> from <code>localStorage["sm-text-size"]</code>, an integer from 13 to 19 px (default 15). A missing or out-of-range value means 15. An inline script in the shell sets it before first paint, beside the theme script. Text size is per browser, like theme, because it depends on the screen.</li>
 <li>Every font size in <code>app.css</code>, <code>queue.css</code> and <code>devices.css</code> becomes a rem value, by this map (px at the standard size):
 <table><thead><tr><th>Today (px)</th><th>New (rem)</th><th>At 15 px root</th></tr></thead><tbody>
 <tr><td>10, 10.5</td><td>0.8</td><td>12</td></tr><tr><td>11, 11.5</td><td>0.867</td><td>13</td></tr><tr><td>12, 12.5</td><td>0.9</td><td>13.5</td></tr>
 <tr><td>13, 13.5 (base)</td><td>1</td><td>15</td></tr><tr><td>14</td><td>1.067</td><td>16</td></tr><tr><td>15</td><td>1.133</td><td>17</td></tr>
 <tr><td>16, 17</td><td>1.2</td><td>18</td></tr><tr><td>18</td><td>1.333</td><td>20</td></tr><tr><td>22, 24</td><td>1.733</td><td>26</td></tr></tbody></table></li>
 <li>Widths already in rem (the rail, the panel, the rings) scale with the root size. Pixel widths in the layout become rem using the same 15 px root. Agent cards use <code>minmax(24rem, 1fr)</code>.</li>
-<li>The xterm font size is 14, 15 or 16 px for standard, larger and largest.</li>
+<li>The xterm font size is the root size minus 1 px.</li>
 <li>Doc pages loaded in the reader keep their own stylesheet.</li>
-<li>Appearance gains a segmented control, Text size: Standard, Larger, Largest.</li>
+<li>Appearance gains a Text size slider, 13 to 19 px in 1 px steps. It shows the value (“15 px”), applies live, and has Reset (15 px).</li>
+<li><b>Phone:</b> Settings › Appearance gains a Text size slider from 85% to 130% in 5% steps (default 100%), stored in <code>SettingsRepository</code>. <code>Theme.kt</code> scales every <code>Typography</code> style's font size and line height by it.</li>
 </ul>
 <h4>A2. Usage meters (web top bar, Queue page Mac tile, phone)</h4>
 <ul>
@@ -667,7 +664,7 @@
 <p>The server computes both, so the web, the phone and <code>sm watch</code> agree. <code>GET /watch/state</code> (<code>http/watch.rs:225-259</code>) gains two objects per session, and new counts.</p>
 <pre><code>"facts": {
   "agent": { "state": "working" | "idle" | "stopped", "since": "…Z" },
-  "jobs":  { "running": 2, "waiting": 0, "quiet": false,
+  "jobs":  { "running": 2, "waiting": 0, "quiet": false, "review": null | { "pr_number": 1790, "since": "…Z" },
              "earliest_start": "…Z" | null, "oldest_wait": "…Z" | null,
              "tone": "green" | "amber" | "red" | null, "text": "2 running · 2h 56m" },
   "you":   null | { "kind": "message" | "doc_review" | "prompt", "since": "…Z",
@@ -675,7 +672,7 @@
   "finished": null | { "at": "…Z", "text": "…" | null, "read": false }
 },
 "attention": { "section": "you" | "finished" | "waiting_long" | "moving" | "waiting" | "idle" | "stopped",
-               "reason": "message" | "doc_review" | "prompt" | "queue_wait" | "quiet" | "stalled" | null,
+               "reason": "message" | "doc_review" | "prompt" | "queue_wait" | "review_wait" | "quiet" | "stalled" | null,
                "order_key": "…" }</code></pre>
 <p><b>agent.</b> <code>working</code> when <code>activity_state</code> is <code>working</code> or <code>thinking</code>. <code>stopped</code> when the session status is stopped. Otherwise <code>idle</code>, and that includes <code>waiting_permission</code>, which instead produces <code>you.kind = "prompt"</code>. <code>since</code> is <code>activity_since</code> as computed today (<code>http/watch.rs:277-290</code>).</p>
 <p><b>jobs.</b> The session's <code>jobs[]</code> with state <code>running</code> or <code>pending</code>, where the session is the requester or, if the job has no requester, its notify target (unchanged from today). Take the first rule that matches for <code>text</code>:</p>
@@ -687,6 +684,7 @@
 <tr><td>n running, m waiting</td><td>“{n} running · {m} waiting {oldest wait age}”</td><td>green</td></tr>
 <tr><td>0 running, 1 waiting</td><td>“Waiting {age} · {ordinal} in line”, using the job's <code>position</code> from <code>GET /client/queue</code></td><td>amber</td></tr>
 <tr><td>0 running, m waiting</td><td>“{m} waiting {oldest age}”, plus “ for a slot” when every waiting job's holding reason is <code>concurrency_cap</code></td><td>amber</td></tr></tbody></table>
+<p><b>Reviews.</b> <code>jobs.review</code> is the oldest pending Codex review (<code>waiting_on</code> kind <code>review</code>). With no queue jobs, <code>text</code> is “Codex review on PR #{n} · {age}” and <code>tone</code> is amber. With jobs, the job text above gains “ · review {age}” and keeps its tone.</p>
 <p>Ages use 1710's rule: under an hour “{m}m”, otherwise “{h}h {m}m”. <code>{Type}</code> is the job type with a capital letter (“Tests”, “Background”).</p>
 <p><b>you.</b> Build candidates in this order and show the first; <code>more</code> counts the rest.</p>
 <ol>
@@ -700,7 +698,7 @@
 <tr><td>0</td><td>Session stopped</td><td>stopped</td><td>inverse of last activity</td></tr>
 <tr><td>1</td><td><code>facts.you</code> set</td><td>you · its kind</td><td><code>you.since</code> (oldest first)</td></tr>
 <tr><td>2</td><td><code>facts.finished</code> set and not read</td><td>finished</td><td>inverse of <code>finished.at</code> (newest first)</td></tr>
-<tr><td>3</td><td>A running job is quiet; or a job has waited at least <code>web_watch.waiting_long_minutes</code> (default 30); or the agent is stalled (1710 D7 rule 7: idle at least <code>board.stall_minutes</code> with a ticket claim, and no job and no pending review)</td><td>waiting_long · quiet, queue_wait or stalled (checked in that order)</td><td>the earliest of <code>quiet_since</code>, <code>oldest_wait</code> and idle start</td></tr>
+<tr><td>3</td><td>A running job is quiet; or a job or a Codex review has waited at least <code>web_watch.waiting_long_minutes</code> (default 30); or the agent is stalled (1710 D7 rule 7: idle at least <code>board.stall_minutes</code> with a ticket claim, and no job and no pending review)</td><td>waiting_long · quiet, queue_wait, review_wait or stalled (checked in that order)</td><td>the earliest of <code>quiet_since</code>, <code>oldest_wait</code> and idle start</td></tr>
 <tr><td>4</td><td>Agent working, or at least one running job</td><td>moving</td><td>inverse of the latest activity or job start</td></tr>
 <tr><td>5</td><td>A waiting job, or a pending Codex review (<code>waiting_on</code> kind <code>review</code>)</td><td>waiting</td><td>the oldest wait or review request</td></tr>
 <tr><td>6</td><td>Otherwise</td><td>idle</td><td><code>0</code> + inverse of last activity when the agent holds a ticket claim; <code>1</code> + the same otherwise</td></tr></tbody></table>
@@ -717,6 +715,7 @@
 <tr><td>(constructed)</td><td>working; one NeedsYou message</td><td>you; agent.state working</td></tr>
 <tr><td>(constructed)</td><td>idle; one job waiting 1h 2m, third in line</td><td>waiting_long · queue_wait; jobs.text “Waiting 1h 2m · 3rd in line”</td></tr>
 <tr><td>(constructed)</td><td>working; one job waiting 8m, first in line</td><td>moving; jobs tone amber</td></tr>
+<tr><td>(constructed)</td><td>idle 12m; Codex review of PR #1790 requested 12m ago; no jobs</td><td>waiting; jobs.text “Codex review on PR #1790 · 12m”</td></tr>
 <tr><td>(constructed)</td><td>idle 34m with a ticket claim; nothing running</td><td>waiting_long · stalled</td></tr></tbody></table>
 
 <h3>C. Clearing “needs you”</h3>
@@ -857,12 +856,18 @@ finished(session_id TEXT NOT NULL, completed_at TEXT NOT NULL, text TEXT, text_a
  Every other path is unchanged. Each direct attach logs “browser attach direct {localhost|lan} {email} {session}”.</li>
 <li><b>Chrome.</b> A public https page may open <code>ws://localhost</code>, because Chrome treats localhost as secure. Reaching localhost or a private address prompts once for local network access; if you decline, the probes fail and Cloudflare is used.</li>
 <li><b>LAN listener</b> (ticket S7, decision 4).
- <ul><li><b>Config:</b> <code>terminal_direct.lan: {enabled: false, hostname: "studio-lan.rajeshgo.li", port: 8443, cert_dir: "~/.config/session-manager/certs/lan", cloudflare_dns_token_path}</code>.</li>
+ <ul><li><b>Config:</b> <code>terminal_direct.lan: {enabled: false, hostname: "studio-lan.rajeshgo.li", port: 8443, cert_dir: "~/.config/session-manager/certs/lan" }</code>. There is no separate token.</li>
  <li><b>Listener:</b> when enabled, sm-server binds <code>0.0.0.0:8443</code> with rustls. It serves only <code>/client/terminal</code> and <code>/client/terminal/probe</code>, and everything else is 404.</li>
  <li><b>Certificate:</b> Let's Encrypt, via ACME DNS-01 through the Cloudflare API. sm-server renews it when fewer than 30 days remain, checking daily.</li>
- <li><b>DNS:</b> the A record <code>studio-lan</code> (DNS only, not proxied) points to the Studio's LAN IPv4, taken from the default-route interface. sm-server rechecks it every 10 minutes and updates the record when the address changes. The server's existing Cloudflare API client makes the calls.</li>
+ <li><b>DNS:</b> the A record <code>studio-lan</code> (DNS only, not proxied) points to the Studio's LAN IPv4, taken from the default-route interface. sm-server rechecks it every 10 minutes and updates the record when the address changes. The server's existing Cloudflare API client makes the calls with <code>cloudflare_access.api_token</code>. If Cloudflare refuses a DNS change with that token, the listener stays down, the log names the missing permission (Zone › DNS › Edit on <code>rajeshgo.li</code>), and the ticket asks Rajesh to add it to that token.</li>
  <li><b>Failure:</b> if the certificate or the record fails, the listener stays down and logs why, and Cloudflare remains the route.</li></ul></li>
 </ol>
+<h4>G5. Relay latency</h4>
+<ul>
+<li><b>Cause.</b> The output reader (<code>mobile_terminal_output_reader</code>, <code>http.rs:9195-9220</code>) reads a non-blocking PTY and sleeps 25 ms whenever no output is waiting. An echo that arrives during the sleep waits for it to end, which adds up to 25 ms (12.5 ms on average) to every keystroke, on every route, for the phone as well.</li>
+<li><b>Fix.</b> Wait for readiness instead of sleeping: <code>poll(2)</code> on the master fd with a 250 ms timeout, which only bounds the time to notice <code>stop</code>, then read. The input writer's 10 ms retry on <code>EAGAIN</code> (<code>:9244</code>) gets the same treatment, waiting for POLLOUT.</li>
+<li><b>Measure.</b> The ticket records the median echo time for 50 single keystrokes through the ping-free path (keystroke to first output frame, timed in the browser) before and after, for localhost and Cloudflare, and puts the four numbers in the PR. The target is at most 5 ms on the direct localhost path.</li>
+</ul>
 <p><b>Tests.</b>
 <ul>
 <li>A loopback direct upgrade with the right Origin and a browser ticket attaches.</li>
@@ -947,9 +952,15 @@ finished(session_id TEXT NOT NULL, completed_at TEXT NOT NULL, text TEXT, text_a
  <ul><li><code>/handoff-defaults</code> keeps <code>providers</code> (provider → enabled) and adds <code>provider_thresholds: {"claude": {threshold_percent, reminder_percent, review_floor_percent}, "codex-fork": {…}}</code> and <code>window_tokens: {"claude": 1000000, "codex-fork": 258400}</code>.</li>
  <li>The legacy flat fields remain and mirror Claude's values. A PUT of a flat field writes Claude's values, so older phone builds keep working.</li>
  <li>The effective policy (<code>handoff/policy.rs:285-309</code>) uses <code>provider_thresholds[provider]</code>.</li>
- <li>Defaults: Claude 35 / 50 / 20; codex-fork 60 / 75 / 40 (threshold / reminder / review floor, in percent).</li>
+ <li>Defaults: Claude 35 / 50 / 20; codex-fork 80 / 90 / 50 (threshold / reminder / review floor, in percent).</li>
  <li>Migration: stored flat values become Claude's, and codex-fork gets the defaults.</li>
  <li><code>window_tokens</code> is the latest window observed per provider: codex-fork's <code>modelContextWindow</code> (<code>sessions.rs:9204</code>); for Claude, the status-line payload's window size when present, else 1,000,000 when the model id ends in <code>[1m]</code>, else 200,000.</li></ul></li>
+<li><b>Handoff per ticket.</b>
+ <ul><li>A new table <code>handoff_ticket_overrides(repo TEXT, number INTEGER, enabled INTEGER NULL, threshold_percent REAL NULL, updated_at TEXT, PRIMARY KEY (repo, number))</code> sits beside the per-session overrides.</li>
+ <li>Routes: <code>GET</code> and <code>PUT /handoff-policy/ticket/{owner}/{repo}/{number}</code>, with the same body as the per-session route (<code>enabled</code>, <code>threshold_percent</code>, <code>use_default</code>). They use the owner and phone guards.</li>
+ <li>The effective policy takes each field from the first that sets it: the agent's own override, then the override of the ticket it holds (its first ticket claim), then the provider default. <code>source</code> becomes <code>override</code>, <code>ticket</code> or <code>default</code>. A successor agent that claims the same ticket therefore inherits it.</li>
+ <li>The web Hand off popover (agent band) gains a scope switch, “This agent | Ticket #{n}”, shown when the agent holds a ticket. The Board's row ⋯ menu gains “Hand off…”, which opens the same popover scoped to the ticket. The phone's per-agent dialog gains the same switch.</li>
+ <li><b>Example.</b> Defaults are off for both providers. Rajesh turns on handoff for ticket #1782 at 35%. sm-1782 (Claude) reaches 35% and is asked to hand off; its successor claims #1782 and inherits the setting. No other agent is affected.</li></ul></li>
 <li><b>Settings › Context handoff</b> (web and phone).
  <ul><li>Show one group per provider that has a gauge (<code>claude</code>, <code>codex-fork</code>). Plain Codex and codex-app are not listed.</li>
  <li>When a provider is off, show only its toggle and one line explaining the default.</li>
@@ -1004,18 +1015,21 @@ finished(session_id TEXT NOT NULL, completed_at TEXT NOT NULL, text TEXT, text_a
  <ol><li>The request carries a ticket (<code>sm spawn --ticket</code>, board Start): use <code>owner_settings.agent_name(ticket)</code> (<code>owner_settings.rs:407</code>).</li>
  <li>The provider is <code>claude</code>: a random unused name from the poem list.</li>
  <li>The provider is <code>codex</code>, <code>codex-fork</code> or <code>codex-app</code>: a random unused name from the star list.</li></ol></li>
-<li><b>Unused</b> means no session record, live or stopped, has it as <code>name</code>, <code>friendly_name</code> or alias (compared case-insensitively).</li>
+<li><b>Unused</b> means no live session, and no session retired or stopped within the last 7 days, has it as <code>name</code>, <code>friendly_name</code> or alias (compared case-insensitively). Names of agents retired longer ago are reused.</li>
+<li><b>Restore after reuse.</b> When <code>sm restore</code> (or Restore in History) brings back an agent whose name a live agent now holds, the restored agent takes the first free suffix (<code>vega-2</code>). sm prints the new name, and the lookup by the old name keeps preferring the live agent, per the restore rule in <code>docs/product/lessons.md</code>.</li>
 <li><b>Exhausted lists.</b> When every name is used, pick a random base and append <code>-2</code>, <code>-3</code>, … up to the first free one.</li>
-<li><b>Record.</b> The generated name is stored as <code>friendly_name</code> with <code>name_generated: true</code>. It queues the native rename exactly as an explicit name does (<code>queue_provider_native_rename</code>). <code>sm name</code> clears <code>name_generated</code>. Session JSON exposes <code>name_generated</code>, and <code>sm me</code> prints “ (generated name)” after the name.</li>
+<li><b>Record.</b> The generated name is stored as <code>friendly_name</code>, and it queues the native rename exactly as an explicit name does (<code>queue_provider_native_rename</code>).</li>
 <li><b>Poem list</b> (64): ozymandias, kubla-khan, dover-beach, the-raven, invictus, jabberwocky, ulysses, tintern-abbey, the-tyger, annabel-lee, daffodils, ode-to-autumn, fern-hill, birches, mending-wall, still-i-rise, the-lake-isle, byzantium, the-lamb, lycidas, the-eagle, crossing-the-bar, the-kraken, the-listeners, adlestrop, pied-beauty, the-windhover, gods-grandeur, the-wild-swans, prufrock, digging, the-fish, one-art, the-moose, wild-geese, the-summer-day, the-flea, the-garden, the-prelude, bright-star, la-belle-dame, to-a-skylark, the-cloud, lady-of-shalott, my-last-duchess, the-owl, stopping-by-woods, fire-and-ice, nothing-gold, red-wheelbarrow, anecdote-of-the-jar, thirteen-ways, richard-cory, chicago, fog, harlem, sympathy, o-captain, i-wandered-lonely, the-solitary-reaper, kubla, endymion, the-snow-man, the-good-morrow. Names containing a Claude model name (fable, opus, sonnet, haiku) are excluded.</li>
 <li><b>Star list</b> (64): vega, rigel, sirius, altair, deneb, polaris, capella, arcturus, aldebaran, antares, betelgeuse, procyon, spica, regulus, castor, pollux, canopus, achernar, fomalhaut, bellatrix, mira, algol, alcor, mizar, dubhe, merak, alioth, alkaid, shaula, sadr, albireo, alnilam, alnitak, mintaka, saiph, hadar, acrux, mimosa, markab, scheat, alpheratz, hamal, menkar, nunki, kochab, thuban, denebola, algieba, elnath, alhena, wezen, adhara, avior, suhail, orion, lyra, cygnus, carina, perseus, draco, auriga, pleiades, hyades, andromeda. Codex model names (sol, astra, terra, luna) are excluded.</li>
-<li><b>CLAUDE.md §3</b>, on approval of decision 9: replace “If it is <code>claude-&lt;slug&gt;</code>, <code>codex-fork-&lt;slug&gt;</code>, or anything similar” with “If <code>sm me</code> marks it as a generated name, or it is <code>claude-&lt;slug&gt;</code> or <code>codex-fork-&lt;slug&gt;</code>”. Make the same change in <code>AGENTS.md</code> if it carries the rule.</li>
+<li><b>AGENTS.md §3</b> (CLAUDE.md is a link to it): delete the paragraph that starts “<b>Name yourself once, at the end of your first turn, and never again.</b>” (line 91 at <code>2a5e74f</code>). Rajesh approved this in the revision 1 review.</li>
 <li><b>Tests.</b>
  <ul><li>No name plus a ticket gives the pattern name.</li>
  <li>No name as Claude gives a poem-list member; as codex-fork, a star-list member.</li>
  <li>A used name is skipped.</li>
  <li>An exhausted list gets a suffix.</li>
- <li>An explicit name is unchanged, with <code>name_generated</code> false.</li></ul></li>
+ <li>An explicit name is unchanged.</li>
+ <li>A name retired 8 days ago is reusable; one retired 6 days ago is not.</li>
+ <li>Restoring an agent whose name is held gets <code>-2</code>.</li></ul></li>
 </ul>
 
 <h3>L. Tickets</h3>
@@ -1024,29 +1038,29 @@ finished(session_id TEXT NOT NULL, completed_at TEXT NOT NULL, text TEXT, text_a
 <tr><td>S1</td><td>Agent facts, attention order, clearing “needs you”, counts fix</td><td>B (without finished), C</td><td><code>http/watch.rs</code>, <code>watch_view.rs</code>, <code>owner_messages.rs</code>, <code>http/messages.rs</code>, the <code>http.rs</code> terminal bridge and Claude hook</td><td>—</td><td>Mid</td></tr>
 <tr><td>S2</td><td>Last turn message, Finished, Inbox finished group, History last turn</td><td>D; B's finished parts</td><td>new <code>turn_messages.rs</code>, <code>sessions.rs</code> (Stop, codex-fork, task-complete), <code>http/inbox.rs</code>, <code>http/agent_history.rs</code></td><td>S1</td><td>Mid</td></tr>
 <tr><td>S3</td><td>Board: close_ready and Close, Start anyway, link fields, GitHub route</td><td>H2, H3, H4 (server), H5</td><td><code>board/*</code>, <code>http/board.rs</code>, <code>claims.rs</code>, new <code>http/github.rs</code></td><td>—</td><td>Mid</td></tr>
-<tr><td>S4</td><td>Handoff thresholds per provider and window tokens</td><td>I (handoff server)</td><td><code>handoff/*</code>, <code>http/handoff.rs</code></td><td>—</td><td>Mid</td></tr>
-<tr><td>S5</td><td>Generated names; <code>sm me</code> marker; CLAUDE.md line</td><td>K</td><td><code>sessions.rs</code> (record builder), <code>bin/sm.rs</code></td><td>S2 (both edit <code>sessions.rs</code>)</td><td>Low</td></tr>
-<tr><td>S6</td><td>Terminal: ping, probe, direct localhost path</td><td>G3, G4 items 1–5</td><td><code>http.rs</code> terminal endpoint, <code>http/browser_terminal.rs</code></td><td>S1 (both edit the bridge)</td><td>Mid</td></tr>
+<tr><td>S4</td><td>Handoff thresholds per provider, per-ticket override, window tokens</td><td>I (handoff server)</td><td><code>handoff/*</code>, <code>http/handoff.rs</code></td><td>—</td><td>Mid</td></tr>
+<tr><td>S5</td><td>Generated names, reuse after a week, restore suffix; remove the naming paragraph</td><td>K</td><td><code>sessions.rs</code> (record builder, restore), <code>AGENTS.md</code></td><td>S2 (both edit <code>sessions.rs</code>)</td><td>Low</td></tr>
+<tr><td>S6</td><td>Terminal: relay latency fix, ping, probe, direct localhost path</td><td>G3, G4 items 1–5, G5</td><td><code>http.rs</code> terminal endpoint, <code>http/browser_terminal.rs</code></td><td>S1 (both edit the bridge)</td><td>Mid</td></tr>
 <tr><td>S7</td><td>LAN TLS listener with its DNS name and certificate (after decision 4)</td><td>G4 item 6</td><td>new <code>terminal_lan.rs</code>, <code>main.rs</code>, <code>config.rs</code></td><td>S6</td><td>Mid</td></tr>
-<tr><td>W1</td><td>Shell: type scale and Text size, meters and Queue tile colours, Toggle, navigation closes details, band and reading pane, Links component</td><td>A, E, H4 (web component), I (Toggle, Queue)</td><td><code>app.js</code>, <code>app.css</code>, <code>ui.js</code>, <code>queue.js</code>, <code>queue.css</code></td><td>—</td><td>Mid</td></tr>
+<tr><td>W1</td><td>Shell: type scale and Text size slider, meters and Queue tile colours, Toggle, navigation closes details, band and reading pane, Links component</td><td>A, E, H4 (web component), I (Toggle, Queue)</td><td><code>app.js</code>, <code>app.css</code>, <code>ui.js</code>, <code>queue.js</code>, <code>queue.css</code></td><td>—</td><td>Mid</td></tr>
 <tr><td>W2</td><td>Agents page: sections, three facts, ✓, both icons, keyboard</td><td>F</td><td><code>agents.js</code></td><td>S1, S2, W1</td><td>Mid</td></tr>
 <tr><td>W3</td><td>Terminal page: switcher, keys, route and time</td><td>G1–G3, G4 client</td><td><code>terminal.js</code></td><td>S6, W2</td><td>Mid</td></tr>
 <tr><td>W4</td><td>Board page: visibility, Close, Start anyway, links, GitHub pane</td><td>H1–H5 (web)</td><td><code>board.js</code>, <code>board-start.js</code>, <code>history.js</code> (ticket pane)</td><td>S3, W1</td><td>Mid</td></tr>
-<tr><td>W5</td><td>Inbox finished and thread header; History; Settings (toggles, handoff, About)</td><td>I (web)</td><td><code>inbox.js</code>, <code>history.js</code> (list), <code>settings.js</code></td><td>S2, S4, W1, W4 (<code>history.js</code>)</td><td>Mid</td></tr>
-<tr><td>P1</td><td>Phone: one style, facts and order, ✓, keep data across tabs, meter colours</td><td>J1, J2, J5, J7</td><td><code>ui/watch</code>, <code>ui/history</code>, <code>ui/navigation</code>, <code>SessionManagerRepository</code>, view models</td><td>S1, S2</td><td>Mid</td></tr>
+<tr><td>W5</td><td>Inbox finished and thread header; History; Settings (toggles, handoff, ticket handoff in the Board ⋯, About)</td><td>I (web)</td><td><code>inbox.js</code>, <code>history.js</code> (list), <code>settings.js</code></td><td>S2, S4, W1, W4 (<code>history.js</code>)</td><td>Mid</td></tr>
+<tr><td>P1</td><td>Phone: one style, facts and order, ✓, keep data across tabs, meter colours, text size</td><td>J1, J2, J5, J7</td><td><code>ui/watch</code>, <code>ui/history</code>, <code>ui/navigation</code>, <code>SessionManagerRepository</code>, view models</td><td>S1, S2</td><td>Mid</td></tr>
 <tr><td>P2</td><td>Phone: native threads, no web tabs, board changes</td><td>J3, J4, J6</td><td><code>ui/inbox</code>, <code>ui/board</code>, <code>DocReader.kt</code>, <code>owner_docs.rs</code> (nav)</td><td>S3, P1</td><td>Mid</td></tr>
 </tbody></table>
 <p>All tickets go under the goal ticket #1782 with <code>sm board under</code>, and their order is recorded with <code>sm board after</code>. S1, S3, S4 and W1 start together. Every web ticket attaches screenshots in light and dark at 1440 px and 390 px, taken at the Standard and Largest text sizes. Every server ticket runs <code>cargo clippy</code> and <code>fmt</code> as CLAUDE.md says, plus its tests.</p>
 
 <h3>M. Requirement trace</h3>
 <table><thead><tr><th>Memo item</th><th>Spec</th><th>Proof</th></tr></thead><tbody>
-<tr><td>Bigger type, Text size</td><td>A1</td><td>W1 screenshots at Standard and Largest</td></tr>
+<tr><td>Bigger type, adjustable on web and phone</td><td>A1</td><td>W1 screenshots at 13, 15 and 19 px; P1 at 85% and 130%</td></tr>
 <tr><td>Terminal typing clears needs-you; clear by hand</td><td>C1, C2, C4</td><td>S1 tests; live check: answer an agent from the web terminal and watch the card move</td></tr>
 <tr><td>Terminal and Claude icons both</td><td>F</td><td>W2 screenshot</td></tr>
 <tr><td>Three facts; the five overlaps</td><td>B, F, J2</td><td>S1 fixture tests (B examples); W2 and P1 screenshots</td></tr>
 <tr><td>No key buttons on computers</td><td>G2</td><td>W3 screenshots at 1440 and 390 px</td></tr>
 <tr><td>Switcher in attention order; the same order on Agents</td><td>B, F, G1</td><td>W3 check: switching agents with ⌘⌥↓ reattaches</td></tr>
-<tr><td>Direct terminal at home</td><td>G3, G4</td><td>S6 tests; S6/W3 live latency numbers in the PR; S7 check from the MacBook</td></tr>
+<tr><td>Terminal lag: relay fix and direct route at home</td><td>G3, G4, G5</td><td>S6 tests; S6/W3 live latency numbers in the PR; S7 check from the MacBook</td></tr>
 <tr><td>Meters: order, heat, queue share; Queue tile</td><td>A2</td><td>W1 screenshots at a low and a high reading</td></tr>
 <tr><td>Details where you clicked; closes on page change</td><td>E</td><td>W1 test: navigate drops <code>open</code>; W2 screenshot of the band</td></tr>
 <tr><td>Finished and last turn message in Inbox</td><td>D</td><td>S2 tests; W5 screenshot</td></tr>
@@ -1055,9 +1069,10 @@ finished(session_id TEXT NOT NULL, completed_at TEXT NOT NULL, text TEXT, text_a
 <tr><td>Container tickets close</td><td>H2</td><td>S3 state tests; live Close on a finished container</td></tr>
 <tr><td>Start anyway</td><td>H3</td><td>S3 tests; brief text check</td></tr>
 <tr><td>History for restoring</td><td>I</td><td>W5 screenshot</td></tr>
-<tr><td>Toggles; handoff disclosure and thresholds per provider; About</td><td>I</td><td>S4 tests (migration, legacy PUT); W5 and P1 screenshots</td></tr>
+<tr><td>Toggles; handoff disclosure, per-provider thresholds, per-agent and per-ticket; About</td><td>I</td><td>S4 tests (migration, legacy PUT, ticket precedence, successor inherits); W5 and P1 screenshots</td></tr>
+<tr><td>Three facts include reviews</td><td>B</td><td>S1 fixture (review example)</td></tr>
 <tr><td>Phone style, native threads, no spinner</td><td>J</td><td>P1 and P2 emulator screenshots; a tab switch shows cached data at once</td></tr>
-<tr><td>Generated names</td><td>K</td><td>S5 tests; <code>sm me</code> output</td></tr>
+<tr><td>Generated names, reuse after a week</td><td>K</td><td>S5 tests</td></tr>
 <tr><td>Roll-ins: count fix, #1771 hidden, plain Codex toggle, empty History, CLI ticket names</td><td>B counts, H1, I, D4, K</td><td>Tests in S1, S4, S2 and S5; W4 screenshot</td></tr>
 </tbody></table>
 
@@ -1065,6 +1080,7 @@ finished(session_id TEXT NOT NULL, completed_at TEXT NOT NULL, text TEXT, text_a
 <p><b>Why not clear “needs you” when the agent starts working again?</b> Agents often keep working while a question waits, for example on another part of the ticket. Clearing on activity would hide real questions. Your own input is the only signal that you answered.</p>
 <p><b>Why can sm tell your typing from its own deliveries only for Claude?</b> Claude reports each submitted prompt to sm through its hook, with the text. sm marks everything it delivers, so unmarked text came from a person. Codex does not report prompts that way today; appendix C2 has the ticket check the codex-fork event stream.</p>
 <p><b>Is the direct terminal path safe?</b> Yes. The ticket is still minted behind the Cloudflare login, it can be used once within 30 seconds, and the direct socket must carry sm's own page origin. On the Studio the socket never leaves the machine. On the home network it is encrypted with a real certificate. The probe answers only a random id, so a ticket is never sent to a different server.</p>
+<p><b>Where does the terminal lag come from?</b> Two places. The route through Cloudflare adds a round trip to Cloudflare's edge on every key; from the Studio today, a small request through it takes tens to hundreds of milliseconds, against under 1 ms locally. sm's own relay adds up to 25 ms more, because it checks for output every 25 ms (G5). Terminal attach in tmux has neither, which is the difference Rajesh noticed.</p>
 <p><b>Why not show GitHub pages inside sm?</b> GitHub forbids it (<code>X-Frame-Options: deny</code>, checked 30 September 2026). sm shows the text itself instead, which also works when GitHub's page is slow.</p>
 <p><b>Why does the server compute the attention order?</b> The web, the phone and <code>sm watch</code> must agree, and the rules depend on queue positions, quiet jobs and the stall threshold, which only the server has in one place.</p>
 <p><b>Why a separate Finished group instead of Needs you?</b> A finished agent does not block anything, and mixing the two would dilute the magenta that means “an agent is stuck on you”.</p>
