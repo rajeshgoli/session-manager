@@ -323,7 +323,7 @@
 </style>
 
 <h1>1782 — Fit and finish: sm web and the phone app</h1>
-<p class="sans"><small>Author: Claude (design) <code>sm-1782</code> · Ticket #1782 · Revision 2, 30 September 2026 · screens drawn from live sm data at 12:47 pm PT that day</small></p>
+<p class="sans"><small>Author: Claude (design) <code>sm-1782</code> · Ticket #1782 · Revision 3, 30 September 2026 · screens drawn from live sm data at 12:47 pm PT that day</small></p>
 
 <h2>Memo</h2>
 
@@ -404,7 +404,7 @@
 <ul class="does">
 <li><b>⌨ is Terminal and ↗ is Open in Claude.</b> Claude agents with a claude.ai session show both. Clicking the card body opens its details under the card (scenario 3).</li>
 <li><b>✓ clears “needs you”</b> when you answered somewhere sm cannot see. <b>By repo</b> brings back today's grouping.</li>
-<li><b>Memory reads 115 of 256 GB, and queue jobs hold 98 GB of it.</b> The solid part of each bar is the queue's share and the tinted part is everything else. That matches the phone's Queue screen.</li>
+<li><b>Memory reads 115 of 256 GB, 98 GB of it queue jobs</b>: solid is the queue's share, tinted is everything else, as on the phone.</li>
 </ul>
 <p>The overlaps you listed, and what each shows:</p>
 <table>
@@ -456,6 +456,7 @@
 <div class="scen">Scenario 3 · Details where you clicked</div>
 <h3>“Show me iter8-run's jobs.”</h3>
 <p>Clicking a card opens today's panel content in a band under the card's row; on the Board and the Queue, under the row you clicked. The right pane is only for reading docs, threads and GitHub tickets. Everything closes when you change page.</p>
+<p><b>Hand off…</b> opens two separate controls. <b>Automatic handoff</b> is a toggle and threshold for this agent and every agent that takes over from it, or, with the scope switch, for its ticket. <b>Hand off now</b> asks the agent to hand off once, after a confirm.</p>
 <div class="scrwrap"><div class="scr">
  <div class="rail"><div class="brand">sm</div><a class="on">Agents <b>10</b></a><a>Board</a><a>Queue</a><a>Inbox</a><span class="grow"></span><a>Settings</a></div>
  <div class="main"><div class="body">
@@ -468,7 +469,7 @@
     <span class="ln"><span class="prov cx">CODEX</span> <span class="tk">#1776</span></span>
     <div class="facts"><span class="fact gr">● Working 1m</span><span class="fact none">No jobs</span></div></div>
    <div class="detail">
-    <div class="acts"><span class="btn pri">Open in Claude ↗</span><span class="btn">Terminal</span><span class="btn">Follow</span><span class="btn">Hand off</span><span class="btn">Clone</span><span class="btn">⋯</span><span style="flex:1"></span><span class="sub">Opus 1M · high · idle since 12:42 pm</span><span class="btn sm">×</span></div>
+    <div class="acts"><span class="btn pri">Open in Claude ↗</span><span class="btn">Terminal</span><span class="btn">Follow</span><span class="btn">Hand off…</span><span class="btn">Clone</span><span class="btn">⋯</span><span style="flex:1"></span><span class="sub">Opus 1M · high · idle since 12:42 pm</span><span class="btn sm">×</span></div>
     <div class="tabs"><span class="on">Work</span><span>Activity</span><span>Summary</span></div>
     <div class="dbody">
      <div><h6>Ticket</h6><span class="tk">#1858</span> Iter8 I8-8: the run <span class="lk">↗ GitHub</span></div>
@@ -484,32 +485,38 @@
 
 <div class="scen">Scenario 4 · The board</div>
 <h3>“What is each ticket, who is on it, and can I push it along?”</h3>
-<p>Every row carries a links line: the ticket, its PR, its agent (⌨ opens the terminal directly), its queue jobs, its inbox thread and its docs. Blocked tickets show as slim rows with <b>Start anyway</b>. Done tickets show the three most recent. Other tickets stay open while they fit. A container ticket whose parts are all done shows <b>Close</b>.</p>
+<p>Every row carries a links line (⌨ opens the agent's terminal). Blocked tickets are slim rows with <b>Start anyway</b>, the three latest done tickets show, Other tickets stay open, and finished containers show <b>Close</b>.</p>
 <div class="scrwrap"><div class="scr">
  <div class="rail"><div class="brand">sm</div><a>Agents</a><a class="on">Board <b>1</b></a><a>Queue</a><a>Inbox</a><span class="grow"></span><a>Settings</a></div>
  <div class="main"><div class="bar"><h5>Board</h5><span class="sub">2 lanes · updated 20s ago</span><span class="sp"></span><span class="seg"><span class="on">3 h</span><span>6 h</span><span>24 h</span></span><span class="btn">Add lane</span></div>
  <div class="body">
   <div class="lane">
+   <div class="lanehd"><span class="rk">1</span><span class="t">fractal-algo-rust <span class="tk">#1859</span> · Iter8 I8-9: the readout</span><span class="sp" style="flex:1"></span><span class="sub">9 done · 1 in progress · 1 blocked</span></div>
+   <div class="brow"><span class="ti"><span class="tk">#1858</span> Iter8 I8-8: the run</span><span class="strip"><s class="sj" style="left:0;width:100%"></s></span><span class="ball gr">2 running · 2h 56m</span><span></span>
+    <div class="links"><span class="lk">#1858 ↗</span><span class="lk">iter8-run · Claude · ○ Idle 5m ⌨</span><span class="lk gr">1858-prepare-3 · running 2h 56m</span><span class="lk gr">1858-run · running 1h 19m</span></div></div>
+  </div>
+  <div class="lane">
    <div class="lanehd"><span class="rk">2</span><span class="t">session-manager <span class="tk">#1775</span> · Reviews: one review command</span><span class="sp" style="flex:1"></span><span class="sub">1 in progress · 6 blocked</span></div>
    <div class="brow"><span class="ti"><span class="tk">#1776</span> Reviews 1/6: sm request-review</span><span class="strip"><s class="sw" style="left:70%;width:30%"></s></span><span class="ball gr">Agent working 1m</span><span></span>
-    <div class="links"><span class="lk">#1776 ↗</span><span class="lk">sm-1776 · Codex ⌨</span><span class="lk">No PR yet</span></div></div>
+    <div class="links"><span class="lk">#1776 ↗</span><span class="lk">sm-1776 · Codex · <span class="gr">● Working 1m</span> ⌨</span><span class="lk">No PR yet</span></div></div>
    <div class="brow blk"><span class="ti"><span class="tk">#1777</span> Reviews 2/6: review runs</span><span class="sub">waits on #1776</span><span class="btn sm">Start anyway</span></div>
    <div class="brow blk"><span class="ti"><span class="tk">#1778</span> Reviews 3/6: repo, lane and ticket policies</span><span class="sub">waits on #1777</span><span class="btn sm">Start anyway</span></div>
-   <div class="brow blk"><span class="ti"><span class="tk">#1779</span> Reviews 4/6: paired reviewers</span><span class="sub">waits on #1778</span><span class="btn sm">Start anyway</span></div>
-   <div class="brow blk"><span class="ti sub">#1780 and #1781 follow the same way, each waiting on #1779</span></div>
+   <div class="brow blk"><span class="ti sub">#1779 to #1781 follow the same way</span></div>
   </div>
   <div class="lane">
    <div class="lanehd"><span class="rk">·</span><span class="t">session-manager · Other tickets</span></div>
    <div class="brow"><span class="ti"><span class="tk mg">#1771</span> Browser device certificate requests break Chrome terminals</span><span></span><span class="ball mg">Needs you 7m</span><span></span>
-    <div class="links"><span class="lk">#1771 ↗</span><span class="lk mg">Inbox · 1 question</span><span class="lk">sm-1726-engineer · Codex ⌨</span></div></div>
+    <div class="links"><span class="lk">#1771 ↗</span><span class="lk mg">Inbox · 1 question</span><span class="lk">sm-1726-engineer · Codex · ○ Idle 7m ⌨</span></div></div>
    <div class="brow"><span class="ti"><span class="tk">#1710</span> sm on the web: one page for everything</span><span class="sub">15 of 15 parts done</span><span class="ball cy">All parts done</span><span class="btn sm pri">Close</span></div>
-   <div class="brow"><span class="ti"><span class="tk">#1773</span> sm request-codex-review waits 60 minutes…</span><span></span><span class="ball cy">Ready</span><span class="btn sm pri">Start</span></div>
+   <div class="brow"><span class="ti"><span class="tk">#1782</span> sm web and mobile redesign, fit and finish</span><span></span><span class="ball mg">Your review 4m</span><span></span>
+    <div class="links"><span class="lk">#1782 ↗</span><span class="lk">sm-1782 · Claude · ○ Idle 4m ⌨</span><span class="lk mg">PR #1785 · open · your review, round 3 · waiting 4m</span><span class="lk mg">Inbox · doc review</span></div></div>
   </div>
  </div></div>
 </div></div>
 <ul class="does">
-<li><b>Links open in place.</b> A ticket or PR opens in the reading pane: sm fetches its text, comments and (for a PR) checks and review state from GitHub, with ↗ to open it on GitHub. GitHub cannot be embedded, because it sends <code>X-Frame-Options: deny</code>. I checked this today.</li>
-<li><b>Start anyway</b> asks “#1777 waits on #1776, which is not done. Start anyway?” The agent's first message then gains one paragraph: “Started early by Rajesh. #1776 is not done yet: check what it has delivered so far and build on it; do not redo its work.” The row then shows “started early”.</li>
+<li><b>Every chip says where its item stands.</b> The agent chip shows working or idle. The PR chip shows its state, the review round, the last verdict, and who it is waiting on and for how long. There is one chip per queue job with its run or wait time. The Inbox chip opens that thread at the newest open question, highlighted.</li>
+<li><b>Tickets and PRs open in the reading pane</b>, with their GitHub text, comments and checks fetched by sm, since GitHub refuses to be embedded (<code>X-Frame-Options: deny</code>, checked today).</li>
+<li><b>Start anyway</b> confirms first, then tells the agent: “Started early by Rajesh. #1776 is not done yet: check what it has delivered so far and build on it; do not redo its work.”</li>
 <li><b>Close</b> closes the GitHub issue with a comment listing its closed parts, then the board refreshes. It applies only to tickets with sub-issues (#1710, shown before you closed it). A ticket that merely starts after others keeps Start.</li>
 </ul>
 
@@ -564,7 +571,7 @@
  </div></div></div></div></div>
 <ul class="does">
 <li>Turning Codex on reveals its own rows, which start at 80% (207k of 258k tokens). The review toggles show only while at least one provider hands off.</li>
-<li><b>To try handoff on one agent or one ticket</b>, leave the defaults off and use Hand off in that agent's details, or in a ticket's ⋯ on the Board. A ticket setting also covers the agents that take over from its first one.</li>
+<li><b>To try handoff on one agent or one ticket</b>, leave the defaults off and use Hand off… in that agent's details or in a ticket's ⋯ on the Board (scenario 3). Either way, the agents that take over inherit the setting.</li>
 <li>Every checkbox becomes a toggle. Appearance gains a Text size slider. About gains coloured status rows: server version, uptime and health, web build, latest phone build.</li>
 </ul>
 
@@ -610,9 +617,9 @@
 <tr><td>1. Show three facts per agent and order by attention?</td><td><b>Yes.</b> Sections: Needs you, Finished, Waiting long, Moving, Waiting, Idle.</td><td>A single colour hides overlaps you run into daily.</td></tr>
 <tr><td>2. What clears “needs you”?</td><td><b>Your answer:</b> Enter in sm's terminal, a prompt you type into a Claude agent, a reply in the Inbox, or ✓. Never the agent working again on its own.</td><td>An agent can work while it waits on you.</td></tr>
 <tr><td>3. Where do details open?</td><td><b>Under the card or row you clicked.</b> The right pane is for reading only, and everything closes on page change.</td><td>Controls sit next to the thing you chose.</td></tr>
-<tr><td>4. Terminal skips Cloudflare at home?</td><td><b>Accepted.</b> Nothing is direct yet; the lag you saw on the Studio is Cloudflare plus sm's 25 ms relay check. The plan fixes the relay, connects directly on the Studio, and gives the MacBook <code>studio-lan.rajeshgo.li</code> with a certificate. sm reuses its Cloudflare token; if it cannot edit DNS, the ticket asks you to add that permission.</td><td>An https page can reach its own machine freely, but another machine only over a certified connection.</td></tr>
+<tr><td>4. Terminal skips Cloudflare at home?</td><td><b>Accepted.</b> Fix sm's 25 ms relay check, connect directly on the Studio, and give the MacBook <code>studio-lan.rajeshgo.li</code> with a certificate, using sm's Cloudflare token.</td><td>An https page can reach its own machine freely, but another machine only over a certified connection.</td></tr>
 <tr><td>5. Close container tickets from the board?</td><td><b>Yes.</b> “All parts done” plus Close, which closes the GitHub issue with a comment.</td><td>They are bookkeeping; one click ends them.</td></tr>
-<tr><td>6. Start blocked tickets?</td><td><b>Yes, as Start anyway</b>, with a confirm.</td><td>You did this by hand this morning to use the idle machine.</td></tr>
+<tr><td>6. Start blocked tickets?</td><td><b>Yes, as Start anyway</b>, with a confirm.</td><td>You did this by hand this morning.</td></tr>
 <tr><td>7. Handoff thresholds</td><td><b>Per provider, shown in tokens</b>, plus per agent and per ticket. Claude stays at 35% (350k tokens). Codex starts off, at 80% (207k of 258k) once on.</td><td>The same percent means four times more tokens on Claude.</td></tr>
 <tr><td>8. Finished rows in the Inbox</td><td><b>Only after <code>sm task-complete</code>.</b></td><td>That is the agent saying “read this”.</td></tr>
 <tr><td>9. Generated names</td><td><b>Poems for Claude, stars for Codex; your ticket pattern first.</b> Names free up a week after retirement. Remove “Name yourself once…” from CLAUDE.md §3.</td><td>Names you can say and remember, without agents renaming.</td></tr>
@@ -622,8 +629,8 @@
 </table>
 
 
-<h3>FAQ — what changed since revision 1</h3>
-<p>The Jobs fact now shows pending Codex reviews. The terminal lag has a second cause, sm's 25 ms relay check, which gets fixed first, and decision 4 is accepted. Codex hands off at 80%, and handoff can be set for one agent or one ticket. Names free up a week after retirement, and the naming paragraph leaves CLAUDE.md. Text size is a slider on the web and the phone.</p>
+<h3>FAQ — what changed since revision 2</h3>
+<p>Board chips show live state (agent, PR review round and wait, job times), and the Inbox chip opens the exact question. Hand off… is two controls; successors inherit. <code>sm pr</code> claims link PRs to tickets.</p>
 <hr class="appendix-divider">
 <h2>Appendices</h2>
 
@@ -913,14 +920,18 @@ finished(session_id TEXT NOT NULL, completed_at TEXT NOT NULL, text TEXT, text_a
 <p>This is one component: <code>Links</code> in <code>ui.js</code>, and <code>LinksRow</code> on the phone. It takes <code>{ticket, prs, agent, jobs, thread, docs}</code> and draws chips in that order, omitting empty ones.</p>
 <table><thead><tr><th>Chip</th><th>Text</th><th>Click</th></tr></thead><tbody>
 <tr><td>ticket</td><td>“#{n} ↗”</td><td>Reading pane, ticket kind (H5)</td></tr>
-<tr><td>pr</td><td>“PR #{n} · {state}”</td><td>Reading pane, ticket kind for the PR</td></tr>
-<tr><td>agent</td><td>“{name} · {Provider} ⌨”</td><td>Body: agent band. ⌨: <code>/terminal/{id}</code></td></tr>
-<tr><td>jobs</td><td>The label when there is one job, else “{n} jobs”; green when any is running, amber when waiting</td><td>Queue page, job band</td></tr>
-<tr><td>thread</td><td>“Inbox · question” in magenta when needs you, else “Inbox · {n}”</td><td>Inbox with the thread open</td></tr>
+<tr><td>pr</td><td>“PR #{n} · {open|draft|merged|closed}”, then, when sm knows of reviews, “ · {your review|Codex review}, round {k}”, then “ · {last verdict}” when there is one, then “ · waiting {age}” while a review is pending. Magenta when waiting on you, amber when waiting on Codex.</td><td>Reading pane, ticket kind for the PR</td></tr>
+<tr><td>agent</td><td>“{name} · {Provider} · {agent fact}” (“● Working 1m” or “○ Idle 5m”, appendix B) and ⌨</td><td>Body: agent band. ⌨: <code>/terminal/{id}</code></td></tr>
+<tr><td>jobs</td><td>One chip per running or waiting job: “{label} · running {age}” (green), “{label} · waiting {age}” (amber) or “{label} · quiet {age}” (red). After three chips, “+{n} jobs”.</td><td>Queue page, that job's band</td></tr>
+<tr><td>thread</td><td>“Inbox · question” or “Inbox · doc review” in magenta when needs you, else “Inbox · {n}”</td><td><code>/inbox?open=thread:{session_id}&amp;at={message_id}</code>: the thread opens scrolled to that message, which is highlighted for 2 seconds. <code>at</code> is the newest open question, else the newest item.</td></tr>
 <tr><td>docs</td><td>The doc title</td><td>Reading pane, doc</td></tr></tbody></table>
 <p>Sources:</p>
 <ul>
-<li><b>Board ticket JSON</b> adds <code>jobs: [{id, label, state, type}]</code> (the ticket's jobs as the clock uses them, <code>http/board_clock.rs</code>), <code>thread: {key, needs_you, count} | null</code> (the holder's inbox agent thread, when it has any items) and <code>docs: [{title, reader_path, state}]</code> (the holder's obligation docs, at most 3).</li>
+<li><b>Board ticket PRs.</b> <code>prs</code> becomes the union of today's GitHub-linked PRs and the PRs the holder claimed with <code>sm pr</code> while holding the ticket. So a PR with “Refs #N” or no reference still shows; today #1782's PR #1785 does not. Each PR gains <code>review: {by: "you"|"codex", round, verdict: "approved"|"changes_requested"|"comments"|null, verdict_at, waiting_since: "…Z"|null} | null</code>. It comes from sm's own records, not from GitHub review counts, because replies posted with Rajesh's account show on GitHub as extra reviews.
+ <ul><li><b>Your review:</b> the owner doc reviews of any doc published with <code>--pr {n}</code>. <code>round</code> counts review requests, <code>verdict</code> is the latest posted review, and <code>waiting_since</code> is the open request's time.</li>
+ <li><b>Codex:</b> the Codex review requests for the PR (<code>codex_requests</code>, and <code>review_history</code> in <code>/watch/state</code>), with the same fields.</li>
+ <li>When both exist, the one with a pending request wins, else the most recent.</li></ul></li>
+<li><b>Board ticket JSON</b> adds <code>jobs: [{id, label, state, type, since, quiet_since}]</code> (the ticket's jobs as the clock uses them, <code>http/board_clock.rs</code>), <code>thread: {key, needs_you, count} | null</code> (the holder's inbox agent thread, when it has any items) and <code>docs: [{title, reader_path, state}]</code> (the holder's obligation docs, at most 3).</li>
 <li><b>Agent band:</b> claims, jobs, docs and <code>thread</code>. <code>/watch/state</code> adds <code>thread</code> per session in the same shape.</li>
 <li><b>Queue job band:</b> tickets from <code>rank_tickets</code>, the requester agent, and the requester's thread.</li>
 <li><b>Inbox thread header:</b> the session's claims, its agent and its jobs.</li>
@@ -966,7 +977,11 @@ finished(session_id TEXT NOT NULL, completed_at TEXT NOT NULL, text TEXT, text_a
  <li>When a provider is off, show only its toggle and one line explaining the default.</li>
  <li>When it is on, show three number fields, each followed by “· {tokens} of {window}”. Tokens are rounded to three significant figures and written with k or M.</li>
  <li>“When a review is requested” shows only while at least one provider is on.</li>
- <li>The per-agent Hand off popover shows tokens for that agent's own window.</li></ul></li>
+ <li>The per-agent Hand off popover shows tokens for that agent's own window.</li>
+<li><b>Hand off… popover</b> (web band, phone dialog), top to bottom:
+ <ul><li><b>Automatic handoff</b>: a scope switch, “This agent and its successors | Ticket #{n}” (the ticket option only when the agent holds one); then a toggle and a threshold with tokens; then “Use default”.</li>
+ <li>A rule line, then <b>Hand off now</b>, which asks once after an inline confirm (<code>ask_now</code>, as today).</li></ul></li>
+<li><b>Successors inherit.</b> When a handoff completes and the successor is recorded (<code>successor_session_id</code>, <code>handoff/policy.rs:364</code>), the predecessor's per-agent override (<code>enabled</code>, <code>threshold_percent</code>) is copied to the successor, unless the successor already has one. Test: an override of 30% on A reaches B after A hands off to B.</li></ul></li>
 <li><b>About.</b> Rows with a status dot:
  <ul><li>Server: <code>config.server_version</code> · up {age}. The shell config gains <code>server_started_at</code>. The dot is green when <code>/health</code> is ok, else red.</li>
  <li>Web build: <code>build_id</code>.</li>
@@ -1037,8 +1052,8 @@ finished(session_id TEXT NOT NULL, completed_at TEXT NOT NULL, text TEXT, text_a
 <table><thead><tr><th>#</th><th>Ticket</th><th>Covers</th><th>Main files</th><th>Starts after</th><th>Tier</th></tr></thead><tbody>
 <tr><td>S1</td><td>Agent facts, attention order, clearing “needs you”, counts fix</td><td>B (without finished), C</td><td><code>http/watch.rs</code>, <code>watch_view.rs</code>, <code>owner_messages.rs</code>, <code>http/messages.rs</code>, the <code>http.rs</code> terminal bridge and Claude hook</td><td>—</td><td>Mid</td></tr>
 <tr><td>S2</td><td>Last turn message, Finished, Inbox finished group, History last turn</td><td>D; B's finished parts</td><td>new <code>turn_messages.rs</code>, <code>sessions.rs</code> (Stop, codex-fork, task-complete), <code>http/inbox.rs</code>, <code>http/agent_history.rs</code></td><td>S1</td><td>Mid</td></tr>
-<tr><td>S3</td><td>Board: close_ready and Close, Start anyway, link fields, GitHub route</td><td>H2, H3, H4 (server), H5</td><td><code>board/*</code>, <code>http/board.rs</code>, <code>claims.rs</code>, new <code>http/github.rs</code></td><td>—</td><td>Mid</td></tr>
-<tr><td>S4</td><td>Handoff thresholds per provider, per-ticket override, window tokens</td><td>I (handoff server)</td><td><code>handoff/*</code>, <code>http/handoff.rs</code></td><td>—</td><td>Mid</td></tr>
+<tr><td>S3</td><td>Board: close_ready and Close, Start anyway, link fields (PR review state, claimed PRs, jobs), GitHub route</td><td>H2, H3, H4 (server), H5</td><td><code>board/*</code>, <code>http/board.rs</code>, <code>claims.rs</code>, new <code>http/github.rs</code></td><td>—</td><td>Mid</td></tr>
+<tr><td>S4</td><td>Handoff thresholds per provider, per-ticket override, successors inherit, window tokens</td><td>I (handoff server)</td><td><code>handoff/*</code>, <code>http/handoff.rs</code></td><td>—</td><td>Mid</td></tr>
 <tr><td>S5</td><td>Generated names, reuse after a week, restore suffix; remove the naming paragraph</td><td>K</td><td><code>sessions.rs</code> (record builder, restore), <code>AGENTS.md</code></td><td>S2 (both edit <code>sessions.rs</code>)</td><td>Low</td></tr>
 <tr><td>S6</td><td>Terminal: relay latency fix, ping, probe, direct localhost path</td><td>G3, G4 items 1–5, G5</td><td><code>http.rs</code> terminal endpoint, <code>http/browser_terminal.rs</code></td><td>S1 (both edit the bridge)</td><td>Mid</td></tr>
 <tr><td>S7</td><td>LAN TLS listener with its DNS name and certificate (after decision 4)</td><td>G4 item 6</td><td>new <code>terminal_lan.rs</code>, <code>main.rs</code>, <code>config.rs</code></td><td>S6</td><td>Mid</td></tr>
@@ -1064,7 +1079,8 @@ finished(session_id TEXT NOT NULL, completed_at TEXT NOT NULL, text TEXT, text_a
 <tr><td>Meters: order, heat, queue share; Queue tile</td><td>A2</td><td>W1 screenshots at a low and a high reading</td></tr>
 <tr><td>Details where you clicked; closes on page change</td><td>E</td><td>W1 test: navigate drops <code>open</code>; W2 screenshot of the band</td></tr>
 <tr><td>Finished and last turn message in Inbox</td><td>D</td><td>S2 tests; W5 screenshot</td></tr>
-<tr><td>Links everywhere; GitHub in the pane</td><td>H4, H5</td><td>S3 route test; W4 screenshot</td></tr>
+<tr><td>Links everywhere, each with its live state; GitHub in the pane</td><td>H4, H5</td><td>S3 tests (PR review field, claimed-PR union); W4 screenshot of today's board with #1782 and #1858; the Inbox chip opens the highlighted message</td></tr>
+<tr><td>Hand off… is two controls; successors inherit</td><td>I</td><td>S4 inheritance test; W5 screenshot</td></tr>
 <tr><td>No needless folding</td><td>H1</td><td>W4 and P2 screenshots of today's board (including #1771 in view)</td></tr>
 <tr><td>Container tickets close</td><td>H2</td><td>S3 state tests; live Close on a finished container</td></tr>
 <tr><td>Start anyway</td><td>H3</td><td>S3 tests; brief text check</td></tr>
