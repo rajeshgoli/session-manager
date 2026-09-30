@@ -5,7 +5,7 @@ import { DevicesList } from './devices.js';
 
 const SECTIONS = [
   ['appearance', 'Appearance'], ['new-agents', 'New agents'], ['context-handoff', 'Context handoff'],
-  ['queue-limits', 'Queue limits'], ['notifications', 'Notifications'], ['devices-access', 'Devices & access'], ['about', 'About'],
+  ['queue-limits', 'Queue limits'], ['terminals', 'Terminals'], ['notifications', 'Notifications'], ['devices-access', 'Devices & access'], ['about', 'About'],
 ];
 const SAMPLE = { repo: 'rajeshgoli/session-manager', number: 1706, title: 'Board Start preselects Fable', url: 'https://github.com/rajeshgoli/session-manager/issues/1706' };
 
@@ -87,6 +87,19 @@ const integerLimit = value => {
   if (!Number.isInteger(n) || n < 0 || n > 16) throw new Error('Enter a whole number from 0 to 16.');
   return n;
 };
+// Terminal limits and their allowed ranges; matches the server's check.
+const TERMINAL_LIMITS = [
+  ['per_user', 'Open terminals (you)', 1, 256, 'How many terminals you can have open at once, across the web and the phone.'],
+  ['per_session', 'Viewers per agent', 1, 256, 'How many terminals can show the same agent at once.'],
+  ['global', 'Open terminals (everyone)', 1, 256, 'All terminals on this server at once.'],
+  ['max_attach_seconds', 'Longest session (seconds)', 60, 86400, 'A terminal closes after this long; reconnect to continue.'],
+];
+const terminalLimit = (value, min, max) => {
+  if (value === '') return null;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < min || n > max) throw new Error(`Enter a whole number from ${min} to ${max}.`);
+  return n;
+};
 function shortNames(text) {
   const result = {};
   for (const line of text.split('\n').filter(line => line.trim())) {
@@ -120,6 +133,7 @@ export function SettingsPage() {
         : selected === 'notifications' ? html`<${Notifications} write=${write} />` : selected === 'devices-access' ? html`<${Devices} write=${write} />`
         : selected === 'about' ? html`<${About} />` : html`<${Resource} state=${settings} retry=${reload}>${data => selected === 'queue-limits'
           ? html`<${QueueLimits} data=${data.queue_limits} write=${write} />`
+          : selected === 'terminals' ? html`<${TerminalLimits} data=${data.terminal_limits} config=${data.terminal_config_limits || {}} write=${write} />`
           : html`<${NewAgents} data=${data.new_agent} write=${write} />`}</${Resource}>`}
     </div>
   </div>`;
@@ -175,6 +189,14 @@ function QueueLimits({ data, write }) {
     <div class="settings-grid">${[['max_running', 'Total'], ['tests', 'Tests'], ['perf', 'Performance'], ['background', 'Background'], ['service', 'Service']].map(([key, label]) => html`<${Field}
       label=${label} type="number" min="0" max="16" initial=${data[key]} placeholder=${String(config.queue_config_limits?.[key] ?? '')} reset=${true}
       save=${value => write('/client/settings', { queue_limits: { [key]: integerLimit(value) } })} />`)}</div>`;
+}
+
+function TerminalLimits({ data, config, write }) {
+  return html`<h2>Terminals</h2><p class="sub">Shared with the phone. Changes apply to the next terminal you open. Reset restores the configured value shown in the field.
+    A terminal that stops answering for 30 seconds closes on its own.</p>
+    <div class="settings-grid">${TERMINAL_LIMITS.map(([key, label, min, max, hint]) => html`<${Field}
+      label=${label} type="number" min=${String(min)} max=${String(max)} initial=${data[key]} placeholder=${String(config[key] ?? '')} reset=${true} hint=${hint}
+      save=${value => write('/client/settings', { terminal_limits: { [key]: terminalLimit(value, min, max) } })} />`)}</div>`;
 }
 
 function handoffProviders(providers) {

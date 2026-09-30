@@ -1,6 +1,7 @@
 //! Owner settings (sm#1718; spec `1710_web_redesign.html`, appendices D4 and
-//! D5): what New agent and board Start fill in, and the queue slot limits
-//! that apply without a restart. The phone and the web share them.
+//! D5): what New agent and board Start fill in, and the queue slot and
+//! terminal attach limits that apply without a restart (sm#1763). The phone
+//! and the web share them.
 //!
 //! Everything here is pure. `sessions` owns persistence: the store keeps, per
 //! settings key, only the fields the owner set (`{value, updated_at}`), and
@@ -20,7 +21,7 @@ use crate::sessions::expand_home;
 /// Top-level key of the stored settings in the session store.
 pub const STORE_KEY: &str = "owner_settings";
 /// The settings keys, one stored row each.
-const KEYS: [&str; 2] = ["new_agent", "queue_limits"];
+const KEYS: [&str; 3] = ["new_agent", "queue_limits", "terminal_limits"];
 /// Objects stored whole: a `PUT` replaces them rather than merging into them.
 const WHOLE_VALUES: [&str; 1] = ["repo_short"];
 const PLACEHOLDERS: [&str; 7] = [
@@ -36,6 +37,14 @@ const CLAUDE_EFFORTS: [&str; 4] = ["low", "medium", "high", "max"];
 const CODEX_EFFORTS: [&str; 3] = ["medium", "high", "xhigh"];
 const QUEUE_LIMITS: [&str; 5] = ["max_running", "tests", "perf", "background", "service"];
 const QUEUE_LIMIT_MAX: i64 = 16;
+/// Each terminal limit and its allowed range. A value out of range is refused
+/// in a `PUT` and clamped when it comes from config.
+pub const TERMINAL_LIMITS: [(&str, i64, i64); 4] = [
+    ("per_user", 1, 256),
+    ("per_session", 1, 256),
+    ("global", 1, 256),
+    ("max_attach_seconds", 60, 86_400),
+];
 const AGENT_NAME_MAX_CHARS: usize = 32;
 
 pub const DEFAULT_NAME_PATTERN: &str = "{repo_short}-{number}";
@@ -71,6 +80,12 @@ pub fn defaults() -> Value {
             "perf": null,
             "background": null,
             "service": null,
+        },
+        "terminal_limits": {
+            "per_user": null,
+            "per_session": null,
+            "global": null,
+            "max_attach_seconds": null,
         },
     })
 }
@@ -229,6 +244,7 @@ fn validate_key(key: &str, value: &Value) -> Result<(), String> {
     match key {
         "new_agent" => validate_new_agent(value),
         "queue_limits" => validate_queue_limits(value),
+        "terminal_limits" => validate_terminal_limits(value),
         other => Err(format!("unknown field {other}")),
     }
 }
@@ -327,6 +343,22 @@ fn validate_queue_limits(value: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_terminal_limits(value: &Value) -> Result<(), String> {
+    for (limit, min, max) in TERMINAL_LIMITS {
+        let value = &value[limit];
+        if !value.is_null()
+            && !value
+                .as_i64()
+                .is_some_and(|value| (min..=max).contains(&value))
+        {
+            return Err(format!(
+                "terminal_limits.{limit} must be an integer from {min} to {max}, or null"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Each `{name}` in `template`, with its byte offset. Braces around
 /// anything but letters, digits and `_` are plain text.
 fn placeholders(template: &str) -> Vec<(usize, &str)> {
@@ -352,6 +384,7 @@ fn placeholders(template: &str) -> Vec<(usize, &str)> {
 pub struct OwnerSettings {
     pub new_agent: NewAgentSettings,
     pub queue_limits: QueueLimits,
+    pub terminal_limits: TerminalLimitOverrides,
 }
 
 impl OwnerSettings {
@@ -490,6 +523,94 @@ pub fn queue_admission_policy(config: &AppConfig, settings: &Value) -> QueueAdmi
         .map(|settings| settings.queue_limits)
         .unwrap_or_default();
     limits.apply(config.queue_admission_policy())
+}
+
+/// Terminal attach limits the owner set; `None` keeps config's value.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+pub struct TerminalLimitOverrides {
+    pub per_user: Option<i64>,
+    pub per_session: Option<i64>,
+    pub global: Option<i64>,
+    pub max_attach_seconds: Option<i64>,
+}
+
+/// The terminal attach limits in force: config's values, clamped to
+/// `TERMINAL_LIMITS`, with the owner's overrides laid over them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalLimits {
+    pub per_user: usize,
+    pub per_session: usize,
+    pub global: usize,
+    pub max_attach_seconds: u64,
+}
+
+impl TerminalLimits {
+    /// Config's values alone. A zero in config means the compiled default.
+    pub fn from_config(config: &AppConfig) -> Self {
+        let defaults = crate::config::MobileTerminalConfig::default();
+        let terminal = &config.mobile_terminal;
+        let pick = |value: i64, default: i64, index: usize| {
+            let (_, min, max) = TERMINAL_LIMITS[index];
+            if value == 0 { default } else { value }.clamp(min, max)
+        };
+        Self {
+            per_user: pick(
+                terminal.max_concurrent_attaches_per_user as i64,
+                defaults.max_concurrent_attaches_per_user as i64,
+                0,
+            ) as usize,
+            per_session: pick(
+                terminal.max_concurrent_attaches_per_session as i64,
+                defaults.max_concurrent_attaches_per_session as i64,
+                1,
+            ) as usize,
+            global: pick(
+                terminal.max_concurrent_attaches_global as i64,
+                defaults.max_concurrent_attaches_global as i64,
+                2,
+            ) as usize,
+            max_attach_seconds: pick(
+                terminal.max_attach_seconds as i64,
+                defaults.max_attach_seconds as i64,
+                3,
+            ) as u64,
+        }
+    }
+
+    /// `self` with the owner's overrides laid over it.
+    pub fn apply(self, owner: TerminalLimitOverrides) -> Self {
+        let pick = |value: Option<i64>, current: i64, index: usize| {
+            let (_, min, max) = TERMINAL_LIMITS[index];
+            value.map_or(current, |value| value.clamp(min, max))
+        };
+        Self {
+            per_user: pick(owner.per_user, self.per_user as i64, 0) as usize,
+            per_session: pick(owner.per_session, self.per_session as i64, 1) as usize,
+            global: pick(owner.global, self.global as i64, 2) as usize,
+            max_attach_seconds: pick(owner.max_attach_seconds, self.max_attach_seconds as i64, 3)
+                as u64,
+        }
+    }
+
+    /// The config values as a JSON object, for the settings pages to show
+    /// what Reset restores.
+    pub fn to_json(self) -> Value {
+        json!({
+            "per_user": self.per_user,
+            "per_session": self.per_session,
+            "global": self.global,
+            "max_attach_seconds": self.max_attach_seconds,
+        })
+    }
+}
+
+/// Config's terminal limits with the owner's overrides laid over them.
+/// `settings` is an effective settings object.
+pub fn terminal_limits(config: &AppConfig, settings: &Value) -> TerminalLimits {
+    let owner = OwnerSettings::from_effective(settings)
+        .map(|settings| settings.terminal_limits)
+        .unwrap_or_default();
+    TerminalLimits::from_config(config).apply(owner)
 }
 
 #[cfg(test)]
@@ -664,5 +785,55 @@ mod tests {
             reasoning_effort: "high".into(),
         })
         .is_none());
+    }
+}
+
+#[cfg(test)]
+mod terminal_limit_tests {
+    use super::*;
+
+    #[test]
+    fn config_zero_means_default_and_values_clamp_to_the_allowed_range() {
+        let mut config = AppConfig::default();
+        config.mobile_terminal.max_concurrent_attaches_per_user = 0;
+        config.mobile_terminal.max_concurrent_attaches_per_session = 1000;
+        config.mobile_terminal.max_concurrent_attaches_global = 7;
+        config.mobile_terminal.max_attach_seconds = 5;
+        let limits = TerminalLimits::from_config(&config);
+        assert_eq!(
+            limits,
+            TerminalLimits {
+                per_user: 100,
+                per_session: 256,
+                global: 7,
+                max_attach_seconds: 60,
+            }
+        );
+    }
+
+    #[test]
+    fn owner_values_override_only_what_the_owner_set() {
+        let config = AppConfig::default();
+        let settings = effective(Some(&json!({
+            "terminal_limits": {"value": {"per_session": 1}, "updated_at": "x"}
+        })));
+        let limits = terminal_limits(&config, &settings);
+        assert_eq!(
+            (
+                limits.per_user,
+                limits.per_session,
+                limits.global,
+                limits.max_attach_seconds
+            ),
+            (100, 1, 100, 86_400)
+        );
+        let refused = apply_patch(
+            None,
+            &json!({"terminal_limits": {"max_attach_seconds": 59}}),
+        );
+        assert_eq!(
+            refused.unwrap_err(),
+            "terminal_limits.max_attach_seconds must be an integer from 60 to 86400, or null"
+        );
     }
 }

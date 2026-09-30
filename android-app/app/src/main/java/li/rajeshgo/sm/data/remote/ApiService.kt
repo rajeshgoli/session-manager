@@ -111,6 +111,12 @@ interface ApiService {
     @retrofit2.http.PUT("handoff-defaults")
     suspend fun setHandoffDefaults(@Body patch: kotlinx.serialization.json.JsonObject): li.rajeshgo.sm.data.model.HandoffDefaults
 
+    @GET("client/settings")
+    suspend fun getOwnerSettings(): kotlinx.serialization.json.JsonObject
+
+    @retrofit2.http.PUT("client/settings")
+    suspend fun setOwnerSettings(@Body patch: kotlinx.serialization.json.JsonObject): kotlinx.serialization.json.JsonObject
+
     @POST("client/sessions/{session_id}/attach-ticket")
     suspend fun createMobileAttachTicket(
         @Path("session_id") sessionId: String,

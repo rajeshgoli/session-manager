@@ -177,8 +177,11 @@ const MOBILE_TERMINAL_MAX_ROWS: u16 = 120;
 const MOBILE_TERMINAL_MAX_COLS: u16 = 300;
 const MOBILE_TERMINAL_INPUT_MAX_CHARS: usize = 8192;
 const MOBILE_TERMINAL_INITIAL_RESIZE_WAIT_SECONDS: f64 = 2.0;
-const MOBILE_TERMINAL_MAX_ATTACH_SECONDS: u64 = 3600;
 const MOBILE_TERMINAL_KEEPALIVE_SECONDS: u64 = 10;
+/// An attach whose client sends nothing, not even a pong, for this long is
+/// dropped. A proxy such as the Cloudflare tunnel can keep the server's side
+/// of the socket open after the client has gone (sm#1763).
+const MOBILE_TERMINAL_CLIENT_SILENCE_SECONDS: u64 = 30;
 const CLOUDFLARE_ACCESS_JWKS_TTL: Duration = Duration::from_secs(60 * 60);
 const CLOUDFLARE_ACCESS_UNKNOWN_KID_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const GOOGLE_ID_TOKEN_JWKS_TTL: Duration = Duration::from_secs(60 * 60);
@@ -522,6 +525,9 @@ pub struct AppState {
     /// Queue admission with the owner's slot limits; `PUT /client/settings`
     /// changes it and the queue runner reads it every pass (sm#1718).
     queue_admission: crate::queue::SharedQueueAdmissionPolicy,
+    /// Terminal attach limits in force; `PUT /client/settings` changes them
+    /// and the next attach reads them (sm#1763).
+    terminal_limits: Arc<std::sync::RwLock<crate::owner_settings::TerminalLimits>>,
 }
 
 impl AppState {
@@ -633,6 +639,9 @@ impl AppState {
             &expand_home(&config.queue_runner_state_dir().to_string_lossy()),
             crate::owner_settings::queue_admission_policy(&config, &settings),
         );
+        let terminal_limits = Arc::new(std::sync::RwLock::new(
+            crate::owner_settings::terminal_limits(&config, &settings),
+        ));
         Ok(Self {
             config,
             session_store,
@@ -665,6 +674,7 @@ impl AppState {
             mobile_terminal_secret,
             push_sender,
             queue_admission,
+            terminal_limits,
         })
     }
 
@@ -7631,6 +7641,13 @@ fn resolve_session_or_registry_role(
     Ok(state.session_store.get_session(&registration.session_id)?)
 }
 
+fn terminal_limits(state: &AppState) -> crate::owner_settings::TerminalLimits {
+    *state
+        .terminal_limits
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn queue_admission_policy(state: &AppState) -> QueueAdmissionPolicy {
     *state
         .queue_admission
@@ -7819,30 +7836,12 @@ async fn create_mobile_attach_ticket(
             status: StatusCode::INTERNAL_SERVER_ERROR,
             detail: "Mobile terminal active attach store is unavailable".to_owned(),
         })?;
-    let max_global = clamp_usize(
-        state.config.mobile_terminal.max_concurrent_attaches_global,
-        1,
-        64,
-        4,
-    );
-    let max_user = clamp_usize(
-        state
-            .config
-            .mobile_terminal
-            .max_concurrent_attaches_per_user,
-        1,
-        16,
-        1,
-    );
-    let max_session = clamp_usize(
-        state
-            .config
-            .mobile_terminal
-            .max_concurrent_attaches_per_session,
-        1,
-        16,
-        1,
-    );
+    let crate::owner_settings::TerminalLimits {
+        global: max_global,
+        per_user: max_user,
+        per_session: max_session,
+        ..
+    } = terminal_limits(&state);
     if tickets.len() + active.len() >= max_global {
         return Err(ApiError::Status {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -8608,12 +8607,7 @@ async fn run_mobile_terminal_bridge_inner(
 
     let mut pending_frames = initial.pending_frames.into_iter().collect::<Vec<_>>();
     pending_frames.reverse();
-    let max_attach_seconds = clamp_u64(
-        state.config.mobile_terminal.max_attach_seconds,
-        30,
-        24 * 3600,
-        MOBILE_TERMINAL_MAX_ATTACH_SECONDS,
-    );
+    let max_attach_seconds = terminal_limits(state).max_attach_seconds;
     let max_timer = tokio::time::sleep(Duration::from_secs(max_attach_seconds));
     tokio::pin!(max_timer);
 
@@ -8623,6 +8617,7 @@ async fn run_mobile_terminal_bridge_inner(
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut close_code = 1000u16;
     let mut close_reason = "transport_closed".to_owned();
+    let mut last_heard = tokio::time::Instant::now();
 
     loop {
         if stop.load(Ordering::SeqCst) || !mobile_terminal_enabled(state) {
@@ -8658,6 +8653,11 @@ async fn run_mobile_terminal_bridge_inner(
 
         tokio::select! {
             _ = keepalive.tick() => {
+                if last_heard.elapsed() >= Duration::from_secs(MOBILE_TERMINAL_CLIENT_SILENCE_SECONDS) {
+                    close_code = 1001;
+                    close_reason = "client_unresponsive".to_owned();
+                    break;
+                }
                 if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
                     break;
                 }
@@ -8735,6 +8735,7 @@ async fn run_mobile_terminal_bridge_inner(
                 let Some(message) = message else {
                     break;
                 };
+                last_heard = tokio::time::Instant::now();
                 let message = match message {
                     Ok(message) => message,
                     Err(_) => break,
@@ -14266,7 +14267,7 @@ fn consume_terminal_ticket(
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 detail: "Mobile terminal active attach store is unavailable".to_owned(),
             })?;
-    enforce_mobile_terminal_active_limits(&state.config, active.values(), &current_ticket)?;
+    enforce_mobile_terminal_active_limits(state, active.values(), &current_ticket)?;
     let ticket = tickets.remove(&ticket_id).expect("ticket checked above");
     let attach_id = random_urlsafe_token(16);
     let stop = Arc::new(AtomicBool::new(false));
@@ -14357,29 +14358,17 @@ fn validate_mobile_terminal_ticket_secret(
 }
 
 fn enforce_mobile_terminal_active_limits<'a>(
-    config: &AppConfig,
+    state: &AppState,
     active: impl Iterator<Item = &'a MobileTerminalActiveAttach>,
     ticket: &MobileTerminalTicket,
 ) -> Result<(), ApiError> {
     let active = active.collect::<Vec<_>>();
-    let max_global = clamp_usize(
-        config.mobile_terminal.max_concurrent_attaches_global,
-        1,
-        64,
-        4,
-    );
-    let max_user = clamp_usize(
-        config.mobile_terminal.max_concurrent_attaches_per_user,
-        1,
-        16,
-        1,
-    );
-    let max_session = clamp_usize(
-        config.mobile_terminal.max_concurrent_attaches_per_session,
-        1,
-        16,
-        1,
-    );
+    let crate::owner_settings::TerminalLimits {
+        global: max_global,
+        per_user: max_user,
+        per_session: max_session,
+        ..
+    } = terminal_limits(state);
     if active.len() >= max_global {
         return Err(ApiError::Status {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -14454,14 +14443,6 @@ fn api_error_detail(error: &ApiError) -> String {
 }
 
 fn clamp_u64(value: u64, minimum: u64, maximum: u64, fallback: u64) -> u64 {
-    if value == 0 {
-        fallback.clamp(minimum, maximum)
-    } else {
-        value.clamp(minimum, maximum)
-    }
-}
-
-fn clamp_usize(value: usize, minimum: usize, maximum: usize, fallback: usize) -> usize {
     if value == 0 {
         fallback.clamp(minimum, maximum)
     } else {
@@ -21036,18 +21017,26 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires tmux and loopback sockets; exercises 30 seconds of real idle keepalives"]
     async fn mobile_terminal_live_bridge_survives_keepalives_and_cleans_up() {
-        check_mobile_terminal_live_bridge(false).await;
+        check_mobile_terminal_live_bridge(false, false).await;
+    }
+
+    /// A client that stops answering pings is dropped, as when a proxy keeps
+    /// the server's side of a dead phone connection open (sm#1763).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mobile_terminal_live_bridge_drops_a_silent_client() {
+        check_mobile_terminal_live_bridge(false, true).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires tmux and loopback sockets; stalls the renderer for 30 seconds"]
     async fn mobile_terminal_live_bridge_backpressures_slow_renderer() {
-        check_mobile_terminal_live_bridge(true).await;
+        check_mobile_terminal_live_bridge(true, false).await;
     }
 
     #[cfg(unix)]
-    async fn check_mobile_terminal_live_bridge(output_ack: bool) {
+    async fn check_mobile_terminal_live_bridge(output_ack: bool, silent: bool) {
         use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
 
         // Own an isolated tmux server. Never attach to or kill a user's session.
@@ -21139,6 +21128,28 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let (mut client, _) = connect_async(format!("ws://{addr}/")).await.unwrap();
+        if silent {
+            // Never read, so the client answers no ping.
+            timeout(
+                Duration::from_secs(MOBILE_TERMINAL_CLIENT_SILENCE_SECONDS + 20),
+                done.notified(),
+            )
+            .await
+            .expect("silent client was not dropped");
+            assert!(state
+                .mobile_terminal_active_attaches
+                .lock()
+                .unwrap()
+                .is_empty());
+            let clients = Command::new("tmux")
+                .args(["-L", &tmux.0, "list-clients"])
+                .output()
+                .unwrap();
+            assert!(clients.stdout.is_empty());
+            drop(client);
+            server.abort();
+            return;
+        }
         client
             .send(ClientMessage::Ping(b"before-resize".to_vec().into()))
             .await
@@ -22187,8 +22198,18 @@ mod tests {
             );
         let app = router(state.clone());
 
+        // The defaults allow many terminals at once (sm#1763).
         let response = app
+            .clone()
             .oneshot(attach_ticket_request(&signing_key, "nonce-1"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        state.mobile_terminal_tickets.lock().unwrap().clear();
+
+        set_terminal_limit_per_user(&state, 1);
+        let response = app
+            .oneshot(attach_ticket_request(&signing_key, "nonce-2"))
             .await
             .unwrap();
         let (status, body) = response_json(response).await;
@@ -22196,6 +22217,10 @@ mod tests {
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(body["detail"], "Too many active mobile attaches for user");
         assert!(state.mobile_terminal_tickets.lock().unwrap().is_empty());
+    }
+
+    fn set_terminal_limit_per_user(state: &AppState, per_user: usize) {
+        state.terminal_limits.write().unwrap().per_user = per_user;
     }
 
     #[tokio::test]
@@ -23378,6 +23403,7 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
         let state = AppState::new(mobile_ticket_config(&signing_key));
         let ticket = mint_mobile_attach_ticket(&state, &signing_key, "ticket-nonce-1").await;
         let frame = signed_mobile_terminal_auth_frame(&signing_key, &ticket, "ws-nonce-1");
+        set_terminal_limit_per_user(&state, 1);
         state
             .mobile_terminal_active_attaches
             .lock()
@@ -23783,9 +23809,10 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
             model: Some("opus".into()),
             reasoning_effort: "high".into(),
         });
+        config.mobile_terminal.max_concurrent_attaches_per_user = 3;
         let state = AppState::new(config);
         seed_cloudflare_access_jwks(&state);
-        let app = router(state);
+        let app = router(state.clone());
         let owner =
             test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
         let put = |body: Value, origin: &str, agent: bool| {
@@ -23882,6 +23909,52 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
         let (_, body) = browser_host_get(&app, "/client/settings", Some(&owner)).await;
         assert_eq!(body["queue_limits"]["service"], Value::Null);
         assert_eq!(background_max().await, 3);
+
+        // Terminal limits (sm#1763): config's values show read-only; an
+        // owner value applies to the next attach; null restores config's.
+        assert_eq!(body["terminal_limits"]["per_user"], Value::Null);
+        assert_eq!(
+            body["terminal_config_limits"],
+            json!({"per_user": 3, "per_session": 4, "global": 100, "max_attach_seconds": 86_400})
+        );
+        assert_eq!(state.terminal_limits.read().unwrap().per_user, 3);
+        let (status, body) = put(
+            json!({"terminal_limits": {"per_user": 50, "max_attach_seconds": 7200}}),
+            "https://sm.example.com",
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["terminal_limits"]["per_user"], 50);
+        assert_eq!(body["terminal_config_limits"]["per_user"], 3);
+        let live = *state.terminal_limits.read().unwrap();
+        assert_eq!((live.per_user, live.max_attach_seconds), (50, 7200));
+        let (status, body) = put(
+            json!({"terminal_limits": {"global": 0}}),
+            "https://sm.example.com",
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["detail"],
+            "terminal_limits.global must be an integer from 1 to 256, or null"
+        );
+        let (status, body) = put(
+            json!({"terminal_config_limits": {"per_user": 9}}),
+            "https://sm.example.com",
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, _) = put(
+            json!({"terminal_limits": null}),
+            "https://sm.example.com",
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(state.terminal_limits.read().unwrap().per_user, 3);
 
         // Other origins and agents cannot write; nobody unsigned can read.
         for (origin, agent) in [

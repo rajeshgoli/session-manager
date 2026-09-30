@@ -658,15 +658,15 @@ fn default_mobile_terminal_device_signature_max_skew_seconds() -> u64 {
 }
 
 fn default_mobile_terminal_max_attaches_per_user() -> usize {
-    1
+    100
 }
 
 fn default_mobile_terminal_max_attaches_per_session() -> usize {
-    1
+    4
 }
 
 fn default_mobile_terminal_max_attaches_global() -> usize {
-    4
+    100
 }
 
 fn default_mobile_terminal_initial_resize_wait_seconds() -> f64 {
@@ -678,7 +678,7 @@ fn default_mobile_terminal_history_preload_lines() -> usize {
 }
 
 fn default_mobile_terminal_max_attach_seconds() -> u64 {
-    3600
+    86_400
 }
 
 fn default_mobile_terminal_device_enrollment_db_path() -> String {
