@@ -5,7 +5,7 @@
 //! `work_attribution`, then scaled so each weekly window's rows add up to
 //! that window's meter reading (scale capped at 0.8–1.25; the rest shows as
 //! "Not in the ledger"). Codex cloud PR reviews count 0.05% each. See
-//! `docs/working/1662_analytics_redesign.html`, appendices B, C and F.1.
+//! `specs/1662_analytics_redesign.html`, appendices B, C and F.1.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},

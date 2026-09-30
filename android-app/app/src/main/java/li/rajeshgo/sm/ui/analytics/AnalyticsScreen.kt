@@ -10,7 +10,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -20,14 +19,12 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
@@ -59,10 +56,8 @@ import li.rajeshgo.sm.ui.queue.jobAgentLabel
 import li.rajeshgo.sm.ui.queue.jobTitle
 import li.rajeshgo.sm.ui.theme.Amber
 import li.rajeshgo.sm.ui.theme.Cyan
-import li.rajeshgo.sm.ui.theme.Panel
 import li.rajeshgo.sm.ui.theme.Rose
 import li.rajeshgo.sm.ui.theme.TextMuted
-import li.rajeshgo.sm.ui.theme.TextSecondary
 
 /**
  * Analytics: quota spend, agent time and the queue's look-back cards (sm#1662).
@@ -78,21 +73,26 @@ fun AnalyticsScreen(
     viewModel: AnalyticsViewModel = viewModel(),
     queueViewModel: QueueViewModel = viewModel(),
     spendViewModel: SpendViewModel = viewModel(),
+    timeViewModel: TimeViewModel = viewModel(),
 ) {
     LaunchedEffect(Unit) { viewModel.open(section) }
     val context = androidx.compose.ui.platform.LocalContext.current
     val current by viewModel.section.collectAsState()
     val queue by queueViewModel.uiState.collectAsState()
     val spend by spendViewModel.state.collectAsState()
+    val time by timeViewModel.state.collectAsState()
     val listState = rememberLazyListState()
-    var expanded by remember(current, spend.provider, spend.range, spend.path) { mutableStateOf(false) }
+    var expanded by remember(current, spend.provider, spend.range, spend.path, time.range, time.path) { mutableStateOf(false) }
     var historyPath by remember { mutableStateOf<String?>(null) }
-    val drillBack = current == AnalyticsSection.SPEND && spend.path.isNotEmpty()
-    val back: () -> Unit = { if (drillBack) spendViewModel.back() else onBack() }
-    BackHandler(enabled = drillBack && historyPath == null) { spendViewModel.back() }
-    LaunchedEffect(current, spend.provider, spend.range, spend.path) { listState.scrollToItem(0) }
+    val drillBack = (current == AnalyticsSection.SPEND && spend.path.isNotEmpty()) ||
+        (current == AnalyticsSection.TIME && time.path.isNotEmpty())
+    val drillUp: () -> Unit = { if (current == AnalyticsSection.TIME) timeViewModel.back() else spendViewModel.back() }
+    val back: () -> Unit = { if (drillBack) drillUp() else onBack() }
+    BackHandler(enabled = drillBack && historyPath == null) { drillUp() }
+    LaunchedEffect(current, spend.provider, spend.range, spend.path, time.range, time.path) { listState.scrollToItem(0) }
     val refreshing = when (current) {
         AnalyticsSection.SPEND -> spend.refreshing
+        AnalyticsSection.TIME -> time.refreshing
         AnalyticsSection.QUEUE -> queue.refreshing
         else -> false
     }
@@ -102,6 +102,7 @@ fun AnalyticsScreen(
     // Fetch when a section opens and on pull-to-refresh; no timer.
     val refresh: (Boolean) -> Unit = { pull ->
         if (current == AnalyticsSection.SPEND) spendViewModel.refresh(pull)
+        if (current == AnalyticsSection.TIME) timeViewModel.refresh(pull)
         if (current == AnalyticsSection.QUEUE) {
             queueViewModel.refresh(pull = pull)
             queueViewModel.refreshStats()
@@ -165,9 +166,22 @@ fun AnalyticsScreen(
                         },
                         onHistory = { historyPath = it },
                     )
-                    AnalyticsSection.TIME -> item {
-                        ComingSoon("What your agents spent their hours on: model, tools, waiting on queue jobs, reviews and you.")
-                    }
+                    AnalyticsSection.TIME -> timeSection(
+                        state = time,
+                        expanded = expanded,
+                        onExpand = { expanded = true },
+                        onSelect = timeViewModel::select,
+                        onRetry = { timeViewModel.refresh(true) },
+                        onOpen = timeViewModel::open,
+                        onLevel = timeViewModel::toLevel,
+                        onAgent = { node ->
+                            node.sessionId?.let { id ->
+                                FollowOpenRequests.pending = FollowOpen(id, null, node.label)
+                                onOpenWatch()
+                            }
+                        },
+                        onHistory = { historyPath = it },
+                    )
                     AnalyticsSection.QUEUE -> queueSection(
                         state = queue,
                         now = now,
@@ -204,16 +218,6 @@ fun AnalyticsScreen(
             onOpenWatch = onOpenWatch,
             onClose = { sheetJob = null },
         )
-    }
-}
-
-@Composable
-private fun ComingSoon(what: String) {
-    Surface(color = Panel, shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth().padding(top = 12.dp)) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("Coming soon", style = MaterialTheme.typography.titleMedium)
-            Text(what, style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
-        }
     }
 }
 

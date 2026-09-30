@@ -36,6 +36,9 @@ interface ApiService {
     @GET("client/analytics/spend")
     suspend fun getAnalyticsSpend(@Query("provider") provider: String?, @Query("range") range: String): li.rajeshgo.sm.data.model.SpendReport
 
+    @GET("client/analytics/time")
+    suspend fun getAnalyticsTime(@Query("range") range: String): li.rajeshgo.sm.data.model.TimeReport
+
     @GET("client/queue")
     suspend fun getQueue(): li.rajeshgo.sm.data.model.QueueOverview
 

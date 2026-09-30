@@ -1,13 +1,18 @@
 package li.rajeshgo.sm.ui.analytics
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -113,5 +118,30 @@ fun LazyListScope.analyticsDrillList(
         val rest = rows.drop(30)
         Text("${rest.size} more · ${formatValue(rest.sumOf { it.value })}", color = Cyan, style = MaterialTheme.typography.labelLarge,
             modifier = Modifier.fillMaxWidth().clickable(onClick = onExpand).padding(vertical = 18.dp))
+    }
+}
+
+@Composable
+fun AnalyticsEyebrow(text: String) { Text(text, style = MaterialTheme.typography.labelSmall, color = TextMuted, modifier = Modifier.padding(top = 4.dp, bottom = 2.dp)) }
+
+@Composable
+fun AnalyticsErrorBanner(error: String, onRetry: () -> Unit) {
+    Surface(color = Rose.copy(alpha = 0.08f), shape = RoundedCornerShape(12.dp)) {
+        Row(Modifier.fillMaxWidth().padding(start = 14.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(error, color = Rose, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f).padding(vertical = 16.dp))
+            TextButton(onClick = onRetry) { Text("Retry") }
+        }
+    }
+}
+
+@Composable
+fun AnalyticsSkeleton() {
+    Surface(color = Panel, shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            Box(Modifier.fillMaxWidth(0.3f).height(12.dp).background(Border, RoundedCornerShape(4.dp)))
+            Box(Modifier.fillMaxWidth(0.5f).height(42.dp).background(Border, RoundedCornerShape(6.dp)))
+            Box(Modifier.fillMaxWidth(0.8f).height(12.dp).background(Border, RoundedCornerShape(4.dp)))
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Cyan, trackColor = Border)
+        }
     }
 }

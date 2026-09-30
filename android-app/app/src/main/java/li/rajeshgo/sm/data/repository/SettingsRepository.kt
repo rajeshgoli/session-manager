@@ -45,6 +45,7 @@ class SettingsRepository(
         val FOLLOW_PUSH_ENABLED = booleanPreferencesKey("follow_push_enabled")
         val SPEND_PROVIDER = stringPreferencesKey("analytics_spend_provider")
         val SPEND_RANGE = stringPreferencesKey("analytics_spend_range")
+        val TIME_RANGE = stringPreferencesKey("analytics_time_range")
         val ANALYTICS_SECTION = stringPreferencesKey("analytics_section")
     }
 
@@ -202,7 +203,6 @@ class SettingsRepository(
         context.dataStore.edit { prefs -> prefs[Keys.FOLLOW_PUSH_ENABLED] = enabled }
     }
 
-    /** The Analytics section last shown (spend, time or queue); blank before the first visit. */
     suspend fun loadSpendChoices(): Pair<String?, String> {
         val prefs = context.dataStore.data.first()
         return prefs[Keys.SPEND_PROVIDER] to (prefs[Keys.SPEND_RANGE] ?: "week")
@@ -215,6 +215,13 @@ class SettingsRepository(
         }
     }
 
+    suspend fun loadTimeRange(): String = context.dataStore.data.first()[Keys.TIME_RANGE] ?: "7d"
+
+    suspend fun saveTimeRange(range: String) {
+        context.dataStore.edit { prefs -> prefs[Keys.TIME_RANGE] = range }
+    }
+
+    /** The Analytics section last shown (spend, time or queue); blank before the first visit. */
     suspend fun loadAnalyticsSection(): String = context.dataStore.data.first()[Keys.ANALYTICS_SECTION].orEmpty()
 
     suspend fun saveAnalyticsSection(section: String) {

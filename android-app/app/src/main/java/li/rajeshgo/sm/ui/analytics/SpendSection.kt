@@ -28,17 +28,10 @@ fun LazyListScope.spendSection(
     onHistory: (String) -> Unit,
 ) {
     item { SpendControls(state, onSelect) }
-    state.error?.let { error -> item {
-        Surface(color = Rose.copy(alpha = 0.08f), shape = RoundedCornerShape(12.dp)) {
-            Row(Modifier.fillMaxWidth().padding(start = 14.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(error, color = Rose, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f).padding(vertical = 16.dp))
-                TextButton(onClick = onRetry) { Text("Retry") }
-            }
-        }
-    } }
+    state.error?.let { error -> item { AnalyticsErrorBanner(error, onRetry) } }
     val report = state.report
     if (report == null) {
-        if (state.loading) item { SpendSkeleton() }
+        if (state.loading) item { AnalyticsSkeleton() }
         return
     }
     val nodes = state.nodes
@@ -56,7 +49,7 @@ fun LazyListScope.spendSection(
         TextButton(onClick = { onHistory(path) }, contentPadding = PaddingValues(0.dp)) { Text("Ticket history  ↗", color = Cyan) }
     } }
     val rows = if (node.kind == "agent") thread?.children.orEmpty().filter { it.id != node.id } else node.children
-    if (node.kind == "agent" && rows.isNotEmpty()) item { SpendEyebrow("SAME TICKET") }
+    if (node.kind == "agent" && rows.isNotEmpty()) item { AnalyticsEyebrow("SAME TICKET") }
     if (rows.isEmpty() && node.kind != "agent") item {
         Text("No agent activity in this range", color = TextMuted, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(vertical = 32.dp))
     }
@@ -101,7 +94,7 @@ private fun SpendControls(state: SpendState, onSelect: (String?, SpendRange) -> 
 private fun SpendHeader(report: SpendReport) {
     Surface(color = Panel, shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth().padding(top = 2.dp)) {
         Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            SpendEyebrow("${report.provider.uppercase()} QUOTA")
+            AnalyticsEyebrow("${report.provider.uppercase()} QUOTA")
             Text(spendPercent(report.total.percent), style = MaterialTheme.typography.displaySmall, fontWeight = FontWeight.SemiBold)
             Text(if (report.range == "4w") "of a week" else "of the week used", color = TextSecondary, style = MaterialTheme.typography.bodyMedium)
             Text("${spendTokens(report.total.tokens)} tokens", color = TextMuted, style = MaterialTheme.typography.bodySmall)
@@ -174,21 +167,6 @@ private fun SpendAgentCard(node: SpendNode, provider: String, onAgent: (SpendNod
                 }
             }
             node.sessionId?.let { TextButton(onClick = { onAgent(node) }, contentPadding = PaddingValues(0.dp)) { Text("Open agent  ↗", color = Cyan) } }
-        }
-    }
-}
-
-@Composable
-private fun SpendEyebrow(text: String) { Text(text, style = MaterialTheme.typography.labelSmall, color = TextMuted, modifier = Modifier.padding(top = 4.dp, bottom = 2.dp)) }
-
-@Composable
-private fun SpendSkeleton() {
-    Surface(color = Panel, shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Box(Modifier.fillMaxWidth(0.3f).height(12.dp).background(Border, RoundedCornerShape(4.dp)))
-            Box(Modifier.fillMaxWidth(0.5f).height(42.dp).background(Border, RoundedCornerShape(6.dp)))
-            Box(Modifier.fillMaxWidth(0.8f).height(12.dp).background(Border, RoundedCornerShape(4.dp)))
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = Cyan, trackColor = Border)
         }
     }
 }

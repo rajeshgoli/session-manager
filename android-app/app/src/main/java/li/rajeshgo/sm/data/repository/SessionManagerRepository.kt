@@ -370,6 +370,10 @@ class SessionManagerRepository(
         executeReadRequest(baseUrl, token) { it.getAnalyticsSpend(provider, range) }
     }
 
+    suspend fun fetchAnalyticsTime(baseUrl: String, token: String, range: String): li.rajeshgo.sm.data.model.TimeReport = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getAnalyticsTime(range) }
+    }
+
     suspend fun fetchQueue(baseUrl: String, token: String): li.rajeshgo.sm.data.model.QueueOverview = withContext(Dispatchers.IO) {
         executeReadRequest(baseUrl, token) { it.getQueue() }
     }
