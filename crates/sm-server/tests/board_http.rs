@@ -1171,6 +1171,91 @@ async fn start_rejects_new_blockers_cycles_and_merged_unclosed_tickets() {
 }
 
 #[tokio::test]
+async fn blocked_ticket_starts_only_with_early_start_flag_and_brief() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    f.board.issues.lock().unwrap().get_mut(&2).unwrap().1 = vec![3];
+    pass(&f).await;
+    let (status, _) = owner_request(&f, "POST", "/client/board/start", Some(start_body(2))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, options) = owner_request(
+        &f,
+        "GET",
+        "/client/board/start-options?repo=acme/widgets&number=2&start_blocked=true",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{options}");
+    assert!(options["brief"]
+        .as_str()
+        .unwrap()
+        .contains("#3 is not done yet"));
+    let mut body = start_body(2);
+    body["start_blocked"] = json!(true);
+    let (status, started) = owner_request(&f, "POST", "/client/board/start", Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    let (_, board) = request_json_board(&f).await;
+    let ticket = board["lanes"][0]["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ticket| ticket["number"] == 2)
+        .unwrap();
+    assert_eq!(ticket["started_early"], true);
+}
+
+#[tokio::test]
+async fn close_requires_finished_container() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    let (status, body) = owner_request(
+        &f,
+        "POST",
+        "/client/board/close",
+        Some(json!({"repo": REPO, "number": 2})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    for child in [2, 3, 4] {
+        f.board.issues.lock().unwrap().get_mut(&child).unwrap().0 = false;
+    }
+    pass(&f).await;
+    let (_, board) = request_json_board(&f).await;
+    let goal = board["lanes"][0]["tickets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ticket| ticket["number"] == 1)
+        .unwrap();
+    assert_eq!(goal["state"], "close_ready");
+    assert_eq!(goal["sub_issues"], json!({"total": 3, "done": 3}));
+}
+
+#[tokio::test]
+async fn board_includes_pr_claimed_by_ticket_holder_without_github_reference() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    f.claim(2, "eng00001");
+    let conn = Connection::open(f.dir.join("message_queue.db")).unwrap();
+    conn.execute("INSERT INTO work_items(repo, number, kind, title, state, url, synced_at)
+        VALUES (?1, 77, 'pr', 'Unlinked PR', 'OPEN', 'https://github.com/acme/widgets/pull/77', '2026-09-29T11:00:00Z')", [REPO]).unwrap();
+    conn.execute(
+        "INSERT INTO work_claims(id, repo, number, kind, session_id, source, claimed_at)
+        VALUES ('pr77', ?1, 77, 'pr', 'eng00001', 'explicit', '2026-09-29T11:00:00Z')",
+        [REPO],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE work_claims SET ended_at = '2026-09-29T12:00:00Z' WHERE id IN ('pr77', 'c2eng00001')",
+        [],
+    ).unwrap();
+    let ticket = f.ticket(2).await;
+    assert_eq!(ticket["prs"][0]["number"], 77);
+    assert_eq!(ticket["prs"][0]["state"], "OPEN");
+    assert_eq!(ticket["prs"][0]["review"], Value::Null);
+}
+
+#[tokio::test]
 async fn start_rechecks_readiness_after_github_fetch_before_claiming() {
     use sm_server::work_claims::{BatchFetch, WorkItemSource};
     struct LateBlocker(PathBuf);

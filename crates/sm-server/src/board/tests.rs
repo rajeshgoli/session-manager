@@ -661,6 +661,37 @@ fn ticket_ref_parsing() {
 // ---------------------------------------------------------------------------
 // D: the model.
 
+#[test]
+fn finished_container_is_close_ready_only_without_active_work() {
+    let mut input = ModelInput::default();
+    input.read_repos.insert(REPO.to_owned());
+    for number in [1, 2] {
+        input.items.insert(k(number), item(&k(number), true));
+    }
+    input.edges.push(edge(&k(1), &k(2), EdgeKind::SubIssue));
+    assert_eq!(
+        compute(&input, now()).facts[&k(1)].state,
+        TicketState::Blocked
+    );
+    input.items.insert(k(2), item(&k(2), false));
+    let board = compute(&input, now());
+    assert_eq!(board.facts[&k(1)].state, TicketState::CloseReady);
+    assert_eq!(board.facts[&k(1)].sub_issues_closed, 1);
+    input
+        .holders
+        .insert(k(1), vec![holder("agent", HolderState::Working)]);
+    assert_eq!(
+        compute(&input, now()).facts[&k(1)].state,
+        TicketState::InProgress
+    );
+    input.holders.clear();
+    input.edges[0].kind = EdgeKind::After;
+    assert_eq!(
+        compute(&input, now()).facts[&k(1)].state,
+        TicketState::Ready
+    );
+}
+
 fn item(key: &Key, open: bool) -> Item {
     Item {
         repo: key.0.clone(),
@@ -1200,7 +1231,7 @@ fn sub_issues_done_flag() {
     input.holders.clear();
     let board = compute(&input, now());
     assert!(board.facts[&k(1651)].sub_issues_done);
-    assert_eq!(state(&board, &k(1651)), TicketState::Ready);
+    assert_eq!(state(&board, &k(1651)), TicketState::CloseReady);
     assert!(!board.facts[&k(1654)].sub_issues_done);
 }
 

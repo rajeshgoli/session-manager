@@ -532,6 +532,19 @@ pub struct WorkClaim {
     pub check_b_due_at: Option<String>,
 }
 
+/// The fields the board needs to preserve PR links after a claim ends.
+#[derive(Debug, Clone)]
+pub struct BoardLinkClaim {
+    pub repo: String,
+    pub number: i64,
+    pub kind: String,
+    pub session_id: String,
+    pub claimed_at: String,
+    pub ended_at: Option<String>,
+    pub state: Option<String>,
+    pub url: Option<String>,
+}
+
 impl WorkClaim {
     pub fn kind(&self) -> WorkKind {
         WorkKind::parse(&self.kind).unwrap_or(WorkKind::Ticket)
@@ -850,6 +863,36 @@ impl WorkClaimStore {
             [],
         )?;
         claim_views(&conn, claims)
+    }
+
+    /// Confirmed ticket and PR claims, including ended ones, for durable board links.
+    pub fn board_link_claims(&self) -> Result<Vec<BoardLinkClaim>> {
+        let Some(conn) = self.open_read()? else {
+            return Ok(Vec::new());
+        };
+        let mut statement = conn.prepare(
+            "SELECT c.repo, c.number, c.kind, c.session_id, c.claimed_at, c.ended_at,
+                    i.state, i.url
+             FROM work_claims c LEFT JOIN work_items i
+               ON i.repo = c.repo AND i.number = c.number
+             WHERE c.reserved_at IS NULL AND c.kind IN ('ticket', 'pr')
+             ORDER BY c.claimed_at, c.id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(BoardLinkClaim {
+                    repo: row.get(0)?,
+                    number: row.get(1)?,
+                    kind: row.get(2)?,
+                    session_id: row.get(3)?,
+                    claimed_at: row.get(4)?,
+                    ended_at: row.get(5)?,
+                    state: row.get(6)?,
+                    url: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     /// Stores a claim-time or sync fetch for `repo`. Items found are

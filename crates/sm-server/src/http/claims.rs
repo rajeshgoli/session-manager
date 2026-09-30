@@ -215,13 +215,14 @@ async fn run_explicit_claim(
     state: &Arc<AppState>,
     request: ClaimRequest,
 ) -> Result<ClaimResult, ApiError> {
-    run_explicit_claim_checked(state, request, false).await
+    run_explicit_claim_checked(state, request, false, false).await
 }
 
 async fn run_explicit_claim_checked(
     state: &Arc<AppState>,
     request: ClaimRequest,
     check_board: bool,
+    start_blocked: bool,
 ) -> Result<ClaimResult, ApiError> {
     if request.tickets.len() + 1 > MAX_ALIASES_PER_QUERY {
         return Err(bad_request("too many --ticket numbers"));
@@ -242,7 +243,11 @@ async fn run_explicit_claim_checked(
             None
         };
         if check_board {
-            super::board::validate_start(&worker_state, &(request.repo.clone(), request.number))?;
+            super::board::validate_start(
+                &worker_state,
+                &(request.repo.clone(), request.number),
+                start_blocked,
+            )?;
         }
         let sessions = session_directory(&worker_state)?;
         Ok(work_claim_store(&worker_state).claim_explicit(&request, fetched, &sessions)?)
@@ -459,6 +464,7 @@ pub(super) struct SpawnTicketReservation {
 pub(super) struct SpawnTicket<'a> {
     pub session_id: &'a str,
     pub check_board: bool,
+    pub start_blocked: bool,
     pub name: Option<&'a str>,
     pub parent: Option<&'a SessionRecord>,
     pub ticket: i64,
@@ -498,7 +504,8 @@ pub(super) async fn reserve_spawn_ticket(
         tickets: Vec::new(),
         reserve: true,
     };
-    let result = run_explicit_claim_checked(state, request, spawn.check_board).await?;
+    let result =
+        run_explicit_claim_checked(state, request, spawn.check_board, spawn.start_blocked).await?;
     deliver_claim_notices(state, &result.notified);
     match result.outcome {
         ClaimOutcome::Claimed { claim, notes, .. } => Ok(SpawnTicketReservation {

@@ -234,6 +234,7 @@ fn warning_words(warning: &str) -> &str {
 fn state_words(state: &str) -> &str {
     match state {
         "needs_you" => "needs you",
+        "close_ready" => "all parts done: close",
         "in_progress" => "in progress",
         other => other,
     }
@@ -405,8 +406,9 @@ pub(crate) fn board_lines(payload: &Value, now: OffsetDateTime) -> Vec<String> {
             })
             .collect();
         lines.push(format!(
-            "  {} needs you · {} ready · {} in progress · {} blocked · {} done · longest chain {}: {}",
+            "  {} needs you · {} all parts done · {} ready · {} in progress · {} blocked · {} done · longest chain {}: {}",
             counts["needs_you"],
+            counts["close_ready"],
             counts["ready"],
             counts["in_progress"],
             counts["blocked"],
