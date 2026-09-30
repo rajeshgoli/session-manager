@@ -35,7 +35,7 @@ function DrillReport({ section }) {
   const ranges = spend ? [['week', 'This week'], ['last_week', 'Last week'], ['4w', '4 weeks']] : [['24h', '24h'], ['7d', '7d'], ['30d', '30d']];
   const value = (n) => spend ? percent(n.percent) : duration(n.active_seconds);
   const labels = Object.fromEntries([...(report?.parts_legend || []), ...(report?.tool_legend || [])].map((l) => [l.key, l.label]));
-  const parts = (n) => Object.entries(n.parts || {}).map(([key, v], i) => html`<span style=${`color:var(--${colors[i % colors.length]})`}>${labels[key] || key}: ${spend ? percent(v) : duration(v)}</span>`);
+  const parts = (n) => Object.entries(n.parts || {}).map(([key, v]) => html`<span style=${`color:var(--${colors[Math.max(0, (report?.parts_legend || []).findIndex((part) => part.key === key)) % colors.length]})`}>${labels[key] || key}: ${spend ? percent(v) : duration(v)}</span>`);
   const legend = report?.parts_legend || [];
   const composition = (child) => {
     const largest = Math.max(1, ...(node.children || []).map((n) => spend ? n.percent : n.active_seconds));
