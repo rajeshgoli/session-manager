@@ -32,6 +32,11 @@ use crate::{
     sessions::expand_home,
 };
 
+// The server owns enrollment and policy writes. Keep a retry's storage and
+// edge update together; separately serialize policy writes from phones/revokes.
+static COMPUTER_ENROLLMENT_LOCK: Mutex<()> = Mutex::new(());
+static DEVICE_POLICY_UPDATE_LOCK: Mutex<()> = Mutex::new(());
+
 const EMPTY_DEVICE_COMMON_NAME: &str = "__sm_no_enrolled_mobile_devices__";
 const MAX_UNKNOWN_PAIRING_ATTEMPTS: u32 = 25;
 const PAIRING_PATH_PREFIX: &str = "/client/mobile-terminal/enroll";
@@ -184,6 +189,9 @@ fn enroll_computer_with_sync(
     csr: &str,
     sync: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<String> {
+    let _enrollment = COMPUTER_ENROLLMENT_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Computer enrollment lock is unavailable"))?;
     if !config.cloudflare_access.browser.enabled || !config.cloudflare_access.browser.device_policy
     {
         bail!("Enable cloudflare_access.browser.enabled and browser.device_policy before enrolling a computer");
@@ -1357,6 +1365,9 @@ impl DevicePolicyRequest {
     }
 
     fn execute(&self) -> Result<()> {
+        let _policy_update = DEVICE_POLICY_UPDATE_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Device policy update lock is unavailable"))?;
         if self.common_name.is_empty() {
             bail!("Cloudflare mobile device policy sync requires a non-empty common name");
         }
@@ -2099,6 +2110,33 @@ mod tests {
         )
         .is_err());
         assert!(enroll_computer(&config, "owner", "studio", "invalid CSR").is_err());
+
+        // A failed first enrollment must not erase a concurrent retry that
+        // succeeds. Hold the first edge update while starting the retry.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (retry_tx, retry_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let first_config = &config;
+            let first_csr = &csr;
+            let first = scope.spawn(move || {
+                enroll_computer_with_sync(first_config, "owner", "retry", first_csr, |_| {
+                    entered_tx.send(()).unwrap();
+                    // Without enrollment serialization, the retry completes here
+                    // and the failing first request then deletes its shared row.
+                    let _ = retry_rx.recv_timeout(std::time::Duration::from_secs(1));
+                    bail!("simulated edge failure")
+                })
+            });
+            entered_rx.recv().unwrap();
+            let second = scope.spawn(|| {
+                let result = enroll_computer_with_sync(&config, "owner", "retry", &csr, |_| Ok(()));
+                let _ = retry_tx.send(());
+                result
+            });
+            assert!(first.join().unwrap().is_err());
+            assert!(second.join().unwrap().is_ok());
+        });
+        assert!(active_device_exists(&mobile_device_db_path(&config), "owner", "retry").unwrap());
         fs::remove_dir_all(dir).unwrap();
     }
 
