@@ -89,6 +89,8 @@ enum Command {
     RemoveDevice(RemoveDeviceArgs),
     #[command(name = "request-review")]
     RequestReview(RequestReviewArgs),
+    #[command(name = "review-policy")]
+    ReviewPolicy(ReviewPolicyArgs),
     #[command(name = "subagent-start")]
     SubagentStart(EmptyArgs),
     #[command(name = "subagent-stop")]
@@ -785,6 +787,32 @@ enum RequestReviewCommand {
 }
 
 #[derive(Args)]
+struct ReviewPolicyArgs {
+    #[arg(long, global = true)]
+    repo: Option<String>,
+    #[command(subcommand)]
+    command: ReviewPolicyCommand,
+}
+
+#[derive(Subcommand)]
+enum ReviewPolicyCommand {
+    Show {
+        #[arg(long, group = "target")]
+        pr: Option<i64>,
+        #[arg(long, group = "target")]
+        ticket: Option<i64>,
+        #[arg(long, group = "target")]
+        lane: Option<i64>,
+    },
+    Set {
+        parts: Vec<String>,
+    },
+    Clear {
+        parts: Vec<String>,
+    },
+}
+
+#[derive(Args)]
 struct ProviderLaunchArgs {
     working_dir: Option<String>,
     #[arg(long)]
@@ -1298,6 +1326,7 @@ fn run() -> Result<()> {
         Command::Subagents(args) => print_subagents(&client, &args.session_id)?,
         Command::Queue(args) => run_queue(&client, args)?,
         Command::RequestReview(args) => run_request_codex_review(&client, args)?,
+        Command::ReviewPolicy(args) => run_review_policy(&client, args)?,
         Command::Watch(args) => run_watch(&api_url, args)?,
         Command::Doc(args) => doc::run_doc(&client, args)?,
         Command::MergeHold(args) => merge_holds::run(&client, args)?,
@@ -2178,6 +2207,164 @@ fn handoff_ask(response: &Value) -> Option<&str> {
     response["handoff_ask"]
         .as_str()
         .filter(|ask| !ask.trim().is_empty())
+}
+
+fn reviewer_argument(text: &str) -> Result<Value> {
+    if text == "github-codex" {
+        return Ok(json!({"kind":"github_codex"}));
+    }
+    let parts: Vec<&str> = text.split('/').collect();
+    match parts.as_slice() {
+        [kind,model,effort] if ["codex","claude"].contains(kind) =>
+            Ok(json!({"kind":kind,"model":model,"effort":effort})),
+        ["paired",provider,model,effort] if ["codex","claude"].contains(provider) =>
+            Ok(json!({"kind":"paired","provider":provider,"model":model,"effort":effort})),
+        _=>bail!("Reviewer must be github-codex, codex/MODEL/EFFORT, claude/MODEL/EFFORT or paired/PROVIDER/MODEL/EFFORT"),
+    }
+}
+
+fn reviewer_text(v: &Value) -> String {
+    match v["kind"].as_str().unwrap_or("") {
+        "github_codex" => "GitHub Codex".into(),
+        "paired" => format!(
+            "Paired {} {} ({})",
+            v["provider"].as_str().unwrap_or("?"),
+            v["model"].as_str().unwrap_or("?"),
+            v["effort"].as_str().unwrap_or("?")
+        ),
+        kind => format!(
+            "{} run {} ({})",
+            if kind == "codex" { "Codex" } else { "Claude" },
+            v["model"].as_str().unwrap_or("?"),
+            v["effort"].as_str().unwrap_or("?")
+        ),
+    }
+}
+
+fn print_policy(v: &Value) {
+    let fallback = v["fallback"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .map(reviewer_text)
+                .collect::<Vec<_>>()
+                .join(", then ")
+        })
+        .unwrap_or_default();
+    let source = v["source"].as_str().unwrap_or("stored");
+    println!(
+        "{source}: {}; falls back to {fallback}",
+        reviewer_text(&v["reviewer"])
+    );
+}
+
+fn run_review_policy(client: &ApiClient, args: ReviewPolicyArgs) -> Result<()> {
+    let repo = args.repo.or_else(resolve_codex_review_repo_from_cwd);
+    let clear = matches!(&args.command, ReviewPolicyCommand::Clear { .. });
+    match args.command {
+        ReviewPolicyCommand::Show { pr, ticket, lane } => {
+            if pr.is_none() && ticket.is_none() && lane.is_none() {
+                let result = client.get_json("/review-policies")?;
+                print_policy(&result["default"]);
+                for policy in result["policies"].as_array().into_iter().flatten() {
+                    let mut p = policy.clone();
+                    p["source"] = json!(match policy["scope"].as_str().unwrap_or("") {
+                        "ticket" => format!(
+                            "ticket {}#{}",
+                            policy["repo"].as_str().unwrap_or(""),
+                            policy["number"]
+                        ),
+                        "lane" => format!(
+                            "lane {}#{}",
+                            policy["repo"].as_str().unwrap_or(""),
+                            policy["number"]
+                        ),
+                        _ => format!("repo {}", policy["repo"].as_str().unwrap_or("")),
+                    });
+                    print_policy(&p);
+                }
+                return Ok(());
+            }
+            let repo = repo.context("Could not determine GitHub repo; pass --repo")?;
+            let mut query = vec![format!("repo={}", encode_query_component(&repo))];
+            for (name, value) in [("pr", pr), ("ticket", ticket), ("lane", lane)] {
+                if let Some(value) = value {
+                    query.push(format!("{name}={value}"));
+                }
+            }
+            print_policy(&client.get_json(&format!("/review-policies?{}", query.join("&")))?);
+        }
+        ReviewPolicyCommand::Set { parts } | ReviewPolicyCommand::Clear { parts } => {
+            let scope = parts
+                .first()
+                .map(String::as_str)
+                .context("scope is required")?;
+            let (repo, number, reviewer) = match scope {
+                "default" => {
+                    anyhow::ensure!(
+                        parts.len() == if clear { 1 } else { 2 },
+                        "Usage: sm review-policy set default REVIEWER"
+                    );
+                    (
+                        repo.unwrap_or_default(),
+                        0,
+                        parts.get(1).map(String::as_str),
+                    )
+                }
+                "repo" => {
+                    let expected = if clear { 1 } else { 2 };
+                    let (explicit, reviewer) = if parts.len() == expected {
+                        (None, parts.get(1).map(String::as_str))
+                    } else if parts.len() == expected + 1 {
+                        (
+                            parts.get(1).map(String::as_str),
+                            parts.get(2).map(String::as_str),
+                        )
+                    } else {
+                        bail!("Usage: sm review-policy set repo [OWNER/NAME] REVIEWER");
+                    };
+                    (
+                        explicit
+                            .map(str::to_owned)
+                            .or(repo)
+                            .context("Could not determine GitHub repo; pass --repo")?,
+                        0,
+                        reviewer,
+                    )
+                }
+                "lane" | "ticket" => {
+                    anyhow::ensure!(
+                        parts.len() == if clear { 2 } else { 3 },
+                        "Usage: sm review-policy set {scope} NUMBER REVIEWER"
+                    );
+                    (
+                        repo.context("Could not determine GitHub repo; pass --repo")?,
+                        parts[1].parse::<i64>()?,
+                        parts.get(2).map(String::as_str),
+                    )
+                }
+                _ => bail!("scope must be default, repo, lane or ticket"),
+            };
+            let reviewer = reviewer.map(reviewer_argument).transpose()?;
+            let result = client.put_json(
+                "/review-policies",
+                json!({"scope":scope,"repo":repo,"number":number,
+                "reviewer":reviewer,"session_id":optional_current_session_id()}),
+            )?;
+            if let Some(policy) = result.get("policy") {
+                if policy.is_null() {
+                    println!("Cleared {scope} review policy.");
+                } else {
+                    let mut p = policy.clone();
+                    p["source"] = json!(format!("{scope} {}#{}", repo, number));
+                    print_policy(&p);
+                }
+            } else {
+                print_policy(&result);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_request_codex_review_list(client: &ApiClient, args: RequestReviewArgs) -> Result<()> {
@@ -7256,6 +7443,33 @@ mod tests {
             })),
             "143"
         );
+    }
+
+    #[test]
+    fn review_policy_cli_accepts_repo_after_show_and_reviewer_shapes() {
+        let cli = Cli::try_parse_from([
+            "sm",
+            "review-policy",
+            "show",
+            "--pr",
+            "1851",
+            "--repo",
+            "far/repo",
+        ])
+        .unwrap();
+        let Command::ReviewPolicy(args) = cli.command else {
+            panic!("review-policy command");
+        };
+        assert_eq!(args.repo.as_deref(), Some("far/repo"));
+        assert!(matches!(
+            args.command,
+            ReviewPolicyCommand::Show { pr: Some(1851), .. }
+        ));
+        assert_eq!(
+            reviewer_argument("codex/gpt-6-astra/high").unwrap()["kind"],
+            "codex"
+        );
+        assert!(reviewer_argument("codex/gpt-6-astra").is_err());
     }
 
     #[test]

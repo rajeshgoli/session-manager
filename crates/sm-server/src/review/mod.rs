@@ -4,6 +4,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
 use std::path::{Component, Path};
 
+pub mod policy;
+
 pub const RUBRIC: &str = include_str!("rubric.md");
 pub const SCHEMA: &str = include_str!("schema.json");
 
@@ -453,6 +455,7 @@ mod tests {
             &db,
             &r.id,
             &chain(&json!({"kind":"github_codex"})),
+            "default",
         )
         .unwrap();
         for index in 0..3 {

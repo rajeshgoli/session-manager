@@ -1841,6 +1841,10 @@ pub fn change_text(event: &Event, base: &str) -> Option<String> {
         ),
         "lane_added" => format!("lane added by {actor}"),
         "lane_ended" => "lane ended".to_owned(),
+        "review_policy" => format!(
+            "review policy {} by {actor}",
+            event.detail.as_deref().unwrap_or("changed")
+        ),
         "agent_started" => format!(
             "Started {} on {a}",
             event.detail.as_deref().unwrap_or_default()
