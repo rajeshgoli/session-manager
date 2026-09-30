@@ -8483,19 +8483,18 @@ async fn send_mobile_terminal_json(socket: &mut WebSocket, payload: Value) -> Re
         Ok(text) => text,
         Err(_) => return Err(()),
     };
-    socket
-        .send(Message::Text(text.into()))
-        .await
-        .map_err(|_| ())
+    send_mobile_terminal_bounded(socket, Message::Text(text.into())).await
 }
 
 async fn close_mobile_terminal_socket(socket: &mut WebSocket, code: u16, reason: &str) {
-    let _ = socket
-        .send(Message::Close(Some(CloseFrame {
+    let _ = send_mobile_terminal_bounded(
+        socket,
+        Message::Close(Some(CloseFrame {
             code,
             reason: reason.to_owned().into(),
-        })))
-        .await;
+        })),
+    )
+    .await;
 }
 
 struct MobileTerminalInitialState {
@@ -8621,8 +8620,9 @@ async fn run_mobile_terminal_bridge_inner(
 
     loop {
         if stop.load(Ordering::SeqCst) || !mobile_terminal_enabled(state) {
-            let _ = sender
-                .send(Message::Text(
+            let _ = send_mobile_terminal_bounded(
+                &mut sender,
+                Message::Text(
                     json!({
                         "type": "exit",
                         "code": 1008,
@@ -8630,8 +8630,9 @@ async fn run_mobile_terminal_bridge_inner(
                     })
                     .to_string()
                     .into(),
-                ))
-                .await;
+                ),
+            )
+            .await;
             close_code = 1008;
             close_reason = "mobile_terminal_disabled".to_owned();
             break;
@@ -8658,13 +8659,12 @@ async fn run_mobile_terminal_bridge_inner(
                     close_reason = "client_unresponsive".to_owned();
                     break;
                 }
-                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                if send_mobile_terminal_bounded(&mut sender, Message::Ping(Vec::new().into())).await.is_err() {
                     break;
                 }
             }
             _ = &mut max_timer => {
-                let _ = sender
-                    .send(Message::Text(
+                let _ = send_mobile_terminal_bounded(&mut sender, Message::Text(
                         json!({
                             "type": "exit",
                             "code": 124,
@@ -8694,14 +8694,13 @@ async fn run_mobile_terminal_bridge_inner(
                             "encoding": "base64",
                             "data": STANDARD.encode(chunk),
                         });
-                        if sender.send(Message::Text(payload.to_string().into())).await.is_err() {
+                        if send_mobile_terminal_bounded(&mut sender, Message::Text(payload.to_string().into())).await.is_err() {
                             break;
                         }
                     }
                     Some(MobileTerminalPtyEvent::Closed) | None => {
                         if stop.load(Ordering::SeqCst) || !mobile_terminal_enabled(state) {
-                            let _ = sender
-                                .send(Message::Text(
+                            let _ = send_mobile_terminal_bounded(&mut sender, Message::Text(
                                     json!({
                                         "type": "exit",
                                         "code": 1008,
@@ -8715,8 +8714,7 @@ async fn run_mobile_terminal_bridge_inner(
                             close_reason = "mobile_terminal_disabled".to_owned();
                             break;
                         }
-                        let _ = sender
-                            .send(Message::Text(
+                        let _ = send_mobile_terminal_bounded(&mut sender, Message::Text(
                                 json!({
                                     "type": "error",
                                     "message": "tmux session is no longer attachable",
@@ -8783,12 +8781,16 @@ async fn run_mobile_terminal_bridge_inner(
         "mobile terminal closed for session {}: code={close_code} reason={close_reason}",
         ticket.session_id
     );
-    let _ = sender
-        .send(Message::Close(Some(CloseFrame {
+    // Brief: the attach is released only after this, and a client that
+    // stopped reading will not take the close frame either.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        sender.send(Message::Close(Some(CloseFrame {
             code: close_code,
             reason: close_reason.into(),
-        })))
-        .await;
+        }))),
+    )
+    .await;
     Ok(())
 }
 
@@ -8890,13 +8892,15 @@ where
         Some("input") => {
             let data = frame.get("data").and_then(Value::as_str).unwrap_or("");
             if data.chars().count() > MOBILE_TERMINAL_INPUT_MAX_CHARS {
-                let _ = sender
-                    .send(Message::Text(
+                let _ = send_mobile_terminal_bounded(
+                    sender,
+                    Message::Text(
                         json!({"type": "error", "message": "input frame too large"})
                             .to_string()
                             .into(),
-                    ))
-                    .await;
+                    ),
+                )
+                .await;
                 *close_code = 1008;
                 *close_reason = "input_frame_too_large".to_owned();
                 return Ok(true);
@@ -8905,13 +8909,15 @@ where
                 if let Err(message) =
                     write_mobile_terminal_pty(master.clone(), data.as_bytes().to_vec()).await
                 {
-                    let _ = sender
-                        .send(Message::Text(
+                    let _ = send_mobile_terminal_bounded(
+                        sender,
+                        Message::Text(
                             json!({"type": "error", "message": message})
                                 .to_string()
                                 .into(),
-                        ))
-                        .await;
+                        ),
+                    )
+                    .await;
                     *close_code = 1011;
                     *close_reason = "failed_to_deliver_terminal_input".to_owned();
                     return Ok(true);
@@ -8921,8 +8927,7 @@ where
         Some("key") => {
             let key = frame.get("key").and_then(Value::as_str).unwrap_or("");
             let Some(bytes) = mobile_terminal_key_bytes(key) else {
-                let _ = sender
-                    .send(Message::Text(
+                let _ = send_mobile_terminal_bounded(sender, Message::Text(
                         json!({"type": "error", "message": format!("unsupported key: {}", key.trim().to_ascii_lowercase())})
                             .to_string()
                             .into(),
@@ -8931,13 +8936,15 @@ where
                 return Ok(false);
             };
             if let Err(message) = write_mobile_terminal_pty(master.clone(), bytes).await {
-                let _ = sender
-                    .send(Message::Text(
+                let _ = send_mobile_terminal_bounded(
+                    sender,
+                    Message::Text(
                         json!({"type": "error", "message": message})
                             .to_string()
                             .into(),
-                    ))
-                    .await;
+                    ),
+                )
+                .await;
                 *close_code = 1011;
                 *close_reason = "failed_to_deliver_terminal_key".to_owned();
                 return Ok(true);
@@ -8946,42 +8953,50 @@ where
         Some("resize") => {
             if let Some((rows, cols)) = mobile_terminal_resize(frame) {
                 if let Err(message) = resize_mobile_terminal_pty(master.clone(), rows, cols).await {
-                    let _ = sender
-                        .send(Message::Text(
+                    let _ = send_mobile_terminal_bounded(
+                        sender,
+                        Message::Text(
                             json!({"type": "error", "message": message})
                                 .to_string()
                                 .into(),
-                        ))
-                        .await;
+                        ),
+                    )
+                    .await;
                     *close_code = 1011;
                     *close_reason = "failed_to_resize_terminal".to_owned();
                     return Ok(true);
                 }
-                let _ = sender
-                    .send(Message::Text(
+                let _ = send_mobile_terminal_bounded(
+                    sender,
+                    Message::Text(
                         json!({"type": "status", "state": "resized", "rows": rows, "cols": cols})
                             .to_string()
                             .into(),
-                    ))
-                    .await;
+                    ),
+                )
+                .await;
             } else {
-                let _ = sender
-                    .send(Message::Text(
+                let _ = send_mobile_terminal_bounded(
+                    sender,
+                    Message::Text(
                         json!({"type": "error", "message": "ignored invalid resize"})
                             .to_string()
                             .into(),
-                    ))
-                    .await;
+                    ),
+                )
+                .await;
             }
         }
         Some("ping") => {
-            let _ = sender
-                .send(Message::Text(
+            let _ = send_mobile_terminal_bounded(
+                sender,
+                Message::Text(
                     json!({"type": "status", "state": "pong"})
                         .to_string()
                         .into(),
-                ))
-                .await;
+                ),
+            )
+            .await;
         }
         Some("detach") => {
             *close_code = 1000;
@@ -8989,16 +9004,36 @@ where
             return Ok(true);
         }
         _ => {
-            let _ = sender
-                .send(Message::Text(
+            let _ = send_mobile_terminal_bounded(
+                sender,
+                Message::Text(
                     json!({"type": "error", "message": "unsupported terminal frame"})
                         .to_string()
                         .into(),
-                ))
-                .await;
+                ),
+            )
+            .await;
         }
     }
     Ok(false)
+}
+
+/// Send one frame, giving up after `MOBILE_TERMINAL_CLIENT_SILENCE_SECONDS`.
+/// A client that stops reading must not block the bridge forever, or its
+/// attach is never released (sm#1763).
+async fn send_mobile_terminal_bounded<S>(sender: &mut S, message: Message) -> Result<(), ()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    match tokio::time::timeout(
+        Duration::from_secs(MOBILE_TERMINAL_CLIENT_SILENCE_SECONDS),
+        sender.send(message),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(()),
+    }
 }
 
 fn mobile_terminal_client_frame(message: Message) -> Result<Option<Value>, String> {
@@ -21017,26 +21052,38 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires tmux and loopback sockets; exercises 30 seconds of real idle keepalives"]
     async fn mobile_terminal_live_bridge_survives_keepalives_and_cleans_up() {
-        check_mobile_terminal_live_bridge(false, false).await;
+        check_mobile_terminal_live_bridge(false, None).await;
     }
 
     /// A client that stops answering pings is dropped, as when a proxy keeps
     /// the server's side of a dead phone connection open (sm#1763).
     #[cfg(unix)]
     #[tokio::test]
+    #[ignore = "requires tmux and loopback sockets; waits out the 30-second silence deadline"]
     async fn mobile_terminal_live_bridge_drops_a_silent_client() {
-        check_mobile_terminal_live_bridge(false, true).await;
+        check_mobile_terminal_live_bridge(false, Some(false)).await;
+    }
+
+    /// The same when the terminal floods output: sends that back up behind a
+    /// client that never reads give up instead of blocking the bridge.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires tmux and loopback sockets; waits for socket buffers to fill and a send to time out"]
+    async fn mobile_terminal_live_bridge_drops_a_silent_client_behind_blocked_output() {
+        check_mobile_terminal_live_bridge(false, Some(true)).await;
     }
 
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires tmux and loopback sockets; stalls the renderer for 30 seconds"]
     async fn mobile_terminal_live_bridge_backpressures_slow_renderer() {
-        check_mobile_terminal_live_bridge(true, false).await;
+        check_mobile_terminal_live_bridge(true, None).await;
     }
 
     #[cfg(unix)]
-    async fn check_mobile_terminal_live_bridge(output_ack: bool, silent: bool) {
+    /// `silent` is `Some(flood)` for a client that never reads; `flood` makes
+    /// the terminal print continuously.
+    async fn check_mobile_terminal_live_bridge(output_ack: bool, silent: Option<bool>) {
         use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
 
         // Own an isolated tmux server. Never attach to or kill a user's session.
@@ -21048,10 +21095,13 @@ mod tests {
                     .output();
             }
         }
+        // The counter keeps tests that start in the same clock tick apart.
+        static NEXT_TMUX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let tmux = TestTmux(format!(
-            "sm-mobile-test-{}-{}",
+            "sm-mobile-test-{}-{}-{}",
             std::process::id(),
-            OffsetDateTime::now_utc().unix_timestamp_nanos()
+            OffsetDateTime::now_utc().unix_timestamp_nanos(),
+            NEXT_TMUX.fetch_add(1, Ordering::SeqCst)
         ));
         let created = Command::new("tmux")
             .args([
@@ -21063,7 +21113,9 @@ mod tests {
                 "-d",
                 "-s",
                 "terminal",
-                if output_ack { r#"sleep 1; i=0; while [ "$i" -lt 200 ]; do printf 'flow-control %s\n' "$i"; i=$((i+1)); sleep 0.05; done; cat"# } else { "cat" },
+                if output_ack { r#"sleep 1; i=0; while [ "$i" -lt 200 ]; do printf 'flow-control %s\n' "$i"; i=$((i+1)); sleep 0.05; done; cat"# }
+                // Flood output so the bridge's sends back up behind a client that never reads.
+                else if silent == Some(true) { "yes flood-output-behind-a-client-that-never-reads" } else { "cat" },
             ])
             .output()
             .unwrap();
@@ -21128,10 +21180,11 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let (mut client, _) = connect_async(format!("ws://{addr}/")).await.unwrap();
-        if silent {
-            // Never read, so the client answers no ping.
+        if silent.is_some() {
+            // Never read, so the client answers no ping. Blocked output adds
+            // up to one send timeout after the socket buffers fill.
             timeout(
-                Duration::from_secs(MOBILE_TERMINAL_CLIENT_SILENCE_SECONDS + 20),
+                Duration::from_secs(3 * MOBILE_TERMINAL_CLIENT_SILENCE_SECONDS),
                 done.notified(),
             )
             .await
