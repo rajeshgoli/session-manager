@@ -105,6 +105,10 @@ fn recorder_snapshot(sample: &crate::utilization::HostSample, host: Option<Strin
         "memory_pressure": sample.pressure_level.and_then(|level| pressure_label(&level.to_string())),
         "cpu_percent": sample.cpu_busy_pct,
         "gpu_percent": sample.gpu_busy_pct,
+        // The running queue jobs' part of each figure (sm#1714).
+        "queue_memory_bytes": sample.queue_mem_bytes,
+        "queue_cpu_percent": sample.queue_cpu_pct,
+        "queue_gpu_percent": sample.queue_gpu_pct,
         "source": "recorder",
     })
 }
@@ -132,7 +136,7 @@ async fn collect_snapshot() -> Value {
         "host": host.map(|s| s.trim().to_owned()),
         "sampled_at": time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).ok(),
         "memory_total_bytes": total.and_then(|s| s.trim().parse::<u64>().ok()),
-        "memory_used_bytes": memory_used(&top),
+        "memory_used_bytes": crate::utilization::memory_used_now(),
         "memory_pressure": pressure.as_deref().and_then(pressure_label),
         "cpu_percent": cpu_percent(&top),
         "gpu_percent": gpu.as_deref().and_then(gpu_percent),
@@ -160,26 +164,6 @@ fn cpu_percent(top: &str) -> Option<f64> {
         .parse::<f64>()
         .ok()?;
     idle.is_finite().then(|| (100.0 - idle).clamp(0.0, 100.0))
-}
-
-fn memory_used(top: &str) -> Option<u64> {
-    let amount = top
-        .lines()
-        .filter_map(|line| line.strip_prefix("PhysMem: "))
-        .next_back()?
-        .split_whitespace()
-        .next()?;
-    let unit = amount.chars().last()?;
-    let multiplier = match unit {
-        'B' => 1.0,
-        'K' => 1024.0,
-        'M' => 1024.0_f64.powi(2),
-        'G' => 1024.0_f64.powi(3),
-        'T' => 1024.0_f64.powi(4),
-        _ => return None,
-    };
-    let value = amount[..amount.len() - 1].parse::<f64>().ok()?;
-    (value.is_finite() && value >= 0.0).then_some((value * multiplier) as u64)
 }
 
 pub(crate) fn gpu_percent(ioreg: &str) -> Option<f64> {
@@ -243,6 +227,7 @@ mod tests {
             mem_used_bytes: Some(87),
             mem_available_bytes: Some(200),
             pressure_level: Some(2),
+            queue_mem_bytes: Some(40),
             ..Default::default()
         };
         assert!(is_fresh(&sample, 1_000_000 + 14_999));
@@ -255,6 +240,8 @@ mod tests {
         assert_eq!(value["cpu_percent"], 42.5);
         assert_eq!(value["sampled_at"], "1970-01-01T00:16:40Z");
         assert_eq!(value["gpu_percent"], Value::Null);
+        assert_eq!(value["queue_memory_bytes"], 40);
+        assert_eq!(value["queue_cpu_percent"], Value::Null);
         let empty = crate::utilization::HostSample {
             sampled_at_ms: 1_000_000,
             interval_ms: 5000,
@@ -267,7 +254,6 @@ mod tests {
     fn uses_recent_cpu_sample_and_preserves_missing_measurements() {
         let sample = "CPU usage: 10% user, 20% sys, 70% idle\nPhysMem: 12G used (1G wired), 4G unused.\nCPU usage: 1% user, 2% sys, 97% idle\nPhysMem: 12500M used (1G wired), 4G unused.";
         assert_eq!(cpu_percent(sample), Some(3.0));
-        assert_eq!(memory_used(sample), Some(12500 * 1024 * 1024));
         assert_eq!(cpu_percent("unavailable"), None);
         assert_eq!(gpu_percent("unavailable"), None);
         assert_eq!(

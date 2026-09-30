@@ -294,14 +294,31 @@ internal fun MeterPanel(host: li.rajeshgo.sm.data.model.HostStatus?, onClick: ((
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(row.label, style = MaterialTheme.typography.labelSmall, color = TextSecondary, modifier = Modifier.width(34.dp))
                     Box(Modifier.weight(1f).height(7.dp).background(PanelMuted, RoundedCornerShape(99.dp))) {
+                        // Everything used, lighter; the queue jobs' part on top of it, solid.
+                        val color = meterColor(row)
+                        val queued = row.queueFraction != null
                         Box(
                             Modifier.fillMaxWidth((row.fraction ?: 0.0).toFloat().coerceIn(0f, 1f)).height(7.dp)
-                                .background(meterColor(row), RoundedCornerShape(99.dp)),
+                                .background(if (queued) color.copy(alpha = 0.4f) else color, RoundedCornerShape(99.dp)),
                         )
+                        row.queueFraction?.let { part ->
+                            Box(
+                                Modifier.fillMaxWidth(part.toFloat().coerceIn(0f, 1f)).height(7.dp)
+                                    .background(color, RoundedCornerShape(99.dp)),
+                            )
+                        }
                     }
                     Text(row.value, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(start = 8.dp))
+                    row.queueValue?.let { Text(" · $it", style = MaterialTheme.typography.labelSmall, color = TextSecondary) }
                     row.warning?.let { Text(" $it", style = MaterialTheme.typography.labelSmall, color = Rose) }
                 }
+            }
+            if (rows.any { it.queueFraction != null }) {
+                Text(
+                    "Solid: queue jobs · light: everything else",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TextMuted,
+                )
             }
             if (onClick != null && rows.isNotEmpty()) {
                 Text("Mac usage over time ›", style = MaterialTheme.typography.labelSmall, color = Cyan)
