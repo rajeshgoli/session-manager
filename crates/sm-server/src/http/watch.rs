@@ -241,7 +241,12 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
             "model": launch.get(id).and_then(|l| l.model.clone()),
             "reasoning_effort": launch.get(id).and_then(|l| l.reasoning_effort.clone()),
             "working_dir": launch.get(id).map(|l| l.working_dir.clone()),
-            "activity_since": launch.get(id).and_then(|l| l.since(state)).or_else(|| optional("last_activity")),
+            // A working agent without a turn-start hook (Codex) has no known
+            // start; its last activity is always now, so leave it unset.
+            "activity_since": launch
+                .get(id)
+                .and_then(|l| l.since(state))
+                .or_else(|| (state != "working").then(|| optional("last_activity")).flatten()),
             "handoff": v["handoff"].clone(),
             "remote_control": remote_control.get(id).cloned().unwrap_or(Value::Null),
             "claims": field("claims"),
