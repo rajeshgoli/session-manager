@@ -3,3 +3,5 @@ def average(values):
     if not values:
         return sum(values) / len(values)
     return 0
+
+# Head-change verification for the review runner.
