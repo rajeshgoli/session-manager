@@ -600,7 +600,7 @@ impl NoticeWorld for AppNoticeWorld<'_> {
             crate::board::NOTICE_BOARD_LANE_DONE => Ok(true),
             // Wanted while the same wait the sweep last saw is still open.
             NOTICE_APPROVAL_NEEDED => {
-                let waits = self.state.approval_waits.lock().expect("approval waits");
+                let waits = push_store(self.state).approval_waits()?;
                 Ok(waits.get(&notice.session_id).is_some_and(|since| {
                     owner_push::approval_subject_id(&notice.session_id, *since) == notice.subject_id
                 }))
@@ -914,7 +914,7 @@ impl AppState {
     /// Records which live sessions are blocked on an approval prompt, and
     /// creates the owner's notice once a wait has lasted
     /// [`APPROVAL_NOTICE_DELAY`] (sm#1743). A wait that ends drops out of the
-    /// map, which withdraws its notice.
+    /// record, which withdraws its notice.
     fn sweep_approval_waits(
         &self,
         store: &OwnerPushStore,
@@ -926,17 +926,17 @@ impl AppState {
             .into_iter()
             .filter(|session| live_activity_state(self, session) == Some("waiting_permission"))
             .collect();
-        let due: Vec<(SessionRecord, OffsetDateTime)> = {
-            let mut waits = self.approval_waits.lock().expect("approval waits");
-            waits.retain(|id, _| waiting.iter().any(|session| &session.id == id));
-            waiting
-                .into_iter()
-                .filter_map(|session| {
-                    let since = *waits.entry(session.id.clone()).or_insert(now);
-                    (now - since >= APPROVAL_NOTICE_DELAY).then_some((session, since))
-                })
-                .collect()
-        };
+        let recorded = store.approval_waits()?;
+        let mut waits = BTreeMap::new();
+        let mut due = Vec::new();
+        for session in waiting {
+            let since = recorded.get(&session.id).copied().unwrap_or(now);
+            waits.insert(session.id.clone(), since);
+            if now - since >= APPROVAL_NOTICE_DELAY {
+                due.push((session, since));
+            }
+        }
+        store.set_approval_waits(&waits)?;
         for (session, since) in due {
             let session_id = session.id.clone();
             let notice = NewNotice::approval_needed(

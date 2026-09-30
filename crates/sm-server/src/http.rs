@@ -518,9 +518,6 @@ pub struct AppState {
     /// Queue admission with the owner's slot limits; `PUT /client/settings`
     /// changes it and the queue runner reads it every pass (sm#1718).
     queue_admission: crate::queue::SharedQueueAdmissionPolicy,
-    /// When each session was first seen blocked on an approval prompt, kept
-    /// by the follow worker's sweep (sm#1743).
-    approval_waits: Arc<Mutex<BTreeMap<String, OffsetDateTime>>>,
 }
 
 impl AppState {
@@ -663,7 +660,6 @@ impl AppState {
             studio_ssh_enabled: Arc::new(AtomicBool::new(studio_ssh_enabled)),
             mobile_terminal_secret,
             push_sender,
-            approval_waits: Arc::new(Mutex::new(BTreeMap::new())),
             queue_admission,
         })
     }
@@ -11947,16 +11943,12 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
     if session.provider.trim() == "claude" {
         // Hook state is posted to the primary from every node, so it is answered
         // before the node check — only the pane is node-local.
-        if claude_hook_gate(session) == ClaudeHookGate::TurnRunning {
-            // Hooks bracket the turn, so a fresh "turn in flight" signal is
-            // authoritative. Skip the pane capture entirely and state the answer
-            // outright — the default projection would otherwise call this idle
-            // once `last_activity` is 30s old, which is exactly what happens
-            // during a long tool-free response.
-            return Some("working");
-        }
         if !is_primary_node(&session.node) {
-            return None;
+            // Hooks bracket the turn, so a fresh "turn in flight" signal is
+            // authoritative; the default projection would otherwise call this
+            // idle once `last_activity` is 30s old, which is exactly what
+            // happens during a long tool-free response.
+            return (claude_hook_gate(session) == ClaudeHookGate::TurnRunning).then_some("working");
         }
         let runtime = TmuxRuntime::from_app_config(&state.config)
             .for_socket_name(session.tmux_socket_name.as_deref());
@@ -12010,6 +12002,12 @@ fn claude_live_activity_state(
     pane_text: Option<&str>,
 ) -> Option<&'static str> {
     let gate = claude_hook_gate(session);
+    // An open Allow prompt outranks even a fresh turn-running hook: the turn
+    // is in flight but blocked on the owner (sm#1743). Only the owning node
+    // has the pane.
+    if is_primary_node(&session.node) && pane_text.is_some_and(claude_pane_awaits_approval) {
+        return Some("waiting_permission");
+    }
     // Hooks reach the primary from every node, and the hook signal outranks both
     // the pane and the default projection's 30s `last_activity` heuristic. Answer
     // it before the node check so remote sessions are not stranded on the default
@@ -12032,9 +12030,6 @@ fn claude_live_activity_state(
         // Last resort: the hook signal is missing or stale, so re-derive the
         // state from the pane.
         ClaudeHookGate::Untracked | ClaudeHookGate::Stale => {
-            if pane_text.is_some_and(claude_pane_awaits_approval) {
-                return Some("waiting_permission");
-            }
             claude_live_activity_from_pane(pane_text)
         }
     }
@@ -17371,6 +17366,14 @@ mod tests {
         assert_eq!(claude_hook_gate(&session), ClaudeHookGate::Stale);
         assert_eq!(
             claude_live_activity_state(&session, Some(CLAUDE_APPROVAL_PROMPT_PANE)),
+            Some("waiting_permission")
+        );
+        // A prompt raised seconds into a turn must not hide behind the fresh
+        // turn-running hook.
+        let fresh = claude_session_with_hook_state("running", Some(&now_rfc3339()));
+        assert_eq!(claude_hook_gate(&fresh), ClaudeHookGate::TurnRunning);
+        assert_eq!(
+            claude_live_activity_state(&fresh, Some(CLAUDE_APPROVAL_PROMPT_PANE)),
             Some("waiting_permission")
         );
         let untracked = claude_session_with_hook_state("running", None);

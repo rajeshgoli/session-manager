@@ -60,6 +60,7 @@ struct Fixture {
     app: axum::Router,
     state: AppState,
     dir: PathBuf,
+    config: AppConfig,
 }
 
 fn create_queue_db(state_dir: &Path) {
@@ -140,12 +141,13 @@ fn fixture(sender: Option<Arc<RecordingSender>>) -> Fixture {
     config.push.db_path = dir.join("owner_push.db").display().to_string();
     config.rust_core.fixture_writes_enabled = true;
     config.rust_core.log_dir = Some(dir.join("logs").display().to_string());
-    let state =
-        AppState::new(config).with_push_sender(sender.map(|sender| sender as Arc<dyn PushSender>));
+    let state = AppState::new(config.clone())
+        .with_push_sender(sender.map(|sender| sender as Arc<dyn PushSender>));
     Fixture {
         app: router(state.clone()),
         state,
         dir,
+        config,
     }
 }
 
@@ -607,8 +609,11 @@ async fn approval_wait_pushes_the_owner_and_withdraws_when_answered() {
     );
     fs::write(&event_stream, waiting).unwrap();
 
+    // Each pass runs on a fresh server over the same state, as after a
+    // restart: the wait must keep its identity, not be withdrawn and re-sent.
     let pass = |at: time::OffsetDateTime| {
-        let state = f.state.clone();
+        let state = AppState::new(f.config.clone())
+            .with_push_sender(Some(sender.clone() as Arc<dyn PushSender>));
         async move {
             tokio::task::spawn_blocking(move || state.run_follow_pass_at(true, at))
                 .await
