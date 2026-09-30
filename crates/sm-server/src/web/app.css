@@ -240,7 +240,7 @@ select.inp { padding: 3px 6px; }
   .rail .item.minor { display: none; }
   .bar { padding: 6px 12px; gap: 8px; }
   .bar .meters, .search kbd { display: none; }
-  .search { min-width: 0; }
+  .bar > .search { min-width: 0; }
   .content { padding: 10px 12px 20px; }
   .panel, .app.wide .panel { position: fixed; inset: 0; width: auto; z-index: 25; border-left: 0; }
   .panel .grip { display: none; }
