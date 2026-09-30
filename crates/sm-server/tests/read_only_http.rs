@@ -11967,6 +11967,10 @@ async fn session_tool_calls_reads_activity_spans_for_all_providers() {
             paths: PathsConfig {
                 state_file: state_file.display().to_string(),
             },
+            usage: sm_server::config::UsageConfig {
+                enabled: true,
+                ..Default::default()
+            },
             activity: sm_server::config::ActivityConfig {
                 db_path: activity_db.display().to_string(),
             },
@@ -12006,6 +12010,10 @@ async fn session_tool_calls_handles_empty_activity_database() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+        },
+        usage: sm_server::config::UsageConfig {
+            enabled: true,
+            ..Default::default()
         },
         activity: sm_server::config::ActivityConfig {
             db_path: activity_db.display().to_string(),
@@ -12499,6 +12507,10 @@ async fn session_tool_calls_handles_missing_db_and_invalid_limit() {
     let app = router(AppState::new(AppConfig {
         paths: PathsConfig {
             state_file: state_file.display().to_string(),
+        },
+        usage: sm_server::config::UsageConfig {
+            enabled: true,
+            ..Default::default()
         },
         activity: sm_server::config::ActivityConfig {
             db_path: state_file
@@ -25141,4 +25153,203 @@ async fn owner_doc_publish_moves_closed_doc_and_preserves_history_but_not_open_d
         let (_, again) = post_json(app.clone(), "/docs", payload).await;
         assert_eq!(again["id"], new_id);
     }
+}
+
+#[tokio::test]
+async fn session_tool_calls_usage_disabled_reads_pre_tool_use_rows() {
+    let state_file = write_session_fixture();
+    let tool_db = unique_temp_path();
+    create_tool_usage_fixture_db(&tool_db);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        tool_logging: ToolLoggingConfig {
+            db_path: tool_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/run12345/tool-calls?limit=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "run12345");
+    assert_eq!(
+        payload["tool_calls"],
+        json!([
+            {
+                "timestamp": "2026-06-01 00:02:00",
+                "tool_name": "Bash",
+                "hook_type": "PreToolUse"
+            },
+            {
+                "timestamp": "2026-06-01 00:01:00",
+                "tool_name": "Read",
+                "hook_type": "PreToolUse"
+            }
+        ])
+    );
+
+    let (status, payload) = get_json(app, "/sessions/Runner/tool-calls?limit=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "run12345");
+    assert_eq!(payload["tool_calls"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn session_tool_calls_usage_disabled_projects_codex_fork_observability_rows() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "forktools",
+                    "name": "codex-fork-forktools",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-fork-forktools",
+                    "tmux_socket_name": null,
+                    "node": "primary",
+                    "provider": "codex-fork",
+                    "log_file": "/tmp/forktools.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00",
+                    "friendly_name": "fork-tools"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let observability_db = unique_temp_path();
+    create_codex_observability_fixture_db(&observability_db);
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        codex_observability: CodexObservabilityConfig {
+            db_path: observability_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app.clone(), "/sessions/forktools/tool-calls?limit=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "forktools");
+    assert_eq!(
+        payload["tool_calls"],
+        json!([
+            {
+                "timestamp": "2026-06-01T00:03:00+00:00",
+                "tool_name": "Bash",
+                "hook_type": "CodexForkToolCall"
+            },
+            {
+                "timestamp": "2026-06-01T00:05:00+00:00",
+                "tool_name": "Edit",
+                "hook_type": "CodexForkToolCall"
+            }
+        ])
+    );
+
+    let (status, payload) = get_json(app, "/sessions/fork-tools/tool-calls?limit=2").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["session_id"], "forktools");
+    assert_eq!(payload["tool_calls"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn session_tool_calls_codex_fork_missing_observability_db_returns_empty_rows() {
+    let state_file = unique_temp_path();
+    fs::write(
+        &state_file,
+        json!({
+            "sessions": [
+                {
+                    "id": "forktools",
+                    "name": "codex-fork-forktools",
+                    "working_dir": "/repo",
+                    "tmux_session": "codex-fork-forktools",
+                    "provider": "codex-fork",
+                    "log_file": "/tmp/forktools.log",
+                    "status": "running",
+                    "created_at": "2026-06-01T00:00:00",
+                    "last_activity": "2026-06-01T00:01:00"
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let app = router(AppState::new(AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        codex_observability: CodexObservabilityConfig {
+            db_path: state_file
+                .with_extension("missing-codex-observability.db")
+                .display()
+                .to_string(),
+        },
+        ..AppConfig::default()
+    }));
+
+    let (status, payload) = get_json(app, "/sessions/forktools/tool-calls").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        payload,
+        json!({ "session_id": "forktools", "tool_calls": [] })
+    );
+}
+
+fn create_tool_usage_fixture_db(path: &PathBuf) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE tool_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            session_id TEXT,
+            hook_type TEXT NOT NULL,
+            tool_name TEXT NOT NULL
+        );
+        INSERT INTO tool_usage (timestamp, session_id, hook_type, tool_name)
+        VALUES
+            ('2026-06-01 00:00:00', 'run12345', 'PreToolUse', 'Write'),
+            ('2026-06-01 00:01:00', 'run12345', 'PreToolUse', 'Read'),
+            ('2026-06-01 00:02:00', 'run12345', 'PreToolUse', 'Bash'),
+            ('2026-06-01 00:03:00', 'run12345', 'PostToolUse', 'Bash'),
+            ('2026-06-01 00:04:00', 'oldstate', 'PreToolUse', 'Glob');
+        "#,
+    )
+    .unwrap();
+}
+
+fn create_codex_observability_fixture_db(path: &PathBuf) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch(
+        r#"
+        CREATE TABLE codex_tool_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            raw_payload_json TEXT,
+            created_at TEXT NOT NULL
+        );
+        INSERT INTO codex_tool_events (session_id, raw_payload_json, created_at)
+        VALUES
+            ('forktools', '{"tool_name":"Read"}', '2026-06-01T00:00:00+00:00'),
+            ('forktools', '{"event_type":"no-tool"}', '2026-06-01T00:01:00+00:00'),
+            ('forktools', 'not-json', '2026-06-01T00:02:00+00:00'),
+            ('forktools', '{"tool_name":"Bash"}', '2026-06-01T00:03:00+00:00'),
+            ('otherfork', '{"tool_name":"Ignore"}', '2026-06-01T00:04:00+00:00'),
+            ('forktools', NULL, '2026-06-01T00:04:30+00:00'),
+            ('forktools', '{"tool_name":"Edit"}', '2026-06-01T00:05:00+00:00');
+        "#,
+    )
+    .unwrap();
 }
