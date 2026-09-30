@@ -2346,11 +2346,17 @@ fn run_review_policy(client: &ApiClient, args: ReviewPolicyArgs) -> Result<()> {
                 _ => bail!("scope must be default, repo, lane or ticket"),
             };
             let reviewer = reviewer.map(reviewer_argument).transpose()?;
-            let result = client.put_json(
-                "/review-policies",
-                json!({"scope":scope,"repo":repo,"number":number,
-                "reviewer":reviewer,"session_id":optional_current_session_id()}),
-            )?;
+            let session_id = optional_current_session_id();
+            let body = json!({"scope":scope,"repo":repo,"number":number,
+                "reviewer":reviewer,"session_id":session_id});
+            let result = match session_id {
+                Some(id) => client.put_json_with_session_credential(
+                    "/review-policies",
+                    body,
+                    &current_session_credential(&id)?,
+                )?,
+                None => client.put_json("/review-policies", body)?,
+            };
             if let Some(policy) = result.get("policy") {
                 if policy.is_null() {
                     println!("Cleared {scope} review policy.");
@@ -5200,6 +5206,21 @@ impl ApiClient {
     fn put_json(&self, path: &str, body: Value) -> Result<Value> {
         let response = self.request("PUT", path, Some(body))?;
         response.into_json()
+    }
+
+    fn put_json_with_session_credential(
+        &self,
+        path: &str,
+        body: Value,
+        credential: &str,
+    ) -> Result<Value> {
+        self.request_with_headers(
+            "PUT",
+            path,
+            Some(body),
+            &[("X-SM-Session-Credential", credential)],
+        )?
+        .into_json()
     }
 
     fn patch_json(&self, path: &str, body: Value) -> Result<Value> {

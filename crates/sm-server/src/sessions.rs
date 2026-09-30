@@ -1835,6 +1835,14 @@ impl SessionStore {
         Ok(resolve_hierarchy_root(&sessions, session_id))
     }
 
+    /// Authenticate an agent's current session against its launch credential.
+    pub fn session_credential_matches(&self, session_id: &str, credential: &str) -> Result<bool> {
+        let sessions = self.load_snapshot()?.into_sessions();
+        Ok(session_credential_matches(
+            &sessions, session_id, credential,
+        ))
+    }
+
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
         let session_id = session_id.trim();
         if session_id.is_empty() {

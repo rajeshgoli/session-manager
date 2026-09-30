@@ -160,6 +160,13 @@ pub(super) async fn put_policy(
         }
     }
     if let Some(id) = caller.as_deref() {
+        let credential = reparent_session_credential(&headers)?;
+        if !state
+            .session_store
+            .session_credential_matches(id, &credential)?
+        {
+            return Err(forbidden("Session credential does not match the caller"));
+        }
         if body.scope != "ticket" {
             return Err(forbidden(format!(
                 "Only {} sets default, repo and lane review policies.",
@@ -175,8 +182,7 @@ pub(super) async fn put_policy(
             )));
         }
     } else {
-        let local_owner = is_local_bypass_request(&headers, Some(peer), &state.config);
-        board::owner_guard(&state, &headers, peer, "PUT", &uri, !local_owner)?;
+        board::owner_guard(&state, &headers, peer, "PUT", &uri, true)?;
     }
     if body.scope == "default" {
         let reviewer = body
@@ -221,6 +227,7 @@ mod tests {
         body::Body,
         http::{Method, Request},
     };
+    use sha2::{Digest, Sha256};
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -232,9 +239,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let state_file = dir.join("sessions.json");
+        let author_hash = format!("{:x}", Sha256::digest(b"author-secret"));
+        let planner_hash = format!("{:x}", Sha256::digest(b"planner-secret"));
         std::fs::write(&state_file,serde_json::to_vec(&json!({"sessions":[
-            {"id":"author","name":"author","working_dir":"/repo","tmux_session":"author","provider":"codex-fork","status":"running","created_at":"2026-09-30T00:00:00","last_activity":"2026-09-30T00:00:00"},
-            {"id":"planner","name":"planner","working_dir":"/repo","tmux_session":"planner","provider":"codex-fork","status":"running","created_at":"2026-09-30T00:00:00","last_activity":"2026-09-30T00:00:00"}
+            {"id":"author","name":"author","working_dir":"/repo","tmux_session":"author","provider":"codex-fork","status":"running","created_at":"2026-09-30T00:00:00","last_activity":"2026-09-30T00:00:00","session_credential_sha256":author_hash},
+            {"id":"planner","name":"planner","working_dir":"/repo","tmux_session":"planner","provider":"codex-fork","status":"running","created_at":"2026-09-30T00:00:00","last_activity":"2026-09-30T00:00:00","session_credential_sha256":planner_hash}
         ]})).unwrap()).unwrap();
         let db = dir.join("queue.db");
         policy::ensure_schema(&db).unwrap();
@@ -252,7 +261,7 @@ mod tests {
         config.sm_send.db_path = db.display().to_string();
         config.rust_core.fixture_writes_enabled = true;
         let app = router(AppState::new(config));
-        let send = |session: Option<&str>, scope: &str, number: i64| {
+        let send = |session: Option<&str>, credential: Option<&str>, scope: &str, number: i64| {
             let mut builder = Request::builder()
                 .method(Method::PUT)
                 .uri("/review-policies")
@@ -260,6 +269,9 @@ mod tests {
                 .header("content-type", "application/json");
             if let Some(session) = session {
                 builder = builder.header("x-sm-session", session);
+            }
+            if let Some(credential) = credential {
+                builder = builder.header("x-sm-session-credential", credential);
             }
             let body = json!({"scope":scope,"repo":"example/repo","number":number,
                 "reviewer":{"kind":"github_codex"},"session_id":session});
@@ -271,7 +283,7 @@ mod tests {
         };
         assert_eq!(
             app.clone()
-                .oneshot(send(Some("author"), "ticket", 7))
+                .oneshot(send(Some("author"), Some("author-secret"), "ticket", 7))
                 .await
                 .unwrap()
                 .status(),
@@ -279,7 +291,7 @@ mod tests {
         );
         assert_eq!(
             app.clone()
-                .oneshot(send(Some("author"), "ticket", 8))
+                .oneshot(send(Some("author"), Some("author-secret"), "ticket", 8))
                 .await
                 .unwrap()
                 .status(),
@@ -287,7 +299,7 @@ mod tests {
         );
         assert_eq!(
             app.clone()
-                .oneshot(send(Some("planner"), "repo", 0))
+                .oneshot(send(Some("planner"), Some("planner-secret"), "repo", 0))
                 .await
                 .unwrap()
                 .status(),
@@ -295,15 +307,26 @@ mod tests {
         );
         assert_eq!(
             app.clone()
-                .oneshot(send(Some("planner"), "ticket", 8))
+                .oneshot(send(Some("planner"), Some("planner-secret"), "ticket", 8))
                 .await
                 .unwrap()
                 .status(),
             StatusCode::OK
         );
         assert_eq!(
-            app.oneshot(send(None, "repo", 0)).await.unwrap().status(),
-            StatusCode::OK
+            app.clone()
+                .oneshot(send(Some("planner"), Some("author-secret"), "ticket", 8))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.oneshot(send(None, None, "repo", 0))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
         );
         let _ = std::fs::remove_dir_all(dir);
     }
