@@ -24,3 +24,21 @@ test('missing chart samples create gaps; absent queue values are not zero', () =
   assert.equal((path.match(/M/g) || []).length, 2);
   assert.equal(chartPath([{ cpu: 50 }], 'queue_cpu_avg', 100), '');
 });
+
+test('Ask agent targets the notification recipient and uses a polling side question', async () => {
+  const { askJobQuestion, jobAgentLabel, jobQuestionPrompt } = await import('../crates/sm-server/src/web/queue-model.js');
+  const job = { id: 'job-test', label: 'Download', type: 'tests', state: 'running', started_at: '2026-09-29T12:00:00Z', notify_session_id: 'responsible', notify_name: 'Responsible agent', requester_session_id: 'submitter', requester_name: 'Submitting agent' };
+  assert.equal(jobAgentLabel(job), 'Responsible agent');
+  assert.match(jobQuestionPrompt('Rajesh', job, 'How long?', Date.parse('2026-09-29T12:10:00Z')), /running for 10m/);
+  const calls = [];
+  const request = await askJobQuestion(async (...args) => { calls.push(args); return { request_id: 'answer-1', status: 'pending' }; }, 'Rajesh', job, 'How long?');
+  assert.equal(request.request_id, 'answer-1');
+  assert.equal(calls[0][0], '/sessions/responsible/what');
+  assert.equal(calls[0][1].body.delivery_mode, 'poll');
+  assert.match(calls[0][1].body.prompt, /ID job-test.*How long\?/);
+  const busyCalls = [];
+  await assert.rejects(askJobQuestion(async (...args) => {
+    busyCalls.push(args); throw Object.assign(new Error('already answering request somebody-else'), { status: 409 });
+  }, 'Rajesh', job, 'How long?'), /Responsible agent is answering another question/);
+  assert.equal(busyCalls.length, 1, 'must not attach to or poll the conflicting question');
+});

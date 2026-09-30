@@ -1,6 +1,7 @@
 import { useState } from 'preact/hooks';
 import { html, api, usePoll, navigate, openPanel, Seg, duration, clock } from './ui.js';
 import { HeldBack } from './queue.js';
+import { jobAgentLabel } from './queue-model.js';
 
 const percent = (n) => `${(n || 0).toFixed(1)}%`;
 const number = (n) => (n || 0).toLocaleString();
@@ -18,7 +19,7 @@ function QueueAnalytics() {
   return html`<div><${Seg} label="Held back range" value=${hours} onChange=${setHours} options=${[{ value: 24, label: '24h' }, { value: 168, label: '7d' }, { value: 720, label: '30d' }]} /></div>
     ${error ? html`<p class="err">${error.message}</p>` : null}<${HeldBack} stats=${stats} />
     <section class="q-card"><h2>Stopped in the last 24 hours</h2>${queueError ? html`<p class="err">${queueError.message}</p>` : null}
-      ${(queue?.ended || []).map((job) => html`<button class="a-row" onClick=${() => openPanel(`job:${job.id}`)}><span>${job.label || job.id}<small>${job.ended_summary || job.state} · ${job.requester_name || job.notify_name || ''}</small></span><span>${clock(job.finished_at)} ›</span></button>`)}
+      ${(queue?.ended || []).map((job) => html`<button class="a-row" onClick=${() => openPanel(`job:${job.id}`)}><span>${job.label || job.id}<small>${job.ended_summary || job.state} · ${jobAgentLabel(job)}</small></span><span>${clock(job.finished_at)} ›</span></button>`)}
       ${queue && !queue.ended.length ? html`<p class="muted">No stopped jobs in the last 24 hours.</p>` : null}
     </section>`;
 }

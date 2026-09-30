@@ -41,3 +41,27 @@ export function chartPath(buckets, key, max, height = 120) {
   });
   return path;
 }
+
+export const jobAgentId = (job) => job.notify_session_id || job.requester_session_id || null;
+export const jobAgentLabel = (job) => job.notify_name || (job.notify_session_id ? job.notify_session_id.slice(0, 8) : job.requester_name || job.requester_session_id?.slice(0, 8) || 'no agent');
+
+export function jobQuestionPrompt(owner, job, question, now = Date.now()) {
+  const at = Date.parse(job.state === 'running' ? job.started_at : job.queued_at);
+  const minutes = Math.max(0, Math.floor((now - at) / 60000));
+  const duration = minutes < 60 ? `${minutes}m` : `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  const timing = ['running', 'pending'].includes(job.state) && Number.isFinite(at)
+    ? `${job.state === 'running' ? 'running for' : 'waiting'} ${duration}` : job.state;
+  return `${owner} is asking from sm web about your queue job ${job.label || job.id} (ID ${job.id}, type ${job.type}, ${timing}): ${question.trim()}`;
+}
+
+/** A conflict belongs to somebody else's question; never attach to it. */
+export async function askJobQuestion(api, owner, job, question) {
+  try {
+    return await api(`/sessions/${encodeURIComponent(jobAgentId(job))}/what`, {
+      method: 'POST', body: { delivery_mode: 'poll', prompt: jobQuestionPrompt(owner, job, question) },
+    });
+  } catch (error) {
+    if (error.status === 409) throw new Error(`${jobAgentLabel(job)} is answering another question — try again in a minute`);
+    throw error;
+  }
+}

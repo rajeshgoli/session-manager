@@ -16084,6 +16084,7 @@ fn queue_job_response_with_names(
     } else {
         "pending"
     };
+    let ended = crate::queue::queue_job_ended_reason(&job);
     let mut response = json!({
         "id": job.id,
         "type": job.job_type,
@@ -16118,6 +16119,8 @@ fn queue_job_response_with_names(
         "process_group_id": job.process_group_id,
         "exit_code": job.exit_code,
         "exit_evidence": exit_evidence,
+        "ended_reason": ended.as_ref().map(|(reason, _)| reason),
+        "ended_summary": ended.as_ref().map(|(_, summary)| summary),
         "termination_reason": termination_reason,
         "memory_guard": job.termination_detail.as_ref().filter(|_| job.state == "memory_exceeded"),
         "process_guard": job.termination_detail.as_ref().filter(|_| job.state == "process_limit_exceeded"),
@@ -22074,6 +22077,22 @@ mod tests {
         assert_eq!(ended.len(), 1, "{ended:?}");
         assert_eq!(ended[0]["id"], displaced.id);
         assert_eq!(ended[0]["ended_reason"], "displaced");
+        let single = app
+            .clone()
+            .oneshot(local_request(
+                Method::GET,
+                &format!("/queue-jobs/{}", displaced.id),
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (single_status, single) = response_json(single).await;
+        assert_eq!(single_status, StatusCode::OK);
+        assert_eq!(single["ended_summary"], ended[0]["ended_summary"]);
+        assert!(single["ended_summary"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()));
+
         assert_eq!(body["slots"]["running"], 1);
         assert_eq!(body["slots"]["by_type"]["tests"]["running"], 1);
         assert!(body["host"].is_object());

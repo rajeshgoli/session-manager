@@ -9,3 +9,4 @@ cargo clippy -p sm-server --all-targets -- -D warnings
 scripts/test-rust-isolated.sh --lib utilization::
 scripts/test-rust-isolated.sh --lib owner_web_guard
 scripts/test-rust-isolated.sh --lib web_shell
+scripts/test-rust-isolated.sh --lib client_queue_lists_running_queued_in_order_and_recent_stops

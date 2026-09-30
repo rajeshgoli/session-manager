@@ -1,6 +1,6 @@
-import { useState } from 'preact/hooks';
-import { html, api, config, usePoll, useNow, setShared, registerPanel, openPanel, navigate, toast, Seg, duration, age, clock, gigabytes } from './ui.js';
-import { timelineSegments, limitsInsight, waitingGroups, chartPath } from './queue-model.js';
+import { useEffect, useState } from 'preact/hooks';
+import { html, api, usePoll, useNow, useShared, setShared, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes } from './ui.js';
+import { timelineSegments, limitsInsight, waitingGroups, chartPath, jobAgentId, jobAgentLabel, askJobQuestion } from './queue-model.js';
 
 const ranges = [{ value: 1, label: '1h' }, { value: 24, label: '24h' }, { value: 168, label: '7d' }, { value: 720, label: '30d' }];
 const pct = (value) => typeof value === 'number' ? `${value.toFixed(1)}%` : '—';
@@ -86,13 +86,16 @@ export function HeldBack({ stats, insightOnly = false }) {
 function JobRow({ job, now }) {
   const deadline = Date.parse(job.wait_deadline_at) - now;
   return html`<button class="q-job" type="button" onClick=${() => openPanel(`job:${job.id}`)}>
-    <span class="q-job-title">${job.position ? `${job.position}. ` : ''}${title(job)}<small>${job.type} · ${job.requester_name || job.notify_name || ''}</small></span>
+    <span class="q-job-title">${job.position ? `${job.position}. ` : ''}${title(job)}<small>${job.type} · ${jobAgentLabel(job)}</small></span>
     <span class="q-timeline">${timelineSegments(job, now).map((s) => html`<i class=${s.kind} style=${`left:${s.left}%;width:${s.width}%`}></i>`)}</span>
     <span class=${job.quiet_since ? 'red' : ''}>${job.state === 'running' ? `${age(job.started_at, now)}${job.timeout_seconds ? ` of ${duration(job.timeout_seconds)}` : " · no time limit"}` : `${age(job.queued_at, now)} waited`}
       ${job.quiet_since ? ` · quiet ${age(job.quiet_since, now)}` : job.low_cpu ? html`<span class="muted"> · low CPU</span>` : ''}
       ${job.state === 'pending' && deadline < 21600000 && Number.isFinite(deadline) ? ` · gives up in ${duration(deadline / 1000)}` : ''}</span>
   </button>`;
 }
+
+const jobQuestions = new Map();
+const QUESTION_DONE = ['completed', 'failed', 'timed_out'];
 
 function JobPanel({ id, controls }) {
   const encoded = encodeURIComponent(id);
@@ -103,7 +106,28 @@ function JobPanel({ id, controls }) {
   const [usage, usageError] = usePoll(() => api(`/client/queue/jobs/${encoded}/usage${before ? `?before_ms=${before}` : ''}`), usageInterval, [id, before, usageInterval]);
   const [follows, , reloadFollows] = usePoll(() => api('/client/follows'), 30000, [id]);
   const [check, setCheck] = useState(null), [cancel, setCancel] = useState(false), [note, setNote] = useState('');
-  const [ask, setAsk] = useState(false), [question, setQuestion] = useState(''), [busy, setBusy] = useState(false), [failure, setFailure] = useState('');
+  const [ask, setAsk] = useState(jobQuestions.has(id)), [question, setQuestion] = useState(''), [busy, setBusy] = useState(false), [failure, setFailure] = useState('');
+  const [request, setRequest] = useState(jobQuestions.get(id) || null);
+  const queue = useShared('queue');
+  const agentId = job && jobAgentId(job);
+  const [agentState] = usePoll(() => agentId ? api(`/watch/state?session=${encodeURIComponent(agentId)}`) : null, 30000, [agentId]);
+  const knownAgent = agentState?.sessions?.find((agent) => agent.id === agentId);
+  const canAsk = knownAgent && knownAgent.state !== 'stopped';
+  const pending = request && !QUESTION_DONE.includes(request.status);
+  useEffect(() => {
+    if (!pending) return;
+    let alive = true;
+    const timer = setTimeout(async () => {
+      try {
+        const updated = await api(`/btw-requests/${encodeURIComponent(request.request_id)}`);
+        jobQuestions.set(id, updated);
+        if (alive) { setRequest(updated); setFailure(''); }
+      } catch (error) {
+        if (alive) { setFailure(error.message); setRequest((current) => ({ ...current })); }
+      }
+    }, 2000);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [request, pending]);
   const perform = async (fn) => {
     if (busy) return;
     setBusy(true); setFailure('');
@@ -112,23 +136,27 @@ function JobPanel({ id, controls }) {
   if (!job) return html`<div class="phd"><span class="t">Job</span>${controls}<span class="s">${error?.message || 'Loading…'}</span></div>`;
   const active = ['running', 'pending'].includes(job.state);
   const following = follows?.follows?.some((f) => f.job_id === job.id && f.state !== 'done');
-  const agent = job.requester_session_id || job.notify_session_id;
   const send = () => perform(async () => {
-    await api(`/inbox/agent/${encodeURIComponent(agent)}/send`, { method: 'POST', headers: config.inbox_token ? { 'x-sm-doc-token': config.inbox_token } : {}, body: { submission_id: crypto.randomUUID(), body: `About queue job ${title(job)} (ID ${job.id}, ${job.type}, ${job.state}): ${question.trim()}` } });
-    setQuestion(''); setAsk(false); toast('Sent to the agent');
+    const created = await askJobQuestion(api, queue?.owner_name || 'The owner', job, question);
+    jobQuestions.set(id, created);
+    setRequest(created);
   });
   const sampleMax = Math.max(100, ...(usage?.samples || []).map((s) => s.cpu_percent || 0), ...(usage?.samples || []).map((s) => s.gpu_percent || 0));
-  return html`<div class="phd"><span class=${job.quiet_since ? 'red' : 'sub'}>${job.state}${job.quiet_since ? ' · quiet' : ''}</span><span class="t">${title(job)}</span>${controls}<span class="s">${job.type} · ${job.requester_name || job.notify_name || ''}</span></div>
+  return html`<div class="phd"><span class=${job.quiet_since ? 'red' : 'sub'}>${job.state}${job.quiet_since ? ' · quiet' : ''}</span><span class="t">${title(job)}</span>${controls}<span class="s">${job.type} · ${jobAgentLabel(job)}</span></div>
     <div class="q-panel-body">${errorText(error)}${failure ? html`<p class="err" role="alert">${failure}</p>` : null}
       <div class="q-actions">
         ${job.state === 'pending' ? html`<button class="btn" disabled=${busy} onClick=${() => perform(async () => setCheck(await api(`/client/queue/jobs/${encoded}/start-check`)))}>Start now</button>` : null}
         ${active ? html`<button class="btn" disabled=${busy} onClick=${() => setCancel(!cancel)}>Cancel</button><button class="btn" disabled=${busy || !follows} aria-pressed=${!!following} onClick=${() => perform(() => api(`/queue-jobs/${encoded}/follow`, { method: following ? 'DELETE' : 'POST', body: {} }))}>${following ? 'Following' : 'Follow'}</button>` : null}
-        ${agent ? html`<button class="btn" onClick=${() => setAsk(!ask)}>Ask agent</button>` : null}
+        ${canAsk || request ? html`<button class="btn" onClick=${() => setAsk(!ask)}>Ask agent</button>` : null}${knownAgent ? html`<button class="btn" onClick=${() => openPanel(`agent:${agentId}`)}>Open agent</button>` : null}
       </div>
       ${check && job.state === 'pending' ? html`<section class="q-card"><h3>Start this job now?</h3>${check.warnings.map((warning) => html`<p class="amber">${warning}</p>`)}<p>Memory available ${gb(check.memory_available_bytes)} · reserve ${gb(check.memory_reserve_bytes)} · estimate ${gb(check.memory_estimate_bytes)} (${check.memory_estimate_source || 'unknown'})</p><button class="btn" disabled=${busy} onClick=${() => perform(async () => { await api(`/client/queue/jobs/${encoded}/start`, { method: 'POST', body: {} }); setCheck(null); })}>Start anyway</button> <button class="btn" onClick=${() => setCheck(null)}>Keep waiting</button></section>` : null}
       ${cancel && active ? html`<section class="q-card"><label>Cancellation note (optional)<textarea class="inp" maxLength="1000" value=${note} onInput=${(e) => setNote(e.target.value)} /></label><button class="btn" disabled=${busy} onClick=${() => perform(async () => { await api(`/queue-jobs/${encoded}/cancel`, { method: 'POST', body: { note: note.trim() || null } }); setCancel(false); })}>Cancel job</button></section>` : null}
-      ${ask ? html`<section class="q-card"><div class="q-suggestions">${['How long do you expect this to run?', 'What is this job for?', 'Is it safe to cancel this?', 'Is this job stuck?'].map((q) => html`<button class="btn sm" onClick=${() => setQuestion(q)}>${q}</button>`)}</div><textarea aria-label="Question for agent" class="inp" value=${question} onInput=${(e) => setQuestion(e.target.value)} /><button class="btn pri" disabled=${busy || !question.trim()} onClick=${send}>Send</button></section>` : null}
-      <dl class="q-details"><dt>Command</dt><dd><code>${job.argv?.join(' ') || job.script_path || '—'}</code></dd><dt>Folder</dt><dd>${job.cwd}</dd><dt>Queued</dt><dd>${clock(job.queued_at)}</dd><dt>Started</dt><dd>${clock(job.started_at) || '—'}</dd><dt>Finished</dt><dd>${clock(job.finished_at) || '—'}</dd><dt>Limits</dt><dd>${job.timeout_seconds ? duration(job.timeout_seconds) : "No time limit"} · CPU ${pct(job.cpu_percent)} · GPU ${pct(job.gpu_percent)} · memory ${gb(job.memory_bytes)}</dd><dt>Why it waits</dt><dd>${job.holding?.summary || '—'}</dd><dt>What happened</dt><dd>${job.ended_summary || job.termination_reason || job.state}${job.exit_code != null ? ` · exit ${job.exit_code}` : ''}${job.cancel_detail?.note ? ` · ${job.cancel_detail.note}` : ''}</dd></dl>
+      ${ask ? html`<section class="q-card"><div class="q-suggestions">${['How long do you expect this to run?', 'What is this job for?', 'Is it safe to cancel this?', 'Is this job stuck?'].map((q) => html`<button class="btn sm" onClick=${() => setQuestion(q)}>${q}</button>`)}</div><textarea aria-label="Question for agent" class="inp" value=${question} onInput=${(e) => setQuestion(e.target.value)} /><button class="btn pri" disabled=${busy || pending || !canAsk || !question.trim()} onClick=${send}>${pending ? 'Asking…' : 'Send'}</button>
+        ${pending ? html`<p class="sub" role="status">${jobAgentLabel(job)} is answering… (${request.status})</p>` : null}
+        ${request?.status === 'completed' ? html`<div class="summary">${request.result}</div>` : null}
+        ${request && ['failed', 'timed_out'].includes(request.status) ? html`<p class="err">${request.error || 'The question did not finish. Try again.'}</p>` : null}
+      </section>` : null}
+      <dl class="q-details"><dt>Command</dt><dd><code>${job.argv?.join(' ') || job.script_path || '—'}</code></dd><dt>Folder</dt><dd>${job.cwd}</dd><dt>Queued</dt><dd>${clock(job.queued_at)}</dd><dt>Started</dt><dd>${clock(job.started_at) || '—'}</dd><dt>Finished</dt><dd>${clock(job.finished_at) || '—'}</dd><dt>Limits</dt><dd>${job.timeout_seconds ? duration(job.timeout_seconds) : "No time limit"} · CPU ${pct(job.cpu_percent)} · GPU ${pct(job.gpu_percent)} · memory ${gb(job.memory_bytes)}</dd><dt>Why it waits</dt><dd>${job.holding?.detail || job.holding?.summary || '—'}</dd><dt>What happened</dt><dd>${job.ended_summary || job.termination_reason || job.state}${job.exit_code != null ? ` · exit ${job.exit_code}` : ''}${job.cancel_detail?.note ? ` · ${job.cancel_detail.note}` : ''}</dd></dl>
       <h3>CPU and GPU over this run</h3>${errorText(usageError)}<p class="sub">CPU: amber · GPU: cyan · percent of one core / GPU second per second · scale ${sampleMax.toFixed(0)}%</p>
       ${usage?.samples?.length ? html`<svg class="q-job-chart" viewBox="0 0 1000 120" preserveAspectRatio="none" role="img" aria-label="Job CPU and GPU over its run">${['cpu_percent', 'gpu_percent'].map((key, i) => html`<path d=${chartPath(usage.samples, key, sampleMax)} fill="none" stroke=${i ? 'var(--cyan)' : 'var(--amber)'} stroke-width="2" vector-effect="non-scaling-stroke" />`)}</svg><div class="q-heading sub"><span>${clock(usage.samples[0].at)}</span><span>${clock(usage.samples.at(-1).at)}</span></div>` : html`<p class="muted">No usage samples recorded.</p>`}
       <div class="q-actions">${usage?.next_before_ms ? html`<button class="btn sm" onClick=${() => setBefore(usage.next_before_ms)}>Earlier samples</button>` : null}${before ? html`<button class="btn sm" onClick=${() => setBefore(null)}>Latest samples</button>` : null}</div>
