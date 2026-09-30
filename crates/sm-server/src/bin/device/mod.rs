@@ -13,15 +13,27 @@ pub(super) struct DeviceArgs {
 enum DeviceCommand {
     /// Install a non-exportable Mac certificate for browser sign-in.
     Enroll { name: String },
+    /// Repair Chrome signing permissions on an existing Mac device key.
+    RepairKeyAccess { name: String },
 }
 
 pub(super) fn run(args: DeviceArgs, api_url: Option<String>) -> Result<()> {
-    let DeviceCommand::Enroll { name } = args.command;
+    let repair = matches!(&args.command, DeviceCommand::RepairKeyAccess { .. });
+    let name = match args.command {
+        DeviceCommand::Enroll { name } | DeviceCommand::RepairKeyAccess { name } => name,
+    };
     if !cfg!(target_os = "macos") {
-        bail!("sm device enroll requires macOS");
+        bail!("sm device requires macOS");
     }
     if !mobile_devices::valid_computer_name(&name) {
         bail!("Device name must match [a-z0-9-]{{1,32}}");
+    }
+    if repair {
+        eprintln!("macOS may ask you to authorize updating this device key's signing permissions.");
+        return with_keychain_helper(|helper| {
+            print!("{}", helper_call(helper, "repair", &name, None)?);
+            Ok(())
+        });
     }
     let url = resolve_api_url(api_url)?;
     let client = ApiClient::parse(&url)?.with_timeout(Duration::from_secs(90));
@@ -35,16 +47,8 @@ pub(super) fn run(args: DeviceArgs, api_url: Option<String>) -> Result<()> {
     } else {
         Some(owner_assertion(&url)?)
     };
-    let temp = env::temp_dir().join(format!(
-        "sm-device-{}-{}",
-        process::id(),
-        OffsetDateTime::now_utc().unix_timestamp_nanos()
-    ));
-    fs::create_dir(&temp)?;
-    let result = (|| -> Result<()> {
-        let helper = temp.join("device.swift");
-        fs::write(&helper, include_str!("device_keychain.swift"))?;
-        let csr = helper_call(&helper, "prepare", &name, None)?;
+    with_keychain_helper(|helper| {
+        let csr = helper_call(helper, "prepare", &name, None)?;
         let origin = format!("{}://{}", client.scheme, client.authority);
         let cookie = assertion
             .as_ref()
@@ -68,7 +72,7 @@ pub(super) fn run(args: DeviceArgs, api_url: Option<String>) -> Result<()> {
             .as_str()
             .context("Server returned no certificate")?;
         let browser_origin = enrollment_browser_origin(&client, &response)?;
-        helper_call(&helper, "import", &name, Some(chain))?;
+        helper_call(helper, "import", &name, Some(chain))?;
         // defaults parses -array-add values as property-list literals. Quote
         // the JSON as a string; bare JSON braces are parsed as a dictionary.
         let selection = serde_json::to_string(
@@ -89,9 +93,63 @@ pub(super) fn run(args: DeviceArgs, api_url: Option<String>) -> Result<()> {
         }
         println!("Enrolled {name}. The private key stays in your login keychain.");
         println!(
-            "Open {browser_origin} in Chrome. If Chrome asks for a certificate, choose {name}."
+            "Quit Chrome completely and reopen it, then open {browser_origin}. If Chrome asks for a certificate, choose {name}."
         );
         Ok(())
+    })
+}
+
+fn with_keychain_helper(run: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    let temp = env::temp_dir().join(format!(
+        "sm-device-{}-{}",
+        process::id(),
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    ));
+    let mut directory = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directory.mode(0o700);
+    }
+    directory.create(&temp)?;
+    let result = (|| -> Result<()> {
+        let source = temp.join("device.swift");
+        let helper = temp.join("sm-device-keychain-helper");
+        fs::write(&source, include_str!("device_keychain.swift"))?;
+        // Keychain trusts the calling executable, not an interpreted script.
+        // Give this restricted helper its own signed identity on every run.
+        let output = ProcessCommand::new("/usr/bin/swiftc")
+            .args(["-O", "-module-name", "SMDeviceKeychain", "-o"])
+            .arg(&helper)
+            .arg(&source)
+            .output()
+            .context("Compile macOS Keychain helper (requires Apple command line tools)")?;
+        if !output.status.success() {
+            bail!(
+                "Compile Keychain helper: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let output = ProcessCommand::new("/usr/bin/codesign")
+            .args([
+                "--force",
+                "--sign",
+                "-",
+                "--options",
+                "runtime",
+                "--identifier",
+                "li.rajeshgo.sm.device-keychain-helper",
+            ])
+            .arg(&helper)
+            .output()
+            .context("Sign macOS Keychain helper")?;
+        if !output.status.success() {
+            bail!(
+                "Sign Keychain helper: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        run(&helper)
     })();
     let _ = fs::remove_dir_all(temp);
     result
@@ -125,9 +183,19 @@ fn enrollment_browser_origin(client: &ApiClient, response: &Value) -> Result<Str
 }
 
 fn helper_call(helper: &Path, operation: &str, name: &str, input: Option<&str>) -> Result<String> {
-    let mut child = ProcessCommand::new("/usr/bin/swift")
-        .arg(helper)
+    helper_call_in_keychain(helper, operation, name, input, None)
+}
+
+fn helper_call_in_keychain(
+    helper: &Path,
+    operation: &str,
+    name: &str,
+    input: Option<&str>,
+    keychain: Option<&Path>,
+) -> Result<String> {
+    let mut child = ProcessCommand::new(helper)
         .args([operation, name])
+        .args(keychain)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -186,6 +254,73 @@ fn owner_assertion(url: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Use the production compiler/launcher path, not a separately compiled
+    // fixture: interpreter execution previously escaped the macOS shell tests.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_helper_blocks_unrelated_swift_signing() {
+        struct DisposableKeychain(PathBuf);
+        impl Drop for DisposableKeychain {
+            fn drop(&mut self) {
+                let _ = ProcessCommand::new("/usr/bin/security")
+                    .arg("delete-keychain")
+                    .arg(&self.0)
+                    .output();
+            }
+        }
+        with_keychain_helper(|helper| {
+            let keychain = DisposableKeychain(helper.parent().unwrap().join("test.keychain-db"));
+            for command in ["create-keychain", "unlock-keychain"] {
+                let output = ProcessCommand::new("/usr/bin/security")
+                    .args([command, "-p", "sm-test-only"])
+                    .arg(&keychain.0)
+                    .output()?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "test Keychain setup failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let csr =
+                helper_call_in_keychain(helper, "prepare", "qa-device", None, Some(&keychain.0))?;
+            anyhow::ensure!(
+                csr.contains("BEGIN CERTIFICATE REQUEST"),
+                "helper did not sign a CSR"
+            );
+            for (filename, source, check_identity) in [
+                (
+                    "check-access.swift",
+                    include_str!("../../../../../scripts/check-device-key-access.swift"),
+                    true,
+                ),
+                (
+                    "unrelated.swift",
+                    include_str!("../../../../../scripts/check-device-interpreter-denial.swift"),
+                    false,
+                ),
+            ] {
+                let script = helper.parent().unwrap().join(filename);
+                fs::write(&script, source)?;
+                let mut command = ProcessCommand::new("/usr/bin/swift");
+                command.arg(&script).arg(&keychain.0);
+                if check_identity {
+                    command.arg(helper);
+                }
+                let output = command.output()?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Keychain boundary check failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            // The narrow helper remains usable after the unrelated caller fails.
+            helper_call_in_keychain(helper, "prepare", "qa-device", None, Some(&keychain.0))?;
+            helper_call_in_keychain(helper, "repair", "qa-device", None, Some(&keychain.0))?;
+            Ok(())
+        })
+        .unwrap();
+    }
 
     #[test]
     fn chrome_selection_uses_selected_remote_origin_without_api_path() {
