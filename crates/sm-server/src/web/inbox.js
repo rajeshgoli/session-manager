@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { html, api, config, bus, usePoll, openPanel, closePanel, registerPanel, Seg, toast } from './ui.js';
 import { Reader } from './reader.js';
 export function safeThreadHtml(source) {
@@ -77,6 +77,14 @@ export function Thread({ id, controls }) {
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState('');
   const attempt = useRef(null);
+  const items = useRef(null);
+  const scrollOnLoad = useRef(true);
+  useLayoutEffect(() => {
+    if (data && scrollOnLoad.current && items.current) {
+      items.current.scrollTop = items.current.scrollHeight;
+      scrollOnLoad.current = false;
+    }
+  }, [data]);
   const quote = e => {
     const link = e.target.closest('a');
     if (link) {
@@ -102,6 +110,7 @@ export function Thread({ id, controls }) {
     setBusy(true); setFailure('');
     try {
       await write(`/inbox/agent/${encodeURIComponent(id)}/send`, {...payload, submission_id: attempt.current.id});
+      scrollOnLoad.current = true;
       attempt.current = null; setBody(''); setQuotes([]); reload();
     } catch (e) { setFailure(e.message); }
     finally { setBusy(false); }
@@ -109,7 +118,7 @@ export function Thread({ id, controls }) {
   return html`<section class="thread-reader">
     <div class="reader-bar"><strong class="reader-title">${data?.title || 'Thread'}</strong><span>${data?.status}</span>${controls}</div>
     ${error ? html`<p role="alert">${error.message}</p>` : null}
-    <div class="thread-items" onClick=${quote}>${data?.items.map((item,i) => html`<div key=${i} dangerouslySetInnerHTML=${{__html:safeThreadHtml(item.html)}} />`)}${!data ? 'Loading…' : null}</div>
+    <div class="thread-items" ref=${items} onClick=${quote}>${data?.items.map((item,i) => html`<div key=${i} dangerouslySetInnerHTML=${{__html:safeThreadHtml(item.html)}} />`)}${!data ? 'Loading…' : null}</div>
     <div class="thread-compose">
       ${quotes.map((q,i) => html`<blockquote>${q.quote}<button class="icon-btn" disabled=${busy} title="Remove quote" onClick=${() => setQuotes(quotes.filter((_,n) => n !== i))}>×</button></blockquote>`)}
       ${data?.can_send ? html`<textarea aria-label="Reply" placeholder=${`Write to ${data.reply_to}… Click a paragraph to quote it.`} value=${body} disabled=${busy} onInput=${e => setBody(e.target.value)} />

@@ -16,10 +16,19 @@ export function HistoryPage({ path }) {
   </div>`;
 }
 function HistoryList({ agents }) {
-  const [query, setQuery] = useState('');
-  const [before, setBefore] = useState('');
+  const [filters] = useState(() => new URLSearchParams(location.search));
+  const [query, setQuery] = useState(() => filters.get(agents ? 'q' : 'repo') || '');
+  const [before, setBefore] = useState(() => filters.get('before') || '');
   const [busy, setBusy] = useState(null);
-  const [data, error, reload] = usePoll(() => api(`${agents ? '/history/agents' : '/history'}?format=json&${agents ? 'q' : 'repo'}=${encodeURIComponent(query)}&before=${encodeURIComponent(before)}`), 30000, [query,before]);
+  const [data, error, reload] = usePoll(() => {
+    const params = new URLSearchParams({format:'json', [agents ? 'q' : 'repo']:query, before});
+    for (const key of agents ? ['limit'] : ['agent','open','limit']) {
+      const value = filters.get(key);
+      // `open` also carries legacy shell panel links, which are not filters.
+      if (value !== null && (key !== 'open' || !value.includes(':'))) params.set(key, value);
+    }
+    return api(`${agents ? '/history/agents' : '/history'}?${params}`);
+  }, 30000, [query,before]);
   const restore = async agent => {
     if (busy) return;
     setBusy(agent.id);
