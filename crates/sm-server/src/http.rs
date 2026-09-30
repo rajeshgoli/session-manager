@@ -335,6 +335,7 @@ mod merge_holds;
 mod messages;
 mod settings;
 mod watch;
+mod web;
 mod worktrees;
 pub use docs::{
     DocFetchError, DocPullRequest, DocReviewOnGitHub, OwnerDocSource, SubmittedDocReview,
@@ -1635,6 +1636,12 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(watch::get_watch_page))
         .route("/watch", get(watch::get_watch_page))
         .route("/watch/state", get(watch::get_watch_state))
+        .route("/queue", get(web::get_shell_only_page))
+        .route("/analytics", get(web::get_shell_only_page))
+        .route("/analytics/{view}", get(web::get_shell_only_page))
+        .route("/settings", get(web::get_shell_only_page))
+        .route("/terminal/{session_id}", get(web::get_shell_only_page))
+        .route("/assets/{*name}", get(web::get_asset))
         .route("/docs/{doc_id}", get(docs::get_owner_doc))
         // `/docs/{id}/view|raw|retract` (internal API) and the readable
         // reader `/docs/<repo-name>/<path in repo>` share one pattern.
@@ -14326,6 +14333,12 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/"
         || path == "/watch"
         || path == "/watch/state"
+        || path == "/queue"
+        || path == "/analytics"
+        || path.starts_with("/analytics/")
+        || path == "/settings"
+        || path.starts_with("/terminal/")
+        || path.starts_with("/assets/")
         || path == "/docs"
         || path.starts_with("/docs/")
         || path.starts_with("/messages/")
@@ -19372,15 +19385,17 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["schema_version"], 1);
         assert!(body["sessions"].is_array(), "{body}");
-        for uri in ["/", "/watch"] {
+        for (uri, expected) in [
+            ("/", StatusCode::OK),
+            ("/watch", StatusCode::MOVED_PERMANENTLY),
+        ] {
             let mut request =
                 public_request_with_host(Method::GET, uri, Body::empty(), "sm.example.com");
             request
                 .headers_mut()
                 .insert("cf-access-jwt-assertion", owner.parse().unwrap());
             let response = app.clone().oneshot(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{uri}");
-            assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
+            assert_eq!(response.status(), expected, "{uri}");
         }
 
         let expired =
@@ -19395,6 +19410,143 @@ mod tests {
                 assert_eq!(status, StatusCode::UNAUTHORIZED, "{uri}");
             }
         }
+    }
+
+    fn owner_session_cookie() -> String {
+        test_session_cookie(
+            "session-cookie-secret",
+            json!({
+                "google_authenticated": true,
+                "google_email": "rajeshgoli@gmail.com",
+                "google_name": "Rajesh"
+            }),
+        )
+    }
+
+    async fn body_text(response: Response) -> String {
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Spec 1710 D1: the browser hostname, or a loopback request with no
+    /// Access headers, gets the web app's shell at every shell path; every
+    /// other hostname keeps today's page, and JSON is unchanged.
+    #[tokio::test]
+    async fn web_shell_serves_the_browser_hostname_and_leaves_the_app_hostname_alone() {
+        let app = owner_doc_browser_access_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let browser = |uri: &str| {
+            let mut request =
+                public_request_with_host(Method::GET, uri, Body::empty(), "sm.example.com");
+            request
+                .headers_mut()
+                .insert("cf-access-jwt-assertion", owner.parse().unwrap());
+            request
+        };
+        let build = web::build_id();
+        for uri in [
+            "/",
+            "/?open=agent:abc12345",
+            "/queue",
+            "/analytics",
+            "/analytics/spend",
+            "/settings",
+            "/terminal/abc12345",
+        ] {
+            let response = app.clone().oneshot(browser(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
+            let html = body_text(response).await;
+            assert!(html.contains(r#"id="sm-config""#), "{uri}");
+            assert!(html.contains(&format!("/assets/app.js?v={build}")), "{uri}");
+            assert!(!html.contains("Handoff defaults"), "{uri}");
+        }
+        // `/watch` moves to `/`, keeping a panel link.
+        let response = app
+            .clone()
+            .oneshot(browser("/watch?open=agent:abc12345"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::MOVED_PERMANENTLY);
+        assert_eq!(response.headers()[LOCATION], "/?open=agent:abc12345");
+        // JSON is unchanged on the browser hostname.
+        let (status, body) = browser_host_get(&app, "/watch/state", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["sessions"].is_array(), "{body}");
+        let (status, body) = browser_host_get(&app, "/history?format=json", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["schema_version"], 1);
+        // The shell still needs the owner's login.
+        let (status, _) = browser_host_get(&app, "/queue", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // Assets: versioned by URL, so cached for a year.
+        let response = app
+            .clone()
+            .oneshot(browser(&format!("/assets/app.js?v={build}")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            response.headers()[CACHE_CONTROL],
+            "public, max-age=31536000, immutable"
+        );
+        let response = app
+            .clone()
+            .oneshot(browser("/assets/vendor/preact.module.js"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .clone()
+            .oneshot(browser("/assets/missing.js"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // The phone app's hostname keeps today's page at `/`, and has no
+        // shell-only pages.
+        let cookie = owner_session_cookie();
+        let app_host = |uri: &str| {
+            let mut request =
+                public_request_with_host(Method::GET, uri, Body::empty(), "sm-app.example.com");
+            request.headers_mut().insert(
+                COOKIE,
+                format!("{SESSION_COOKIE_NAME}={cookie}").parse().unwrap(),
+            );
+            request
+        };
+        let response = app.clone().oneshot(app_host("/")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = body_text(response).await;
+        assert!(html.contains("Handoff defaults"));
+        assert!(!html.contains(r#"id="sm-config""#));
+        let response = app.clone().oneshot(app_host("/watch")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app.clone().oneshot(app_host("/queue")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn web_shell_serves_loopback_requests_without_access_headers() {
+        let app = router(AppState::new(AppConfig::default()));
+        let response = app
+            .clone()
+            .oneshot(local_request(Method::GET, "/", Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_text(response).await.contains(r#"id="sm-config""#));
+        let response = app
+            .oneshot(local_request(Method::GET, "/settings", Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// The owner's browser login does not authorize general write routes.
@@ -19791,6 +19943,52 @@ mod tests {
         );
         assert_eq!(links["rcnone01"], &Value::Null);
         assert_eq!(links["rcstop01"], &Value::Null);
+    }
+
+    /// The web's agent panel and Clone read model, effort and folder, and
+    /// fetch one agent with `?session=` whether it is live or stopped.
+    #[tokio::test]
+    async fn watch_state_carries_launch_fields_and_serves_one_session() {
+        let state_file = write_session_state("wslive01", "running");
+        let mut fixture: Value = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+        let template = fixture["sessions"][0].clone();
+        let mut sessions = Vec::new();
+        for (id, status) in [("wslive01", "running"), ("wsstop01", "stopped")] {
+            let mut session = template.clone();
+            session["id"] = json!(id);
+            session["name"] = json!(format!("claude-{id}"));
+            session["status"] = json!(status);
+            session["model"] = json!("opus");
+            session["reasoning_effort"] = json!("high");
+            session["working_dir"] = json!("/tmp/widgets");
+            sessions.push(session);
+        }
+        fixture["sessions"] = json!(sessions);
+        fs::write(&state_file, serde_json::to_vec(&fixture).unwrap()).unwrap();
+        let mut config = AppConfig::default();
+        config.paths.state_file = state_file;
+        let app = router(AppState::new(config));
+        let get = |uri: &str| {
+            let app = app.clone();
+            let request = local_request(Method::GET, uri, Body::empty());
+            async move { response_json(app.oneshot(request).await.unwrap()).await }
+        };
+        let (status, body) = get("/watch/state").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let live = body["sessions"].as_array().unwrap();
+        assert_eq!(live.len(), 1, "{body}");
+        assert_eq!(live[0]["model"], "opus");
+        assert_eq!(live[0]["reasoning_effort"], "high");
+        assert_eq!(live[0]["working_dir"], "/tmp/widgets");
+        assert!(live[0]["activity_since"].is_string(), "{body}");
+        let (status, body) = get("/watch/state?session=wsstop01").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let one = body["sessions"].as_array().unwrap();
+        assert_eq!(one.len(), 1, "{body}");
+        assert_eq!(one[0]["id"], "wsstop01");
+        assert_eq!(one[0]["state"], "stopped");
+        let (_, body) = get("/watch/state?session=nobody").await;
+        assert_eq!(body["sessions"], json!([]));
     }
 
     #[tokio::test]
@@ -23009,10 +23207,17 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(body["threshold_percent"], 45);
         }
-        let request =
-            public_request_with_host(Method::GET, "/watch", Body::empty(), "sm.example.com");
-        let request = handoff_json_request(request, &[("cf-access-jwt-assertion", &owner)]);
+        // The browser hostname now gets the web app; today's watch page, with
+        // its handoff controls, stays on every other hostname.
+        let cookie = owner_session_cookie();
+        let mut request =
+            public_request_with_host(Method::GET, "/watch", Body::empty(), "sm-app.example.com");
+        request.headers_mut().insert(
+            COOKIE,
+            format!("{SESSION_COOKIE_NAME}={cookie}").parse().unwrap(),
+        );
         let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(bytes.to_vec()).unwrap();
         assert!(html.contains("Handoff defaults"));

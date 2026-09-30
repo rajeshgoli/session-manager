@@ -30,6 +30,9 @@ pub(super) struct WatchParams {
     node: Option<String>,
     #[serde(default)]
     stopped: Option<String>,
+    /// One session by id, stopped or not: the web's agent panel.
+    #[serde(default)]
+    session: Option<String>,
 }
 
 fn nonempty(value: &Option<String>) -> Option<&str> {
@@ -46,6 +49,20 @@ pub(super) async fn get_watch_page(
     request: Request,
 ) -> Result<Response, ApiError> {
     ensure_owner_page_read_allowed(&state, &request)?;
+    // The browser hostname gets the web app (spec 1710 D1); `/watch` there
+    // moves to `/`, keeping any panel link.
+    if super::web::wants_shell(&state, &request) {
+        if request.uri().path() == "/watch" {
+            let location = request
+                .uri()
+                .query()
+                .map_or_else(|| "/".to_owned(), |query| format!("/?{query}"));
+            return Ok((StatusCode::MOVED_PERMANENTLY, [(LOCATION, location)]).into_response());
+        }
+        if let Some(shell) = super::web::shell_page(&state, &request) {
+            return Ok(shell);
+        }
+    }
     let doc = watch_state(&state, &params)?;
     let path = if request.uri().path() == "/watch" {
         "/watch"
@@ -104,6 +121,23 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
         .iter()
         .map(|record| (record.id.clone(), record.context_used_percentage))
         .collect();
+    // Model, effort, folder and activity times for the web's agent panel,
+    // Clone and ball line (spec 1710 D6.1, D6.2).
+    let launch: BTreeMap<String, Launch> = records
+        .iter()
+        .map(|record| {
+            (
+                record.id.clone(),
+                Launch {
+                    model: record.model.clone(),
+                    reasoning_effort: record.reasoning_effort.clone(),
+                    working_dir: record.working_dir.clone(),
+                    turn_start: record.activity_turn_start_hook_at.clone(),
+                    turn_end: record.activity_hook_at.clone(),
+                },
+            )
+        })
+        .collect();
     // Same link and null rules as `/client/sessions`.
     let remote_control: BTreeMap<String, Value> = records
         .iter()
@@ -111,7 +145,10 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
         .collect();
     let sessions: Vec<Value> = records
         .into_iter()
-        .filter(|record| include_stopped || !record.is_stopped())
+        .filter(|record| match nonempty(&params.session) {
+            Some(id) => record.id == id,
+            None => include_stopped || !record.is_stopped(),
+        })
         .map(|record| serde_json::to_value(session_response_with_live_activity(state, record)))
         .collect::<Result<_, _>>()?;
 
@@ -178,7 +215,7 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
             .map(|job| {
                 json!({"id": job.id, "type": job.job_type, "label": job.label,
                        "state": job.state, "started_at": job.started_at,
-                       "queued_at": job.queued_at})
+                       "queued_at": job.queued_at, "timeout_seconds": job.timeout_seconds})
             })
             .collect();
         let optional = |key: &str| {
@@ -201,6 +238,10 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
             "repo": repo(v),
             "node": s(v, "node"),
             "context_percent": context.get(id).copied().flatten(),
+            "model": launch.get(id).and_then(|l| l.model.clone()),
+            "reasoning_effort": launch.get(id).and_then(|l| l.reasoning_effort.clone()),
+            "working_dir": launch.get(id).map(|l| l.working_dir.clone()),
+            "activity_since": launch.get(id).and_then(|l| l.since(state)).or_else(|| optional("last_activity")),
             "handoff": v["handoff"].clone(),
             "remote_control": remote_control.get(id).cloned().unwrap_or(Value::Null),
             "claims": field("claims"),
@@ -218,6 +259,30 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
         "sessions": out,
         "counts": {"live": live, "waiting_on_owner": waiting_on_owner},
     }))
+}
+
+struct Launch {
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    working_dir: String,
+    turn_start: Option<String>,
+    turn_end: Option<String>,
+}
+
+impl Launch {
+    /// When the agent's current working or idle stretch began: the turn's
+    /// start hook while working, the Stop hook while idle. A start older
+    /// than the last Stop belongs to an earlier turn.
+    fn since(&self, state: &str) -> Option<String> {
+        match state {
+            "working" => self
+                .turn_start
+                .clone()
+                .filter(|start| self.turn_end.as_ref().is_none_or(|end| start >= end)),
+            "idle" | "waiting" => self.turn_end.clone(),
+            _ => None,
+        }
+    }
 }
 
 /// `sm watch` lists a job under the agent that asked for it, or under the
