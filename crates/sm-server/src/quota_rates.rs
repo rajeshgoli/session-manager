@@ -1,7 +1,7 @@
 //! Converting ledger tokens to percent of a weekly quota (sm#1662, ticket
 //! #1675). Each model family has a fitted rate: percent of the weekly meter
 //! per million weighted tokens. See
-//! `docs/working/1662_analytics_redesign.html`, appendix B.1.
+//! `specs/1662_analytics_redesign.html`, appendix B.1.
 
 /// The day the rates below were fitted against meter readings.
 pub const FITTED_AT: &str = "2026-09-29";

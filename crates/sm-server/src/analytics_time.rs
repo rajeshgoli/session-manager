@@ -7,7 +7,7 @@
 //! last (queue job, Codex review, a question to the owner, child agents);
 //! with none open, it is "parked" when the agent holds no claim, else "you"
 //! or "idle" by who typed the prompt that ended the gap. Each instant is attributed to a thread by
-//! `work_attribution`. See `docs/working/1662_analytics_redesign.html`,
+//! `work_attribution`. See `specs/1662_analytics_redesign.html`,
 //! appendices E and F.2.
 
 use std::{

@@ -5,7 +5,7 @@
 //! The first rule that applies wins: the agent's latest active claim, its
 //! parent's (up to five levels), a ticket number in its name, else "No
 //! ticket" under the repo of its working folder. See
-//! `docs/working/1662_analytics_redesign.html`, appendix C.
+//! `specs/1662_analytics_redesign.html`, appendix C.
 
 use std::{
     collections::{BTreeSet, HashMap},
