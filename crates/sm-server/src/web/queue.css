@@ -1,0 +1,44 @@
+/* Queue and Analytics use the shell's light/dark tokens (1710 D6.6, D6.8). */
+.q-card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; min-width:0; }
+.q-card h2 { font-size:14px; margin:0 0 10px; }
+.q-card h3 { font-size:13px; }
+.q-tiles { display:grid; grid-template-columns:repeat(4,minmax(85px,1fr)) minmax(300px,2.7fr); gap:10px; }
+.q-label { display:block; color:var(--ink-2); text-transform:capitalize; margin-bottom:6px; }
+.q-tiles strong { display:block; font-size:24px; font-weight:600; font-variant-numeric:tabular-nums; }
+.q-tiles small { color:var(--ink-3); font-size:13px; font-weight:400; }
+.q-meter { display:grid; grid-template-columns:30px minmax(40px,1fr) auto; align-items:center; gap:7px; font-size:11px; margin:5px 0; font-variant-numeric:tabular-nums; }
+.q-meter i { height:7px; position:relative; background:var(--panel-2); overflow:hidden; border-radius:2px; }
+.q-meter s { position:absolute; height:100%; background:var(--green); opacity:.4; }
+.q-meter s.q { opacity:1; }
+.q-heading { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; }
+.q-heading h2 { margin:0; }
+.q-legend { display:flex; gap:14px; flex-wrap:wrap; font-size:11px; margin:10px 0; color:var(--ink-2); }
+.q-chart svg { width:100%; height:180px; display:block; }
+.q-chart-caption { min-height:2.8em; font-size:12px; color:var(--ink-2); margin-bottom:0; }
+.cyan { color:var(--cyan); } .green { color:var(--green); } .red { color:var(--red); } .amber { color:var(--amber); }
+.q-insight { border-left:3px solid var(--amber); }
+.q-job { width:100%; display:grid; grid-template-columns:minmax(130px,1fr) minmax(100px,2fr) minmax(140px,1fr); align-items:center; gap:14px; border:0; border-bottom:1px solid var(--line); background:none; padding:12px 0; text-align:left; cursor:pointer; }
+.q-job:hover { background:var(--panel-2); }
+.q-job-title { overflow:hidden; text-overflow:ellipsis; }
+.q-job small { display:block; color:var(--ink-3); font-size:11px; }
+.q-timeline { height:16px; position:relative; background:var(--panel-2); border-right:1px solid var(--ink-3); }
+.q-timeline i { position:absolute; height:100%; }
+.q-timeline .waiting { background:var(--amber); opacity:.5; }
+.q-timeline .running { background:repeating-linear-gradient(125deg,transparent 0 4px,var(--green) 4px 6px); background-color:color-mix(in srgb,var(--green) 20%,transparent); }
+.q-timeline .quiet { background:var(--red); opacity:.7; }
+.q-panel-body { overflow:auto; padding:14px; min-height:0; }
+.q-actions, .q-suggestions { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px; }
+.q-panel-body textarea { width:100%; margin:8px 0; }
+.q-details { display:grid; grid-template-columns:90px minmax(0,1fr); gap:8px; font-size:12px; }
+.q-details dt { color:var(--ink-3); } .q-details dd { margin:0; overflow-wrap:anywhere; }
+.q-log { color:var(--term-ink); background:var(--term); border-radius:6px; padding:12px; white-space:pre-wrap; overflow-wrap:anywhere; font:11px/1.5 var(--mono); }
+.q-job-chart { width:100%; height:100px; background:var(--panel-2); }
+.a-row { width:100%; border:0; border-bottom:1px solid var(--line); background:none; display:flex; align-items:center; justify-content:space-between; gap:16px; padding:13px 4px; text-align:left; color:var(--ink); }
+button.a-row { cursor:pointer; } button.a-row:hover { background:var(--panel-2); }
+.a-row small { display:block; color:var(--ink-3); margin:3px 0; }
+.a-row strong { white-space:nowrap; }
+.a-parts { display:flex; flex-wrap:wrap; gap:8px; font-size:11px; }
+.a-crumbs { display:flex; flex-wrap:wrap; gap:5px; margin-bottom:14px; }
+.analytics-page .q-tiles { grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); }
+@media(max-width:1100px) { .q-tiles { grid-template-columns:repeat(4,1fr); } .q-mac { grid-column:1/-1; } }
+@media(max-width:600px) { .q-tiles { grid-template-columns:repeat(2,1fr); } .q-job { grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:7px; font-size:12px; } .q-timeline { grid-row:2; grid-column:1/-1; } .q-meter { grid-template-columns:30px minmax(25px,1fr) auto; } .q-legend { gap:8px; } .q-card { padding:10px; } .a-row { gap:6px; } .a-row>span { min-width:0; overflow-wrap:anywhere; } }

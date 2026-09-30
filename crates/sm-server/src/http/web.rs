@@ -38,6 +38,10 @@ const ASSETS: &[Asset] = &[
     asset!("ui.js", JS),
     asset!("start.js", JS),
     asset!("agents.js", JS),
+    asset!("queue.js", JS),
+    asset!("queue-model.js", JS),
+    asset!("analytics.js", JS),
+    asset!("queue.css", "text/css; charset=utf-8"),
     asset!("vendor/preact.module.js", JS),
     asset!("vendor/hooks.module.js", JS),
     asset!("vendor/htm.module.js", JS),
@@ -132,6 +136,7 @@ fn shell_response(state: &AppState) -> Response {
 <title>sm</title>
 <script>try{{var t=localStorage.getItem("sm-theme");if(t==="light"||t==="dark")document.documentElement.dataset.theme=t}}catch(e){{}}</script>
 <link rel="stylesheet" href="/assets/app.css?v={id}">
+<link rel="stylesheet" href="/assets/queue.css?v={id}">
 <script type="importmap">{imports}</script>
 <script type="application/json" id="sm-config">{config}</script>
 <script type="module" src="/assets/app.js?v={id}"></script>

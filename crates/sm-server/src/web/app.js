@@ -9,6 +9,8 @@ import {
   openPanel, closePanel, navigate, openItem, toast, Icon, Ring, Seg, gigabytes, basename,
 } from './ui.js';
 import { AgentsPage } from './agents.js';
+import { QueuePage } from './queue.js';
+import { AnalyticsPage } from './analytics.js';
 import { NewAgentPopover } from './start.js';
 
 // ---- pages ------------------------------------------------------------------
@@ -142,6 +144,8 @@ function App() {
 
 function Page({ page, loc }) {
   if (page === 'agents') return html`<${AgentsPage} openRef=${loc.open} />`;
+  if (page === 'queue') return html`<${QueuePage} />`;
+  if (page === 'analytics') return html`<${AnalyticsPage} path=${loc.path} />`;
   if (page === 'settings') return html`<${SettingsStub} />`;
   const current = PAGES.find((p) => p.key === page);
   return html`<div class="content"><div class="stub">

@@ -1520,6 +1520,10 @@ pub fn router(state: AppState) -> Router {
             "/client/queue/jobs/{job_id}/start",
             post(follows::force_start_queue_job),
         )
+        .route(
+            "/client/queue/jobs/{job_id}/usage",
+            get(client_queue_job_usage),
+        )
         .route("/client/utilization/series", get(client_utilization_series))
         .route(
             "/client/analytics/spend",
@@ -2722,6 +2726,27 @@ async fn client_queue_stats(
     }
     read_utilization(&state, move |path| {
         crate::utilization::queue_stats(path, hours)
+    })
+    .await
+}
+
+/// Recorded five-second samples for one retained job (sm#1723).
+async fn client_queue_job_usage(
+    State(state): State<Arc<AppState>>,
+    Path(identifier): Path<String>,
+    request: Request,
+) -> Result<Json<Value>, ApiError> {
+    ensure_client_read(&state, &request)?;
+    let job = RetainedQueueStore::resolve_queue_job_from_path(
+        &expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
+            .join("queue_runner.db"),
+        &identifier,
+    )
+    .map_err(queue_lookup_error)?
+    .ok_or(ApiError::NotFound("Queue job not found"))?;
+    let minutes = state.config.queue_runner.quiet_minutes;
+    read_utilization(&state, move |path| {
+        crate::utilization::job_series(path, &job.id, minutes)
     })
     .await
 }
@@ -14321,6 +14346,10 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
         || path == "/client/queue"
         || path == "/client/queue/stats"
         || path == "/client/utilization/series"
+        || path
+            .strip_prefix("/client/queue/jobs/")
+            .and_then(|rest| rest.strip_suffix("/usage"))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
         || path == "/codex-review-requests"
         || path.starts_with("/codex-review-requests/")
         || path == "/session-obligations"
@@ -19688,10 +19717,11 @@ mod tests {
     }
 
     /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
-    const OWNER_WEB_READS: [&str; 16] = [
+    const OWNER_WEB_READS: [&str; 17] = [
         "/client/queue",
         "/client/queue/stats",
         "/client/queue/jobs/job-missing/start-check",
+        "/client/queue/jobs/job-missing/usage",
         "/client/utilization/series",
         "/client/host-status",
         "/queue-jobs/job-missing/log",
