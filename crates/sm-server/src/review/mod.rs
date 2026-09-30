@@ -118,8 +118,16 @@ pub fn rollout_output(text: &str) -> Option<Value> {
     text.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter_map(|v| {
-            (v["payload"]["type"] == "exited_review_mode")
-                .then(|| v["payload"]["review_output"].clone())
+            let payload = &v["payload"];
+            if payload["type"] == "exited_review_mode" {
+                Some(payload["review_output"].clone())
+            } else if payload["type"] == "item_completed"
+                && payload["item"]["type"] == "ExitedReviewMode"
+            {
+                Some(payload["item"]["review_output"].clone())
+            } else {
+                None
+            }
         })
         .next_back()
         .filter(valid_output)
@@ -524,6 +532,24 @@ mod tests {
         })
         .is_err());
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn recorded_native_provider_outputs_produce_inline_reviews() {
+        let codex = rollout_output(include_str!("fixtures/codex-rollout.jsonl")).unwrap();
+        let claude = claude_output(include_str!("fixtures/claude-result.json")).unwrap();
+        let (_dir, r) = request();
+        let diffs = std::collections::BTreeMap::from([(
+            "review_smoke_1777.py".into(),
+            "@@ -0,0 +1,5 @@\n".into(),
+        )]);
+        for output in [codex, claude] {
+            let p = payload(&r, Path::new("/fixture/checkout"), &output, &diffs, true);
+            assert_eq!(p["comments"].as_array().unwrap().len(), 1);
+            assert_eq!(p["comments"][0]["path"], "review_smoke_1777.py");
+            assert_eq!(p["comments"][0]["line"], 5);
+            assert!(p["body"].as_str().unwrap().contains("patch is incorrect"));
+        }
     }
 
     #[test]

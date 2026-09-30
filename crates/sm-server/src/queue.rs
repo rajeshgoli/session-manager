@@ -690,7 +690,7 @@ impl RetainedQueueStore {
         job: &QueueJobRecord,
     ) -> Result<()> {
         let conn = Connection::open(db_path)?;
-        conn.execute("UPDATE codex_review_request_registrations SET run_job_id=?3,step_state=?4 WHERE id=?1 AND step_index=?2 AND is_active=1",params![id,index,job.id,if job.state=="running" {"running"} else {"queued"}])?;
+        conn.execute("UPDATE codex_review_request_registrations SET run_job_id=?3,step_state=?4 WHERE id=?1 AND step_index=?2 AND is_active=1",params![id,index,job.id,match job.state.as_str() {"running" => "running", "pending" => "queued", _ => "finished"}])?;
         Ok(())
     }
 

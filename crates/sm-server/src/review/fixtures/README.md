@@ -1,0 +1,1 @@
+Provider outputs recorded on 30 September 2026 from temporary PR #1802, request 8495b6c48bb2. The Codex file retains its completed review item; the Claude file retains its result type, error flag and structured output. Checkout paths are normalized to `/fixture/checkout`. No prompts, credentials or usage records are included.
