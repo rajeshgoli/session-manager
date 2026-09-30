@@ -306,6 +306,29 @@ pub fn post_with_body_fallback(
     }
 }
 
+/// Queue jobs start from an empty environment. Carry only tool lookup,
+/// identity, locale and provider config roots; never the author's session,
+/// nesting guard, GitHub token or unrelated service credentials.
+pub fn environment(
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> std::collections::BTreeMap<String, String> {
+    const KEYS: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "TERM",
+        "LANG",
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+    ];
+    vars.into_iter()
+        .filter(|(k, v)| !v.is_empty() && (KEYS.contains(&k.as_str()) || k.starts_with("LC_")))
+        .collect()
+}
+
 pub fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
@@ -363,6 +386,24 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn provider_environment_keeps_auth_roots_without_agent_or_github_credentials() {
+        let env = environment(
+            [
+                ("PATH", "/tools/bin"),
+                ("HOME", "/home/owner"),
+                ("CODEX_HOME", "/home/owner/.codex"),
+                ("GH_TOKEN", "secret"),
+                ("CLAUDECODE", "nested"),
+                ("CLAUDE_SESSION_MANAGER_ID", "author"),
+            ]
+            .map(|(k, v)| (k.into(), v.into())),
+        );
+        assert_eq!(env.len(), 3);
+        assert_eq!(env["PATH"], "/tools/bin");
+        assert_eq!(env["HOME"], "/home/owner");
+    }
+
     #[test]
     fn fallback_preserves_tier_and_never_loops() {
         for (kind, model, want) in [

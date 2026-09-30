@@ -389,7 +389,7 @@ fn prepare(
             cwd: run.checkout.to_string_lossy().into_owned(),
             argv: None,
             script: Some(format!("unset CLAUDECODE CLAUDE_SESSION_MANAGER_ID SESSION_MANAGER_ID SM_SESSION_ID\n{script}")),
-            env: BTreeMap::new(),
+            env: review::environment(std::env::vars()),
             timeout_seconds: 2700,
             cpu_percent: None,
             gpu_percent: None,
