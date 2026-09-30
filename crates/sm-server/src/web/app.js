@@ -10,6 +10,7 @@ import {
 } from './ui.js';
 import { BoardPage } from './board.js';
 import { AgentsPage } from './agents.js';
+import { SettingsPage } from './settings.js';
 import { TerminalPage } from './terminal.js';
 import { NewAgentPopover } from './start.js';
 
@@ -144,8 +145,8 @@ function App() {
 
 function Page({ page, loc }) {
   if (page === 'agents') return html`<${AgentsPage} openRef=${loc.open} />`;
+  if (page === 'settings') return html`<${SettingsPage} />`;
   if (page === 'board') return html`<${BoardPage} />`;
-  if (page === 'settings') return html`<${SettingsStub} />`;
   const current = PAGES.find((p) => p.key === page);
   return html`<div class="content"><div class="stub">
     <h2>${current.label}</h2>
@@ -439,33 +440,6 @@ function Toasts({ items }) {
     ${items.map((item) => html`<button type="button" class="toast" key=${item.id}
       onClick=${() => item.onClick && item.onClick()}>${item.text}</button>`)}
   </div>`;
-}
-
-// ---- placeholder pages ----------------------------------------------------------
-
-function SettingsStub() {
-  const [theme, setTheme] = useState(() => {
-    try {
-      return localStorage.getItem('sm-theme') || 'system';
-    } catch (e) {
-      return 'system';
-    }
-  });
-  const choose = (value) => {
-    setTheme(value);
-    try {
-      localStorage.setItem('sm-theme', value);
-    } catch (e) {
-      /* the choice lasts until reload */
-    }
-    document.documentElement.dataset.theme = value;
-  };
-  return html`<div class="content"><div class="stub">
-    <h2>Appearance</h2>
-    <div><${Seg} label="Theme" value=${theme} onChange=${choose}
-      options=${[{ value: 'system', label: 'System' }, { value: 'light', label: 'Light' }, { value: 'dark', label: 'Dark' }]} /></div>
-    <p class="sub">Saved in this browser only. The other settings arrive in a later web ticket; until then they live on the phone.</p>
-  </div></div>`;
 }
 
 render(html`<${App} />`, document.getElementById('app'));

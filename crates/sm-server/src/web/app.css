@@ -251,6 +251,37 @@ select.inp { padding: 3px 6px; }
 @container (max-width: 820px) { .bar .meters .meter:not(.link) { display: none; } }
 @container (max-width: 560px) { .bar .meters { display: none; } }
 
+/* Settings: section menu and compact, labelled forms; no fixed field widths. */
+.settings-page { flex-direction: row; gap: 28px; align-items: flex-start; }
+.settings-nav { flex: 0 0 10rem; display: flex; flex-direction: column; gap: 4px; position: sticky; top: 0; }
+.settings-nav a { padding: 7px 10px; border-radius: 6px; color: var(--ink-2); text-decoration: none; }
+.settings-nav a.on { background: var(--panel-2); color: var(--ink); font-weight: 600; }
+.settings-body { width: 100%; max-width: 46rem; min-width: 0; padding-bottom: 28px; }
+.settings-body h2 { font-size: 16px; margin: 0 0 14px; }
+.settings-body h3 { font-size: 13px; margin: 22px 0 12px; }
+.settings-body > .sub { margin-bottom: 18px; }
+.settings-field { margin: 0 0 12px; min-width: 0; }
+.settings-field label { display: flex; flex-direction: column; gap: 6px; }
+.settings-field label:has(input[type=checkbox]) { flex-direction: row; align-items: center; justify-content: space-between; }
+.settings-field input[type=checkbox] { width: auto; accent-color: var(--accent); }
+.settings-field .sub { font-size: 11px; margin: 5px 0; overflow-wrap: anywhere; }
+.settings-feedback { display: flex; gap: 8px; align-items: center; min-height: 19px; margin-top: 4px; font-size: 11px; }
+.saved { color: var(--green); }
+.settings-error { color: var(--red); }
+.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 20px; }
+.settings-preview { background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 12px; margin: 0 0 20px; }
+.settings-preview .sub, .settings-preview code { display: block; }
+.settings-preview pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; margin-bottom: 0; }
+.settings-device { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.settings-about { display: grid; grid-template-columns: auto 1fr; gap: 10px 20px; }
+.settings-about dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 700px) {
+  .settings-page { flex-direction: column; gap: 20px; }
+  .settings-nav { flex: none; flex-direction: row; flex-wrap: wrap; position: static; gap: 2px; }
+  .settings-nav a { padding: 6px 8px; font-size: 12px; }
+  .settings-grid { grid-template-columns: 1fr; }
+}
+
 /* Board: server-owned ticket clocks and lane order (1710 D6.4). */
 .board-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .board-toolbar > .sub { margin-right: auto; }
