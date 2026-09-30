@@ -33,6 +33,14 @@ export const navigate = (path) => bus.emit('navigate', path);
 /** Open the side panel on `kind:id` (D1 `?open=`). */
 export const openPanel = (ref) => bus.emit('open', ref);
 export const closePanel = () => bus.emit('open', null);
+/**
+ * True when a keystroke lands in a text field. Reads the composed path because a
+ * document listener sees a field inside a shadow root (the doc review sheet) retargeted to its host.
+ */
+export const typingIn = (event) => {
+  const target = event.composedPath?.()[0] || event.target;
+  return !!target?.closest?.('input,textarea,select,[contenteditable]') || !!target?.isContentEditable;
+};
 export const toast = (text, onClick) => bus.emit('toast', { text, onClick });
 /** Open New agent, optionally filled in (Clone). */
 export const newAgent = (prefill) => bus.emit('new-agent', prefill || {});

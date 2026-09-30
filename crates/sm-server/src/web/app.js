@@ -6,7 +6,7 @@ import { render } from 'preact';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import {
   html, api, bus, network, usePoll, useShared, setShared, stored, store, panels,
-  openPanel, closePanel, navigate, openItem, toast, Icon, Ring, Seg, gigabytes, basename,
+  openPanel, closePanel, navigate, openItem, toast, typingIn, Icon, Ring, Seg, gigabytes, basename,
 } from './ui.js';
 import { BoardPage } from './board.js';
 import { InboxPage } from './inbox.js';
@@ -404,7 +404,6 @@ function useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, cre
   state.current = { page, loc, layout, palette, creating };
   useEffect(() => {
     let pendingG = 0;
-    const typing = (target) => target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
     const down = (event) => {
       const { page: current, loc: where, layout: now, palette: paletteOpen } = state.current;
       const mod = event.metaKey || event.ctrlKey;
@@ -428,10 +427,10 @@ function useKeyboard({ page, loc, layout, updateLayout, setPalette, palette, cre
       }
       if (paletteOpen || mod || event.altKey) return;
       if (event.key === 'Escape') {
-        if (where.open && !typing(event.target)) closePanel();
+        if (where.open && !typingIn(event)) closePanel();
         return;
       }
-      if (typing(event.target)) return;
+      if (typingIn(event)) return;
       if (event.key === 'g') {
         pendingG = Date.now();
         return;
