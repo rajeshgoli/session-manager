@@ -13,6 +13,24 @@ import li.rajeshgo.sm.data.model.CreateSessionRequest
 
 fun supportsSessionCloning(provider: String?): Boolean = provider in listOf("claude", "codex", "codex-fork")
 
+/**
+ * Start from the board (sm#1665 appendix K): the sheet shows [label] instead
+ * of the workspace picker, and opens on the board's name, brief and defaults.
+ */
+data class TicketStart(
+    val label: String,
+    val workingDir: String,
+    val name: String,
+    val brief: String,
+    val provider: String,
+    val model: String?,
+    val effort: String,
+)
+
+/** The efforts the board's Start offers for [provider], as the web sheet does. */
+private fun startEfforts(provider: String): List<String> =
+    if (provider == "claude") listOf("low", "medium", "high", "max") else listOf("low", "medium", "high", "xhigh")
+
 fun sessionTemplate(source: ClientSession?): CreateSessionRequest = CreateSessionRequest(
     provider = source?.provider ?: "claude",
     workingDir = source?.workingDir ?: "/Users/rajesh/projects/fractal-algo-rust",
@@ -29,16 +47,22 @@ fun CreateSessionSheet(
     busy: Boolean,
     error: String?,
     onDismiss: () -> Unit,
+    ticket: TicketStart? = null,
     onCreate: (CreateSessionRequest) -> Unit,
 ) {
-    val template = remember(source?.id) { sessionTemplate(source) }
-    var provider by rememberSaveable(source?.id) { mutableStateOf(template.provider) }
-    var model by rememberSaveable(source?.id) { mutableStateOf(template.model.orEmpty()) }
-    var effort by rememberSaveable(source?.id) { mutableStateOf(template.reasoningEffort.orEmpty()) }
-    var directory by rememberSaveable(source?.id) { mutableStateOf(template.workingDir) }
+    val sheetKey = ticket?.label ?: source?.id
+    val template = remember(sheetKey) {
+        ticket?.let { CreateSessionRequest(it.provider, it.workingDir, it.model, it.effort) } ?: sessionTemplate(source)
+    }
+    var provider by rememberSaveable(sheetKey) { mutableStateOf(template.provider) }
+    var model by rememberSaveable(sheetKey) { mutableStateOf(template.model.orEmpty()) }
+    var effort by rememberSaveable(sheetKey) { mutableStateOf(template.reasoningEffort.orEmpty()) }
+    var directory by rememberSaveable(sheetKey) { mutableStateOf(template.workingDir) }
     var customModel by rememberSaveable { mutableStateOf(false) }
-    var name by rememberSaveable(source?.id) { mutableStateOf("") }
-    var prompt by rememberSaveable(source?.id) { mutableStateOf("") }
+    var name by rememberSaveable(sheetKey) { mutableStateOf(ticket?.name.orEmpty()) }
+    var prompt by rememberSaveable(sheetKey) { mutableStateOf(ticket?.brief.orEmpty()) }
+    // Start preselects the catalog's first model when the board's default is missing from it.
+    var defaultUnavailable by rememberSaveable(sheetKey) { mutableStateOf(false) }
     var customDirectory by rememberSaveable { mutableStateOf(false) }
     val directories = (listOf("/Users/rajesh/projects/fractal-algo-rust", "/Users/rajesh/projects/session-manager", "/Users/rajesh/projects/codex-fork") + sessions.map { it.workingDir } + directory).distinct()
     var catalog by remember(provider, directory) { mutableStateOf(emptyList<String>()) }
@@ -51,36 +75,61 @@ fun CreateSessionSheet(
         try {
             kotlinx.coroutines.delay(300)
             catalog = loadModels(provider, directory.trim())
+            if (ticket != null && catalog.isNotEmpty() && model !in catalog) {
+                defaultUnavailable = model.isNotBlank()
+                model = catalog.first()
+            }
         }
         catch (error: kotlinx.coroutines.CancellationException) { throw error }
         catch (_: Exception) { modelsError = true }
         finally { modelsLoading = false }
     }
-    val models = (listOf("") + catalog + sessions.filter { it.provider == provider }.mapNotNull { it.model } + listOf(model)).distinct()
+    val models = (if (ticket != null) catalog + listOf(model) else listOf("") + catalog + sessions.filter { it.provider == provider }.mapNotNull { it.model } + listOf(model)).distinct()
     ModalBottomSheet(sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), onDismissRequest = { if (!busy) onDismiss() }) {
         Column(Modifier.fillMaxWidth().imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Text(if (source == null) "New session" else "Clone ${sessionDisplayName(source)}", style = MaterialTheme.typography.headlineSmall)
-            Text(if (source == null) "Choose a workspace and start something new." else "A fresh conversation with the same provider, model, effort and workspace.", style = MaterialTheme.typography.bodyMedium)
-            SessionChoice("Provider", provider, (listOf("claude", "codex") + provider).distinct(), !busy) {
-                provider = it; model = ""; effort = "high"; customModel = false
+            Text(
+                when {
+                    ticket != null -> "Start"
+                    source == null -> "New session"
+                    else -> "Clone ${sessionDisplayName(source)}"
+                },
+                style = MaterialTheme.typography.headlineSmall,
+            )
+            Text(
+                when {
+                    ticket != null -> ticket.label
+                    source == null -> "Choose a workspace and start something new."
+                    else -> "A fresh conversation with the same provider, model, effort and workspace."
+                },
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            val providers = if (ticket != null) listOf("claude", "codex-fork") else listOf("claude", "codex")
+            SessionChoice("Provider", provider, (providers + provider).distinct(), !busy) {
+                provider = it; model = ""; effort = "high"; customModel = false; defaultUnavailable = false
             }
             SessionChoice("Model", model, models + "Other model…", !busy, emptyLabel = "Provider default") {
                 if (it == "Other model…") customModel = true else { model = it; customModel = false }
             }
             if (modelsLoading) Text("Loading available models…", style = MaterialTheme.typography.bodySmall)
+            if (defaultUnavailable && !modelsLoading) Text("The default model is unavailable; the first available model is selected.", style = MaterialTheme.typography.bodySmall)
             if (modelsError) TextButton(onClick = { catalogAttempt++ }) { Text("Couldn't load models · Retry") }
             if (customModel) OutlinedTextField(model, { model = it }, label = { Text("Model identifier") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), singleLine = true)
-            SessionChoice("Effort", effort, (listOf("medium", "high") + effort).distinct(), !busy) { effort = it }
-            SessionChoice("Workspace", directory, directories + "Other directory…", !busy, shortPaths = true) {
-                if (it == "Other directory…") customDirectory = true else { directory = it; customDirectory = false }
+            val efforts = if (ticket != null) startEfforts(provider) else listOf("medium", "high")
+            SessionChoice("Effort", effort, (efforts + effort).distinct(), !busy) { effort = it }
+            if (ticket == null) {
+                SessionChoice("Workspace", directory, directories + "Other directory…", !busy, shortPaths = true) {
+                    if (it == "Other directory…") customDirectory = true else { directory = it; customDirectory = false }
+                }
+                if (customDirectory) OutlinedTextField(directory, { directory = it }, label = { Text("Absolute directory path") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                else Text(directory, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else {
+                Text(directory, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            if (customDirectory) OutlinedTextField(directory, { directory = it }, label = { Text("Absolute directory path") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), singleLine = true)
-            else Text(directory, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            OutlinedTextField(name, { name = it }, label = { Text("Name · optional") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), singleLine = true)
-            OutlinedTextField(prompt, { prompt = it }, label = { Text("First message · optional") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), minLines = 2, maxLines = 5)
+            OutlinedTextField(name, { name = it }, label = { Text(if (ticket != null) "Name" else "Name · optional") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), singleLine = true)
+            OutlinedTextField(prompt, { prompt = it }, label = { Text(if (ticket != null) "Brief" else "First message · optional") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), minLines = 2, maxLines = if (ticket != null) 8 else 5)
             error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-            Button(onClick = { onCreate(CreateSessionRequest(provider, directory.trim(), model.ifBlank { null }, effort.ifBlank { null }, name.trim().ifBlank { null }, prompt.trim().ifBlank { null })) }, enabled = !busy && directory.trim().startsWith('/'), modifier = Modifier.fillMaxWidth().height(52.dp)) {
-                if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) else Text("Create session")
+            Button(onClick = { onCreate(CreateSessionRequest(provider, directory.trim(), model.ifBlank { null }, effort.ifBlank { null }, name.trim().ifBlank { null }, prompt.trim().ifBlank { null })) }, enabled = !busy && directory.trim().startsWith('/') && (ticket == null || (model.isNotBlank() && !modelsLoading)), modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp) else Text(if (ticket != null) "Start" else "Create session")
             }
         }
     }

@@ -16,6 +16,9 @@ import androidx.navigation.navArgument
 import li.rajeshgo.sm.data.repository.SettingsRepository
 import li.rajeshgo.sm.push.FollowOpenRequests
 import li.rajeshgo.sm.ui.analytics.AnalyticsScreen
+import li.rajeshgo.sm.ui.board.BoardBadgeRefresher
+import li.rajeshgo.sm.ui.board.BoardLinkRequests
+import li.rajeshgo.sm.ui.board.BoardScreen
 import li.rajeshgo.sm.ui.guestbook.GuestbookScreen
 import li.rajeshgo.sm.ui.history.HistoryScreen
 import li.rajeshgo.sm.ui.inbox.InboxBadgeRefresher
@@ -32,6 +35,7 @@ object Routes {
     const val SETTINGS = "settings"
     const val WATCH = "watch"
     const val INBOX = "inbox"
+    const val BOARD = "board"
     const val ANALYTICS = "analytics"
     const val QUEUE = "queue"
     const val USAGE = "usage"
@@ -75,13 +79,15 @@ fun AppNavigation() {
         }
     }
 
-    // The Inbox badge on every screen's bottom nav, while the app is in front.
+    // The Inbox and Board badges on every screen's bottom nav, while the app is in front.
     val resumed = rememberResumed()
     val badgeRefresher = remember { InboxBadgeRefresher(context.applicationContext as android.app.Application) }
+    val boardBadgeRefresher = remember { BoardBadgeRefresher(context.applicationContext as android.app.Application) }
     LaunchedEffect(resumed, isLoggedIn) {
         if (!resumed || isLoggedIn != true) return@LaunchedEffect
         while (isActive) {
             badgeRefresher.refresh()
+            boardBadgeRefresher.refresh()
             delay(INBOX_BADGE_REFRESH_MS)
         }
     }
@@ -94,6 +100,12 @@ fun AppNavigation() {
 
     val toWatch = {
         navController.navigate(Routes.WATCH) {
+            popUpTo(Routes.WATCH) { inclusive = false }
+            launchSingleTop = true
+        }
+    }
+    val toBoard = {
+        navController.navigate(Routes.BOARD) {
             popUpTo(Routes.WATCH) { inclusive = false }
             launchSingleTop = true
         }
@@ -128,6 +140,16 @@ fun AppNavigation() {
         }
     }
 
+    // A `/board` link or a tapped board alert opens the Board tab, which scrolls to its lane.
+    val pendingBoardLink = BoardLinkRequests.pending
+    LaunchedEffect(pendingBoardLink, isLoggedIn) {
+        if (pendingBoardLink != null && isLoggedIn == true &&
+            navController.currentDestination?.route != Routes.BOARD
+        ) {
+            toBoard()
+        }
+    }
+
     NavHost(navController = navController, startDestination = startDestination) {
         composable(Routes.SETTINGS) {
             SettingsScreen(
@@ -141,6 +163,7 @@ fun AppNavigation() {
         composable(Routes.INBOX) {
             InboxScreen(
                 onNavigateToWatch = toWatch,
+                onNavigateToBoard = toBoard,
                 onNavigateToQueue = toQueue,
                 menu = menu,
             )
@@ -148,6 +171,15 @@ fun AppNavigation() {
         composable(Routes.WATCH) {
             WatchScreen(
                 onNavigateToInbox = toInbox,
+                onNavigateToBoard = toBoard,
+                onNavigateToQueue = toQueue,
+                menu = menu,
+            )
+        }
+        composable(Routes.BOARD) {
+            BoardScreen(
+                onNavigateToInbox = toInbox,
+                onNavigateToWatch = toWatch,
                 onNavigateToQueue = toQueue,
                 menu = menu,
             )
@@ -156,6 +188,7 @@ fun AppNavigation() {
             QueueScreen(
                 onNavigateToInbox = toInbox,
                 onNavigateToWatch = toWatch,
+                onNavigateToBoard = toBoard,
                 onOpenUsage = { navController.navigate(Routes.USAGE) },
                 onOpenStopped = {
                     navController.navigate("${Routes.ANALYTICS}?section=queue") { launchSingleTop = true }

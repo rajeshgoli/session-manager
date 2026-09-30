@@ -145,6 +145,7 @@ private const val WATCH_TOAST_MS = 3500L
 @Composable
 fun WatchScreen(
     onNavigateToInbox: () -> Unit,
+    onNavigateToBoard: () -> Unit,
     onNavigateToQueue: () -> Unit,
     menu: AppMenuActions,
     viewModel: WatchViewModel = viewModel(),
@@ -482,6 +483,7 @@ fun WatchScreen(
                 currentRoute = Routes.WATCH,
                 onInbox = onNavigateToInbox,
                 onWatch = {},
+                onBoard = onNavigateToBoard,
                 onQueue = onNavigateToQueue,
                 queueBadge = waitingJobCount(state.sessions),
             )

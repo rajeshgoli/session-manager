@@ -98,6 +98,7 @@ internal fun rememberResumed(): Boolean {
 fun QueueScreen(
     onNavigateToInbox: () -> Unit,
     onNavigateToWatch: () -> Unit,
+    onNavigateToBoard: () -> Unit,
     onOpenUsage: () -> Unit,
     onOpenStopped: () -> Unit,
     menu: AppMenuActions,
@@ -203,6 +204,7 @@ fun QueueScreen(
                 currentRoute = Routes.QUEUE,
                 onInbox = onNavigateToInbox,
                 onWatch = onNavigateToWatch,
+                onBoard = onNavigateToBoard,
                 onQueue = {},
             )
         }

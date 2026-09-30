@@ -3,7 +3,9 @@ package li.rajeshgo.sm.ui.navigation
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -12,6 +14,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ViewList
 import androidx.compose.material.icons.rounded.HourglassTop
 import androidx.compose.material.icons.rounded.Inbox
+import androidx.compose.material.icons.rounded.ViewKanban
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -21,6 +24,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import li.rajeshgo.sm.ui.board.BoardBadge
 import li.rajeshgo.sm.ui.inbox.InboxBadge
 import li.rajeshgo.sm.ui.theme.Amber
 import li.rajeshgo.sm.ui.theme.BorderStrong
@@ -33,6 +37,7 @@ fun AppBottomNav(
     currentRoute: String,
     onInbox: () -> Unit,
     onWatch: () -> Unit,
+    onBoard: () -> Unit,
     onQueue: () -> Unit,
     modifier: Modifier = Modifier,
     queueBadge: Int = 0,
@@ -47,8 +52,8 @@ fun AppBottomNav(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly,
+                .padding(horizontal = 6.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             val inboxBadge = InboxBadge.needsYou
             AppBottomNavItem(
@@ -67,6 +72,13 @@ fun AppBottomNav(
                 icon = { Icon(Icons.AutoMirrored.Rounded.ViewList, contentDescription = null, modifier = Modifier.size(18.dp)) },
                 onClick = onWatch,
             )
+            val boardBadge = BoardBadge.count
+            AppBottomNavItem(
+                label = if (boardBadge > 0) "Board · $boardBadge" else "Board",
+                selected = currentRoute == Routes.BOARD,
+                icon = { Icon(Icons.Rounded.ViewKanban, contentDescription = null, modifier = Modifier.size(18.dp), tint = if (boardBadge > 0) Amber else androidx.compose.material3.LocalContentColor.current) },
+                onClick = onBoard,
+            )
             AppBottomNavItem(
                 label = if (queueBadge > 0) "Queue · $queueBadge" else "Queue",
                 selected = currentRoute == Routes.QUEUE,
@@ -77,8 +89,9 @@ fun AppBottomNav(
     }
 }
 
+/** Icon over label, each tab an equal share of the bar, so four tabs fit a phone. */
 @Composable
-private fun AppBottomNavItem(
+private fun RowScope.AppBottomNavItem(
     label: String,
     selected: Boolean,
     icon: @Composable () -> Unit,
@@ -86,16 +99,17 @@ private fun AppBottomNavItem(
 ) {
     val textColor = if (selected) MaterialTheme.colorScheme.onSurface else TextMuted
     val iconTint = if (selected) Cyan else TextMuted
-    Row(
+    Column(
         modifier = Modifier
+            .weight(1f)
             .background(
                 color = if (selected) MaterialTheme.colorScheme.surface.copy(alpha = 0.55f) else androidx.compose.ui.graphics.Color.Transparent,
                 shape = RoundedCornerShape(14.dp),
             )
             .clickable(onClick = onClick)
-            .padding(horizontal = 10.dp, vertical = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
+            .padding(horizontal = 4.dp, vertical = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {
         androidx.compose.runtime.CompositionLocalProvider(
             androidx.compose.material3.LocalContentColor provides iconTint,
@@ -106,6 +120,7 @@ private fun AppBottomNavItem(
             color = textColor,
             style = MaterialTheme.typography.labelMedium,
             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
+            maxLines = 1,
         )
     }
 }

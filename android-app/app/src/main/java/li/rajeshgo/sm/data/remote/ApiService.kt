@@ -221,6 +221,40 @@ interface ApiService {
         @Query("before") before: String?,
     ): li.rajeshgo.sm.data.model.AgentHistoryResponse
 
+    /** The board (sm#1665): lanes, their tickets and the Board count. */
+    @GET("client/board")
+    suspend fun getBoard(): li.rajeshgo.sm.data.model.BoardResponse
+
+    @GET("client/board/badge")
+    suspend fun getBoardBadge(): li.rajeshgo.sm.data.model.BoardBadge
+
+    /** The owner saw the board: clears the Board count on web and phone. */
+    @POST("client/board/seen")
+    suspend fun markBoardSeen()
+
+    /** Reads GitHub now; the pass runs in the background. */
+    @POST("client/board/refresh")
+    suspend fun refreshBoard()
+
+    /** The full new order of active lanes, rank 1 first. */
+    @PUT("client/board/order")
+    suspend fun putBoardOrder(@Body request: li.rajeshgo.sm.data.model.BoardOrderRequest): li.rajeshgo.sm.data.model.BoardResponse
+
+    @POST("client/board/lanes")
+    suspend fun addBoardLane(@Body request: li.rajeshgo.sm.data.model.BoardLaneRequest): li.rajeshgo.sm.data.model.BoardLaneAdded
+
+    @DELETE("client/board/lanes/{lane_id}")
+    suspend fun endBoardLane(@Path("lane_id") laneId: Long): li.rajeshgo.sm.data.model.BoardResponse
+
+    @GET("client/board/start-options")
+    suspend fun getBoardStartOptions(
+        @Query("repo") repo: String,
+        @Query("number") number: Long,
+    ): li.rajeshgo.sm.data.model.BoardStartOptions
+
+    @POST("client/board/start")
+    suspend fun startBoardTicket(@Body request: li.rajeshgo.sm.data.model.BoardStartRequest): li.rajeshgo.sm.data.model.BoardStarted
+
     /** Brings a stopped or retired agent back, as `sm restore` does. */
     @POST("sessions/{session_id}/restore")
     suspend fun restoreSession(@Path("session_id") sessionId: String): kotlinx.serialization.json.JsonObject

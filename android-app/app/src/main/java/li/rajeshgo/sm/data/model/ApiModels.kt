@@ -883,3 +883,165 @@ data class AgentWorkDoc(
     val state: String = "",
     @SerialName("reader_path") val readerPath: String = "",
 )
+
+/** `GET /client/board` (sm#1665 appendix F): lanes, their tickets, and the Board count. */
+@Serializable
+data class BoardResponse(
+    @SerialName("generated_at") val generatedAt: String = "",
+    val unseen: BoardUnseen = BoardUnseen(),
+    val repos: List<BoardRepo> = emptyList(),
+    val lanes: List<BoardLane> = emptyList(),
+    val other: List<BoardOtherGroup> = emptyList(),
+    @SerialName("start_defaults") val startDefaults: BoardStartDefaults = BoardStartDefaults(),
+)
+
+@Serializable
+data class BoardUnseen(
+    val count: Int = 0,
+    @SerialName("lane_ids") val laneIds: List<Long> = emptyList(),
+)
+
+@Serializable
+data class BoardRepo(
+    val repo: String = "",
+    @SerialName("last_ok_at") val lastOkAt: String? = null,
+    val stale: Boolean = false,
+    val error: String? = null,
+)
+
+@Serializable
+data class BoardLane(
+    val id: Long = 0,
+    val rank: Int = 0,
+    val goal: BoardGoal = BoardGoal(),
+    @SerialName("added_at") val addedAt: String = "",
+    @SerialName("added_by_name") val addedByName: String = "",
+    val counts: BoardCounts = BoardCounts(),
+    /** The lane has a board alert the owner has not seen. */
+    val unseen: Boolean = false,
+    @SerialName("longest_chain") val longestChain: List<BoardRef> = emptyList(),
+    val stale: Boolean = false,
+    val cycles: List<List<BoardRef>> = emptyList(),
+    /** In row order: needs you, ready, in progress, blocked, then done. */
+    val tickets: List<BoardTicket> = emptyList(),
+    val changes: List<BoardChange> = emptyList(),
+)
+
+@Serializable
+data class BoardGoal(
+    val repo: String = "",
+    val number: Long = 0,
+    val title: String = "",
+    val url: String = "",
+)
+
+@Serializable
+data class BoardCounts(
+    @SerialName("needs_you") val needsYou: Int = 0,
+    val ready: Int = 0,
+    @SerialName("in_progress") val inProgress: Int = 0,
+    val blocked: Int = 0,
+    val done: Int = 0,
+)
+
+@Serializable
+data class BoardRef(val repo: String = "", val number: Long = 0)
+
+@Serializable
+data class BoardTicket(
+    val repo: String = "",
+    val number: Long = 0,
+    val title: String = "",
+    val url: String = "",
+    /** `needs_you`, `ready`, `in_progress`, `blocked` or `done`. */
+    val state: String = "blocked",
+    /** Done only: `completed`, `not_planned`, `duplicate` or `missing`. */
+    @SerialName("done_reason") val doneReason: String? = null,
+    @SerialName("needs_you") val needsYou: BoardNeedsYou? = null,
+    @SerialName("waits_on") val waitsOn: List<BoardWaitsOn> = emptyList(),
+    val holder: BoardHolder? = null,
+    val prs: List<BoardPr> = emptyList(),
+    /** Lane rows only; tickets outside every lane have none. */
+    val chain: Int? = null,
+    @SerialName("on_longest_chain") val onLongestChain: Boolean = false,
+    @SerialName("sub_issues_done") val subIssuesDone: Boolean = false,
+    @SerialName("also_in") val alsoIn: List<BoardAlsoIn> = emptyList(),
+    /** `working_while_blocked`, `holder_stopped`, `merged_not_closed`, `cycle` or `stale`. */
+    val warnings: List<String> = emptyList(),
+    val new: Boolean = false,
+    @SerialName("closed_at") val closedAt: String? = null,
+)
+
+@Serializable
+data class BoardNeedsYou(
+    /** `message` or `review`. */
+    val kind: String = "",
+    val text: String = "",
+    /** A path on the sm host: `/messages/<id>` or the doc's page. */
+    val url: String = "",
+)
+
+@Serializable
+data class BoardWaitsOn(val repo: String = "", val number: Long = 0, val state: String = "")
+
+@Serializable
+data class BoardHolder(
+    @SerialName("session_id") val sessionId: String = "",
+    val name: String = "",
+    /** `working`, `idle` or `stopped`. */
+    val state: String = "",
+)
+
+@Serializable
+data class BoardPr(val repo: String = "", val number: Long = 0, val state: String = "", val url: String = "")
+
+@Serializable
+data class BoardAlsoIn(@SerialName("lane_id") val laneId: Long = 0, val rank: Int = 0)
+
+@Serializable
+data class BoardChange(val ts: String = "", val kind: String = "", val text: String = "")
+
+@Serializable
+data class BoardOtherGroup(val repo: String = "", val tickets: List<BoardTicket> = emptyList())
+
+@Serializable
+data class BoardStartDefaults(
+    val provider: String = "claude",
+    val model: String? = null,
+    @SerialName("reasoning_effort") val reasoningEffort: String = "high",
+)
+
+@Serializable
+data class BoardBadge(val count: Int = 0)
+
+@Serializable
+data class BoardOrderRequest(@SerialName("lane_ids") val laneIds: List<Long>)
+
+@Serializable
+data class BoardLaneRequest(val repo: String, val number: Long)
+
+@Serializable
+data class BoardLaneAdded(val message: String = "")
+
+/** `GET /client/board/start-options`: the checkout, name and brief Start fills in. */
+@Serializable
+data class BoardStartOptions(
+    @SerialName("working_dir") val workingDir: String = "",
+    val name: String = "",
+    val brief: String = "",
+)
+
+@Serializable
+data class BoardStartRequest(
+    val repo: String,
+    val number: Long,
+    /** `claude` or `codex-fork`. */
+    val provider: String,
+    val model: String? = null,
+    @SerialName("reasoning_effort") val reasoningEffort: String? = null,
+    val name: String? = null,
+    val brief: String? = null,
+)
+
+@Serializable
+data class BoardStarted(@SerialName("session_id") val sessionId: String = "", val name: String = "")

@@ -498,6 +498,43 @@ class SessionManagerRepository(
         executeReadRequest(baseUrl, token) { it.getInbox(filter) }
     }
 
+    suspend fun fetchBoard(baseUrl: String, token: String): li.rajeshgo.sm.data.model.BoardResponse = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getBoard() }
+    }
+
+    suspend fun fetchBoardBadge(baseUrl: String, token: String): li.rajeshgo.sm.data.model.BoardBadge = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getBoardBadge() }
+    }
+
+    suspend fun markBoardSeen(baseUrl: String, token: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).markBoardSeen() }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun refreshBoard(baseUrl: String, token: String): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).refreshBoard() }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun reorderBoard(baseUrl: String, token: String, laneIds: List<Long>): Result<li.rajeshgo.sm.data.model.BoardResponse> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).putBoardOrder(li.rajeshgo.sm.data.model.BoardOrderRequest(laneIds)) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun addBoardLane(baseUrl: String, token: String, repo: String, number: Long): Result<li.rajeshgo.sm.data.model.BoardLaneAdded> = withContext(Dispatchers.IO) {
+        // Adding a lane reads GitHub before it answers.
+        runCatching { api(baseUrl, token, readTimeoutSeconds = 90).addBoardLane(li.rajeshgo.sm.data.model.BoardLaneRequest(repo, number)) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun endBoardLane(baseUrl: String, token: String, laneId: Long): Result<li.rajeshgo.sm.data.model.BoardResponse> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).endBoardLane(laneId) }.mapFailure(::classifyWriteFailure)
+    }
+
+    suspend fun fetchBoardStartOptions(baseUrl: String, token: String, repo: String, number: Long): li.rajeshgo.sm.data.model.BoardStartOptions = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getBoardStartOptions(repo, number) }
+    }
+
+    suspend fun startBoardTicket(baseUrl: String, token: String, request: li.rajeshgo.sm.data.model.BoardStartRequest): Result<li.rajeshgo.sm.data.model.BoardStarted> = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token, readTimeoutSeconds = 120).startBoardTicket(request) }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun fetchGuestbook(baseUrl: String, token: String, repo: String?, before: Long?): li.rajeshgo.sm.data.model.GuestbookResponse = withContext(Dispatchers.IO) {
         executeReadRequest(baseUrl, token) { it.getGuestbook(repo, before) }
     }
