@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1710 — sm on the web</title>
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+<style>
+  /* Screen mockups use the proposed sm web palette (appendix A). Light by default; the memo's
+     dark toggle flips them, so each screen previews both themes. */
+  :root {
+    --m-bg:#F5F5F2; --m-panel:#FFFFFF; --m-panel2:#EEEEE9; --m-line:#E0E0D9;
+    --m-ink:#16171B; --m-ink2:#555864; --m-ink3:#8B8D96; --m-accent:#0B7A90; --m-sel:#E2F1F4;
+    --m-green:#15803D; --m-amber:#B45309; --m-mag:#A21CAF; --m-red:#BE123C;
+    --m-cyan:#0E7490; --m-slate:#64748B; --m-claude:#C2410C; --m-codex:#6D28D9;
+    --m-term:#0E0F14; --m-termink:#D7DAE3;
+  }
+  :root[data-theme="dark"] {
+    --m-bg:#09090D; --m-panel:#121219; --m-panel2:#1A1A23; --m-line:#2B2B37;
+    --m-ink:#F5F7FA; --m-ink2:#ADB2C2; --m-ink3:#777C8B; --m-accent:#5EE7FF; --m-sel:#143744;
+    --m-green:#4ADE80; --m-amber:#FBBF24; --m-mag:#F0ABFC; --m-red:#FB7185;
+    --m-cyan:#5EE7FF; --m-slate:#8B93A7; --m-claude:#FB923C; --m-codex:#A78BFA;
+    --m-term:#050507; --m-termink:#D7DAE3;
+  }
+  @media print { :root[data-theme="dark"] {
+    --m-bg:#F5F5F2; --m-panel:#FFFFFF; --m-panel2:#EEEEE9; --m-line:#E0E0D9;
+    --m-ink:#16171B; --m-ink2:#555864; --m-ink3:#8B8D96; --m-accent:#0B7A90; --m-sel:#E2F1F4;
+    --m-green:#15803D; --m-amber:#B45309; --m-mag:#A21CAF; --m-red:#BE123C;
+    --m-cyan:#0E7490; --m-slate:#64748B; --m-claude:#C2410C; --m-codex:#6D28D9; } }
+
+  .scrwrap { overflow-x: auto; margin: 1rem 0 .4rem; width: min(72rem, calc(100vw - 2rem)); position: relative; left: 50%; transform: translateX(-50%); }
+  .scr { min-width: 46rem; background: var(--m-bg); color: var(--m-ink); border: 1px solid var(--m-line);
+    border-radius: 10px; overflow: hidden; font: 12.5px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    display: grid; grid-template-columns: 8.2rem 1fr; }
+  .scr.pane { grid-template-columns: 8.2rem 1fr 21rem; }
+  .scr * { box-sizing: border-box; }
+  .scr code, .scr .mono { font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; background: none; padding: 0; }
+  .rail { background: var(--m-panel); border-right: 1px solid var(--m-line); padding: .7rem .5rem; display: flex; flex-direction: column; gap: .15rem; }
+  .rail .brand { font: 700 14px ui-monospace, Menlo, monospace; color: var(--m-accent); padding: 0 .5rem .6rem; }
+  .rail a { display: flex; justify-content: space-between; padding: .32rem .5rem; border-radius: 6px; color: var(--m-ink2); text-decoration: none; }
+  .rail a.on { background: var(--m-sel); color: var(--m-ink); font-weight: 600; }
+  .rail a b { font-weight: 600; font-size: 11px; color: var(--m-ink3); }
+  .rail a b.hot { color: var(--m-amber); }
+  .rail .grow { flex: 1; }
+  .main { min-width: 0; display: flex; flex-direction: column; }
+  .bar { display: flex; align-items: center; gap: .8rem; padding: .55rem .9rem; border-bottom: 1px solid var(--m-line); background: var(--m-panel); }
+  .bar h5 { margin: 0; font-size: 13.5px; font-weight: 650; }
+  .bar .crumb { color: var(--m-ink3); font-size: 12.5px; }
+  .bar .sp { flex: 1; }
+  .search { color: var(--m-ink3); border: 1px solid var(--m-line); border-radius: 6px; padding: .2rem .55rem; min-width: 11rem; }
+  .meter { white-space: nowrap; display: inline-flex; align-items: center; gap: .3rem; color: var(--m-ink2); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .meter i { display: inline-block; width: 2.4rem; height: 5px; border-radius: 3px; background: var(--m-panel2); position: relative; overflow: hidden; }
+  .meter i s { position: absolute; inset: 0 auto 0 0; background: var(--m-green); }
+  .btn { border: 1px solid var(--m-line); border-radius: 6px; padding: .22rem .6rem; color: var(--m-ink); background: var(--m-panel); white-space: nowrap; }
+  .btn.pri { background: var(--m-accent); border-color: var(--m-accent); color: var(--m-panel); font-weight: 600; }
+  .btn.sm { padding: .1rem .45rem; font-size: 11.5px; }
+  .body { padding: .8rem .9rem; display: flex; flex-direction: column; gap: .7rem; }
+  .sum { display: flex; gap: 1.1rem; color: var(--m-ink2); font-variant-numeric: tabular-nums; flex-wrap: wrap; }
+  .sum b { color: var(--m-ink); }
+  .grp { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--m-ink3); font-weight: 600; }
+  .cards { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: .5rem; }
+  .card { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; padding: .55rem .6rem; display: grid; grid-template-columns: 2.1rem 1fr; gap: .1rem .55rem; align-items: center; }
+  .card.sel { outline: 2px solid var(--m-accent); outline-offset: -1px; }
+  .card .nm { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .ln { grid-column: 2; font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .ring { grid-row: span 3; }
+  .ring { width: 2.1rem; height: 2.1rem; border-radius: 50%; display: grid; place-items: center; font-size: 10.5px; font-weight: 600; color: var(--m-ink2);
+    background: radial-gradient(closest-side, var(--m-panel) 76%, transparent 78%), conic-gradient(var(--rc) calc(var(--p) * 1%), var(--m-panel2) 0); }
+  .prov { font-size: 10.5px; font-weight: 600; }
+  .prov.cl { color: var(--m-claude); } .prov.cx { color: var(--m-codex); }
+  .tk { font: 11px ui-monospace, Menlo, monospace; color: var(--m-ink2); }
+  .ball { font-weight: 550; }
+  .ball::before { content: ""; display: inline-block; width: .5rem; height: .5rem; border-radius: 50%; margin-right: .35rem; background: currentColor; vertical-align: .02rem; }
+  .gr { color: var(--m-green); } .am { color: var(--m-amber); } .mg { color: var(--m-mag); } .rd { color: var(--m-red); } .cy { color: var(--m-cyan); } .sl { color: var(--m-slate); } .mu { color: var(--m-ink3); }
+  .chip { display: inline-block; font-size: 10.5px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; border-radius: 999px; padding: .08rem .45rem; background: color-mix(in srgb, currentColor 14%, transparent); }
+  /* board */
+  .lane { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; overflow: hidden; }
+  .lanehd { display: flex; align-items: center; gap: .6rem; padding: .5rem .7rem; border-bottom: 1px solid var(--m-line); }
+  .lanehd .rk { font: 700 11px ui-monospace, Menlo, monospace; color: var(--m-ink3); }
+  .lanehd .t { font-weight: 650; }
+  .prog { display: flex; height: 6px; width: 8rem; border-radius: 3px; overflow: hidden; background: var(--m-panel2); }
+  .prog s { display: block; }
+  .row { display: grid; grid-template-columns: 5.6rem minmax(0,1fr) 13rem 14rem; gap: .6rem; align-items: center; padding: .42rem .7rem; border-bottom: 1px solid var(--m-line); }
+  .row:last-child { border-bottom: 0; }
+  .row .ti { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .who { font-size: 11.5px; color: var(--m-ink2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .now { font-size: 11.5px; }
+  .strip { position: relative; height: 10px; border-radius: 3px; background: var(--m-panel2); overflow: hidden; }
+  .strip s { position: absolute; top: 0; bottom: 0; }
+  .sw { background: var(--m-green); } .sj { background: repeating-linear-gradient(135deg, var(--m-green) 0 3px, color-mix(in srgb, var(--m-green) 45%, transparent) 3px 6px); }
+  .sq { background: var(--m-amber); } .sy { background: var(--m-mag); } .sx { background: var(--m-red); }
+  .axis { display: flex; justify-content: space-between; font-size: 10px; color: var(--m-ink3); font-variant-numeric: tabular-nums; }
+  .fold { padding: .42rem .7rem; color: var(--m-ink2); font-size: 11.5px; border-top: 1px solid var(--m-line); }
+  /* queue */
+  .qhd { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: .5rem; }
+  .tile { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; padding: .5rem .6rem; }
+  .tile .k { font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--m-ink3); font-weight: 600; }
+  .tile .v { font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .slots { display: flex; gap: .2rem; margin-top: .3rem; }
+  .slots s { display: block; width: .8rem; height: .5rem; border-radius: 2px; background: var(--m-panel2); }
+  .slots s.u { background: var(--m-green); } .slots s.f { background: var(--m-amber); }
+  .insight { border: 1px solid color-mix(in srgb, var(--m-amber) 45%, var(--m-line)); background: color-mix(in srgb, var(--m-amber) 8%, var(--m-panel)); border-radius: 8px; padding: .55rem .7rem; display: flex; gap: .8rem; align-items: center; }
+  .gantt { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; padding: .5rem .7rem; }
+  .gr2 { display: grid; grid-template-columns: 1.3rem 12.5rem minmax(0,1fr) 8.5rem; gap: .5rem; align-items: center; padding: .22rem 0; }
+  .gr2 .pos { color: var(--m-ink3); font-variant-numeric: tabular-nums; text-align: right; }
+  .gr2 .lb { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .gr2 .rt { font-size: 11.5px; text-align: right; font-variant-numeric: tabular-nums; }
+  .sub { font-size: 10.5px; color: var(--m-ink3); }
+  /* pane */
+  .side { border-left: 1px solid var(--m-line); background: var(--m-panel); display: flex; flex-direction: column; min-width: 0; }
+  .side .hd { padding: .65rem .8rem; border-bottom: 1px solid var(--m-line); display: grid; grid-template-columns: 2.6rem 1fr; gap: .1rem .6rem; align-items: center; }
+  .side .hd .ring { width: 2.6rem; height: 2.6rem; grid-row: span 2; font-size: 12px; }
+  .acts { display: flex; gap: .35rem; padding: .5rem .8rem; border-bottom: 1px solid var(--m-line); flex-wrap: wrap; }
+  .tabs { display: flex; gap: 1rem; padding: .45rem .8rem 0; border-bottom: 1px solid var(--m-line); }
+  .tabs span { padding-bottom: .38rem; color: var(--m-ink3); box-shadow: inset 0 -2px 0 transparent; }
+  .tabs span.on { color: var(--m-ink); font-weight: 600; box-shadow: inset 0 -2px 0 var(--m-accent); }
+  .term { margin: .6rem .8rem; background: var(--m-term); color: var(--m-termink); border-radius: 6px; padding: .55rem .65rem; font: 10.8px/1.45 ui-monospace, Menlo, monospace; white-space: pre-wrap; }
+  .term .d { color: #8a8f9c; } .term .p { color: #9fb7ff; } .term .y { color: #e8c15a; } .term .gg { color: #57d38c; }
+  .keys { display: flex; gap: .3rem; padding: 0 .8rem .45rem; }
+  .keys span { border: 1px solid var(--m-line); border-radius: 4px; padding: 0 .35rem; font-size: 11px; color: var(--m-ink2); }
+  .msg { margin: 0 .8rem .7rem; border: 1px solid var(--m-line); border-radius: 6px; padding: .35rem .55rem; color: var(--m-ink3); display: flex; justify-content: space-between; }
+  /* start popover */
+  .pop { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.14); padding: .7rem .8rem; display: flex; flex-direction: column; gap: .55rem; }
+  .seg { display: inline-flex; border: 1px solid var(--m-line); border-radius: 7px; overflow: hidden; }
+  .seg span { padding: .22rem .8rem; color: var(--m-ink2); }
+  .seg span.on { background: var(--m-sel); color: var(--m-ink); font-weight: 600; }
+  .fld { display: grid; grid-template-columns: 5rem 1fr; gap: .5rem; align-items: center; }
+  .fld .l { color: var(--m-ink3); font-size: 11.5px; }
+  .inp { border: 1px solid var(--m-line); border-radius: 6px; padding: .22rem .5rem; background: var(--m-bg); }
+  .inp.ta { white-space: pre-wrap; font-size: 11.5px; line-height: 1.4; }
+  .ph { font: 11px ui-monospace, Menlo, monospace; color: var(--m-accent); }
+  .pop .seg { align-self: flex-start; }
+  .popgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; align-items: start; padding: .9rem; background: var(--m-bg); }
+  /* inbox */
+  .two { display: grid; grid-template-columns: 17rem 1fr; min-height: 0; }
+  .list { border-right: 1px solid var(--m-line); }
+  .it { padding: .5rem .8rem; border-bottom: 1px solid var(--m-line); display: flex; flex-direction: column; gap: .1rem; }
+  .it.sel { background: var(--m-sel); }
+  .it .top { display: flex; justify-content: space-between; gap: .5rem; }
+  .it .top b { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .it .pv { color: var(--m-ink2); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .reader { min-width: 0; display: flex; flex-direction: column; }
+  .rbar { display: flex; gap: .6rem; align-items: center; padding: .5rem .9rem; border-bottom: 1px solid var(--m-line); font-size: 12px; flex-wrap: wrap; }
+  .doc { padding: .9rem 1.4rem; font-family: Georgia, serif; font-size: 12.5px; line-height: 1.55; color: var(--m-ink); }
+  .doc h6 { font: 650 15px -apple-system, BlinkMacSystemFont, sans-serif; margin: 0 0 .35rem; }
+  .doc p { margin: .35rem 0; }
+  /* settings */
+  .set { display: grid; grid-template-columns: 9rem 1fr; }
+  .setnav { border-right: 1px solid var(--m-line); padding: .7rem .5rem; display: flex; flex-direction: column; gap: .1rem; }
+  .setnav span { padding: .28rem .5rem; border-radius: 6px; color: var(--m-ink2); }
+  .setnav span.on { background: var(--m-sel); color: var(--m-ink); font-weight: 600; }
+  .setbody { padding: .8rem 1rem; display: flex; flex-direction: column; gap: .8rem; }
+  .sgrp { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; }
+  .sgrp > div { display: grid; grid-template-columns: 9.5rem 1fr; gap: .8rem; padding: .5rem .75rem; border-bottom: 1px solid var(--m-line); align-items: center; }
+  .sgrp > div:last-child { border-bottom: 0; }
+  .sgrp .l { color: var(--m-ink2); }
+  .sgrp h6 { margin: 0; padding: .5rem .75rem; font-size: 12px; border-bottom: 1px solid var(--m-line); }
+  .scen { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .78rem; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); margin-top: 2.2rem; }
+  .scen + h3 { margin-top: .2rem; }
+  ul.does { margin: .3rem 0 0; padding-left: 1.2rem; }
+  ul.does li { margin: .15rem 0; }
+  .swatch { display:inline-block; width:.75em; height:.75em; border-radius:50%; vertical-align:-.03em; margin-right:.3em; }
+  @media print { .scrwrap { overflow: visible; width: 100%; left: 0; transform: none; } .scr { min-width: 0; font-size: 10.5px; } }
+</style>
+
+<h1>1710 — sm on the web: one page for everything</h1>
+<p class="sans"><small>Author: Claude (design) <code>sm-web-redesign-spec-author</code> · Ticket #1710 · 29 September 2026 · every screen below is drawn from live sm data at 5:25 pm PT that day</small></p>
+
+<h2>Memo</h2>
+
+<p><b>sm.rajeshgo.li becomes one page on the laptop that does everything the phone app and the Studio do.</b> A left-hand menu replaces the five tabs. A side panel opens any agent, doc, queue job or ticket without leaving the page. The page follows the Mac's light or dark setting. It keeps the phone app's look (its palette, context rings and cards) and adds what only a wide screen can show: timelines, two-pane reading, and a live terminal.</p>
+
+<p><b>One idea runs through every screen: colour tells you who has the ball.</b> The server already knows this. It is scattered across the agent state, queue jobs, Codex reviews and your inbox, and today you piece it together in your head. The redesign shows it as a single status per ticket and per agent:</p>
+
+<table>
+<thead><tr><th style="width:22%">Colour</th><th>Meaning</th><th style="width:38%">Example today at 5:25 pm</th></tr></thead>
+<tbody>
+<tr><td><span class="swatch" style="background:var(--m-green)"></span>Green</td><td>Moving: the agent is working, or its queue job is running.</td><td>#1856 tests running 1h 49m of a 3h limit</td></tr>
+<tr><td><span class="swatch" style="background:var(--m-amber)"></span>Amber</td><td>Waiting on the machine: a queue slot or a Codex review.</td><td>#1853 two jobs waiting 1h 55m for a slot</td></tr>
+<tr><td><span class="swatch" style="background:var(--m-mag)"></span>Magenta</td><td>Waiting on you.</td><td>None right now</td></tr>
+<tr><td><span class="swatch" style="background:var(--m-red)"></span>Red</td><td>Stalled: the ticket is in progress, but nothing is moving and nobody is being waited on.</td><td>None right now</td></tr>
+<tr><td><span class="swatch" style="background:var(--m-cyan)"></span>Cyan</td><td>Ready to start.</td><td>#1706 (not in a lane)</td></tr>
+<tr><td><span class="swatch" style="background:var(--m-slate)"></span>Slate</td><td>Blocked by another ticket. This is expected for future work, so it stays quiet.</td><td>#1858 waits on #1844, #1854, #1855, #1856</td></tr>
+</tbody>
+</table>
+
+<p>The seven scenarios below each show one screen. The decisions you need to make are at the end of the memo.</p>
+
+<!-- ============ Scenario 1 ============ -->
+<p class="scen">Scenario 1 · You sit down at the laptop</p>
+<h3>“What is everyone doing?”</h3>
+<p>The Agents page opens by default. Each agent is a card with the phone app's context ring and one coloured line saying who has the ball. The top bar always shows the Mac's load and the queue, so you never need a separate page to know whether the machine is busy.</p>
+
+<div class="scrwrap"><div class="scr">
+  <nav class="rail"><div class="brand">sm</div>
+    <a class="on">Agents <b>14</b></a><a>Board <b>1</b></a><a>Queue <b class="hot">6</b></a><a>Inbox</a><a>Analytics</a><a>History</a><div class="grow"></div><a>Settings</a></nav>
+  <div class="main">
+    <div class="bar"><h5>Agents</h5><span class="search">Search or jump… ⌘K</span><span class="sp"></span>
+      <span class="meter">CPU <i><s style="width:15%"></s></i> 15%</span><span class="meter">Memory <i><s style="width:17%"></s></i> 212 GB free</span><span class="meter">Queue 4 running · 6 waiting</span><span class="btn pri">New agent</span></div>
+    <div class="body">
+      <div class="sum"><span><b>3</b> working</span><span><b>4</b> jobs running</span><span><b>3</b> agents waiting on the queue</span><span><b>1</b> waiting on review</span><span><b>0</b> need you</span><span class="mu"><b>6</b> idle</span></div>
+      <div class="grp">fractal-algo-rust</div>
+      <div class="cards">
+        <div class="card"><div class="ring" style="--p:82;--rc:var(--m-red)">82</div><div class="nm">1848-purchase-coordination</div><div class="ln"><span class="prov cx">CODEX</span> <span class="tk">#1848 +1</span></div><div class="ln ball gr">Tests running 35m</div></div>
+        <div class="card"><div class="ring" style="--p:18;--rc:var(--m-green)">18</div><div class="nm">1854-engineer</div><div class="ln"><span class="prov cl">CLAUDE</span> <span class="tk">#1854</span></div><div class="ln ball gr">2 running · 3 waiting 2h 23m</div></div>
+        <div class="card"><div class="ring" style="--p:45;--rc:var(--m-amber)">45</div><div class="nm">1856-engineer</div><div class="ln"><span class="prov cl">CLAUDE</span> <span class="tk">#1856 +1</span></div><div class="ln ball gr">Tests running 1h 49m of 3h</div></div>
+        <div class="card"><div class="ring" style="--p:35;--rc:var(--m-green)">35</div><div class="nm">1853-engineer</div><div class="ln"><span class="prov cl">CLAUDE</span> <span class="tk">#1853</span></div><div class="ln ball am">2 jobs waiting 1h 55m for a slot</div></div>
+        <div class="card"><div class="ring" style="--p:29;--rc:var(--m-green)">29</div><div class="nm">1844-engineer</div><div class="ln"><span class="prov cl">CLAUDE</span> <span class="tk">#1844</span></div><div class="ln ball am">Job waiting 1h 31m · 6th in line</div></div>
+        <div class="card"><div class="ring" style="--p:32;--rc:var(--m-green)">32</div><div class="nm">1857-engineer</div><div class="ln"><span class="prov cx">CODEX</span> <span class="tk">no ticket</span></div><div class="ln ball mu">Idle 25m</div></div>
+      </div>
+      <div class="grp">session-manager</div>
+      <div class="cards">
+        <div class="card"><div class="ring" style="--p:14;--rc:var(--m-green)">14</div><div class="nm">session-manager-1680</div><div class="ln"><span class="prov cl">CLAUDE</span> <span class="tk">#1680</span></div><div class="ln ball gr">Working 3m</div></div>
+        <div class="card"><div class="ring" style="--p:29;--rc:var(--m-green)">29</div><div class="nm">sm-1684-engineer</div><div class="ln"><span class="prov cl">CLAUDE</span> <span class="tk">#1684 · PR #1711</span></div><div class="ln ball am">Codex review requested 2m ago</div></div>
+        <div class="card"><div class="ring" style="--p:68;--rc:var(--m-amber)">68</div><div class="nm">sm-1683-engineer</div><div class="ln"><span class="prov cx">CODEX</span> <span class="tk">no ticket</span></div><div class="ln ball mu">Idle 6m</div></div>
+      </div>
+    </div>
+  </div>
+</div></div>
+<ul class="does">
+<li>The ring is the phone's context ring: green at empty, amber at half, red when full. 1848-purchase-coordination at 82% is the one you would hand off.</li>
+<li>Cards sort by who has the ball within each repo. Idle agents without a ticket sink to the bottom and fade.</li>
+<li>The left menu marks the page you are on with a filled background. Nothing changes size, so the tabs no longer jump.</li>
+</ul>
+
+<!-- ============ Scenario 2 ============ -->
+<p class="scen">Scenario 2 · Checking the critical path</p>
+<h3>“Is Iter8 moving, or is it stuck?”</h3>
+<p>Today's board shows all five in-progress Iter8 tickets with their agent as “idle”. That is technically true and tells you nothing. The redesigned row gives each ticket a <b>ticket clock</b>: its last three hours as a coloured strip, plus one line saying what is happening now.</p>
+
+<div class="scrwrap"><div class="scr">
+  <nav class="rail"><div class="brand">sm</div>
+    <a>Agents <b>14</b></a><a class="on">Board <b>1</b></a><a>Queue <b class="hot">6</b></a><a>Inbox</a><a>Analytics</a><a>History</a><div class="grow"></div><a>Settings</a></nav>
+  <div class="main">
+    <div class="bar"><h5>Board</h5><span class="crumb">3 lanes · read from GitHub 22s ago</span><span class="sp"></span><span class="btn">Add lane</span></div>
+    <div class="body">
+      <div class="lane">
+        <div class="lanehd"><span class="rk">1</span><span class="t">fractal-algo-rust #1859 · Iter8 readout</span><span class="sp" style="flex:1"></span>
+          <span class="prog"><s class="sw" style="width:23%"></s><s style="width:39%;background:var(--m-green);opacity:.45"></s><s style="width:38%"></s></span><span class="mu" style="font-size:11.5px">3 done · 5 in progress · 5 blocked</span></div>
+        <div class="row" style="padding-block:.25rem"><span></span><span class="sub" style="white-space:nowrap">Critical path: #1848 → #1861 → #1855 → #1858 → #1859</span><div class="axis"><span>2:25</span><span>3:25</span><span>4:25</span><span>now</span></div><span></span></div>
+        <div class="row"><span class="chip gr">Moving</span><span class="ti"><span class="tk">#1848</span> Databento purchase: 55 stocks, euro, gold, yen</span><div class="strip"><s class="sw" style="left:0;width:80.6%"></s><s class="sj" style="left:80.6%;width:19.4%"></s></div><span class="now gr">Tests running 35m</span></div>
+        <div class="row"><span class="chip gr">Moving</span><span class="ti"><span class="tk">#1854</span> Do other markets help in training? Mac probe</span><div class="strip"><s class="sw" style="left:0;width:22.2%"></s><s class="sq" style="left:22.2%;width:24.5%"></s><s class="sj" style="left:46.7%;width:53.3%"></s></div><span class="now gr">2 running · 3 waiting 2h 23m</span></div>
+        <div class="row"><span class="chip gr">Moving</span><span class="ti"><span class="tk">#1856</span> The two-turn head, loss and selection</span><div class="strip"><s class="sw" style="left:0;width:40%"></s><s class="sj" style="left:40%;width:60%"></s></div><span class="now gr">Tests running 1h 49m of 3h</span></div>
+        <div class="row"><span class="chip am">Queue</span><span class="ti"><span class="tk">#1853</span> Targets by expected value on iteration 7's model</span><div class="strip"><s class="sw" style="left:0;width:36.1%"></s><s class="sq" style="left:36.1%;width:63.9%"></s></div><span class="now am">2 jobs waiting 1h 55m for a slot</span></div>
+        <div class="row"><span class="chip am">Queue</span><span class="ti"><span class="tk">#1844</span> Chains for every view already on disk</span><div class="strip"><s class="sw" style="left:0;width:61.7%"></s><s class="sq" style="left:61.7%;width:38.3%"></s></div><span class="now am">Job waiting 1h 31m · 6th in line</span></div>
+        <div class="fold"><span class="chip sl">Blocked</span>&nbsp; 5 tickets: #1861, #1855, #1858, #1860, #1859 wait on the five above &nbsp;›&nbsp;&nbsp;&nbsp; <span class="mu">Done 3 ›</span></div>
+      </div>
+      <div class="lane"><div class="lanehd"><span class="rk">2</span><span class="t">session-manager #1665 · sm board</span><span style="flex:1"></span><span class="tk">#1684</span>&nbsp;<span class="am" style="font-size:11.5px">● Codex review on PR #1711, 2m</span></div></div>
+      <div class="lane"><div class="lanehd"><span class="rk">3</span><span class="t">session-manager #1662 · Analytics redesign</span><span style="flex:1"></span><span class="tk">#1680</span>&nbsp;<span class="gr" style="font-size:11.5px">● Agent working 3m</span></div></div>
+      <div class="sub"><span class="swatch" style="background:var(--m-green)"></span>agent working &nbsp; <span class="swatch" style="background:var(--m-green);opacity:.5"></span>queue job running &nbsp; <span class="swatch" style="background:var(--m-amber)"></span>waiting on queue or review &nbsp; <span class="swatch" style="background:var(--m-mag)"></span>waiting on you &nbsp; <span class="swatch" style="background:var(--m-red)"></span>nothing moving</div>
+    </div>
+  </div>
+</div></div>
+<ul class="does">
+<li>A glance answers the question: three tickets are moving and two are waiting in the queue. #1854 waited 47 minutes before its first job started, which the strip shows as the amber block.</li>
+<li>Blocked tickets fold into one line naming what they wait on. Lanes with a single live ticket shrink to their header row, which still shows the ball.</li>
+<li>The ticket turns red (stalled) after 15 minutes with nothing moving. That is the case you most need to catch and currently cannot see.</li>
+</ul>
+
+<!-- ============ Scenario 3 ============ -->
+<p class="scen">Scenario 3 · Following up on the amber</p>
+<h3>“Why are my jobs waiting when the Mac is idle?”</h3>
+<p>Clicking an amber line opens the Queue page. This is the phone app's Queue screen laid out as a timeline, so wait time and run time are visible as lengths rather than numbers. Today it shows something the current web cannot: six background jobs are waiting for one of the two background slots while the Mac runs at 15% CPU with 212 GB of memory free.</p>
+
+<div class="scrwrap"><div class="scr">
+  <nav class="rail"><div class="brand">sm</div>
+    <a>Agents <b>14</b></a><a>Board <b>1</b></a><a class="on">Queue <b class="hot">6</b></a><a>Inbox</a><a>Analytics</a><a>History</a><div class="grow"></div><a>Settings</a></nav>
+  <div class="main">
+    <div class="bar"><h5>Queue</h5><span class="crumb">studio.local · memory pressure normal</span><span class="sp"></span><span class="btn">Mac usage over time</span></div>
+    <div class="body">
+      <div class="qhd">
+        <div class="tile"><div class="k">Tests</div><div class="v">2 <span class="mu" style="font-size:12px">of 6</span></div><div class="slots"><s class="u"></s><s class="u"></s><s></s><s></s><s></s><s></s></div></div>
+        <div class="tile" style="border-color:color-mix(in srgb,var(--m-amber) 50%,var(--m-line))"><div class="k">Background</div><div class="v am">2 <span style="font-size:12px">of 2 · 6 waiting</span></div><div class="slots"><s class="f"></s><s class="f"></s></div></div>
+        <div class="tile"><div class="k">Perf</div><div class="v">0 <span class="mu" style="font-size:12px">of 1</span></div><div class="slots"><s></s></div></div>
+        <div class="tile"><div class="k">Mac</div><div class="v">15% <span class="mu" style="font-size:12px">CPU · 212 GB free</span></div><div class="slots"><s class="u"></s><s></s><s></s><s></s><s></s><s></s></div></div>
+      </div>
+      <div class="insight"><span class="am" style="font-size:18px">⌛</span><div style="flex:1"><b>The background limit is holding jobs back.</b> In the last 24 hours the queue's limits held jobs for 26.2 hours in total, and the Mac had room to run 49% of that. Background jobs peak at 119 GB each (95th percentile), which is why the limit is 2.</div><span class="btn">Queue limits…</span></div>
+      <div class="gantt">
+        <div class="gr2"><span></span><span class="grp">Running</span><div class="axis"><span>2:25</span><span>3:25</span><span>4:25</span><span>now</span></div><span></span></div>
+        <div class="gr2"><span></span><span class="lb">1856-pilot-mac <span class="sub">tests</span></span><div class="strip"><s class="sj" style="left:40%;width:60%"></s></div><span class="rt">1h 49m of 3h</span></div>
+        <div class="gr2"><span></span><span class="lb">1854-es-with <span class="sub">background</span></span><div class="strip"><s class="sq" style="left:20.6%;width:26.1%"></s><s class="sj" style="left:46.7%;width:53.3%"></s></div><span class="rt">1h 35m · waited 47m</span></div>
+        <div class="gr2"><span></span><span class="lb">1854-es-without <span class="sub">background</span></span><div class="strip"><s class="sq" style="left:20.6%;width:41.1%"></s><s class="sj" style="left:61.7%;width:38.3%"></s></div><span class="rt">1h 9m · waited 1h 14m</span></div>
+        <div class="gr2"><span></span><span class="lb">1848-remaining-stocks… <span class="sub">tests</span></span><div class="strip"><s class="sj" style="left:80.6%;width:19.4%"></s></div><span class="rt">35m of 8h</span></div>
+        <div class="gr2" style="margin-top:.35rem"><span></span><span class="grp">Waiting · in start order</span><span class="sub">all six wait for a background slot · lane 1 (Iter8)</span><span></span></div>
+        <div class="gr2"><span class="pos">1</span><span class="lb">1854-ym-with</span><div class="strip"><s class="sq" style="left:20.6%;width:79.4%"></s></div><span class="rt am">2h 23m</span></div>
+        <div class="gr2"><span class="pos">2</span><span class="lb">1854-ym-without</span><div class="strip"><s class="sq" style="left:20.6%;width:79.4%"></s></div><span class="rt am">2h 23m</span></div>
+        <div class="gr2"><span class="pos">3</span><span class="lb">1854-measure</span><div class="strip"><s class="sq" style="left:20.6%;width:79.4%"></s></div><span class="rt am">2h 23m</span></div>
+        <div class="gr2"><span class="pos">4</span><span class="lb">1853-ev-es-ym</span><div class="strip"><s class="sq" style="left:35.9%;width:64.1%"></s></div><span class="rt am">1h 55m</span></div>
+        <div class="gr2"><span class="pos">5</span><span class="lb">1853-ev-nq1m</span><div class="strip"><s class="sq" style="left:35.9%;width:64.1%"></s></div><span class="rt am">1h 55m</span></div>
+        <div class="gr2"><span class="pos">6</span><span class="lb">1844-nq1m-census</span><div class="strip"><s class="sq" style="left:49.4%;width:50.6%"></s></div><span class="rt am">1h 31m · gives up in 4h 29m</span></div>
+      </div>
+      <div class="sub">Clicking a row opens the job in the side panel, with the same actions as the phone: Start now (with its memory check), Cancel with a note, Follow, Ask the agent, and the last 40 log lines. The line “14 stopped in the last 24h ›” links to Analytics.</div>
+    </div>
+  </div>
+</div></div>
+<ul class="does">
+<li>The page keeps the phone's facts (slots by type, start order, the reason each job waits) and adds the timeline, which only fits on a wide screen.</li>
+<li>The insight card uses the “Held back?” numbers the phone already shows under Analytics. It appears on the Queue page only when a limit is costing you time. It points to a Queue limits setting (decision 5).</li>
+<li>Jobs have no drag-to-reorder. Lane rank on the Board stays the one control for queue order, as the board memo decided.</li>
+</ul>
+
+<!-- ============ Scenario 4 ============ -->
+<p class="scen">Scenario 4 · Starting the next ticket</p>
+<h3>“Start #1706.”</h3>
+<p>Today, Start opens a six-field form. In the redesign it opens a small popover: pick Claude or Codex and press Start. Your defaults fill in the model, effort, workspace, name and first message, and each sits behind a “Change” link. The first message comes from a template you edit once in Settings.</p>
+
+<div class="scrwrap"><div class="scr" style="grid-template-columns:1fr">
+  <div class="popgrid">
+    <div>
+      <div class="sub" style="margin-bottom:.35rem">As it opens: two clicks to start</div>
+      <div class="pop">
+        <div style="display:flex;justify-content:space-between;align-items:center"><b>Start #1706</b><span class="chip cy">Ready</span></div>
+        <div class="mu" style="font-size:11.5px">Board Start preselects Fable: start_defaults model never matches the Claude catalog</div>
+        <div class="seg"><span class="on">Claude</span><span>Codex</span></div>
+        <div style="font-size:12px">Opus 1M · high effort · ~/projects/session-manager <span class="ac" style="color:var(--m-accent)">Change</span></div>
+        <div style="font-size:12px" class="mu">Named <span class="tk">session-manager-1706</span> · first message from your template <span style="color:var(--m-accent)">Preview</span></div>
+        <div style="display:flex;gap:.4rem;justify-content:flex-end"><span class="btn">Cancel</span><span class="btn pri">Start</span></div>
+      </div>
+    </div>
+    <div>
+      <div class="sub" style="margin-bottom:.35rem">After “Change”: everything, still one panel</div>
+      <div class="pop">
+        <div class="seg"><span class="on">Claude</span><span>Codex</span></div>
+        <div class="fld"><span class="l">Model</span><span class="inp">Opus 1M ▾</span></div>
+        <div class="fld"><span class="l">Effort</span><span class="seg"><span>low</span><span>medium</span><span class="on">high</span><span>max</span></span></div>
+        <div class="fld"><span class="l">Name</span><span class="inp mono">session-manager-1706</span></div>
+        <div class="fld" style="align-items:start"><span class="l">First message</span><span class="inp ta">Work ticket #1706 in rajeshgoli/session-manager: Board Start preselects Fable…
+https://github.com/rajeshgoli/session-manager/issues/1706
+
+You already hold the claim on #1706. Run `sm ticket 1706 --setup-worktree`…</span></div>
+        <div style="display:flex;gap:.4rem;justify-content:flex-end"><span class="btn">Cancel</span><span class="btn pri">Start</span></div>
+      </div>
+    </div>
+  </div>
+</div></div>
+<ul class="does">
+<li>Claude defaults to Opus 1M at high effort, the board memo's choice. Today the web preselects Fable, the most expensive model; that is bug #1706, and saved defaults remove the cause.</li>
+<li>The same popover serves “New agent” in the top bar, except that it asks for a workspace and has no ticket.</li>
+</ul>
+
+<!-- ============ Scenario 5 ============ -->
+<p class="scen">Scenario 5 · Looking over an agent's shoulder</p>
+<h3>“What is 1854-engineer actually doing?”</h3>
+<p>Clicking a card opens the agent in the side panel. The live terminal is the first tab, and you can type into it. <b>Open in Claude</b> opens the agent's claude.ai session in its own browser tab, and later clicks reuse that tab. The side panel cannot embed claude.ai because claude.ai refuses to load inside another site's page (it sends <code>X-Frame-Options: SAMEORIGIN</code>). The terminal covers the same need and never leaves the page.</p>
+
+<div class="scrwrap"><div class="scr pane">
+  <nav class="rail"><div class="brand">sm</div>
+    <a class="on">Agents <b>14</b></a><a>Board <b>1</b></a><a>Queue <b class="hot">6</b></a><a>Inbox</a><a>Analytics</a><a>History</a><div class="grow"></div><a>Settings</a></nav>
+  <div class="main">
+    <div class="bar"><h5>Agents</h5><span class="sp"></span><span class="btn pri">New agent</span></div>
+    <div class="body">
+      <div class="grp">fractal-algo-rust</div>
+      <div class="cards" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+        <div class="card"><div class="ring" style="--p:82;--rc:var(--m-red)">82</div><div class="nm">1848-purchase-coordination</div><div class="ln"><span class="prov cx">CODEX</span> <span class="tk">#1848 +1</span></div><div class="ln ball gr">Tests running 35m</div></div>
+        <div class="card sel"><div class="ring" style="--p:18;--rc:var(--m-green)">18</div><div class="nm">1854-engineer</div><div class="ln"><span class="prov cl">CLAUDE</span> <span class="tk">#1854</span></div><div class="ln ball gr">2 running · 3 waiting</div></div>
+        <div class="card"><div class="ring" style="--p:45;--rc:var(--m-amber)">45</div><div class="nm">1856-engineer</div><div class="ln"><span class="prov cl">CLAUDE</span> <span class="tk">#1856 +1</span></div><div class="ln ball gr">Tests running 1h 49m</div></div>
+        <div class="card"><div class="ring" style="--p:35;--rc:var(--m-green)">35</div><div class="nm">1853-engineer</div><div class="ln"><span class="prov cl">CLAUDE</span> <span class="tk">#1853</span></div><div class="ln ball am">2 jobs waiting 1h 55m</div></div>
+      </div>
+    </div>
+  </div>
+  <aside class="side">
+    <div class="hd"><div class="ring" style="--p:18;--rc:var(--m-green)">18%</div><b>1854-engineer</b><span class="sub">Claude · Opus 1M · high · #1854 · idle since 3:05 pm</span></div>
+    <div class="acts"><span class="btn pri">Open in Claude ↗</span><span class="btn">Follow</span><span class="btn">Hand off</span><span class="btn">Clone</span><span class="btn">⋯</span></div>
+    <div class="tabs"><span class="on">Terminal</span><span>Work</span><span>Activity</span><span>Summary</span></div>
+    <div class="term"><span class="d">…</span>I'm idle until the queue starts them. When they finish, I'll post the result table and the gain / no-gain verdict on #1854.
+<span class="d">✻ Baked for 4s · done 3:05 PM</span>
+
+<span class="p">❯</span> ok, wait for the queue
+<span class="d">Opus 5.5 (1M context)</span>  <span class="gg">[███░░░░░░░░░░░░░]</span> <span class="d">18%</span>
+<span class="y">⏵⏵ auto mode on</span></div>
+    <div class="keys"><span>Esc</span><span>Tab</span><span>⇧Tab</span><span>↑</span><span>↓</span><span>Ctrl-C</span><span>/model</span></div>
+    <div class="msg"><span>Message 1854-engineer…</span><span>↵</span></div>
+  </aside>
+</div></div>
+<ul class="does">
+<li>The Work tab lists the ticket, PRs, docs, reviews and queue jobs (today's expandable card sections). Activity lists the last ten tool calls. Summary is the phone's “Summarize progress”.</li>
+<li>“Message” sends the text as an owner message, so it shows in the Inbox thread like a reply sent from the phone.</li>
+<li>The side panel handles docs, queue jobs, inbox threads and tickets the same way. Esc closes it, and every panel has its own link you can share.</li>
+</ul>
+
+<!-- ============ Scenario 6 ============ -->
+<p class="scen">Scenario 6 · Reading and answering</p>
+<h3>“Read the Iter8 plan and reply.”</h3>
+<p>On a wide screen the Inbox is a two-pane mail layout. The list stays on the left and the doc or thread opens on the right. The reader carries its route: a back arrow and the path “Inbox › 1843 — Iteration 8 plan”. A doc link opened from anywhere else gets the same bar, with a back link to sm.</p>
+
+<div class="scrwrap"><div class="scr">
+  <nav class="rail"><div class="brand">sm</div>
+    <a>Agents <b>14</b></a><a>Board <b>1</b></a><a>Queue <b class="hot">6</b></a><a class="on">Inbox</a><a>Analytics</a><a>History</a><div class="grow"></div><a>Settings</a></nav>
+  <div class="main">
+    <div class="two">
+      <div class="list">
+        <div class="bar" style="gap:.4rem"><span class="seg"><span class="on">Open</span><span>Docs</span><span>Done</span></span></div>
+        <div class="it sel"><div class="top"><b><span class="chip cy">Doc</span> 1843 — Iteration 8 plan</b><span class="sub">26m</span></div><div class="pv">Read · fractal-algo-rust · PR #1862 · 1857-engineer</div></div>
+        <div class="it"><div class="top"><b>1857-engineer</b><span class="sub">43m</span></div><div class="pv">You: Yes go ahead · 4 messages</div></div>
+        <div class="it"><div class="top"><b><span class="chip cy">Doc</span> 1651 — Context handoff</b><span class="sub">47m</span></div><div class="pv">Read · session-manager · PR #1704</div></div>
+        <div class="it"><div class="top"><b>1848-purchase-coordination</b><span class="sub">48m</span></div><div class="pv">You: Shows $35.41 remaining · 3 messages</div></div>
+        <div class="it"><div class="top"><b><span class="chip cy">Doc</span> Iteration 7 readout</b><span class="sub">1h 10m</span></div><div class="pv">Read · fractal-algo-rust · 1775-engineer</div></div>
+        <div class="it"><div class="top"><b>1854-engineer</b><span class="sub">2h 20m</span></div><div class="pv">You: CPU and memory right now are nearly full, so I guess…</div></div>
+      </div>
+      <div class="reader">
+        <div class="rbar"><span>←</span><span class="mu">Inbox ›</span><b>1843 — Iteration 8 plan</b><span class="sp" style="flex:1"></span><span class="inp" style="font-size:11px">rev 3ecfb6d (latest) ▾</span><span class="chip gr">PR #1862 merged</span><span class="btn sm">Review</span><span class="btn sm">↗</span></div>
+        <div class="doc"><h6>1843 — Iteration 8: predict two turns, choose the target by expected value, train on three and a half times the data</h6>
+        <p><b>Iteration 8 changes what the model is asked and what a trade does with the answer, and trains on about three and a half times iteration 7's data for less GPU money.</b> Iteration 7 forecasts where a leg turns about 0.10 nats better than the frequency table…</p>
+        <p class="mu" style="font-family:-apple-system,sans-serif;font-size:11.5px">The doc renders exactly as it does today, review bar and comments included. The shell adds only the bar above.</p></div>
+      </div>
+    </div>
+  </div>
+</div></div>
+
+<!-- ============ Scenario 7 ============ -->
+<p class="scen">Scenario 7 · Setting it once</p>
+<h3>“I want Opus by default, and a better first message.”</h3>
+<p>Settings brings over the phone's settings page and adds what the web needs. The settings are stored on the server, so the phone and the laptop share them. The only exception is theme, which is saved per browser.</p>
+
+<div class="scrwrap"><div class="scr">
+  <nav class="rail"><div class="brand">sm</div>
+    <a>Agents <b>14</b></a><a>Board <b>1</b></a><a>Queue <b class="hot">6</b></a><a>Inbox</a><a>Analytics</a><a>History</a><div class="grow"></div><a class="on">Settings</a></nav>
+  <div class="main">
+    <div class="set">
+      <div class="setnav"><span>Appearance</span><span class="on">New agents</span><span>Context handoff</span><span>Queue limits</span><span>Notifications</span><span>Devices &amp; access</span><span>About</span></div>
+      <div class="setbody">
+        <div class="sgrp"><h6>Defaults</h6>
+          <div><span class="l">Default agent</span><span class="seg" style="justify-self:start"><span class="on">Claude</span><span>Codex</span></span></div>
+          <div><span class="l">Claude</span><span>Opus 1M ▾ &nbsp; <span class="seg"><span>low</span><span>medium</span><span class="on">high</span><span>max</span></span></span></div>
+          <div><span class="l">Codex</span><span>Provider default ▾ &nbsp; <span class="seg"><span>medium</span><span class="on">high</span><span>xhigh</span></span></span></div>
+          <div><span class="l">Workspaces</span><span class="mono">~/projects/fractal-algo-rust · ~/projects/session-manager · ~/projects/codex-fork &nbsp;<span style="color:var(--m-accent)">Edit</span></span></div>
+        </div>
+        <div class="sgrp"><h6>First message when starting a ticket</h6>
+          <div style="align-items:start"><span class="l">Template<br><span class="ph">{ticket} {repo} {title} {url}</span></span><span class="inp ta">Work ticket {ticket} in {repo}: {title}
+{url}
+
+You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree` and work in the worktree it prints, then follow this repo's CLAUDE.md.</span></div>
+          <div><span class="l">Preview</span><span class="mu" style="font-size:11.5px">Work ticket #1706 in rajeshgoli/session-manager: Board Start preselects Fable…</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div></div>
+<p>The remaining sections: <b>Appearance</b> (System, Light, Dark). <b>Context handoff</b> (today's “Handoff defaults” button, moved here). <b>Queue limits</b> (slots per job type; decision 5). <b>Notifications</b> (which phone gets pushes, and a test push). <b>Devices &amp; access</b> (Studio SSH, enrolled phones, and revoking a device). <b>About</b> (server version and the latest app build).</p>
+
+<h3>Decisions</h3>
+<table>
+<thead><tr><th style="width:30%">Question</th><th>Recommendation</th><th style="width:28%">Why</th></tr></thead>
+<tbody>
+<tr><td>1. Adopt this direction: one page, left menu, side panel, colour meaning who has the ball?</td><td><b>Yes.</b> After you approve it, I write the build spec as appendices here and split it into tickets.</td><td>It answers each complaint in your list with one design rather than seven patches.</td></tr>
+<tr><td>2. Terminal in the browser?</td><td><b>Yes, full typing.</b> It is protected by the same Cloudflare login as the rest of the site, and only your Google account passes that login.</td><td>It is the one thing you can do at the Studio but not from the web today.</td></tr>
+<tr><td>3. Where do settings live?</td><td><b>On the server, shared with the phone.</b> They replace the <code>board.start_defaults</code> config entry. Theme stays per browser.</td><td>You set a default once, and it applies on every device.</td></tr>
+<tr><td>4. When is a ticket “stalled” (red)?</td><td><b>After 15 minutes in progress with nothing moving</b>: the agent is not working, no job is queued or running, no review is pending, and nothing waits on you.</td><td>Short enough to catch a stuck critical path, long enough to ignore a pause between turns.</td></tr>
+<tr><td>5. Should Settings let you change queue slot limits?</td><td><b>Yes, per job type, taking effect without a restart.</b> The Queue page links there only when a limit is holding work back.</td><td>Today the limit is a config edit and a restart. The 24-hour numbers say it cost real time.</td></tr>
+<tr><td>6. How is it built?</td><td><b>A single web app that sm-server serves, with no separate build step.</b> The phone keeps its current pages until the app moves over.</td><td><code>cargo build</code> and the restart script stay the only way to ship, and the app is not broken in the meantime.</td></tr>
+</tbody>
+</table>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p>This is the first revision.</p>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<h3>A. Palette and type</h3>
+<p>Dark keeps the phone app's palette (<code>android-app/…/ui/theme/Color.kt</code>), which today's web already mirrors (<code>owner_docs.rs</code>, <code>page_shell</code>). Light is new, with each status colour darkened until it reads on white. Every colour is a token with a light value and a dark value. The page follows <code>prefers-color-scheme</code> unless Settings › Appearance overrides it.</p>
+<table>
+<thead><tr><th>Token</th><th>Light</th><th>Dark</th><th>Use</th></tr></thead>
+<tbody>
+<tr><td>bg / panel / panel-2 / line</td><td>#F5F5F2 / #FFFFFF / #EEEEE9 / #E0E0D9</td><td>#09090D / #121219 / #1A1A23 / #2B2B37</td><td>Page, cards, fills, rules</td></tr>
+<tr><td>ink / ink-2 / ink-3</td><td>#16171B / #555864 / #8B8D96</td><td>#F5F7FA / #ADB2C2 / #777C8B</td><td>Text levels</td></tr>
+<tr><td>accent</td><td>#0B7A90</td><td>#5EE7FF</td><td>Brand, selection, primary buttons, links</td></tr>
+<tr><td>green / amber / magenta / red / cyan / slate</td><td>#15803D / #B45309 / #A21CAF / #BE123C / #0E7490 / #64748B</td><td>#4ADE80 / #FBBF24 / #F0ABFC / #FB7185 / #5EE7FF / #8B93A7</td><td>Who has the ball (memo table)</td></tr>
+<tr><td>claude / codex</td><td>#C2410C / #6D28D9</td><td>#FB923C / #A78BFA</td><td>Provider labels. Claude moves off magenta so it cannot be confused with “waiting on you”.</td></tr>
+</tbody>
+</table>
+<p>Type uses the Mac system face for the interface and SF Mono for ticket numbers, job labels and the terminal. The type scale is 11, 12.5, 13.5, 17 and 22 px. Numbers that line up in columns use tabular figures. Chips are filled with their status colour at 14% strength and have no border. A selected item gets a filled background, never a border or a change of weight, so nothing shifts when you select it. The context ring's colour is the phone's continuous blend from green at 0% through amber at 50% to red at 100% (<code>HandoffControls.kt</code>, <code>ContextHandoffStatus</code>).</p>
+
+<h3>B. Where each screen's data comes from</h3>
+<table>
+<thead><tr><th style="width:24%">Screen element</th><th>Source today</th><th style="width:28%">New server work</th></tr></thead>
+<tbody>
+<tr><td>Agent cards, rings, the ball line</td><td><code>GET /watch/state</code>: state, context_percent, claims, jobs, waiting_on (review, queue_job)</td><td>None for the cards.</td></tr>
+<tr><td>Ticket clock strip and “now” line</td><td>Queue job queued_at, started_at and finished_at, linked to tickets by <code>rank_tickets</code> (<code>queue.rs</code>, <code>queue_rank_tickets</code>). Agent working and waiting time per ticket from Analytics › Time (<code>analytics_time.rs</code>: model, tools, queue, review, you, idle, attributed to a ticket).</td><td>Add a per-ticket <code>clock</code> to <code>GET /client/board</code>: the current ball, when it started, and the last few hours as segments.</td></tr>
+<tr><td>Queue tiles, timeline, insight card</td><td><code>GET /client/queue</code>, <code>GET /client/queue/stats</code>, <code>GET /client/host-status</code></td><td>Let the browser login call these (today they accept only the phone's login). Add read and write for slot limits.</td></tr>
+<tr><td>Start popover</td><td><code>GET /client/board/start-options</code>, <code>GET /client/session-models</code>, <code>POST /client/board/start</code>; the brief text is in <code>board.rs</code> (<code>start_options_payload</code>)</td><td>An owner settings store (defaults and the message template) that the popover and the phone both read.</td></tr>
+<tr><td>Terminal tab</td><td>The phone's terminal socket (<code>/client/terminal</code>), which needs a phone device key</td><td>A browser attach ticket that is authorised by the Cloudflare login and restricted to the same site.</td></tr>
+<tr><td>Open in Claude</td><td><code>remote_control.url</code>, sent only to the phone (<code>claude_remote_control.rs</code>)</td><td>Include it in <code>/watch/state</code>.</td></tr>
+<tr><td>Inbox and reader</td><td><code>GET /inbox?format=json</code>, the thread page, and <code>/docs/…</code> as served today</td><td>A back bar on doc pages opened directly in a browser.</td></tr>
+</tbody>
+</table>
+
+<h3>C. How today's complaints map to the design</h3>
+<table>
+<thead><tr><th>Complaint</th><th>Answer</th></tr></thead>
+<tbody>
+<tr><td>Weak colour scheme, no light or dark mode</td><td>Appendix A: the phone palette plus a matched light palette, following the system setting.</td></tr>
+<tr><td>The highlighted tab jumps</td><td>Cause: the active tab gets a 2px underline that the others lack, so it is 2px taller (<code>owner_docs.rs</code>, <code>.tab.on</code>). The left menu marks selection with a fill instead.</td></tr>
+<tr><td>Start opens a huge form</td><td>Scenario 4.</td></tr>
+<tr><td>No place to set the default start message; no settings page</td><td>Scenario 7.</td></tr>
+<tr><td>The inbox belongs on a phone</td><td>Scenario 6: two panes.</td></tr>
+<tr><td>Watch shows “ctx 12%” instead of rings</td><td>Scenario 1.</td></tr>
+<tr><td>No attach or Claude link; <code>sm attach</code> is useless on the web</td><td>Scenario 5: terminal tab and Open in Claude.</td></tr>
+<tr><td>The reader has no back button and no sense of where you came from</td><td>Scenario 6: breadcrumb bar.</td></tr>
+<tr><td>Board colours and layout; agent status instead of task status</td><td>Scenario 2: ball colours and the ticket clock.</td></tr>
+<tr><td>No Queue page</td><td>Scenario 3.</td></tr>
+</tbody>
+</table>
+
+<h3>Z. FAQ</h3>
+<p><b>Why not embed claude.ai?</b> claude.ai sends <code>X-Frame-Options: SAMEORIGIN</code>, so browsers refuse to show it inside any other site. I checked this on 29 September 2026. Opening it in a reused tab is the closest you can get.</p>
+<p><b>Does the phone app change?</b> Not in this work. The phone keeps loading today's pages. A later pass can give the app the light theme and the ticket clock, since both come from the same server data.</p>
+<p><b>Why are the Iter8 strips only three hours long?</b> The window can be 3, 6 or 24 hours. Three hours fits today's example. In these mockups, the segment before each agent's first queued job is drawn from the agent's last recorded activity. The shipped version reads Analytics › Time for the exact split.</p>
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
