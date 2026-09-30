@@ -25,7 +25,10 @@ export function InboxPage({ openRef }) {
   const [filter, setFilter] = useState('open');
   const [data, error, reload] = usePoll(() => api(`/inbox?format=json&filter=${filter}`), 30000, [filter]);
   const rowRef = row => row.kind === 'doc' ? `doc:${row.url}` : `thread:${row.session_id}`;
-  const selected = data?.rows.find(row => rowRef(row) === openRef);
+  const selected = data?.rows.find(row => rowRef(row) === openRef || (
+    row.kind === 'doc' && openRef?.startsWith('doc:') &&
+    new URL(row.url, location.origin).pathname === new URL(openRef.slice(4), location.origin).pathname
+  ));
   const [busy, setBusy] = useState(false);
   const done = async () => {
     if (!selected || busy) return;
