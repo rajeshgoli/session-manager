@@ -260,13 +260,13 @@
 <tr><td><span class="swatch" style="background:var(--m-green)"></span>Green</td><td>Moving: the agent is working, or its queue job is running.</td><td>#1856 tests running 1h 49m of a 3h limit</td></tr>
 <tr><td><span class="swatch" style="background:var(--m-amber)"></span>Amber</td><td>Waiting on the machine: a queue slot or a Codex review.</td><td>#1853 two jobs waiting 1h 55m for a slot</td></tr>
 <tr><td><span class="swatch" style="background:var(--m-mag)"></span>Magenta</td><td>Waiting on you.</td><td>None right now</td></tr>
-<tr><td><span class="swatch" style="background:var(--m-red)"></span>Red</td><td>Stalled: the ticket is in progress, but nothing is moving and nobody is being waited on.</td><td>None right now</td></tr>
+<tr><td><span class="swatch" style="background:var(--m-red)"></span>Red</td><td>Stalled: the ticket is in progress, but nothing is moving and nobody is being waited on. This includes a <b>quiet job</b>: running, but no CPU, no GPU and no new log output for 20 minutes, which suggests it is hung.</td><td>None right now</td></tr>
 <tr><td><span class="swatch" style="background:var(--m-cyan)"></span>Cyan</td><td>Ready to start.</td><td>#1706 (not in a lane)</td></tr>
 <tr><td><span class="swatch" style="background:var(--m-slate)"></span>Slate</td><td>Blocked by another ticket. This is expected for future work, so it stays quiet.</td><td>#1858 waits on #1844, #1854, #1855, #1856</td></tr>
 </tbody>
 </table>
 
-<p>The seven scenarios below each show one screen. The decisions you need to make are at the end of the memo.</p>
+<p>The nine scenarios below each show one screen. The decisions you need to make are at the end of the memo.</p>
 
 <!-- ============ Scenario 1 ============ -->
 <p class="scen">Scenario 1 · You sit down at the laptop</p>
@@ -321,7 +321,7 @@
         <div class="lanehd"><span class="rk">1</span><span class="t">fractal-algo-rust #1859 · Iter8 readout</span><span class="sp" style="flex:1"></span>
           <span class="prog"><s class="sw" style="width:23%"></s><s style="width:39%;background:var(--m-green);opacity:.45"></s><s style="width:38%"></s></span><span class="mu" style="font-size:11.5px">3 done · 5 in progress · 5 blocked</span></div>
         <div class="row" style="padding-block:.25rem"><span></span><span class="sub" style="white-space:nowrap">Critical path: #1848 → #1861 → #1855 → #1858 → #1859</span><div class="axis"><span>2:25</span><span>3:25</span><span>4:25</span><span>now</span></div><span></span></div>
-        <div class="row"><span class="chip gr">Moving</span><span class="ti"><span class="tk">#1848</span> Databento purchase: 55 stocks, euro, gold, yen</span><div class="strip"><s class="sw" style="left:0;width:80.6%"></s><s class="sj" style="left:80.6%;width:19.4%"></s></div><span class="now gr">Tests running 35m</span></div>
+        <div class="row"><span class="chip gr">Moving</span><span class="ti"><span class="tk">#1848</span> Databento purchase: 55 stocks, euro, gold, yen</span><div class="strip"><s class="sw" style="left:0;width:80.6%"></s><s class="sj" style="left:80.6%;width:19.4%"></s></div><span class="now gr">Tests running 35m · low CPU, log active</span></div>
         <div class="row"><span class="chip gr">Moving</span><span class="ti"><span class="tk">#1854</span> Do other markets help in training? Mac probe</span><div class="strip"><s class="sw" style="left:0;width:22.2%"></s><s class="sq" style="left:22.2%;width:24.5%"></s><s class="sj" style="left:46.7%;width:53.3%"></s></div><span class="now gr">2 running · 3 waiting 2h 23m</span></div>
         <div class="row"><span class="chip gr">Moving</span><span class="ti"><span class="tk">#1856</span> The two-turn head, loss and selection</span><div class="strip"><s class="sw" style="left:0;width:40%"></s><s class="sj" style="left:40%;width:60%"></s></div><span class="now gr">Tests running 1h 49m of 3h</span></div>
         <div class="row"><span class="chip am">Queue</span><span class="ti"><span class="tk">#1853</span> Targets by expected value on iteration 7's model</span><div class="strip"><s class="sw" style="left:0;width:36.1%"></s><s class="sq" style="left:36.1%;width:63.9%"></s></div><span class="now am">2 jobs waiting 1h 55m for a slot</span></div>
@@ -337,7 +337,7 @@
 <ul class="does">
 <li>A glance answers the question: three tickets are moving and two are waiting in the queue. #1854 waited 47 minutes before its first job started, which the strip shows as the amber block.</li>
 <li>Blocked tickets fold into one line naming what they wait on. Lanes with a single live ticket shrink to their header row, which still shows the ball.</li>
-<li>The ticket turns red (stalled) after 15 minutes with nothing moving. That is the case you most need to catch and currently cannot see.</li>
+<li>A ticket turns red after 15 minutes with nothing moving, or when all its running jobs have gone quiet (scenario 4). That is the case you most need to catch and currently cannot see.</li>
 </ul>
 
 <!-- ============ Scenario 3 ============ -->
@@ -364,7 +364,7 @@
         <div class="gr2"><span></span><span class="lb">1856-pilot-mac <span class="sub">tests</span></span><div class="strip"><s class="sj" style="left:40%;width:60%"></s></div><span class="rt">1h 49m of 3h</span></div>
         <div class="gr2"><span></span><span class="lb">1854-es-with <span class="sub">background</span></span><div class="strip"><s class="sq" style="left:20.6%;width:26.1%"></s><s class="sj" style="left:46.7%;width:53.3%"></s></div><span class="rt">1h 35m · waited 47m</span></div>
         <div class="gr2"><span></span><span class="lb">1854-es-without <span class="sub">background</span></span><div class="strip"><s class="sq" style="left:20.6%;width:41.1%"></s><s class="sj" style="left:61.7%;width:38.3%"></s></div><span class="rt">1h 9m · waited 1h 14m</span></div>
-        <div class="gr2"><span></span><span class="lb">1848-remaining-stocks… <span class="sub">tests</span></span><div class="strip"><s class="sj" style="left:80.6%;width:19.4%"></s></div><span class="rt">35m of 8h</span></div>
+        <div class="gr2"><span></span><span class="lb">1848-remaining-stocks… <span class="sub">tests</span></span><div class="strip"><s class="sj" style="left:80.6%;width:19.4%"></s></div><span class="rt">35m of 8h · <span class="mu">low CPU</span></span></div>
         <div class="gr2" style="margin-top:.35rem"><span></span><span class="grp">Waiting · in start order</span><span class="sub">all six wait for a background slot · lane 1 (Iter8)</span><span></span></div>
         <div class="gr2"><span class="pos">1</span><span class="lb">1854-ym-with</span><div class="strip"><s class="sq" style="left:20.6%;width:79.4%"></s></div><span class="rt am">2h 23m</span></div>
         <div class="gr2"><span class="pos">2</span><span class="lb">1854-ym-without</span><div class="strip"><s class="sq" style="left:20.6%;width:79.4%"></s></div><span class="rt am">2h 23m</span></div>
@@ -386,9 +386,57 @@
 </ul>
 
 <!-- ============ Scenario 4 ============ -->
-<p class="scen">Scenario 4 · Starting the next ticket</p>
+<p class="scen">Scenario 4 · A job that might be hung</p>
+<h3>“This job has run an hour on almost no CPU. Is it stuck?”</h3>
+<p>A job that sits at 0% for a long time is often hung or buggy, and today nothing tells you. In the redesign, clicking a running job opens its panel, which puts the job's CPU and GPU over its run beside the tail of its log. sm calls a job <b>quiet</b>, and turns it red on the Queue page and the Board, only when all three have stopped for 20 minutes: CPU, GPU and log output. The live case below shows why the log matters. At 5:54 pm, #1848's purchase job had run 1h 04m on 0.8 seconds of CPU, which looks hung. Its log shows a healthy download: one market at a time, each verified, with the budget tracked.</p>
+<div class="scrwrap"><div class="scr pane">
+  <nav class="rail"><div class="brand">sm</div>
+    <a>Agents <b>14</b></a><a>Board <b>1</b></a><a class="on">Queue <b class="hot">6</b></a><a>Inbox</a><a>Analytics</a><a>History</a><div class="grow"></div><a>Settings</a></nav>
+  <div class="main">
+    <div class="bar"><h5>Queue</h5><span class="sp"></span></div>
+    <div class="body">
+      <div class="gantt">
+        <div class="gr2" style="grid-template-columns:12rem minmax(0,1fr) 7rem"><span class="grp">Running</span><span></span><span></span></div>
+        <div class="gr2" style="grid-template-columns:12rem minmax(0,1fr) 7rem"><span class="lb">1856-pilot-mac</span><div class="strip"><s class="sj" style="left:40%;width:60%"></s></div><span class="rt">1h 49m of 3h</span></div>
+        <div class="gr2" style="grid-template-columns:12rem minmax(0,1fr) 7rem"><span class="lb">1854-es-with</span><div class="strip"><s class="sq" style="left:20.6%;width:26.1%"></s><s class="sj" style="left:46.7%;width:53.3%"></s></div><span class="rt">1h 35m</span></div>
+        <div class="gr2" style="grid-template-columns:12rem minmax(0,1fr) 7rem;background:var(--m-sel);border-radius:4px"><span class="lb"><b>1848-remaining-stocks…</b></span><div class="strip"><s class="sj" style="left:80.6%;width:19.4%"></s></div><span class="rt mu">low CPU</span></div>
+        <div class="gr2" style="grid-template-columns:12rem minmax(0,1fr) 7rem;margin-top:.6rem"><span class="lb rd">example: hung-job</span><div class="strip"><s class="sj" style="left:30%;width:25%"></s><s class="sx" style="left:55%;width:45%"></s></div><span class="rt rd">quiet 1h 21m</span></div>
+        <div class="sub">The last row shows how a hung job would look: red from the moment it went quiet. There is none today.</div>
+      </div>
+    </div>
+  </div>
+  <aside class="side">
+    <div class="hd" style="grid-template-columns:1fr"><b>1848-remaining-stocks-verified-sequence</b><span class="sub">tests · running 1h 04m of 8h · 1848-purchase-coordination · lane 1</span></div>
+    <div class="acts"><span class="btn pri">Ask agent</span><span class="btn">Follow</span><span class="btn">Cancel…</span></div>
+    <div class="body" style="gap:.5rem">
+      <div><div style="display:flex;justify-content:space-between"><span class="grp">CPU over the run</span><span class="sub">0.8 s total</span></div>
+        <svg viewBox="0 0 300 36" style="width:100%;height:auto;display:block"><line x1="0" y1="34" x2="300" y2="34" style="stroke:var(--m-line)"/><polyline points="0,34 18,34 20,29 22,34 55,34 57,30 59,34 96,34 98,28 100,34 131,34 133,30 135,34 170,34 172,29 174,34 206,34 208,31 210,34 241,34 243,29 245,34 280,34 282,30 284,34 300,34" style="fill:none;stroke:var(--m-amber);stroke-width:1.3"/></svg></div>
+      <div><div style="display:flex;justify-content:space-between"><span class="grp">GPU</span><span class="sub">none</span></div>
+        <svg viewBox="0 0 300 10" style="width:100%;height:auto;display:block"><line x1="0" y1="8" x2="300" y2="8" style="stroke:var(--m-cyan);stroke-width:1.3"/></svg></div>
+      <div><div style="display:flex;justify-content:space-between"><span class="grp">Log</span><span class="sub gr">last line 1m ago</span></div>
+      <div class="term" style="margin:.25rem 0 0;font-size:10.3px">nflx   NFLX  ok  1229063 bars  23.1 MB
+batch downloaded; run verify before the next batch
+verified; new spend $57.85; remaining $30.35
+nflx: complete and verified; proceeding to next market
+xom    XNYS.PILLAR  XOM  2018-05-01 .. 2026-09-29  $0.513
+xom    XOM   ok  820180 bars  13.9 MB
+verified; new spend $58.36; remaining $29.84
+xom: complete and verified; proceeding to next market</div></div>
+      <div class="insight" style="border-color:var(--m-line);background:var(--m-panel2)"><div><b>Not quiet.</b> CPU is near zero, but the log grows every few minutes, so this job is probably waiting on downloads. It turns red only if the log also stops for 20 minutes.</div></div>
+      <div class="sub">Ask agent suggests: “Is this job stuck?” · “How long do you expect this to run?” · “Is it safe to cancel this?”</div>
+    </div>
+  </aside>
+</div></div>
+<ul class="does">
+<li>The CPU trace is drawn from what the process list showed. The job starts a short helper for each market, each using under a second of CPU; the flat line between blips is the download. #1714 records each job's CPU and GPU time every 5 seconds, which is what the panel plots.</li>
+<li>A quiet job turns the ticket red on the Board, so a hung job on the critical path is seen within 20 minutes rather than hours later.</li>
+<li>sm does not cancel quiet jobs or send an alert about them. It marks them. The job's 8-hour limit still applies.</li>
+</ul>
+
+<!-- ============ Scenario 5 ============ -->
+<p class="scen">Scenario 5 · Starting the next ticket</p>
 <h3>“Start #1706.”</h3>
-<p>Today, Start opens a six-field form. In the redesign it opens a small popover: pick Claude or Codex and press Start. Your defaults fill in the model, effort, workspace, name and first message, and each sits behind a “Change” link. The name and the first message come from a pattern and a template you set once in Settings (scenario 7).</p>
+<p>Today, Start opens a six-field form. In the redesign it opens a small popover: pick Claude or Codex and press Start. Your defaults fill in the model, effort, workspace, name and first message, and each sits behind a “Change” link. The name and the first message come from a pattern and a template you set once in Settings (scenario 8).</p>
 
 <div class="scrwrap"><div class="scr" style="grid-template-columns:1fr">
   <div class="popgrid">
@@ -424,8 +472,8 @@ You already hold the claim on #1706. Run `sm ticket 1706 --setup-worktree`…</s
 <li>The same popover serves “New agent” in the top bar, except that it asks for a workspace and has no ticket.</li>
 </ul>
 
-<!-- ============ Scenario 5 ============ -->
-<p class="scen">Scenario 5 · Looking over an agent's shoulder</p>
+<!-- ============ Scenario 6 ============ -->
+<p class="scen">Scenario 6 · Looking over an agent's shoulder</p>
 <h3>“What is 1854-engineer actually doing?”</h3>
 <p>This follows the phone app. When the agent has a claude.ai session, <b>Open in Claude</b> is the main action, both on the card (its right-hand icon) and in the panel. It opens a Claude window docked beside sm, taking the right half of the screen, and later clicks reuse that window. sm cannot put claude.ai inside its own page, because claude.ai refuses to load inside another site (it sends <code>X-Frame-Options: SAMEORIGIN</code>). When an agent has no claude.ai session, which includes every Codex agent, the main action is <b>Terminal</b>. It takes over the page and leaves a slim top bar, as the doc reader does, and you can type into it. Clicking the card itself opens the side panel with the agent's work, activity and summary.</p>
 
@@ -478,8 +526,8 @@ You already hold the claim on #1706. Run `sm ticket 1706 --setup-worktree`…</s
 <li>The side panel handles docs, queue jobs, inbox threads and tickets the same way. Esc closes it, and every panel has its own link you can share.</li>
 </ul>
 
-<!-- ============ Scenario 6 ============ -->
-<p class="scen">Scenario 6 · Reading and answering</p>
+<!-- ============ Scenario 7 ============ -->
+<p class="scen">Scenario 7 · Reading and answering</p>
 <h3>“Read the Iter8 plan and reply.”</h3>
 <p>On a wide screen the Inbox is a two-pane mail layout. The list stays on the left and the doc or thread opens on the right. The reader carries its route: a back arrow and the path “Inbox › 1843 — Iteration 8 plan”. A doc link opened from anywhere else gets the same bar, with a back link to sm.</p>
 
@@ -507,8 +555,8 @@ You already hold the claim on #1706. Run `sm ticket 1706 --setup-worktree`…</s
   </div>
 </div></div>
 
-<!-- ============ Scenario 7 ============ -->
-<p class="scen">Scenario 7 · Setting it once</p>
+<!-- ============ Scenario 8 ============ -->
+<p class="scen">Scenario 8 · Setting it once</p>
 <h3>“I want my own defaults, names and first message.”</h3>
 <p>Settings brings over the phone's settings page and adds what the web needs. The settings are stored on the server, so the phone and the laptop share them. The only exception is theme, which is saved per browser.</p>
 
@@ -539,7 +587,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 </div></div>
 <p>The remaining sections: <b>Appearance</b> (System, Light, Dark). <b>Context handoff</b> (today's “Handoff defaults” button, moved here). <b>Queue limits</b> (slots per job type; decision 5). <b>Notifications</b> (which phone gets pushes, and a test push). <b>Devices &amp; access</b> (Studio SSH, enrolled phones, and revoking a device). <b>About</b> (server version and the latest app build).</p>
 
-<p class="scen">Scenario 8 · Opening sm on the laptop or the Studio</p>
+<p class="scen">Scenario 9 · Opening sm on the laptop or the Studio</p>
 <h3>“No more email codes.”</h3>
 <p>You use sm.rajeshgo.li on both computers, because every link sm sends points there. Each computer gets a device certificate once, as the phone already has. Chrome then presents the certificate on every visit, so Cloudflare lets you in without the email or Google step. Settings › Devices &amp; access lists every device with its last use and a Revoke button.</p>
 <div class="scrwrap"><div class="scr">
@@ -577,7 +625,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <tr><td>1. Adopt this direction: one page, left menu, side panel, colour meaning who has the ball?</td><td><b>Yes.</b> Appendix D is the build spec; appendix E splits it into eleven tickets.</td><td>It answers each complaint in your list with one design rather than seven patches.</td></tr>
 <tr><td>2. Terminal in the browser?</td><td><b>Yes, full typing.</b> It is protected by the same Cloudflare login as the rest of the site, and only your Google account passes that login.</td><td>It is the one thing you can do at the Studio but not from the web today.</td></tr>
 <tr><td>3. Where do settings live?</td><td><b>On the server, shared with the phone.</b> They replace the <code>board.start_defaults</code> config entry. Theme stays per browser. An unset model or effort means the provider's own default.</td><td>You set a default once, and it applies on every device.</td></tr>
-<tr><td>4. When is a ticket “stalled” (red)?</td><td><b>After 15 minutes in progress with nothing moving</b>: the agent is not working, no job is queued or running, no review is pending, and nothing waits on you.</td><td>Short enough to catch a stuck critical path, long enough to ignore a pause between turns.</td></tr>
+<tr><td>4. When is a ticket “stalled” (red)?</td><td><b>After 15 minutes in progress with nothing moving</b>: the agent is not working, no job is queued or running, no review is pending, and nothing waits on you. <b>A job is “quiet” (red) after 20 minutes with no CPU (under 1% of one core), no GPU and no new log output.</b></td><td>Short enough to catch a stuck critical path, long enough to ignore a pause between turns.</td></tr>
 <tr><td>5. Should Settings let you change queue slot limits?</td><td><b>Yes, per job type, taking effect without a restart.</b> The Queue page links there only when a limit is holding work back.</td><td>Today the limit is a config edit and a restart. The 24-hour numbers say it cost real time.</td></tr>
 <tr><td>6. How is it built?</td><td><b>A single web app that sm-server serves, with no separate build step.</b> The phone keeps its current pages until the app moves over.</td><td><code>cargo build</code> and the restart script stay the only way to ship, and the app is not broken in the meantime.</td></tr>
 <tr><td>7. Device certificates for the laptop and the Studio, instead of email login?</td><td><b>Yes</b>, using the phone's certificate system. Email login stays as the fallback.</td><td>You open sm many times a day on both computers, and the certificate is already how the phone gets in.</td></tr>
@@ -589,7 +637,8 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <p><b>Start and Settings:</b> agent names come from a pattern in Settings. With no model or effort set, sm leaves the choice to Claude Code or Codex. The popover points to Settings for the first-message template.</p>
 <p><b>Terminal and Claude:</b> as in the phone app, Open in Claude is the main action when the agent has a claude.ai session. It opens a Claude window docked beside sm; claude.ai cannot be embedded in the page. Otherwise the main action is Terminal, which is now its own page with a slim top bar rather than a side-panel tab.</p>
 <p><b>New:</b> the build spec (appendix D) and the ticket plan (appendix E).</p>
-<p><b>Device sign-in (scenario 8, decision 7):</b> the laptop and the Studio sign in with device certificates, as the phone does.</p>
+<p><b>Device sign-in (scenario 9, decision 7):</b> the laptop and the Studio sign in with device certificates, as the phone does.</p>
+<p><b>Hung jobs (new scenario 4):</b> a running job with no CPU, no GPU and no new log output for 20 minutes is “quiet” and turns red on the Queue page and the Board. #1848's purchase job shows why the log counts: it barely uses the CPU but is healthy.</p>
 <p><b>Memory figures (#1714):</b> memory is Activity Monitor's “Memory Used” (135 of 256 GB now, not “212 GB free”), and each live bar shades the queue's share.</p>
 
 <hr class="appendix-divider">
@@ -629,12 +678,12 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <tbody>
 <tr><td>Weak colour scheme, no light or dark mode</td><td>Appendix A: the phone palette plus a matched light palette, following the system setting.</td></tr>
 <tr><td>The highlighted tab jumps</td><td>Cause: the active tab gets a 2px underline that the others lack, so it is 2px taller (<code>owner_docs.rs</code>, <code>.tab.on</code>). The left menu marks selection with a fill instead.</td></tr>
-<tr><td>Start opens a huge form</td><td>Scenario 4.</td></tr>
-<tr><td>No place to set the default start message; no settings page</td><td>Scenario 7.</td></tr>
-<tr><td>The inbox belongs on a phone</td><td>Scenario 6: two panes.</td></tr>
+<tr><td>Start opens a huge form</td><td>Scenario 5.</td></tr>
+<tr><td>No place to set the default start message; no settings page</td><td>Scenario 8.</td></tr>
+<tr><td>The inbox belongs on a phone</td><td>Scenario 7: two panes.</td></tr>
 <tr><td>Watch shows “ctx 12%” instead of rings</td><td>Scenario 1.</td></tr>
-<tr><td>No attach or Claude link; <code>sm attach</code> is useless on the web</td><td>Scenario 5: terminal tab and Open in Claude.</td></tr>
-<tr><td>The reader has no back button and no sense of where you came from</td><td>Scenario 6: breadcrumb bar.</td></tr>
+<tr><td>No attach or Claude link; <code>sm attach</code> is useless on the web</td><td>Scenario 6: terminal tab and Open in Claude.</td></tr>
+<tr><td>The reader has no back button and no sense of where you came from</td><td>Scenario 7: breadcrumb bar.</td></tr>
 <tr><td>Board colours and layout; agent status instead of task status</td><td>Scenario 2: ball colours and the ticket clock.</td></tr>
 <tr><td>No Queue page</td><td>Scenario 3.</td></tr>
 </tbody>
@@ -831,6 +880,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
   </ul></li>
 <li><b>Insight card.</b> Shown when the 24-hour stats' <code>limits</code> group has at least 3600 job-seconds held and a headroom share (<code>headroom_job_seconds ÷ job_seconds</code>) of at least 25%. Its text is the memo's. The button opens Settings › Queue limits.</li>
 <li><b>Timeline.</b> Running rows, then waiting rows in <code>position</code> order, over the last 3 hours. Amber is waiting and hatched green is running. The right column shows “elapsed of limit” or “waited”, plus “gives up in” when <code>wait_deadline_at</code> is under 6 hours away. The waiting group's caption is the shared <code>holding.summary</code> and the lane.</li>
+<li><b>Quiet jobs.</b> A running job is quiet when it has run for at least <code>queue_runner.quiet_minutes</code> (default 20) and, over the last <code>quiet_minutes</code>, all three hold: its process group's CPU time grew by less than 1% of one core (0.01 × elapsed seconds), its GPU time did not grow, and its log file did not grow. The log rule keeps network-bound jobs out: #1848's purchase job uses 0.8 s of CPU per hour but writes a line per market. It uses the per-job CPU and GPU time that #1714 records each sample. <code>GET /client/queue</code> gains, per running job, <code>cpu_seconds</code>, <code>gpu_seconds</code>, <code>log_updated_at</code> and <code>quiet_since</code> (null unless quiet). A job that is not quiet but has used under 1% of one core over the window gets the grey note “low CPU” and no colour change. Quiet rows are red in the timeline from <code>quiet_since</code>. The job panel shows the job's CPU and GPU over its run (<code>GET /client/queue/jobs/{id}/usage</code>, 5 s samples, new). Ask agent adds “Is this job stuck?” to its suggestions. The server sends no alert; it only marks the job.</li>
 <li><b>Stopped link.</b> “n stopped in the last 24h ›” links to Analytics › Queue when n &gt; 0.</li>
 <li><b>Job panel.</b> Command, folder, times, limits, why it waits, what happened, and the last 40 log lines.
   <ul>
@@ -872,7 +922,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <h4>D7. Ticket clock</h4>
 <p>Every ticket in state <code>in_progress</code> or <code>needs_you</code> in <code>GET /client/board</code> gains:</p>
 <pre><code>"clock": {
-  "ball": "you" | "working" | "job_running" | "queue" | "review" | "idle" | "stalled" | "no_agent",
+  "ball": "you" | "working" | "job_running" | "job_quiet" | "queue" | "review" | "idle" | "stalled" | "no_agent",
   "since": "2026-09-29T22:29:44Z",
   "text": "2 jobs waiting 1h 55m for a slot",
   "segments": [ { "kind": "working" | "job_running" | "queue" | "review" | "you" | "idle", "from": "…", "to": "…" } ]
@@ -884,6 +934,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <tbody>
 <tr><td>1</td><td>The ticket has a needs-you record</td><td>you</td><td>record created</td><td>“Waiting on you {age}: {text}”</td></tr>
 <tr><td>2</td><td>The holder's activity is working or thinking, or it has background shells running</td><td>working</td><td>last activity change</td><td>“Agent working {age}”</td></tr>
+<tr><td>3a</td><td>Every running job of the ticket is quiet (D6.6), and none is waiting</td><td>job_quiet</td><td>latest <code>quiet_since</code></td><td>“Job running {age}, quiet {quiet age}: {cpu seconds} CPU”</td></tr>
 <tr><td>3</td><td>At least one of the ticket's jobs is running</td><td>job_running</td><td>earliest running start</td><td>One job: “{Type} running {age} of {limit}” (drop “of {limit}” when there is no limit). Several: “{n} running · {m} waiting {oldest wait}”</td></tr>
 <tr><td>4</td><td>At least one of the ticket's jobs is waiting</td><td>queue</td><td>earliest queued_at</td><td>One job: “Job waiting {age} · {ordinal} in line”. Several with the same reason: “{m} jobs waiting {age} for a slot”</td></tr>
 <tr><td>5</td><td>The holder waits on a Codex review of the ticket's PR</td><td>review</td><td>review requested</td><td>“Codex review on PR #{pr}, {age}”</td></tr>
@@ -892,7 +943,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <tr><td>8</td><td>No live holder</td><td>no_agent</td><td>claim released or holder stopped</td><td>“No agent”</td></tr>
 </tbody>
 </table>
-<p><b>Colours.</b> <code>you</code> is magenta. <code>working</code> and <code>job_running</code> are green. <code>queue</code> and <code>review</code> are amber. <code>idle</code> is muted. <code>stalled</code> and <code>no_agent</code> are red.</p>
+<p><b>Colours.</b> <code>you</code> is magenta. <code>working</code> and <code>job_running</code> are green. <code>queue</code> and <code>review</code> are amber. <code>idle</code> is muted. <code>stalled</code>, <code>job_quiet</code> and <code>no_agent</code> are red.</p>
 <p><b>Ages.</b> Under 1 hour: “{m}m”. Otherwise: “{h}h {m}m”.</p>
 <p><b>Segments.</b> Start from the ticket's instants in the Analytics › Time timeline (<code>analytics_time.rs</code>). Add <code>analytics_time::thread_intervals(repo, number, from, to)</code>, which returns the parts over the window.</p>
 <ul>
@@ -900,6 +951,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <li><code>queue</code> becomes <code>job_running</code> wherever one of the ticket's jobs was running at that instant, and <code>queue</code> otherwise.</li>
 <li><code>review</code> and <code>you</code> keep their names.</li>
 <li><code>idle</code> becomes <code>idle</code>, and instants past the stall threshold within an idle run become <code>stalled</code> on the strip.</li>
+<li>A <code>job_running</code> instant after a job's <code>quiet_since</code> becomes <code>quiet</code>, drawn red.</li>
 <li>Adjacent segments of the same kind merge.</li>
 <li>Segments are cached for 60 s per ticket. The ball is computed on every request.</li>
 </ul>
@@ -907,7 +959,8 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <table>
 <thead><tr><th>Ticket</th><th>Facts</th><th>Ball and text</th></tr></thead>
 <tbody>
-<tr><td>#1848</td><td>Holder idle. Job queued and started 23:50:35, 8 h limit.</td><td>job_running · “Tests running 35m of 8h”</td></tr>
+<tr><td>#1848</td><td>Holder idle. Job queued and started 23:50:35, 8 h limit. Low CPU, but the log grows every few minutes.</td><td>job_running · “Tests running 35m of 8h”</td></tr>
+<tr><td>(constructed)</td><td>Holder idle. One running job; no CPU, GPU or log growth since 00:01.</td><td>job_quiet · “Job running 1h 10m, quiet 24m: 0.2 s CPU”</td></tr>
 <tr><td>#1854</td><td>Holder idle. Two jobs running since 22:49 and 23:16. Three waiting since 22:02.</td><td>job_running · “2 running · 3 waiting 2h 23m”</td></tr>
 <tr><td>#1856</td><td>Holder idle. Job running since 22:36:45, 3 h limit.</td><td>job_running · “Tests running 1h 48m of 3h”</td></tr>
 <tr><td>#1853</td><td>Holder idle since 22:30. Two jobs waiting since 22:29, both for a background slot.</td><td>queue · “2 jobs waiting 1h 55m for a slot”</td></tr>
@@ -983,7 +1036,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <tr><td>4</td><td>Web shell: tokens, themes, rail, top bar, palette, panel, Agents page, agent panel, New agent popover</td><td>D1, D2, D6.1, D6.2, D6.5 (New agent)</td><td>1</td><td>Mid</td></tr>
 <tr><td>5</td><td>Browser terminal: ticket, WebSocket login, terminal page</td><td>D6.3, D8</td><td>4</td><td>Mid</td></tr>
 <tr><td>6</td><td>Board page and Start popover</td><td>D6.4, D6.5</td><td>2, 3, 4</td><td>Mid</td></tr>
-<tr><td>7</td><td>Queue page, Mac chart (with queue share series), job panel, Analytics</td><td>D6.6, D6.8 (Analytics)</td><td>4, #1714</td><td>Mid</td></tr>
+<tr><td>7</td><td>Queue page, Mac chart (with queue share series), quiet-job detection and job usage route, job panel, Analytics</td><td>D6.6, D6.8 (Analytics)</td><td>4, #1714</td><td>Mid</td></tr>
 <tr><td>8</td><td>Inbox two-pane, reader frame, back bar, History, Guestbook</td><td>D6.7, D6.8</td><td>4</td><td>Mid</td></tr>
 <tr><td>9</td><td>Settings page</td><td>D6.9</td><td>2, 4</td><td>Mid</td></tr>
 <tr><td>11</td><td>Device certificates for computers: browser device rule, common-name identity, <code>sm device enroll</code>, device list in Settings</td><td>D8b</td><td>1 (list UI after 9)</td><td>Mid</td></tr>
@@ -1005,6 +1058,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <tr><td>Inbox two-pane, reader breadcrumb, back bar</td><td>D6.7</td><td>Back-bar injection test on the browser hostname only</td></tr>
 <tr><td>Settings shared with the phone</td><td>D4, D6.9</td><td>Settings API tests; the phone's start-options reflects settings</td></tr>
 <tr><td>Laptop and Studio sign in by device certificate</td><td>D8b</td><td>D8b guard tests; live check on both computers</td></tr>
+<tr><td>Quiet jobs turn red</td><td>D6.6, D7 rule 3a</td><td>Quiet detection unit tests: low CPU with a growing log is not quiet; no CPU, GPU or log growth is quiet</td></tr>
 <tr><td>Memory and queue share per #1714</td><td>D6.6</td><td>Live screenshot with #1714 fields present and absent</td></tr>
 <tr><td>Phone unaffected</td><td>D1, D3</td><td>Routing test for the app hostname; existing phone guard tests</td></tr>
 </tbody>
