@@ -1,0 +1,1169 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1782 — Fit and finish: sm web and the phone app</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+<style>
+  /* Screen mockups use the proposed sm web palette (appendix A). Light by default; the memo's
+     dark toggle flips them, so each screen previews both themes. */
+  :root {
+    --m-bg:#F5F5F2; --m-panel:#FFFFFF; --m-panel2:#EEEEE9; --m-line:#E0E0D9;
+    --m-ink:#16171B; --m-ink2:#555864; --m-ink3:#8B8D96; --m-accent:#0B7A90; --m-sel:#E2F1F4;
+    --m-green:#15803D; --m-amber:#B45309; --m-mag:#A21CAF; --m-red:#BE123C;
+    --m-cyan:#0E7490; --m-slate:#64748B; --m-claude:#C2410C; --m-codex:#6D28D9;
+    --m-term:#0E0F14; --m-termink:#D7DAE3;
+  }
+  :root[data-theme="dark"] {
+    --m-bg:#09090D; --m-panel:#121219; --m-panel2:#1A1A23; --m-line:#2B2B37;
+    --m-ink:#F5F7FA; --m-ink2:#ADB2C2; --m-ink3:#777C8B; --m-accent:#5EE7FF; --m-sel:#143744;
+    --m-green:#4ADE80; --m-amber:#FBBF24; --m-mag:#F0ABFC; --m-red:#FB7185;
+    --m-cyan:#5EE7FF; --m-slate:#8B93A7; --m-claude:#FB923C; --m-codex:#A78BFA;
+    --m-term:#050507; --m-termink:#D7DAE3;
+  }
+  @media print { :root[data-theme="dark"] {
+    --m-bg:#F5F5F2; --m-panel:#FFFFFF; --m-panel2:#EEEEE9; --m-line:#E0E0D9;
+    --m-ink:#16171B; --m-ink2:#555864; --m-ink3:#8B8D96; --m-accent:#0B7A90; --m-sel:#E2F1F4;
+    --m-green:#15803D; --m-amber:#B45309; --m-mag:#A21CAF; --m-red:#BE123C;
+    --m-cyan:#0E7490; --m-slate:#64748B; --m-claude:#C2410C; --m-codex:#6D28D9; } }
+
+  .scrwrap { overflow-x: auto; margin: 1rem 0 .4rem; width: min(72rem, calc(100vw - 2rem)); position: relative; left: 50%; transform: translateX(-50%); }
+  .scr { min-width: 46rem; background: var(--m-bg); color: var(--m-ink); border: 1px solid var(--m-line);
+    border-radius: 10px; overflow: hidden; font: 12.5px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    display: grid; grid-template-columns: 8.2rem 1fr; }
+  .scr.pane { grid-template-columns: 8.2rem 1fr 21rem; }
+  .scr * { box-sizing: border-box; }
+  .scr code, .scr .mono { font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace; background: none; padding: 0; }
+  .rail { background: var(--m-panel); border-right: 1px solid var(--m-line); padding: .7rem .5rem; display: flex; flex-direction: column; gap: .15rem; }
+  .rail .brand { font: 700 14px ui-monospace, Menlo, monospace; color: var(--m-accent); padding: 0 .5rem .6rem; }
+  .rail a { display: flex; justify-content: space-between; padding: .32rem .5rem; border-radius: 6px; color: var(--m-ink2); text-decoration: none; }
+  .rail a.on { background: var(--m-sel); color: var(--m-ink); font-weight: 600; }
+  .rail a b { font-weight: 600; font-size: 11px; color: var(--m-ink3); }
+  .rail a b.hot { color: var(--m-amber); }
+  .rail .grow { flex: 1; }
+  .main { min-width: 0; display: flex; flex-direction: column; }
+  .bar { display: flex; align-items: center; gap: .8rem; padding: .55rem .9rem; border-bottom: 1px solid var(--m-line); background: var(--m-panel); }
+  .bar h5 { margin: 0; font-size: 13.5px; font-weight: 650; }
+  .bar .crumb { color: var(--m-ink3); font-size: 12.5px; }
+  .bar .sp { flex: 1; }
+  .search { color: var(--m-ink3); border: 1px solid var(--m-line); border-radius: 6px; padding: .2rem .55rem; min-width: 11rem; }
+  .meter { white-space: nowrap; display: inline-flex; align-items: center; gap: .3rem; color: var(--m-ink2); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+  .meter i { display: inline-block; width: 2.4rem; height: 5px; border-radius: 3px; background: var(--m-panel2); position: relative; overflow: hidden; }
+  .meter i s { position: absolute; inset: 0 auto 0 0; background: var(--m-green); }
+  .btn { border: 1px solid var(--m-line); border-radius: 6px; padding: .22rem .6rem; color: var(--m-ink); background: var(--m-panel); white-space: nowrap; }
+  .btn.pri { background: var(--m-accent); border-color: var(--m-accent); color: var(--m-panel); font-weight: 600; }
+  .btn.sm { padding: .1rem .45rem; font-size: 11.5px; }
+  .body { padding: .8rem .9rem; display: flex; flex-direction: column; gap: .7rem; }
+  .sum { display: flex; gap: 1.1rem; color: var(--m-ink2); font-variant-numeric: tabular-nums; flex-wrap: wrap; }
+  .sum b { color: var(--m-ink); }
+  .grp { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--m-ink3); font-weight: 600; }
+  .cards { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: .5rem; }
+  .card { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; padding: .55rem .6rem; display: grid; grid-template-columns: 2.1rem 1fr; gap: .1rem .55rem; align-items: center; }
+  .card.sel { outline: 2px solid var(--m-accent); outline-offset: -1px; }
+  .card .nm { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .ln { grid-column: 2; font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .ring { grid-row: span 3; }
+  .ring { width: 2.1rem; height: 2.1rem; border-radius: 50%; display: grid; place-items: center; font-size: 10.5px; font-weight: 600; color: var(--m-ink2);
+    background: radial-gradient(closest-side, var(--m-panel) 76%, transparent 78%), conic-gradient(var(--rc) calc(var(--p) * 1%), var(--m-panel2) 0); }
+  .prov { font-size: 10.5px; font-weight: 600; }
+  .prov.cl { color: var(--m-claude); } .prov.cx { color: var(--m-codex); }
+  .tk { font: 11px ui-monospace, Menlo, monospace; color: var(--m-ink2); }
+  .ball { font-weight: 550; }
+  .ball::before { content: ""; display: inline-block; width: .5rem; height: .5rem; border-radius: 50%; margin-right: .35rem; background: currentColor; vertical-align: .02rem; }
+  .gr { color: var(--m-green); } .am { color: var(--m-amber); } .mg { color: var(--m-mag); } .rd { color: var(--m-red); } .cy { color: var(--m-cyan); } .sl { color: var(--m-slate); } .mu { color: var(--m-ink3); }
+  .chip { display: inline-block; font-size: 10.5px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; border-radius: 999px; padding: .08rem .45rem; background: color-mix(in srgb, currentColor 14%, transparent); }
+  /* board */
+  .lane { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; overflow: hidden; }
+  .lanehd { display: flex; align-items: center; gap: .6rem; padding: .5rem .7rem; border-bottom: 1px solid var(--m-line); }
+  .lanehd .rk { font: 700 11px ui-monospace, Menlo, monospace; color: var(--m-ink3); }
+  .lanehd .t { font-weight: 650; }
+  .prog { display: flex; height: 6px; width: 8rem; border-radius: 3px; overflow: hidden; background: var(--m-panel2); }
+  .prog s { display: block; }
+  .row { display: grid; grid-template-columns: 5.6rem minmax(0,1fr) 13rem 14rem; gap: .6rem; align-items: center; padding: .42rem .7rem; border-bottom: 1px solid var(--m-line); }
+  .row:last-child { border-bottom: 0; }
+  .row .ti { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .who { font-size: 11.5px; color: var(--m-ink2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .now { font-size: 11.5px; }
+  .strip { position: relative; height: 10px; border-radius: 3px; background: var(--m-panel2); overflow: hidden; }
+  .strip s { position: absolute; top: 0; bottom: 0; }
+  .sw { background: var(--m-green); } .sj { background: repeating-linear-gradient(135deg, var(--m-green) 0 3px, color-mix(in srgb, var(--m-green) 45%, transparent) 3px 6px); }
+  .sq { background: var(--m-amber); } .sy { background: var(--m-mag); } .sx { background: var(--m-red); }
+  .axis { display: flex; justify-content: space-between; font-size: 10px; color: var(--m-ink3); font-variant-numeric: tabular-nums; }
+  .fold { padding: .42rem .7rem; color: var(--m-ink2); font-size: 11.5px; border-top: 1px solid var(--m-line); }
+  /* queue */
+  .qhd { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: .5rem; }
+  .tile { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; padding: .5rem .6rem; }
+  .tile .k { font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--m-ink3); font-weight: 600; }
+  .tile .v { font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .slots { display: flex; gap: .2rem; margin-top: .3rem; }
+  .slots s { display: block; width: .8rem; height: .5rem; border-radius: 2px; background: var(--m-panel2); }
+  .slots s.u { background: var(--m-green); } .slots s.f { background: var(--m-amber); }
+  .insight { border: 1px solid color-mix(in srgb, var(--m-amber) 45%, var(--m-line)); background: color-mix(in srgb, var(--m-amber) 8%, var(--m-panel)); border-radius: 8px; padding: .55rem .7rem; display: flex; gap: .8rem; align-items: center; }
+  .gantt { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; padding: .5rem .7rem; }
+  .gr2 { display: grid; grid-template-columns: 1.3rem 12.5rem minmax(0,1fr) 8.5rem; gap: .5rem; align-items: center; padding: .22rem 0; }
+  .gr2 .pos { color: var(--m-ink3); font-variant-numeric: tabular-nums; text-align: right; }
+  .gr2 .lb { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .gr2 .rt { font-size: 11.5px; text-align: right; font-variant-numeric: tabular-nums; }
+  .sub { font-size: 10.5px; color: var(--m-ink3); }
+  /* pane */
+  .side { border-left: 1px solid var(--m-line); background: var(--m-panel); display: flex; flex-direction: column; min-width: 0; }
+  .side .hd { padding: .65rem .8rem; border-bottom: 1px solid var(--m-line); display: grid; grid-template-columns: 2.6rem 1fr; gap: .1rem .6rem; align-items: center; }
+  .side .hd .ring { width: 2.6rem; height: 2.6rem; grid-row: span 2; font-size: 12px; }
+  .acts { display: flex; gap: .35rem; padding: .5rem .8rem; border-bottom: 1px solid var(--m-line); flex-wrap: wrap; }
+  .tabs { display: flex; gap: 1rem; padding: .45rem .8rem 0; border-bottom: 1px solid var(--m-line); }
+  .tabs span { padding-bottom: .38rem; color: var(--m-ink3); box-shadow: inset 0 -2px 0 transparent; }
+  .tabs span.on { color: var(--m-ink); font-weight: 600; box-shadow: inset 0 -2px 0 var(--m-accent); }
+  .term { margin: .6rem .8rem; background: var(--m-term); color: var(--m-termink); border-radius: 6px; padding: .55rem .65rem; font: 10.8px/1.45 ui-monospace, Menlo, monospace; white-space: pre-wrap; }
+  .term .d { color: #8a8f9c; } .term .p { color: #9fb7ff; } .term .y { color: #e8c15a; } .term .gg { color: #57d38c; }
+  .keys { display: flex; gap: .3rem; padding: 0 .8rem .45rem; }
+  .keys span { border: 1px solid var(--m-line); border-radius: 4px; padding: 0 .35rem; font-size: 11px; color: var(--m-ink2); }
+  .msg { margin: 0 .8rem .7rem; border: 1px solid var(--m-line); border-radius: 6px; padding: .35rem .55rem; color: var(--m-ink3); display: flex; justify-content: space-between; }
+  /* start popover */
+  .pop { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 10px; box-shadow: 0 10px 30px rgba(0,0,0,.14); padding: .7rem .8rem; display: flex; flex-direction: column; gap: .55rem; }
+  .seg { display: inline-flex; border: 1px solid var(--m-line); border-radius: 7px; overflow: hidden; }
+  .seg span { padding: .22rem .8rem; color: var(--m-ink2); }
+  .seg span.on { background: var(--m-sel); color: var(--m-ink); font-weight: 600; }
+  .fld { display: grid; grid-template-columns: 5rem 1fr; gap: .5rem; align-items: center; }
+  .fld .l { color: var(--m-ink3); font-size: 11.5px; }
+  .inp { border: 1px solid var(--m-line); border-radius: 6px; padding: .22rem .5rem; background: var(--m-bg); }
+  .inp.ta { white-space: pre-wrap; font-size: 11.5px; line-height: 1.4; }
+  .ph { font: 11px ui-monospace, Menlo, monospace; color: var(--m-accent); }
+  .pop .seg { align-self: flex-start; }
+  .popgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; align-items: start; padding: .9rem; background: var(--m-bg); }
+  /* inbox */
+  .two { display: grid; grid-template-columns: 17rem 1fr; min-height: 0; }
+  .list { border-right: 1px solid var(--m-line); }
+  .it { padding: .5rem .8rem; border-bottom: 1px solid var(--m-line); display: flex; flex-direction: column; gap: .1rem; }
+  .it.sel { background: var(--m-sel); }
+  .it .top { display: flex; justify-content: space-between; gap: .5rem; }
+  .it .top b { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .it .pv { color: var(--m-ink2); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .reader { min-width: 0; display: flex; flex-direction: column; }
+  .rbar { display: flex; gap: .6rem; align-items: center; padding: .5rem .9rem; border-bottom: 1px solid var(--m-line); font-size: 12px; flex-wrap: wrap; }
+  .doc { padding: .9rem 1.4rem; font-family: Georgia, serif; font-size: 12.5px; line-height: 1.55; color: var(--m-ink); }
+  .doc h6 { font: 650 15px -apple-system, BlinkMacSystemFont, sans-serif; margin: 0 0 .35rem; }
+  .doc p { margin: .35rem 0; }
+  /* settings */
+  .set { display: grid; grid-template-columns: 9rem 1fr; }
+  .setnav { border-right: 1px solid var(--m-line); padding: .7rem .5rem; display: flex; flex-direction: column; gap: .1rem; }
+  .setnav span { padding: .28rem .5rem; border-radius: 6px; color: var(--m-ink2); }
+  .setnav span.on { background: var(--m-sel); color: var(--m-ink); font-weight: 600; }
+  .setbody { padding: .8rem 1rem; display: flex; flex-direction: column; gap: .8rem; }
+  .sgrp { background: var(--m-panel); border: 1px solid var(--m-line); border-radius: 8px; }
+  .sgrp > div { display: grid; grid-template-columns: 9.5rem 1fr; gap: .8rem; padding: .5rem .75rem; border-bottom: 1px solid var(--m-line); align-items: center; }
+  .sgrp > div:last-child { border-bottom: 0; }
+  .sgrp .l { color: var(--m-ink2); }
+  .sgrp h6 { margin: 0; padding: .5rem .75rem; font-size: 12px; border-bottom: 1px solid var(--m-line); }
+  .scen { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .78rem; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); margin-top: 2.2rem; }
+  .scen + h3 { margin-top: .2rem; }
+  ul.does { margin: .3rem 0 0; padding-left: 1.2rem; }
+  ul.does li { margin: .15rem 0; }
+  .swatch { display:inline-block; width:.75em; height:.75em; border-radius:50%; vertical-align:-.03em; margin-right:.3em; }
+  @media print { .scrwrap { overflow: visible; width: 100%; left: 0; transform: none; } .scr { min-width: 0; font-size: 10.5px; } }
+</style>
+<style>
+  /* 1782 additions. Mockups use the new, larger type (base 15 px; drawn here at 14 px so they fit the page). */
+  .scr { font-size: 14px; }
+  .scr .sub { font-size: 12px; }
+  .scr .card { grid-template-columns: 2.3rem minmax(0,1fr) auto; padding: .55rem .65rem; border-left: 3px solid var(--edge, var(--m-line)); }
+  .scr .card .ln { font-size: 13px; }
+  .cards2 { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: .5rem; }
+  .facts { grid-column: 2 / span 2; display: grid; grid-template-columns: 7.2rem minmax(0,1fr); gap: .1rem .5rem; font-size: 13px; align-items: baseline; }
+  .facts .you, .facts .fin { grid-column: 1 / -1; }
+  .fact { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .fact.none { color: var(--m-ink3); }
+  .fact.you { color: var(--m-mag); font-weight: 600; }
+  .fact.fin { color: var(--m-cyan); font-weight: 600; }
+  .icons { display: flex; gap: .25rem; grid-row: 1; grid-column: 3; }
+  .ico { border: 1px solid var(--m-line); border-radius: 5px; padding: 0 .35rem; font-size: 12px; color: var(--m-ink2); background: var(--m-panel); }
+  .ok { border: 1px solid currentColor; border-radius: 5px; padding: 0 .3rem; font-size: 11.5px; font-weight: 600; }
+  .sec { font-size: 12px; letter-spacing: .06em; text-transform: uppercase; font-weight: 700; margin: .25rem 0 -.2rem; }
+  .card.fade { opacity: .6; }
+  .meter i s.lo { background: var(--m-green); } .meter i s.gp { background: var(--m-cyan); }
+  .meter i s.md { background: var(--m-amber); } .meter i s.hi { background: var(--m-red); }
+  .meter i s.tint { opacity: .4; }
+  .tsw { display: grid; grid-template-columns: 15.5rem minmax(0,1fr); min-height: 17rem; }
+  .tsw .list { background: var(--m-panel); border-right: 1px solid var(--m-line); padding: .45rem; display: flex; flex-direction: column; gap: .15rem; font-size: 13px; }
+  .tsw .it2 { display: grid; grid-template-columns: 1.1rem minmax(0,1fr) auto; gap: .1rem .4rem; align-items: center; padding: .3rem .4rem; border-radius: 6px; }
+  .tsw .it2.on { background: var(--m-sel); }
+  .tsw .it2 .n { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tsw .it2 .f { grid-column: 2 / span 2; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dot { width: .6rem; height: .6rem; border-radius: 50%; display: inline-block; background: currentColor; }
+  .tbar { display: flex; gap: .6rem; align-items: center; padding: .4rem .7rem; background: var(--m-panel); border-bottom: 1px solid var(--m-line); font-size: 13px; }
+  .tscreen { background: var(--m-term); color: var(--m-termink); font: 12.5px/1.5 ui-monospace, Menlo, monospace; padding: .6rem .8rem; white-space: pre-wrap; }
+  .detail { grid-column: 1 / -1; border: 1px solid var(--m-accent); border-radius: 8px; background: var(--m-panel); }
+  .detail .acts, .detail .tabs { border-bottom: 1px solid var(--m-line); }
+  .detail .dbody { padding: .55rem .8rem; display: grid; grid-template-columns: 1fr 1fr; gap: .4rem 1.4rem; font-size: 13px; }
+  .detail h6 { margin: 0; font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--m-ink3); }
+  .lk { display: inline-flex; gap: .25rem; align-items: center; border: 1px solid var(--m-line); border-radius: 999px; padding: 0 .5rem; font-size: 12px; color: var(--m-ink2); background: var(--m-panel); white-space: nowrap; }
+  .lk.mg { color: var(--m-mag); border-color: color-mix(in srgb, var(--m-mag) 45%, var(--m-line)); }
+  .brow { display: grid; grid-template-columns: minmax(0,1fr) 7rem 10rem auto; gap: .6rem; align-items: center; padding: .45rem .7rem; border-top: 1px solid var(--m-line); }
+  .brow .ti { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .brow.blk { grid-template-columns: minmax(0,1fr) 8rem auto; }
+  .brow.hist { grid-template-columns: minmax(0,1fr) 9rem auto; }
+  .brow .links { grid-column: 1 / -1; display: flex; gap: .3rem; flex-wrap: wrap; margin-top: -.1rem; }
+  .brow.blk { color: var(--m-ink2); padding: .3rem .7rem; }
+  .toggle { display: inline-block; width: 34px; height: 20px; border-radius: 10px; background: var(--m-panel2); position: relative; border: 1px solid var(--m-line); vertical-align: middle; }
+  .toggle::after { content: ''; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--m-ink3); }
+  .toggle.on { background: var(--m-accent); border-color: var(--m-accent); }
+  .toggle.on::after { left: 16px; background: var(--m-panel); }
+  .pair { display: flex; gap: 1.4rem; flex-wrap: wrap; justify-content: center; margin: 1rem 0 .4rem; }
+  .phone { width: 18.5rem; border: 7px solid #26262c; border-radius: 26px; background: #09090D; color: #F5F7FA; padding: .6rem .55rem; font: 13px/1.35 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .phone .ph { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; font-weight: 700; margin: .5rem .1rem .25rem; }
+  .pc { background: #121219; border: 1px solid #2B2B37; border-radius: 12px; padding: .5rem .6rem; margin-bottom: .4rem; }
+  .pc .n { font-weight: 600; font-size: 14px; }
+  .pc .m { color: #ADB2C2; font-size: 12px; }
+  .ptag { border-radius: 4px; padding: 0 .3rem; font-size: 10.5px; font-weight: 700; }
+  .bub { background: #121219; border: 1px solid #2B2B37; border-radius: 10px; padding: .45rem .55rem; margin: .35rem 0; font-size: 12.5px; }
+  .bub.me { background: #143744; margin-left: 2.5rem; }
+  .cap { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .8rem; color: var(--ink-2); text-align: center; margin-top: .3rem; }
+  .map td:first-child { width: 36%; }
+  @media print { .phone { width: 16rem; } .scr { font-size: 11.5px; } .scr .sub, .facts, .scr .card .ln { font-size: 10.5px; } .tscreen { font-size: 10.5px; } }
+</style>
+
+<h1>1782 — Fit and finish: sm web and the phone app</h1>
+<p class="sans"><small>Author: Claude (design) <code>sm-1782</code> · Ticket #1782 · Revision 3, 30 September 2026 · screens drawn from live sm data at 12:47 pm PT that day</small></p>
+
+<h2>Memo</h2>
+
+<p><b>This round makes sm easier to read and quicker to act on, on both the laptop and the phone.</b> The type gets two sizes bigger. Each agent shows three separate facts instead of one colour: whether it is working, what its queue jobs are doing, and whether it needs you. You can clear “needs you” by answering in any terminal, or with one click. Pages are ordered by what needs your attention. The ticket, pull request, agent, terminal, queue jobs and inbox thread linked to any item are one click from wherever you see it. The board stops folding away rows it has room for, and it gains Close for finished container tickets and Start anyway for blocked ones. The phone app moves to one visual style and reads inbox threads natively.</p>
+
+<p><b>Terms used below.</b> An agent <b>needs you</b> when it asked you something with <code>sm send rajesh --blocking</code>, asked for your review of a doc, or is stopped at an Allow prompt in its terminal. An agent has <b>finished</b> when it ran <code>sm task-complete</code>. Its <b>last turn message</b> is the text it wrote at the end of its latest turn, which is usually the summary you read. The <b>attention order</b> ranks agents: needs you first, then finished, then anything stuck or waiting a long time, then working, then idle.</p>
+
+<h3>Your notes, and what changes</h3>
+<table class="map">
+<thead><tr><th>Your note</th><th>What changes</th></tr></thead>
+<tbody>
+<tr><td>Fonts one or two sizes too small; Terminal button on Claude cards</td><td>Base text 13.5 → 15 px, adjustable in Settings on the web and the phone; Claude cards get both icons. Scenario 1.</td></tr>
+<tr><td>Typing in the web terminal did not clear “waiting on me”; no way to clear it after typing elsewhere</td><td>Enter in sm's terminal clears it, as does a prompt you type into a Claude agent anywhere. ✓ clears it by hand. Scenario 2.</td></tr>
+<tr><td>One chip cannot show working, jobs and waiting-on-me together</td><td>Three separate facts per agent. Scenario 1 shows your overlaps, plus waiting on a review.</td></tr>
+<tr><td>Esc, Tab and Shift-Tab buttons on the web terminal</td><td>Gone on computers, since the keyboard reaches the terminal directly. Kept on phones. Scenario 2.</td></tr>
+<tr><td>With a terminal open, show other agents in attention order and switch fast</td><td>A switcher column in attention order, with ✓. The Agents page uses the same order. Scenarios 1, 2.</td></tr>
+<tr><td>Terminal latency on the home network</td><td>sm's relay stops adding up to 25 ms per key, and at home the terminal skips Cloudflare (decision 4). The bar shows route and round-trip time. Scenario 2.</td></tr>
+<tr><td>Top bar and Queue tab: memory, CPU, GPU; redder when busier; queue share</td><td>That order, in the phone's colours (green, amber above 60%, red above 85%), queue share solid. Queue page too. Scenario 1.</td></tr>
+<tr><td>Side panel feels far away and outlives page changes</td><td>Details open under the card you clicked. The right pane is for reading only and closes on page change. Scenario 3.</td></tr>
+<tr><td>Inbox: show a finished agent's last message</td><td>A Finished group, below Needs you, shows the last turn message. Scenario 5.</td></tr>
+<tr><td>Board: ticket, PR, agent, terminal, inbox one click away</td><td>A links line on every ticket, agent, job, thread and History row. sm shows GitHub text itself, since GitHub cannot be embedded. Scenario 4.</td></tr>
+<tr><td>Board hides lanes and groups it has room for</td><td>Nothing folds while it fits, and a needs-you ticket never hides. Scenario 4.</td></tr>
+<tr><td>Container tickets show Start when all their parts are done</td><td>“All parts done” and Close, which closes the GitHub issue. Scenario 4.</td></tr>
+<tr><td>Blocked tickets cannot be started</td><td>Start anyway; the agent is told to build on the blockers' partial output. Scenario 4.</td></tr>
+<tr><td>History: what is it for; fonts and colours</td><td>It opens on “Bring back an agent”, with last words and Restore. Scenario 6.</td></tr>
+<tr><td>Settings: toggles; About is colourless</td><td>Toggles everywhere; About gets coloured status rows. Scenario 7.</td></tr>
+<tr><td>Context handoff: progressive disclosure; Claude and Codex need different thresholds</td><td>Thresholds appear once a provider is on, per provider, in tokens and percent (decision 7). Scenario 7.</td></tr>
+<tr><td>Phone: Watch style differs; inbox items show web tabs; Board spins; carry over the web changes</td><td>One style, native threads, tabs keep their data, and every change above ships on the phone. Scenario 8, appendix J.</td></tr>
+<tr><td>The phone showed #1784 and a needs-you the web did not</td><td>The web hid both in a closed “Other tickets” box, and reads needs-you from a slower feed. Both apps will draw the same server-computed fields. Appendices B, H1.</td></tr>
+<tr><td>New agents are named <code>claude-&lt;id&gt;</code></td><td>Your ticket pattern, else a poem (Claude) or a star (Codex). Scenario 9.</td></tr>
+</tbody>
+</table>
+
+<p><b>Roll-ins found in the code</b>, all in the plan: the “need you” count misses blocking questions; Settings offers a handoff toggle for plain Codex, which has no gauge; History shows no last words; <code>sm spawn --ticket</code> ignores your name pattern.</p>
+
+<div class="scen">Scenario 1 · You sit down at the laptop</div>
+<h3>“Who needs me, who is done, and what is moving?”</h3>
+<p>The Agents page lists agents in attention order, in sections. Each card shows three facts: <b>Agent</b> (working or idle) and <b>Jobs</b> (its queue jobs and Codex reviews) side by side, and <b>You</b> (needs you, or its finished summary) on its own line when there is something. The colour on the card's left edge is its section. The top bar reads Memory, CPU, GPU, and each meter turns amber and then red as it fills.</p>
+<div class="scrwrap"><div class="scr">
+ <div class="rail"><div class="brand">sm</div><a class="on">Agents <b>10</b></a><a>Board <b>1</b></a><a>Queue <b>2</b></a><a>Inbox <b class="hot" style="color:var(--m-mag)">1</b></a><a>Analytics</a><a>History</a><span class="grow"></span><a>Settings</a></div>
+ <div class="main">
+  <div class="bar"><h5>Agents</h5><span class="search">Search or jump… ⌘K</span><span class="sp"></span>
+   <span class="meter">Memory <i><s class="lo tint" style="width:45%"></s><s class="lo" style="width:38%"></s></i>115/256G · queue 98G</span>
+   <span class="meter">CPU <i><s class="lo tint" style="width:21%"></s><s class="lo" style="width:6%"></s></i>21%</span>
+   <span class="meter">GPU <i><s class="gp" style="width:0%"></s></i>0%</span>
+   <span class="meter">Queue 2 running · 0 waiting</span><span class="btn pri">New agent</span></div>
+  <div class="body">
+   <div class="sum"><span class="mg"><b style="color:inherit">1</b> needs you</span><span class="cy"><b style="color:inherit">1</b> finished</span><span><b>3</b> moving</span><span><b>5</b> idle</span><span class="sp" style="flex:1"></span><span class="seg"><span class="on">By attention</span><span>By repo</span></span></div>
+   <div class="sec mg">Needs you</div>
+   <div class="cards2">
+    <div class="card" style="--edge:var(--m-mag)"><span class="ring" style="--p:62;--rc:#E0A31E">62</span><span class="nm">sm-1726-engineer</span><span class="icons"><span class="ico">⌨</span></span>
+     <span class="ln"><span class="prov cx">CODEX</span> <span class="tk">#1771</span> <span class="sub">session-manager</span></span>
+     <div class="facts"><span class="fact mu">○ Idle 7m</span><span class="fact none">No jobs</span><span class="fact you">◆ 7m: one manual Chrome check… <span class="ok">✓</span></span></div></div>
+   </div>
+   <div class="sec cy">Finished</div>
+   <div class="cards2">
+    <div class="card" style="--edge:var(--m-cyan)"><span class="ring" style="--p:26;--rc:#6CC24A">26</span><span class="nm">far-1855</span><span class="icons"><span class="ico">⌨</span><span class="ico">↗</span></span>
+     <span class="ln"><span class="prov cl">CLAUDE</span> <span class="tk">#1855</span> <span class="sub">fractal-algo-rust</span></span>
+     <div class="facts"><span class="fact mu">○ Idle 4h 46m</span><span class="fact none">No jobs</span><span class="fact fin">✔ 1855 done and closed: 68 views built…</span></div></div>
+   </div>
+   <div class="sec gr">Moving</div>
+   <div class="cards2">
+    <div class="card" style="--edge:var(--m-green)"><span class="ring" style="--p:26;--rc:#6CC24A">26</span><span class="nm">iter8-run</span><span class="icons"><span class="ico">⌨</span><span class="ico">↗</span></span>
+     <span class="ln"><span class="prov cl">CLAUDE</span> <span class="tk">#1858</span> <span class="sub">fractal-algo-rust</span></span>
+     <div class="facts"><span class="fact mu">○ Idle 5m</span><span class="fact gr">▶ 2 running · 2h 56m</span></div></div>
+    <div class="card" style="--edge:var(--m-green)"><span class="ring" style="--p:33;--rc:#86C43F">33</span><span class="nm">sm-1776</span><span class="icons"><span class="ico">⌨</span></span>
+     <span class="ln"><span class="prov cx">CODEX</span> <span class="tk">#1776</span> <span class="sub">session-manager</span></span>
+     <div class="facts"><span class="fact gr">● Working 1m</span><span class="fact none">No jobs</span></div></div>
+    <div class="card" style="--edge:var(--m-green)"><span class="ring" style="--p:20;--rc:#58BF4C">20</span><span class="nm">sm-1782</span><span class="icons"><span class="ico">⌨</span><span class="ico">↗</span></span>
+     <span class="ln"><span class="prov cl">CLAUDE</span> <span class="tk">#1782</span> <span class="sub">session-manager</span></span>
+     <div class="facts"><span class="fact gr">● Working 7m</span><span class="fact none">No jobs</span></div></div>
+   </div>
+   <div class="sec mu">Idle · 5</div>
+   <div class="sub">sm-1768 (11m) · iter7-teacher (1h 10m) · sm-1727 (2h 16m) · sm-reviewer (2h 24m) · iter8-dedicated-reviewer (3h 38m), drawn as faded cards</div>
+  </div>
+ </div>
+</div></div>
+<ul class="does">
+<li><b>⌨ is Terminal and ↗ is Open in Claude.</b> Claude agents with a claude.ai session show both. Clicking the card body opens its details under the card (scenario 3).</li>
+<li><b>✓ clears “needs you”</b> when you answered somewhere sm cannot see. <b>By repo</b> brings back today's grouping.</li>
+<li><b>Memory reads 115 of 256 GB, 98 GB of it queue jobs</b>: solid is the queue's share, tinted is everything else, as on the phone.</li>
+</ul>
+<p>The overlaps you listed, and what each shows:</p>
+<table>
+<thead><tr><th>Situation</th><th>Agent</th><th>Jobs</th><th>You</th><th>Section</th></tr></thead>
+<tbody>
+<tr><td>Working, and still has a question open for you</td><td class="gr">● Working 3m</td><td class="mu">No jobs</td><td class="mg">◆ Needs you 12m</td><td>Needs you</td></tr>
+<tr><td>Idle, waiting for its running job</td><td class="mu">○ Idle 40m</td><td class="gr">▶ Tests running 38m of 3h</td><td>—</td><td>Moving</td></tr>
+<tr><td>Idle, waiting for a job still in the queue</td><td class="mu">○ Idle 1h 5m</td><td class="am">⏸ Waiting 1h 2m · 3rd in line</td><td>—</td><td>Waiting long (after 30 min)</td></tr>
+<tr><td>Working, with a job running</td><td class="gr">● Working 2m</td><td class="gr">▶ Background running 1h 9m</td><td>—</td><td>Moving</td></tr>
+<tr><td>Idle, waiting for a Codex review</td><td class="mu">○ Idle 12m</td><td class="am">⏸ Codex review on PR #1790 · 12m</td><td>—</td><td>Waiting (Waiting long after 30 min)</td></tr>
+<tr><td>Working, with a job queued</td><td class="gr">● Working 2m</td><td class="am">⏸ Waiting 8m · 1st in line</td><td>—</td><td>Moving</td></tr>
+</tbody>
+</table>
+
+<div class="scen">Scenario 2 · Answering from the terminal</div>
+<h3>“I answered it in the terminal. Stop telling me it is waiting.”</h3>
+<p>The terminal page keeps a switcher column on the left, in attention order. Pressing Enter in sm's terminal clears that agent's “needs you” at once. sm also treats a prompt you type straight into a Claude agent on the Studio as your answer: sm can tell your typing from its own deliveries, because every message sm delivers starts with a marker such as <code>[Input from: …]</code>. Codex agents do not report typing, so for them it is sm's terminal or ✓.</p>
+<div class="scrwrap"><div class="scr" style="grid-template-columns: 1fr">
+ <div class="main">
+  <div class="tbar"><span>←</span><span class="ring" style="--p:62;--rc:#E0A31E;width:1.7rem;height:1.7rem;font-size:10px">62</span><b>sm-1726-engineer</b><span class="sub">Codex · #1771</span><span class="gr" style="font-weight:600">Live</span><span class="sub">Direct · 3 ms</span><span class="sp" style="flex:1"></span><span class="btn sm">Details</span></div>
+  <div class="tsw">
+   <div class="list">
+    <div class="sec mg" style="font-size:11px">Needs you</div>
+    <div class="it2 on"><span class="dot mg"></span><span class="n">sm-1726-engineer</span><span class="ok mg">✓</span><span class="f mg">7m: one manual Chrome check</span></div>
+    <div class="sec cy" style="font-size:11px">Finished</div>
+    <div class="it2"><span class="dot cy"></span><span class="n">far-1855</span><span></span><span class="f mu">1855 done and closed…</span></div>
+    <div class="sec gr" style="font-size:11px">Moving</div>
+    <div class="it2"><span class="dot gr"></span><span class="n">iter8-run</span><span></span><span class="f mu">2 jobs running · 2h 56m</span></div>
+    <div class="it2"><span class="dot gr"></span><span class="n">sm-1776</span><span></span><span class="f mu">Working 1m</span></div>
+    <div class="it2"><span class="dot gr"></span><span class="n">sm-1782</span><span></span><span class="f mu">Working 7m</span></div>
+    <div class="sec mu" style="font-size:11px">Idle · 5 ›</div>
+   </div>
+   <div class="tscreen">• 1771 is waiting for one manual Chrome check. The last test still left terminals
+  Reconnecting, so I rolled it back immediately. Please open any agent's terminal in
+  Chrome on the laptop and tell me whether it connects.
+
+› <span style="color:#9fb7ff">Checked in Chrome on the laptop: it connects in about a second, no Reconnecting. Merge it.</span>▌
+
+  <span style="color:#8a8f9c">⏎ send   ⇧⏎ newline</span></div>
+  </div>
+ </div>
+</div></div>
+<ul class="does">
+<li><b>Keys go straight to the terminal</b>, so the key buttons show only on phone-sized screens. ⌘⌥↑ and ⌘⌥↓ move through the switcher.</li>
+<li><b>Why typing lags today.</b> The web terminal always goes through Cloudflare, even on the Studio, and sm's relay checks for the agent's output only every 25 ms, adding up to 25 ms to every echo. The relay will pass output on the moment it appears.</li>
+<li><b>Direct · 3 ms</b> means the terminal is connected straight to the server, skipping Cloudflare. Over Cloudflare the bar reads, for example, “Cloudflare · 45 ms”. Chrome asks once for permission to reach the local server, and if you decline, sm uses Cloudflare as today.</li>
+</ul>
+
+<div class="scen">Scenario 3 · Details where you clicked</div>
+<h3>“Show me iter8-run's jobs.”</h3>
+<p>Clicking a card opens today's panel content in a band under the card's row; on the Board and the Queue, under the row you clicked. The right pane is only for reading docs, threads and GitHub tickets. Everything closes when you change page.</p>
+<p><b>Hand off…</b> opens two separate controls. <b>Automatic handoff</b> is a toggle and threshold for this agent and every agent that takes over from it, or, with the scope switch, for its ticket. <b>Hand off now</b> asks the agent to hand off once, after a confirm.</p>
+<div class="scrwrap"><div class="scr">
+ <div class="rail"><div class="brand">sm</div><a class="on">Agents <b>10</b></a><a>Board</a><a>Queue</a><a>Inbox</a><span class="grow"></span><a>Settings</a></div>
+ <div class="main"><div class="body">
+  <div class="sec gr">Moving</div>
+  <div class="cards2">
+   <div class="card sel" style="--edge:var(--m-green)"><span class="ring" style="--p:26;--rc:#6CC24A">26</span><span class="nm">iter8-run</span><span class="icons"><span class="ico">⌨</span><span class="ico">↗</span></span>
+    <span class="ln"><span class="prov cl">CLAUDE</span> <span class="tk">#1858</span> <span class="sub">fractal-algo-rust</span></span>
+    <div class="facts"><span class="fact mu">○ Idle 5m</span><span class="fact gr">▶ 2 running · 2h 56m</span></div></div>
+   <div class="card" style="--edge:var(--m-green)"><span class="ring" style="--p:33;--rc:#86C43F">33</span><span class="nm">sm-1776</span><span class="icons"><span class="ico">⌨</span></span>
+    <span class="ln"><span class="prov cx">CODEX</span> <span class="tk">#1776</span></span>
+    <div class="facts"><span class="fact gr">● Working 1m</span><span class="fact none">No jobs</span></div></div>
+   <div class="detail">
+    <div class="acts"><span class="btn pri">Open in Claude ↗</span><span class="btn">Terminal</span><span class="btn">Follow</span><span class="btn">Hand off…</span><span class="btn">Clone</span><span class="btn">⋯</span><span style="flex:1"></span><span class="sub">Opus 1M · high · idle since 12:42 pm</span><span class="btn sm">×</span></div>
+    <div class="tabs"><span class="on">Work</span><span>Activity</span><span>Summary</span></div>
+    <div class="dbody">
+     <div><h6>Ticket</h6><span class="tk">#1858</span> Iter8 I8-8: the run <span class="lk">↗ GitHub</span></div>
+     <div><h6>Queue jobs</h6><span class="ball gr">1858-prepare-3</span> <span class="sub">background · running 2h 56m</span><br><span class="ball gr">1858-run</span> <span class="sub">background · running 1h 19m</span></div>
+     <div><h6>Inbox</h6><span class="sub">No messages to you</span></div>
+     <div><h6>Workspace</h6><span class="mono">~/projects/fractal-algo-rust</span></div>
+    </div>
+    <div class="msg">Message iter8-run…<span>↵</span></div>
+   </div>
+  </div>
+ </div></div>
+</div></div>
+
+<div class="scen">Scenario 4 · The board</div>
+<h3>“What is each ticket, who is on it, and can I push it along?”</h3>
+<p>Every row carries a links line (⌨ opens the agent's terminal). Blocked tickets are slim rows with <b>Start anyway</b>, the three latest done tickets show, Other tickets stay open, and finished containers show <b>Close</b>.</p>
+<div class="scrwrap"><div class="scr">
+ <div class="rail"><div class="brand">sm</div><a>Agents</a><a class="on">Board <b>1</b></a><a>Queue</a><a>Inbox</a><span class="grow"></span><a>Settings</a></div>
+ <div class="main"><div class="bar"><h5>Board</h5><span class="sub">2 lanes · updated 20s ago</span><span class="sp"></span><span class="seg"><span class="on">3 h</span><span>6 h</span><span>24 h</span></span><span class="btn">Add lane</span></div>
+ <div class="body">
+  <div class="lane">
+   <div class="lanehd"><span class="rk">1</span><span class="t">fractal-algo-rust <span class="tk">#1859</span> · Iter8 I8-9: the readout</span><span class="sp" style="flex:1"></span><span class="sub">9 done · 1 in progress · 1 blocked</span></div>
+   <div class="brow"><span class="ti"><span class="tk">#1858</span> Iter8 I8-8: the run</span><span class="strip"><s class="sj" style="left:0;width:100%"></s></span><span class="ball gr">2 running · 2h 56m</span><span></span>
+    <div class="links"><span class="lk">#1858 ↗</span><span class="lk">iter8-run · Claude · ○ Idle 5m ⌨</span><span class="lk gr">1858-prepare-3 · running 2h 56m</span><span class="lk gr">1858-run · running 1h 19m</span></div></div>
+  </div>
+  <div class="lane">
+   <div class="lanehd"><span class="rk">2</span><span class="t">session-manager <span class="tk">#1775</span> · Reviews: one review command</span><span class="sp" style="flex:1"></span><span class="sub">1 in progress · 6 blocked</span></div>
+   <div class="brow"><span class="ti"><span class="tk">#1776</span> Reviews 1/6: sm request-review</span><span class="strip"><s class="sw" style="left:70%;width:30%"></s></span><span class="ball gr">Agent working 1m</span><span></span>
+    <div class="links"><span class="lk">#1776 ↗</span><span class="lk">sm-1776 · Codex · <span class="gr">● Working 1m</span> ⌨</span><span class="lk">No PR yet</span></div></div>
+   <div class="brow blk"><span class="ti"><span class="tk">#1777</span> Reviews 2/6: review runs</span><span class="sub">waits on #1776</span><span class="btn sm">Start anyway</span></div>
+   <div class="brow blk"><span class="ti"><span class="tk">#1778</span> Reviews 3/6: repo, lane and ticket policies</span><span class="sub">waits on #1777</span><span class="btn sm">Start anyway</span></div>
+   <div class="brow blk"><span class="ti sub">#1779 to #1781 follow the same way</span></div>
+  </div>
+  <div class="lane">
+   <div class="lanehd"><span class="rk">·</span><span class="t">session-manager · Other tickets</span></div>
+   <div class="brow"><span class="ti"><span class="tk mg">#1771</span> Browser device certificate requests break Chrome terminals</span><span></span><span class="ball mg">Needs you 7m</span><span></span>
+    <div class="links"><span class="lk">#1771 ↗</span><span class="lk mg">Inbox · 1 question</span><span class="lk">sm-1726-engineer · Codex · ○ Idle 7m ⌨</span></div></div>
+   <div class="brow"><span class="ti"><span class="tk">#1710</span> sm on the web: one page for everything</span><span class="sub">15 of 15 parts done</span><span class="ball cy">All parts done</span><span class="btn sm pri">Close</span></div>
+   <div class="brow"><span class="ti"><span class="tk">#1782</span> sm web and mobile redesign, fit and finish</span><span></span><span class="ball mg">Your review 4m</span><span></span>
+    <div class="links"><span class="lk">#1782 ↗</span><span class="lk">sm-1782 · Claude · ○ Idle 4m ⌨</span><span class="lk mg">PR #1785 · open · your review, round 3 · waiting 4m</span><span class="lk mg">Inbox · doc review</span></div></div>
+  </div>
+ </div></div>
+</div></div>
+<ul class="does">
+<li><b>Every chip says where its item stands.</b> The agent chip shows working or idle. The PR chip shows its state, the review round, the last verdict, and who it is waiting on and for how long. There is one chip per queue job with its run or wait time. The Inbox chip opens that thread at the newest open question, highlighted.</li>
+<li><b>Tickets and PRs open in the reading pane</b>, with their GitHub text, comments and checks fetched by sm, since GitHub refuses to be embedded (<code>X-Frame-Options: deny</code>, checked today).</li>
+<li><b>Start anyway</b> confirms first, then tells the agent: “Started early by Rajesh. #1776 is not done yet: check what it has delivered so far and build on it; do not redo its work.”</li>
+<li><b>Close</b> closes the GitHub issue with a comment listing its closed parts, then the board refreshes. It applies only to tickets with sub-issues (#1710, shown before you closed it). A ticket that merely starts after others keeps Start.</li>
+</ul>
+
+<div class="scen">Scenario 5 · Reading what finished</div>
+<h3>“far-1855 is done. What did it say?”</h3>
+<div class="scrwrap"><div class="scr">
+ <div class="rail"><div class="brand">sm</div><a>Agents</a><a>Board</a><a>Queue</a><a class="on">Inbox <b style="color:var(--m-mag)">1</b></a><span class="grow"></span><a>Settings</a></div>
+ <div class="main"><div class="two">
+  <div class="list">
+   <div class="it"><div class="sec mg" style="font-size:11px">Needs you</div></div>
+   <div class="it"><div class="top"><b>sm-1726-engineer</b><span class="sub">7m</span></div><span class="pv">1771 is waiting for one manual Chrome check…</span></div>
+   <div class="it"><div class="sec cy" style="font-size:11px">Finished</div></div>
+   <div class="it sel"><div class="top"><b>far-1855</b><span class="sub">4h 46m</span></div><span class="pv">1855 done and closed: 68 views built and gated…</span></div>
+   <div class="it"><div class="sec mu" style="font-size:11px">Earlier</div></div>
+   <div class="it"><div class="top"><b>Doc · Iteration 7 teaching memo</b><span class="sub">1h 10m</span></div><span class="pv">Read</span></div>
+  </div>
+  <div class="reader">
+   <div class="rbar"><b>far-1855</b><span class="sub">Claude · #1855 · finished 8:01 am</span><span style="flex:1"></span><span class="lk">#1855 ↗</span><span class="lk">⌨ Terminal</span><span class="btn sm">Done</span></div>
+   <div class="doc" style="font-family:inherit"><p class="sub">Last turn · 8:01 am</p><p><b>1855 done and closed:</b> 68 views built and gated, 19.0 M training rows… (the agent's full last message, rendered as Markdown)</p></div>
+   <div class="msg">Reply to far-1855…<span>↵</span></div>
+  </div>
+ </div></div>
+</div></div>
+<p>A Finished row appears when an agent runs <code>sm task-complete</code>, showing the message it wrote at the end of that turn. Done marks it read. sm also keeps every agent's latest last turn message for the details band and History.</p>
+
+<div class="scen">Scenario 6 · History</div>
+<h3>“Bring back the agent that fixed the terminal.”</h3>
+<p>History opens on retired agents, newest first. Each row shows the agent's name, ticket, when it retired and its last turn message, with Restore at the right. Tickets are the second tab. Type uses the app's normal ink levels, not grey on grey. The quotes show what the new last-turn record will hold; today these fields are empty.</p>
+<div class="scrwrap"><div class="scr" style="grid-template-columns: 1fr"><div class="main"><div class="body">
+ <div class="sum"><b>Bring back an agent</b><span class="seg"><span class="on">Agents</span><span>Tickets</span></span><span class="search" style="min-width:14rem">Find by name, ticket or folder</span></div>
+ <div class="brow hist"><span class="ti"><b>sm-1768</b> <span class="prov cl">CLAUDE</span> <span class="tk">#1768</span> · retired 4m ago</span><span class="sub">session-manager</span><span class="btn sm pri">Restore</span><div class="links"><span class="sub">Last turn: “Memo 1768 is merged and published…”</span></div></div>
+ <div class="brow hist"><span class="ti"><b>sm-terminal-fix</b> <span class="prov cl">CLAUDE</span> <span class="tk">#1763</span> · retired 3h 47m ago</span><span class="sub">session-manager</span><span class="btn sm pri">Restore</span><div class="links"><span class="sub">Last turn: “Terminal fix (#1763) is ready, but it can't get a review…”</span></div></div>
+ <div class="brow hist"><span class="ti"><b>sm-1765-reviewer</b> <span class="prov cx">CODEX</span> · retired 4h 10m ago</span><span class="sub">session-manager</span><span class="btn sm pri">Restore</span></div>
+</div></div></div></div>
+
+
+<div class="scen">Scenario 7 · Settings</div>
+<h3>“Hand off Claude at 350k tokens, and leave Codex alone.”</h3>
+<div class="scrwrap"><div class="scr"><div class="rail"><div class="brand">sm</div><a>Agents</a><a>Board</a><a>Queue</a><a>Inbox</a><span class="grow"></span><a class="on">Settings</a></div>
+ <div class="main"><div class="set"><div class="setnav"><span>Appearance</span><span>New agents</span><span class="on">Context handoff</span><span>Queue limits</span><span>Terminals</span><span>Notifications</span><span>Devices &amp; access</span><span>About</span></div>
+ <div class="setbody">
+  <div class="sgrp"><h6>Claude agents</h6>
+   <div><span class="l">Hand off automatically</span><span><span class="toggle on"></span></span></div>
+   <div><span class="l">Hand off at</span><span><span class="inp">35</span> % of context · <b>350k</b> of 1M tokens</span></div>
+   <div><span class="l">Remind at</span><span><span class="inp">50</span> % · 500k tokens</span></div>
+   <div><span class="l">Review floor</span><span><span class="inp">20</span> % · 200k tokens <span class="sub">(below this, a review request does not ask for a handoff)</span></span></div></div>
+  <div class="sgrp"><h6>Codex agents</h6>
+   <div><span class="l">Hand off automatically</span><span><span class="toggle"></span> <span class="sub">Off. Codex compacts its own context near the end of its 258k window.</span></span></div></div>
+  <div class="sgrp"><h6>When a review is requested</h6>
+   <div><span class="l">Codex review of a PR</span><span><span class="toggle on"></span> ask the agent to hand off first</span></div>
+   <div><span class="l">Your review of a doc</span><span><span class="toggle on"></span> ask the agent to hand off first</span></div></div>
+ </div></div></div></div></div>
+<ul class="does">
+<li>Turning Codex on reveals its own rows, which start at 80% (207k of 258k tokens). The review toggles show only while at least one provider hands off.</li>
+<li><b>To try handoff on one agent or one ticket</b>, leave the defaults off and use Hand off… in that agent's details or in a ticket's ⋯ on the Board (scenario 3). Either way, the agents that take over inherit the setting.</li>
+<li>Every checkbox becomes a toggle. Appearance gains a Text size slider. About gains coloured status rows: server version, uptime and health, web build, latest phone build.</li>
+</ul>
+
+<div class="scen">Scenario 8 · The phone</div>
+<h3>“One look, and reading stays in the app.”</h3>
+<div class="pair">
+ <div><div class="phone">
+  <div class="ph" style="color:#F0ABFC">Needs you</div>
+  <div class="pc" style="border-left:3px solid #F0ABFC"><div class="n">sm-1726-engineer <span class="ptag" style="background:#A78BFA2e;color:#A78BFA">CODEX</span></div><div class="m">#1771 · ○ Idle 7m · No jobs</div><div style="color:#F0ABFC;font-size:12.5px">◆ 7m: one manual Chrome check… <span class="ok">✓</span></div></div>
+  <div class="ph" style="color:#5EE7FF">Finished</div>
+  <div class="pc" style="border-left:3px solid #5EE7FF"><div class="n">far-1855 <span class="ptag" style="background:#FB923C2e;color:#FB923C">CLAUDE</span></div><div class="m">#1855 · finished 4h 46m</div><div style="color:#5EE7FF;font-size:12.5px">✔ 1855 done and closed: 68 views…</div></div>
+  <div class="ph" style="color:#4ADE80">Moving</div>
+  <div class="pc" style="border-left:3px solid #4ADE80"><div class="n">iter8-run <span class="ptag" style="background:#FB923C2e;color:#FB923C">CLAUDE</span></div><div class="m">#1858 · ○ Idle 5m · <span style="color:#4ADE80">▶ 2 running · 2h 56m</span></div></div>
+ </div><div class="cap">Agents (today's Watch), in the Board and Inbox style</div></div>
+ <div><div class="phone">
+  <div style="display:flex;justify-content:space-between;font-weight:600">‹ Inbox <span>sm-1726-engineer</span><span style="color:#ADB2C2">⋯</span></div>
+  <div class="m" style="color:#ADB2C2;font-size:12px;margin:.2rem 0 .4rem">Codex · #1771 · ⌨ Terminal · #1771 ↗</div>
+  <div class="bub" style="border-color:#F0ABFC">1771 is waiting for one manual Chrome check. The last test still left terminals Reconnecting, so I rolled it back immediately…</div>
+  <div class="bub me">Checked on the laptop: it connects. Merge it.</div>
+  <div class="bub" style="color:#ADB2C2">Reply…</div>
+  <div style="display:flex;gap:.4rem;margin-top:.3rem"><span class="ptag" style="border:1px solid #2B2B37;padding:.1rem .5rem">✓ Answered</span><span class="ptag" style="border:1px solid #2B2B37;padding:.1rem .5rem">Done</span></div>
+ </div><div class="cap">A thread, drawn natively; no web tabs</div></div>
+</div>
+<ul class="does">
+<li>Watch and History drop their large rounded cards for the compact rows and small tags of Board and Inbox. Section headers are coloured words, as in the Inbox.</li>
+<li>Docs still open in the reader, but without sm's web tab bar.</li>
+<li>Board, Inbox and Queue show their last data at once when you return to the tab. A thin bar shows the refresh, and there is no spinner.</li>
+</ul>
+
+<div class="scen">Scenario 9 · Starting an agent without a name</div>
+<h3>“Give it a name I can say.”</h3>
+<ul class="does">
+<li><b>With a ticket</b> (Board Start or <code>sm spawn --ticket 1782</code>): your pattern, <code>sm-1782</code>. Today the CLI gives <code>claude-48ab12cd</code>.</li>
+<li><b>Without one, Claude:</b> a poem's name, such as <code>kubla-khan</code>, <code>ozymandias</code> or <code>dover-beach</code>.</li>
+<li><b>Without one, Codex:</b> a star's name, such as <code>vega</code>, <code>rigel</code> or <code>altair</code>.</li>
+</ul>
+<p>A name is skipped while a live agent holds it, or one that retired less than a week ago; older names are reused. Most agents then need no rename, so the naming paragraph leaves CLAUDE.md (decision 9).</p>
+
+<h3>Decisions</h3>
+<table>
+<thead><tr><th style="width:26%">Question</th><th>Recommendation</th><th style="width:28%">Why</th></tr></thead>
+<tbody>
+<tr><td>1. Show three facts per agent and order by attention?</td><td><b>Yes.</b> Sections: Needs you, Finished, Waiting long, Moving, Waiting, Idle.</td><td>A single colour hides overlaps you run into daily.</td></tr>
+<tr><td>2. What clears “needs you”?</td><td><b>Your answer:</b> Enter in sm's terminal, a prompt you type into a Claude agent, a reply in the Inbox, or ✓. Never the agent working again on its own.</td><td>An agent can work while it waits on you.</td></tr>
+<tr><td>3. Where do details open?</td><td><b>Under the card or row you clicked.</b> The right pane is for reading only, and everything closes on page change.</td><td>Controls sit next to the thing you chose.</td></tr>
+<tr><td>4. Terminal skips Cloudflare at home?</td><td><b>Accepted.</b> Fix sm's 25 ms relay check, connect directly on the Studio, and give the MacBook <code>studio-lan.rajeshgo.li</code> with a certificate, using sm's Cloudflare token.</td><td>An https page can reach its own machine freely, but another machine only over a certified connection.</td></tr>
+<tr><td>5. Close container tickets from the board?</td><td><b>Yes.</b> “All parts done” plus Close, which closes the GitHub issue with a comment.</td><td>They are bookkeeping; one click ends them.</td></tr>
+<tr><td>6. Start blocked tickets?</td><td><b>Yes, as Start anyway</b>, with a confirm.</td><td>You did this by hand this morning.</td></tr>
+<tr><td>7. Handoff thresholds</td><td><b>Per provider, shown in tokens</b>, plus per agent and per ticket. Claude stays at 35% (350k tokens). Codex starts off, at 80% (207k of 258k) once on.</td><td>The same percent means four times more tokens on Claude.</td></tr>
+<tr><td>8. Finished rows in the Inbox</td><td><b>Only after <code>sm task-complete</code>.</b></td><td>That is the agent saying “read this”.</td></tr>
+<tr><td>9. Generated names</td><td><b>Poems for Claude, stars for Codex; your ticket pattern first.</b> Names free up a week after retirement. Remove “Name yourself once…” from CLAUDE.md §3.</td><td>Names you can say and remember, without agents renaming.</td></tr>
+<tr><td>10. Type and phone style</td><td><b>15 px base, adjustable</b>: a Text size slider on the web (13 to 19 px) and on the phone (85% to 130%). On the phone, <b>the Board and Inbox style everywhere</b>.</td><td>Two sizes up by default; you set the rest.</td></tr>
+<tr><td>11. Plan</td><td><b>Fourteen tickets</b> (appendix L): seven server, five web, two phone.</td><td>Each fits one agent without compaction.</td></tr>
+</tbody>
+</table>
+
+
+<h3>FAQ — what changed since revision 2</h3>
+<p>Board chips show live state (agent, PR review round and wait, job times), and the Inbox chip opens the exact question. Hand off… is two controls; successors inherit. <code>sm pr</code> claims link PRs to tickets.</p>
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<p>These appendices are for the implementing agents. Code references are to <code>crates/sm-server/src</code> at <code>2a5e74f</code> unless a path says otherwise. The memo screens are the visual reference. <code>docs/specs/1710_web_redesign.html</code> remains the base spec, and this document changes only what it names.</p>
+
+<h3>A. Type and colour</h3>
+<h4>A1. Type scale (web)</h4>
+<ul>
+<li>The root font size is set on <code>&lt;html&gt;</code> from <code>localStorage["sm-text-size"]</code>, an integer from 13 to 19 px (default 15). A missing or out-of-range value means 15. An inline script in the shell sets it before first paint, beside the theme script. Text size is per browser, like theme, because it depends on the screen.</li>
+<li>Every font size in <code>app.css</code>, <code>queue.css</code> and <code>devices.css</code> becomes a rem value, by this map (px at the standard size):
+<table><thead><tr><th>Today (px)</th><th>New (rem)</th><th>At 15 px root</th></tr></thead><tbody>
+<tr><td>10, 10.5</td><td>0.8</td><td>12</td></tr><tr><td>11, 11.5</td><td>0.867</td><td>13</td></tr><tr><td>12, 12.5</td><td>0.9</td><td>13.5</td></tr>
+<tr><td>13, 13.5 (base)</td><td>1</td><td>15</td></tr><tr><td>14</td><td>1.067</td><td>16</td></tr><tr><td>15</td><td>1.133</td><td>17</td></tr>
+<tr><td>16, 17</td><td>1.2</td><td>18</td></tr><tr><td>18</td><td>1.333</td><td>20</td></tr><tr><td>22, 24</td><td>1.733</td><td>26</td></tr></tbody></table></li>
+<li>Widths already in rem (the rail, the panel, the rings) scale with the root size. Pixel widths in the layout become rem using the same 15 px root. Agent cards use <code>minmax(24rem, 1fr)</code>.</li>
+<li>The xterm font size is the root size minus 1 px.</li>
+<li>Doc pages loaded in the reader keep their own stylesheet.</li>
+<li>Appearance gains a Text size slider, 13 to 19 px in 1 px steps. It shows the value (“15 px”), applies live, and has Reset (15 px).</li>
+<li><b>Phone:</b> Settings › Appearance gains a Text size slider from 85% to 130% in 5% steps (default 100%), stored in <code>SettingsRepository</code>. <code>Theme.kt</code> scales every <code>Typography</code> style's font size and line height by it.</li>
+</ul>
+<h4>A2. Usage meters (web top bar, Queue page Mac tile, phone)</h4>
+<ul>
+<li><b>Band</b> is computed from the total fraction <i>f</i>. Memory uses <code>memory_used_bytes ÷ memory_total_bytes</code>; CPU and GPU use percent ÷ 100. Below 0.60 is low, 0.60 to 0.85 is mid, and above 0.85 is high. This is the phone's <code>meterBand</code> (<code>android-app/…/ui/queue/QueueModels.kt:148</code>).</li>
+<li><b>Colour:</b> low is green, mid is amber, high is red. GPU in the low band is cyan. The colours are the palette tokens (1710 appendix A).</li>
+<li><b>Fill:</b> when the queue share is known, the total bar is the band colour at 40% opacity and the queue share (clamped to at most the total) is drawn over it in solid band colour. When it is unknown, the total is solid.</li>
+<li><b>Order:</b> Memory, CPU, GPU, then the Queue link. The labels are <code>115/256G · queue 98G</code>, <code>21%</code> and <code>0%</code>, using gigabytes as <code>ui.js</code> <code>gigabytes()</code> computes them today.</li>
+<li><b>Narrow bars:</b> GPU is shed first, then CPU, then Memory, then all meters (<code>app.css</code> container queries).</li>
+<li><b>Queue link:</b> the link text turns amber when any waiting job has waited 30 minutes or more.</li>
+<li>One function, <code>meterBand(fraction, kind)</code> in <code>ui.js</code>, serves the top bar and the Queue page's Mac tile (<code>queue.js:34-43</code>). The Queue chart's line colours do not change.</li>
+</ul>
+<h4>A3. Section colours</h4>
+<table><thead><tr><th>Section (appendix B)</th><th>Colour token</th><th>Card left edge</th></tr></thead><tbody>
+<tr><td>you</td><td>magenta</td><td>magenta</td></tr><tr><td>finished</td><td>cyan</td><td>cyan</td></tr>
+<tr><td>waiting_long</td><td>amber</td><td>red when the reason is <code>quiet</code> or <code>stalled</code>; otherwise amber</td></tr>
+<tr><td>moving</td><td>green</td><td>green</td></tr><tr><td>waiting</td><td>amber</td><td>amber</td></tr><tr><td>idle, stopped</td><td>ink-3</td><td>line colour; cards without a ticket fade to 60%</td></tr></tbody></table>
+
+<h3>B. Agent facts and attention order</h3>
+<p>The server computes both, so the web, the phone and <code>sm watch</code> agree. <code>GET /watch/state</code> (<code>http/watch.rs:225-259</code>) gains two objects per session, and new counts.</p>
+<pre><code>"facts": {
+  "agent": { "state": "working" | "idle" | "stopped", "since": "…Z" },
+  "jobs":  { "running": 2, "waiting": 0, "quiet": false, "review": null | { "pr_number": 1790, "since": "…Z" },
+             "earliest_start": "…Z" | null, "oldest_wait": "…Z" | null,
+             "tone": "green" | "amber" | "red" | null, "text": "2 running · 2h 56m" },
+  "you":   null | { "kind": "message" | "doc_review" | "prompt", "since": "…Z",
+                    "text": "…", "more": 0, "message_ids": ["msg_…"], "dismissible": true },
+  "finished": null | { "at": "…Z", "text": "…" | null, "read": false }
+},
+"attention": { "section": "you" | "finished" | "waiting_long" | "moving" | "waiting" | "idle" | "stopped",
+               "reason": "message" | "doc_review" | "prompt" | "queue_wait" | "review_wait" | "quiet" | "stalled" | null,
+               "order_key": "…" }</code></pre>
+<p><b>agent.</b> <code>working</code> when <code>activity_state</code> is <code>working</code> or <code>thinking</code>. <code>stopped</code> when the session status is stopped. Otherwise <code>idle</code>, and that includes <code>waiting_permission</code>, which instead produces <code>you.kind = "prompt"</code>. <code>since</code> is <code>activity_since</code> as computed today (<code>http/watch.rs:277-290</code>).</p>
+<p><b>jobs.</b> The session's <code>jobs[]</code> with state <code>running</code> or <code>pending</code>, where the session is the requester or, if the job has no requester, its notify target (unchanged from today). Take the first rule that matches for <code>text</code>:</p>
+<table><thead><tr><th>Jobs</th><th>text</th><th>tone</th></tr></thead><tbody>
+<tr><td>None</td><td>“No jobs”</td><td>null</td></tr>
+<tr><td>Every running job is quiet (1716 rule, <code>quiet_since</code> set) and none waits</td><td>“Quiet {age of latest quiet_since}: {label}”</td><td>red</td></tr>
+<tr><td>1 running, 0 waiting</td><td>“{Type} running {age}” plus “ of {limit}” when <code>timeout_seconds &gt; 0</code></td><td>green</td></tr>
+<tr><td>n running, 0 waiting</td><td>“{n} running · {age of earliest start}”</td><td>green</td></tr>
+<tr><td>n running, m waiting</td><td>“{n} running · {m} waiting {oldest wait age}”</td><td>green</td></tr>
+<tr><td>0 running, 1 waiting</td><td>“Waiting {age} · {ordinal} in line”, using the job's <code>position</code> from <code>GET /client/queue</code></td><td>amber</td></tr>
+<tr><td>0 running, m waiting</td><td>“{m} waiting {oldest age}”, plus “ for a slot” when every waiting job's holding reason is <code>concurrency_cap</code></td><td>amber</td></tr></tbody></table>
+<p><b>Reviews.</b> <code>jobs.review</code> is the oldest pending Codex review (<code>waiting_on</code> kind <code>review</code>). With no queue jobs, <code>text</code> is “Codex review on PR #{n} · {age}” and <code>tone</code> is amber. With jobs, the job text above gains “ · review {age}” and keeps its tone.</p>
+<p>Ages use 1710's rule: under an hour “{m}m”, otherwise “{h}h {m}m”. <code>{Type}</code> is the job type with a capital letter (“Tests”, “Background”).</p>
+<p><b>you.</b> Build candidates in this order and show the first; <code>more</code> counts the rest.</p>
+<ol>
+<li><code>message</code>: the session's owner messages in state NeedsYou (<code>owner_messages.rs:100-118</code>). <code>since</code> is the oldest one's creation time. <code>text</code> is the newest one's preview (the first 120 characters of its body). <code>message_ids</code> lists them all. <code>dismissible: true</code>.</li>
+<li><code>doc_review</code>: each <code>owner_review</code> obligation (<code>http.rs:6903</code>). <code>text</code> is “Review: {doc title}”. <code>dismissible: false</code>, because clearing a review needs a review or “No review needed” on the doc.</li>
+<li><code>prompt</code>: <code>activity_state == "waiting_permission"</code>. <code>text</code> is “Allow prompt in its terminal”. <code>dismissible: false</code>, because it clears itself.</li>
+</ol>
+<p><b>finished</b> is specified in appendix D.</p>
+<p><b>attention.section.</b> The first rule that matches:</p>
+<table><thead><tr><th>#</th><th>Condition</th><th>section · reason</th><th>order_key (ascending)</th></tr></thead><tbody>
+<tr><td>0</td><td>Session stopped</td><td>stopped</td><td>inverse of last activity</td></tr>
+<tr><td>1</td><td><code>facts.you</code> set</td><td>you · its kind</td><td><code>you.since</code> (oldest first)</td></tr>
+<tr><td>2</td><td><code>facts.finished</code> set and not read</td><td>finished</td><td>inverse of <code>finished.at</code> (newest first)</td></tr>
+<tr><td>3</td><td>A running job is quiet; or a job or a Codex review has waited at least <code>web_watch.waiting_long_minutes</code> (default 30); or the agent is stalled (1710 D7 rule 7: idle at least <code>board.stall_minutes</code> with a ticket claim, and no job and no pending review)</td><td>waiting_long · quiet, queue_wait, review_wait or stalled (checked in that order)</td><td>the earliest of <code>quiet_since</code>, <code>oldest_wait</code> and idle start</td></tr>
+<tr><td>4</td><td>Agent working, or at least one running job</td><td>moving</td><td>inverse of the latest activity or job start</td></tr>
+<tr><td>5</td><td>A waiting job, or a pending Codex review (<code>waiting_on</code> kind <code>review</code>)</td><td>waiting</td><td>the oldest wait or review request</td></tr>
+<tr><td>6</td><td>Otherwise</td><td>idle</td><td><code>0</code> + inverse of last activity when the agent holds a ticket claim; <code>1</code> + the same otherwise</td></tr></tbody></table>
+<p>“Inverse of a time” means <code>9999999999 − unix seconds</code>, zero-padded to 10 digits, so a plain string sort puts the newest first. Clients sort by the section's index in the order above (you, finished, waiting_long, moving, waiting, idle, stopped), then by <code>order_key</code>, then by name.</p>
+<p><b>One source.</b> The web's <code>agentBall</code> (<code>agents.js:24-67</code>) and the phone's own status logic are removed. Both clients draw <code>facts</code> and <code>attention</code> as given, and neither derives status from other feeds (today the web reads needs-you from the 30-second inbox poll, <code>agents.js:70-81</code>). A parity test in S1 renders each fixture below through the server and asserts the section, the facts text and the counts. W2 and P1 use the same fixtures for their UI tests.</p>
+<p><b>Counts.</b> <code>counts</code> gains <code>needs_you</code>, <code>finished</code>, <code>waiting_long</code>, <code>moving</code>, <code>waiting</code> and <code>idle</code>, counting live sessions by section. <code>counts.waiting_on_owner</code> stays for old clients and equals <code>needs_you</code>. This fixes today's undercount, where an agent's blocking question is missing from the count (<code>http/watch.rs:206-211</code>).</p>
+<p><b>Worked examples.</b> These are live data from 30 September, 19:47 UTC, and they are the unit-test fixtures:</p>
+<table><thead><tr><th>Agent</th><th>Facts</th><th>Section</th></tr></thead><tbody>
+<tr><td>sm-1726-engineer</td><td>idle since 19:40:16; no jobs; one NeedsYou message since 19:40:12</td><td>you · message; you.text “1771 is waiting for one manual Chrome check…”</td></tr>
+<tr><td>iter8-run</td><td>idle since 19:42:42; jobs running since 16:51:21 and 18:28:28, background, no limit, not quiet</td><td>moving; jobs.text “2 running · 2h 56m”</td></tr>
+<tr><td>sm-1776</td><td>working</td><td>moving</td></tr>
+<tr><td>far-1855</td><td>idle since 15:01:43; no claim; (constructed) finished row at 15:01, unread</td><td>finished</td></tr>
+<tr><td>sm-1768</td><td>idle since 19:36:39; no claim</td><td>idle, order key prefix 1</td></tr>
+<tr><td>(constructed)</td><td>working; one NeedsYou message</td><td>you; agent.state working</td></tr>
+<tr><td>(constructed)</td><td>idle; one job waiting 1h 2m, third in line</td><td>waiting_long · queue_wait; jobs.text “Waiting 1h 2m · 3rd in line”</td></tr>
+<tr><td>(constructed)</td><td>working; one job waiting 8m, first in line</td><td>moving; jobs tone amber</td></tr>
+<tr><td>(constructed)</td><td>idle 12m; Codex review of PR #1790 requested 12m ago; no jobs</td><td>waiting; jobs.text “Codex review on PR #1790 · 12m”</td></tr>
+<tr><td>(constructed)</td><td>idle 34m with a ticket claim; nothing running</td><td>waiting_long · stalled</td></tr></tbody></table>
+
+<h3>C. Clearing “needs you”</h3>
+<p>One server function, <code>owner_answered(session_id, via)</code>, marks every NeedsYou owner message from that session as handled. It sets <code>handled_at</code> and a new column <code>handled_via</code> (<code>terminal</code>, <code>claude_prompt</code>, <code>manual</code>, <code>inbox</code>). It sends nothing to the agent, because you answered it directly. It is idempotent, it runs at most once per session every 2 seconds, and it calls <code>board::request_recompute</code> when it changed anything. The thread shows an event line: “You answered in the terminal · 12:49 pm”, “…in Claude”, or “Marked answered”. Doc reviews and Allow prompts are never cleared by it.</p>
+<h4>C1. Enter in sm's terminal</h4>
+<p>In the terminal bridge (<code>process_mobile_terminal_client_frame</code>, <code>http.rs:8879</code>), pass the ticket's session id and kind. For browser and phone tickets, an <code>input</code> frame whose data contains <code>\r</code> or <code>\n</code>, or a <code>key</code> frame with key <code>enter</code>, calls <code>owner_answered(session, "terminal")</code> after the write to the PTY succeeds.</p>
+<h4>C2. A prompt you type into a Claude agent</h4>
+<p>In <code>claude_hook</code> for <code>UserPromptSubmit</code> (<code>http.rs:2163</code>), read the payload's <code>prompt</code> string. It is <b>owner-typed</b> when all of these hold:</p>
+<ol><li>After trimming, it is non-empty.</li>
+<li>It does not start with <code>[Input from:</code> or <code>[sm </code> (sm's delivery markers: <code>owner_messages.rs:264</code> and the <code>[sm remind]</code>, <code>[sm queue]</code>, <code>[sm review]</code> and <code>[sm claim]</code> wakes).</li>
+<li>It does not equal, after trimming, any text sm delivered to this session in the last 120 seconds (the message queue's delivered rows), and it is not a <code>/rename</code> that sm queued in that window.</li></ol>
+<p>Then call <code>owner_answered(session, "claude_prompt")</code>. Examples:</p>
+<table><thead><tr><th>prompt</th><th>Owner-typed?</th></tr></thead><tbody>
+<tr><td><code>Checked in Chrome, merge it.</code></td><td>Yes</td></tr>
+<tr><td><code>[Input from: Rajesh via sm app] Re: "…" (msg_3f9a2c1d)\nYes.</code></td><td>No (marker). This path already clears the message through the reply.</td></tr>
+<tr><td><code>[sm queue] job_… finished</code></td><td>No (marker)</td></tr>
+<tr><td>A board Start first message delivered 4 s earlier</td><td>No (matches a delivery)</td></tr>
+<tr><td><code>/rename sm-1782</code> queued by sm</td><td>No (sm's rename)</td></tr></tbody></table>
+<p>For <b>codex-fork</b>, the ticket checks on a live session whether the event stream carries the user's submitted text (an item of type <code>userMessage</code>). If it does, apply the same three tests. If it does not, only C1 and C4 clear a Codex agent, and the PR says so.</p>
+<h4>C3. Reply in the Inbox</h4>
+<p>This is unchanged (<code>http/inbox.rs:1115-1245</code>). It records <code>handled_via = "inbox"</code> where it marks messages handled.</p>
+<h4>C4. The ✓ button</h4>
+<p><code>POST /sessions/{id}/needs-you/answered</code> with an empty body. It uses <code>owner_web_guard</code> or the phone guard, as other <code>/client</code> routes do. It calls <code>owner_answered(id, "manual")</code> and returns <code>{"facts": …}</code> for that session. It is 404 for an unknown session, and 200 when nothing was open. The web and the phone show the toast “Marked answered”.</p>
+<p><b>Tests.</b> An Enter frame clears an open message. A frame without Enter does not. Each C2 example above. ✓ is idempotent. A doc review survives all three paths. <code>facts.you</code> is null after each clearing path. The agent receives no message.</p>
+
+<h3>D. Last turn message and Finished</h3>
+<h4>D1. Capture</h4>
+<ul>
+<li>New store module <code>turn_messages.rs</code>, with its tables in the session store database:
+<pre><code>turn_messages(session_id TEXT PRIMARY KEY, provider TEXT NOT NULL, at TEXT NOT NULL, text TEXT NOT NULL)
+finished(session_id TEXT NOT NULL, completed_at TEXT NOT NULL, text TEXT, text_at TEXT, read_at TEXT,
+         PRIMARY KEY (session_id, completed_at))</code></pre></li>
+<li><b>Claude.</b> At the Stop hook, where <code>last_action_summary</code> is set today (<code>sessions.rs:1991-1996</code>), upsert <code>turn_messages</code> with that text. The text comes from <code>sm_last_message</code>, or from the transcript read in <code>http.rs:2172-2223</code>.</li>
+<li><b>codex-fork.</b> On an item-completed event whose item type is <code>agentMessage</code> and whose <code>phase</code> is not <code>commentary</code> (<code>sessions.rs:9253</code>), upsert with the item's text. Plain Codex and codex-app record nothing.</li>
+<li>Text is capped at 20,000 characters, cut at a character boundary, with “…” appended.</li>
+</ul>
+<h4>D2. Finished</h4>
+<ul>
+<li><code>task_complete</code> (<code>sessions.rs:7560</code>) inserts <code>finished(session, now, NULL, NULL, NULL)</code>.</li>
+<li>The next <code>turn_messages</code> upsert for that session with <code>at ≥ completed_at</code> fills <code>text</code> and <code>text_at</code> on every finished row of that session where <code>text</code> is null. This captures the summary the agent writes after running <code>sm task-complete</code>.</li>
+<li>If no such message arrives within 10 minutes, a sweep fills <code>text</code> from the latest turn message before <code>completed_at</code>, when there is one.</li>
+<li><code>facts.finished</code> is non-null exactly when the session's <code>agent_task_completed_at</code> is set (it is cleared by the next turn, <code>sessions.rs:2139</code>) and its newest finished row has <code>read_at</code> null. <code>text</code> is the row's text, or null (“Finishing…”).</li>
+</ul>
+<h4>D3. Inbox</h4>
+<ul>
+<li><code>group_rank</code> (<code>http/inbox.rs:111-117</code>) becomes: needs_you 0, <b>finished 1</b>, new 2, earlier 3.</li>
+<li>An agent thread is in <code>finished</code> when it is not needs_you and has a finished row with <code>read_at</code> null and <code>text</code> set.</li>
+<li>Each finished row counts as one thread item (<code>agent_rows</code>, <code>:235-267</code>), so the Done watermark works.</li>
+<li>The row preview is the first line of the text, up to 140 characters.</li>
+<li>Done on the thread (<code>POST /inbox/done</code>) sets <code>read_at</code> on all of that session's finished rows. It also runs today's behaviour.</li>
+<li>Thread JSON gains an item <code>{"type": "turn", "at", "html", "finished": true}</code>, where <code>html</code> is the text rendered with the doc Markdown renderer and sanitized. The web and the phone draw it as a bubble labelled “Last turn · {time}”.</li>
+<li>The phone push on task-complete (Follows) is unchanged.</li>
+</ul>
+<h4>D4. Other readers</h4>
+<ul>
+<li><code>GET /sessions/{id}/last-turn</code> returns <code>{at, text}</code>, or 404 when there is none. It uses the owner guards.</li>
+<li>History agent rows (<code>/history/agents?format=json</code>) gain <code>last_turn: {at, text}</code>, with text cut to 300 characters.</li>
+<li>The agent details band shows it under “Last turn”, beside the existing “Last words” (the agent's <code>sm status</code>).</li>
+</ul>
+<p><b>Retention.</b> <code>turn_messages</code> rows live as long as the session record. Finished rows are deleted 90 days after <code>completed_at</code>.</p>
+<p><b>Tests.</b> Stop then task-complete then Stop fills the text from the second Stop. Task-complete with no later Stop falls back after 10 minutes. Done sets read. A new turn clears <code>facts.finished</code> but keeps the inbox row until Done. A codex-fork commentary item is ignored.</p>
+
+<h3>E. Web shell: details band, reading pane, navigation</h3>
+<ul>
+<li><b>Navigation closes everything.</b> <code>navigate()</code> (<code>app.js:98-107</code>) no longer carries <code>open</code> to the new path: it calls <code>urlFor(path, null)</code>. Back and forward still restore any earlier URL, including its <code>open</code>.</li>
+<li><b>Two kinds of detail.</b>
+ <ul><li><b>Band kinds</b>, <code>agent</code> and <code>job</code>, render inline as a <i>details band</i>.</li>
+ <li><b>Reading kinds</b>, <code>doc</code>, <code>thread</code> and <code>ticket</code> (appendix H5), render in the right-hand <i>reading pane</i>, which has today's sizes, grip, wide mode and ⌘. toggle.</li></ul></li>
+<li><b>Where the band goes.</b>
+ <ul><li>On Agents it goes after the last card in the clicked card's visual row. Find the cards whose <code>offsetTop</code> equals the clicked card's, insert the band after the last of them with <code>grid-column: 1 / -1</code>, and recompute on resize.</li>
+ <li>On Board, Queue and History it goes directly after the row that holds the link.</li>
+ <li>On a page with no row for the item (the palette, an Inbox thread header), opening an agent navigates to <code>/?open=agent:{id}</code>, and opening a job navigates to <code>/queue?open=job:{id}</code>. The band opens there and scrolls into view.</li></ul></li>
+<li><b>Band content.</b> It holds today's agent panel or job panel minus the header ring and name, which the card or row already shows. The header becomes the actions row with the model, effort and state text on the right, and × to close. The tabs, the Links line (H4) and the message box are unchanged. Only one band is open at a time. Esc closes the band, or the pane when no band is open.</li>
+<li><b>URLs are unchanged:</b> <code>?open=agent:{id}</code>, <code>job:{id}</code>, <code>doc:…</code>, <code>thread:{id}</code>, <code>ticket:{owner/repo}#{n}</code>.</li>
+<li>The terminal page keeps its Details pane (<code>terminal.js:141</code>).</li>
+</ul>
+
+<h3>F. Agents page</h3>
+<ul>
+<li><b>Views.</b> <code>By attention</code> (default) and <code>By repo</code>, stored in <code>localStorage["sm-agents-view"]</code>. By attention draws a section header (A3 colours) and a card grid per non-empty section, in section order. By repo is today's grouping (<code>groupAgents</code>), with the new card. The Live and With stopped filter stays.</li>
+<li><b>Summary strip:</b> “{n} needs you · {n} finished · {n} waiting long · {n} moving · {n} waiting · {n} idle”. Zero counts are omitted, except “0 needs you”. Each count uses its section colour and scrolls to its section when clicked.</li>
+<li><b>Idle folding.</b> In the idle section, cards of agents without a ticket beyond the fourth fold into “+ {n} more idle: name (age), …”, and clicking it expands them. Nothing else folds.</li>
+<li><b>Card</b> (memo scenario 1):
+ <ul><li>Row 1: ring (spans all rows), name, icons.</li>
+ <li>Row 2: provider label, ticket text (the first claim, plus “+n”), and repo basename (hidden in By repo).</li>
+ <li>Row 3: the Agent and Jobs facts, in columns of <code>7.2rem | 1fr</code>. Row 4, only when present: the You fact, or else the Finished fact, across the full width.
+  <ul><li>Agent: “● Working {age}” in green, or “○ Idle {age}” in ink-3.</li>
+  <li>Jobs: “▶ {text}” in its tone, or “No jobs” in ink-3.</li>
+  <li>You: “◆ {age}: {text}” in magenta, plus a ✓ button when dismissible. When there is no <code>you</code> but <code>finished</code> is set: “✔ {text or Finishing…}” in cyan. Otherwise row 4 is absent.</li></ul></li>
+ <li>Truncated text shows in full on hover (<code>title</code>).</li>
+ <li>The left edge is 3 px in the section colour.</li></ul></li>
+<li><b>Icons.</b> ⌨ (Terminal) shows when the session is live. ↗ (Open in Claude) shows when <code>remote_control.url</code> starts with <code>https://claude.ai/code/</code>. Both can show. Each stops propagation, so it does not open the band.</li>
+<li><b>Keyboard</b>, when not typing:
+ <ul><li><code>j</code> and <code>k</code> move a selection ring through the cards in display order.</li>
+ <li>Enter opens the band.</li>
+ <li><code>t</code> opens the terminal.</li>
+ <li><code>c</code> opens Claude.</li>
+ <li><code>x</code> presses ✓.</li></ul></li>
+<li><b>Grid.</b> <code>repeat(auto-fill, minmax(24rem, 1fr))</code>.</li>
+</ul>
+
+<h3>G. Terminal page</h3>
+<h4>G1. Layout and switcher</h4>
+<ul>
+<li>The page is the 40 px bar over a grid of <code>[switcher 15.5rem | terminal]</code>.</li>
+<li>The switcher toggles with ⌘\ or a bar button, and the state is stored in <code>localStorage["sm-term-switcher"]</code>. It is hidden by default below 900 px wide.</li>
+<li><b>Data.</b> <code>GET /watch/state</code> at <code>web_watch.refresh_seconds</code>. Live sessions only, grouped and ordered by <code>attention</code>, with small coloured section headers. The idle section starts collapsed to “Idle · {n} ›” (remembered).</li>
+<li><b>Row.</b> A dot in the section colour, the name, a trailing ✓ when <code>you.dismissible</code>, and a second line with the most important fact: you text, else finished text, else jobs text when jobs exist, else the agent fact. The current agent is highlighted.</li>
+<li><b>Switching.</b> Clicking a row calls <code>navigate('/terminal/{id}')</code> with pushState. The existing effect cleanup detaches the old socket, and the new one attaches. ⌘⌥↑ and ⌘⌥↓ select the previous or next row and switch. The xterm key handler lets these combinations through to the page.</li>
+<li>Focus returns to xterm after any click on the bar or the switcher.</li>
+</ul>
+<h4>G2. Keys</h4>
+<p>The key buttons and <code>/model</code> (<code>terminal.js:7</code>, <code>:131-133</code>) render only when <code>matchMedia('(pointer: coarse)').matches</code> or the window is under 720 px wide. On a computer the keyboard sends Esc, Tab, Shift-Tab (xterm sends <code>\x1b[Z</code>), arrows and Ctrl-C directly. No page handler intercepts them, because <code>useKeyboard</code> returns early on the terminal page (<code>app.js:411</code>).</p>
+<h4>G3. Route and round-trip time</h4>
+<ul>
+<li><b>Ping frames.</b> Once Live, the client sends <code>{"type":"ping","id":n}</code> every 5 seconds. The bridge answers <code>{"type":"pong","id":n}</code> straight from its loop, without touching the PTY.</li>
+<li><b>Display.</b> The bar shows the route (“Direct” or “Cloudflare”) and the median of the last three round trips, rounded to whole ms. For example: “Direct · 3 ms”.</li>
+<li><b>Compatibility.</b> Old phone builds never send ping and are unaffected.</li>
+</ul>
+<h4>G4. Direct connection</h4>
+<ol>
+<li><b>Ticket.</b> <code>POST /client/sessions/{id}/browser-attach-ticket</code> adds <code>server_instance</code> (random, fixed per server start) and <code>direct</code>, which is a list of <code>{url, probe}</code>:
+ <ul><li><code>{"url":"ws://localhost:8420/client/terminal","probe":"http://localhost:8420/client/terminal/probe"}</code> is always present.</li>
+ <li><code>{"url":"wss://{lan.hostname}:{lan.port}/client/terminal","probe":"https://{lan.hostname}:{lan.port}/client/terminal/probe"}</code> is present when <code>terminal_direct.lan.enabled</code>.</li>
+ <li>The port for the localhost entry is <code>server.port</code>.</li></ul>
+ Browser tickets record the owner email that minted them.</li>
+<li><b>Probe route.</b> <code>GET /client/terminal/probe</code> returns <code>{"instance": server_instance}</code>. It sends <code>Access-Control-Allow-Origin: https://{cloudflare_access.browser.hostname}</code> and <code>Vary: Origin</code>. <code>OPTIONS</code> answers the preflight with <code>Access-Control-Allow-Private-Network: true</code>, <code>Access-Control-Allow-Methods: GET</code> and the same origin. It needs no login, because it reveals only a random id.</li>
+<li><b>Client.</b>
+ <ul><li>Before each connection, fetch every <code>probe</code> in parallel with a 700 ms timeout.</li>
+ <li>Use the first entry, in list order, whose <code>instance</code> equals the ticket's <code>server_instance</code>. A probe that answers with another instance (for example the MacBook's own node server) is skipped, so the ticket never goes to it.</li>
+ <li>If no probe matches, use today's relative <code>ws_url</code> through Cloudflare.</li>
+ <li>If a direct socket closes before <code>attached</code>, mint a new ticket and connect through Cloudflare.</li>
+ <li>Remember the chosen route in <code>sessionStorage["sm-term-route"]</code> for 10 minutes, and skip the probes while it holds.</li></ul></li>
+<li><b>Server acceptance.</b> <code>/client/terminal</code> also accepts a request that did not come through the Browser Access host when all of these hold:
+ <ul><li>the auth frame carries a browser ticket (single use, unexpired, as today);</li>
+ <li>the upgrade's <code>Origin</code> equals <code>https://{cloudflare_access.browser.hostname}</code>;</li>
+ <li>either the peer address is loopback and <code>Host</code> is <code>localhost</code> or <code>127.0.0.1</code> with the server port, or the request arrived on the LAN TLS listener.</li></ul>
+ Every other path is unchanged. Each direct attach logs “browser attach direct {localhost|lan} {email} {session}”.</li>
+<li><b>Chrome.</b> A public https page may open <code>ws://localhost</code>, because Chrome treats localhost as secure. Reaching localhost or a private address prompts once for local network access; if you decline, the probes fail and Cloudflare is used.</li>
+<li><b>LAN listener</b> (ticket S7, decision 4).
+ <ul><li><b>Config:</b> <code>terminal_direct.lan: {enabled: false, hostname: "studio-lan.rajeshgo.li", port: 8443, cert_dir: "~/.config/session-manager/certs/lan" }</code>. There is no separate token.</li>
+ <li><b>Listener:</b> when enabled, sm-server binds <code>0.0.0.0:8443</code> with rustls. It serves only <code>/client/terminal</code> and <code>/client/terminal/probe</code>, and everything else is 404.</li>
+ <li><b>Certificate:</b> Let's Encrypt, via ACME DNS-01 through the Cloudflare API. sm-server renews it when fewer than 30 days remain, checking daily.</li>
+ <li><b>DNS:</b> the A record <code>studio-lan</code> (DNS only, not proxied) points to the Studio's LAN IPv4, taken from the default-route interface. sm-server rechecks it every 10 minutes and updates the record when the address changes. The server's existing Cloudflare API client makes the calls with <code>cloudflare_access.api_token</code>. If Cloudflare refuses a DNS change with that token, the listener stays down, the log names the missing permission (Zone › DNS › Edit on <code>rajeshgo.li</code>), and the ticket asks Rajesh to add it to that token.</li>
+ <li><b>Failure:</b> if the certificate or the record fails, the listener stays down and logs why, and Cloudflare remains the route.</li></ul></li>
+</ol>
+<h4>G5. Relay latency</h4>
+<ul>
+<li><b>Cause.</b> The output reader (<code>mobile_terminal_output_reader</code>, <code>http.rs:9195-9220</code>) reads a non-blocking PTY and sleeps 25 ms whenever no output is waiting. An echo that arrives during the sleep waits for it to end, which adds up to 25 ms (12.5 ms on average) to every keystroke, on every route, for the phone as well.</li>
+<li><b>Fix.</b> Wait for readiness instead of sleeping: <code>poll(2)</code> on the master fd with a 250 ms timeout, which only bounds the time to notice <code>stop</code>, then read. The input writer's 10 ms retry on <code>EAGAIN</code> (<code>:9244</code>) gets the same treatment, waiting for POLLOUT.</li>
+<li><b>Measure.</b> The ticket records the median echo time for 50 single keystrokes through the ping-free path (keystroke to first output frame, timed in the browser) before and after, for localhost and Cloudflare, and puts the four numbers in the PR. The target is at most 5 ms on the direct localhost path.</li>
+</ul>
+<p><b>Tests.</b>
+<ul>
+<li>A loopback direct upgrade with the right Origin and a browser ticket attaches.</li>
+<li>The wrong Origin is refused.</li>
+<li>A phone ticket without its signature on the direct path is refused.</li>
+<li>A non-loopback peer on port 8420 without Access is refused.</li>
+<li>The probe returns the instance and the CORS headers.</li>
+<li>Ping gets a pong.</li>
+<li>The client skips a probe whose instance does not match.</li>
+</ul></p>
+<p><b>Live check.</b> On the Studio, open a terminal in Chrome, confirm “Direct · n ms” against “Cloudflare · n ms” with direct disabled, and put both numbers in the PR.</p>
+
+<h3>H. Board</h3>
+<h4>H1. Visibility (web and phone)</h4>
+<ul>
+<li><b>Lanes</b> are never collapsed on first view. The phone drops its “only rank 1 expanded” rule (<code>BoardScreen.kt:327</code>). A lane you collapse by hand stays collapsed (phone only).</li>
+<li><b>Active rows</b> (needs_you, close_ready, ready, in_progress) are always rows.</li>
+<li><b>Blocked tickets</b> are slim rows when the lane has at most 12 non-done tickets. A slim row holds the ref, title, “waits on #a, #b” (open blockers only) and Start anyway. Above 12 non-done tickets, blocked tickets fold into today's line, “{n} blocked · waiting on …”.</li>
+<li><b>Done:</b> the three most recently closed show as slim rows, followed by a fold, “{n} more done ›”, when there are more.</li>
+<li><b>Other tickets</b> become an open section per repo instead of a closed box. Needs-you rows always show. At most 10 other rows show, followed by “{n} more ›”.</li>
+<li>The short-lane rule (one active ticket drawn in the header) stays.</li>
+<li>These rules are the same on the web and the phone. Today the web closes “Other tickets” (<code>board.js:149</code>) and the phone shows them. On 30 September at 12:56 pm #1784 (in progress) and #1771 (needs you) were in <code>other</code> and hidden on the web only.</li>
+</ul>
+<h4>H2. Container tickets: “All parts done” and Close</h4>
+<ul>
+<li><b>State rule.</b> The rule (<code>board/model.rs:598-608</code>) gains a step between In progress and Ready. An open ticket with at least one sub-issue, all of them closed (<code>sub_issues_done</code>, <code>model.rs:631</code>), no holder, no open PR and no needs-you record is <code>close_ready</code>. <code>counts</code> gains <code>close_ready</code>. Row order puts it after needs_you.</li>
+<li><b>Payload.</b> The ticket JSON adds <code>sub_issues: {total, done}</code>.</li>
+<li><b>Display.</b> The ball text is “All parts done” in cyan. The row shows “{done} of {total} parts done” and Close. A ⋯ menu offers “Start instead”. Start accepts <code>close_ready</code> as startable, and the start guard allows it.</li>
+<li><b>Close route.</b> <code>POST /client/board/close</code> with <code>{repo, number}</code> uses the owner guards. It returns 409 unless the state is <code>close_ready</code>. It runs <code>gh issue close {number} -R {repo} --comment "All {k} sub-issues are done: #a, #b, …. Closed from the sm board."</code> through <code>gh_command_output</code> (<code>http.rs:845</code>), requests a recompute, and returns <code>{"closed": true}</code>. A gh failure returns 502 with the first line of stderr.</li>
+<li><b>Lane goal.</b> When a lane's goal is <code>close_ready</code>, the lane header shows Close.</li>
+<li><b>CLI.</b> The <code>sm board</code> text shows “all parts done: close”.</li>
+<li><b>Tests.</b> A parent with all children closed is close_ready. With one child open, it is blocked. With a holder, it is in progress. A ticket that only has “after” edges is never close_ready. Close refuses a ready ticket.</li>
+</ul>
+<h4>H3. Start anyway</h4>
+<ul>
+<li><b>Request.</b> <code>POST /client/board/start</code> accepts <code>"start_blocked": true</code>. <code>validate_start</code> (<code>http/board.rs:967-1018</code>) and <code>reserve_spawn_ticket</code> (<code>claims.rs:234-246</code>) then allow <code>state == blocked</code> when the ticket is not stale and not in a cycle. Every other refusal is unchanged.</li>
+<li><b>First message.</b> <code>start_options_payload</code> takes the same flag and appends one paragraph: “Started early by {owner name}. {blockers} {is/are} not done yet: check what {it has/they have} delivered so far and build on it; do not redo {its/their} work.” <code>{blockers}</code> lists the open blockers ascending: “#1776”, “#1776 and #1777”, or “#1776, #1777 and #1778”.</li>
+<li><b>Record.</b> The board records <code>started_early_at</code> for the ticket. The ticket JSON adds <code>started_early: true</code>, and the row shows “started early” until the ticket closes.</li>
+<li><b>Popover.</b> The Start popover opened from a blocked row shows “#{n} waits on {blockers}, which {is/are} not done.” and labels its button “Start anyway”.</li>
+<li><b>Tests.</b> Blocked with the flag succeeds and the brief contains the paragraph. Blocked without the flag is refused (409, as today). Stale or cyclic tickets are refused even with the flag.</li>
+</ul>
+<h4>H4. Links line (everywhere)</h4>
+<p>This is one component: <code>Links</code> in <code>ui.js</code>, and <code>LinksRow</code> on the phone. It takes <code>{ticket, prs, agent, jobs, thread, docs}</code> and draws chips in that order, omitting empty ones.</p>
+<table><thead><tr><th>Chip</th><th>Text</th><th>Click</th></tr></thead><tbody>
+<tr><td>ticket</td><td>“#{n} ↗”</td><td>Reading pane, ticket kind (H5)</td></tr>
+<tr><td>pr</td><td>“PR #{n} · {open|draft|merged|closed}”, then, when sm knows of reviews, “ · {your review|Codex review}, round {k}”, then “ · {last verdict}” when there is one, then “ · waiting {age}” while a review is pending. Magenta when waiting on you, amber when waiting on Codex.</td><td>Reading pane, ticket kind for the PR</td></tr>
+<tr><td>agent</td><td>“{name} · {Provider} · {agent fact}” (“● Working 1m” or “○ Idle 5m”, appendix B) and ⌨</td><td>Body: agent band. ⌨: <code>/terminal/{id}</code></td></tr>
+<tr><td>jobs</td><td>One chip per running or waiting job: “{label} · running {age}” (green), “{label} · waiting {age}” (amber) or “{label} · quiet {age}” (red). After three chips, “+{n} jobs”.</td><td>Queue page, that job's band</td></tr>
+<tr><td>thread</td><td>“Inbox · question” or “Inbox · doc review” in magenta when needs you, else “Inbox · {n}”</td><td><code>/inbox?open=thread:{session_id}&amp;at={message_id}</code>: the thread opens scrolled to that message, which is highlighted for 2 seconds. <code>at</code> is the newest open question, else the newest item.</td></tr>
+<tr><td>docs</td><td>The doc title</td><td>Reading pane, doc</td></tr></tbody></table>
+<p>Sources:</p>
+<ul>
+<li><b>Board ticket PRs.</b> <code>prs</code> becomes the union of today's GitHub-linked PRs and the PRs the holder claimed with <code>sm pr</code> while holding the ticket. So a PR with “Refs #N” or no reference still shows; today #1782's PR #1785 does not. Each PR gains <code>review: {by: "you"|"codex", round, verdict: "approved"|"changes_requested"|"comments"|null, verdict_at, waiting_since: "…Z"|null} | null</code>. It comes from sm's own records, not from GitHub review counts, because replies posted with Rajesh's account show on GitHub as extra reviews.
+ <ul><li><b>Your review:</b> the owner doc reviews of any doc published with <code>--pr {n}</code>. <code>round</code> counts review requests, <code>verdict</code> is the latest posted review, and <code>waiting_since</code> is the open request's time.</li>
+ <li><b>Codex:</b> the Codex review requests for the PR (<code>codex_requests</code>, and <code>review_history</code> in <code>/watch/state</code>), with the same fields.</li>
+ <li>When both exist, the one with a pending request wins, else the most recent.</li></ul></li>
+<li><b>Board ticket JSON</b> adds <code>jobs: [{id, label, state, type, since, quiet_since}]</code> (the ticket's jobs as the clock uses them, <code>http/board_clock.rs</code>), <code>thread: {key, needs_you, count} | null</code> (the holder's inbox agent thread, when it has any items) and <code>docs: [{title, reader_path, state}]</code> (the holder's obligation docs, at most 3).</li>
+<li><b>Agent band:</b> claims, jobs, docs and <code>thread</code>. <code>/watch/state</code> adds <code>thread</code> per session in the same shape.</li>
+<li><b>Queue job band:</b> tickets from <code>rank_tickets</code>, the requester agent, and the requester's thread.</li>
+<li><b>Inbox thread header:</b> the session's claims, its agent and its jobs.</li>
+<li><b>History rows:</b> the <code>work</code> tickets, PRs and docs.</li>
+</ul>
+<h4>H5. GitHub in the reading pane</h4>
+<ul>
+<li><b>Route.</b> <code>GET /client/github/{owner}/{repo}/{number}</code>, using the owner guards, returns:
+<pre><code>{ "kind": "issue" | "pr", "number", "title", "state", "state_reason", "author", "created_at", "url",
+  "labels": [..], "body_html", "comments": [{ "author", "created_at", "body_html" }],
+  "pr": null | { "head", "base", "draft", "merged", "mergeable", "review_decision",
+                 "checks": [{ "name", "conclusion" }] } }</code></pre></li>
+<li><b>Fetch.</b> Through <code>gh_api_json</code> (<code>http.rs:937</code>): <code>issues/{n}</code>, <code>issues/{n}/comments</code> (the first 100), and for a PR, <code>pulls/{n}</code> and the head commit's check runs. The result is cached in memory for 60 seconds per item.</li>
+<li><b>Rendering.</b> Markdown uses the doc renderer with raw HTML stripped.</li>
+<li><b>Pane.</b> The <code>ticket</code> kind (<code>history.js:48-76</code>) gains two tabs: GitHub (the default) and sm history (today's <code>/t/</code> view). ↗ opens <code>url</code> in a new tab.</li>
+<li><b>Phone.</b> The phone keeps opening GitHub links externally.</li>
+</ul>
+
+<h3>I. Inbox, History, Settings, Queue</h3>
+<ul>
+<li><b>Inbox (web).</b> A Finished group appears between Needs you and New (D3). The thread header shows the Links line and, when the thread needs you, “✓ Answered” (C4) beside Done. Turn items render as bubbles labelled “Last turn · {time}”.</li>
+<li><b>History (web).</b>
+ <ul><li><code>/history</code> opens the Agents tab, titled “Bring back an agent”. Tickets move to <code>/history/tickets</code>. A <code>/history</code> URL that carries a ticket filter (<code>repo</code>, <code>agent</code>, or a non-panel <code>open</code>) goes to the Tickets tab, so old links keep working.</li>
+ <li>An agent row shows: the name (bold ink), provider label, first ticket, “retired {age} ago”, and the repo basename. The second line is “Last turn: {last_turn.text}”, clamped to 2 lines in ink-2. The Links line follows.</li>
+ <li>Restore is the primary button on the right. When the agent cannot be restored, the button is disabled and shows <code>unrestorable_reason</code> on hover.</li>
+ <li>Primary text never uses ink-3.</li></ul></li>
+<li><b>Toggle.</b> A <code>Toggle</code> component in <code>ui.js</code>: <code>role="switch"</code>, <code>aria-checked</code>, a 34×20 px track with an accent fill when on, and Space and Enter to flip it. Every <code>type="checkbox"</code> in Settings and the Hand off popover (<code>settings.js:70-76</code>, <code>agents.js</code> HandoffPopover) uses it.</li>
+<li><b>Handoff thresholds per provider</b> (decision 7). The server change:
+ <ul><li><code>/handoff-defaults</code> keeps <code>providers</code> (provider → enabled) and adds <code>provider_thresholds: {"claude": {threshold_percent, reminder_percent, review_floor_percent}, "codex-fork": {…}}</code> and <code>window_tokens: {"claude": 1000000, "codex-fork": 258400}</code>.</li>
+ <li>The legacy flat fields remain and mirror Claude's values. A PUT of a flat field writes Claude's values, so older phone builds keep working.</li>
+ <li>The effective policy (<code>handoff/policy.rs:285-309</code>) uses <code>provider_thresholds[provider]</code>.</li>
+ <li>Defaults: Claude 35 / 50 / 20; codex-fork 80 / 90 / 50 (threshold / reminder / review floor, in percent).</li>
+ <li>Migration: stored flat values become Claude's, and codex-fork gets the defaults.</li>
+ <li><code>window_tokens</code> is the latest window observed per provider: codex-fork's <code>modelContextWindow</code> (<code>sessions.rs:9204</code>); for Claude, the status-line payload's window size when present, else 1,000,000 when the model id ends in <code>[1m]</code>, else 200,000.</li></ul></li>
+<li><b>Handoff per ticket.</b>
+ <ul><li>A new table <code>handoff_ticket_overrides(repo TEXT, number INTEGER, enabled INTEGER NULL, threshold_percent REAL NULL, updated_at TEXT, PRIMARY KEY (repo, number))</code> sits beside the per-session overrides.</li>
+ <li>Routes: <code>GET</code> and <code>PUT /handoff-policy/ticket/{owner}/{repo}/{number}</code>, with the same body as the per-session route (<code>enabled</code>, <code>threshold_percent</code>, <code>use_default</code>). They use the owner and phone guards.</li>
+ <li>The effective policy takes each field from the first that sets it: the agent's own override, then the override of the ticket it holds (its first ticket claim), then the provider default. <code>source</code> becomes <code>override</code>, <code>ticket</code> or <code>default</code>. A successor agent that claims the same ticket therefore inherits it.</li>
+ <li>The web Hand off popover (agent band) gains a scope switch, “This agent | Ticket #{n}”, shown when the agent holds a ticket. The Board's row ⋯ menu gains “Hand off…”, which opens the same popover scoped to the ticket. The phone's per-agent dialog gains the same switch.</li>
+ <li><b>Example.</b> Defaults are off for both providers. Rajesh turns on handoff for ticket #1782 at 35%. sm-1782 (Claude) reaches 35% and is asked to hand off; its successor claims #1782 and inherits the setting. No other agent is affected.</li></ul></li>
+<li><b>Settings › Context handoff</b> (web and phone).
+ <ul><li>Show one group per provider that has a gauge (<code>claude</code>, <code>codex-fork</code>). Plain Codex and codex-app are not listed.</li>
+ <li>When a provider is off, show only its toggle and one line explaining the default.</li>
+ <li>When it is on, show three number fields, each followed by “· {tokens} of {window}”. Tokens are rounded to three significant figures and written with k or M.</li>
+ <li>“When a review is requested” shows only while at least one provider is on.</li>
+ <li>The per-agent Hand off popover shows tokens for that agent's own window.</li>
+<li><b>Hand off… popover</b> (web band, phone dialog), top to bottom:
+ <ul><li><b>Automatic handoff</b>: a scope switch, “This agent and its successors | Ticket #{n}” (the ticket option only when the agent holds one); then a toggle and a threshold with tokens; then “Use default”.</li>
+ <li>A rule line, then <b>Hand off now</b>, which asks once after an inline confirm (<code>ask_now</code>, as today).</li></ul></li>
+<li><b>Successors inherit.</b> When a handoff completes and the successor is recorded (<code>successor_session_id</code>, <code>handoff/policy.rs:364</code>), the predecessor's per-agent override (<code>enabled</code>, <code>threshold_percent</code>) is copied to the successor, unless the successor already has one. Test: an override of 30% on A reaches B after A hands off to B.</li></ul></li>
+<li><b>About.</b> Rows with a status dot:
+ <ul><li>Server: <code>config.server_version</code> · up {age}. The shell config gains <code>server_started_at</code>. The dot is green when <code>/health</code> is ok, else red.</li>
+ <li>Web build: <code>build_id</code>.</li>
+ <li>Phone app: the latest build from <code>meta.json</code>, with its build time.</li>
+ <li>Repository: a link to GitHub.</li>
+ <li>The <code>sm</code> mark is shown in accent.</li></ul></li>
+<li><b>Queue page.</b> The Mac tile uses A2.</li>
+</ul>
+
+<h3>J. Phone app</h3>
+<ol>
+<li><b>One style.</b>
+ <ul><li>Watch rows (<code>WatchScreen.kt:1277-1378</code>) and History cards (<code>HistoryScreen.kt:236-309</code>) take the Board and Inbox style:
+  <ul><li>Panel fill with a 1 dp border and a 3 dp left edge in the section colour;</li>
+  <li>12 dp corners;</li>
+  <li>12×10 dp padding;</li>
+  <li>8 dp between rows.</li></ul></li>
+ <li>The name is <code>titleSmall</code> SemiBold. Provider and state tags are 4 dp-corner tags with a 0.16-alpha tint, replacing <code>StatusChip</code>.</li>
+ <li>Section headers are coloured bold <code>labelSmall</code>, as in the Inbox.</li>
+ <li>The expanded Watch details keep their content, and their inner cards use 10 dp corners.</li></ul></li>
+<li><b>Facts and order.</b> Watch groups by <code>attention.section</code>, with By repo in the overflow menu.
+ <ul><li>Line 2 of a row: “#ticket · {agent fact} · {jobs fact}”.</li>
+ <li>Line 3: the you fact in Fuchsia with ✓ (C4), or the finished fact in Cyan.</li></ul></li>
+<li><b>Native threads.</b> A new <code>ThreadScreen</code> reads <code>GET /inbox/agent/{id}?format=json</code>.
+ <ul><li>It draws messages, replies, follows and turn items as bubbles, with the app's Markdown renderer.</li>
+ <li>Its reply box posts to <code>/inbox/agent/{id}/send</code>. If that route does not accept the phone's authentication today, the ticket adds the phone guard, as 1710 D3 added the browser guard.</li>
+ <li>Header: the name, the Links row (terminal, ticket), “✓ Answered” and Done.</li>
+ <li>Inbox rows for agent threads open <code>ThreadScreen</code>. Doc rows keep <code>DocReaderOverlay</code>.</li></ul></li>
+<li><b>No web tabs in the app.</b>
+ <ul><li><code>page_shell_with_status</code> (<code>owner_docs.rs:1841</code>) omits <code>&lt;nav class="top"&gt;</code> when the request's Access application is the mobile app.</li>
+ <li><code>DocReader.kt</code>'s <code>isOwnerPagePath</code> drops <code>/watch</code>, <code>/history</code>, <code>/guestbook</code> and <code>/</code>, so those links open natively or not at all.</li></ul></li>
+<li><b>Keep data across tabs.</b>
+ <ul><li>Bottom navigation uses <code>saveState = true</code> and <code>restoreState = true</code> (<code>AppNavigation.kt:95-118</code>).</li>
+ <li><code>SessionManagerRepository</code> keeps the last payload per screen (board, inbox, queue, watch) in memory.</li>
+ <li>A recreated ViewModel starts from that payload with <code>loading = false</code> and <code>refreshing = true</code>. A 2 dp <code>LinearProgressIndicator</code> under the top bar shows the refresh.</li>
+ <li>The full-screen spinner appears only when there is no cached payload.</li></ul></li>
+<li><b>Board.</b> H1 visibility, <code>close_ready</code> with Close, Start anyway with its confirm dialog, and the Links row. GitHub links stay external.</li>
+<li><b>Meters.</b> <code>HostStatusSheet</code> colours its values by A2 bands.</li>
+<li><b>Phone terminal.</b> Its key buttons are unchanged.</li>
+</ol>
+<p><b>Live check.</b> Use the preview emulator on live data (the <code>adb reverse</code> recipe), with screenshots in the PR. Deploy the APK per <code>docs/product/lessons.md</code> (rebuild and redeploy <code>latest.apk</code>).</p>
+
+<h3>K. Names</h3>
+<ul>
+<li><b>Rule.</b> When <code>request.name</code> is empty, <code>build_core_session_record</code> (<code>sessions.rs:8439-8447</code>) takes the first rule that applies:
+ <ol><li>The request carries a ticket (<code>sm spawn --ticket</code>, board Start): use <code>owner_settings.agent_name(ticket)</code> (<code>owner_settings.rs:407</code>).</li>
+ <li>The provider is <code>claude</code>: a random unused name from the poem list.</li>
+ <li>The provider is <code>codex</code>, <code>codex-fork</code> or <code>codex-app</code>: a random unused name from the star list.</li></ol></li>
+<li><b>Unused</b> means no live session, and no session retired or stopped within the last 7 days, has it as <code>name</code>, <code>friendly_name</code> or alias (compared case-insensitively). Names of agents retired longer ago are reused.</li>
+<li><b>Restore after reuse.</b> When <code>sm restore</code> (or Restore in History) brings back an agent whose name a live agent now holds, the restored agent takes the first free suffix (<code>vega-2</code>). sm prints the new name, and the lookup by the old name keeps preferring the live agent, per the restore rule in <code>docs/product/lessons.md</code>.</li>
+<li><b>Exhausted lists.</b> When every name is used, pick a random base and append <code>-2</code>, <code>-3</code>, … up to the first free one.</li>
+<li><b>Record.</b> The generated name is stored as <code>friendly_name</code>, and it queues the native rename exactly as an explicit name does (<code>queue_provider_native_rename</code>).</li>
+<li><b>Poem list</b> (64): ozymandias, kubla-khan, dover-beach, the-raven, invictus, jabberwocky, ulysses, tintern-abbey, the-tyger, annabel-lee, daffodils, ode-to-autumn, fern-hill, birches, mending-wall, still-i-rise, the-lake-isle, byzantium, the-lamb, lycidas, the-eagle, crossing-the-bar, the-kraken, the-listeners, adlestrop, pied-beauty, the-windhover, gods-grandeur, the-wild-swans, prufrock, digging, the-fish, one-art, the-moose, wild-geese, the-summer-day, the-flea, the-garden, the-prelude, bright-star, la-belle-dame, to-a-skylark, the-cloud, lady-of-shalott, my-last-duchess, the-owl, stopping-by-woods, fire-and-ice, nothing-gold, red-wheelbarrow, anecdote-of-the-jar, thirteen-ways, richard-cory, chicago, fog, harlem, sympathy, o-captain, i-wandered-lonely, the-solitary-reaper, kubla, endymion, the-snow-man, the-good-morrow. Names containing a Claude model name (fable, opus, sonnet, haiku) are excluded.</li>
+<li><b>Star list</b> (64): vega, rigel, sirius, altair, deneb, polaris, capella, arcturus, aldebaran, antares, betelgeuse, procyon, spica, regulus, castor, pollux, canopus, achernar, fomalhaut, bellatrix, mira, algol, alcor, mizar, dubhe, merak, alioth, alkaid, shaula, sadr, albireo, alnilam, alnitak, mintaka, saiph, hadar, acrux, mimosa, markab, scheat, alpheratz, hamal, menkar, nunki, kochab, thuban, denebola, algieba, elnath, alhena, wezen, adhara, avior, suhail, orion, lyra, cygnus, carina, perseus, draco, auriga, pleiades, hyades, andromeda. Codex model names (sol, astra, terra, luna) are excluded.</li>
+<li><b>AGENTS.md §3</b> (CLAUDE.md is a link to it): delete the paragraph that starts “<b>Name yourself once, at the end of your first turn, and never again.</b>” (line 91 at <code>2a5e74f</code>). Rajesh approved this in the revision 1 review.</li>
+<li><b>Tests.</b>
+ <ul><li>No name plus a ticket gives the pattern name.</li>
+ <li>No name as Claude gives a poem-list member; as codex-fork, a star-list member.</li>
+ <li>A used name is skipped.</li>
+ <li>An exhausted list gets a suffix.</li>
+ <li>An explicit name is unchanged.</li>
+ <li>A name retired 8 days ago is reusable; one retired 6 days ago is not.</li>
+ <li>Restoring an agent whose name is held gets <code>-2</code>.</li></ul></li>
+</ul>
+
+<h3>L. Tickets</h3>
+<p>Fourteen tickets, one agent each. All are Mid tier unless marked. “Starts after” lists what must merge first. Tickets on the same line of the order graph touch separate files.</p>
+<table><thead><tr><th>#</th><th>Ticket</th><th>Covers</th><th>Main files</th><th>Starts after</th><th>Tier</th></tr></thead><tbody>
+<tr><td>S1</td><td>Agent facts, attention order, clearing “needs you”, counts fix</td><td>B (without finished), C</td><td><code>http/watch.rs</code>, <code>watch_view.rs</code>, <code>owner_messages.rs</code>, <code>http/messages.rs</code>, the <code>http.rs</code> terminal bridge and Claude hook</td><td>—</td><td>Mid</td></tr>
+<tr><td>S2</td><td>Last turn message, Finished, Inbox finished group, History last turn</td><td>D; B's finished parts</td><td>new <code>turn_messages.rs</code>, <code>sessions.rs</code> (Stop, codex-fork, task-complete), <code>http/inbox.rs</code>, <code>http/agent_history.rs</code></td><td>S1</td><td>Mid</td></tr>
+<tr><td>S3</td><td>Board: close_ready and Close, Start anyway, link fields (PR review state, claimed PRs, jobs), GitHub route</td><td>H2, H3, H4 (server), H5</td><td><code>board/*</code>, <code>http/board.rs</code>, <code>claims.rs</code>, new <code>http/github.rs</code></td><td>—</td><td>Mid</td></tr>
+<tr><td>S4</td><td>Handoff thresholds per provider, per-ticket override, successors inherit, window tokens</td><td>I (handoff server)</td><td><code>handoff/*</code>, <code>http/handoff.rs</code></td><td>—</td><td>Mid</td></tr>
+<tr><td>S5</td><td>Generated names, reuse after a week, restore suffix; remove the naming paragraph</td><td>K</td><td><code>sessions.rs</code> (record builder, restore), <code>AGENTS.md</code></td><td>S2 (both edit <code>sessions.rs</code>)</td><td>Low</td></tr>
+<tr><td>S6</td><td>Terminal: relay latency fix, ping, probe, direct localhost path</td><td>G3, G4 items 1–5, G5</td><td><code>http.rs</code> terminal endpoint, <code>http/browser_terminal.rs</code></td><td>S1 (both edit the bridge)</td><td>Mid</td></tr>
+<tr><td>S7</td><td>LAN TLS listener with its DNS name and certificate (after decision 4)</td><td>G4 item 6</td><td>new <code>terminal_lan.rs</code>, <code>main.rs</code>, <code>config.rs</code></td><td>S6</td><td>Mid</td></tr>
+<tr><td>W1</td><td>Shell: type scale and Text size slider, meters and Queue tile colours, Toggle, navigation closes details, band and reading pane, Links component</td><td>A, E, H4 (web component), I (Toggle, Queue)</td><td><code>app.js</code>, <code>app.css</code>, <code>ui.js</code>, <code>queue.js</code>, <code>queue.css</code></td><td>—</td><td>Mid</td></tr>
+<tr><td>W2</td><td>Agents page: sections, three facts, ✓, both icons, keyboard</td><td>F</td><td><code>agents.js</code></td><td>S1, S2, W1</td><td>Mid</td></tr>
+<tr><td>W3</td><td>Terminal page: switcher, keys, route and time</td><td>G1–G3, G4 client</td><td><code>terminal.js</code></td><td>S6, W2</td><td>Mid</td></tr>
+<tr><td>W4</td><td>Board page: visibility, Close, Start anyway, links, GitHub pane</td><td>H1–H5 (web)</td><td><code>board.js</code>, <code>board-start.js</code>, <code>history.js</code> (ticket pane)</td><td>S3, W1</td><td>Mid</td></tr>
+<tr><td>W5</td><td>Inbox finished and thread header; History; Settings (toggles, handoff, ticket handoff in the Board ⋯, About)</td><td>I (web)</td><td><code>inbox.js</code>, <code>history.js</code> (list), <code>settings.js</code></td><td>S2, S4, W1, W4 (<code>history.js</code>)</td><td>Mid</td></tr>
+<tr><td>P1</td><td>Phone: one style, facts and order, ✓, keep data across tabs, meter colours, text size</td><td>J1, J2, J5, J7</td><td><code>ui/watch</code>, <code>ui/history</code>, <code>ui/navigation</code>, <code>SessionManagerRepository</code>, view models</td><td>S1, S2</td><td>Mid</td></tr>
+<tr><td>P2</td><td>Phone: native threads, no web tabs, board changes</td><td>J3, J4, J6</td><td><code>ui/inbox</code>, <code>ui/board</code>, <code>DocReader.kt</code>, <code>owner_docs.rs</code> (nav)</td><td>S3, P1</td><td>Mid</td></tr>
+</tbody></table>
+<p>All tickets go under the goal ticket #1782 with <code>sm board under</code>, and their order is recorded with <code>sm board after</code>. S1, S3, S4 and W1 start together. Every web ticket attaches screenshots in light and dark at 1440 px and 390 px, taken at the Standard and Largest text sizes. Every server ticket runs <code>cargo clippy</code> and <code>fmt</code> as CLAUDE.md says, plus its tests.</p>
+
+<h3>M. Requirement trace</h3>
+<table><thead><tr><th>Memo item</th><th>Spec</th><th>Proof</th></tr></thead><tbody>
+<tr><td>Bigger type, adjustable on web and phone</td><td>A1</td><td>W1 screenshots at 13, 15 and 19 px; P1 at 85% and 130%</td></tr>
+<tr><td>Terminal typing clears needs-you; clear by hand</td><td>C1, C2, C4</td><td>S1 tests; live check: answer an agent from the web terminal and watch the card move</td></tr>
+<tr><td>Terminal and Claude icons both</td><td>F</td><td>W2 screenshot</td></tr>
+<tr><td>Three facts; the five overlaps</td><td>B, F, J2</td><td>S1 fixture tests (B examples); W2 and P1 screenshots</td></tr>
+<tr><td>No key buttons on computers</td><td>G2</td><td>W3 screenshots at 1440 and 390 px</td></tr>
+<tr><td>Switcher in attention order; the same order on Agents</td><td>B, F, G1</td><td>W3 check: switching agents with ⌘⌥↓ reattaches</td></tr>
+<tr><td>Terminal lag: relay fix and direct route at home</td><td>G3, G4, G5</td><td>S6 tests; S6/W3 live latency numbers in the PR; S7 check from the MacBook</td></tr>
+<tr><td>Meters: order, heat, queue share; Queue tile</td><td>A2</td><td>W1 screenshots at a low and a high reading</td></tr>
+<tr><td>Details where you clicked; closes on page change</td><td>E</td><td>W1 test: navigate drops <code>open</code>; W2 screenshot of the band</td></tr>
+<tr><td>Finished and last turn message in Inbox</td><td>D</td><td>S2 tests; W5 screenshot</td></tr>
+<tr><td>Links everywhere, each with its live state; GitHub in the pane</td><td>H4, H5</td><td>S3 tests (PR review field, claimed-PR union); W4 screenshot of today's board with #1782 and #1858; the Inbox chip opens the highlighted message</td></tr>
+<tr><td>Hand off… is two controls; successors inherit</td><td>I</td><td>S4 inheritance test; W5 screenshot</td></tr>
+<tr><td>No needless folding</td><td>H1</td><td>W4 and P2 screenshots of today's board (including #1771 in view)</td></tr>
+<tr><td>Container tickets close</td><td>H2</td><td>S3 state tests; live Close on a finished container</td></tr>
+<tr><td>Start anyway</td><td>H3</td><td>S3 tests; brief text check</td></tr>
+<tr><td>History for restoring</td><td>I</td><td>W5 screenshot</td></tr>
+<tr><td>Toggles; handoff disclosure, per-provider thresholds, per-agent and per-ticket; About</td><td>I</td><td>S4 tests (migration, legacy PUT, ticket precedence, successor inherits); W5 and P1 screenshots</td></tr>
+<tr><td>Three facts include reviews</td><td>B</td><td>S1 fixture (review example)</td></tr>
+<tr><td>Phone style, native threads, no spinner</td><td>J</td><td>P1 and P2 emulator screenshots; a tab switch shows cached data at once</td></tr>
+<tr><td>Generated names, reuse after a week</td><td>K</td><td>S5 tests</td></tr>
+<tr><td>Roll-ins: count fix, #1771 hidden, plain Codex toggle, empty History, CLI ticket names</td><td>B counts, H1, I, D4, K</td><td>Tests in S1, S4, S2 and S5; W4 screenshot</td></tr>
+</tbody></table>
+
+<h3>Z. FAQ</h3>
+<p><b>Why not clear “needs you” when the agent starts working again?</b> Agents often keep working while a question waits, for example on another part of the ticket. Clearing on activity would hide real questions. Your own input is the only signal that you answered.</p>
+<p><b>Why can sm tell your typing from its own deliveries only for Claude?</b> Claude reports each submitted prompt to sm through its hook, with the text. sm marks everything it delivers, so unmarked text came from a person. Codex does not report prompts that way today; appendix C2 has the ticket check the codex-fork event stream.</p>
+<p><b>Is the direct terminal path safe?</b> Yes. The ticket is still minted behind the Cloudflare login, it can be used once within 30 seconds, and the direct socket must carry sm's own page origin. On the Studio the socket never leaves the machine. On the home network it is encrypted with a real certificate. The probe answers only a random id, so a ticket is never sent to a different server.</p>
+<p><b>Where does the terminal lag come from?</b> Two places. The route through Cloudflare adds a round trip to Cloudflare's edge on every key; from the Studio today, a small request through it takes tens to hundreds of milliseconds, against under 1 ms locally. sm's own relay adds up to 25 ms more, because it checks for output every 25 ms (G5). Terminal attach in tmux has neither, which is the difference Rajesh noticed.</p>
+<p><b>Why not show GitHub pages inside sm?</b> GitHub forbids it (<code>X-Frame-Options: deny</code>, checked 30 September 2026). sm shows the text itself instead, which also works when GitHub's page is slow.</p>
+<p><b>Why does the server compute the attention order?</b> The web, the phone and <code>sm watch</code> must agree, and the rules depend on queue positions, quiet jobs and the stall threshold, which only the server has in one place.</p>
+<p><b>Why a separate Finished group instead of Needs you?</b> A finished agent does not block anything, and mixing the two would dilute the magenta that means “an agent is stuck on you”.</p>
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
