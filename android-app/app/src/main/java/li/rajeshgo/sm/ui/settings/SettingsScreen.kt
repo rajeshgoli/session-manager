@@ -129,6 +129,9 @@ fun SettingsScreen(
         if (state.isLoggedIn) SettingsGroup("Handoff defaults") {
             li.rajeshgo.sm.ui.handoff.HandoffDefaultsSection()
         }
+        if (state.isLoggedIn) SettingsGroup("Terminals") {
+            TerminalLimitsSection()
+        }
         Row(Modifier.fillMaxWidth().clickable { advanced = !advanced }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("Advanced", Modifier.weight(1f), color = TextMuted, style = MaterialTheme.typography.titleSmall)
             Icon(if (advanced) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, "Advanced settings", tint = TextMuted)

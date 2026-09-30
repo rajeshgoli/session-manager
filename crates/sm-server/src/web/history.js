@@ -52,7 +52,8 @@ function HistoryList({ agents }) {
 }
 function Ticket({ id, controls }) {
   const split = id.lastIndexOf('#');
-  const repo = id.slice(0,split).split('/').pop();
+  const slug = id.slice(0,split);
+  const repo = slug.split('/').pop();
   const number = id.slice(split+1);
   const [data, error] = usePoll(() => api(`/t/${encodeURIComponent(repo)}/${encodeURIComponent(number)}?format=json`), 30000, [id]);
   const followLink = link => {
@@ -65,7 +66,9 @@ function Ticket({ id, controls }) {
     }
   };
   return html`<div class="reader-bar"><strong class="reader-title">#${number} ${data?.item.title || repo}</strong>${controls}</div>
-    <div class="content">${error ? html`<p role="alert">${error.message}</p>` : null}
+    <div class="content">${error?.status === 404 ? html`<p>No agent has worked on this ticket yet, so sm has no history for it.</p>
+      ${slug.includes('/') ? html`<a class="btn" href=${`https://github.com/${slug}/issues/${number}`} target="_blank" rel="noopener">Open on GitHub</a>` : null}`
+      : error ? html`<p role="alert">${error.message}</p>` : null}
     ${data ? html`<p>${data.item.state}</p><${WorkLinks} work=${data.item} />
       ${(data.events || []).map(event => html`<article class="history-card"><small>${event.at} · ${event.name || ''}</small><p>${event.text}</p>
         ${event.link ? html`<button class="btn sm" onClick=${() => followLink(event.link)}>Open item</button>` : null}</article>`)}` : !error ? 'Loading…' : null}</div>`;

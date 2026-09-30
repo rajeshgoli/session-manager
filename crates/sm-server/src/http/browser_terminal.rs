@@ -95,11 +95,7 @@ pub(super) async fn create_ticket(
             stop: Arc::new(AtomicBool::new(false)),
         })
         .collect::<Vec<_>>();
-    enforce_mobile_terminal_active_limits(
-        &state.config,
-        active.values().chain(pending.iter()),
-        &ticket,
-    )?;
+    enforce_mobile_terminal_active_limits(&state, active.values().chain(pending.iter()), &ticket)?;
     ensure_mobile_terminal_ticket_runtime_enabled(&state)?;
     tickets.insert(ticket_id.clone(), ticket);
     // Relative to the authenticated browser origin, never the phone hostname.

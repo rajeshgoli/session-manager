@@ -94,3 +94,13 @@ test('shared handoff controls exclude the desktop app and retain future provider
   const providers = harness().evaluate('handoffProviders')({ 'codex-app': true, future: false });
   assert.deepEqual(Array.from(providers), ['claude', 'codex-fork', 'codex', 'future']);
 });
+
+test('terminal limits accept blank as reset and refuse values outside the range', () => {
+  const h = harness();
+  const limit = h.evaluate('terminalLimit');
+  assert.equal(limit('', 1, 256), null);
+  assert.equal(limit('100', 1, 256), 100);
+  assert.throws(() => limit('0', 1, 256), /from 1 to 256/);
+  assert.throws(() => limit('1.5', 60, 86400), /from 60 to 86400/);
+  assert.equal(h.evaluate("TERMINAL_LIMITS.map(([key]) => key).join()"), 'per_user,per_session,global,max_attach_seconds');
+});

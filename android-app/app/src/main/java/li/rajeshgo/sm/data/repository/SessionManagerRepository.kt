@@ -296,6 +296,15 @@ class SessionManagerRepository(
         runCatching { api(baseUrl, token).setHandoffDefaults(patch) }.mapFailure(::classifyWriteFailure)
     }
 
+    /** Owner settings shared with the web (`GET /client/settings`). */
+    suspend fun fetchOwnerSettings(baseUrl: String, token: String) = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getOwnerSettings() }
+    }
+
+    suspend fun setOwnerSettings(baseUrl: String, token: String, patch: kotlinx.serialization.json.JsonObject) = withContext(Dispatchers.IO) {
+        runCatching { api(baseUrl, token).setOwnerSettings(patch) }.mapFailure(::classifyWriteFailure)
+    }
+
     suspend fun retireSession(baseUrl: String, token: String, sessionId: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
             val response = api(baseUrl, token).retireSession(sessionId)

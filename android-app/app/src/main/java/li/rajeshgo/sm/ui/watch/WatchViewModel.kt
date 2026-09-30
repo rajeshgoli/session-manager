@@ -768,7 +768,9 @@ class WatchViewModel(application: Application, private val savedState: androidx.
         if (!foreground) {
             terminalConnectionGeneration++
             terminalReconnectJob?.cancel()
-            terminalSocket?.cancel()
+            // Close with a frame so the server frees this attach now; an abrupt
+            // cancel can leave it open behind the tunnel (sm#1763).
+            terminalSocket?.close(1000, "backgrounded")
             terminalSocket = null
             terminalWriter = null
             _uiState.value = _uiState.value.copy(terminal = _uiState.value.terminal?.copy(status = "paused", error = null))
