@@ -1924,6 +1924,7 @@ private fun activityTint(state: String?): Color = when (activityLabel(state)) {
     "thinking" -> Cyan
     "bg-wait" -> Violet
     "waiting" -> Amber
+    "approve" -> Fuchsia
     "stopped" -> Rose
     else -> TextSecondary
 }

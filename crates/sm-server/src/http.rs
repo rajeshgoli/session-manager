@@ -123,16 +123,17 @@ use crate::sessions::codex_fork_legacy_event_stream_path_from_log_file;
 use crate::sessions::ReviewAsk;
 use crate::sessions::{
     claude_hook_gate, codex_fork_event_line_matches_root_thread, codex_fork_event_line_starts_turn,
-    codex_fork_newest_event_stream_path, codex_fork_status_for_event_line, expand_home,
-    is_primary_node, submit_codex_fork_btw, AcceptSpawnBriefRequest, AgentRegistrationResponse,
-    AgentStatusRequest, ArmStopNotifyOutcome, ArmStopNotifyRequest, ChildSessionResponse,
-    ClaudeHookGate, ClearSessionRequest, ClientSessionResponse, ContextMonitorOutcome,
-    ContextMonitorRequest, ContextSnapshotResponse, ContextUsageEvent, ContextUsageOutcome,
-    CoreClearOutcome, CoreInputBatchResponse, CoreInputBatchResult, CoreRestoreOutcome,
-    CoreRetireOutcome, CoreReviewOutcome, CreateCoreSessionRequest, CreateReparentRequest,
-    CreateReparentTreeRequest, CredentialRotationOutcome, DecideReparentRequest,
-    HierarchyRootResolution, MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision,
-    ReparentMutationOutcome, ReparentRepairAction, RetireAuthority, RoleRegistrationRequest,
+    codex_fork_event_line_waits_on_owner, codex_fork_newest_event_stream_path,
+    codex_fork_status_for_event_line, expand_home, is_primary_node, submit_codex_fork_btw,
+    AcceptSpawnBriefRequest, AgentRegistrationResponse, AgentStatusRequest, ArmStopNotifyOutcome,
+    ArmStopNotifyRequest, ChildSessionResponse, ClaudeHookGate, ClearSessionRequest,
+    ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest, ContextSnapshotResponse,
+    ContextUsageEvent, ContextUsageOutcome, CoreClearOutcome, CoreInputBatchResponse,
+    CoreInputBatchResult, CoreRestoreOutcome, CoreRetireOutcome, CoreReviewOutcome,
+    CreateCoreSessionRequest, CreateReparentRequest, CreateReparentTreeRequest,
+    CredentialRotationOutcome, DecideReparentRequest, HierarchyRootResolution,
+    MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision, ReparentMutationOutcome,
+    ReparentRepairAction, RetireAuthority, RoleRegistrationRequest,
     SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest, SendCoreInputRequest,
     SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
     SetMaintainerRequest, SpawnBriefBinding, SpawnBriefSource, SpawnReviewRequest,
@@ -11974,16 +11975,12 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
     if session.provider.trim() == "claude" {
         // Hook state is posted to the primary from every node, so it is answered
         // before the node check — only the pane is node-local.
-        if claude_hook_gate(session) == ClaudeHookGate::TurnRunning {
-            // Hooks bracket the turn, so a fresh "turn in flight" signal is
-            // authoritative. Skip the pane capture entirely and state the answer
-            // outright — the default projection would otherwise call this idle
-            // once `last_activity` is 30s old, which is exactly what happens
-            // during a long tool-free response.
-            return Some("working");
-        }
         if !is_primary_node(&session.node) {
-            return None;
+            // Hooks bracket the turn, so a fresh "turn in flight" signal is
+            // authoritative; the default projection would otherwise call this
+            // idle once `last_activity` is 30s old, which is exactly what
+            // happens during a long tool-free response.
+            return (claude_hook_gate(session) == ClaudeHookGate::TurnRunning).then_some("working");
         }
         let runtime = TmuxRuntime::from_app_config(&state.config)
             .for_socket_name(session.tmux_socket_name.as_deref());
@@ -12013,7 +12010,7 @@ fn live_activity_state(state: &AppState, session: &SessionRecord) -> Option<&'st
         .filter(|signal| codex_fork_signal_is_newer_than_task_complete(signal, task_completed_at));
     if matches!(
         event_activity.as_ref().map(|signal| signal.activity),
-        Some("working" | "stopped")
+        Some("working" | "stopped" | "waiting_permission")
     ) {
         return event_activity.map(|signal| signal.activity);
     }
@@ -12037,6 +12034,12 @@ fn claude_live_activity_state(
     pane_text: Option<&str>,
 ) -> Option<&'static str> {
     let gate = claude_hook_gate(session);
+    // An open Allow prompt outranks even a fresh turn-running hook: the turn
+    // is in flight but blocked on the owner (sm#1743). Only the owning node
+    // has the pane.
+    if is_primary_node(&session.node) && pane_text.is_some_and(claude_pane_awaits_approval) {
+        return Some("waiting_permission");
+    }
     // Hooks reach the primary from every node, and the hook signal outranks both
     // the pane and the default projection's 30s `last_activity` heuristic. Answer
     // it before the node check so remote sessions are not stranded on the default
@@ -12062,6 +12065,39 @@ fn claude_live_activity_state(
             claude_live_activity_from_pane(pane_text)
         }
     }
+}
+
+/// How many non-blank lines at the bottom of the pane a permission prompt
+/// occupies at most: header, tool detail, question, options, footer.
+const CLAUDE_APPROVAL_PROMPT_TAIL_LINES: usize = 16;
+
+/// True when the bottom of the pane is Claude's permission prompt:
+///
+/// ```text
+///  Do you want to proceed?
+///  ❯ 1. Yes
+///    2. Yes, and always allow access to … from this project
+///    3. No
+///  Esc to cancel · Tab to amend
+/// ```
+///
+/// The numbered `1. Yes` option and the `Esc to cancel` footer together only
+/// appear while the prompt is open; either alone also shows in transcripts.
+fn claude_pane_awaits_approval(pane_text: &str) -> bool {
+    let tail: Vec<&str> = pane_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .rev()
+        .take(CLAUDE_APPROVAL_PROMPT_TAIL_LINES)
+        .collect();
+    let footer = tail.iter().any(|line| line.starts_with("Esc to cancel"));
+    let first_option = tail.iter().any(|line| {
+        line.trim_start_matches('❯')
+            .trim_start()
+            .starts_with("1. Yes")
+    });
+    footer && first_option
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12272,7 +12308,10 @@ fn codex_fork_live_activity_from_signals(
     event_activity: Option<&'static str>,
     pane_title: Option<&str>,
 ) -> Option<&'static str> {
-    if matches!(event_activity, Some("stopped" | "working")) {
+    if matches!(
+        event_activity,
+        Some("stopped" | "working" | "waiting_permission")
+    ) {
         return event_activity;
     }
     if pane_title
@@ -12463,6 +12502,11 @@ fn codex_fork_event_stream_signal_from_path(
             if !codex_fork_event_line_matches_root_thread(line, root_thread_id) {
                 continue;
             }
+            let activity = if codex_fork_event_line_waits_on_owner(line) {
+                "waiting_permission"
+            } else {
+                activity
+            };
             if activity == "working"
                 && latest_activity
                     .as_ref()
@@ -17337,6 +17381,64 @@ mod tests {
         );
     }
 
+    /// The prompt as Claude Code 2.1 draws it at the bottom of the pane.
+    const CLAUDE_APPROVAL_PROMPT_PANE: &str = "⏺ Creating an empty file named probe.txt
+  ⎿  $ touch probe.txt
+────────────────────────────────────────────────────────
+ Bash command
+   touch probe.txt
+   Create an empty file named probe.txt
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to /tmp/probe from
+      this project
+   3. No
+ Esc to cancel · Tab to amend
+";
+
+    #[test]
+    fn claude_live_activity_reports_an_open_approval_prompt() {
+        // sm#1743: an agent blocked on "Allow" read as working (or idle) for
+        // hours. Once the hook signal is stale the pane decides, and an open
+        // prompt is its own state.
+        let session = claude_session_with_hook_state("running", Some("2026-06-01T00:00:00Z"));
+        assert_eq!(claude_hook_gate(&session), ClaudeHookGate::Stale);
+        assert_eq!(
+            claude_live_activity_state(&session, Some(CLAUDE_APPROVAL_PROMPT_PANE)),
+            Some("waiting_permission")
+        );
+        // A prompt raised seconds into a turn must not hide behind the fresh
+        // turn-running hook.
+        let fresh = claude_session_with_hook_state("running", Some(&now_rfc3339()));
+        assert_eq!(claude_hook_gate(&fresh), ClaudeHookGate::TurnRunning);
+        assert_eq!(
+            claude_live_activity_state(&fresh, Some(CLAUDE_APPROVAL_PROMPT_PANE)),
+            Some("waiting_permission")
+        );
+        let untracked = claude_session_with_hook_state("running", None);
+        assert_eq!(
+            claude_live_activity_state(&untracked, Some(CLAUDE_APPROVAL_PROMPT_PANE)),
+            Some("waiting_permission")
+        );
+    }
+
+    #[test]
+    fn claude_pane_approval_needs_the_live_prompt_not_its_echo() {
+        assert!(claude_pane_awaits_approval(CLAUDE_APPROVAL_PROMPT_PANE));
+        // Answered: the options are gone, the transcript carries on.
+        let answered =
+            "⏺ Bash(touch probe.txt)\n  ⎿  Done\n\n⏺ Created probe.txt.\n\n✻ Baked for 4s\n";
+        assert!(!claude_pane_awaits_approval(answered));
+        // Prompt text quoted in output, far above the bottom, or without the footer.
+        let quoted = format!(
+            "{}{}",
+            " ❯ 1. Yes\n Esc to cancel · Tab to amend\n",
+            "⏺ line\n".repeat(CLAUDE_APPROVAL_PROMPT_TAIL_LINES)
+        );
+        assert!(!claude_pane_awaits_approval(&quoted));
+        assert!(!claude_pane_awaits_approval(" ❯ 1. Yes\n   2. No\n"));
+    }
+
     #[test]
     fn claude_live_activity_keeps_a_fresh_stopped_turn_conclusive() {
         // The flip side: while the Stop signal is fresh it still outranks the
@@ -17795,6 +17897,49 @@ mod tests {
             codex_fork_event_stream_activity_from_path(event_stream),
             Some("working")
         );
+    }
+
+    #[test]
+    fn codex_fork_approval_wait_reads_as_waiting_permission_until_answered() {
+        // Replays sm#1743: a computer-use MCP call raised an elicitation
+        // ("Allow") and the thread sat on `waitingOnApproval` for two hours.
+        let dir = env::temp_dir().join(format!(
+            "sm-rust-codex-approval-wait-{}-{}",
+            process::id(),
+            random_urlsafe_token(8)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let event_stream = dir.join("events.jsonl");
+        let waiting = concat!(
+            "{\"ts\":\"2026-09-30T02:47:04.945Z\",\"session_id\":\"t1\",\"event_type\":\"turn_started\",\"payload\":{\"turn_id\":\"u1\"}}\n",
+            "{\"ts\":\"2026-09-30T02:47:18.308Z\",\"session_id\":\"t1\",\"event_type\":\"item/started\",\"payload\":{\"item\":{\"type\":\"mcpToolCall\",\"id\":\"c1\"}}}\n",
+            "{\"ts\":\"2026-09-30T02:47:21.221Z\",\"session_id\":\"t1\",\"event_type\":\"thread/status/changed\",\"payload\":{\"threadId\":\"t1\",\"status\":{\"type\":\"active\",\"activeFlags\":[\"waitingOnApproval\"]}}}\n",
+            "{\"ts\":\"2026-09-30T02:48:00.000Z\",\"session_id\":\"unknown\",\"event_type\":\"account/rateLimits/updated\",\"payload\":{}}\n",
+        );
+        fs::write(&event_stream, waiting).unwrap();
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path(event_stream.clone()),
+            Some("waiting_permission")
+        );
+        // The pane title spinner must not mask it.
+        assert_eq!(
+            codex_fork_live_activity_from_signals(
+                Some("waiting_permission"),
+                Some("⠋ codex working")
+            ),
+            Some("waiting_permission")
+        );
+
+        let answered = format!(
+            "{waiting}{}",
+            "{\"ts\":\"2026-09-30T04:41:18.590Z\",\"session_id\":\"t1\",\"event_type\":\"thread/status/changed\",\"payload\":{\"threadId\":\"t1\",\"status\":{\"type\":\"active\",\"activeFlags\":[]}}}\n"
+        );
+        fs::write(&event_stream, answered).unwrap();
+        assert_eq!(
+            codex_fork_event_stream_activity_from_path(event_stream),
+            Some("working")
+        );
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

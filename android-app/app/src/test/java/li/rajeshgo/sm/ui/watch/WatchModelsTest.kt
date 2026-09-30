@@ -105,7 +105,7 @@ class WatchModelsTest {
     fun backgroundWaitIsLabelledDistinctlyFromWaitingOnAHuman() {
         assertEquals("bg-wait", activityLabel("waiting"))
         assertEquals("waiting", activityLabel("waiting_input"))
-        assertEquals("waiting", activityLabel("waiting_permission"))
+        assertEquals("approve", activityLabel("waiting_permission"))
     }
 
     @Test

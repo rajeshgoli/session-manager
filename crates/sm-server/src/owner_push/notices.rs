@@ -8,6 +8,12 @@ use super::*;
 
 pub const NOTICE_MESSAGE: &str = "message";
 pub const NOTICE_REVIEW_REQUESTED: &str = "review_requested";
+/// An agent has been blocked on an approval prompt only the owner can answer
+/// (sm#1743). Withdrawn once the agent moves on.
+pub const NOTICE_APPROVAL_NEEDED: &str = "approval_needed";
+/// How long an agent waits on an approval before the owner is pushed, so a
+/// prompt answered at the desk never reaches the phone.
+pub const APPROVAL_NOTICE_DELAY: Duration = Duration::seconds(60);
 /// The push that takes a shown notice's notification off the phone (sm#1643).
 pub const NOTICE_WITHDRAW: &str = "withdraw";
 /// Notices stay listed for the app this long.
@@ -103,6 +109,34 @@ impl NewNotice {
     }
 }
 
+impl NewNotice {
+    /// An approval wait: `{agent} needs your approval`. One notice per wait,
+    /// keyed by the session and when the wait was first seen.
+    pub fn approval_needed(
+        user_id: &str,
+        session_id: &str,
+        session_name: &str,
+        waiting_since: OffsetDateTime,
+    ) -> Self {
+        Self {
+            user_id: user_id.to_owned(),
+            kind: NOTICE_APPROVAL_NEEDED.to_owned(),
+            session_id: session_id.to_owned(),
+            session_name: session_name.to_owned(),
+            subject_id: approval_subject_id(session_id, waiting_since),
+            title: format!("{session_name} needs your approval"),
+            body: "Blocked on an Allow prompt. Open its terminal to answer.".to_owned(),
+            reader_path: format!("/?open=agent:{session_id}"),
+            blocking: true,
+        }
+    }
+}
+
+/// `approval:{session}:{unix seconds the wait was first seen}`.
+pub fn approval_subject_id(session_id: &str, waiting_since: OffsetDateTime) -> String {
+    format!("approval:{session_id}:{}", waiting_since.unix_timestamp())
+}
+
 impl Notice {
     /// The FCM data payload (appendix F3); every value is a string.
     pub fn data(&self, unread_count: i64) -> BTreeMap<String, String> {
@@ -150,6 +184,11 @@ CREATE TABLE IF NOT EXISTS owner_notices (
 );
 CREATE INDEX IF NOT EXISTS owner_notices_pending ON owner_notices(notified_at, notify_after);
 CREATE UNIQUE INDEX IF NOT EXISTS owner_notices_subject ON owner_notices(kind, subject_id);
+-- Sessions blocked on an approval prompt, and since when (sm#1743).
+CREATE TABLE IF NOT EXISTS owner_approval_waits (
+  session_id  TEXT PRIMARY KEY,
+  since       TEXT NOT NULL
+);
 -- A shown notice whose notification the phone was told to remove (sm#1643).
 CREATE TABLE IF NOT EXISTS owner_notice_withdrawals (
   notice_id     TEXT PRIMARY KEY,
@@ -219,6 +258,40 @@ impl OwnerPushStore {
             }
         }
         anyhow::bail!("could not allocate a unique notice id")
+    }
+
+    /// Sessions blocked on an approval prompt and when each wait was first
+    /// seen. Kept in the database so a restart resumes the same waits rather
+    /// than retracting their alerts and sending them again (sm#1743).
+    pub fn approval_waits(&self) -> Result<BTreeMap<String, OffsetDateTime>> {
+        let conn = self.open()?;
+        let mut statement = conn.prepare("SELECT session_id, since FROM owner_approval_waits")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut waits = BTreeMap::new();
+        for row in rows {
+            let (session_id, since) = row?;
+            if let Some(since) = parse_ts(&since) {
+                waits.insert(session_id, since);
+            }
+        }
+        Ok(waits)
+    }
+
+    /// Replaces the recorded waits with `waits`.
+    pub fn set_approval_waits(&self, waits: &BTreeMap<String, OffsetDateTime>) -> Result<()> {
+        let mut conn = self.open()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM owner_approval_waits", [])?;
+        for (session_id, since) in waits {
+            tx.execute(
+                "INSERT INTO owner_approval_waits (session_id, since) VALUES (?1, ?2)",
+                params![session_id, format_ts(*since)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn notice(&self, id: &str) -> Result<Option<Notice>> {

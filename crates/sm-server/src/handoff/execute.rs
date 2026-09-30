@@ -263,6 +263,11 @@ pub const NOT_MOVED_COLUMNS: &[(&str, &str, &str)] = &[
     ),
     ("owner_notices", "session_id", "history"),
     (
+        "owner_approval_waits",
+        "session_id",
+        "live state, recomputed from the session's own prompt every sweep",
+    ),
+    (
         "seat_sessions",
         "provider_session_id",
         "a provider transcript id, not an sm session",

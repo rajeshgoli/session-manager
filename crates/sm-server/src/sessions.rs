@@ -8960,6 +8960,35 @@ pub(crate) fn codex_fork_status_for_event_line(line: &str) -> Option<&'static st
     codex_fork_status_for_event(event)
 }
 
+/// True when the line is a `thread/status/changed` whose active flags say the
+/// turn is blocked on the owner: an approval prompt (commands, MCP
+/// elicitations such as computer-use "Allow") or a question for the user.
+/// Codex clears the flags with a later status change once it is answered.
+pub(crate) fn codex_fork_event_line_waits_on_owner(line: &str) -> bool {
+    let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
+        return false;
+    };
+    let Some(event) = event.as_object() else {
+        return false;
+    };
+    let is_status_change = codex_fork_event_type(event).is_some_and(|event_type| {
+        normalize_codex_fork_event_type(&event_type.replace('/', "_")) == "thread_status_changed"
+    });
+    is_status_change
+        && codex_fork_payload(event)
+            .and_then(|payload| payload.get("status"))
+            .and_then(|status| status.get("activeFlags"))
+            .and_then(Value::as_array)
+            .is_some_and(|flags| {
+                flags.iter().any(|flag| {
+                    matches!(
+                        flag.as_str(),
+                        Some("waitingOnApproval" | "waitingOnUserInput")
+                    )
+                })
+            })
+}
+
 pub(crate) fn codex_fork_event_line_starts_turn(line: &str) -> bool {
     let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
         return false;
@@ -22221,6 +22250,27 @@ sleep 30
         assert_eq!(codex_fork_status_for_event_line(unknown), None);
         assert!(codex_fork_event_line_starts_turn(active));
         assert!(!codex_fork_event_line_starts_turn(idle));
+    }
+
+    #[test]
+    fn codex_fork_waits_on_owner_only_for_approval_and_input_flags() {
+        let line = |flags: &str| {
+            format!("{{\"event_type\":\"thread/status/changed\",\"payload\":{{\"status\":{{\"type\":\"active\",\"activeFlags\":{flags}}}}}}}")
+        };
+        assert!(codex_fork_event_line_waits_on_owner(&line(
+            "[\"waitingOnApproval\"]"
+        )));
+        assert!(codex_fork_event_line_waits_on_owner(&line(
+            "[\"waitingOnUserInput\"]"
+        )));
+        assert!(!codex_fork_event_line_waits_on_owner(&line("[]")));
+        assert!(!codex_fork_event_line_waits_on_owner(
+            r#"{"event_type":"thread/status/changed","payload":{"status":{"type":"active"}}}"#
+        ));
+        // Only a status change carries the flags.
+        assert!(!codex_fork_event_line_waits_on_owner(
+            r#"{"event_type":"item/started","payload":{"status":{"activeFlags":["waitingOnApproval"]}}}"#
+        ));
     }
 
     #[test]
