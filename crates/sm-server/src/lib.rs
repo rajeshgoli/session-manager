@@ -29,6 +29,7 @@ pub mod push_fcm;
 pub mod queue;
 pub mod queue_authority;
 pub mod quota_rates;
+pub mod review;
 pub mod runtime;
 pub mod seat_sessions;
 pub mod sessions;

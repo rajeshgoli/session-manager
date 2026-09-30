@@ -23,7 +23,7 @@ pub const STORE_KEY: &str = "owner_settings";
 /// The settings keys, one stored row each.
 const KEYS: [&str; 4] = ["new_agent", "queue_limits", "terminal_limits", "reviews"];
 /// Objects stored whole: a `PUT` replaces them rather than merging into them.
-const WHOLE_VALUES: [&str; 1] = ["repo_short"];
+const WHOLE_VALUES: [&str; 2] = ["repo_short", "reviewer"];
 const PLACEHOLDERS: [&str; 7] = [
     "ticket",
     "number",
@@ -33,9 +33,16 @@ const PLACEHOLDERS: [&str; 7] = [
     "title",
     "url",
 ];
-const CLAUDE_EFFORTS: [&str; 4] = ["low", "medium", "high", "max"];
+const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 const CODEX_EFFORTS: [&str; 3] = ["medium", "high", "xhigh"];
-const QUEUE_LIMITS: [&str; 5] = ["max_running", "tests", "perf", "background", "service"];
+const QUEUE_LIMITS: [&str; 6] = [
+    "max_running",
+    "tests",
+    "perf",
+    "background",
+    "service",
+    "review",
+];
 const QUEUE_LIMIT_MAX: i64 = 16;
 /// Each terminal limit and its allowed range. A value out of range is refused
 /// in a `PUT` and clamped when it comes from config.
@@ -80,6 +87,7 @@ pub fn defaults() -> Value {
             "perf": null,
             "background": null,
             "service": null,
+            "review": 4,
         },
         "terminal_limits": {
             "per_user": null,
@@ -223,9 +231,7 @@ fn validate_key(key: &str, value: &Value) -> Result<(), String> {
         "queue_limits" => validate_queue_limits(value),
         "terminal_limits" => validate_terminal_limits(value),
         "reviews" => {
-            if value["reviewer"] != json!({"kind": "github_codex"}) {
-                return Err("reviews.reviewer must be {\"kind\":\"github_codex\"}".to_owned());
-            }
+            crate::review::validate_reviewer(&value["reviewer"])?;
             if !value["skip_meter_percent"]
                 .as_i64()
                 .is_some_and(|percent| (50..=100).contains(&percent))
@@ -486,6 +492,7 @@ pub struct QueueLimits {
     pub perf: Option<i64>,
     pub background: Option<i64>,
     pub service: Option<i64>,
+    pub review: Option<i64>,
 }
 
 impl QueueLimits {
@@ -501,6 +508,7 @@ impl QueueLimits {
         policy.perf_max_concurrent = slots(self.perf, policy.perf_max_concurrent);
         policy.background_max_concurrent = slots(self.background, policy.background_max_concurrent);
         policy.service_max_concurrent = slots(self.service, policy.service_max_concurrent);
+        policy.review_max_concurrent = slots(self.review, policy.review_max_concurrent);
         policy
     }
 }
@@ -720,7 +728,7 @@ mod tests {
     #[test]
     fn put_refuses_bad_values_naming_the_field() {
         for (patch, error) in [
-            (json!({"new_agent": {"claude": {"effort": "xhigh"}}}), "new_agent.claude.effort must be one of low, medium, high, max, or null"),
+            (json!({"new_agent": {"claude": {"effort": "invalid"}}}), "new_agent.claude.effort must be one of low, medium, high, xhigh, max, or null"),
             (json!({"new_agent": {"codex": {"effort": "low"}}}), "new_agent.codex.effort must be one of medium, high, xhigh, or null"),
             (json!({"new_agent": {"claude": {"model": " "}}}), "new_agent.claude.model must be a non-empty model name or null"),
             (json!({"new_agent": {"provider": "codex"}}), "new_agent.provider must be claude or codex-fork"),
