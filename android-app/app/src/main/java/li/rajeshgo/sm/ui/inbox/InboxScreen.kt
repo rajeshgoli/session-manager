@@ -108,6 +108,7 @@ fun inboxRowDetail(row: InboxRow): String {
 @Composable
 fun InboxScreen(
     onNavigateToWatch: () -> Unit,
+    onNavigateToBoard: () -> Unit,
     onNavigateToQueue: () -> Unit,
     menu: AppMenuActions,
     viewModel: InboxViewModel = viewModel(),
@@ -238,6 +239,7 @@ fun InboxScreen(
                 currentRoute = Routes.INBOX,
                 onInbox = {},
                 onWatch = onNavigateToWatch,
+                onBoard = onNavigateToBoard,
                 onQueue = onNavigateToQueue,
             )
         }

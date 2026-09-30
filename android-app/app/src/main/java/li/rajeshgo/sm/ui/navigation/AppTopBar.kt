@@ -68,6 +68,8 @@ fun AppTopBar(
     current: String? = null,
     onBack: (() -> Unit)? = null,
     onRefresh: (() -> Unit)? = null,
+    /** Screen buttons before the menu, such as the Board's add lane. */
+    actions: (@Composable () -> Unit)? = null,
     updateViewModel: UpdateAvailabilityViewModel = viewModel(),
 ) {
     val update by updateViewModel.uiState.collectAsState()
@@ -108,6 +110,7 @@ fun AppTopBar(
                     )
                 }
             }
+            actions?.invoke()
             Box {
                 IconButton(onClick = { menuExpanded = true }) {
                     Icon(Icons.Rounded.MoreVert, contentDescription = "Menu", tint = if (busy) Cyan else TextSecondary)

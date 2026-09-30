@@ -53,6 +53,7 @@
                 <data android:host="${smLinkHost}" />
                 <data android:pathPrefix="/docs/" />
                 <data android:pathPrefix="/t/" />
+                <data android:pathPrefix="/board" />
                 <data android:path="/history" />
                 <data android:path="/guestbook" />
             </intent-filter>

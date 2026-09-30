@@ -7,6 +7,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import li.rajeshgo.sm.push.FollowOpen
 import li.rajeshgo.sm.push.FollowOpenRequests
+import li.rajeshgo.sm.ui.board.BoardLinkRequests
+import li.rajeshgo.sm.ui.board.boardLaneForLink
+import li.rajeshgo.sm.ui.board.boardLaneFromPath
 import li.rajeshgo.sm.ui.navigation.AppNavigation
 import li.rajeshgo.sm.ui.navigation.EnrollmentLinkRequests
 import li.rajeshgo.sm.ui.navigation.ReaderLinkRequests
@@ -22,6 +25,7 @@ class MainActivity : ComponentActivity() {
         FollowOpenRequests.pending = null
         EnrollmentLinkRequests.pending = null
         ReaderLinkRequests.pending = null
+        BoardLinkRequests.pending = null
         takeEnrollmentLink(intent)
         takeReaderLink(intent)
         takeFollowOpen(intent)
@@ -54,10 +58,11 @@ class MainActivity : ComponentActivity() {
         return uri.getQueryParameter("url")?.trim()?.takeIf { it.isNotBlank() }
     }
 
-    /** Hands a tapped follow notification to the watch screen, once. */
+    /** Hands a tapped follow notification to the watch screen, and a board alert to the Board tab, once. */
     private fun takeFollowOpen(intent: Intent?) {
         val open = FollowOpen.fromIntent(intent) ?: return
-        FollowOpenRequests.pending = open
+        val lane = open.readerPath?.let(::boardLaneFromPath)
+        if (lane != null) BoardLinkRequests.pending = lane else FollowOpenRequests.pending = open
         setIntent(Intent(this, MainActivity::class.java))
     }
 
@@ -65,6 +70,11 @@ class MainActivity : ComponentActivity() {
     private fun takeReaderLink(intent: Intent?) {
         if (intent?.action != Intent.ACTION_VIEW) return
         val url = intent.dataString ?: return
+        boardLaneForLink(url, BuildConfig.SM_LINK_HOST)?.let { lane ->
+            BoardLinkRequests.pending = lane
+            setIntent(Intent(this, MainActivity::class.java))
+            return
+        }
         val page = readerPageForLink(url, BuildConfig.SM_LINK_HOST) ?: return
         ReaderLinkRequests.pending = page
         setIntent(Intent(this, MainActivity::class.java))
