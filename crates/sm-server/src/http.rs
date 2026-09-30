@@ -107,7 +107,6 @@ use crate::google_auth::{
     fetch_google_id_token_jwks, google_id_token_key_id, verify_google_id_token_with_jwks,
     GoogleIdTokenClaims, GoogleIdTokenError,
 };
-use crate::mobile_analytics::build_mobile_analytics_summary;
 use crate::mobile_devices::{self, mobile_device_db_path};
 use crate::queue::{
     CodexReviewRequestFilters, CodexReviewRequestRegistration, CompleteCodexReviewRequest,
@@ -1506,7 +1505,6 @@ pub fn router(state: AppState) -> Router {
             post(follows::force_start_queue_job),
         )
         .route("/client/utilization/series", get(client_utilization_series))
-        .route("/client/analytics/summary", get(client_analytics_summary))
         .route(
             "/client/analytics/spend",
             get(analytics::client_analytics_spend),
@@ -2722,39 +2720,6 @@ async fn client_host_status(
         request_actor_email(&state.config, &request).as_deref(),
     )?;
     Ok(Json(crate::host_status::snapshot().await))
-}
-
-async fn client_analytics_summary(
-    State(state): State<Arc<AppState>>,
-    request: Request,
-) -> Result<Json<Value>, ApiError> {
-    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-    ensure_public_edge_assertion_for_request(&state, &request)?;
-    ensure_session_read_allowed(&state, &request)?;
-    ensure_mobile_cloudflare_access_context_matches_optional_actor(
-        &state,
-        access_context.as_ref(),
-        request_actor_email(&state.config, &request).as_deref(),
-    )?;
-    let mut summary = build_mobile_analytics_summary(&state.config, &state.session_store)?;
-    let sessions = state.session_store.list_sessions(false)?;
-    let mut counts = std::collections::BTreeMap::<String, usize>::new();
-    for session in sessions {
-        let response = serde_json::to_value(session_response_with_live_activity(&state, session))
-            .unwrap_or(Value::Null);
-        let activity = match response["activity_state"].as_str() {
-            Some("working") => "working",
-            Some("thinking") => "thinking",
-            Some("waiting" | "waiting_permission" | "waiting_input") => "waiting",
-            _ => "idle",
-        };
-        *counts.entry(activity.into()).or_default() += 1;
-    }
-    summary["workload"]["agents_working"] =
-        json!(counts.get("working").unwrap_or(&0) + counts.get("thinking").unwrap_or(&0));
-    summary["state_distribution"] = json!(["working", "thinking", "waiting", "idle"]
-        .map(|key| json!({"key": key, "label": key, "count": counts.get(key).unwrap_or(&0)})));
-    Ok(Json(summary))
 }
 
 async fn submit_client_bug_report(
@@ -11170,13 +11135,6 @@ fn shadow_predict_read(
                 support_status: "implemented_read_status_only",
             }));
         }
-        "/client/analytics/summary" => {
-            return Ok(Some(ShadowPrediction {
-                status: StatusCode::OK.as_u16(),
-                body_sha256: None,
-                support_status: "implemented_read_status_only",
-            }));
-        }
         "/codex-review-requests" | "/session-obligations" => {
             return Ok(Some(ShadowPrediction {
                 status: StatusCode::OK.as_u16(),
@@ -14274,7 +14232,6 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
     path == "/events"
         || path == "/events/state"
         || path == "/apk"
-        || path == "/client/analytics/summary"
         || path == "/client/analytics/spend"
         || path == "/client/analytics/time"
         || path == "/client/session-models"
@@ -19994,7 +19951,6 @@ mod tests {
                 r#"{"id_token":"fixture"}"#,
                 true,
             ),
-            (Method::GET, "/client/analytics/summary", "", false),
             (Method::GET, "/client/analytics/spend", "", false),
             (Method::GET, "/client/analytics/time", "", false),
             (
@@ -21236,38 +21192,6 @@ mod tests {
             json!({"kind": "cancel", "note": "not needed"})
         );
         let _ = std::fs::remove_dir_all(state_dir);
-    }
-
-    #[tokio::test]
-    async fn mobile_analytics_activity_distribution_matches_workload_totals() {
-        let signing_key = SigningKey::random(&mut OsRng);
-        let app = router(AppState::new(mobile_ticket_config(&signing_key)));
-        let response = app
-            .oneshot(local_request(
-                Method::GET,
-                "/client/analytics/summary",
-                Body::empty(),
-            ))
-            .await
-            .unwrap();
-        let (status, body) = response_json(response).await;
-        assert_eq!(status, StatusCode::OK);
-        let rows = body["state_distribution"].as_array().unwrap();
-        assert_eq!(
-            rows.iter()
-                .map(|row| row["count"].as_u64().unwrap())
-                .sum::<u64>(),
-            body["workload"]["agents_live"].as_u64().unwrap()
-        );
-        let working = rows
-            .iter()
-            .filter(|row| row["key"] == "working" || row["key"] == "thinking")
-            .map(|row| row["count"].as_u64().unwrap())
-            .sum::<u64>();
-        assert_eq!(
-            working,
-            body["workload"]["agents_working"].as_u64().unwrap()
-        );
     }
 
     #[tokio::test]

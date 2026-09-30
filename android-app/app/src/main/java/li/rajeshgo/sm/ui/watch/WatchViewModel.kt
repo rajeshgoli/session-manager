@@ -216,6 +216,24 @@ class WatchViewModel(application: Application, private val savedState: androidx.
         super.onCleared()
     }
 
+    // An explicit Open agent may target a retired session, outside the live roster.
+    private var openedHistoricalSession: ClientSession? = null
+
+    fun openHistoricalSession(sessionId: String, onError: (String) -> Unit) {
+        viewModelScope.launch {
+            try {
+                val session = sessionRepository.fetchSession(settingsRepository.serverUrl.first(), settingsRepository.accessToken.first(), sessionId)
+                openedHistoricalSession = session
+                _uiState.value = _uiState.value.copy(sessions = (_uiState.value.sessions + session).distinctBy { it.id })
+                expandSession(session)
+            } catch (cancel: kotlinx.coroutines.CancellationException) {
+                throw cancel
+            } catch (error: Exception) {
+                onError("Couldn't open this agent. Try again.")
+            }
+        }
+    }
+
     fun refresh(initial: Boolean = false) {
         if (refreshJob?.isActive == true) {
             return
@@ -237,7 +255,8 @@ class WatchViewModel(application: Application, private val savedState: androidx.
                 _uiState.value = _uiState.value.copy(loading = initial, refreshing = !initial, error = null)
                 val expandedSessionIds = _uiState.value.expandedSessionIds
                 runCatching { sessionRepository.fetchSessions(serverUrl, accessToken) }
-                    .onSuccess { sessions ->
+                    .onSuccess { liveSessions ->
+                        val sessions = (liveSessions + listOfNotNull(openedHistoricalSession)).distinctBy { it.id }
                         val sessionIds = sessions.map { it.id }.toSet()
                         val preservedDetails = _uiState.value.detailsBySessionId.filterKeys { it in sessionIds }
                         val preservedWhat = _uiState.value.whatBySessionId.filterKeys { it in sessionIds }

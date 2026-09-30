@@ -43,6 +43,8 @@ class SettingsRepository(
         val WHAT_SUMMARIES = stringPreferencesKey("what_summaries")
         val QUEUE_ASKS = stringPreferencesKey("queue_asks")
         val FOLLOW_PUSH_ENABLED = booleanPreferencesKey("follow_push_enabled")
+        val SPEND_PROVIDER = stringPreferencesKey("analytics_spend_provider")
+        val SPEND_RANGE = stringPreferencesKey("analytics_spend_range")
         val ANALYTICS_SECTION = stringPreferencesKey("analytics_section")
     }
 
@@ -201,6 +203,18 @@ class SettingsRepository(
     }
 
     /** The Analytics section last shown (spend, time or queue); blank before the first visit. */
+    suspend fun loadSpendChoices(): Pair<String?, String> {
+        val prefs = context.dataStore.data.first()
+        return prefs[Keys.SPEND_PROVIDER] to (prefs[Keys.SPEND_RANGE] ?: "week")
+    }
+
+    suspend fun saveSpendChoices(provider: String?, range: String) {
+        context.dataStore.edit { prefs ->
+            if (provider != null) prefs[Keys.SPEND_PROVIDER] = provider
+            prefs[Keys.SPEND_RANGE] = range
+        }
+    }
+
     suspend fun loadAnalyticsSection(): String = context.dataStore.data.first()[Keys.ANALYTICS_SECTION].orEmpty()
 
     suspend fun saveAnalyticsSection(section: String) {
