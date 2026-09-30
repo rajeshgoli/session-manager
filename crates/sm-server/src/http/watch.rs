@@ -104,6 +104,11 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
         .iter()
         .map(|record| (record.id.clone(), record.context_used_percentage))
         .collect();
+    // Same link and null rules as `/client/sessions`.
+    let remote_control: BTreeMap<String, Value> = records
+        .iter()
+        .map(|record| (record.id.clone(), remote_control_payload(record)))
+        .collect();
     let sessions: Vec<Value> = records
         .into_iter()
         .filter(|record| include_stopped || !record.is_stopped())
@@ -197,6 +202,7 @@ fn watch_state(state: &AppState, params: &WatchParams) -> Result<Value, ApiError
             "node": s(v, "node"),
             "context_percent": context.get(id).copied().flatten(),
             "handoff": v["handoff"].clone(),
+            "remote_control": remote_control.get(id).cloned().unwrap_or(Value::Null),
             "claims": field("claims"),
             "docs": field("docs"),
             "waiting_on": waiting_on,

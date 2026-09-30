@@ -61,6 +61,14 @@ fn links() -> Arc<LinkMap> {
     links
 }
 
+/// Drops the cached scan, so a test sees session files it just wrote.
+#[cfg(test)]
+pub(crate) fn clear_cache_for_test() {
+    *CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
 fn claude_session_dirs() -> Vec<PathBuf> {
     // A test process must never read the developer's live Claude sessions.
     if let Ok(Some(root)) = test_isolation_root_from_environment() {
