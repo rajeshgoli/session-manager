@@ -497,8 +497,11 @@ pub(super) async fn get_inbox(
         Some("done") => "done",
         Some(_) => return Err(bad_request("filter must be open, docs or done")),
     };
+    if let Some(shell) = web::shell_page(&state, &request) {
+        return Ok(shell);
+    }
     let (rows, needs_you_count, has_new) = inbox_listing(&state, filter)?;
-    if query.format.as_deref() == Some("json") {
+    if query.format.as_deref() == Some("json") || web::wants_json(&request) {
         return Ok(Json(json!({
             "filter": filter,
             "needs_you_count": needs_you_count,
@@ -839,7 +842,13 @@ pub(super) async fn get_agent_thread(
 ) -> Result<Response, ApiError> {
     ensure_owner_page_read_allowed(&state, &request)?;
     let at = query.at.filter(|_| query.bottom.is_none());
-    agent_thread_page(&state, &session_id, at)
+    agent_thread_page(
+        &state,
+        &session_id,
+        at,
+        web::wants_json(&request),
+        web::wants_shell(&state, &request),
+    )
 }
 
 /// The thread page for `session_id`, scrolled to message `at`. Also what
@@ -849,6 +858,8 @@ pub(super) fn agent_thread_page(
     state: &AppState,
     session_id: &str,
     at: Option<String>,
+    json_format: bool,
+    browser: bool,
 ) -> Result<Response, ApiError> {
     let session_id = session_id.to_owned();
     let world = World::load(state)?;
@@ -935,6 +946,17 @@ pub(super) fn agent_thread_page(
         _ => "ended".to_owned(),
     };
     let repo = world.agent_repo(&session_id);
+    if json_format {
+        return Ok(Json(json!({
+            "session_id": session_id, "title": name, "status": status, "repo": repo,
+            "can_send": recipient.is_some(),
+            "reply_to": recipient.as_ref().map(|s| session_display_name(s.clone())),
+            "items": items.iter().map(|item| json!({
+                "at": item.at(), "html": render_item(item, &world, &session_id, now),
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response());
+    }
     let mut body = format!(
         r#"<style>{THREAD_STYLE}</style><div class="th-head"><a class="dim" href="/inbox">‹ Inbox</a><span class="big">{name}</span><span class="m"><span class="dot {dot}"></span>{status}{repo}</span></div><div class="items{quote_class}">"#,
         name = escape_html(&name),
@@ -988,6 +1010,7 @@ pub(super) fn agent_thread_page(
         "<script>{INBOX_CLIENT_JS}({});</script>",
         inline_json(&config)
     ));
+    body.push_str(&web::reader_injection(browser));
     Ok(html(page_shell_with_status(&name, "inbox", "", &body)))
 }
 

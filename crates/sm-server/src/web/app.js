@@ -9,6 +9,9 @@ import {
   openPanel, closePanel, navigate, openItem, toast, Icon, Ring, Seg, gigabytes, basename,
 } from './ui.js';
 import { BoardPage } from './board.js';
+import { InboxPage } from './inbox.js';
+import { HistoryPage } from './history.js';
+import { GuestbookPage } from './guestbook.js';
 import { AgentsPage } from './agents.js';
 import { SettingsPage } from './settings.js';
 import { TerminalPage } from './terminal.js';
@@ -20,9 +23,10 @@ const PAGES = [
   { key: 'agents', label: 'Agents', icon: 'agents', path: '/', key_hint: 'a' },
   { key: 'board', label: 'Board', icon: 'board', path: '/board', key_hint: 'b' },
   { key: 'queue', label: 'Queue', icon: 'queue', path: '/queue', key_hint: 'q' },
-  { key: 'inbox', label: 'Inbox', icon: 'inbox', path: '/inbox', key_hint: 'i', legacy: true },
+  { key: 'inbox', label: 'Inbox', icon: 'inbox', path: '/inbox', key_hint: 'i' },
   { key: 'analytics', label: 'Analytics', icon: 'analytics', path: '/analytics', minor: true },
-  { key: 'history', label: 'History', icon: 'history', path: '/history', legacy: true, minor: true },
+  { key: 'history', label: 'History', icon: 'history', path: '/history', minor: true },
+  { key: 'guestbook', label: 'Guestbook', icon: 'history', path: '/guestbook', minor: true },
   { key: 'settings', label: 'Settings', icon: 'settings', path: '/settings', key_hint: 's', bottom: true },
 ];
 
@@ -127,7 +131,7 @@ function App() {
       <${Toasts} items=${toasts} />`;
   }
 
-  const panelOpen = !!loc.open;
+  const panelOpen = !!loc.open && !(page === 'inbox' && /^(doc|thread):/.test(loc.open));
   const cls = ['app', layout.rail === 'folded' && 'folded', panelOpen && layout.panel_mode === 'wide' && 'wide']
     .filter(Boolean).join(' ');
   return html`<div class=${cls} style=${`--panel-w:${clampWidth(layout.panel_width_rem)}rem`}>
@@ -147,6 +151,9 @@ function Page({ page, loc }) {
   if (page === 'agents') return html`<${AgentsPage} openRef=${loc.open} />`;
   if (page === 'settings') return html`<${SettingsPage} />`;
   if (page === 'board') return html`<${BoardPage} />`;
+  if (page === 'inbox') return html`<${InboxPage} openRef=${loc.open} />`;
+  if (page === 'history') return html`<${HistoryPage} path=${loc.path} />`;
+  if (page === 'guestbook') return html`<${GuestbookPage} />`;
   const current = PAGES.find((p) => p.key === page);
   return html`<div class="content"><div class="stub">
     <h2>${current.label}</h2>

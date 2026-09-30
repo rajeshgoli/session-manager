@@ -1266,6 +1266,7 @@ async fn view_doc_response(
     state: &Arc<AppState>,
     doc: &OwnerDoc,
     commit_sha: &str,
+    browser: bool,
 ) -> Result<Response, ApiError> {
     let bytes = load_doc_bytes_async(state, doc, commit_sha).await?;
     let store = owner_doc_store(state);
@@ -1328,7 +1329,11 @@ async fn view_doc_response(
             &doc.path,
             &doc.title,
             &bytes,
-            &review_client_injection(&config),
+            &format!(
+                "{}{}",
+                review_client_injection(&config),
+                web::reader_injection(browser)
+            ),
         )),
     )
         .into_response();
@@ -1770,7 +1775,13 @@ pub(super) async fn get_owner_doc_subpath(
         return if rest == "raw" {
             raw_doc_response(&state, &doc, &commit_sha).await
         } else {
-            view_doc_response(&state, &doc, &commit_sha).await
+            view_doc_response(
+                &state,
+                &doc,
+                &commit_sha,
+                web::wants_shell(&state, &request),
+            )
+            .await
         };
     }
     let version = query
@@ -1820,7 +1831,15 @@ pub(super) async fn get_owner_doc_subpath(
             )
                 .into_response())
         }
-        _ => view_doc_response(&state, &doc, &commit_sha).await,
+        _ => {
+            view_doc_response(
+                &state,
+                &doc,
+                &commit_sha,
+                web::wants_shell(&state, &request),
+            )
+            .await
+        }
     }
 }
 

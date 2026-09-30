@@ -104,6 +104,9 @@ pub(super) async fn get_history(
     request: Request,
 ) -> Result<Response, ApiError> {
     ensure_owner_page_read_allowed(&state, &request)?;
+    if let Some(shell) = web::shell_page(&state, &request) {
+        return Ok(shell);
+    }
     let data = history_data(&state)?;
     let (records, sessions) = load_sessions(&state)?;
     let before = match nonempty(&params.before) {
@@ -124,7 +127,7 @@ pub(super) async fn get_history(
         limit: params.limit.unwrap_or(DEFAULT_LIMIT),
     };
     let page = data.list(&sessions, &query, OffsetDateTime::now_utc());
-    if params.format.as_deref() == Some("json") {
+    if params.format.as_deref() == Some("json") || web::wants_json(&request) {
         let mut body = json!({
             "schema_version": HISTORY_SCHEMA_VERSION,
             "rows": page.rows,
@@ -148,7 +151,7 @@ pub(super) async fn get_timeline(
     request: Request,
 ) -> Result<Response, ApiError> {
     ensure_owner_page_read_allowed(&state, &request)?;
-    let json_format = params.format.as_deref() == Some("json");
+    let json_format = params.format.as_deref() == Some("json") || web::wants_json(&request);
     let data = history_data(&state)?;
     let (_, sessions) = load_sessions(&state)?;
     let timeline = number.trim().parse::<i64>().ok().and_then(|number| {
@@ -190,7 +193,15 @@ pub(super) async fn get_timeline(
     );
     Ok(html_response(
         StatusCode::OK,
-        page_shell(&title, "", &render_timeline(&timeline)),
+        page_shell(
+            &title,
+            "",
+            &format!(
+                "{}{}",
+                render_timeline(&timeline),
+                web::reader_injection(web::wants_shell(&state, &request))
+            ),
+        ),
     ))
 }
 

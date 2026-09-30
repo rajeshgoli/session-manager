@@ -19528,6 +19528,10 @@ mod tests {
             "/",
             "/?open=agent:abc12345",
             "/board",
+            "/inbox",
+            "/history",
+            "/history/agents",
+            "/guestbook",
             "/queue",
             "/analytics",
             "/analytics/spend",
@@ -19629,6 +19633,27 @@ mod tests {
         let html = body_text(response).await;
         assert!(html.contains("Handoff defaults"));
         assert!(!html.contains(r#"id="sm-config""#));
+        for uri in ["/inbox", "/history", "/guestbook"] {
+            let response = app.clone().oneshot(app_host(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert!(
+                !body_text(response).await.contains(r#"id="sm-config""#),
+                "{uri}"
+            );
+        }
+        for uri in ["/inbox", "/history", "/history/agents", "/guestbook"] {
+            let mut request = browser(uri);
+            request
+                .headers_mut()
+                .insert("accept", "application/json".parse().unwrap());
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert_eq!(
+                response.headers()[CONTENT_TYPE],
+                "application/json",
+                "{uri}"
+            );
+        }
         let response = app.clone().oneshot(app_host("/watch")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let response = app.clone().oneshot(app_host("/board")).await.unwrap();

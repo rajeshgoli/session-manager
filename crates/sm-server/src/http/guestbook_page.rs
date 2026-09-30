@@ -98,6 +98,9 @@ pub(super) async fn get_guestbook(
     request: Request,
 ) -> Result<Response, ApiError> {
     ensure_owner_page_read_allowed(&state, &request)?;
+    if let Some(shell) = web::shell_page(&state, &request) {
+        return Ok(shell);
+    }
     let before = match nonempty(&params.before) {
         Some(cursor) => Some(cursor.parse::<i64>().map_err(|_| ApiError::Status {
             status: StatusCode::BAD_REQUEST,
@@ -110,7 +113,7 @@ pub(super) async fn get_guestbook(
         before,
         limit: params.limit.unwrap_or(DEFAULT_LIMIT),
     })?;
-    if params.format.as_deref() == Some("json") {
+    if params.format.as_deref() == Some("json") || web::wants_json(&request) {
         let mut body = json!({
             "schema_version": GUESTBOOK_SCHEMA_VERSION,
             "entries": page.entries,
