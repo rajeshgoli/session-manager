@@ -109,7 +109,7 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
         val serverUrl = settingsRepository.serverUrl.first()
         val token = settingsRepository.accessToken.first()
         if (serverUrl.isBlank() || token.isBlank()) {
-            _uiState.update { it.copy(loading = false, refreshing = false, signedOut = true) }
+            _uiState.update { it.copy(loading = false, refreshing = false, signedOut = true, busy = false, start = null) }
             return null
         }
         return serverUrl to token
@@ -118,7 +118,8 @@ class BoardViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun handleAuth(error: Throwable): Boolean {
         if (error !is SessionManagerAuthException) return false
         settingsRepository.clearAuth()
-        _uiState.update { it.copy(loading = false, refreshing = false, signedOut = true) }
+        // Signed out: a Start sheet mid-request would otherwise stay locked.
+        _uiState.update { it.copy(loading = false, refreshing = false, signedOut = true, start = null) }
         return true
     }
 
