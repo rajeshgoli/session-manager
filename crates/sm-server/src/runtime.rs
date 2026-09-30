@@ -417,6 +417,7 @@ impl TmuxRuntime {
                 "fable".into(),
                 "sonnet".into(),
                 "opus".into(),
+                "opus[1m]".into(),
                 "haiku".into(),
             ]);
         }

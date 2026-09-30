@@ -15,14 +15,14 @@ class Element {
   showModal() { this.open = true; }
   close() { this.open = false; this.listeners.close?.(); }
 }
-async function harness() {
+async function harness(defaultModel = 'unavailable') {
   const ids = Object.fromEntries(['board','board-message','board-start','board-start-form','board-start-error','board-submit','board-model-note','board-cancel','board-start-title'].map(id=>[id,new Element()]));
   const fields = Object.fromEntries(['provider','model','reasoning_effort','name','brief'].map(name=>[name,new Element()]));
   const form = ids['board-start-form'];
   form.fields = fields; form.elements = {namedItem:name=>fields[name]};
   const calls = [], intervals = [], windowEvents = {};
   let failure, models = ['fable','opus'];
-  const board = {html:'<p>lane</p>',start_defaults:{provider:'claude',model:'unavailable',reasoning_effort:'high'}};
+  const board = {html:'<p>lane</p>',start_defaults:{provider:'claude',model:defaultModel,reasoning_effort:'high'}};
   const fetch = async (path,options={}) => {
     calls.push({path,...options});
     if (path === '/client/board/start' && failure) return {ok:false,status:409,json:async()=>({detail:failure})};
@@ -88,6 +88,19 @@ test('Start uses resolved checkout and fallback model, shows errors, then refres
   assert.equal(h.ids['board-message'].textContent,'Started widgets-2');
   const sent = JSON.parse(h.calls.filter(c=>c.path==='/client/board/start').at(-1).body);
   assert.equal(sent.number,2); assert.equal(sent.repo,'acme/widgets'); assert.equal(sent.model,'fable');
+});
+
+test('Start preselects and submits configured Opus 1M at high effort',async()=>{
+  const h = await harness('opus[1m]');
+  h.setModels(['fable','sonnet','opus','opus[1m]','haiku']);
+  await h.ids.board.listeners.click({target:new Element({start:'2',repo:'acme/widgets'})});
+  assert.equal(h.fields.model.value,'opus[1m]');
+  assert.equal(h.fields.reasoning_effort.value,'high');
+  assert.equal(h.ids['board-model-note'].textContent,'');
+  await h.ids['board-start-form'].listeners.submit({preventDefault(){}});
+  const sent = JSON.parse(h.calls.find(c=>c.path==='/client/board/start').body);
+  assert.equal(sent.model,'opus[1m]');
+  assert.equal(sent.reasoning_effort,'high');
 });
 
 test('nav_board_badge hides zero and clears after the board is seen',async()=>{
