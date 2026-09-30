@@ -14,7 +14,7 @@ use std::path::Path;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::config::{AppConfig, BoardStartDefaults};
+use crate::config::AppConfig;
 use crate::queue::QueueAdmissionPolicy;
 use crate::sessions::expand_home;
 
@@ -145,33 +145,6 @@ pub fn apply_patch(
         changed.insert(key.clone(), owner);
     }
     Ok(changed)
-}
-
-/// The stored `new_agent` value seeded from `board.start_defaults`, keeping
-/// only the fields that validate.
-pub fn seed_new_agent(start: &BoardStartDefaults) -> Option<Value> {
-    let defaults = defaults();
-    let provider_key = provider_settings_key(&start.provider)?;
-    let mut seed = json!({ "provider": start.provider });
-    for (field, value) in [
-        ("model", start.model.as_deref()),
-        ("effort", Some(start.reasoning_effort.as_str())),
-    ] {
-        let Some(value) = value else { continue };
-        let mut candidate = seed.clone();
-        candidate[provider_key][field] = json!(value);
-        if validate_key(
-            "new_agent",
-            &overlay(&defaults["new_agent"], &candidate, false),
-        )
-        .is_ok()
-        {
-            seed = candidate;
-        }
-    }
-    validate_key("new_agent", &overlay(&defaults["new_agent"], &seed, false))
-        .ok()
-        .map(|()| seed)
 }
 
 /// `claude` settings for the Claude provider, `codex` for Codex.
@@ -765,26 +738,6 @@ mod tests {
             policy.tests_max_concurrent,
             QueueAdmissionPolicy::default().tests_max_concurrent
         );
-    }
-
-    #[test]
-    fn seed_keeps_the_config_fields_that_validate() {
-        let seed = seed_new_agent(&BoardStartDefaults {
-            provider: "codex-fork".into(),
-            model: Some("gpt-5.5".into()),
-            reasoning_effort: "low".into(),
-        })
-        .unwrap();
-        assert_eq!(
-            seed,
-            json!({"provider": "codex-fork", "codex": {"model": "gpt-5.5"}})
-        );
-        assert!(seed_new_agent(&BoardStartDefaults {
-            provider: "gemini".into(),
-            model: None,
-            reasoning_effort: "high".into(),
-        })
-        .is_none());
     }
 }
 

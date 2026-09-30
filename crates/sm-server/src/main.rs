@@ -160,7 +160,7 @@ async fn main() -> Result<()> {
         // Stored owner limits apply from the first pass; `PUT /client/settings`
         // changes the shared policy after that (sm#1718).
         let settings = SessionStore::new(expand_home(&config.paths.state_file))
-            .owner_settings(None)
+            .owner_settings()
             .unwrap_or_else(|error| {
                 eprintln!("owner settings unreadable, using config queue limits: {error:#}");
                 owner_settings::defaults()

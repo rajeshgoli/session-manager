@@ -336,7 +336,6 @@ mod agent_history;
 mod analytics;
 mod board;
 mod board_clock;
-mod board_page;
 mod browser_terminal;
 mod claims;
 mod docs;
@@ -631,7 +630,7 @@ impl AppState {
         OsRng.fill_bytes(&mut mobile_terminal_secret);
         let (tmux_client_event_tx, _) = broadcast::channel(128);
         let studio_ssh_enabled = studio_ssh::status(&config.external_access.studio_ssh).enabled;
-        let settings = session_store.owner_settings(None).unwrap_or_else(|error| {
+        let settings = session_store.owner_settings().unwrap_or_else(|error| {
             eprintln!("owner settings unreadable, using config queue limits: {error:#}");
             crate::owner_settings::defaults()
         });
@@ -20168,7 +20167,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         // The phone app's hostname keeps today's page at `/`, and has no
-        // shell-only pages.
+        // shell-only pages; its Board is the app's own tab.
         let cookie = owner_session_cookie();
         let app_host = |uri: &str| {
             let mut request =
@@ -20207,13 +20206,10 @@ mod tests {
         }
         let response = app.clone().oneshot(app_host("/watch")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let response = app.clone().oneshot(app_host("/board")).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let html = body_text(response).await;
-        assert!(html.contains("board-add"));
-        assert!(!html.contains(r#"id="sm-config""#));
-        let response = app.clone().oneshot(app_host("/queue")).await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        for uri in ["/board", "/queue"] {
+            let response = app.clone().oneshot(app_host(uri)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        }
     }
 
     #[tokio::test]
@@ -22863,18 +22859,6 @@ mod tests {
             body["models"],
             json!(["fable", "sonnet", "opus", "opus[1m]", "haiku"])
         );
-        // The documented Board Start default must match the shared catalog
-        // exactly, or both clients silently preselect its first entry.
-        let example: Value =
-            serde_yaml::from_str(include_str!("../../../config.yaml.example")).unwrap();
-        let defaults = &example["board"]["start_defaults"];
-        assert_eq!(defaults["provider"], "claude");
-        assert_eq!(defaults["model"], "opus[1m]");
-        assert_eq!(defaults["reasoning_effort"], "high");
-        assert!(body["models"]
-            .as_array()
-            .unwrap()
-            .contains(&defaults["model"]));
         let response = app
             .oneshot(local_request(
                 Method::GET,
@@ -23811,7 +23795,7 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
         let owner =
             test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
         for uri in [
-            "/client/board?html=true",
+            "/client/board",
             "/client/board/badge",
             "/client/session-models?provider=claude",
         ] {
@@ -23893,18 +23877,13 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
     }
 
     #[tokio::test]
-    async fn owner_settings_seed_merge_validate_and_move_queue_limits() {
+    async fn owner_settings_merge_validate_and_move_queue_limits() {
         let mut config = google_auth_config();
         config.cloudflare_access = cloudflare_access_config().cloudflare_access;
         config.paths.state_file = write_session_state("settings-browser", "running");
         config.rust_core.fixture_writes_enabled = true;
         config.rust_core.runtime_enabled = false;
         config.queue_runner.types.background.max_concurrent = 2;
-        config.board.start_defaults = Some(crate::config::BoardStartDefaults {
-            provider: "claude".into(),
-            model: Some("opus".into()),
-            reasoning_effort: "high".into(),
-        });
         config.mobile_terminal.max_concurrent_attaches_per_user = 3;
         let state = AppState::new(config);
         seed_cloudflare_access_jwks(&state);
@@ -23945,17 +23924,28 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
             }
         };
 
-        // The first read seeds new_agent from board.start_defaults.
+        // With nothing stored, every setting reads as its default.
         let (status, body) = browser_host_get(&app, "/client/settings", Some(&owner)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["new_agent"]["provider"], "claude");
         assert_eq!(
             body["new_agent"]["claude"],
-            json!({"model": "opus", "effort": "high"})
+            json!({"model": null, "effort": null})
         );
         assert_eq!(body["new_agent"]["name_pattern"], "{repo_short}-{number}");
         assert_eq!(body["queue_limits"]["background"], Value::Null);
         assert_eq!(background_max().await, 2);
+        let (status, body) = put(
+            json!({"new_agent": {"claude": {"model": "opus", "effort": "high"}}}),
+            "https://sm.example.com",
+            false,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["new_agent"]["claude"],
+            json!({"model": "opus", "effort": "high"})
+        );
 
         // A partial PUT merges; null restores the default; the limit applies
         // to the queue without a restart.

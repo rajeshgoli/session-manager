@@ -3,10 +3,10 @@
 //! and the app routes on the client. Every other hostname keeps today's
 //! page at each path, and JSON responses are unchanged everywhere.
 //!
-//! Page paths join the shell as their page modules land: `/` and `/watch`
-//! (Agents), `/board`, `/queue`, `/analytics…`, `/settings` and `/terminal/{id}` here;
-//! `/inbox`, `/history…` and `/guestbook` keep today's page until
-//! the tickets that build those modules route them through [`shell_page`].
+//! `/` (Agents), `/inbox`, `/history…` and `/guestbook` also have a server
+//! page, which the phone's reader shows; their handlers call [`shell_page`]
+//! first. `/board`, `/queue`, `/analytics…`, `/settings` and `/terminal/{id}`
+//! are the web app's alone and answer 404 on every other hostname.
 
 use super::*;
 use crate::owner_doc_render::inline_json;
