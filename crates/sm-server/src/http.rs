@@ -21959,7 +21959,22 @@ mod tests {
             .unwrap();
         let (status, body) = response_json(response).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["models"], json!(["fable", "sonnet", "opus", "haiku"]));
+        assert_eq!(
+            body["models"],
+            json!(["fable", "sonnet", "opus", "opus[1m]", "haiku"])
+        );
+        // The documented Board Start default must match the shared catalog
+        // exactly, or both clients silently preselect its first entry.
+        let example: Value =
+            serde_yaml::from_str(include_str!("../../../config.yaml.example")).unwrap();
+        let defaults = &example["board"]["start_defaults"];
+        assert_eq!(defaults["provider"], "claude");
+        assert_eq!(defaults["model"], "opus[1m]");
+        assert_eq!(defaults["reasoning_effort"], "high");
+        assert!(body["models"]
+            .as_array()
+            .unwrap()
+            .contains(&defaults["model"]));
         let response = app
             .oneshot(local_request(
                 Method::GET,
