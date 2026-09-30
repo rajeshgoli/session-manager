@@ -260,7 +260,7 @@
 <tr><td><span class="swatch" style="background:var(--m-green)"></span>Green</td><td>Moving: the agent is working, or its queue job is running.</td><td>#1856 tests running 1h 49m of a 3h limit</td></tr>
 <tr><td><span class="swatch" style="background:var(--m-amber)"></span>Amber</td><td>Waiting on the machine: a queue slot or a Codex review.</td><td>#1853 two jobs waiting 1h 55m for a slot</td></tr>
 <tr><td><span class="swatch" style="background:var(--m-mag)"></span>Magenta</td><td>Waiting on you.</td><td>None right now</td></tr>
-<tr><td><span class="swatch" style="background:var(--m-red)"></span>Red</td><td>Stalled: the ticket is in progress, but nothing is moving and nobody is being waited on. This includes a <b>quiet job</b>: running, but no CPU, no GPU and no new log output for 20 minutes, which suggests it is hung.</td><td>None right now</td></tr>
+<tr><td><span class="swatch" style="background:var(--m-red)"></span>Red</td><td>Stalled: the ticket is in progress, but nothing is moving and nobody is being waited on. This includes a <b>quiet job</b>: running, but no CPU, no GPU and no new log output for 10 minutes, which suggests it is hung.</td><td>None right now</td></tr>
 <tr><td><span class="swatch" style="background:var(--m-cyan)"></span>Cyan</td><td>Ready to start.</td><td>#1706 (not in a lane)</td></tr>
 <tr><td><span class="swatch" style="background:var(--m-slate)"></span>Slate</td><td>Blocked by another ticket. This is expected for future work, so it stays quiet.</td><td>#1858 waits on #1844, #1854, #1855, #1856</td></tr>
 </tbody>
@@ -388,7 +388,7 @@
 <!-- ============ Scenario 4 ============ -->
 <p class="scen">Scenario 4 · A job that might be hung</p>
 <h3>“This job has run an hour on almost no CPU. Is it stuck?”</h3>
-<p>A job that sits at 0% for a long time is often hung or buggy, and today nothing tells you. In the redesign, clicking a running job opens its panel, which puts the job's CPU and GPU over its run beside the tail of its log. sm calls a job <b>quiet</b>, and turns it red on the Queue page and the Board, only when all three have stopped for 20 minutes: CPU, GPU and log output. The live case below shows why the log matters. At 5:54 pm, #1848's purchase job had run 1h 04m on 0.8 seconds of CPU, which looks hung. Its log shows a healthy download: one market at a time, each verified, with the budget tracked.</p>
+<p>A job that sits at 0% for a long time is often hung or buggy, and today nothing tells you. In the redesign, clicking a running job opens its panel, which puts the job's CPU and GPU over its run beside the tail of its log. sm calls a job <b>quiet</b>, and turns it red on the Queue page and the Board, only when all three have stopped for 10 minutes: CPU, GPU and log output. The live case below shows why the log matters. At 5:54 pm, #1848's purchase job had run 1h 04m on 0.8 seconds of CPU, which looks hung. Its log shows a healthy download: one market at a time, each verified, with the budget tracked.</p>
 <div class="scrwrap"><div class="scr pane">
   <nav class="rail"><div class="brand">sm</div>
     <a>Agents <b>14</b></a><a>Board <b>1</b></a><a class="on">Queue <b class="hot">6</b></a><a>Inbox</a><a>Analytics</a><a>History</a><div class="grow"></div><a>Settings</a></nav>
@@ -422,15 +422,15 @@ xom    XNYS.PILLAR  XOM  2018-05-01 .. 2026-09-29  $0.513
 xom    XOM   ok  820180 bars  13.9 MB
 verified; new spend $58.36; remaining $29.84
 xom: complete and verified; proceeding to next market</div></div>
-      <div class="insight" style="border-color:var(--m-line);background:var(--m-panel2)"><div><b>Not quiet.</b> CPU is near zero, but the log grows every few minutes, so this job is probably waiting on downloads. It turns red only if the log also stops for 20 minutes.</div></div>
+      <div class="insight" style="border-color:var(--m-line);background:var(--m-panel2)"><div><b>Not quiet.</b> CPU is near zero, but the log grows every few minutes, so this job is probably waiting on downloads. It turns red only if the log also stops for 10 minutes.</div></div>
       <div class="sub">Ask agent suggests: “Is this job stuck?” · “How long do you expect this to run?” · “Is it safe to cancel this?”</div>
     </div>
   </aside>
 </div></div>
 <ul class="does">
 <li>The CPU trace is drawn from what the process list showed. The job starts a short helper for each market, each using under a second of CPU; the flat line between blips is the download. #1714 records each job's CPU and GPU time every 5 seconds, which is what the panel plots.</li>
-<li>A quiet job turns the ticket red on the Board, so a hung job on the critical path is seen within 20 minutes rather than hours later.</li>
-<li>sm does not cancel quiet jobs or send an alert about them. It marks them. The job's 8-hour limit still applies.</li>
+<li>A quiet job turns the ticket red on the Board, so a hung job on the critical path is seen within 10 minutes rather than hours later.</li>
+<li>sm does not cancel quiet jobs. It marks them and sends the job's agent one message (#1716, <code>docs/working/1716_quiet_job_alert.html</code>). The job's 8-hour limit still applies.</li>
 </ul>
 
 <!-- ============ Scenario 5 ============ -->
@@ -638,7 +638,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <tr><td>1. Adopt this direction: one page, left menu, side panel, colour meaning who has the ball?</td><td><b>Yes.</b> Appendix D is the build spec; appendix E splits it into eleven tickets.</td><td>It answers each complaint in your list with one design rather than seven patches.</td></tr>
 <tr><td>2. Terminal in the browser?</td><td><b>Yes, full typing.</b> It is protected by the same Cloudflare login as the rest of the site, and only your Google account passes that login.</td><td>It is the one thing you can do at the Studio but not from the web today.</td></tr>
 <tr><td>3. Where do settings live?</td><td><b>On the server, shared with the phone.</b> They replace the <code>board.start_defaults</code> config entry. Theme stays per browser. An unset model or effort means the provider's own default.</td><td>You set a default once, and it applies on every device.</td></tr>
-<tr><td>4. When is a ticket “stalled” (red)?</td><td><b>After 15 minutes in progress with nothing moving</b>: the agent is not working, no job is queued or running, no review is pending, and nothing waits on you. <b>A job is “quiet” (red) after 20 minutes with no CPU (under 1% of one core), no GPU and no new log output.</b></td><td>Short enough to catch a stuck critical path, long enough to ignore a pause between turns.</td></tr>
+<tr><td>4. When is a ticket “stalled” (red)?</td><td><b>After 15 minutes in progress with nothing moving</b>: the agent is not working, no job is queued or running, no review is pending, and nothing waits on you. <b>A job is “quiet” (red) after 10 minutes with no CPU (under 1% of one core), no GPU and no new log output.</b></td><td>Short enough to catch a stuck critical path, long enough to ignore a pause between turns.</td></tr>
 <tr><td>5. Should Settings let you change queue slot limits?</td><td><b>Yes, per job type, taking effect without a restart.</b> The Queue page links there only when a limit is holding work back.</td><td>Today the limit is a config edit and a restart. The 24-hour numbers say it cost real time.</td></tr>
 <tr><td>6. How is it built?</td><td><b>A single web app that sm-server serves, with no separate build step.</b> The phone keeps its current pages until the app moves over.</td><td><code>cargo build</code> and the restart script stay the only way to ship, and the app is not broken in the meantime.</td></tr>
 <tr><td>7. Device certificates for the laptop and the Studio, instead of email login?</td><td><b>Yes</b>, using the phone's certificate system. Email login stays as the fallback.</td><td>You open sm many times a day on both computers, and the certificate is already how the phone gets in.</td></tr>
@@ -651,7 +651,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <p><b>Terminal and Claude:</b> as in the phone app, Open in Claude is the main action when the agent has a claude.ai session. It opens a Claude window docked beside sm; claude.ai cannot be embedded in the page. Otherwise the main action is Terminal, which is now its own page with a slim top bar rather than a side-panel tab.</p>
 <p><b>New:</b> the build spec (appendix D) and the ticket plan (appendix E).</p>
 <p><b>Device sign-in (scenario 9, decision 7):</b> the laptop and the Studio sign in with device certificates, as the phone does.</p>
-<p><b>Hung jobs (new scenario 4):</b> a running job with no CPU, no GPU and no new log output for 20 minutes is “quiet” and turns red on the Queue page and the Board. #1848's purchase job shows why the log counts: it barely uses the CPU but is healthy.</p>
+<p><b>Hung jobs (new scenario 4):</b> a running job with no CPU, no GPU and no new log output for 10 minutes is “quiet” and turns red on the Queue page and the Board. #1848's purchase job shows why the log counts: it barely uses the CPU but is healthy.</p>
 <p><b>Panels:</b> the left menu folds to icons, and the side panel can be hidden, resized or widened. Each browser remembers its own layout (scenario 6).</p>
 <p><b>Full-screen docs:</b> ⤢ opens a doc like today's doc page, with a slim sm bar of back, title, chips and Review (scenario 7).</p>
 <p><b>Memory figures (#1714):</b> memory is Activity Monitor's “Memory Used” (135 of 256 GB now, not “212 GB free”), and each live bar shades the queue's share.</p>
@@ -903,7 +903,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
   </ul></li>
 <li><b>Insight card.</b> Shown when the 24-hour stats' <code>limits</code> group has at least 3600 job-seconds held and a headroom share (<code>headroom_job_seconds ÷ job_seconds</code>) of at least 25%. Its text is the memo's. The button opens Settings › Queue limits.</li>
 <li><b>Timeline.</b> Running rows, then waiting rows in <code>position</code> order, over the last 3 hours. Amber is waiting and hatched green is running. The right column shows “elapsed of limit” or “waited”, plus “gives up in” when <code>wait_deadline_at</code> is under 6 hours away. The waiting group's caption is the shared <code>holding.summary</code> and the lane.</li>
-<li><b>Quiet jobs.</b> A running job is quiet when it has run for at least <code>queue_runner.quiet_minutes</code> (default 20) and, over the last <code>quiet_minutes</code>, all three hold: its process group's CPU time grew by less than 1% of one core (0.01 × elapsed seconds), its GPU time did not grow, and its log file did not grow. The log rule keeps network-bound jobs out: #1848's purchase job uses 0.8 s of CPU per hour but writes a line per market. It uses the per-job CPU and GPU time that #1714 records each sample. <code>GET /client/queue</code> gains, per running job, <code>cpu_seconds</code>, <code>gpu_seconds</code>, <code>log_updated_at</code> and <code>quiet_since</code> (null unless quiet). A job that is not quiet but has used under 1% of one core over the window gets the grey note “low CPU” and no colour change. Quiet rows are red in the timeline from <code>quiet_since</code>. The job panel shows the job's CPU and GPU over its run (<code>GET /client/queue/jobs/{id}/usage</code>, 5 s samples, new). Ask agent adds “Is this job stuck?” to its suggestions. The server sends no alert; it only marks the job.</li>
+<li><b>Quiet jobs.</b> The server decides whether a running job is quiet and computes <code>quiet_since</code>; the rule, its fields on <code>GET /client/queue</code> (<code>cpu_seconds</code>, <code>gpu_seconds</code>, <code>footprint_bytes</code>, <code>log_updated_at</code>, <code>quiet_since</code>, <code>quiet_alerted_at</code>) and the alert to the job's agent are specified in <code>docs/working/1716_quiet_job_alert.html</code>, appendices A to C. In short: every 5-second step for <code>queue_runner.quiet_minutes</code> (default 10) shows under 1% of one core of CPU growth (a drop, from an exited process, counts as 0), no GPU growth and no log growth. A job that is not quiet but whose CPU growth, summed step by step the same way, is under 1% of one core over the last <code>quiet_minutes</code> gets the grey note “low CPU” and no colour change. Quiet rows are red in the timeline from <code>quiet_since</code>. The job panel shows the job's CPU and GPU over its run (<code>GET /client/queue/jobs/{id}/usage</code>, 5 s samples, new). Ask agent adds “Is this job stuck?” to its suggestions.</li>
 <li><b>Stopped link.</b> “n stopped in the last 24h ›” links to Analytics › Queue when n &gt; 0.</li>
 <li><b>Job panel.</b> Command, folder, times, limits, why it waits, what happened, and the last 40 log lines.
   <ul>
@@ -1068,7 +1068,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <tr><td>#1720</td><td>Web shell: tokens, themes, rail, top bar, palette, panel, Agents page, agent panel, New agent popover</td><td>D1, D2, D6.1, D6.2, D6.5 (New agent)</td><td>#1717</td><td>Mid</td></tr>
 <tr><td>#1721</td><td>Browser terminal: ticket, WebSocket login, terminal page</td><td>D6.3, D8</td><td>#1720</td><td>Mid</td></tr>
 <tr><td>#1722</td><td>Board page and Start popover</td><td>D6.4, D6.5</td><td>#1718, #1719, #1720</td><td>Mid</td></tr>
-<tr><td>#1723</td><td>Queue page, Mac chart (with queue share series), quiet-job detection and job usage route, job panel, Analytics</td><td>D6.6, D6.8 (Analytics)</td><td>#1720, #1714</td><td>Mid</td></tr>
+<tr><td>#1723</td><td>Queue page, Mac chart (with queue share series), quiet-job rendering and job usage route, job panel, Analytics</td><td>D6.6, D6.8 (Analytics)</td><td>#1720, #1714, #1716</td><td>Mid</td></tr>
 <tr><td>#1724</td><td>Inbox two-pane, reader frame, back bar, History, Guestbook</td><td>D6.7, D6.8</td><td>#1720</td><td>Mid</td></tr>
 <tr><td>#1725</td><td>Settings page</td><td>D6.9</td><td>#1718, #1720</td><td>Mid</td></tr>
 <tr><td>#1726</td><td>Device certificates for computers: browser device rule, common-name identity, <code>sm device enroll</code>, device list in Settings</td><td>D8b</td><td>#1717</td><td>Mid</td></tr>
@@ -1090,7 +1090,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <tr><td>Inbox two-pane, reader breadcrumb, full-screen reading with sm bar</td><td>D6.7</td><td>Back-bar injection test on the browser hostname only</td></tr>
 <tr><td>Settings shared with the phone</td><td>D4, D6.9</td><td>Settings API tests; the phone's start-options reflects settings</td></tr>
 <tr><td>Laptop and Studio sign in by device certificate</td><td>D8b</td><td>D8b guard tests; live check on both computers</td></tr>
-<tr><td>Quiet jobs turn red</td><td>D6.6, D7 rule 3a</td><td>Quiet detection unit tests: low CPU with a growing log is not quiet; no CPU, GPU or log growth is quiet</td></tr>
+<tr><td>Quiet jobs turn red</td><td>D6.6, D7 rule 3a</td><td>Quiet detection tests live in #1716 (1716 memo, appendix F). #1723: a job with <code>quiet_since</code> set renders red from that time</td></tr>
 <tr><td>Memory and queue share per #1714</td><td>D6.6</td><td>Live screenshot with #1714 fields present and absent</td></tr>
 <tr><td>Phone unaffected</td><td>D1, D3</td><td>Routing test for the app hostname; existing phone guard tests</td></tr>
 </tbody>
