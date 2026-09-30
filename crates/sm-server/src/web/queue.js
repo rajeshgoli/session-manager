@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
-import { html, api, bus, closePanel, usePoll, useNow, useShared, setShared, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes } from './ui.js';
+import { html, api, bus, closePanel, usePoll, useNow, useShared, setShared, registerPanel, openPanel, navigate, Seg, duration, age, clock, gigabytes, meterBand } from './ui.js';
 import { timelineSegments, limitsInsight, waitingGroups, chartPath, jobAgentId, jobAgentLabel, askJobQuestion } from './queue-model.js';
 
 const ranges = [{ value: 1, label: '1h' }, { value: 24, label: '24h' }, { value: 168, label: '7d' }, { value: 720, label: '30d' }];
@@ -35,11 +35,16 @@ export function QueuePage() {
 export function MacNow({ host }) {
   if (!host || host.available === false) return html`<div class="q-card q-mac">Mac now · unavailable</div>`;
   const metrics = [
-    ['MEM', host.memory_used_bytes, host.queue_memory_bytes, host.memory_total_bytes, `${gb(host.memory_used_bytes)}/${gb(host.memory_total_bytes)}`, gb],
-    ['CPU', host.cpu_percent, host.queue_cpu_percent, 100, pct(host.cpu_percent), pct],
-    ['GPU', host.gpu_percent, host.queue_gpu_percent, 100, pct(host.gpu_percent), pct],
+    ['MEM', host.memory_used_bytes, host.queue_memory_bytes, host.memory_total_bytes, `${gigabytes(host.memory_used_bytes)}/${gigabytes(host.memory_total_bytes)}G${typeof host.queue_memory_bytes === 'number' ? ` · queue ${gb(host.queue_memory_bytes)}` : ''}`],
+    ['CPU', host.cpu_percent, host.queue_cpu_percent, 100, `${Math.round(host.cpu_percent || 0)}%`],
+    ['GPU', host.gpu_percent, host.queue_gpu_percent, 100, `${Math.round(host.gpu_percent || 0)}%`],
   ];
-  return html`<div class="q-card q-mac"><span class="q-label">Mac now</span>${metrics.map(([label, total, queue, max, text, format]) => html`<div class="q-meter"><span>${label}</span><i><s style=${`width:${Math.min(100, (total || 0) / (max || 1) * 100)}%`}></s>${typeof queue === 'number' ? html`<s class="q" style=${`width:${Math.min(100, queue / (max || 1) * 100)}%`}></s>` : null}</i><span>${text}${typeof queue === 'number' ? ` · queue ${format(queue)}` : ''}</span></div>`)}</div>`;
+  return html`<div class="q-card q-mac"><span class="q-label">Mac now</span>${metrics.map(([label, total, queue, max, text]) => {
+    const totalWidth = Math.max(0, Math.min(100, (total || 0) / (max || 1) * 100));
+    const shareWidth = Math.max(0, Math.min(totalWidth, (queue || 0) / (max || 1) * 100));
+    const color = meterBand(totalWidth / 100, label.toLowerCase());
+    return html`<div class="q-meter" style=${`--meter-color:var(--${color})`}><span>${label}</span><i><s style=${`width:${totalWidth}%;opacity:${typeof queue === 'number' ? '.4' : '1'}`}></s>${typeof queue === 'number' ? html`<s class="q" style=${`width:${shareWidth}%`}></s>` : null}</i><span>${text}</span></div>`;
+  })}</div>`;
 }
 
 export function MacChart() {
@@ -86,7 +91,7 @@ export function HeldBack({ stats, insightOnly = false }) {
 
 function JobRow({ job, now }) {
   const deadline = Date.parse(job.wait_deadline_at) - now;
-  return html`<button class="q-job" type="button" onClick=${() => openPanel(`job:${job.id}`)}>
+  return html`<button class="q-job" type="button" data-open-ref=${`job:${job.id}`} onClick=${() => openPanel(`job:${job.id}`)}>
     <span class="q-job-title">${job.position ? `${job.position}. ` : ''}${title(job)}<small>${job.type} · ${jobAgentLabel(job)}</small></span>
     <span class="q-timeline">${timelineSegments(job, now).map((s) => html`<i class=${s.kind} style=${`left:${s.left}%;width:${s.width}%`}></i>`)}</span>
     <span class=${job.quiet_since ? 'red' : ''}>${job.state === 'running' ? `${age(job.started_at, now)}${job.timeout_seconds ? ` of ${duration(job.timeout_seconds)}` : " · no time limit"}` : `${age(job.queued_at, now)} waited`}

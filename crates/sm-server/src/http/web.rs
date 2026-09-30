@@ -157,6 +157,7 @@ fn shell_response(state: &AppState) -> Response {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>sm</title>
 <script>try{{var t=localStorage.getItem("sm-theme");if(t==="light"||t==="dark")document.documentElement.dataset.theme=t}}catch(e){{}}</script>
+<script>try{{var s=Number(localStorage.getItem("sm-text-size"));document.documentElement.style.fontSize=(Number.isInteger(s)&&s>=13&&s<=19?s:15)+"px"}}catch(e){{document.documentElement.style.fontSize="15px"}}</script>
 <link rel="stylesheet" href="/assets/vendor/xterm.css?v={id}">
 <link rel="stylesheet" href="/assets/app.css?v={id}">
 <link rel="stylesheet" href="/assets/queue.css?v={id}">

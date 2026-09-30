@@ -19,7 +19,7 @@ export function TerminalPage({ id, open }) {
 
   useEffect(() => {
     const terminal = new window.Terminal({
-      fontFamily: '"SF Mono", Menlo, monospace', fontSize: 13, cursorBlink: true,
+      fontFamily: '"SF Mono", Menlo, monospace', fontSize: parseFloat(getComputedStyle(document.documentElement).fontSize) - 1, cursorBlink: true,
       scrollback: 10000, theme: { background: '#0E0F14', foreground: '#D7DAE3' },
     });
     const fit = new window.FitAddon.FitAddon();

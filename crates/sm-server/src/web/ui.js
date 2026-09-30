@@ -246,6 +246,40 @@ export function gigabytes(bytes) {
   return Math.round((bytes || 0) / 2 ** 30);
 }
 
+/** Usage heat shared by the shell and the Queue tile. */
+export function meterBand(fraction, kind) {
+  const value = Number.isFinite(fraction) ? fraction : 0;
+  if (value > 0.85) return 'red';
+  if (value >= 0.60) return 'amber';
+  return kind === 'gpu' ? 'cyan' : 'green';
+}
+
+export function Toggle({ checked, onChange, label, disabled = false }) {
+  return html`<button type="button" class="toggle" role="switch" aria-label=${label}
+    aria-checked=${!!checked} disabled=${disabled}
+    onClick=${() => onChange(!checked)}>${label ? html`<span class="sr-only">${label}</span>` : null}</button>`;
+}
+
+/** Shared related-item chips. Empty kinds do not occupy space. */
+export function Links({ ticket, prs = [], agent, jobs = [], thread, docs = [] }) {
+  const ticketRef = item => `ticket:${item.repo || ticket?.repo}#${item.number}`;
+  const pending = review => !!review?.waiting_since;
+  const reviewText = review => review ? ` · ${review.by === 'you' ? 'your review' : 'Codex review'}, round ${review.round}${review.verdict ? ` · ${review.verdict.replace('_', ' ')}` : ''}${pending(review) ? ` · waiting ${age(review.waiting_since)}` : ''}` : '';
+  const visibleJobs = jobs.filter(job => ['running', 'pending', 'waiting', 'queued'].includes(job.state));
+  if (!ticket && !prs.length && !agent && !visibleJobs.length && !thread && !docs.length) return null;
+  return html`<div class="links">
+    ${ticket ? html`<button class="link-chip" onClick=${() => openPanel(ticketRef(ticket))}>#${ticket.number} ↗</button>` : null}
+    ${prs.map(pr => html`<button class=${`link-chip ${pending(pr.review) ? pr.review.by === 'you' ? 'magenta' : 'amber' : ''}`}
+      onClick=${() => openPanel(ticketRef(pr))}>PR #${pr.number} · ${pr.state || 'open'}${reviewText(pr.review)}</button>`)}
+    ${agent ? html`<span class="link-pair"><button class="link-chip" onClick=${() => openPanel(`agent:${agent.id}`)}>${agent.name} · ${providerLabel(agent.provider)} · ${agent.fact || agent.state || ''}</button><button class="link-chip" aria-label=${`Terminal for ${agent.name}`} onClick=${() => navigate(`/terminal/${encodeURIComponent(agent.id)}`)}>⌨</button></span>` : null}
+    ${visibleJobs.slice(0, 3).map(job => html`<button class=${`link-chip ${job.quiet_since ? 'red' : job.state === 'running' ? 'green' : 'amber'}`}
+      onClick=${() => { navigate('/queue'); openPanel(`job:${job.id}`); }}>${job.label || job.id} · ${job.quiet_since ? 'quiet' : job.state === 'running' ? 'running' : 'waiting'} ${age(job.quiet_since || job.since || job.started_at || job.queued_at)}</button>`)}
+    ${visibleJobs.length > 3 ? html`<span class="link-chip">+${visibleJobs.length - 3} jobs</span>` : null}
+    ${thread ? html`<button class=${`link-chip ${thread.needs_you ? 'magenta' : ''}`} onClick=${() => { location.href = `/inbox?open=thread:${encodeURIComponent(thread.key)}${thread.at ? `&at=${encodeURIComponent(thread.at)}` : ''}`; }}>Inbox · ${thread.needs_you ? 'question' : thread.count}</button>` : null}
+    ${docs.map(doc => html`<button class="link-chip" onClick=${() => openPanel(`doc:${doc.reader_path}`)}>${doc.title}</button>`)}
+  </div>`;
+}
+
 export function providerLabel(provider) {
   return provider && provider.startsWith('codex') ? 'Codex' : 'Claude';
 }
