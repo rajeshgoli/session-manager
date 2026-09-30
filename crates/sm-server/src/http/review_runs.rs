@@ -756,3 +756,76 @@ pub(super) fn start_sweeper(state: Arc<AppState>) {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weekly_meter_advances_the_persisted_request_to_the_other_provider() {
+        let dir = std::env::temp_dir().join(format!(
+            "sm-review-meter-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::default();
+        config.paths.state_file = dir.join("sessions.json").to_string_lossy().into_owned();
+        config.sm_send.db_path = dir.join("messages.db").to_string_lossy().into_owned();
+        config.usage.db_path = dir.join("usage.db").to_string_lossy().into_owned();
+        config.rust_core.fixture_writes_enabled = true;
+        let mut state = AppState::new(config);
+        // Enable only the run-step code under test after constructing isolated
+        // stores. The selected provider must be skipped before any process starts.
+        state.config.rust_core.runtime_enabled = true;
+        let db = expand_home(&state.config.sm_send.db_path);
+        let usage = expand_home(&state.config.usage.db_path);
+        let _burn = crate::usage_burn::UsageBurnStore::new(&usage).unwrap();
+        let c = rusqlite::Connection::open(&usage).unwrap();
+        c.execute_batch("INSERT INTO accounts(account_key,provider,external_id,first_seen,last_seen) VALUES('codex:meter-test','codex','meter-test','2026-09-30T12:00:00Z','2026-09-30T12:00:00Z');
+            INSERT INTO burn_samples(account_key,window_kind,window_start,percent,resets_at,source,observed_at) VALUES('codex:meter-test','codex_10080','2026-09-28T00:00:00Z',96,'2026-10-05T00:00:00Z','test','2026-09-30T12:00:00Z');").unwrap();
+        let r = RetainedQueueStore::create_codex_review_request_in_path(
+            &db,
+            CreateCodexReviewRequest {
+                repo: "example/missing-review-fixture".into(),
+                pr_number: 7,
+                requester_session_id: Some("author".into()),
+                notify_session_id: "author".into(),
+                steer: None,
+                requested_head_sha: "1111111111111111111111111111111111111111".into(),
+                latest_request_comment_id: None,
+                latest_request_comment_url: None,
+                latest_request_posted_at: now_rfc3339(),
+                poll_interval_seconds: 30,
+                retry_interval_seconds: 120,
+            },
+        )
+        .unwrap();
+        let step = json!({"kind":"codex","model":"gpt-6-sol","effort":"medium"});
+        RetainedQueueStore::initialize_review_chain(&db, &r.id, &review::chain(&step)).unwrap();
+        let r = RetainedQueueStore::get_codex_review_request_from_path(&db, &r.id)
+            .unwrap()
+            .unwrap();
+        assert!(poll_run_blocking(&state, &db, &r, &step).unwrap());
+        let advanced = RetainedQueueStore::get_codex_review_request_from_path(&db, &r.id)
+            .unwrap()
+            .unwrap();
+        assert!(advanced.is_active);
+        assert_eq!(advanced.step_index, 1);
+        assert_eq!(
+            advanced.reviewer_label.as_deref(),
+            Some("Claude run (opus, high)")
+        );
+        assert_eq!(
+            advanced.last_error.as_deref(),
+            Some("Codex weekly meter at 96%")
+        );
+        assert!(advanced.run_job_id.is_none());
+        drop(c);
+        drop(state);
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
