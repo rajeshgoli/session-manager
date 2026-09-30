@@ -1216,7 +1216,8 @@ pub fn series_at(db_path: &Path, hours: i64, now_ms: i64) -> Result<Value> {
                       MAX(pressure_level),
                       AVG(running_tests), AVG(running_perf), AVG(running_background),
                       AVG(running_service),
-                      MAX(pending_tests + pending_perf + pending_background + pending_service)
+                      MAX(pending_tests + pending_perf + pending_background + pending_service),
+                      AVG(queue_mem_bytes), AVG(queue_cpu_pct), AVG(queue_gpu_pct)
                FROM host_samples
                WHERE sampled_at_ms >= ?1 AND sampled_at_ms < ?2
                GROUP BY bucket"#,
@@ -1242,12 +1243,15 @@ pub fn series_at(db_path: &Path, hours: i64, now_ms: i64) -> Result<Value> {
             put_f("cpu_max", row.get(3)?);
             put_f("gpu_avg", row.get(4)?);
             put_f("gpu_max", row.get(5)?);
+            put_f("queue_cpu_avg", row.get(16)?);
+            put_f("queue_gpu_avg", row.get(17)?);
             let mut put_i = |key: &str, value: Option<f64>| {
                 if let Some(value) = value {
                     object.insert(key.into(), json!(value.round() as i64));
                 }
             };
             put_i("mem_used_avg", row.get(6)?);
+            put_i("queue_memory_avg", row.get(15)?);
             put_i(
                 "mem_used_max",
                 row.get::<_, Option<i64>>(7)?.map(|v| v as f64),
@@ -1331,9 +1335,155 @@ pub fn series_at(db_path: &Path, hours: i64, now_ms: i64) -> Result<Value> {
     }))
 }
 
+/// At most eight hours of five-second samples per chart page. The extra
+/// boundary sample supplies the first delta and indicates an earlier page.
+const JOB_SERIES_PAGE_SIZE: usize = 5760;
+
+pub fn job_series(db_path: &Path, job_id: &str, before_ms: Option<i64>) -> Result<Value> {
+    let Some(conn) = open_for_read(db_path)? else {
+        return Ok(json!({"available": false}));
+    };
+    let mut statement = conn.prepare(
+        "SELECT sampled_at_ms, cpu_seconds_total, gpu_seconds_total, footprint_bytes
+         FROM job_samples WHERE job_id = ?1 AND state = 'running' AND sampled_at_ms < ?2
+         ORDER BY sampled_at_ms DESC LIMIT ?3",
+    )?;
+    let mut rows = statement
+        .query_map(
+            params![
+                job_id,
+                before_ms.unwrap_or(i64::MAX),
+                JOB_SERIES_PAGE_SIZE as i64 + 1
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<f64>>(1)?,
+                    row.get::<_, Option<f64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.reverse();
+    let skip = usize::from(rows.len() > JOB_SERIES_PAGE_SIZE);
+    let mut samples = Vec::with_capacity(rows.len() - skip);
+    for (index, &(at, cpu, gpu, memory)) in rows.iter().enumerate().skip(skip) {
+        let previous = index.checked_sub(1).map(|i| rows[i]);
+        let rate = |current: Option<f64>, old: Option<f64>, elapsed: i64| {
+            current
+                .zip(old)
+                .filter(|_| elapsed > 0 && elapsed <= 60_000)
+                .map(|(c, p)| (c - p).max(0.0) * 100_000.0 / elapsed as f64)
+        };
+        samples.push(json!({
+            "at": rfc3339_ms(at), "cpu_seconds": cpu, "gpu_seconds": gpu,
+            "memory_bytes": memory,
+            "cpu_percent": previous.and_then(|p| rate(cpu, p.1, at - p.0)),
+            "gpu_percent": previous.and_then(|p| rate(gpu, p.2, at - p.0)),
+        }));
+    }
+    Ok(json!({"available": !samples.is_empty(), "job_id": job_id,
+        "samples": samples, "next_before_ms": (skip > 0).then(|| rows[skip].0)}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_job_usage_pages_are_bounded_and_keep_boundary_deltas() {
+        let (_dir, path, conn) = temp_db();
+        conn.execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i < 6000)
+            INSERT INTO job_samples(sampled_at_ms, job_id, job_type, state, cpu_seconds_total)
+            SELECT 1700000000000 + i*5000, 'long-service', 'service', 'running', i FROM n;",
+        )
+        .unwrap();
+        let newest = job_series(&path, "long-service", None).unwrap();
+        assert_eq!(
+            newest["samples"].as_array().unwrap().len(),
+            JOB_SERIES_PAGE_SIZE
+        );
+        assert_eq!(newest["samples"][0]["cpu_percent"], 20.0);
+        let before = newest["next_before_ms"].as_i64().unwrap();
+        let earlier = job_series(&path, "long-service", Some(before)).unwrap();
+        assert_eq!(earlier["samples"].as_array().unwrap().len(), 241);
+        assert!(earlier["next_before_ms"].is_null());
+        assert_eq!(newest["samples"][0]["at"], rfc3339_ms(before));
+        assert_eq!(earlier["samples"][240]["at"], rfc3339_ms(before - 5000));
+        assert!(!earlier["samples"][240]["cpu_percent"].is_null());
+    }
+
+    #[test]
+    fn web_queue_series_preserves_optional_queue_shares() {
+        let (_dir, path, mut conn) = temp_db();
+        let base = 1_700_000_000_000;
+        let mut sample = host(base, Some(50.0), 128 * GIB, 1);
+        write_sample(&mut conn, &sample, &[]).unwrap();
+        let report = series_at(&path, 1, base).unwrap();
+        let bucket = report["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["samples"] == 1)
+            .unwrap();
+        assert!(bucket.get("queue_memory_avg").is_none());
+        sample.queue_mem_bytes = Some(20 * GIB);
+        sample.queue_cpu_pct = Some(12.5);
+        sample.queue_gpu_pct = Some(3.0);
+        write_sample(&mut conn, &sample, &[]).unwrap();
+        let report = series_at(&path, 1, base).unwrap();
+        let bucket = report["buckets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["samples"] == 1)
+            .unwrap();
+        assert_eq!(bucket["queue_memory_avg"], 20 * GIB);
+        assert_eq!(bucket["queue_cpu_avg"], 12.5);
+        assert_eq!(bucket["queue_gpu_avg"], 3.0);
+    }
+
+    #[test]
+    fn web_job_usage_uses_step_growth_and_preserves_missing_data() {
+        let (_dir, path, mut conn) = temp_db();
+        let base = 1_700_000_000_000;
+        for i in 0..=120 {
+            let sample = host(base + i * 5000, Some(10.0), 128 * GIB, 1);
+            let job = JobSample {
+                job_id: "job-a".into(),
+                job_type: "tests".into(),
+                state: "running".into(),
+                cpu_seconds_total: Some(if i < 60 { 10.0 } else { 0.0 }),
+                gpu_seconds_total: Some(i as f64),
+                ..JobSample::default()
+            };
+            write_sample(&mut conn, &sample, &[job]).unwrap();
+        }
+        let usage = job_series(&path, "job-a", None).unwrap();
+        assert_eq!(usage["samples"].as_array().unwrap().len(), 121);
+        assert_eq!(usage["samples"][60]["cpu_percent"], 0.0);
+        assert_eq!(usage["samples"][60]["gpu_percent"], 20.0);
+
+        assert_eq!(
+            job_series(&path, "job-b", None).unwrap()["available"],
+            false
+        );
+        conn.execute(
+            "DELETE FROM job_samples WHERE sampled_at_ms > ?1 AND sampled_at_ms < ?2",
+            params![base + 200_000, base + 300_000],
+        )
+        .unwrap();
+        let usage = job_series(&path, "job-a", None).unwrap();
+        let after_gap = usage["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|sample| sample["at"] == rfc3339_ms(base + 300_000))
+            .unwrap();
+        assert!(after_gap["cpu_percent"].is_null());
+    }
 
     const GIB: i64 = 1024 * 1024 * 1024;
 

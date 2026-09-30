@@ -10,6 +10,8 @@ import {
 } from './ui.js';
 import { BoardPage } from './board.js';
 import { AgentsPage } from './agents.js';
+import { QueuePage } from './queue.js';
+import { AnalyticsPage } from './analytics.js';
 import { SettingsPage } from './settings.js';
 import { TerminalPage } from './terminal.js';
 import { NewAgentPopover } from './start.js';
@@ -145,6 +147,8 @@ function App() {
 
 function Page({ page, loc }) {
   if (page === 'agents') return html`<${AgentsPage} openRef=${loc.open} />`;
+  if (page === 'queue') return html`<${QueuePage} />`;
+  if (page === 'analytics') return html`<${AnalyticsPage} path=${loc.path} />`;
   if (page === 'settings') return html`<${SettingsPage} />`;
   if (page === 'board') return html`<${BoardPage} />`;
   const current = PAGES.find((p) => p.key === page);

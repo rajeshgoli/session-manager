@@ -11,6 +11,7 @@ pub struct Status {
     pub rss_bytes: Option<i64>,
     pub log_updated_at: Option<String>,
     pub quiet_since: Option<String>,
+    pub low_cpu: bool,
 }
 
 static STATUS: RwLock<Option<(PathBuf, HashMap<String, Status>)>> = RwLock::new(None);
@@ -73,10 +74,37 @@ struct Clock {
     last_active: i64,
     log_updated: Option<i64>,
     became_quiet: Option<i64>,
+    cpu_window: std::collections::VecDeque<(i64, Option<f64>)>,
+    low_cpu: bool,
 }
 
 impl Clock {
     fn observe(&mut self, sample: Sample, window_ms: i64) {
+        self.low_cpu = false;
+        if window_ms == 0 {
+            self.cpu_window.clear();
+        } else {
+            self.cpu_window.push_back((sample.at, sample.cpu));
+            let cutoff = sample.at.saturating_sub(window_ms);
+            // Keep one boundary reading so the whole window has measured deltas.
+            while self.cpu_window.len() > 2 && self.cpu_window[1].0 <= cutoff {
+                self.cpu_window.pop_front();
+            }
+            if self.cpu_window.front().is_some_and(|p| p.0 <= cutoff) {
+                let mut growth = 0.0;
+                let mut covered = true;
+                for (p, c) in self.cpu_window.iter().zip(self.cpu_window.iter().skip(1)) {
+                    match p.1.zip(c.1) {
+                        Some((old, new)) if c.0 > p.0 && c.0 - p.0 <= 60_000 => {
+                            growth += (new - old).max(0.0);
+                        }
+                        _ => covered = false,
+                    }
+                }
+                let elapsed = sample.at - self.cpu_window[0].0;
+                self.low_cpu = covered && elapsed > 0 && growth * 100_000.0 < elapsed as f64;
+            }
+        }
         if let Some(previous) = &self.previous {
             if log_changed(previous, &sample) {
                 self.log_updated = Some(sample.at);
@@ -105,6 +133,7 @@ impl Clock {
             rss_bytes: p.rss,
             log_updated_at: self.log_updated.map(timestamp),
             quiet_since: self.became_quiet.map(|_| timestamp(self.last_active)),
+            low_cpu: self.low_cpu,
         }
     }
 }
@@ -188,6 +217,34 @@ impl Detector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn low_cpu_is_window_growth_and_zero_disables_it() {
+        let mut clock = Clock::default();
+        for i in 0..=120 {
+            let mut reading = sample(i * 5000);
+            // One short burst, then an exited process drops the counter.
+            reading.cpu = Some(if (30..90).contains(&i) { 0.1 } else { 0.0 });
+            clock.observe(reading, 600_000);
+        }
+        assert!(clock.status().low_cpu);
+        assert!(clock.cpu_window.len() <= 121);
+        clock.observe(sample(605_000), 0);
+        assert!(!clock.status().low_cpu);
+        assert!(clock.cpu_window.is_empty());
+    }
+
+    #[test]
+    fn low_cpu_requires_known_contiguous_readings() {
+        let mut clock = Clock::default();
+        clock.observe(sample(0), 60_000);
+        clock.observe(sample(70_000), 60_000);
+        assert!(!clock.status().low_cpu);
+        let mut missing = sample(75_000);
+        missing.cpu = None;
+        clock.observe(missing, 60_000);
+        assert!(!clock.status().low_cpu);
+    }
+
     static STATUS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn sample(at: i64) -> Sample {

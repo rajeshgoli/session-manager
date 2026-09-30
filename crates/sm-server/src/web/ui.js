@@ -134,11 +134,11 @@ export function usePoll(load, ms, deps = []) {
         try {
           const value = await saved.current();
           if (alive) setState({ value, error: null });
-          network.report(poll, true);
+          if (alive) network.report(poll, true);
         } catch (error) {
           if (alive) setState((prev) => ({ value: prev.value, error }));
           // A 4xx answer means the server is reachable.
-          network.report(poll, error instanceof ApiError && error.status < 500);
+          if (alive) network.report(poll, error instanceof ApiError && error.status < 500);
         } finally {
           running = false;
         }
