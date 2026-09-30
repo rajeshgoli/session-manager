@@ -109,8 +109,12 @@ data class NoticeMessage(
     val blocking: Boolean,
     val unreadCount: Int,
 ) {
-    /** One notification per agent: a newer message replaces the last. */
-    val notificationId: Int get() = ("agent:$sessionId").hashCode()
+    /**
+     * One notification per agent: a newer message replaces the last. Approval
+     * alerts get their own slot, so withdrawing one never clears an unread message.
+     */
+    val notificationId: Int get() =
+        (if (kind == NoticePush.KIND_APPROVAL_NEEDED) "approval:$sessionId" else "agent:$sessionId").hashCode()
 
     /** The body, with how many more unread messages the agent has sent. */
     val displayBody: String get() = if (unreadCount > 1) "$body (+${unreadCount - 1} more)" else body
