@@ -142,11 +142,9 @@ use crate::sessions::{
 };
 use crate::work_attribution::git_origin_github_repo;
 
+use crate::activity_ledger::list_recent_tool_calls_from_path;
 use crate::studio_ssh::{self, StudioSshStatus};
-use crate::tool_usage::{
-    list_recent_codex_fork_tool_calls_from_path, list_recent_tool_calls_from_path,
-    log_tool_usage_to_path, ToolCallRow, ToolUsageEvent,
-};
+use crate::tool_usage::{log_tool_usage_to_path, ToolCallRow, ToolUsageEvent};
 use crate::usage_burn::UsageBurnStore;
 use crate::usage_identity::UsageIdentityStore;
 use crate::usage_ledger::{ScanSummary, UsageLedgerStore, UsageModelDefaults};
@@ -10691,16 +10689,22 @@ async fn session_tool_calls(
             detail: "limit must be between 1 and 100".to_owned(),
         });
     };
-    if session.provider == "codex-fork" {
+    let tool_calls = if state.config.usage.enabled {
+        let db_path = expand_home(&state.config.activity.db_path);
+        list_recent_tool_calls_from_path(&db_path, &session.id, limit)?
+    } else if session.provider == "codex-fork" {
+        // Usage scanning also owns the activity recorder. Preserve the event-backed
+        // view on deployments where that recorder is intentionally disabled.
         let db_path = expand_home(&state.config.codex_observability.db_path);
-        let tool_calls = list_recent_codex_fork_tool_calls_from_path(&db_path, &session.id, limit)?;
-        return Ok(Json(ToolCallsResponse {
-            session_id: session.id,
-            tool_calls,
-        }));
-    }
-    let db_path = expand_home(&state.config.tool_logging.db_path);
-    let tool_calls = list_recent_tool_calls_from_path(&db_path, &session.id, limit)?;
+        crate::tool_usage::list_recent_codex_fork_tool_calls_from_path(
+            &db_path,
+            &session.id,
+            limit,
+        )?
+    } else {
+        let db_path = expand_home(&state.config.tool_logging.db_path);
+        crate::tool_usage::list_recent_tool_calls_from_path(&db_path, &session.id, limit)?
+    };
     Ok(Json(ToolCallsResponse {
         session_id: session.id,
         tool_calls,
@@ -15957,6 +15961,11 @@ fn queue_job_response_with_names(
     requester_name: Option<String>,
     notify_name: Option<String>,
 ) -> Result<Value, ApiError> {
+    let quiet = crate::utilization::quiet::status(
+        &expand_home(&state.config.queue_runner_state_dir().to_string_lossy())
+            .join("queue_runner.db"),
+        &job,
+    );
     let termination_reason =
         crate::queue::queue_job_termination_reason(&job.state, job.termination_detail.as_ref());
     let lane = queue_job_lane(state, &job)?;
@@ -15977,7 +15986,7 @@ fn queue_job_response_with_names(
     } else {
         "pending"
     };
-    Ok(json!({
+    let mut response = json!({
         "id": job.id,
         "type": job.job_type,
         "label": job.label,
@@ -15997,6 +16006,7 @@ fn queue_job_response_with_names(
         "holding": crate::queue::queue_hold_explanation(&job, active, queue_admission_policy(state)),
         "holding_reason": job.holding_reason,
         "owner_forced_at": job.owner_forced_at,
+        "quiet_alerted_at": job.quiet_alerted_at,
         "lane_rank": lane.as_ref().map(|lane| lane.rank),
         "lane_goal": lane.as_ref().map(|lane| json!({
             "repo": lane.goal.0,
@@ -16021,7 +16031,17 @@ fn queue_job_response_with_names(
         "peak_process_count": job.peak_process_count,
         "readable_log_path": job.log_path.as_deref().and_then(|p| std::path::Path::new(p).parent()).map(|p| p.join(crate::queue::queue_log_filename(&job.label, &job.id)).display().to_string()).filter(|p| std::path::Path::new(p).exists()),
         "log_path": job.log_path,
-    }))
+    });
+    response
+        .as_object_mut()
+        .expect("job response is an object")
+        .extend(
+            serde_json::to_value(quiet)?
+                .as_object()
+                .expect("quiet status is an object")
+                .clone(),
+        );
+    Ok(response)
 }
 
 fn session_display_name(session: SessionRecord) -> String {
@@ -16226,6 +16246,7 @@ mod tests {
             is_active: true,
         };
         let job = QueueJobRecord {
+            quiet_alerted_at: None,
             id: "j1".into(),
             job_type: "tests".into(),
             label: "unit tests".into(),
@@ -22062,7 +22083,22 @@ mod tests {
             .unwrap();
         let (status, body) = response_json(response).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["models"], json!(["fable", "sonnet", "opus", "haiku"]));
+        assert_eq!(
+            body["models"],
+            json!(["fable", "sonnet", "opus", "opus[1m]", "haiku"])
+        );
+        // The documented Board Start default must match the shared catalog
+        // exactly, or both clients silently preselect its first entry.
+        let example: Value =
+            serde_yaml::from_str(include_str!("../../../config.yaml.example")).unwrap();
+        let defaults = &example["board"]["start_defaults"];
+        assert_eq!(defaults["provider"], "claude");
+        assert_eq!(defaults["model"], "opus[1m]");
+        assert_eq!(defaults["reasoning_effort"], "high");
+        assert!(body["models"]
+            .as_array()
+            .unwrap()
+            .contains(&defaults["model"]));
         let response = app
             .oneshot(local_request(
                 Method::GET,

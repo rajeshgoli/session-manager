@@ -276,6 +276,7 @@ fn ticket_jobs(
                 .cloned()
                 .unwrap_or_default(),
         };
+        let quiet = crate::utilization::quiet::status(&path, record);
         let job = ClockJob {
             job_type: record.job_type.clone(),
             phase,
@@ -285,10 +286,8 @@ fn ticket_jobs(
             timeout_seconds: record.timeout_seconds,
             holding_reason: record.holding_reason.clone(),
             position: positions.get(&record.id).copied(),
-            // Quiet detection (D6.6) ships with the Queue page's server
-            // part; rule 3a applies once it fills these.
-            quiet_since: None,
-            cpu_seconds: None,
+            quiet_since: quiet.quiet_since.as_deref().and_then(parse_time),
+            cpu_seconds: quiet.cpu_seconds,
         };
         for key in tickets {
             jobs.entry(key).or_default().push(job.clone());

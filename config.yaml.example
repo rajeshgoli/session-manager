@@ -498,5 +498,5 @@ board:
   # model catalog returns (GET /client/session-models).
   start_defaults:
     provider: claude
-    model: claude-opus-5-5[1m]
+    model: opus[1m]
     reasoning_effort: high

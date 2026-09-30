@@ -17,6 +17,8 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+pub mod quiet;
+
 use crate::queue::{active_queue_jobs_for_sampling, ActiveQueueJob};
 
 /// Job types in admission order; the order every per-type output uses.
@@ -36,6 +38,9 @@ pub struct RecorderSettings {
     pub queue_db_path: PathBuf,
     pub interval: Duration,
     pub retention_days: i64,
+    pub quiet_minutes: u64,
+    pub quiet_alert_repeat_minutes: u64,
+    pub message_queue_db_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -82,6 +87,9 @@ pub struct JobSample {
     pub footprint_bytes: Option<i64>,
     /// GPU time of the group's live processes; drops when one exits.
     pub gpu_seconds_total: Option<f64>,
+    pub log_bytes: Option<i64>,
+    /// Cumulative bytes written by sm quiet notices, excluded from activity.
+    pub log_notice_bytes: i64,
 }
 
 /// A running job's live use of the machine, as percent of the whole host.
@@ -154,6 +162,12 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         ("host_samples", "queue_gpu_pct", "REAL"),
         ("job_samples", "footprint_bytes", "INTEGER"),
         ("job_samples", "gpu_seconds_total", "REAL"),
+        ("job_samples", "log_bytes", "INTEGER"),
+        (
+            "job_samples",
+            "log_notice_bytes",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
     ] {
         let exists: Option<i64> = conn
             .query_row(
@@ -256,8 +270,8 @@ pub fn write_sample(conn: &mut Connection, host: &HostSample, jobs: &[JobSample]
             INSERT OR REPLACE INTO job_samples (
                 sampled_at_ms, job_id, job_type, state, holding_reason,
                 rss_bytes, cpu_seconds_total, process_count,
-                footprint_bytes, gpu_seconds_total
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                footprint_bytes, gpu_seconds_total, log_bytes, log_notice_bytes
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             "#,
         )?;
         for job in jobs
@@ -275,6 +289,8 @@ pub fn write_sample(conn: &mut Connection, host: &HostSample, jobs: &[JobSample]
                 job.process_count,
                 job.footprint_bytes,
                 job.gpu_seconds_total,
+                job.log_bytes,
+                job.log_notice_bytes,
             ])?;
         }
     }
@@ -557,6 +573,12 @@ pub fn job_samples(jobs: &[ActiveQueueJob], groups: &HashMap<i64, GroupUsage>) -
                 process_count: usage.map(|usage| usage.processes),
                 footprint_bytes: usage.and_then(|usage| usage.footprint_bytes),
                 gpu_seconds_total: usage.map(|usage| usage.gpu_ns as f64 / 1e9),
+                log_bytes: job
+                    .log_path
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .and_then(|m| i64::try_from(m.len()).ok()),
+                log_notice_bytes: job.log_notice_bytes,
             }
         })
         .collect()
@@ -748,6 +770,7 @@ struct Recorder {
     previous_counters: Option<UsageCounters>,
     last_prune: Option<Instant>,
     last_write_warning: Option<Instant>,
+    quiet: quiet::Detector,
 }
 
 impl Recorder {
@@ -866,6 +889,7 @@ impl Recorder {
             self.conn = None;
             return Err(error);
         }
+        self.quiet.tick(conn, &self.settings, &jobs, now_ms)?;
         if self
             .last_prune
             .is_none_or(|at| at.elapsed() >= PRUNE_INTERVAL)
@@ -900,6 +924,7 @@ pub fn spawn_recorder(settings: RecorderSettings) {
             previous_counters: None,
             last_prune: None,
             last_write_warning: None,
+            quiet: quiet::Detector::default(),
         }));
         loop {
             ticker.tick().await;
@@ -1453,6 +1478,9 @@ mod tests {
     #[test]
     fn job_usage_turns_counters_into_whole_machine_shares() {
         let running = |id: &str, pgid: i64| ActiveQueueJob {
+            started_at: None,
+            log_path: None,
+            log_notice_bytes: 0,
             id: id.into(),
             job_type: "background".into(),
             state: "running".into(),
@@ -1561,6 +1589,9 @@ mod tests {
     fn job_samples_keep_hold_reasons_for_pending_and_usage_for_running() {
         let jobs = vec![
             ActiveQueueJob {
+                started_at: None,
+                log_path: None,
+                log_notice_bytes: 0,
                 id: "a".into(),
                 job_type: "tests".into(),
                 state: "running".into(),
@@ -1568,6 +1599,9 @@ mod tests {
                 process_group_id: Some(42),
             },
             ActiveQueueJob {
+                started_at: None,
+                log_path: None,
+                log_notice_bytes: 0,
                 id: "b".into(),
                 job_type: "background".into(),
                 state: "pending".into(),
@@ -1575,6 +1609,9 @@ mod tests {
                 process_group_id: Some(42),
             },
             ActiveQueueJob {
+                started_at: None,
+                log_path: None,
+                log_notice_bytes: 0,
                 id: "c".into(),
                 job_type: "tests".into(),
                 state: "running".into(),
@@ -1807,12 +1844,16 @@ mod tests {
                 queue_db_path: dir.0.join("absent_queue.db"),
                 interval: Duration::from_secs(5),
                 retention_days: 90,
+                quiet_minutes: 10,
+                quiet_alert_repeat_minutes: 120,
+                message_queue_db_path: dir.0.join("messages.db"),
             },
             conn: None,
             previous_ticks: None,
             previous_counters: None,
             last_prune: None,
             last_write_warning: None,
+            quiet: quiet::Detector::default(),
         };
         let samples = 120;
         let part = |name: &str, step: &mut dyn FnMut()| {
@@ -1879,12 +1920,16 @@ mod tests {
                 queue_db_path: std::env::var("SM_PROBE_QUEUE_DB").unwrap().into(),
                 interval: Duration::from_secs(5),
                 retention_days: 1,
+                quiet_minutes: 0,
+                quiet_alert_repeat_minutes: 120,
+                message_queue_db_path: dir.0.join("messages.db"),
             },
             conn: None,
             previous_ticks: None,
             previous_counters: None,
             last_prune: None,
             last_write_warning: None,
+            quiet: quiet::Detector::default(),
         };
         recorder.tick().unwrap();
         std::thread::sleep(Duration::from_secs(5));
