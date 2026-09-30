@@ -23,7 +23,7 @@ pub(super) fn run(args: DeviceArgs, api_url: Option<String>) -> Result<()> {
     if !mobile_devices::valid_computer_name(&name) {
         bail!("Device name must match [a-z0-9-]{{1,32}}");
     }
-    let url = api_url.unwrap_or_else(|| "https://sm.rajeshgo.li".into());
+    let url = resolve_api_url(api_url)?;
     let client = ApiClient::parse(&url)?.with_timeout(Duration::from_secs(90));
     let local = client.scheme == "http"
         && matches!(client.host.as_str(), "localhost" | "127.0.0.1" | "::1");
@@ -67,9 +67,10 @@ pub(super) fn run(args: DeviceArgs, api_url: Option<String>) -> Result<()> {
         let chain = response["certificate_chain_pem"]
             .as_str()
             .context("Server returned no certificate")?;
+        let browser_origin = enrollment_browser_origin(&client, &response)?;
         helper_call(&helper, "import", &name, Some(chain))?;
         let selection =
-            json!({ "pattern": "https://sm.rajeshgo.li", "filter": { "SUBJECT": { "CN": name } } })
+            json!({ "pattern": browser_origin, "filter": { "SUBJECT": { "CN": name } } })
                 .to_string();
         let status = ProcessCommand::new("/usr/bin/defaults")
             .args([
@@ -84,11 +85,40 @@ pub(super) fn run(args: DeviceArgs, api_url: Option<String>) -> Result<()> {
             bail!("Certificate installed, but Chrome preference could not be saved");
         }
         println!("Enrolled {name}. The private key stays in your login keychain.");
-        println!("Open https://sm.rajeshgo.li in Chrome. If Chrome asks for a certificate, choose {name}.");
+        println!(
+            "Open {browser_origin} in Chrome. If Chrome asks for a certificate, choose {name}."
+        );
         Ok(())
     })();
     let _ = fs::remove_dir_all(temp);
     result
+}
+
+// The local API address is not a browser sign-in origin. The server advertises
+// its configured browser hostname so enrollment on the Studio targets that host.
+// Remote enrollment targets the HTTPS origin explicitly selected by the client.
+fn enrollment_browser_origin(client: &ApiClient, response: &Value) -> Result<String> {
+    if client.scheme == "https" {
+        return Ok(format!("https://{}", client.authority));
+    }
+    let origin = response["browser_origin"]
+        .as_str()
+        .context("Local enrollment requires a configured Cloudflare browser hostname")?;
+    let uri: axum::http::Uri = origin
+        .parse()
+        .context("Invalid browser origin from server")?;
+    if uri.scheme_str() != Some("https")
+        || uri.host().is_none()
+        || uri
+            .authority()
+            .is_some_and(|value| value.as_str().contains('@'))
+        || uri
+            .path_and_query()
+            .is_some_and(|value| value.as_str() != "/")
+    {
+        bail!("Server browser origin must be an HTTPS origin");
+    }
+    Ok(origin.trim_end_matches('/').to_owned())
 }
 
 fn helper_call(helper: &Path, operation: &str, name: &str, input: Option<&str>) -> Result<String> {
@@ -148,4 +178,42 @@ fn owner_assertion(url: &str) -> Result<String> {
         bail!("Owner browser login returned an empty token");
     }
     Ok(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chrome_selection_uses_selected_remote_origin_without_api_path() {
+        let client = ApiClient::parse("https://staging.example.com:8443/api").unwrap();
+        assert_eq!(
+            enrollment_browser_origin(&client, &json!({})).unwrap(),
+            "https://staging.example.com:8443"
+        );
+    }
+
+    #[test]
+    fn local_enrollment_uses_server_browser_origin() {
+        let client = ApiClient::parse("http://127.0.0.1:8420").unwrap();
+        assert_eq!(
+            enrollment_browser_origin(
+                &client,
+                &json!({"browser_origin": "https://sm.example.com/"})
+            )
+            .unwrap(),
+            "https://sm.example.com"
+        );
+        for origin in [
+            "http://sm.example.com",
+            "https://sm.example.com/path",
+            "https://user@sm.example.com",
+            "https://sm.example.com/?all=true",
+        ] {
+            assert!(
+                enrollment_browser_origin(&client, &json!({"browser_origin": origin})).is_err()
+            );
+        }
+        assert!(enrollment_browser_origin(&client, &json!({})).is_err());
+    }
 }

@@ -256,6 +256,7 @@ struct MobileTerminalDeviceSummary {
 
 #[derive(Debug, Serialize)]
 struct MobileTerminalDeviceListResponse {
+    browser_sign_in: Option<Value>,
     devices: Vec<MobileTerminalDeviceSummary>,
     owner_view: bool,
     runtime_only_revocations: bool,
@@ -8110,7 +8111,18 @@ async fn enroll_browser_computer(
     })
     .await
     .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
-    Ok(Json(json!({ "certificate_chain_pem": chain })))
+    let browser_origin = state
+        .config
+        .cloudflare_access
+        .browser
+        .hostname
+        .as_deref()
+        .map(str::trim)
+        .filter(|hostname| !hostname.is_empty())
+        .map(|hostname| format!("https://{hostname}"));
+    Ok(Json(
+        json!({ "certificate_chain_pem": chain, "browser_origin": browser_origin }),
+    ))
 }
 
 async fn list_mobile_terminal_devices(
@@ -8123,6 +8135,22 @@ async fn list_mobile_terminal_devices(
         request_peer_addr(&request),
         request.method().as_str(),
     )?;
+    let browser_sign_in = if browser_actor.is_some() {
+        let assertion = header_text(request.headers(), "cf-access-jwt-assertion")
+            .expect("browser owner guard verified an assertion");
+        let context = classify_cloudflare_access_assertion_cached(
+            &state,
+            CloudflareAccessApplication::Browser,
+            &assertion,
+        )
+        .map_err(cloudflare_access_error)?;
+        Some(json!({
+            "method": if context.common_name.is_some() { "certificate" } else { "email" },
+            "device_name": context.common_name,
+        }))
+    } else {
+        None
+    };
     let access_context = if browser_actor.is_none() {
         let context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
         ensure_public_edge_assertion_for_request(&state, &request)?;
@@ -8205,6 +8233,7 @@ async fn list_mobile_terminal_devices(
     }
 
     Ok(Json(MobileTerminalDeviceListResponse {
+        browser_sign_in,
         devices,
         owner_view,
         runtime_only_revocations: true,
@@ -19204,7 +19233,12 @@ mod tests {
                 assert_eq!(status, StatusCode::FORBIDDEN, "{route}: {body}");
             }
         }
+        let (_, devices) = browser_host_get(&app, "/client/devices", Some(&computer)).await;
+        assert_eq!(devices["browser_sign_in"]["method"], "certificate");
+        assert_eq!(devices["browser_sign_in"]["device_name"], "macbook");
         let (_, devices) = browser_host_get(&app, "/client/devices", Some(&email)).await;
+        assert_eq!(devices["browser_sign_in"]["method"], "email");
+        assert!(devices["browser_sign_in"]["device_name"].is_null());
         let computer_row = devices["devices"]
             .as_array()
             .unwrap()
