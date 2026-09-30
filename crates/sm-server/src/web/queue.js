@@ -79,7 +79,7 @@ export function HeldBack({ stats, insightOnly = false }) {
   return html`<section class="q-card q-insight"><h2>${insightOnly ? 'The queue limits are holding jobs back.' : 'Held back?'}</h2>
     ${stats?.available ? (stats.waiting || []).filter((r) => r.job_seconds > 0 && (!insightOnly || r.group === 'limits')).map((row) => html`<p>${{ limits: 'Queue limits', perf_rules: 'Perf rules', memory: 'Memory', other: 'Other rules' }[row.group]} held jobs for ${(row.job_seconds / 3600).toFixed(1)} hours in total. The Mac had room to run ${Math.round(100 * row.headroom_job_seconds / row.job_seconds)}% of that.${row.unknown_job_seconds ? ` Headroom was unknown for ${duration(row.unknown_job_seconds)}.` : ''}</p>`) : html`<p class="muted">No utilization data recorded.</p>`}
     ${stats?.by_type?.filter((r) => r.peak_rss_p95_bytes != null).map((r) => html`<p class="sub">${r.type} jobs peak at ${gb(r.peak_rss_p95_bytes)} each (95th percentile).</p>`)}
-    ${limits ? html`<a href="/settings/queue" onClick=${(e) => { e.preventDefault(); navigate('/settings/queue'); }}>Queue limits…</a>` : null}
+    ${limits ? html`<a href="/settings#queue-limits">Queue limits…</a>` : null}
   </section>`;
 }
 

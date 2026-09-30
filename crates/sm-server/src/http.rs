@@ -192,9 +192,16 @@ const CLAUDE_BTW_WAITING_PREFIX: &str = "claude:waiting:";
 const CLAUDE_BTW_SUBMITTING_PREFIX: &str = "claude:submitting:";
 const CLAUDE_BTW_SUBMITTED_PREFIX: &str = "claude:submitted:";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalTicketKind {
+    Phone,
+    Browser,
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 struct MobileTerminalTicket {
+    kind: TerminalTicketKind,
     ticket_id: String,
     secret_hash: String,
     user_id: String,
@@ -322,6 +329,7 @@ mod analytics;
 mod board;
 mod board_clock;
 mod board_page;
+mod browser_terminal;
 mod claims;
 mod docs;
 mod follows;
@@ -1537,6 +1545,7 @@ pub fn router(state: AppState) -> Router {
             "/client/push-token",
             put(follows::put_push_token).delete(follows::delete_push_token),
         )
+        .route("/client/push/status", get(follows::push_status))
         .route("/client/push/test", post(follows::send_test_push))
         .route("/client/follows", get(follows::list_follows))
         .route("/client/follows/{follow_id}/ack", post(follows::ack_follow))
@@ -1839,6 +1848,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/client/sessions/{session_id}/attach-ticket",
             post(create_mobile_attach_ticket),
+        )
+        .route(
+            "/client/sessions/{session_id}/browser-attach-ticket",
+            post(browser_terminal::create_ticket),
         )
         .route("/client/sessions/{session_id}", get(get_client_session))
         .fallback(not_found);
@@ -3547,7 +3560,16 @@ async fn get_app_artifact_metadata(
     Path(app_name): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_app_artifact_read_allowed(&state, &request)?;
+    if owner_web_guard(
+        &state,
+        request.headers(),
+        request_peer_addr(&request),
+        "GET",
+    )?
+    .is_none()
+    {
+        ensure_app_artifact_read_allowed(&state, &request)?;
+    }
     if !valid_app_name(&app_name) {
         return Err(ApiError::NotFound("Artifact metadata not found"));
     }
@@ -7852,6 +7874,7 @@ async fn create_mobile_attach_ticket(
     tickets.insert(
         ticket_id.clone(),
         MobileTerminalTicket {
+            kind: TerminalTicketKind::Phone,
             ticket_id: ticket_id.clone(),
             secret_hash,
             user_id,
@@ -7954,13 +7977,15 @@ struct StudioSshToggleRequest {
 /// (local curl tests / internal callers). Non-local requests must satisfy the
 /// exact same gate as `disable_mobile_terminal`: mobile Cloudflare Access +
 /// public-edge assertion + an allowlisted owner who can disable mobile terminal.
-fn ensure_studio_ssh_admin(state: &Arc<AppState>, request: &Request) -> Result<(), ApiError> {
-    let peer_addr = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|value| value.0);
-    if is_local_bypass_request(request.headers(), peer_addr, &state.config) {
-        return Ok(());
+/// Settings device controls accept the browser owner and retain phone guards.
+fn settings_device_actor(state: &AppState, request: &Request) -> Result<String, ApiError> {
+    if let Some(email) = owner_web_guard(
+        state,
+        request.headers(),
+        request_peer_addr(request),
+        request.method().as_str(),
+    )? {
+        return Ok(email);
     }
     let access_context = ensure_mobile_cloudflare_access_for_request(state, request)?;
     ensure_public_edge_assertion_for_request(state, request)?;
@@ -7974,6 +7999,18 @@ fn ensure_studio_ssh_admin(state: &Arc<AppState>, request: &Request) -> Result<(
         access_context.as_ref(),
         &actor_email,
     )?;
+    Ok(actor_email)
+}
+
+fn ensure_studio_ssh_admin(state: &Arc<AppState>, request: &Request) -> Result<(), ApiError> {
+    let peer_addr = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0);
+    if is_local_bypass_request(request.headers(), peer_addr, &state.config) {
+        return Ok(());
+    }
+    let actor_email = settings_device_actor(state, request)?;
     let Some((_user_id, user_config)) = mobile_terminal_visible_user(&state.config, &actor_email)
     else {
         return Err(ApiError::Status {
@@ -8054,18 +8091,7 @@ async fn list_mobile_terminal_devices(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<MobileTerminalDeviceListResponse>, ApiError> {
-    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-    ensure_public_edge_assertion_for_request(&state, &request)?;
-    let actor_email =
-        request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
-            status: StatusCode::UNAUTHORIZED,
-            detail: "Authentication required".to_owned(),
-        })?;
-    ensure_mobile_cloudflare_access_context_matches_actor(
-        &state,
-        access_context.as_ref(),
-        &actor_email,
-    )?;
+    let actor_email = settings_device_actor(&state, &request)?;
     let (actor_user_id, owner_view) = mobile_device_manager(&state.config, &actor_email)?;
     let revoked_keys = state
         .mobile_terminal_revoked_keys
@@ -8136,8 +8162,7 @@ async fn revoke_mobile_terminal_device(
     Query(query): Query<MobileTerminalRevokeDeviceQuery>,
     request: Request,
 ) -> Result<Json<MobileTerminalRevokeDeviceResponse>, ApiError> {
-    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-    ensure_public_edge_assertion_for_request(&state, &request)?;
+    let actor_email = settings_device_actor(&state, &request)?;
     let device_key_id = device_key_id.trim().to_owned();
     if device_key_id.is_empty() {
         return Err(ApiError::Status {
@@ -8145,16 +8170,6 @@ async fn revoke_mobile_terminal_device(
             detail: "Mobile terminal device id is required".to_owned(),
         });
     }
-    let actor_email =
-        request_actor_email(&state.config, &request).ok_or_else(|| ApiError::Status {
-            status: StatusCode::UNAUTHORIZED,
-            detail: "Authentication required".to_owned(),
-        })?;
-    ensure_mobile_cloudflare_access_context_matches_actor(
-        &state,
-        access_context.as_ref(),
-        &actor_email,
-    )?;
     let (actor_user_id, owner_view) = mobile_device_manager(&state.config, &actor_email)?;
     let target_user_id = resolve_mobile_terminal_revoke_target(
         &state,
@@ -8198,8 +8213,15 @@ async fn mobile_terminal_endpoint(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-    ensure_public_edge_assertion_for_request(&state, &request)?;
+    let browser = request_cloudflare_access_application(&state, &request)
+        == Some(CloudflareAccessApplication::Browser);
+    let (browser_email, access_context) = if browser {
+        (Some(browser_terminal::authorize(&state, &request)?), None)
+    } else {
+        let context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
+        ensure_public_edge_assertion_for_request(&state, &request)?;
+        (None, context)
+    };
     let (mut parts, _body) = request.into_parts();
     let headers = parts.headers.clone();
     let peer_addr = parts
@@ -8208,7 +8230,14 @@ async fn mobile_terminal_endpoint(
         .map(|value| value.0);
     if let Ok(ws) = WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
         return Ok(ws
-            .on_upgrade(move |socket| mobile_terminal_websocket(socket, state))
+            .on_upgrade(move |socket| mobile_terminal_websocket(socket, state, browser_email))
+            .into_response());
+    }
+    if browser {
+        return Ok((
+            StatusCode::UPGRADE_REQUIRED,
+            "Terminal requires a WebSocket upgrade",
+        )
             .into_response());
     }
     mobile_terminal_upgrade_required(&state, access_context.as_ref(), &headers, peer_addr)
@@ -8250,7 +8279,11 @@ fn mobile_terminal_upgrade_required(
         .into_response())
 }
 
-async fn mobile_terminal_websocket(mut socket: WebSocket, state: Arc<AppState>) {
+async fn mobile_terminal_websocket(
+    mut socket: WebSocket,
+    state: Arc<AppState>,
+    browser_email: Option<String>,
+) {
     if !mobile_terminal_enabled(&state) {
         send_mobile_terminal_error(&mut socket, "mobile terminal attach is disabled").await;
         close_mobile_terminal_socket(&mut socket, 1008, "mobile_terminal_disabled").await;
@@ -8275,7 +8308,7 @@ async fn mobile_terminal_websocket(mut socket: WebSocket, state: Arc<AppState>) 
         }
     };
 
-    match consume_mobile_terminal_ticket(&state, &auth_frame) {
+    match consume_terminal_ticket(&state, &auth_frame, browser_email.as_deref()) {
         Ok((ticket, attach_id, stop)) => {
             run_mobile_terminal_bridge(
                 socket,
@@ -8886,6 +8919,9 @@ fn mobile_terminal_key_bytes(key: &str) -> Option<Vec<u8>> {
         "enter" => Some(b"\r".to_vec()),
         "esc" | "escape" => Some(b"\x1b".to_vec()),
         "tab" => Some(b"\t".to_vec()),
+        "shift-tab" => Some(b"\x1b[Z".to_vec()),
+        "up" => Some(b"\x1b[A".to_vec()),
+        "down" => Some(b"\x1b[B".to_vec()),
         "backspace" => Some(b"\x7f".to_vec()),
         "ctrl-c" => Some(b"\x03".to_vec()),
         "ctrl-d" => Some(b"\x04".to_vec()),
@@ -13899,9 +13935,18 @@ fn mobile_terminal_proof_nonce_key(
     [user_id, device_key_id, session_id, nonce].join("\u{1f}")
 }
 
+#[cfg(test)]
 fn consume_mobile_terminal_ticket(
     state: &AppState,
     frame: &MobileTerminalAuthFrame,
+) -> Result<(MobileTerminalTicket, String, Arc<AtomicBool>), ApiError> {
+    consume_terminal_ticket(state, frame, None)
+}
+
+fn consume_terminal_ticket(
+    state: &AppState,
+    frame: &MobileTerminalAuthFrame,
+    browser_email: Option<&str>,
 ) -> Result<(MobileTerminalTicket, String, Arc<AtomicBool>), ApiError> {
     if !mobile_terminal_enabled(state) {
         return Err(ApiError::Status {
@@ -13911,59 +13956,65 @@ fn consume_mobile_terminal_ticket(
     }
     let ticket_id = nonempty_frame_field(&frame.ticket_id);
     let ticket_secret = nonempty_frame_field(&frame.ticket_secret);
-    let device_key_id = nonempty_frame_field(&frame.device_key_id);
-    let nonce = nonempty_frame_field(&frame.nonce);
-    let signature = nonempty_frame_field(&frame.signature);
-    if ticket_id.is_none()
-        || ticket_secret.is_none()
-        || device_key_id.is_none()
-        || nonce.is_none()
-        || signature.is_none()
-    {
-        return Err(ApiError::Status {
-            status: StatusCode::UNAUTHORIZED,
-            detail: "Invalid terminal auth frame".to_owned(),
-        });
-    }
-    let ticket_id = ticket_id.unwrap();
-    let ticket_secret = ticket_secret.unwrap();
-    let device_key_id = device_key_id.unwrap();
-    let nonce = nonce.unwrap();
-    let signature = signature.unwrap();
+    let (Some(ticket_id), Some(ticket_secret)) = (ticket_id, ticket_secret) else {
+        return Err(browser_terminal::denied("Invalid terminal auth frame"));
+    };
+    let device_key_id = nonempty_frame_field(&frame.device_key_id)
+        .or_else(|| browser_email.map(|_| "browser".to_owned()))
+        .ok_or_else(|| browser_terminal::denied("Invalid terminal auth frame"))?;
     let now = OffsetDateTime::now_utc().unix_timestamp();
-
     let ticket =
         mobile_terminal_ticket_for_consume(state, &ticket_id, &ticket_secret, &device_key_id, now)?;
-    let Some((user_id, user_config)) =
-        mobile_terminal_visible_user(&state.config, &ticket.actor_email)
-    else {
-        return Err(ApiError::Status {
-            status: StatusCode::FORBIDDEN,
-            detail: "User is no longer allowed to attach".to_owned(),
-        });
-    };
-    if user_id != ticket.user_id {
-        return Err(ApiError::Status {
-            status: StatusCode::FORBIDDEN,
-            detail: "User is no longer allowed to attach".to_owned(),
-        });
+    match ticket.kind {
+        TerminalTicketKind::Browser => {
+            if browser_email != Some(ticket.actor_email.as_str())
+                || !allowlisted_google_email(&state.config, &ticket.actor_email)
+            {
+                return Err(browser_terminal::denied(
+                    "Browser login required for this ticket",
+                ));
+            }
+        }
+        TerminalTicketKind::Phone => {
+            let nonce = nonempty_frame_field(&frame.nonce)
+                .ok_or_else(|| browser_terminal::denied("Device signature required"))?;
+            let signature = nonempty_frame_field(&frame.signature)
+                .ok_or_else(|| browser_terminal::denied("Device signature required"))?;
+            let Some((user_id, user_config)) =
+                mobile_terminal_visible_user(&state.config, &ticket.actor_email)
+            else {
+                return Err(ApiError::Status {
+                    status: StatusCode::FORBIDDEN,
+                    detail: "User is no longer allowed to attach".to_owned(),
+                });
+            };
+            if user_id != ticket.user_id {
+                return Err(ApiError::Status {
+                    status: StatusCode::FORBIDDEN,
+                    detail: "User is no longer allowed to attach".to_owned(),
+                });
+            }
+            let Some(device_public_key) = mobile_terminal_device_public_key(
+                state,
+                &ticket.user_id,
+                user_config,
+                &device_key_id,
+            )?
+            else {
+                return Err(browser_terminal::denied(
+                    "Device key is no longer registered",
+                ));
+            };
+            let message = mobile_terminal_ws_message(
+                &ticket.ticket_id,
+                &ticket.session_id,
+                &ticket.actor_email,
+                &device_key_id,
+                &nonce,
+            );
+            verify_mobile_terminal_p256_signature(&device_public_key, &signature, &message)?;
+        }
     }
-    let Some(device_public_key) =
-        mobile_terminal_device_public_key(state, &ticket.user_id, user_config, &device_key_id)?
-    else {
-        return Err(ApiError::Status {
-            status: StatusCode::UNAUTHORIZED,
-            detail: "Device key is no longer registered".to_owned(),
-        });
-    };
-    let message = mobile_terminal_ws_message(
-        &ticket.ticket_id,
-        &ticket.session_id,
-        &ticket.actor_email,
-        &device_key_id,
-        &nonce,
-    );
-    verify_mobile_terminal_p256_signature(&device_public_key, &signature, &message)?;
 
     let Some(session) = state.session_store.get_session(&ticket.session_id)? else {
         return Err(ApiError::Status {
@@ -14050,6 +14101,12 @@ fn consume_mobile_terminal_ticket(
             stop: stop.clone(),
         },
     );
+    if ticket.kind == TerminalTicketKind::Browser {
+        eprintln!(
+            "browser terminal attach: email={} session={}",
+            ticket.actor_email, ticket.session_id
+        );
+    }
     Ok((ticket, attach_id, stop))
 }
 
@@ -19197,6 +19254,7 @@ mod tests {
 
     fn test_mobile_terminal_ticket() -> MobileTerminalTicket {
         MobileTerminalTicket {
+            kind: TerminalTicketKind::Phone,
             ticket_id: "att_test".to_owned(),
             secret_hash: "secret-hash".to_owned(),
             user_id: "local_bypass".to_owned(),
@@ -19503,6 +19561,7 @@ mod tests {
         for uri in [
             "/",
             "/?open=agent:abc12345",
+            "/board",
             "/queue",
             "/analytics",
             "/analytics/spend",
@@ -19532,6 +19591,29 @@ mod tests {
         let (status, body) = browser_host_get(&app, "/history?format=json", Some(&owner)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["schema_version"], 1);
+        let (status, body) = browser_host_get(&app, "/client/board", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["lanes"].is_array());
+        // Legacy JSON retains its session-cookie guard; the browser app uses
+        // /client/board. Both JSON negotiation forms must still return JSON.
+        for uri in ["/board?format=json", "/board"] {
+            let mut request = browser(uri);
+            request.headers_mut().insert(
+                COOKIE,
+                format!("{SESSION_COOKIE_NAME}={}", owner_session_cookie())
+                    .parse()
+                    .unwrap(),
+            );
+            if uri == "/board" {
+                request.headers_mut().insert(
+                    axum::http::header::ACCEPT,
+                    "application/json".parse().unwrap(),
+                );
+            }
+            let (status, body) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            assert!(body["lanes"].is_array(), "{body}");
+        }
         // The shell still needs the owner's login.
         let (status, _) = browser_host_get(&app, "/queue", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -19583,8 +19665,148 @@ mod tests {
         assert!(!html.contains(r#"id="sm-config""#));
         let response = app.clone().oneshot(app_host("/watch")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        let response = app.clone().oneshot(app_host("/board")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = body_text(response).await;
+        assert!(html.contains("board-add"));
+        assert!(!html.contains(r#"id="sm-config""#));
         let response = app.clone().oneshot(app_host("/queue")).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn settings_push_status_is_owner_scoped_and_never_exposes_tokens() {
+        let mut config = google_auth_config();
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        let state = AppState::new(config);
+        let store = follows::push_store(&state);
+        for (user, name, token) in [
+            ("rajeshgoli@gmail.com", "Owner phone", "secret-owner-token"),
+            ("someone@example.com", "Other phone", "secret-other-token"),
+        ] {
+            store
+                .upsert_token(
+                    &crate::owner_push::PushTokenRegistration {
+                        user_id: user.into(),
+                        token: token.into(),
+                        device_id: None,
+                        device_name: name.into(),
+                        app_version: "1".into(),
+                    },
+                    OffsetDateTime::now_utc(),
+                )
+                .unwrap();
+        }
+        seed_cloudflare_access_jwks(&state);
+        let app = router(state);
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let (status, body) = browser_host_get(&app, "/client/push/status", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["devices"], json!([{"device_name": "Owner phone"}]));
+        let (status, _) = browser_host_get(
+            &app,
+            "/apps/session-manager-android/meta.json",
+            Some(&owner),
+        )
+        .await;
+        // Missing artifact is a data absence, not an authentication rejection.
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!body.to_string().contains("secret-"));
+        let (status, _) = browser_host_get(&app, "/client/push/status", None).await;
+        assert!(is_auth_denial_status(status.as_u16()));
+    }
+
+    #[tokio::test]
+    async fn settings_browser_controls_require_owner_origin_and_keep_phone_guard() {
+        let mut config = google_auth_config();
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        let key = SigningKey::random(&mut OsRng);
+        config.mobile_terminal = mobile_ticket_config(&key).mobile_terminal;
+        let mut user = config
+            .mobile_terminal
+            .allowed_users
+            .remove("local_bypass")
+            .unwrap();
+        user.email = Some("rajeshgoli@gmail.com".into());
+        user.owner = true;
+        config
+            .mobile_terminal
+            .allowed_users
+            .insert("rajesh".into(), user);
+        let state = AppState::new(config);
+        seed_cloudflare_access_jwks(&state);
+        let app = router(state);
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let (status, body) =
+            browser_host_get(&app, "/client/mobile-terminal/devices", Some(&owner)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["devices"][0]["device_key_id"], "test-device");
+        for (method, path, body) in [
+            (Method::POST, "/client/push/test", json!({})),
+            (Method::POST, "/admin/studio-ssh", json!({"enabled": false})),
+            (
+                Method::DELETE,
+                "/client/mobile-terminal/devices/test-device",
+                json!({}),
+            ),
+        ] {
+            for headers in [
+                vec![],
+                vec![("origin", "https://other.example.com")],
+                vec![
+                    ("origin", "https://sm.example.com"),
+                    ("x-sm-session", "agent"),
+                ],
+            ] {
+                let request = owner_web_request(
+                    method.clone(),
+                    path,
+                    "sm.example.com",
+                    Some(&owner),
+                    &headers,
+                    &body,
+                );
+                assert_eq!(
+                    app.clone().oneshot(request).await.unwrap().status(),
+                    StatusCode::FORBIDDEN,
+                    "{path}"
+                );
+            }
+            let request = owner_web_request(
+                method,
+                path,
+                "sm-app.example.com",
+                Some(&owner),
+                &[("origin", "https://sm-app.example.com")],
+                &body,
+            );
+            assert!(
+                is_auth_denial_status(
+                    app.clone()
+                        .oneshot(request)
+                        .await
+                        .unwrap()
+                        .status()
+                        .as_u16()
+                ),
+                "{path}"
+            );
+        }
+        // Auth succeeds, then the unconfigured test sender reports unavailable.
+        let request = owner_web_request(
+            Method::POST,
+            "/client/push/test",
+            "sm.example.com",
+            Some(&owner),
+            &[("origin", "https://sm.example.com")],
+            &json!({}),
+        );
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]
@@ -23296,4 +23518,5 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
         assert!(html.contains("data-handoff=\"handoff-browser\""));
         assert!(html.contains("hands off at 45%") || html.contains("handoff off"));
     }
+    include!("http/browser_terminal_tests.rs");
 }
