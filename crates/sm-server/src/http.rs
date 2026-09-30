@@ -129,15 +129,14 @@ use crate::sessions::{
     ArmStopNotifyRequest, ChildSessionResponse, ClaudeHookGate, ClearSessionRequest,
     ClientSessionResponse, ContextMonitorOutcome, ContextMonitorRequest, ContextSnapshotResponse,
     ContextUsageEvent, ContextUsageOutcome, CoreClearOutcome, CoreInputBatchResponse,
-    CoreInputBatchResult, CoreRestoreOutcome, CoreRetireOutcome, CoreReviewOutcome,
-    CreateCoreSessionRequest, CreateReparentRequest, CreateReparentTreeRequest,
-    CredentialRotationOutcome, DecideReparentRequest, HierarchyRootResolution,
-    MaintainerMutationOutcome, RegistryMutationOutcome, ReparentDecision, ReparentMutationOutcome,
-    ReparentRepairAction, RetireAuthority, RoleRegistrationRequest,
-    SeatSessionReconciliationSnapshot, SendCoreInputBatchRequest, SendCoreInputRequest,
-    SessionMetadataOutcome, SessionRecord, SessionResponse, SessionStore, SessionsEnvelope,
-    SetMaintainerRequest, SpawnBriefBinding, SpawnBriefSource, SpawnReviewRequest,
-    StartReviewRequest, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
+    CoreInputBatchResult, CoreRestoreOutcome, CoreRetireOutcome, CreateCoreSessionRequest,
+    CreateReparentRequest, CreateReparentTreeRequest, CredentialRotationOutcome,
+    DecideReparentRequest, HierarchyRootResolution, MaintainerMutationOutcome,
+    RegistryMutationOutcome, ReparentDecision, ReparentMutationOutcome, ReparentRepairAction,
+    RetireAuthority, RoleRegistrationRequest, SeatSessionReconciliationSnapshot,
+    SendCoreInputBatchRequest, SendCoreInputRequest, SessionMetadataOutcome, SessionRecord,
+    SessionResponse, SessionStore, SessionsEnvelope, SetMaintainerRequest, SpawnBriefBinding,
+    SpawnBriefSource, SubagentStartOutcome, SubagentStartRequest, SubagentStopOutcome,
     SubagentStopRequest, TaskCompleteOutcome, TaskCompleteRequest, TurnCompleteOutcome,
     UpdateSessionMetadataRequest,
 };
@@ -187,8 +186,6 @@ const CLOUDFLARE_ACCESS_UNKNOWN_KID_REFRESH_INTERVAL: Duration = Duration::from_
 const GOOGLE_ID_TOKEN_JWKS_TTL: Duration = Duration::from_secs(60 * 60);
 const GOOGLE_ID_TOKEN_UNKNOWN_KID_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const DEVICE_TOKEN_MAX_AGE_SECONDS: i64 = 60 * 60 * 24 * 14;
-const REVIEW_WAIT_IDLE_THRESHOLD: Duration = Duration::from_secs(1);
-const REVIEW_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const BTW_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
 const BTW_PROVIDER_POLL: Duration = Duration::from_millis(250);
 static BTW_NATIVE_COPY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -399,14 +396,23 @@ pub trait GitHubReviewPoster: Send + Sync {
         Ok(None)
     }
 
-    /// Returns the earliest Codex comment posted after `since` that reports
-    /// the review run failed ("Codex Review: Something went wrong").
+    /// Returns the earliest Codex error or quota comment after `since`.
     fn find_codex_review_failure(
         &self,
         _repo: &str,
         _pr_number: i64,
         _since: &str,
         _request_comment_id: Option<i64>,
+    ) -> Result<Option<GitHubReviewMatch>, String> {
+        Ok(None)
+    }
+
+    fn find_owner_review(
+        &self,
+        _repo: &str,
+        _pr_number: i64,
+        _since: &str,
+        _head: &str,
     ) -> Result<Option<GitHubReviewMatch>, String> {
         Ok(None)
     }
@@ -476,6 +482,63 @@ impl GitHubReviewPoster for GhCliReviewPoster {
         request_comment_id: Option<i64>,
     ) -> Result<Option<GitHubReviewMatch>, String> {
         find_codex_review_failure_with_gh(repo, pr_number, since, request_comment_id)
+    }
+
+    fn find_owner_review(
+        &self,
+        repo: &str,
+        pr_number: i64,
+        since: &str,
+        head: &str,
+    ) -> Result<Option<GitHubReviewMatch>, String> {
+        let actor = gh_command_output(
+            &[
+                "api".to_owned(),
+                "user".to_owned(),
+                "--jq".to_owned(),
+                ".login".to_owned(),
+            ],
+            Duration::from_secs(15),
+        )
+        .map_err(|error| error.to_string())?;
+        if !actor.status.success() {
+            return Err(format!("gh api user failed: {}", command_stderr(&actor)));
+        }
+        let login = String::from_utf8_lossy(&actor.stdout).trim().to_owned();
+        let Some(since_dt) = parse_github_datetime(since) else {
+            return Ok(None);
+        };
+        let reviews = gh_api_json(repo, &format!("pulls/{pr_number}/reviews"), true)?;
+        Ok(reviews
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|review| {
+                let at = review
+                    .get("submitted_at")?
+                    .as_str()
+                    .and_then(parse_github_datetime)?;
+                let body = review.get("body").and_then(Value::as_str).unwrap_or("");
+                let reviewer = review.get("user")?.get("login")?.as_str()?;
+                if at <= since_dt
+                    || !reviewer.eq_ignore_ascii_case(&login)
+                    || review.get("commit_id").and_then(Value::as_str) != Some(head)
+                    || body.contains("sm-review-request:")
+                {
+                    return None;
+                }
+                Some(GitHubReviewMatch {
+                    source: "owner".to_owned(),
+                    created_at: at.format(&Rfc3339).ok()?,
+                    id: review.get("id").cloned(),
+                    url: review
+                        .get("html_url")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    head_sha: Some(head.to_owned()),
+                })
+            })
+            .min_by(|a, b| a.created_at.cmp(&b.created_at)))
     }
 }
 
@@ -1150,7 +1213,16 @@ fn find_codex_review_failure_with_gh(
             && codex_comment_reports_review_failure(comment, request_comment_id)
         {
             failures.push(GitHubReviewMatch {
-                source: "failure".to_owned(),
+                source: if comment
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .is_some_and(codex_comment_reports_quota)
+                {
+                    "quota"
+                } else {
+                    "failure"
+                }
+                .to_owned(),
                 created_at: created_at
                     .format(&Rfc3339)
                     .unwrap_or_else(|_| now_rfc3339()),
@@ -1177,7 +1249,12 @@ fn codex_comment_reports_review_failure(comment: &Value, request_comment_id: Opt
     comment.get("id").and_then(Value::as_i64) != request_comment_id
         && github_actor_is_codex(comment)
         && !body.starts_with("@codex review")
-        && body.contains("something went wrong")
+        && !body.contains("reviewed commit:")
+}
+
+fn codex_comment_reports_quota(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    body.contains("usage limits") || body.contains("add credits")
 }
 
 fn reviewed_commit_matches_requested_head(body: &str, requested_head_sha: &str) -> bool {
@@ -1614,12 +1691,25 @@ pub fn router(state: AppState) -> Router {
             post(cancel_queue_job_with_note),
         )
         .route(
-            "/codex-review-requests",
+            "/review-requests",
             get(list_codex_review_requests).post(create_codex_review_request),
         )
         .route(
-            "/codex-review-requests/{request_id}",
+            "/review-requests/{request_id}",
             get(get_codex_review_request).delete(cancel_codex_review_request),
+        )
+        .route("/client/reviews/status", get(client_review_status))
+        .route(
+            "/client/reviews/github-codex/check",
+            post(client_check_github_codex),
+        )
+        .route(
+            "/client/review-requests/{request_id}/retry",
+            post(client_retry_review_request),
+        )
+        .route(
+            "/client/review-requests/{request_id}/owner",
+            post(client_owner_review_request),
         )
         .route("/btw-requests/{request_id}", get(get_btw_request))
         .route(
@@ -1688,7 +1778,6 @@ pub fn router(state: AppState) -> Router {
             "/scheduler/remind/{reminder_id}",
             delete(cancel_scheduled_reminder),
         )
-        .route("/reviews/pr", post(start_pr_review))
         .route("/nodes", get(list_nodes))
         .route("/nodes/{node_id}/ping", post(ping_node))
         .route(
@@ -1763,7 +1852,6 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/sessions/input-batch", post(send_session_input_batch))
         .route("/sessions/spawn", post(spawn_session))
-        .route("/sessions/review", post(spawn_review_session))
         .route("/sessions/context-monitor", get(get_context_monitor_status))
         .route(
             "/sessions/{session_id}",
@@ -1783,7 +1871,6 @@ pub fn router(state: AppState) -> Router {
             post(create_session_credential_rotation),
         )
         .route("/sessions/{session_id}/usage", get(get_session_usage))
-        .route("/sessions/{session_id}/review", post(start_session_review))
         .route(
             "/sessions/{parent_session_id}/children",
             get(list_children_sessions),
@@ -4492,311 +4579,6 @@ async fn create_runtime_core_session(
     .map_err(core_session_create_api_error)
 }
 
-async fn start_session_review(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Path(session_id): Path<String>,
-    Json(payload): Json<StartReviewRequest>,
-) -> Result<Json<Value>, ApiError> {
-    ensure_session_allowed_from_parts(
-        &state.config,
-        &headers,
-        Some(peer_addr),
-        &format!("/sessions/{session_id}/review"),
-    )?;
-    ensure_core_writes_enabled(&state)?;
-    let runtime = state.runtime();
-    let wait_seconds = payload.wait;
-    let watcher_session_id = payload
-        .watcher_session_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    match state.session_store.start_review_with_runtime(
-        &session_id,
-        payload,
-        &runtime,
-        &state.config.codex_review,
-    )? {
-        CoreReviewOutcome::Started(result) => {
-            spawn_review_steer_if_needed(state.clone(), &result, &runtime);
-            if let (Some(wait_seconds), Some(watcher_session_id)) =
-                (wait_seconds, watcher_session_id)
-            {
-                spawn_session_wait_monitor(
-                    state,
-                    result.session_id.clone(),
-                    watcher_session_id,
-                    wait_seconds,
-                );
-            }
-            Ok(Json(serde_json::to_value(result)?))
-        }
-        CoreReviewOutcome::NotFound => Err(ApiError::Status {
-            status: StatusCode::NOT_FOUND,
-            detail: "Session not found".to_owned(),
-        }),
-        CoreReviewOutcome::Error(error) => Ok(Json(json!({ "error": error }))),
-    }
-}
-
-async fn spawn_review_session(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(payload): Json<SpawnReviewRequest>,
-) -> Result<Json<Value>, ApiError> {
-    ensure_session_allowed_from_parts(
-        &state.config,
-        &headers,
-        Some(peer_addr),
-        "/sessions/review",
-    )?;
-    ensure_core_writes_enabled(&state)?;
-    let Some(parent) = state
-        .session_store
-        .get_session(&payload.parent_session_id)?
-    else {
-        return Err(ApiError::Status {
-            status: StatusCode::NOT_FOUND,
-            detail: "Parent session not found".to_owned(),
-        });
-    };
-    if let Some(name) = payload
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        validate_requested_friendly_name(name)?;
-    }
-
-    let working_dir = payload
-        .working_dir
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(parent.working_dir.as_str())
-        .to_owned();
-    let create_payload = CreateCoreSessionRequest {
-        id: None,
-        name: Some(
-            payload
-                .name
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| format!("child-{}", short_session_id(&parent.id))),
-        ),
-        working_dir: Some(working_dir),
-        provider: Some("codex".to_owned()),
-        parent_session_id: Some(parent.id.clone()),
-        node: Some("primary".to_owned()),
-        initial_message: None,
-        model: payload.model.clone(),
-        reasoning_effort: None,
-        wait: None,
-        spawn_prompt_source: None,
-        spawn_brief: None,
-    };
-    let log_dir = state.config.rust_core.log_dir.as_deref().map(expand_home);
-    let runtime = TmuxRuntime::from_app_config(&state.config);
-    let child = if state.config.rust_core.runtime_enabled {
-        ensure_core_runtime_provider_supported(&create_payload)?;
-        ensure_core_runtime_request_node_supported(&state, &create_payload)?;
-        state
-            .session_store
-            .create_core_session_with_runtime(create_payload, log_dir, &runtime)
-            .map_err(core_session_create_api_error)?
-    } else {
-        state
-            .session_store
-            .create_core_session(create_payload, log_dir)?
-    };
-
-    tokio::time::sleep(runtime.startup_settle_duration()).await;
-
-    let review_request = StartReviewRequest {
-        mode: payload.mode.clone(),
-        base_branch: payload.base_branch.clone(),
-        commit_sha: payload.commit_sha.clone(),
-        custom_prompt: payload.custom_prompt.clone(),
-        steer_text: payload.steer_text.clone(),
-        wait: None,
-        watcher_session_id: None,
-    };
-    let review_outcome = match state.session_store.start_review_with_runtime(
-        &child.id,
-        review_request,
-        &runtime,
-        &state.config.codex_review,
-    ) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            retire_spawned_review_child(&state, &child.id, &runtime);
-            return Err(error.into());
-        }
-    };
-    match review_outcome {
-        CoreReviewOutcome::Started(result) => {
-            spawn_review_steer_if_needed(state.clone(), &result, &runtime);
-            if let Some(wait_seconds) = payload.wait {
-                spawn_child_wait_monitor(state.clone(), child.clone(), wait_seconds);
-            }
-            Ok(Json(json!({
-                "session_id": child.id,
-                "name": child.name,
-                "friendly_name": child
-                    .friendly_name
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or(child.name.as_str()),
-                "review_mode": payload.mode,
-                "base_branch": payload.base_branch,
-                "status": "started"
-            })))
-        }
-        CoreReviewOutcome::NotFound => {
-            Ok(Json(json!({ "error": "Failed to spawn review session" })))
-        }
-        CoreReviewOutcome::Error(error) => {
-            retire_spawned_review_child(&state, &child.id, &runtime);
-            Ok(Json(json!({ "error": error })))
-        }
-    }
-}
-
-fn retire_spawned_review_child(state: &AppState, child_id: &str, runtime: &TmuxRuntime) {
-    let _ = if state.config.rust_core.runtime_enabled {
-        state
-            .session_store
-            .retire_core_session_with_runtime(child_id, None, runtime)
-    } else {
-        state.session_store.retire_core_session(child_id, None)
-    };
-}
-
-fn spawn_review_steer_if_needed(
-    state: Arc<AppState>,
-    result: &crate::sessions::CoreReviewResult,
-    runtime: &TmuxRuntime,
-) {
-    let Some(steer_text) = result
-        .steer_text
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-    else {
-        return;
-    };
-    let session_id = result.session_id.clone();
-    let tmux_session = result.tmux_session.clone();
-    let session_runtime = runtime.for_socket_name(result.tmux_socket_name.as_deref());
-    let delay = Duration::from_secs_f64(state.config.codex_review.steer_delay_seconds.max(0.0));
-    tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        let delivered = tokio::task::spawn_blocking(move || {
-            session_runtime.send_steer_text(&tmux_session, &steer_text)
-        })
-        .await;
-        if matches!(delivered, Ok(Ok(true))) {
-            let _ = state.session_store.mark_review_steer_delivered(&session_id);
-        }
-    });
-}
-
-fn spawn_session_wait_monitor(
-    state: Arc<AppState>,
-    target_session_id: String,
-    watcher_session_id: String,
-    wait_seconds: u64,
-) {
-    tokio::spawn(async move {
-        let Ok(Some(initial_target)) = state.session_store.get_session(&target_session_id) else {
-            queue_wait_notification(
-                &state,
-                &watcher_session_id,
-                format!("[sm wait] {target_session_id} no longer exists (waited 0s)"),
-            );
-            return;
-        };
-        let mut last_activity = initial_target.last_activity.clone();
-        let mut last_output_size = child_output_size(&initial_target);
-        let mut idle_since = Instant::now();
-        let started_at = Instant::now();
-        loop {
-            tokio::time::sleep(REVIEW_WAIT_POLL_INTERVAL).await;
-            let elapsed = started_at.elapsed().as_secs();
-            let Ok(Some(target)) = state.session_store.get_session(&target_session_id) else {
-                queue_wait_notification(
-                    &state,
-                    &watcher_session_id,
-                    format!("[sm wait] {target_session_id} no longer exists (waited {elapsed}s)"),
-                );
-                break;
-            };
-            let output_size = child_output_size(&target);
-            if target.last_activity != last_activity || output_size != last_output_size {
-                last_activity = target.last_activity.clone();
-                last_output_size = output_size;
-                idle_since = Instant::now();
-            }
-            let target_name = child_display_name(&target);
-            let notification =
-                if target.is_stopped() || runtime_child_session_exited(&state, &target) {
-                    Some(format!(
-                        "[sm wait] {target_name} reached stopped (waited {elapsed}s)"
-                    ))
-                } else if idle_since.elapsed() >= REVIEW_WAIT_IDLE_THRESHOLD {
-                    Some(format!(
-                        "[sm wait] {target_name} is now idle (waited {elapsed}s)"
-                    ))
-                } else if elapsed >= wait_seconds {
-                    Some(format!(
-                        "[sm wait] Timeout: {target_name} still active after {wait_seconds}s"
-                    ))
-                } else {
-                    None
-                };
-            if let Some(notification) = notification {
-                queue_wait_notification(&state, &watcher_session_id, notification);
-                break;
-            }
-        }
-    });
-}
-
-fn queue_wait_notification(state: &AppState, watcher_session_id: &str, text: String) {
-    let request = SendCoreInputRequest {
-        text,
-        delivery_mode: "important".to_owned(),
-        sender_session_id: None,
-        from_sm_send: false,
-        timeout_seconds: None,
-        notify_on_delivery: false,
-        notify_after_seconds: None,
-        notify_on_stop: false,
-        remind_soft_threshold: None,
-        remind_hard_threshold: None,
-        remind_cancel_on_reply_session_id: None,
-        parent_session_id: None,
-    };
-    let _ = if state.config.rust_core.runtime_enabled {
-        let runtime = TmuxRuntime::from_app_config(&state.config);
-        state
-            .session_store
-            .send_core_input_with_runtime(watcher_session_id, request, &runtime)
-    } else {
-        state
-            .session_store
-            .send_core_input(watcher_session_id, request)
-    };
-}
-
 fn spawn_child_wait_monitor(state: Arc<AppState>, child: SessionRecord, wait_seconds: u64) {
     if child
         .parent_session_id
@@ -5069,8 +4851,15 @@ async fn create_codex_review_request(
         &state.config,
         &headers,
         Some(peer_addr),
-        "/codex-review-requests",
+        "/review-requests",
     )?;
+    create_review_request_core(state, payload).await
+}
+
+async fn create_review_request_core(
+    state: Arc<AppState>,
+    payload: CodexReviewRequestCreateRequest,
+) -> Result<Json<Value>, ApiError> {
     validate_codex_review_create_payload(&payload)?;
     ensure_core_writes_enabled(&state)?;
 
@@ -5190,43 +4979,6 @@ async fn create_codex_review_request(
             }
         }
 
-        let poster = state.github_review_poster.clone();
-        let repo_for_poster = repo.clone();
-        let steer_for_poster = payload.steer.clone();
-        let comment = tokio::task::spawn_blocking(move || {
-            poster.post_initial_review_request(
-                &repo_for_poster,
-                payload.pr_number,
-                steer_for_poster.as_deref(),
-            )
-        })
-        .await
-        .map_err(|error| ApiError::Status {
-            status: StatusCode::BAD_GATEWAY,
-            detail: format!("Failed to request Codex review: {error}"),
-        })?
-        .map_err(codex_review_poster_error)?;
-
-        // A push and the GitHub PR API can briefly disagree. Bind the durable
-        // request to the head visible after the trigger comment was accepted,
-        // which is the head Codex will actually review.
-        let requested_head_sha = match github_current_open_pr_head(
-            state.github_review_poster.clone(),
-            &repo,
-            payload.pr_number,
-        )
-        .await
-        {
-            Ok(head_sha) => head_sha,
-            Err(error) => {
-                eprintln!(
-                    "Codex review request post-comment head reconciliation failed for {} PR #{}: {}; retaining initial head {}",
-                    repo, payload.pr_number, error, initial_head_sha
-                );
-                initial_head_sha
-            }
-        };
-
         let registration = RetainedQueueStore::create_codex_review_request_in_path(
             &queue_db_path,
             CreateCodexReviewRequest {
@@ -5235,10 +4987,10 @@ async fn create_codex_review_request(
                 requester_session_id: trimmed(&payload.requester_session_id),
                 notify_session_id: notify_session.id.clone(),
                 steer: trimmed(&payload.steer),
-                requested_head_sha,
-                latest_request_comment_id: comment.comment_id,
-                latest_request_comment_url: comment.comment_url,
-                latest_request_posted_at: comment.posted_at,
+                requested_head_sha: initial_head_sha,
+                latest_request_comment_id: None,
+                latest_request_comment_url: None,
+                latest_request_posted_at: now_rfc3339(),
                 poll_interval_seconds: payload.poll_interval_seconds,
                 retry_interval_seconds: payload.retry_interval_seconds,
             },
@@ -5256,6 +5008,84 @@ async fn create_codex_review_request(
                 codex_review_store_error(error)
             }
         })?;
+        let now = now_rfc3339();
+        let allowed = RetainedQueueStore::reserve_github_review_check_in_path(
+            &queue_db_path,
+            &registration.id,
+            &now,
+        )
+        .map_err(codex_review_store_error)?;
+        let registration = if allowed {
+            match github_post_review_request(
+                state.github_review_poster.clone(),
+                &repo,
+                payload.pr_number,
+                payload.steer.as_deref(),
+            )
+            .await
+            {
+                Ok(comment) => {
+                    let posted = RetainedQueueStore::mark_github_review_posted_in_path(
+                        &queue_db_path,
+                        &registration.id,
+                        comment.comment_id,
+                        comment.comment_url.as_deref(),
+                        &comment.posted_at,
+                    )
+                    .map_err(codex_review_store_error)?
+                    .unwrap_or(registration);
+                    // GitHub can show a just-pushed head only after accepting the comment.
+                    if let Ok(GitHubPullRequestState::Open { head_sha }) = github_current_pr_state(
+                        state.github_review_poster.clone(),
+                        &repo,
+                        payload.pr_number,
+                    )
+                    .await
+                    {
+                        RetainedQueueStore::reconcile_initial_review_head_in_path(
+                            &queue_db_path,
+                            &posted.id,
+                            &head_sha,
+                        )
+                        .map_err(codex_review_store_error)?;
+                    }
+                    posted
+                }
+                Err(error) => {
+                    finish_github_review_step(
+                        &state,
+                        &queue_db_path,
+                        &registration,
+                        &format!("failed to start: {error}"),
+                        &now,
+                    )
+                    .map_err(|error| ApiError::Status {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        detail: error,
+                    })?;
+                    registration
+                }
+            }
+        } else {
+            let channel = RetainedQueueStore::github_review_channel_from_path(&queue_db_path)
+                .map_err(codex_review_store_error)?;
+            let reason = format!(
+                "paused (out of quota since {})",
+                channel.paused_at.as_deref().unwrap_or("unknown")
+            );
+            finish_github_review_step(&state, &queue_db_path, &registration, &reason, &now)
+                .map_err(|error| ApiError::Status {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    detail: error,
+                })?;
+            registration
+        };
+        let registration = RetainedQueueStore::get_codex_review_request_from_path(
+            &queue_db_path,
+            &registration.id,
+        )
+        .map_err(codex_review_store_error)?
+        .unwrap_or(registration);
         let mut response = codex_review_request_response(&state, registration.clone())?;
         add_codex_review_claim_warning(&state, &registration, &mut response);
         handoff::add_review_handoff_ask(
@@ -5266,7 +5096,9 @@ async fn create_codex_review_request(
             },
             &mut response,
         );
-        spawn_codex_review_request_watcher(state.clone(), registration.id);
+        if registration.is_active {
+            spawn_codex_review_request_watcher(state.clone(), registration.id);
+        }
         Ok(Json(response))
     });
     create_task.await.map_err(|error| ApiError::Status {
@@ -5329,89 +5161,6 @@ fn add_codex_review_claim_warning(
     }
 }
 
-async fn start_pr_review(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(payload): Json<PrReviewRequest>,
-) -> Result<Json<Value>, ApiError> {
-    ensure_session_allowed_from_parts(&state.config, &headers, Some(peer_addr), "/reviews/pr")?;
-    ensure_core_writes_enabled(&state)?;
-    let repo = match resolve_pr_review_repo(
-        &state,
-        payload.repo.as_deref(),
-        payload.caller_session_id.as_deref(),
-    )
-    .await
-    {
-        Ok(repo) => repo,
-        Err(error) => return Ok(Json(json!({ "error": error }))),
-    };
-    let steer = trimmed(&payload.steer);
-    let poster = state.github_review_poster.clone();
-    let comment = match github_post_review_request(
-        poster,
-        &repo,
-        payload.pr_number,
-        steer.as_deref(),
-    )
-    .await
-    {
-        Ok(comment) => comment,
-        Err(error) => return Ok(Json(json!({ "error": error }))),
-    };
-    let caller_session_id = trimmed(&payload.caller_session_id);
-    let server_polling = payload.wait.is_some_and(|wait| wait != 0) && caller_session_id.is_some();
-    if server_polling {
-        spawn_pr_review_completion_notifier(
-            state.clone(),
-            repo.clone(),
-            payload.pr_number,
-            comment.posted_at.clone(),
-            payload.wait.unwrap_or_default(),
-            caller_session_id.clone().unwrap_or_default(),
-        );
-    }
-
-    Ok(Json(json!({
-        "repo": repo,
-        "pr_number": payload.pr_number,
-        "posted_at": comment.posted_at,
-        "comment_id": comment.comment_id.unwrap_or(0),
-        "comment_body": codex_review_comment_body(steer.as_deref()),
-        "status": "posted",
-        "server_polling": server_polling,
-    })))
-}
-
-async fn resolve_pr_review_repo(
-    state: &AppState,
-    repo: Option<&str>,
-    caller_session_id: Option<&str>,
-) -> Result<String, String> {
-    if let Some(repo) = repo.map(str::trim).filter(|value| !value.is_empty()) {
-        return Ok(repo.to_owned());
-    }
-    let Some(caller_session_id) = caller_session_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Err(
-            "Could not determine repo. Provide --repo or run from a git directory.".to_owned(),
-        );
-    };
-    let Some(caller) = state
-        .session_store
-        .get_session(caller_session_id)
-        .map_err(|error| error.to_string())?
-    else {
-        return Err(
-            "Could not determine repo. Provide --repo or run from a git directory.".to_owned(),
-        );
-    };
-    repo_from_session_working_dir(caller_session_id, caller.working_dir).await
-}
-
 fn codex_review_comment_body(steer: Option<&str>) -> String {
     match normalized_codex_review_steer(steer) {
         Some(steer) => format!("@codex review\n\nSteer: {steer}"),
@@ -5438,53 +5187,6 @@ fn normalized_codex_review_steer(steer: Option<&str>) -> Option<&str> {
     (!normalized.is_empty()).then_some(normalized)
 }
 
-fn spawn_pr_review_completion_notifier(
-    state: Arc<AppState>,
-    repo: String,
-    pr_number: i64,
-    posted_at: String,
-    wait_seconds: i64,
-    caller_session_id: String,
-) {
-    tokio::spawn(async move {
-        let wait_duration = Duration::from_secs(wait_seconds.max(0) as u64);
-        let deadline = Instant::now() + wait_duration;
-        loop {
-            if let Ok(Some(_review_match)) = github_find_fresh_pull_review(
-                state.github_review_poster.clone(),
-                &repo,
-                pr_number,
-                &posted_at,
-            )
-            .await
-            {
-                let text =
-                    format!("Review --pr {pr_number} ({repo}) completed: Codex posted review on PR #{pr_number}");
-                enqueue_pr_review_notification(&state, &caller_session_id, &text);
-                return;
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let sleep_for = std::cmp::min(
-                Duration::from_secs(30),
-                deadline.saturating_duration_since(now),
-            );
-            tokio::time::sleep(sleep_for).await;
-        }
-
-        let text = format!("Review --pr {pr_number} ({repo}) timed out after {wait_seconds}s");
-        enqueue_pr_review_notification(&state, &caller_session_id, &text);
-    });
-}
-
-fn enqueue_pr_review_notification(state: &AppState, caller_session_id: &str, text: &str) {
-    let queue_db_path = expand_home(&state.config.sm_send.db_path);
-    let queue = RetainedQueueStore::new(queue_db_path);
-    let _ = queue.enqueue_message(caller_session_id, text, "important", None);
-}
-
 fn validate_codex_review_create_payload(
     payload: &CodexReviewRequestCreateRequest,
 ) -> Result<(), ApiError> {
@@ -5492,6 +5194,16 @@ fn validate_codex_review_create_payload(
         return Err(ApiError::Status {
             status: StatusCode::UNPROCESSABLE_ENTITY,
             detail: "pr_number must be > 0".to_owned(),
+        });
+    }
+    if payload
+        .steer
+        .as_deref()
+        .is_some_and(|steer| steer.chars().count() > 2000)
+    {
+        return Err(ApiError::Status {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            detail: "steer must be at most 2,000 characters".to_owned(),
         });
     }
     if payload.poll_interval_seconds <= 0 {
@@ -5522,14 +5234,10 @@ fn codex_review_request_requested_at(value: &str) -> Option<OffsetDateTime> {
     parse_github_datetime(value).or_else(|| parse_python_naive_datetime_local(value))
 }
 
-fn codex_review_request_expired(registration: &CodexReviewRequestRegistration) -> bool {
-    codex_review_request_requested_at(&registration.requested_at).is_none_or(|requested_at| {
-        OffsetDateTime::now_utc() - requested_at
-            >= TimeDuration::seconds(CODEX_REVIEW_REQUEST_TTL_SECONDS)
-    })
-}
-
 fn codex_review_request_ttl_remaining(registration: &CodexReviewRequestRegistration) -> Duration {
+    if registration.chain_json.is_some() {
+        return Duration::from_secs(registration.poll_interval_seconds.max(1) as u64);
+    }
     let Some(requested_at) = codex_review_request_requested_at(&registration.requested_at) else {
         return Duration::ZERO;
     };
@@ -5540,21 +5248,12 @@ fn codex_review_request_ttl_remaining(registration: &CodexReviewRequestRegistrat
 
 /// A plain stop is not terminal: a crashed or relaunched seat is restored under
 /// the same id, and the review wake waits in its queue until then. Only a
-/// missing or retired seat ends the request early; the TTL bounds the rest. A
+/// missing or retired seat ends the request early. A
 /// failed state read is not evidence the seat is gone, so it keeps waiting.
 fn codex_review_request_local_terminal_reason(
     state: &AppState,
     registration: &CodexReviewRequestRegistration,
 ) -> Option<(&'static str, String)> {
-    if codex_review_request_expired(registration) {
-        return Some((
-            "expired",
-            format!(
-                "Codex review request exceeded its {} second TTL",
-                CODEX_REVIEW_REQUEST_TTL_SECONDS
-            ),
-        ));
-    }
     let notify_session = match state
         .session_store
         .get_session(&registration.notify_session_id)
@@ -5593,63 +5292,26 @@ fn terminate_codex_review_request_for_local_condition(
     else {
         return Ok(false);
     };
-    terminate_codex_review_request_for_reason(
-        state,
-        queue_db_path,
-        registration,
-        terminal_state,
-        &reason,
-        true,
-    )
-    .map_err(|error| error.to_string())?;
+    terminate_codex_review_request_for_reason(queue_db_path, registration, terminal_state, &reason)
+        .map_err(|error| error.to_string())?;
     Ok(true)
 }
 
-/// Terminates a request for a local condition. An expired request also wakes
-/// its notify session, so the requester is not left waiting on a review that
-/// will never be reported. `deliver_now` drains that wake inline; startup
-/// recovery passes false and gets back the request whose wake it must deliver
-/// off the startup path.
+/// Terminates a request whose notify session no longer exists.
 fn terminate_codex_review_request_for_reason(
-    state: &AppState,
     queue_db_path: &StdPath,
     registration: &CodexReviewRequestRegistration,
     terminal_state: &str,
     reason: &str,
-    deliver_now: bool,
-) -> anyhow::Result<Option<CodexReviewRequestRegistration>> {
-    if terminal_state != "expired" {
-        RetainedQueueStore::terminate_codex_review_request_in_path(
-            queue_db_path,
-            &registration.id,
-            terminal_state,
-            &now_rfc3339(),
-            reason,
-        )?;
-        return Ok(None);
-    }
-    let text = format!(
-        "[sm review] Codex review request {} for PR #{} expired after {} minutes without a Codex review. Run `sm request-codex-review {}` to ask again.",
-        registration.id,
-        registration.pr_number,
-        CODEX_REVIEW_REQUEST_TTL_SECONDS / 60,
-        registration.pr_number
-    );
-    let terminated = RetainedQueueStore::terminate_codex_review_request_and_enqueue_in_path(
+) -> anyhow::Result<()> {
+    RetainedQueueStore::terminate_codex_review_request_in_path(
         queue_db_path,
         &registration.id,
         terminal_state,
         &now_rfc3339(),
         reason,
-        &text,
     )?;
-    match terminated {
-        Some(terminated) if deliver_now => {
-            deliver_codex_review_wake_now(state, &terminated);
-            Ok(None)
-        }
-        terminated => Ok(terminated),
-    }
+    Ok(())
 }
 
 fn fail_codex_review_request_after_codex_errors(
@@ -5738,23 +5400,12 @@ fn recover_codex_review_request_watchers(state: Arc<AppState>) {
                     codex_review_request_local_terminal_reason(&state, &registration)
                 {
                     match terminate_codex_review_request_for_reason(
-                        &state,
                         &queue_db_path,
                         &registration,
                         terminal_state,
                         &reason,
-                        false,
                     ) {
-                        Ok(Some(terminated)) => {
-                            // Nothing else drains ordinary queued messages
-                            // at startup, so deliver the expiry wake here,
-                            // on a blocking task to keep tmux off startup.
-                            let state = state.clone();
-                            tokio::task::spawn_blocking(move || {
-                                deliver_codex_review_wake_now(&state, &terminated)
-                            });
-                        }
-                        Ok(None) => {}
+                        Ok(()) => {}
                         Err(error) => {
                             eprintln!(
                                 "Codex review request recovery failed to terminate {}: {error:#}",
@@ -5805,6 +5456,12 @@ async fn wait_for_codex_review_poll_or_terminal(
         Duration::from_secs(registration.poll_interval_seconds.max(1) as u64),
         codex_review_request_ttl_remaining(registration),
     );
+    // A refusal must reach the author and owner within twenty seconds.
+    let poll_wait = if registration.chain_json.is_some() {
+        poll_wait.min(Duration::from_secs(10))
+    } else {
+        poll_wait
+    };
     let poll_deadline = Instant::now()
         .checked_add(poll_wait)
         .ok_or_else(|| "Codex review poll deadline overflowed after TTL bounding".to_owned())?;
@@ -5837,6 +5494,325 @@ async fn wait_for_codex_review_poll_or_terminal(
     }
 }
 
+fn no_reviewer_wake(state: &AppState, request: &CodexReviewRequestRegistration) -> String {
+    let head = request.requested_head_sha.as_deref().unwrap_or("unknown");
+    format!(
+        "[sm review] No reviewer could take PR #{} @ {}. sm has told {}. Stand by: sm wakes you when a review lands or {} answers.",
+        request.pr_number,
+        &head[..head.len().min(7)],
+        state.config.owner_name,
+        state.config.owner_name,
+    )
+}
+
+fn finish_github_review_step(
+    state: &AppState,
+    db_path: &StdPath,
+    request: &CodexReviewRequestRegistration,
+    reason: &str,
+    now: &str,
+) -> Result<(), String> {
+    let wake = no_reviewer_wake(state, request);
+    if let Some(finished) = RetainedQueueStore::finish_github_review_step_in_path(
+        db_path,
+        &request.id,
+        reason,
+        now,
+        &wake,
+    )
+    .map_err(|error| error.to_string())?
+    {
+        deliver_codex_review_wake_now(state, &finished);
+        let author = finished
+            .requester_session_id
+            .as_deref()
+            .unwrap_or(&finished.notify_session_id);
+        let author_name = state
+            .session_store
+            .get_session(author)
+            .ok()
+            .flatten()
+            .map(session_display_name)
+            .unwrap_or_else(|| author.to_owned());
+        let body = format!(
+            "GitHub Codex: {reason}\n\nPR: https://github.com/{}/pull/{}\nRequest: {}",
+            finished.repo, finished.pr_number, finished.id
+        );
+        let result = crate::owner_messages::OwnerMessageStore::new(db_path.to_path_buf())
+            .create_once(
+                crate::owner_messages::NewOwnerMessage {
+                    human: state.config.owner_name.clone(),
+                    sender_session_id: author.to_owned(),
+                    sender_session_name: author_name,
+                    title: format!("PR #{} has no reviewer", finished.pr_number),
+                    body_markdown: body,
+                    blocking: true,
+                },
+                Some(&format!("review-no-reviewer:{}", finished.id)),
+            )
+            .map_err(|error| error.to_string())?;
+        if let crate::owner_messages::CreateOwnerMessage::Created(message) = result {
+            follows::notice_new_message(state, &message);
+        }
+    }
+    Ok(())
+}
+
+fn push_review_notice(state: &AppState, kind: &str, title: &str, body: &str, reader_path: &str) {
+    let Some(sender) = state.push_sender.as_deref() else {
+        return;
+    };
+    let user_id = follows::follow_owner_id(&state.config, None);
+    let store =
+        crate::owner_push::OwnerPushStore::new(crate::owner_push::push_db_path(&state.config));
+    let Ok(tokens) = store.valid_tokens(&user_id) else {
+        return;
+    };
+    let notification = crate::owner_push::Notification {
+        kind: kind.to_owned(),
+        title: title.to_owned(),
+        body: body.to_owned(),
+        reader_path: Some(reader_path.to_owned()),
+    };
+    let data = notification.data(None);
+    for token in tokens {
+        if let Err(error) = sender.send(&token.token, &data) {
+            eprintln!("review push to {} failed: {error}", token.device_name);
+        }
+    }
+}
+
+/// One poll of the GitHub-only chain. A later ticket adds local review steps.
+async fn poll_github_review_step(
+    state: &AppState,
+    db_path: &StdPath,
+    request: &CodexReviewRequestRegistration,
+) -> Result<bool, String> {
+    let now = now_rfc3339();
+    let head = request
+        .requested_head_sha
+        .as_deref()
+        .ok_or("review request has no head")?;
+    match github_current_pr_state(
+        state.github_review_poster.clone(),
+        &request.repo,
+        request.pr_number,
+    )
+    .await?
+    {
+        GitHubPullRequestState::Closed { state: pr_state } => {
+            terminate_codex_review_request_for_closed_pr(
+                db_path,
+                &request.id,
+                request.pr_number,
+                &pr_state,
+                &now,
+            )?;
+            return Ok(true);
+        }
+        GitHubPullRequestState::Open { head_sha } if head_sha != head => {
+            supersede_codex_review_request_for_head_change(
+                state,
+                db_path,
+                &request.id,
+                request,
+                head,
+                &head_sha,
+                &now,
+            )?;
+            return Ok(true);
+        }
+        GitHubPullRequestState::Open { .. } => {}
+    }
+    if request.step_state.as_deref() == Some("owner") {
+        let poster = state.github_review_poster.clone();
+        let repo = request.repo.clone();
+        let since = request
+            .step_started_at
+            .clone()
+            .unwrap_or_else(|| request.requested_at.clone());
+        let head = head.to_owned();
+        let pr = request.pr_number;
+        let review =
+            tokio::task::spawn_blocking(move || poster.find_owner_review(&repo, pr, &since, &head))
+                .await
+                .map_err(|error| error.to_string())??;
+        if let Some(review) = review {
+            complete_codex_review_request(state, db_path, &request.id, request, review, &now)?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    let Some(comment_id) = request.latest_request_comment_id else {
+        finish_github_review_step(
+            state,
+            db_path,
+            request,
+            "failed to start: no request comment",
+            &now,
+        )?;
+        return Ok(true);
+    };
+    if let Some(review) = github_find_fresh_review(
+        state.github_review_poster.clone(),
+        &request.repo,
+        request.pr_number,
+        &request.requested_at,
+        Some(head),
+        Some(comment_id),
+    )
+    .await?
+    {
+        complete_codex_review_request(state, db_path, &request.id, request, review, &now)?;
+        RetainedQueueStore::mark_github_review_available_in_path(db_path, &request.id, &now)
+            .map_err(|error| error.to_string())?;
+        return Ok(true);
+    }
+    let since = request
+        .latest_request_posted_at
+        .as_deref()
+        .unwrap_or(&request.requested_at);
+    if request.pickup_detected_at.is_none()
+        && github_detect_pickup(
+            state.github_review_poster.clone(),
+            &request.repo,
+            comment_id,
+        )
+        .await?
+    {
+        RetainedQueueStore::mark_codex_review_request_pickup_in_path(db_path, &request.id, &now)
+            .map_err(|error| error.to_string())?;
+        RetainedQueueStore::mark_github_review_step_in_path(
+            db_path,
+            &request.id,
+            "picked_up",
+            request.step_failures,
+            &now,
+        )
+        .map_err(|error| error.to_string())?;
+        RetainedQueueStore::mark_github_review_available_in_path(db_path, &request.id, &now)
+            .map_err(|error| error.to_string())?;
+        return Ok(false);
+    }
+    if request.step_state.as_deref() == Some("error_wait") {
+        let repost_at = codex_review_next_retry_at(
+            request.step_started_at.as_deref().unwrap_or(since),
+            CODEX_REVIEW_FAILURE_RETRY_DELAY_SECONDS,
+        );
+        if repost_at.as_deref().is_some_and(codex_review_datetime_due) {
+            // Persist the one retry before posting so a failed response or a
+            // watcher restart cannot issue duplicate GitHub comments.
+            RetainedQueueStore::mark_github_review_step_in_path(
+                db_path,
+                &request.id,
+                "retry_posting",
+                request.step_failures,
+                &now,
+            )
+            .map_err(|error| error.to_string())?;
+            let comment = match github_post_review_request(
+                state.github_review_poster.clone(),
+                &request.repo,
+                request.pr_number,
+                request.steer.as_deref(),
+            )
+            .await
+            {
+                Ok(comment) => comment,
+                Err(error) => {
+                    finish_github_review_step(
+                        state,
+                        db_path,
+                        request,
+                        &format!("failed to repost after Codex error: {error}"),
+                        &now,
+                    )?;
+                    return Ok(true);
+                }
+            };
+            RetainedQueueStore::mark_github_review_posted_in_path(
+                db_path,
+                &request.id,
+                comment.comment_id,
+                comment.comment_url.as_deref(),
+                &comment.posted_at,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        return Ok(false);
+    }
+    if let Some(failure) = github_find_review_failure(
+        state.github_review_poster.clone(),
+        &request.repo,
+        request.pr_number,
+        since,
+        Some(comment_id),
+    )
+    .await?
+    {
+        if failure.source == "quota" {
+            let next_check =
+                codex_review_next_retry_at(&now, 7200).ok_or("invalid channel check time")?;
+            let first = RetainedQueueStore::pause_github_review_channel_in_path(
+                db_path,
+                failure.url.as_deref(),
+                &now,
+                &next_check,
+            )
+            .map_err(|error| error.to_string())?;
+            if first {
+                push_review_notice(
+                    state,
+                    "github_codex_paused",
+                    "GitHub Codex is out of review quota",
+                    "Reviews go to local runs until it recovers; sm checks every 2 hours.",
+                    "/settings#reviews",
+                );
+            }
+            finish_github_review_step(state, db_path, request, "out of code-review quota", &now)?;
+            return Ok(true);
+        }
+        if request.step_failures == 0 {
+            RetainedQueueStore::mark_github_review_step_in_path(
+                db_path,
+                &request.id,
+                "error_wait",
+                1,
+                &failure.created_at,
+            )
+            .map_err(|error| error.to_string())?;
+            return Ok(false);
+        }
+        finish_github_review_step(state, db_path, request, "reported an error twice", &now)?;
+        return Ok(true);
+    }
+    let deadline = if request.pickup_detected_at.is_some() {
+        3600
+    } else {
+        300
+    };
+    let expired = codex_review_next_retry_at(since, deadline)
+        .as_deref()
+        .is_some_and(codex_review_datetime_due);
+    if expired {
+        let reason = if request.pickup_detected_at.is_some() {
+            "picked up but no review in 60 minutes"
+        } else {
+            "no response in 5 minutes"
+        };
+        RetainedQueueStore::defer_github_review_check_in_path(
+            db_path,
+            &request.id,
+            &codex_review_next_retry_at(&now, 7200).unwrap_or_else(now_rfc3339),
+            &now,
+        )
+        .map_err(|error| error.to_string())?;
+        finish_github_review_step(state, db_path, request, reason, &now)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 async fn run_codex_review_request_watcher(
     state: Arc<AppState>,
     request_id: String,
@@ -5858,6 +5834,35 @@ async fn run_codex_review_request_watcher(
             &registration,
         )? {
             return Ok(());
+        }
+        if registration.chain_json.is_none() && registration.requested_head_sha.is_some() {
+            RetainedQueueStore::upgrade_legacy_review_request_in_path(&queue_db_path, &request_id)
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
+        if registration.chain_json.is_some() {
+            match poll_github_review_step(&state, &queue_db_path, &registration).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    RetainedQueueStore::mark_codex_review_request_poll_error_in_path(
+                        &queue_db_path,
+                        &request_id,
+                        &now_rfc3339(),
+                        &error,
+                        None,
+                    )
+                    .map_err(|store_error| store_error.to_string())?;
+                }
+            }
+            let _ = wait_for_codex_review_poll_or_terminal(
+                &state,
+                &queue_db_path,
+                &request_id,
+                &registration,
+            )
+            .await?;
+            continue;
         }
         let Some(mut registration) = wait_for_codex_review_poll_or_terminal(
             &state,
@@ -5912,7 +5917,7 @@ async fn run_codex_review_request_watcher(
                     continue;
                 }
             };
-            let Some(backfilled) = RetainedQueueStore::backfill_codex_review_request_head_in_path(
+            let Some(_backfilled) = RetainedQueueStore::backfill_codex_review_request_head_in_path(
                 &queue_db_path,
                 &request_id,
                 &current_head_sha,
@@ -5922,7 +5927,9 @@ async fn run_codex_review_request_watcher(
             else {
                 return Ok(());
             };
-            registration = backfilled;
+            RetainedQueueStore::upgrade_legacy_review_request_in_path(&queue_db_path, &request_id)
+                .map_err(|error| error.to_string())?;
+            continue;
         }
         if let Some(comment_id) = registration.latest_request_comment_id {
             if registration.pickup_detected_at.is_none() {
@@ -6179,17 +6186,6 @@ async fn run_codex_review_request_watcher(
     }
 }
 
-async fn github_current_open_pr_head(
-    poster: Arc<dyn GitHubReviewPoster>,
-    repo: &str,
-    pr_number: i64,
-) -> Result<String, String> {
-    let repo = repo.to_owned();
-    tokio::task::spawn_blocking(move || poster.current_open_pr_head(&repo, pr_number))
-        .await
-        .map_err(|error| format!("PR head lookup task failed: {error}"))?
-}
-
 async fn github_current_pr_state(
     poster: Arc<dyn GitHubReviewPoster>,
     repo: &str,
@@ -6237,19 +6233,6 @@ async fn github_find_fresh_review(
     })
     .await
     .map_err(|error| format!("review poll task failed: {error}"))?
-}
-
-async fn github_find_fresh_pull_review(
-    poster: Arc<dyn GitHubReviewPoster>,
-    repo: &str,
-    pr_number: i64,
-    since: &str,
-) -> Result<Option<GitHubReviewMatch>, String> {
-    let repo = repo.to_owned();
-    let since = since.to_owned();
-    tokio::task::spawn_blocking(move || poster.find_fresh_codex_review(&repo, pr_number, &since))
-        .await
-        .map_err(|error| format!("review poll task failed: {error}"))?
 }
 
 async fn github_find_review_failure(
@@ -6339,8 +6322,8 @@ fn supersede_codex_review_request_for_head_change(
         "PR head changed from {requested_head_sha} to {current_head_sha}; no retry was posted"
     );
     let text = format!(
-        "[sm review] Codex review request {request_id} for PR #{} stopped because the PR head changed from {requested_head_sha} to {current_head_sha}. Request a new review for the current head.",
-        registration.pr_number
+        "[sm review] Review request {request_id} for PR #{} stopped: the PR head moved from {} to {}. Run `sm request-review {}` when the new head is ready.",
+        registration.pr_number, &requested_head_sha[..requested_head_sha.len().min(7)], &current_head_sha[..current_head_sha.len().min(7)], registration.pr_number
     );
     let Some(superseded) = RetainedQueueStore::supersede_codex_review_request_and_enqueue_in_path(
         queue_db_path,
@@ -6582,6 +6565,18 @@ fn render_codex_review_landed_message(
     registration: &CodexReviewRequestRegistration,
     review_match: &GitHubReviewMatch,
 ) -> String {
+    if registration.chain_json.is_some() {
+        let head = registration
+            .requested_head_sha
+            .as_deref()
+            .unwrap_or("unknown");
+        return format!(
+            "[sm review] Review of PR #{} @ {} is here: {}",
+            registration.pr_number,
+            &head[..head.len().min(7)],
+            review_match.url.as_deref().unwrap_or("")
+        );
+    }
     let noun = if review_match.source == "comment" {
         "comment"
     } else {
@@ -6700,7 +6695,7 @@ async fn cancel_codex_review_request(
         &state.config,
         &headers,
         Some(peer_addr),
-        &format!("/codex-review-requests/{request_id}"),
+        &format!("/review-requests/{request_id}"),
     )?;
     ensure_core_writes_enabled(&state)?;
     let queue_db_path = expand_home(&state.config.sm_send.db_path);
@@ -6710,6 +6705,143 @@ async fn cancel_codex_review_request(
         return Err(ApiError::NotFound("Codex review request not found"));
     };
     Ok(Json(codex_review_request_response(&state, registration)?))
+}
+
+async fn client_review_status(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    board::owner_guard(&state, &headers, peer_addr, "GET", &uri, false)?;
+    let db_path = expand_home(&state.config.sm_send.db_path);
+    let channel = RetainedQueueStore::github_review_channel_from_path(&db_path)?;
+    let requests = RetainedQueueStore::list_codex_review_requests_from_path(
+        &db_path,
+        CodexReviewRequestFilters {
+            include_inactive: true,
+            ..Default::default()
+        },
+    )?;
+    let cutoff = OffsetDateTime::now_utc() - TimeDuration::hours(24);
+    let recent = requests.iter().filter(|request| {
+        codex_review_request_requested_at(&request.requested_at).is_some_and(|at| at >= cutoff)
+    });
+    let (github_codex, no_reviewer) = recent.fold((0, 0), |(reviewed, missing), request| {
+        (
+            reviewed
+                + i64::from(
+                    request.state == "completed"
+                        && request.review_source.as_deref() != Some("owner"),
+                ),
+            missing + i64::from(request.state == "no_reviewer"),
+        )
+    });
+    let running = requests
+        .into_iter()
+        .filter(|request| request.is_active)
+        .map(|request| {
+            json!({
+                "id": request.id, "repo": request.repo, "pr_number": request.pr_number,
+                "step_state": request.step_state, "reviewer_label": request.reviewer_label,
+                "requested_head_sha": request.requested_head_sha,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "github_codex": { "state": channel.state, "paused_at": channel.paused_at,
+            "next_check_at": channel.next_check_at, "refusal_url": channel.refusal_url },
+        "last_24h": { "github_codex": github_codex, "codex_runs": 0, "claude_runs": 0,
+            "no_reviewer": no_reviewer },
+        "running": running, "meters": { "codex": null, "claude": null },
+    })))
+}
+
+async fn client_check_github_codex(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    board::owner_guard(&state, &headers, peer_addr, "POST", &uri, true)?;
+    RetainedQueueStore::request_github_review_check_in_path(
+        &expand_home(&state.config.sm_send.db_path),
+        &now_rfc3339(),
+    )?;
+    Ok(Json(json!({"status": "ready_for_next_request"})))
+}
+
+async fn client_retry_review_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    board::owner_guard(&state, &headers, peer_addr, "POST", &uri, true)?;
+    let db_path = expand_home(&state.config.sm_send.db_path);
+    let request = RetainedQueueStore::get_codex_review_request_from_path(&db_path, &request_id)?
+        .ok_or(ApiError::NotFound("Review request not found"))?;
+    if request.state != "no_reviewer" {
+        return Err(ApiError::Status {
+            status: StatusCode::CONFLICT,
+            detail: "Only a request with no reviewer can be retried".to_owned(),
+        });
+    }
+    let response = create_review_request_core(
+        state,
+        CodexReviewRequestCreateRequest {
+            pr_number: request.pr_number,
+            repo: Some(request.repo),
+            steer: request.steer,
+            notify_target: Some(request.notify_session_id),
+            requester_session_id: request.requester_session_id,
+            poll_interval_seconds: 30,
+            retry_interval_seconds: 1200,
+        },
+    )
+    .await?;
+    if response.0["state"] != "no_reviewer" {
+        crate::owner_messages::OwnerMessageStore::new(db_path)
+            .mark_handled_by_delivery_key(&format!("review-no-reviewer:{request_id}"))?;
+    }
+    Ok(response)
+}
+
+async fn client_owner_review_request(
+    State(state): State<Arc<AppState>>,
+    Path(request_id): Path<String>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    board::owner_guard(&state, &headers, peer_addr, "POST", &uri, true)?;
+    let db_path = expand_home(&state.config.sm_send.db_path);
+    let request = RetainedQueueStore::get_codex_review_request_from_path(&db_path, &request_id)?
+        .ok_or(ApiError::NotFound("Review request not found"))?;
+    let head = request.requested_head_sha.as_deref().unwrap_or("unknown");
+    let owner = &state.config.owner_name;
+    let wake = format!(
+        "[sm review] {owner} will review PR #{} @ {} personally. Stand by.",
+        request.pr_number,
+        &head[..head.len().min(7)]
+    );
+    let assigned = RetainedQueueStore::assign_review_to_owner_in_path(
+        &db_path,
+        &request_id,
+        owner,
+        &now_rfc3339(),
+        &wake,
+    )?
+    .ok_or_else(|| ApiError::Status {
+        status: StatusCode::CONFLICT,
+        detail: "Only a request with no reviewer can be assigned to the owner".to_owned(),
+    })?;
+    crate::owner_messages::OwnerMessageStore::new(db_path)
+        .mark_handled_by_delivery_key(&format!("review-no-reviewer:{request_id}"))?;
+    deliver_codex_review_wake_now(&state, &assigned);
+    spawn_codex_review_request_watcher(state.clone(), assigned.id.clone());
+    Ok(Json(codex_review_request_response(&state, assigned)?))
 }
 
 /// Read-only projection for watch and desktop clients. Activity remains a
@@ -11295,23 +11427,7 @@ fn shadow_predict_retained_write(
             };
         }
     }
-    if method == "POST"
-        && (path == "/sessions/review" || session_review_path_session_id(path).is_some())
-    {
-        return Ok(Some(ShadowPrediction {
-            status: StatusCode::OK.as_u16(),
-            body_sha256: None,
-            support_status: "implemented_retained_write_status_only",
-        }));
-    }
-    if method == "POST" && path == "/codex-review-requests" {
-        return Ok(Some(ShadowPrediction {
-            status: StatusCode::OK.as_u16(),
-            body_sha256: None,
-            support_status: "implemented_retained_write_status_only",
-        }));
-    }
-    if method == "POST" && path == "/reviews/pr" {
+    if method == "POST" && path == "/review-requests" {
         return Ok(Some(ShadowPrediction {
             status: StatusCode::OK.as_u16(),
             body_sha256: None,
@@ -11320,7 +11436,7 @@ fn shadow_predict_retained_write(
     }
     if method == "DELETE" {
         if let Some(request_id) = path
-            .strip_prefix("/codex-review-requests/")
+            .strip_prefix("/review-requests/")
             .filter(|value| !value.is_empty() && !value.contains('/'))
         {
             let queue_db_path = expand_home(&state.config.sm_send.db_path);
@@ -11386,7 +11502,7 @@ fn shadow_predict_read(
     }
 
     if let Some(request_id) = path
-        .strip_prefix("/codex-review-requests/")
+        .strip_prefix("/review-requests/")
         .filter(|value| !value.is_empty() && !value.contains('/'))
     {
         let queue_db_path = expand_home(&state.config.sm_send.db_path);
@@ -11476,7 +11592,7 @@ fn shadow_predict_read(
                 support_status: "implemented_read_status_only",
             }));
         }
-        "/codex-review-requests" | "/session-obligations" => {
+        "/review-requests" | "/session-obligations" => {
             return Ok(Some(ShadowPrediction {
                 status: StatusCode::OK.as_u16(),
                 body_sha256: None,
@@ -14520,7 +14636,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 fn is_static_sessions_path(path: &str) -> bool {
     matches!(
         path,
-        "/sessions/create" | "/sessions/input-batch" | "/sessions/spawn" | "/sessions/review"
+        "/sessions/create" | "/sessions/input-batch" | "/sessions/spawn"
     )
 }
 
@@ -14537,13 +14653,10 @@ fn is_retained_write_surface(method: &str, path: &str) -> bool {
     if path.starts_with("/sessions/") {
         return matches!(method, "POST" | "PUT" | "PATCH" | "DELETE");
     }
-    if method == "POST" && path == "/codex-review-requests" {
+    if method == "POST" && path == "/review-requests" {
         return true;
     }
-    if method == "POST" && path == "/reviews/pr" {
-        return true;
-    }
-    if path.starts_with("/codex-review-requests/") {
+    if path.starts_with("/review-requests/") {
         return matches!(method, "POST" | "DELETE");
     }
     if method == "POST" && path == "/queue-jobs" {
@@ -14556,11 +14669,6 @@ fn is_retained_write_surface(method: &str, path: &str) -> bool {
         return true;
     }
     false
-}
-
-fn session_review_path_session_id(path: &str) -> Option<&str> {
-    let session_id = path.strip_prefix("/sessions/")?.strip_suffix("/review")?;
-    (!session_id.is_empty() && !session_id.contains('/')).then_some(session_id)
 }
 
 fn validate_requested_friendly_name(name: &str) -> Result<(), ApiError> {
@@ -14632,8 +14740,8 @@ fn is_protected_read_surface(method: &str, path: &str) -> bool {
             .strip_prefix("/client/queue/jobs/")
             .and_then(|rest| rest.strip_suffix("/usage"))
             .is_some_and(|id| !id.is_empty() && !id.contains('/'))
-        || path == "/codex-review-requests"
-        || path.starts_with("/codex-review-requests/")
+        || path == "/review-requests"
+        || path.starts_with("/review-requests/")
         || path == "/session-obligations"
         || path == "/claims"
         || path == "/board"
@@ -15606,6 +15714,7 @@ struct CodexReviewRequestCreateRequest {
     #[serde(default)]
     steer: Option<String>,
     #[serde(default)]
+    #[serde(alias = "notify_session_id")]
     notify_target: Option<String>,
     #[serde(default)]
     requester_session_id: Option<String>,
@@ -15613,19 +15722,6 @@ struct CodexReviewRequestCreateRequest {
     poll_interval_seconds: i64,
     #[serde(default = "default_codex_review_retry_interval_seconds")]
     retry_interval_seconds: i64,
-}
-
-#[derive(Debug, Deserialize)]
-struct PrReviewRequest {
-    pr_number: i64,
-    #[serde(default)]
-    repo: Option<String>,
-    #[serde(default)]
-    steer: Option<String>,
-    #[serde(default)]
-    wait: Option<i64>,
-    #[serde(default)]
-    caller_session_id: Option<String>,
 }
 
 fn default_codex_review_poll_interval_seconds() -> i64 {
@@ -16209,7 +16305,7 @@ fn codex_review_request_response(
                 .format(&Rfc3339)
                 .ok()
         });
-    Ok(json!({
+    let mut response = json!({
         "id": registration.id,
         "repo": registration.repo,
         "pr_number": registration.pr_number,
@@ -16241,7 +16337,25 @@ fn codex_review_request_response(
         "last_error": registration.last_error,
         "state": registration.state,
         "is_active": registration.is_active,
-    }))
+    });
+    let steps =
+        serde_json::from_str::<Value>(registration.steps_log_json.as_deref().unwrap_or("[]"))
+            .unwrap_or_else(|_| json!([]));
+    response["steps"] = steps;
+    response["chain_json"] = json!(registration.chain_json);
+    response["policy_source"] = json!(registration.policy_source);
+    response["step_index"] = json!(registration.step_index);
+    response["step_state"] = json!(registration.step_state);
+    response["step_started_at"] = json!(registration.step_started_at);
+    response["step_failures"] = json!(registration.step_failures);
+    response["steps_log_json"] = json!(registration.steps_log_json);
+    response["reviewer_session_id"] = json!(registration.reviewer_session_id);
+    response["checkout_snapshot"] = json!(registration.checkout_snapshot);
+    response["run_job_id"] = json!(registration.run_job_id);
+    response["reviewer_label"] = json!(registration.reviewer_label);
+    response["round"] = json!(registration.round);
+    response["findings_json"] = json!(registration.findings_json);
+    Ok(response)
 }
 
 /// Appendix H3: the board lane the job counts toward now, if any.
@@ -16593,6 +16707,19 @@ mod tests {
             last_error: None,
             state: "pending".into(),
             is_active: true,
+            chain_json: None,
+            policy_source: None,
+            step_index: 0,
+            step_state: None,
+            step_started_at: None,
+            step_failures: 0,
+            steps_log_json: None,
+            reviewer_session_id: None,
+            checkout_snapshot: None,
+            run_job_id: None,
+            reviewer_label: None,
+            round: 1,
+            findings_json: None,
         };
         let job = QueueJobRecord {
             quiet_alerted_at: None,
@@ -20379,7 +20506,7 @@ mod tests {
             (Method::POST, "/claims/worktree"),
             (Method::POST, "/worktrees/keep"),
             (Method::POST, "/queue-jobs"),
-            (Method::POST, "/codex-review-requests"),
+            (Method::POST, "/review-requests"),
             (Method::POST, "/docs"),
             (Method::POST, "/docs/zzzzzzzz/reviews"),
             (Method::POST, "/humans/rajesh/messages"),
@@ -20410,7 +20537,7 @@ mod tests {
                 }
                 "/queue-jobs" => json!({"type": "tests", "job_type": "tests", "label": "x",
                     "cwd": "/tmp", "argv": ["true"], "env": {}}),
-                "/codex-review-requests" => json!({"pr_number": 1, "repo": "acme/widgets",
+                "/review-requests" => json!({"pr_number": 1, "repo": "acme/widgets",
                     "poll_interval_seconds": 60, "retry_interval_seconds": 60}),
                 "/docs" => json!({"repo": "acme/widgets", "path": "a.md",
                     "commit_sha": "c".repeat(40), "session_id": "abc12345", "review": false}),
@@ -23510,6 +23637,23 @@ printf '%s' '{"models":[{"slug":"workspace-model","visibility":"list"}]}'
             .lock()
             .unwrap()
             .contains_key(ticket["ticket_id"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn codex_error_reply_does_not_depend_on_its_wording() {
+        let failure = json!({
+            "id": 78,
+            "body": "To use Codex here, create an environment for this repo.",
+            "user": { "login": "chatgpt-codex-connector[bot]" }
+        });
+        assert!(codex_comment_reports_review_failure(&failure, Some(77)));
+        assert!(!codex_comment_reports_review_failure(&failure, Some(78)));
+        let review = json!({
+            "id": 79,
+            "body": "Reviewed commit: `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`",
+            "user": { "login": "chatgpt-codex-connector[bot]" }
+        });
+        assert!(!codex_comment_reports_review_failure(&review, Some(77)));
     }
 
     #[test]

@@ -105,6 +105,19 @@ pub struct CodexReviewRequestRegistration {
     pub last_error: Option<String>,
     pub state: String,
     pub is_active: bool,
+    pub chain_json: Option<String>,
+    pub policy_source: Option<String>,
+    pub step_index: i64,
+    pub step_state: Option<String>,
+    pub step_started_at: Option<String>,
+    pub step_failures: i64,
+    pub steps_log_json: Option<String>,
+    pub reviewer_session_id: Option<String>,
+    pub checkout_snapshot: Option<String>,
+    pub run_job_id: Option<String>,
+    pub reviewer_label: Option<String>,
+    pub round: i64,
+    pub findings_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +150,15 @@ pub struct CompleteCodexReviewRequest {
     pub review_comment_id: Option<JsonValue>,
     pub review_url: Option<String>,
     pub last_polled_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewChannel {
+    pub state: String,
+    pub paused_at: Option<String>,
+    pub refusal_url: Option<String>,
+    pub next_check_at: Option<String>,
+    pub check_request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -530,6 +552,226 @@ impl RetainedQueueStore {
         &self.db_path
     }
 
+    pub fn github_review_channel_from_path(db_path: &Path) -> Result<ReviewChannel> {
+        let conn = Connection::open(db_path)?;
+        init_codex_review_requests_schema(&conn)?;
+        let channel = conn.query_row(
+            "SELECT state, paused_at, refusal_url, next_check_at, check_request_id FROM review_channels WHERE name = 'github_codex'",
+            [],
+            |row| Ok(ReviewChannel { state: row.get(0)?, paused_at: row.get(1)?, refusal_url: row.get(2)?, next_check_at: row.get(3)?, check_request_id: row.get(4)? }),
+        ).optional()?;
+        Ok(channel.unwrap_or(ReviewChannel {
+            state: "available".to_owned(),
+            paused_at: None,
+            refusal_url: None,
+            next_check_at: None,
+            check_request_id: None,
+        }))
+    }
+
+    /// Reserve the one probe after a quota pause. Other requests skip GitHub Codex.
+    pub fn reserve_github_review_check_in_path(
+        db_path: &Path,
+        request_id: &str,
+        now: &str,
+    ) -> Result<bool> {
+        let mut conn = Connection::open(db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        init_codex_review_requests_schema(&tx)?;
+        let channel = tx.query_row(
+            "SELECT state, next_check_at, check_request_id FROM review_channels WHERE name = 'github_codex'",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, Option<String>>(2)?)),
+        ).optional()?;
+        let allowed = match channel {
+            None => true,
+            Some((state, _, _)) if state == "available" => true,
+            Some((_, next_check, check_id)) => {
+                check_id.is_none() && next_check.as_deref().is_some_and(|due| due <= now)
+            }
+        };
+        if allowed {
+            tx.execute("UPDATE review_channels SET check_request_id = ?1, updated_at = ?2 WHERE name = 'github_codex' AND state = 'paused'", params![request_id, now])?;
+        }
+        tx.commit()?;
+        Ok(allowed)
+    }
+
+    /// Returns true only for the first refusal of this pause.
+    pub fn pause_github_review_channel_in_path(
+        db_path: &Path,
+        refusal_url: Option<&str>,
+        now: &str,
+        next_check_at: &str,
+    ) -> Result<bool> {
+        let mut conn = Connection::open(db_path)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        init_codex_review_requests_schema(&tx)?;
+        let previous = tx
+            .query_row(
+                "SELECT state, paused_at FROM review_channels WHERE name = 'github_codex'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let first = previous.as_ref().is_none_or(|(state, _)| state != "paused");
+        let paused_at = previous
+            .and_then(|(_, at)| at)
+            .filter(|_| !first)
+            .unwrap_or_else(|| now.to_owned());
+        tx.execute("INSERT INTO review_channels (name, state, paused_at, refusal_url, next_check_at, check_request_id, updated_at) VALUES ('github_codex', 'paused', ?1, ?2, ?3, NULL, ?4) ON CONFLICT(name) DO UPDATE SET state = 'paused', paused_at = excluded.paused_at, refusal_url = excluded.refusal_url, next_check_at = excluded.next_check_at, check_request_id = NULL, updated_at = excluded.updated_at", params![paused_at, refusal_url, next_check_at, now])?;
+        tx.commit()?;
+        Ok(first)
+    }
+
+    pub fn mark_github_review_available_in_path(
+        db_path: &Path,
+        request_id: &str,
+        now: &str,
+    ) -> Result<()> {
+        let conn = Connection::open(db_path)?;
+        conn.execute("UPDATE review_channels SET state = 'available', paused_at = NULL, refusal_url = NULL, next_check_at = NULL, check_request_id = NULL, updated_at = ?2 WHERE name = 'github_codex' AND check_request_id = ?1", params![request_id, now])?;
+        Ok(())
+    }
+
+    pub fn defer_github_review_check_in_path(
+        db_path: &Path,
+        request_id: &str,
+        next_check_at: &str,
+        now: &str,
+    ) -> Result<()> {
+        let conn = Connection::open(db_path)?;
+        conn.execute("UPDATE review_channels SET next_check_at = ?2, check_request_id = NULL, updated_at = ?3 WHERE name = 'github_codex' AND check_request_id = ?1", params![request_id, next_check_at, now])?;
+        Ok(())
+    }
+
+    pub fn request_github_review_check_in_path(db_path: &Path, now: &str) -> Result<()> {
+        let conn = Connection::open(db_path)?;
+        conn.execute("UPDATE review_channels SET next_check_at = ?1, updated_at = ?1 WHERE name = 'github_codex' AND state = 'paused'", [now])?;
+        Ok(())
+    }
+
+    pub fn mark_github_review_posted_in_path(
+        db_path: &Path,
+        request_id: &str,
+        comment_id: Option<i64>,
+        comment_url: Option<&str>,
+        posted_at: &str,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        let conn = Connection::open(db_path)?;
+        conn.execute("UPDATE codex_review_request_registrations SET latest_request_comment_id = ?2, latest_request_comment_url = ?3, latest_request_posted_at = ?4, step_state = 'posted', step_started_at = ?4, attempt_count = attempt_count + 1 WHERE id = ?1 AND is_active = 1", params![request_id, comment_id, comment_url, posted_at])?;
+        get_codex_review_request_conn(&conn, request_id)
+    }
+
+    pub fn reconcile_initial_review_head_in_path(
+        db_path: &Path,
+        request_id: &str,
+        head: &str,
+    ) -> Result<()> {
+        let conn = Connection::open(db_path)?;
+        conn.execute("UPDATE codex_review_request_registrations SET requested_head_sha = ?2 WHERE id = ?1 AND is_active = 1 AND step_state = 'posted' AND attempt_count = 1", params![request_id, head])?;
+        Ok(())
+    }
+
+    pub fn mark_github_review_step_in_path(
+        db_path: &Path,
+        request_id: &str,
+        step_state: &str,
+        failures: i64,
+        now: &str,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        let conn = Connection::open(db_path)?;
+        conn.execute("UPDATE codex_review_request_registrations SET step_state = ?2, step_failures = ?3, last_polled_at = ?4 WHERE id = ?1 AND is_active = 1", params![request_id, step_state, failures, now])?;
+        get_codex_review_request_conn(&conn, request_id)
+    }
+
+    pub fn assign_review_to_owner_in_path(
+        db_path: &Path,
+        request_id: &str,
+        owner: &str,
+        now: &str,
+        wake: &str,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        let conn = Connection::open(db_path)?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        init_schema(&conn)?;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let changed = conn.execute("UPDATE codex_review_request_registrations SET state = 'owner', is_active = 1, step_state = 'owner', step_started_at = ?2, reviewer_label = ?3 WHERE id = ?1 AND state = 'no_reviewer' AND is_active = 0", params![request_id, now, owner])?;
+            if changed == 0 {
+                return Ok(None);
+            }
+            let registration = get_codex_review_request_conn(&conn, request_id)?
+                .ok_or_else(|| anyhow::anyhow!("owner review request disappeared"))?;
+            enqueue_message_with_metadata_conn(
+                &conn,
+                &registration.notify_session_id,
+                wake,
+                "sequential",
+                QueueMessageMetadata::default(),
+            )?;
+            Ok(Some(registration))
+        })();
+        match result {
+            Ok(registration) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(registration)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    pub fn finish_github_review_step_in_path(
+        db_path: &Path,
+        request_id: &str,
+        reason: &str,
+        now: &str,
+        wake: &str,
+    ) -> Result<Option<CodexReviewRequestRegistration>> {
+        let conn = Connection::open(db_path)?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        init_schema(&conn)?;
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let Some(registration) = get_codex_review_request_conn(&conn, request_id)? else {
+                return Ok(None);
+            };
+            if !registration.is_active {
+                return Ok(None);
+            }
+            let started_at = registration
+                .step_started_at
+                .as_deref()
+                .unwrap_or(&registration.requested_at);
+            let log = serde_json::json!([{"index": 0, "label": "GitHub Codex", "started_at": started_at, "ended_at": now, "outcome": "failed", "reason": reason}]);
+            conn.execute("UPDATE codex_review_request_registrations SET steps_log_json = ?2, step_state = 'finished', state = 'no_reviewer', is_active = 0, last_polled_at = ?3, last_error = ?4, next_retry_at = NULL WHERE id = ?1 AND is_active = 1", params![request_id, log.to_string(), now, reason])?;
+            let finished = get_codex_review_request_conn(&conn, request_id)?
+                .ok_or_else(|| anyhow::anyhow!("finished review request disappeared"))?;
+            enqueue_message_with_metadata_conn(
+                &conn,
+                &finished.notify_session_id,
+                wake,
+                "sequential",
+                QueueMessageMetadata::default(),
+            )?;
+            Ok(Some(finished))
+        })();
+        match result {
+            Ok(finished) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(finished)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
     pub fn list_codex_review_requests_from_path(
         db_path: &Path,
         filters: CodexReviewRequestFilters,
@@ -542,6 +784,22 @@ impl RetainedQueueStore {
             Err(_) => return Ok(Vec::new()),
         };
         list_codex_review_requests_conn(&conn, filters)
+    }
+
+    /// Active requests from before review chains shipped keep their original
+    /// comment and head, but follow the current one-step GitHub Codex rules.
+    pub fn upgrade_legacy_review_request_in_path(db_path: &Path, request_id: &str) -> Result<()> {
+        let conn = Connection::open(db_path)?;
+        conn.execute(
+            "UPDATE codex_review_request_registrations SET \
+             chain_json = '[{\"kind\":\"github_codex\"}]', policy_source = 'default', \
+             step_index = 0, step_state = CASE WHEN pickup_detected_at IS NULL THEN 'posted' ELSE 'picked_up' END, \
+             step_started_at = COALESCE(latest_request_posted_at, requested_at), \
+             step_failures = 0, reviewer_label = 'GitHub Codex', round = COALESCE(round, 1) \
+             WHERE id = ?1 AND is_active = 1 AND chain_json IS NULL AND requested_head_sha IS NOT NULL",
+            [request_id],
+        )?;
+        Ok(())
     }
 
     pub fn ensure_codex_review_requests_schema_from_path(db_path: &Path) -> Result<()> {
@@ -690,7 +948,7 @@ impl RetainedQueueStore {
         reason: &str,
         wake_text: &str,
     ) -> Result<Option<CodexReviewRequestRegistration>> {
-        if !matches!(state, "expired" | "failed") {
+        if !matches!(state, "expired" | "failed" | "no_reviewer") {
             anyhow::bail!("invalid notifying Codex review request terminal state {state:?}");
         }
         if !db_path.exists() {
@@ -3414,7 +3672,29 @@ fn init_codex_review_requests_schema(conn: &Connection) -> Result<()> {
             last_polled_at TIMESTAMP,
             last_error TEXT,
             state TEXT NOT NULL,
-            is_active INTEGER DEFAULT 1
+            is_active INTEGER DEFAULT 1,
+            chain_json TEXT,
+            policy_source TEXT,
+            step_index INTEGER DEFAULT 0,
+            step_state TEXT,
+            step_started_at TEXT,
+            step_failures INTEGER DEFAULT 0,
+            steps_log_json TEXT,
+            reviewer_session_id TEXT,
+            checkout_snapshot TEXT,
+            run_job_id TEXT,
+            reviewer_label TEXT,
+            round INTEGER DEFAULT 1,
+            findings_json TEXT
+        );
+        CREATE TABLE IF NOT EXISTS review_channels (
+            name TEXT PRIMARY KEY,
+            state TEXT NOT NULL,
+            paused_at TEXT,
+            refusal_url TEXT,
+            next_check_at TEXT,
+            check_request_id TEXT,
+            updated_at TEXT NOT NULL
         );
         "#,
     )?;
@@ -3435,6 +3715,42 @@ fn init_codex_review_requests_schema(conn: &Connection) -> Result<()> {
         "codex_review_request_registrations",
         "superseded_at",
         "TIMESTAMP",
+    )?;
+    for (name, kind) in [
+        ("chain_json", "TEXT"),
+        ("policy_source", "TEXT"),
+        ("step_index", "INTEGER DEFAULT 0"),
+        ("step_state", "TEXT"),
+        ("step_started_at", "TEXT"),
+        ("step_failures", "INTEGER DEFAULT 0"),
+        ("steps_log_json", "TEXT"),
+        ("reviewer_session_id", "TEXT"),
+        ("checkout_snapshot", "TEXT"),
+        ("run_job_id", "TEXT"),
+        ("reviewer_label", "TEXT"),
+        ("round", "INTEGER DEFAULT 1"),
+        ("findings_json", "TEXT"),
+    ] {
+        ensure_column(conn, "codex_review_request_registrations", name, kind)?;
+    }
+    conn.execute_batch(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS release_finished_github_review_check
+        AFTER UPDATE OF is_active ON codex_review_request_registrations
+        WHEN OLD.is_active = 1 AND NEW.is_active = 0
+        BEGIN
+            UPDATE review_channels
+            SET check_request_id = NULL, updated_at = COALESCE(NEW.last_polled_at, updated_at)
+            WHERE check_request_id = NEW.id;
+        END;
+        UPDATE review_channels
+        SET check_request_id = NULL
+        WHERE check_request_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM codex_review_request_registrations
+              WHERE id = review_channels.check_request_id AND is_active = 1
+          );
+        "#,
     )?;
     Ok(())
 }
@@ -7113,7 +7429,10 @@ fn list_codex_review_requests_conn(
                latest_request_posted_at, attempt_count, next_retry_at,
                poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
                pickup_source, review_landed_at, review_source, review_comment_id,
-               review_url, last_polled_at, last_error, state, is_active
+               review_url, last_polled_at, last_error, state, is_active,
+               chain_json, policy_source, step_index, step_state, step_started_at,
+               step_failures, steps_log_json, reviewer_session_id, checkout_snapshot,
+               run_job_id, reviewer_label, round, findings_json
         FROM codex_review_request_registrations
     "#
     .to_owned();
@@ -7214,8 +7533,12 @@ fn create_codex_review_request_conn(
     }
 
     let latest_posted_at = request.latest_request_posted_at;
-    let next_retry_at =
-        codex_review_next_retry_at(&latest_posted_at, request.retry_interval_seconds)?;
+    let next_retry_at = None;
+    let completed_rounds: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM codex_review_request_registrations WHERE repo = ?1 AND pr_number = ?2 AND state = 'completed'",
+        params![request.repo, request.pr_number],
+        |row| row.get(0),
+    )?;
     let registration = CodexReviewRequestRegistration {
         id: generate_codex_review_request_id(),
         repo: request.repo,
@@ -7229,9 +7552,9 @@ fn create_codex_review_request_conn(
         requested_at: latest_posted_at.clone(),
         latest_request_comment_id: request.latest_request_comment_id,
         latest_request_comment_url: request.latest_request_comment_url,
-        latest_request_posted_at: Some(latest_posted_at),
-        attempt_count: 1,
-        next_retry_at: Some(next_retry_at),
+        latest_request_posted_at: None,
+        attempt_count: 0,
+        next_retry_at,
         poll_interval_seconds: request.poll_interval_seconds,
         retry_interval_seconds: request.retry_interval_seconds,
         pickup_detected_at: None,
@@ -7244,6 +7567,19 @@ fn create_codex_review_request_conn(
         last_error: None,
         state: "active".to_owned(),
         is_active: true,
+        chain_json: Some("[{\"kind\":\"github_codex\"}]".to_owned()),
+        policy_source: Some("default".to_owned()),
+        step_index: 0,
+        step_state: Some("queued".to_owned()),
+        step_started_at: Some(latest_posted_at),
+        step_failures: 0,
+        steps_log_json: Some("[]".to_owned()),
+        reviewer_session_id: None,
+        checkout_snapshot: None,
+        run_job_id: None,
+        reviewer_label: Some("GitHub Codex".to_owned()),
+        round: completed_rounds + 1,
+        findings_json: None,
     };
     conn.execute(
         r#"
@@ -7275,7 +7611,9 @@ fn create_codex_review_request_conn(
              latest_request_posted_at, attempt_count, next_retry_at,
              poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
              pickup_source, review_landed_at, review_source, review_comment_id,
-             review_url, last_polled_at, last_error, state, is_active)
+             review_url, last_polled_at, last_error, state, is_active,
+             chain_json, policy_source, step_index, step_state, step_started_at,
+             step_failures, steps_log_json, reviewer_label, round)
         VALUES
             (?1, ?2, ?3, ?4, ?5, ?6,
              ?7, NULL, NULL,
@@ -7283,7 +7621,9 @@ fn create_codex_review_request_conn(
              ?11, ?12, ?13,
              ?14, ?15, NULL,
              NULL, NULL, NULL, NULL,
-             NULL, NULL, NULL, ?16, 1)
+             NULL, NULL, NULL, ?16, 1,
+             ?17, ?18, ?19, ?20, ?21,
+             ?22, ?23, ?24, ?25)
         "#,
         params![
             registration.id,
@@ -7302,6 +7642,15 @@ fn create_codex_review_request_conn(
             registration.poll_interval_seconds,
             registration.retry_interval_seconds,
             registration.state,
+            registration.chain_json,
+            registration.policy_source,
+            registration.step_index,
+            registration.step_state,
+            registration.step_started_at,
+            registration.step_failures,
+            registration.steps_log_json,
+            registration.reviewer_label,
+            registration.round,
         ],
     )?;
     Ok(registration)
@@ -7319,7 +7668,10 @@ fn get_codex_review_request_conn(
                latest_request_posted_at, attempt_count, next_retry_at,
                poll_interval_seconds, retry_interval_seconds, pickup_detected_at,
                pickup_source, review_landed_at, review_source, review_comment_id,
-               review_url, last_polled_at, last_error, state, is_active
+               review_url, last_polled_at, last_error, state, is_active,
+               chain_json, policy_source, step_index, step_state, step_started_at,
+               step_failures, steps_log_json, reviewer_session_id, checkout_snapshot,
+               run_job_id, reviewer_label, round, findings_json
         FROM codex_review_request_registrations
         WHERE id = ?1
         LIMIT 1
@@ -7373,6 +7725,19 @@ fn codex_review_request_registration_from_row(
         last_error: row.get(24)?,
         state: row.get(25)?,
         is_active: row.get::<_, Option<i64>>(26)?.unwrap_or(1) != 0,
+        chain_json: row.get(27)?,
+        policy_source: row.get(28)?,
+        step_index: row.get::<_, Option<i64>>(29)?.unwrap_or(0),
+        step_state: row.get(30)?,
+        step_started_at: row.get(31)?,
+        step_failures: row.get::<_, Option<i64>>(32)?.unwrap_or(0),
+        steps_log_json: row.get(33)?,
+        reviewer_session_id: row.get(34)?,
+        checkout_snapshot: row.get(35)?,
+        run_job_id: row.get(36)?,
+        reviewer_label: row.get(37)?,
+        round: row.get::<_, Option<i64>>(38)?.unwrap_or(1),
+        findings_json: row.get(39)?,
     })
 }
 
@@ -7857,14 +8222,6 @@ fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
-}
-
-fn codex_review_next_retry_at(posted_at: &str, retry_interval_seconds: i64) -> Result<String> {
-    let posted_at = parse_queue_datetime(posted_at)
-        .or_else(|| parse_python_naive_datetime(posted_at).map(PrimitiveDateTime::assume_utc))
-        .unwrap_or_else(OffsetDateTime::now_utc);
-    let next_retry_at = posted_at + Duration::seconds(retry_interval_seconds.max(1));
-    Ok(next_retry_at.format(&Rfc3339)?)
 }
 
 fn timeout_at_rfc3339(timeout_seconds: Option<u64>) -> Result<Option<String>> {

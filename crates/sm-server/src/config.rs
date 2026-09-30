@@ -49,7 +49,6 @@ pub struct AppConfig {
     pub codex_observability: CodexObservabilityConfig,
     pub claude: ProviderLaunchConfig,
     pub codex: ProviderLaunchConfig,
-    pub codex_review: CodexReviewConfig,
     pub codex_fork: CodexForkLaunchConfig,
     pub nodes: NodesConfig,
     pub queue_runner: QueueRunnerConfig,
@@ -121,7 +120,6 @@ impl Default for AppConfig {
                 Some("~/.codex/session_index.jsonl".to_owned()),
                 None,
             ),
-            codex_review: CodexReviewConfig::default(),
             codex_fork: CodexForkLaunchConfig::default(),
             nodes: NodesConfig::default(),
             queue_runner: QueueRunnerConfig::default(),
@@ -1182,45 +1180,6 @@ impl Default for ProviderLaunchConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct CodexReviewConfig {
-    #[serde(default = "default_codex_review_default_wait")]
-    pub default_wait: u64,
-    #[serde(default = "default_codex_review_menu_settle_seconds")]
-    pub menu_settle_seconds: f64,
-    #[serde(default = "default_codex_review_branch_settle_seconds")]
-    pub branch_settle_seconds: f64,
-    #[serde(default = "default_codex_review_steer_delay_seconds")]
-    pub steer_delay_seconds: f64,
-}
-
-impl Default for CodexReviewConfig {
-    fn default() -> Self {
-        Self {
-            default_wait: default_codex_review_default_wait(),
-            menu_settle_seconds: default_codex_review_menu_settle_seconds(),
-            branch_settle_seconds: default_codex_review_branch_settle_seconds(),
-            steer_delay_seconds: default_codex_review_steer_delay_seconds(),
-        }
-    }
-}
-
-fn default_codex_review_default_wait() -> u64 {
-    600
-}
-
-fn default_codex_review_menu_settle_seconds() -> f64 {
-    1.0
-}
-
-fn default_codex_review_branch_settle_seconds() -> f64 {
-    1.0
-}
-
-fn default_codex_review_steer_delay_seconds() -> f64 {
-    5.0
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexForkLaunchConfig {
     pub command: String,
@@ -2151,6 +2110,8 @@ struct RawConfig {
     #[serde(default)]
     codex: RawCodexConfig,
     #[serde(default)]
+    codex_review: Option<YamlValue>,
+    #[serde(default)]
     codex_fork: RawCodexForkLaunchConfig,
     #[serde(default)]
     nodes: YamlValue,
@@ -2200,7 +2161,12 @@ impl From<RawConfig> for AppConfig {
             vec!["--permission-mode".to_owned(), "auto".to_owned()],
             None,
         );
-        let codex_review = raw.codex.review;
+        if raw.codex_review.is_some() || raw.codex.review.is_some() {
+            static LEGACY_REVIEW_WARNING: OnceLock<()> = OnceLock::new();
+            LEGACY_REVIEW_WARNING.get_or_init(|| {
+                eprintln!("config: [codex_review] is no longer used and is ignored");
+            });
+        }
         let codex = provider_launch_config(
             raw.codex.provider,
             "codex",
@@ -2275,7 +2241,6 @@ impl From<RawConfig> for AppConfig {
             codex_observability,
             claude,
             codex,
-            codex_review,
             codex_fork,
             nodes: nodes_config_from_yaml(raw.nodes),
             queue_runner,
@@ -2358,7 +2323,7 @@ struct RawCodexConfig {
     #[serde(flatten)]
     provider: RawProviderLaunchConfig,
     #[serde(default)]
-    review: CodexReviewConfig,
+    review: Option<YamlValue>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -3807,7 +3772,7 @@ claude:
     }
 
     #[test]
-    fn raw_config_reads_codex_launch_and_review_timing() {
+    fn raw_config_ignores_legacy_review_timing() {
         let raw: RawConfig = serde_yaml::from_str(
             r#"
 codex:
@@ -3832,10 +3797,6 @@ codex:
             config.codex.session_index_path.as_deref(),
             Some("/tmp/codex/session_index.jsonl")
         );
-        assert_eq!(config.codex_review.default_wait, 42);
-        assert_eq!(config.codex_review.menu_settle_seconds, 0.25);
-        assert_eq!(config.codex_review.branch_settle_seconds, 0.5);
-        assert_eq!(config.codex_review.steer_delay_seconds, 0.75);
     }
 
     #[test]

@@ -263,8 +263,6 @@ struct StubGitHubReviewPoster {
     // posted `@codex review` comments is at most `failing_through_post`.
     // Reviews are withheld until that many posts have failed.
     review_failure: Arc<Mutex<Option<(GitHubReviewMatch, usize)>>>,
-    // Posts beyond this count fail until it is raised.
-    post_failures_after: Arc<Mutex<Option<usize>>>,
     // When set, a post records its call and then blocks until released.
     post_release: Arc<Mutex<Option<mpsc::Receiver<()>>>>,
 }
@@ -289,7 +287,6 @@ impl StubGitHubReviewPoster {
             head_after_post: Arc::new(Mutex::new(None)),
             pickup_detected: Arc::new(Mutex::new(false)),
             review_failure: Arc::new(Mutex::new(None)),
-            post_failures_after: Arc::new(Mutex::new(None)),
             post_release: Arc::new(Mutex::new(None)),
         }
     }
@@ -306,7 +303,6 @@ impl StubGitHubReviewPoster {
             head_after_post: Arc::new(Mutex::new(None)),
             pickup_detected: Arc::new(Mutex::new(false)),
             review_failure: Arc::new(Mutex::new(None)),
-            post_failures_after: Arc::new(Mutex::new(None)),
             post_release: Arc::new(Mutex::new(None)),
         }
     }
@@ -317,11 +313,6 @@ impl StubGitHubReviewPoster {
 
     fn with_fresh_review(self, review_match: GitHubReviewMatch) -> Self {
         self.fresh_reviews.lock().unwrap().push_back(review_match);
-        self
-    }
-
-    fn with_fresh_reviews(self, review_matches: Vec<GitHubReviewMatch>) -> Self {
-        *self.fresh_reviews.lock().unwrap() = review_matches.into_iter().collect();
         self
     }
 
@@ -355,10 +346,6 @@ impl StubGitHubReviewPoster {
         release
     }
 
-    fn fail_posts_after(&self, successful_posts: Option<usize>) {
-        *self.post_failures_after.lock().unwrap() = successful_posts;
-    }
-
     fn active_review_failure(&self) -> Option<GitHubReviewMatch> {
         let posts = self.calls.lock().unwrap().len();
         self.review_failure
@@ -377,11 +364,6 @@ impl GitHubReviewPoster for StubGitHubReviewPoster {
         pr_number: i64,
         steer: Option<&str>,
     ) -> Result<GitHubReviewComment, String> {
-        if let Some(limit) = *self.post_failures_after.lock().unwrap() {
-            if self.calls.lock().unwrap().len() >= limit {
-                return Err("gh pr comment failed: transient".to_owned());
-            }
-        }
         self.calls
             .lock()
             .unwrap()
@@ -480,6 +462,19 @@ fn codex_review_failure_comment() -> GitHubReviewMatch {
         id: Some(json!(4701300001_i64)),
         url: Some(
             "https://github.com/rajeshgoli/session-manager/pull/971#issuecomment-4701300001"
+                .to_owned(),
+        ),
+        head_sha: None,
+    }
+}
+
+fn codex_review_quota_comment() -> GitHubReviewMatch {
+    GitHubReviewMatch {
+        source: "quota".to_owned(),
+        created_at: test_now_rfc3339(),
+        id: Some(json!(4701300099_i64)),
+        url: Some(
+            "https://github.com/rajeshgoli/session-manager/pull/971#issuecomment-4701300099"
                 .to_owned(),
         ),
         head_sha: None,
@@ -2049,12 +2044,12 @@ async fn codex_review_requests_missing_db_returns_empty_requests() {
         ..AppConfig::default()
     }));
 
-    let (status, payload) = get_json(app.clone(), "/codex-review-requests").await;
+    let (status, payload) = get_json(app.clone(), "/review-requests").await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload, json!({ "requests": [] }));
 
-    let (status, payload) = get_json(app, "/codex-review-requests/missing").await;
+    let (status, payload) = get_json(app, "/review-requests/missing").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(payload["detail"], "Codex review request not found");
 }
@@ -2126,7 +2121,7 @@ async fn codex_review_requests_lists_rows_with_filters_and_session_names() {
         ..AppConfig::default()
     }));
 
-    let (status, payload) = get_json(app.clone(), "/codex-review-requests").await;
+    let (status, payload) = get_json(app.clone(), "/review-requests").await;
     assert_eq!(status, StatusCode::OK);
     let requests = payload["requests"].as_array().unwrap();
     assert_eq!(requests.len(), 2);
@@ -2141,7 +2136,7 @@ async fn codex_review_requests_lists_rows_with_filters_and_session_names() {
     assert_eq!(requests[1]["id"], "active-new");
     assert_eq!(requests[1]["review_comment_id"], "R_kw123");
 
-    let (status, payload) = get_json(app.clone(), "/codex-review-requests/active-old").await;
+    let (status, payload) = get_json(app.clone(), "/review-requests/active-old").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["id"], "active-old");
     assert_eq!(payload["repo"], "rajeshgoli/session-manager");
@@ -2152,13 +2147,13 @@ async fn codex_review_requests_lists_rows_with_filters_and_session_names() {
     assert_eq!(payload["review_comment_id"], 222);
     assert_eq!(payload["is_active"], true);
 
-    let (status, payload) = get_json(app.clone(), "/codex-review-requests/missing").await;
+    let (status, payload) = get_json(app.clone(), "/review-requests/missing").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(payload["detail"], "Codex review request not found");
 
     let (status, payload) = get_json(
         app.clone(),
-        "/codex-review-requests?repo=rajeshgoli/session-manager&pr_number=830&notify_target=notify1",
+        "/review-requests?repo=rajeshgoli/session-manager&pr_number=830&notify_target=notify1",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -2171,15 +2166,14 @@ async fn codex_review_requests_lists_rows_with_filters_and_session_names() {
 
     let (status, payload) = get_json(
         app.clone(),
-        "/codex-review-requests?repo=rajeshgoli/session-manager&pr_number=830&notify_target=reviewer",
+        "/review-requests?repo=rajeshgoli/session-manager&pr_number=830&notify_target=reviewer",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["requests"].as_array().unwrap().len(), 1);
     assert_eq!(payload["requests"][0]["id"], "active-old");
 
-    let (status, payload) =
-        get_json(app.clone(), "/codex-review-requests?include_inactive=true").await;
+    let (status, payload) = get_json(app.clone(), "/review-requests?include_inactive=true").await;
     assert_eq!(status, StatusCode::OK);
     let ids = payload["requests"]
         .as_array()
@@ -2189,7 +2183,7 @@ async fn codex_review_requests_lists_rows_with_filters_and_session_names() {
         .collect::<Vec<_>>();
     assert_eq!(ids, vec!["active-old", "inactive", "active-new"]);
 
-    let (status, payload) = get_json(app, "/codex-review-requests/inactive").await;
+    let (status, payload) = get_json(app, "/review-requests/inactive").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["id"], "inactive");
     assert_eq!(payload["state"], "cancelled");
@@ -2215,7 +2209,7 @@ async fn codex_review_request_cancel_updates_active_row_and_preserves_inactive_r
     let app = router(AppState::new(config));
 
     let (status, payload) =
-        delete_json(app.clone(), "/codex-review-requests/active-old", json!({})).await;
+        delete_json(app.clone(), "/review-requests/active-old", json!({})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["id"], "active-old");
     assert_eq!(payload["state"], "cancelled");
@@ -2233,7 +2227,7 @@ async fn codex_review_request_cancel_updates_active_row_and_preserves_inactive_r
     assert_eq!(state, "cancelled");
     assert_eq!(is_active, 0);
 
-    let (status, payload) = get_json(app.clone(), "/codex-review-requests").await;
+    let (status, payload) = get_json(app.clone(), "/review-requests").await;
     assert_eq!(status, StatusCode::OK);
     let active_ids = payload["requests"]
         .as_array()
@@ -2243,7 +2237,7 @@ async fn codex_review_request_cancel_updates_active_row_and_preserves_inactive_r
         .collect::<Vec<_>>();
     assert_eq!(active_ids, vec!["active-new"]);
 
-    let (status, payload) = delete_json(app, "/codex-review-requests/inactive", json!({})).await;
+    let (status, payload) = delete_json(app, "/review-requests/inactive", json!({})).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["id"], "inactive");
     assert_eq!(payload["state"], "cancelled");
@@ -2307,7 +2301,7 @@ async fn codex_review_request_create_posts_and_persists_active_row() {
 
     let (status, payload) = post_json(
         app.clone(),
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 967,
             "repo": "rajeshgoli/session-manager",
@@ -2357,7 +2351,7 @@ async fn codex_review_request_create_posts_and_persists_active_row() {
     );
 
     let conn = Connection::open(&queue_db).unwrap();
-    let row: (String, i64, String, i64, String, String, i64) = conn
+    let row: (String, i64, String, i64, String, Option<String>, i64) = conn
         .query_row(
             r#"
             SELECT id, latest_request_comment_id, latest_request_comment_url,
@@ -2387,12 +2381,304 @@ async fn codex_review_request_create_posts_and_persists_active_row() {
     );
     assert_eq!(row.3, 1);
     assert_eq!(row.4, "active");
-    assert!(row.5 > test_now_rfc3339());
+    assert!(row.5.is_none());
     assert_eq!(row.6, 1);
 
-    let (status, payload) = get_json(app, &format!("/codex-review-requests/{request_id}")).await;
+    let (status, payload) = get_json(app, &format!("/review-requests/{request_id}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["id"], request_id);
+}
+
+#[tokio::test]
+async fn github_quota_pauses_channel_and_skips_the_next_request() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("review-quota.db");
+    let poster = StubGitHubReviewPoster::successful();
+    poster.set_review_failure(codex_review_quota_comment(), usize::MAX);
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+    let first = json!({"pr_number": 971, "repo": "rajeshgoli/session-manager", "notify_target": "run12345", "poll_interval_seconds": 1});
+    let (status, first) = post_json(app.clone(), "/review-requests", first).await;
+    assert_eq!(status, StatusCode::OK);
+    let first_id = first["id"].as_str().unwrap();
+    let mut completed = false;
+    for _ in 0..30 {
+        let current: String = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM codex_review_request_registrations WHERE id = ?1",
+                [first_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if current == "no_reviewer" {
+            completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        completed,
+        "quota refusal should end the GitHub-only chain promptly"
+    );
+    let channel: (String, Option<String>) = Connection::open(&queue_db)
+        .unwrap()
+        .query_row(
+            "SELECT state, next_check_at FROM review_channels WHERE name = 'github_codex'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(channel.0, "paused");
+    assert!(channel.1.is_some());
+    assert_eq!(poster.calls().len(), 1);
+    let second = json!({"pr_number": 972, "repo": "rajeshgoli/session-manager", "notify_target": "run12345"});
+    let (status, second) = post_json(app, "/review-requests", second).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["state"], "no_reviewer");
+    assert_eq!(
+        poster.calls().len(),
+        1,
+        "the paused channel must not post again"
+    );
+}
+
+#[tokio::test]
+async fn ending_a_reserved_quota_probe_allows_the_next_request_to_check() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("review-probe-release.db");
+    let poster = StubGitHubReviewPoster::successful();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+    let (status, first) = post_json(
+        app.clone(),
+        "/review-requests",
+        json!({
+            "pr_number": 971, "repo": "rajeshgoli/session-manager", "notify_target": "run12345"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let first_id = first["id"].as_str().unwrap();
+    let conn = Connection::open(&queue_db).unwrap();
+    conn.execute(
+        "INSERT INTO review_channels (name, state, next_check_at, check_request_id, updated_at) VALUES ('github_codex', 'paused', '2020-01-01T00:00:00Z', ?1, '2020-01-01T00:00:00Z')",
+        [first_id],
+    ).unwrap();
+    RetainedQueueStore::cancel_codex_review_request_in_path(&queue_db, first_id).unwrap();
+    let check_id: Option<String> = conn
+        .query_row(
+            "SELECT check_request_id FROM review_channels WHERE name = 'github_codex'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(check_id.is_none());
+    let (status, second) = post_json(
+        app,
+        "/review-requests",
+        json!({
+            "pr_number": 972, "repo": "rajeshgoli/session-manager", "notify_target": "run12345"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(second["state"], "active");
+    assert_eq!(poster.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn github_error_reposts_once_then_stops() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("review-error-twice.db");
+    let poster = StubGitHubReviewPoster::successful();
+    poster.set_review_failure(codex_review_failure_comment(), usize::MAX);
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+    let (status, response) = post_json(app, "/review-requests", json!({
+        "pr_number": 971, "repo": "rajeshgoli/session-manager", "notify_target": "run12345", "poll_interval_seconds": 1,
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    let id = response["id"].as_str().unwrap();
+    let mut waiting_for_repost = false;
+    for _ in 0..30 {
+        let step_state: String = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT step_state FROM codex_review_request_registrations WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if step_state == "error_wait" {
+            waiting_for_repost = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(waiting_for_repost);
+    Connection::open(&queue_db).unwrap().execute(
+        "UPDATE codex_review_request_registrations SET step_started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3 minutes') WHERE id = ?1",
+        [id],
+    ).unwrap();
+    let mut outcome = None;
+    for _ in 0..50 {
+        let row: (String, i64, Option<String>) = Connection::open(&queue_db).unwrap().query_row(
+            "SELECT state, attempt_count, last_error FROM codex_review_request_registrations WHERE id = ?1", [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).unwrap();
+        if row.0 == "no_reviewer" {
+            outcome = Some(row);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        outcome,
+        Some((
+            "no_reviewer".to_owned(),
+            2,
+            Some("reported an error twice".to_owned())
+        ))
+    );
+    assert_eq!(poster.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn failed_codex_error_repost_ends_without_repeating_comments() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("review-repost-fails.db");
+    let poster = StubGitHubReviewPoster::successful();
+    poster.set_review_failure(codex_review_failure_comment(), usize::MAX);
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+    let (status, response) = post_json(app, "/review-requests", json!({
+        "pr_number": 971, "repo": "rajeshgoli/session-manager", "notify_target": "run12345", "poll_interval_seconds": 1
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    let id = response["id"].as_str().unwrap();
+    for _ in 0..30 {
+        let step: String = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT step_state FROM codex_review_request_registrations WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if step == "error_wait" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    *poster.result.lock().unwrap() = Err("post failed".to_owned());
+    Connection::open(&queue_db).unwrap().execute(
+        "UPDATE codex_review_request_registrations SET step_started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3 minutes') WHERE id = ?1", [id]
+    ).unwrap();
+    let mut final_state = None;
+    for _ in 0..50 {
+        let row: (String, Option<String>) = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state, last_error FROM codex_review_request_registrations WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        if row.0 == "no_reviewer" {
+            final_state = Some(row);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        final_state,
+        Some((
+            "no_reviewer".to_owned(),
+            Some("failed to repost after Codex error: post failed".to_owned())
+        ))
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(poster.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn github_silence_stops_without_reposting() {
+    let state_file = write_session_fixture();
+    let queue_db = state_file.with_extension("review-silence.db");
+    let poster = StubGitHubReviewPoster::successful();
+    let mut config = AppConfig {
+        paths: PathsConfig {
+            state_file: state_file.display().to_string(),
+        },
+        sm_send: SmSendConfig {
+            db_path: queue_db.display().to_string(),
+        },
+        ..AppConfig::default()
+    };
+    config.rust_core.fixture_writes_enabled = true;
+    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
+    let (status, response) = post_json(app, "/review-requests", json!({
+        "pr_number": 971, "repo": "rajeshgoli/session-manager", "notify_target": "run12345", "poll_interval_seconds": 1,
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    let id = response["id"].as_str().unwrap();
+    Connection::open(&queue_db).unwrap().execute(
+        "UPDATE codex_review_request_registrations SET latest_request_posted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-6 minutes') WHERE id = ?1", [id],
+    ).unwrap();
+    let mut state = String::new();
+    for _ in 0..30 {
+        state = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM codex_review_request_registrations WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if state == "no_reviewer" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(state, "no_reviewer");
+    assert_eq!(poster.calls().len(), 1);
 }
 
 #[tokio::test]
@@ -2423,7 +2709,7 @@ async fn codex_review_request_create_survives_client_disconnect() {
     // The client goes away while the `@codex review` comment is being posted.
     let abandoned = tokio::spawn(post_json(
         app.clone(),
-        "/codex-review-requests",
+        "/review-requests",
         create_body.clone(),
     ));
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -2435,7 +2721,7 @@ async fn codex_review_request_create_survives_client_disconnect() {
     assert!(abandoned.await.unwrap_err().is_cancelled());
 
     // Creation is still in flight, so a concurrent create is refused.
-    let (status, _) = post_json(app.clone(), "/codex-review-requests", create_body.clone()).await;
+    let (status, _) = post_json(app.clone(), "/review-requests", create_body.clone()).await;
     assert_eq!(status, StatusCode::CONFLICT);
 
     // Creation finishes without its client and registers the posted comment.
@@ -2444,12 +2730,14 @@ async fn codex_review_request_create_survives_client_disconnect() {
     let registered = loop {
         let (status, payload) = get_json(
             app.clone(),
-            "/codex-review-requests?repo=rajeshgoli%2Fsession-manager&pr_number=967",
+            "/review-requests?repo=rajeshgoli%2Fsession-manager&pr_number=967",
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         if let Some(request) = payload["requests"].as_array().and_then(|rows| rows.first()) {
-            break request.clone();
+            if request["latest_request_comment_id"].as_i64() == Some(4701290334) {
+                break request.clone();
+            }
         }
         assert!(
             Instant::now() < deadline,
@@ -2463,7 +2751,7 @@ async fn codex_review_request_create_survives_client_disconnect() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let payload = loop {
         let (status, payload) =
-            post_json(app.clone(), "/codex-review-requests", create_body.clone()).await;
+            post_json(app.clone(), "/review-requests", create_body.clone()).await;
         if status == StatusCode::OK {
             break payload;
         }
@@ -2498,7 +2786,7 @@ async fn codex_review_request_create_reconciles_head_after_post() {
 
     let (status, payload) = post_json(
         app,
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 967,
             "repo": "rajeshgoli/session-manager",
@@ -2524,262 +2812,6 @@ async fn codex_review_request_create_reconciles_head_after_post() {
         )
         .unwrap();
     assert_eq!(persisted_head, "2222222222222222222222222222222222222222");
-}
-
-#[tokio::test]
-async fn pr_review_route_posts_comment_and_returns_python_shape() {
-    let state_file = unique_temp_path();
-    fs::write(
-        &state_file,
-        json!({
-            "sessions": [
-                {
-                    "id": "caller1",
-                    "name": "codex-fork-caller1",
-                    "working_dir": "/repo/caller",
-                    "tmux_session": "codex-fork-caller1",
-                    "log_file": "/tmp/caller1.log",
-                    "status": "running",
-                    "created_at": "2026-06-01T00:00:00Z",
-                    "last_activity": "2026-06-01T00:01:00Z",
-                    "provider": "codex-fork"
-                }
-            ]
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let queue_db = state_file.with_extension("pr-review-route-message-queue.db");
-    let poster = StubGitHubReviewPoster::successful().with_fresh_review(GitHubReviewMatch {
-        source: "review".to_owned(),
-        created_at: "2026-06-14T02:30:01Z".to_owned(),
-        id: Some(json!("PRR_kw123")),
-        url: Some(
-            "https://github.com/rajeshgoli/session-manager/pull/967#pullrequestreview-1".to_owned(),
-        ),
-        head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
-    });
-    let mut config = AppConfig::default();
-    config.paths.state_file = state_file.display().to_string();
-    config.sm_send.db_path = queue_db.display().to_string();
-    config.rust_core.fixture_writes_enabled = true;
-    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
-
-    let (status, payload) = post_json(
-        app,
-        "/reviews/pr",
-        json!({
-            "pr_number": 967,
-            "repo": "rajeshgoli/session-manager",
-            "steer": "focus create",
-            "wait": 600,
-            "caller_session_id": "caller1"
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["repo"], "rajeshgoli/session-manager");
-    assert_eq!(payload["pr_number"], 967);
-    assert!(payload["posted_at"].as_str().is_some());
-    assert_eq!(payload["comment_id"], 4701290334_i64);
-    assert_eq!(
-        payload["comment_body"],
-        "@codex review\n\nSteer: focus create"
-    );
-    assert_eq!(payload["status"], "posted");
-    assert_eq!(payload["server_polling"], true);
-    assert_eq!(
-        poster.calls(),
-        vec![(
-            "rajeshgoli/session-manager".to_owned(),
-            967,
-            Some("focus create".to_owned())
-        )]
-    );
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        queued_message_texts(&queue_db, "caller1"),
-        vec!["Review --pr 967 (rajeshgoli/session-manager) completed: Codex posted review on PR #967"]
-    );
-}
-
-#[tokio::test]
-async fn pr_review_route_wait_ignores_issue_comments_until_review_or_timeout() {
-    let state_file = unique_temp_path();
-    fs::write(
-        &state_file,
-        json!({
-            "sessions": [
-                {
-                    "id": "caller-comment",
-                    "name": "codex-fork-caller-comment",
-                    "working_dir": "/repo/caller",
-                    "tmux_session": "codex-fork-caller-comment",
-                    "log_file": "/tmp/caller-comment.log",
-                    "status": "running",
-                    "created_at": "2026-06-01T00:00:00Z",
-                    "last_activity": "2026-06-01T00:01:00Z",
-                    "provider": "codex-fork"
-                }
-            ]
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let queue_db = state_file.with_extension("pr-review-route-comment-message-queue.db");
-    let poster = StubGitHubReviewPoster::successful().with_fresh_review(GitHubReviewMatch {
-        source: "comment".to_owned(),
-        created_at: "2026-06-14T02:30:01Z".to_owned(),
-        id: Some(json!(4701300000_i64)),
-        url: Some(
-            "https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701300000"
-                .to_owned(),
-        ),
-        head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
-    });
-    let mut config = AppConfig::default();
-    config.paths.state_file = state_file.display().to_string();
-    config.sm_send.db_path = queue_db.display().to_string();
-    config.rust_core.fixture_writes_enabled = true;
-    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster)));
-
-    let (status, payload) = post_json(
-        app,
-        "/reviews/pr",
-        json!({
-            "pr_number": 967,
-            "repo": "rajeshgoli/session-manager",
-            "wait": 1,
-            "caller_session_id": "caller-comment"
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["server_polling"], true);
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    assert_eq!(
-        queued_message_texts(&queue_db, "caller-comment"),
-        vec!["Review --pr 967 (rajeshgoli/session-manager) timed out after 1s"]
-    );
-}
-
-#[tokio::test]
-async fn pr_review_route_wait_completes_when_comment_precedes_review() {
-    let state_file = unique_temp_path();
-    fs::write(
-        &state_file,
-        json!({
-            "sessions": [
-                {
-                    "id": "caller-review",
-                    "name": "codex-fork-caller-review",
-                    "working_dir": "/repo/caller",
-                    "tmux_session": "codex-fork-caller-review",
-                    "log_file": "/tmp/caller-review.log",
-                    "status": "running",
-                    "created_at": "2026-06-01T00:00:00Z",
-                    "last_activity": "2026-06-01T00:01:00Z",
-                    "provider": "codex-fork"
-                }
-            ]
-        })
-        .to_string(),
-    )
-    .unwrap();
-    let queue_db = state_file.with_extension("pr-review-route-real-review-message-queue.db");
-    let poster = StubGitHubReviewPoster::successful().with_fresh_reviews(vec![
-        GitHubReviewMatch {
-            source: "comment".to_owned(),
-            created_at: "2026-06-14T02:30:01Z".to_owned(),
-            id: Some(json!(4701300000_i64)),
-            url: Some(
-                "https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701300000"
-                    .to_owned(),
-            ),
-            head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
-        },
-        GitHubReviewMatch {
-            source: "review".to_owned(),
-            created_at: "2026-06-14T02:30:30Z".to_owned(),
-            id: Some(json!("PRR_kw123")),
-            url: Some(
-                "https://github.com/rajeshgoli/session-manager/pull/967#pullrequestreview-1"
-                    .to_owned(),
-            ),
-            head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
-        },
-    ]);
-    let mut config = AppConfig::default();
-    config.paths.state_file = state_file.display().to_string();
-    config.sm_send.db_path = queue_db.display().to_string();
-    config.rust_core.fixture_writes_enabled = true;
-    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster)));
-
-    let (status, payload) = post_json(
-        app,
-        "/reviews/pr",
-        json!({
-            "pr_number": 967,
-            "repo": "rajeshgoli/session-manager",
-            "wait": 600,
-            "caller_session_id": "caller-review"
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["server_polling"], true);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(
-        queued_message_texts(&queue_db, "caller-review"),
-        vec!["Review --pr 967 (rajeshgoli/session-manager) completed: Codex posted review on PR #967"]
-    );
-}
-
-#[tokio::test]
-async fn pr_review_route_returns_error_payloads_and_preserves_write_gate() {
-    let poster = StubGitHubReviewPoster::failing("PR #999 not found in owner/repo");
-    let mut config = AppConfig::default();
-    config.rust_core.fixture_writes_enabled = true;
-    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
-
-    let (status, payload) = post_json(
-        app.clone(),
-        "/reviews/pr",
-        json!({
-            "pr_number": 999,
-            "repo": "owner/repo"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["error"], "PR #999 not found in owner/repo");
-    assert_eq!(poster.calls(), vec![("owner/repo".to_owned(), 999, None)]);
-
-    let (status, payload) = post_json(app.clone(), "/reviews/pr", json!({ "pr_number": 42 })).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        payload["error"],
-        "Could not determine repo. Provide --repo or run from a git directory."
-    );
-
-    let gated_app = router(AppState::new(AppConfig::default()));
-    let (status, payload) = post_json(
-        gated_app,
-        "/reviews/pr",
-        json!({
-            "pr_number": 42,
-            "repo": "owner/repo"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(payload["detail"]
-        .as_str()
-        .unwrap()
-        .contains("Rust core writes are disabled"));
 }
 
 #[tokio::test]
@@ -2829,7 +2861,7 @@ async fn codex_review_request_watcher_completes_and_queues_wake() {
 
     let (status, payload) = post_json(
         app,
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 967,
             "repo": "rajeshgoli/session-manager",
@@ -2879,7 +2911,7 @@ async fn codex_review_request_watcher_completes_and_queues_wake() {
         .unwrap();
     assert_eq!(
         message,
-        "[sm review] Codex comment for PR #967 is here. https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701300000"
+        "[sm review] Review of PR #967 @ 1111111 is here: https://github.com/rajeshgoli/session-manager/pull/967#issuecomment-4701300000"
     );
 }
 
@@ -2905,7 +2937,7 @@ async fn codex_review_request_create_rejects_stopped_notify_session() {
 
     let (status, payload) = post_json(
         app,
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 971,
             "repo": "rajeshgoli/session-manager",
@@ -2940,7 +2972,7 @@ async fn codex_review_request_watcher_stops_before_retry_when_head_changes() {
 
     let (status, payload) = post_json(
         app,
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 971,
             "repo": "rajeshgoli/session-manager",
@@ -2992,8 +3024,8 @@ async fn codex_review_request_watcher_stops_before_retry_when_head_changes() {
     let messages = queued_message_texts(&queue_db, "run12345");
     assert_eq!(messages.len(), 1);
     assert!(messages[0].contains(&request_id));
-    assert!(messages[0].contains("PR head changed"));
-    assert!(messages[0].contains("Request a new review"));
+    assert!(messages[0].contains("PR head moved"));
+    assert!(messages[0].contains("Run `sm request-review 971`"));
 }
 
 #[tokio::test]
@@ -3016,7 +3048,7 @@ async fn codex_review_request_watcher_clears_retry_after_pickup() {
 
     let (status, payload) = post_json(
         app,
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 971,
             "repo": "rajeshgoli/session-manager",
@@ -3082,357 +3114,6 @@ async fn codex_review_request_watcher_clears_retry_after_pickup() {
 }
 
 #[tokio::test]
-async fn codex_review_request_watcher_retries_after_codex_failure_comment() {
-    let state_file = write_session_fixture();
-    let queue_db = state_file.with_extension("codex-review-failure-retry.db");
-    let poster = StubGitHubReviewPoster::successful().with_fresh_review(GitHubReviewMatch {
-        source: "comment".to_owned(),
-        created_at: "2026-06-14T02:40:00Z".to_owned(),
-        id: Some(json!(4701300002_i64)),
-        url: Some(
-            "https://github.com/rajeshgoli/session-manager/pull/971#issuecomment-4701300002"
-                .to_owned(),
-        ),
-        head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
-    });
-    poster.set_pickup_detected(true);
-    poster.set_review_failure(codex_review_failure_comment(), 1);
-    let mut config = AppConfig {
-        paths: PathsConfig {
-            state_file: state_file.display().to_string(),
-        },
-        sm_send: SmSendConfig {
-            db_path: queue_db.display().to_string(),
-        },
-        ..AppConfig::default()
-    };
-    config.rust_core.fixture_writes_enabled = true;
-    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
-
-    let (status, payload) = post_json(
-        app,
-        "/codex-review-requests",
-        json!({
-            "pr_number": 971,
-            "repo": "rajeshgoli/session-manager",
-            "notify_target": "run12345",
-            "poll_interval_seconds": 1,
-            "retry_interval_seconds": 1
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let request_id = payload["id"].as_str().unwrap().to_owned();
-
-    let mut completed = None;
-    for _ in 0..60 {
-        let current: (String, i64) = Connection::open(&queue_db)
-            .unwrap()
-            .query_row(
-                "SELECT state, attempt_count FROM codex_review_request_registrations WHERE id = ?1",
-                [&request_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        if current.0 == "completed" {
-            completed = Some(current);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let completed = completed.expect("a Codex failure comment must trigger a fresh request");
-    assert_eq!(completed.1, 2);
-    assert_eq!(poster.calls().len(), 2);
-}
-
-#[tokio::test]
-async fn codex_review_request_watcher_retries_codex_failure_without_pickup_before_pickup_deadline()
-{
-    let state_file = write_session_fixture();
-    let queue_db = state_file.with_extension("codex-review-failure-no-pickup.db");
-    let poster = StubGitHubReviewPoster::successful().with_fresh_review(GitHubReviewMatch {
-        source: "comment".to_owned(),
-        created_at: "2026-06-14T02:40:00Z".to_owned(),
-        id: Some(json!(4701300002_i64)),
-        url: Some(
-            "https://github.com/rajeshgoli/session-manager/pull/971#issuecomment-4701300002"
-                .to_owned(),
-        ),
-        head_sha: Some("1111111111111111111111111111111111111111".to_owned()),
-    });
-    // Codex fails before it reacts with 👀, so the no-pickup deadline set at
-    // post time is still pending when the failure comment lands.
-    poster.set_pickup_detected(false);
-    poster.set_review_failure(codex_review_failure_comment(), 1);
-    let mut config = AppConfig {
-        paths: PathsConfig {
-            state_file: state_file.display().to_string(),
-        },
-        sm_send: SmSendConfig {
-            db_path: queue_db.display().to_string(),
-        },
-        ..AppConfig::default()
-    };
-    config.rust_core.fixture_writes_enabled = true;
-    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
-
-    let (status, payload) = post_json(
-        app,
-        "/codex-review-requests",
-        json!({
-            "pr_number": 971,
-            "repo": "rajeshgoli/session-manager",
-            "notify_target": "run12345",
-            "poll_interval_seconds": 1,
-            "retry_interval_seconds": 1200
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let request_id = payload["id"].as_str().unwrap().to_owned();
-
-    let mut completed = None;
-    for _ in 0..60 {
-        let current: (String, i64) = Connection::open(&queue_db)
-            .unwrap()
-            .query_row(
-                "SELECT state, attempt_count FROM codex_review_request_registrations WHERE id = ?1",
-                [&request_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        if current.0 == "completed" {
-            completed = Some(current);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let completed = completed.expect(
-        "a Codex failure comment must trigger a fresh request before the no-pickup deadline",
-    );
-    assert_eq!(completed.1, 2);
-    assert_eq!(poster.calls().len(), 2);
-}
-
-#[tokio::test]
-async fn codex_review_request_watcher_honors_retry_post_backoff_without_pickup() {
-    let state_file = write_session_fixture();
-    let queue_db = state_file.with_extension("codex-review-failure-no-pickup-backoff.db");
-    let poster = StubGitHubReviewPoster::successful();
-    poster.set_pickup_detected(false);
-    poster.set_review_failure(codex_review_failure_comment(), 1);
-    poster.fail_posts_after(Some(1));
-    let mut config = AppConfig {
-        paths: PathsConfig {
-            state_file: state_file.display().to_string(),
-        },
-        sm_send: SmSendConfig {
-            db_path: queue_db.display().to_string(),
-        },
-        ..AppConfig::default()
-    };
-    config.rust_core.fixture_writes_enabled = true;
-    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
-
-    let (status, payload) = post_json(
-        app,
-        "/codex-review-requests",
-        json!({
-            "pr_number": 971,
-            "repo": "rajeshgoli/session-manager",
-            "notify_target": "run12345",
-            "poll_interval_seconds": 1,
-            "retry_interval_seconds": 1200
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let request_id = payload["id"].as_str().unwrap().to_owned();
-    let read_retry = || -> (Option<String>, Option<String>) {
-        Connection::open(&queue_db)
-            .unwrap()
-            .query_row(
-                "SELECT last_error, next_retry_at FROM codex_review_request_registrations WHERE id = ?1",
-                [&request_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap()
-    };
-
-    let mut backoff = None;
-    for _ in 0..40 {
-        let (last_error, next_retry_at) = read_retry();
-        if last_error
-            .as_deref()
-            .is_some_and(|error| error.contains("review retry post failed"))
-        {
-            backoff = next_retry_at;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let backoff = backoff.expect("the failed retry post must schedule a backoff");
-
-    // Each further retry post would fail and push the backoff later; three
-    // polls without movement show the watcher is waiting it out.
-    tokio::time::sleep(Duration::from_millis(3500)).await;
-    assert_eq!(read_retry().1.as_deref(), Some(backoff.as_str()));
-    assert_eq!(poster.calls().len(), 1);
-}
-
-#[tokio::test]
-async fn codex_review_request_watcher_survives_failed_retry_post() {
-    let state_file = write_session_fixture();
-    let queue_db = state_file.with_extension("codex-review-retry-post-fails.db");
-    let poster = StubGitHubReviewPoster::successful();
-    poster.set_pickup_detected(true);
-    poster.set_review_failure(codex_review_failure_comment(), 1);
-    poster.fail_posts_after(Some(1));
-    let mut config = AppConfig {
-        paths: PathsConfig {
-            state_file: state_file.display().to_string(),
-        },
-        sm_send: SmSendConfig {
-            db_path: queue_db.display().to_string(),
-        },
-        ..AppConfig::default()
-    };
-    config.rust_core.fixture_writes_enabled = true;
-    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
-
-    let (status, payload) = post_json(
-        app,
-        "/codex-review-requests",
-        json!({
-            "pr_number": 971,
-            "repo": "rajeshgoli/session-manager",
-            "notify_target": "run12345",
-            "poll_interval_seconds": 1,
-            "retry_interval_seconds": 1
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let request_id = payload["id"].as_str().unwrap().to_owned();
-
-    let mut post_error = None;
-    for _ in 0..40 {
-        let current: (String, Option<String>) = Connection::open(&queue_db)
-            .unwrap()
-            .query_row(
-                "SELECT state, last_error FROM codex_review_request_registrations WHERE id = ?1",
-                [&request_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        if current
-            .1
-            .as_deref()
-            .is_some_and(|error| error.contains("review retry post failed"))
-        {
-            post_error = Some(current);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let post_error = post_error.expect("a failed retry post must be recorded");
-    assert_eq!(post_error.0, "active");
-
-    poster.fail_posts_after(None);
-    let mut attempts = None;
-    for _ in 0..40 {
-        let current: i64 = Connection::open(&queue_db)
-            .unwrap()
-            .query_row(
-                "SELECT attempt_count FROM codex_review_request_registrations WHERE id = ?1",
-                [&request_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        if current == 2 {
-            attempts = Some(current);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert_eq!(
-        attempts,
-        Some(2),
-        "the watcher must keep running and retry once posting works again"
-    );
-}
-
-#[tokio::test]
-async fn codex_review_request_watcher_gives_up_and_notifies_after_repeated_codex_failures() {
-    let state_file = write_session_fixture();
-    let queue_db = state_file.with_extension("codex-review-failure-exhausted.db");
-    let poster = StubGitHubReviewPoster::successful();
-    poster.set_pickup_detected(true);
-    poster.set_review_failure(codex_review_failure_comment(), usize::MAX);
-    let mut config = AppConfig {
-        paths: PathsConfig {
-            state_file: state_file.display().to_string(),
-        },
-        sm_send: SmSendConfig {
-            db_path: queue_db.display().to_string(),
-        },
-        ..AppConfig::default()
-    };
-    config.rust_core.fixture_writes_enabled = true;
-    let app = router(AppState::new(config).with_github_review_poster(Arc::new(poster.clone())));
-
-    let (status, payload) = post_json(
-        app,
-        "/codex-review-requests",
-        json!({
-            "pr_number": 971,
-            "repo": "rajeshgoli/session-manager",
-            "notify_target": "run12345",
-            "poll_interval_seconds": 1,
-            "retry_interval_seconds": 1
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let request_id = payload["id"].as_str().unwrap().to_owned();
-
-    let mut failed = None;
-    for _ in 0..80 {
-        let current: (String, i64, i64) = Connection::open(&queue_db)
-            .unwrap()
-            .query_row(
-                "SELECT state, is_active, attempt_count FROM codex_review_request_registrations WHERE id = ?1",
-                [&request_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        if current.0 == "failed" {
-            failed = Some(current);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let failed = failed.expect("repeated Codex failures must end the request");
-    assert_eq!(failed, ("failed".to_owned(), 0, 3));
-    assert_eq!(poster.calls().len(), 3, "sm must stop after three requests");
-
-    let message: String = Connection::open(&queue_db)
-        .unwrap()
-        .query_row(
-            "SELECT text FROM message_queue WHERE target_session_id = 'run12345'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        message,
-        format!(
-            "[sm review] Codex review request {request_id} for PR #971 failed: Codex reported an error on each of 3 attempts, so sm stopped retrying. Latest error: https://github.com/rajeshgoli/session-manager/pull/971#issuecomment-4701300001"
-        )
-    );
-}
-
-#[tokio::test]
 async fn codex_review_request_watcher_terminates_when_pr_closes() {
     let state_file = write_session_fixture();
     let queue_db = state_file.with_extension("codex-review-pr-closed.db");
@@ -3451,7 +3132,7 @@ async fn codex_review_request_watcher_terminates_when_pr_closes() {
 
     let (status, payload) = post_json(
         app,
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 971,
             "repo": "rajeshgoli/session-manager",
@@ -3509,7 +3190,7 @@ async fn codex_review_request_watcher_waits_on_stopped_and_terminates_on_retired
 
     let (status, payload) = post_json(
         app,
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 971,
             "repo": "rajeshgoli/session-manager",
@@ -3583,7 +3264,7 @@ async fn codex_review_request_watcher_survives_unreadable_session_state() {
 
     let (status, payload) = post_json(
         app,
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 971,
             "repo": "rajeshgoli/session-manager",
@@ -3707,7 +3388,7 @@ async fn codex_review_request_watcher_delivers_sequential_wake_to_runtime_sessio
 
     let (status, payload) = post_json(
         app.clone(),
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 978,
             "repo": "rajeshgoli/session-manager",
@@ -3719,7 +3400,7 @@ async fn codex_review_request_watcher_delivers_sequential_wake_to_runtime_sessio
     .await;
     assert_eq!(status, StatusCode::OK);
     let request_id = payload["id"].as_str().unwrap().to_owned();
-    let expected_message = "[sm review] Codex review for PR #978 is here. https://github.com/rajeshgoli/session-manager/pull/978#pullrequestreview-1";
+    let expected_message = "[sm review] Review of PR #978 @ 1111111 is here: https://github.com/rajeshgoli/session-manager/pull/978#pullrequestreview-1";
 
     let mut completed = None;
     for _ in 0..30 {
@@ -3847,7 +3528,7 @@ async fn codex_review_request_recovery_spawns_active_watchers() {
         .unwrap();
     assert_eq!(
         message,
-        "[sm review] Codex review for PR #971 is here. https://github.com/rajeshgoli/session-manager/pull/971#pullrequestreview-1"
+        "[sm review] Review of PR #971 @ 1111111 is here: https://github.com/rajeshgoli/session-manager/pull/971#pullrequestreview-1"
     );
 }
 
@@ -4059,7 +3740,7 @@ async fn codex_review_request_recovery_keeps_stopped_notify_session_active() {
 }
 
 #[tokio::test]
-async fn codex_review_request_recovery_expires_request_after_one_hour() {
+async fn codex_review_request_recovery_applies_new_silence_rule_to_old_requests() {
     let state_file = unique_temp_path();
     let queue_db = state_file.with_extension("codex-review-recover-expired.db");
     fs::write(
@@ -4078,7 +3759,7 @@ async fn codex_review_request_recovery_expires_request_after_one_hour() {
     Connection::open(&queue_db)
         .unwrap()
         .execute(
-            "UPDATE codex_review_request_registrations SET requested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-61 minutes') WHERE id = 'expired-review'",
+            "UPDATE codex_review_request_registrations SET requested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-61 minutes'), latest_request_posted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-61 minutes') WHERE id = 'expired-review'",
             [],
         )
         .unwrap();
@@ -4092,7 +3773,25 @@ async fn codex_review_request_recovery_expires_request_after_one_hour() {
         ..AppConfig::default()
     };
     config.rust_core.runtime_enabled = true;
-    let _app = router(AppState::new(config));
+    let _app = router(
+        AppState::new(config)
+            .with_github_review_poster(Arc::new(StubGitHubReviewPoster::successful())),
+    );
+
+    for _ in 0..30 {
+        let state: String = Connection::open(&queue_db)
+            .unwrap()
+            .query_row(
+                "SELECT state FROM codex_review_request_registrations WHERE id = 'expired-review'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if state == "no_reviewer" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     let row: (String, i64, Option<String>) = Connection::open(&queue_db)
         .unwrap()
@@ -4102,11 +3801,11 @@ async fn codex_review_request_recovery_expires_request_after_one_hour() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(row.0, "expired");
+    assert_eq!(row.0, "no_reviewer");
     assert_eq!(row.1, 0);
     assert!(row
         .2
-        .is_some_and(|reason| reason.contains("3600 second TTL")));
+        .is_some_and(|reason| reason.contains("no response in 5 minutes")));
     let message: String = Connection::open(&queue_db)
         .unwrap()
         .query_row(
@@ -4116,14 +3815,13 @@ async fn codex_review_request_recovery_expires_request_after_one_hour() {
         )
         .unwrap();
     assert!(
-        message.starts_with("[sm review] Codex review request expired-review for PR #")
-            && message.contains("expired after 60 minutes without a Codex review"),
+        message.starts_with("[sm review] No reviewer could take PR #971 @ 1111111."),
         "{message}"
     );
 }
 
 #[tokio::test]
-async fn codex_review_request_ttl_bounds_an_oversized_poll_interval() {
+async fn legacy_review_request_uses_silence_deadline_despite_oversized_poll_interval() {
     let Some(tmux) = live_notify_tmux("review-ttl", "notify1") else {
         return;
     };
@@ -4146,7 +3844,7 @@ async fn codex_review_request_ttl_bounds_an_oversized_poll_interval() {
     Connection::open(&queue_db)
         .unwrap()
         .execute(
-            "UPDATE codex_review_request_registrations SET requested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3599 seconds') WHERE id = 'bounded-expiry'",
+            "UPDATE codex_review_request_registrations SET latest_request_posted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-6 minutes') WHERE id = 'bounded-expiry'",
             [],
         )
         .unwrap();
@@ -4160,9 +3858,10 @@ async fn codex_review_request_ttl_bounds_an_oversized_poll_interval() {
         ..AppConfig::default()
     };
     config.rust_core.runtime_enabled = true;
-    let _app = router(AppState::new(config));
+    let poster = StubGitHubReviewPoster::successful();
+    let _app = router(AppState::new(config).with_github_review_poster(Arc::new(poster)));
 
-    let mut expired = false;
+    let mut finished = false;
     for _ in 0..30 {
         let row: (String, i64) = Connection::open(&queue_db)
             .unwrap()
@@ -4172,15 +3871,15 @@ async fn codex_review_request_ttl_bounds_an_oversized_poll_interval() {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        if row == ("expired".to_owned(), 0) {
-            expired = true;
+        if row == ("no_reviewer".to_owned(), 0) {
+            finished = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(
-        expired,
-        "one-hour TTL must safely preempt an extreme legacy GitHub poll interval"
+        finished,
+        "the new five-minute silence rule must preempt an extreme legacy poll interval"
     );
 }
 
@@ -4223,7 +3922,7 @@ async fn codex_review_request_create_returns_actionable_conflict_for_other_owner
 
     let (status, payload) = post_json(
         app,
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 830,
             "repo": "rajeshgoli/session-manager",
@@ -4269,7 +3968,7 @@ async fn codex_review_request_supersedes_same_owner_stale_head_and_ignores_late_
 
     let (status, first) = post_json(
         app.clone(),
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 992, "repo": "rajeshgoli/session-manager", "notify_target": "notify1",
             "poll_interval_seconds": 1, "retry_interval_seconds": 900
@@ -4280,7 +3979,7 @@ async fn codex_review_request_supersedes_same_owner_stale_head_and_ignores_late_
     let first_id = first["id"].as_str().unwrap().to_owned();
     let (status, repeated) = post_json(
         app.clone(),
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 992, "repo": "rajeshgoli/session-manager", "notify_target": "notify1",
             "poll_interval_seconds": 1, "retry_interval_seconds": 900
@@ -4304,7 +4003,7 @@ async fn codex_review_request_supersedes_same_owner_stale_head_and_ignores_late_
     poster.set_current_head("2222222222222222222222222222222222222222");
     let (status, second) = post_json(
         app,
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 992, "repo": "rajeshgoli/session-manager", "notify_target": "notify1",
             "poll_interval_seconds": 1, "retry_interval_seconds": 900
@@ -4395,7 +4094,7 @@ async fn codex_review_request_create_preserves_validation_errors_and_write_gate(
     }));
     let (status, payload) = post_json(
         disabled_app,
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 967,
             "repo": "rajeshgoli/session-manager",
@@ -4421,7 +4120,7 @@ async fn codex_review_request_create_preserves_validation_errors_and_write_gate(
 
     let (status, payload) = post_json(
         app.clone(),
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 967,
             "repo": "rajeshgoli/session-manager",
@@ -4435,7 +4134,7 @@ async fn codex_review_request_create_preserves_validation_errors_and_write_gate(
 
     let (status, payload) = post_json(
         app.clone(),
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 967,
             "repo": "rajeshgoli/session-manager",
@@ -4450,7 +4149,7 @@ async fn codex_review_request_create_preserves_validation_errors_and_write_gate(
 
     let (status, payload) = post_json(
         app.clone(),
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 967,
             "repo": "rajeshgoli/session-manager",
@@ -4468,7 +4167,7 @@ async fn codex_review_request_create_preserves_validation_errors_and_write_gate(
 
     let (status, payload) = post_json(
         app.clone(),
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 0,
             "repo": "rajeshgoli/session-manager",
@@ -4482,7 +4181,7 @@ async fn codex_review_request_create_preserves_validation_errors_and_write_gate(
 
     let (status, payload) = post_json(
         app,
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 967,
             "repo": "rajeshgoli/session-manager",
@@ -4490,13 +4189,17 @@ async fn codex_review_request_create_preserves_validation_errors_and_write_gate(
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(payload["detail"], "gh pr comment failed: denied");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["state"], "no_reviewer");
+    assert_eq!(
+        payload["last_error"],
+        "failed to start: gh pr comment failed: denied"
+    );
     assert_eq!(
         poster.calls(),
         vec![("rajeshgoli/session-manager".to_owned(), 967, None)]
     );
-    assert!(!queue_db.exists());
+    assert!(queue_db.exists());
 }
 
 #[tokio::test]
@@ -4537,7 +4240,7 @@ async fn codex_review_request_create_surfaces_transport_failure_as_bad_gateway()
 
     let (status, payload) = post_json(
         app,
-        "/codex-review-requests",
+        "/review-requests",
         json!({
             "pr_number": 967,
             "repo": "rajeshgoli/session-manager",
@@ -4546,13 +4249,14 @@ async fn codex_review_request_create_surfaces_transport_failure_as_bad_gateway()
     )
     .await;
 
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert!(payload["detail"]
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["state"], "no_reviewer");
+    assert!(payload["last_error"]
         .as_str()
         .unwrap()
-        .starts_with("GitHub transport failure after 3 attempts: tls:"));
+        .starts_with("failed to start: GitHub transport failure after 3 attempts: tls:"));
     assert_eq!(poster.calls().len(), 1);
-    assert!(!queue_db.exists());
+    assert!(queue_db.exists());
 }
 
 #[tokio::test]
@@ -4572,10 +4276,10 @@ async fn codex_review_request_cancel_preserves_missing_and_write_gate_errors() {
     }));
 
     let (status, payload) =
-        delete_json(app.clone(), "/codex-review-requests/active-old", json!({})).await;
+        delete_json(app.clone(), "/review-requests/active-old", json!({})).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(payload["detail"], "Rust core writes are disabled");
-    let (status, payload) = get_json(app.clone(), "/codex-review-requests/active-old").await;
+    let (status, payload) = get_json(app.clone(), "/review-requests/active-old").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(payload["state"], "completed");
     assert_eq!(payload["is_active"], true);
@@ -4591,8 +4295,7 @@ async fn codex_review_request_cancel_preserves_missing_and_write_gate_errors() {
     };
     write_config.rust_core.fixture_writes_enabled = true;
     let write_app = router(AppState::new(write_config));
-    let (status, payload) =
-        delete_json(write_app, "/codex-review-requests/missing", json!({})).await;
+    let (status, payload) = delete_json(write_app, "/review-requests/missing", json!({})).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(payload["detail"], "Codex review request not found");
 }
@@ -4613,7 +4316,7 @@ async fn codex_review_requests_unknown_notify_target_returns_404() {
         ..AppConfig::default()
     }));
 
-    let (status, payload) = get_json(app, "/codex-review-requests?notify_target=missing").await;
+    let (status, payload) = get_json(app, "/review-requests?notify_target=missing").await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(payload["detail"], "Notify target not found");
@@ -4626,33 +4329,29 @@ async fn codex_review_requests_rejects_public_host_without_auth() {
     let app = router(AppState::new(config_with_state_file_and_auth(&state_file)));
 
     let (status, payload) =
-        get_json_with_host(app.clone(), "/codex-review-requests", "sm.example.com").await;
+        get_json_with_host(app.clone(), "/review-requests", "sm.example.com").await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(payload["detail"], "Authentication required");
     assert_eq!(
         payload["login_url"],
-        "/auth/google/login?next=%2Fcodex-review-requests"
+        "/auth/google/login?next=%2Freview-requests"
     );
 
-    let (status, payload) = get_json_with_host(
-        app.clone(),
-        "/codex-review-requests/active-old",
-        "sm.example.com",
-    )
-    .await;
+    let (status, payload) =
+        get_json_with_host(app.clone(), "/review-requests/active-old", "sm.example.com").await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(payload["detail"], "Authentication required");
     assert_eq!(
         payload["login_url"],
-        "/auth/google/login?next=%2Fcodex-review-requests%2Factive-old"
+        "/auth/google/login?next=%2Freview-requests%2Factive-old"
     );
 
     let (status, payload) = json_request_with_headers_and_peer(
         app,
         "DELETE",
-        "/codex-review-requests/active-old",
+        "/review-requests/active-old",
         json!({}),
         &[("host", "sm.example.com")],
         Some(SocketAddr::from(([203, 0, 113, 10], 49152))),
@@ -4663,7 +4362,7 @@ async fn codex_review_requests_rejects_public_host_without_auth() {
     assert_eq!(payload["detail"], "Authentication required");
     assert_eq!(
         payload["login_url"],
-        "/auth/google/login?next=%2Fcodex-review-requests%2Factive-old"
+        "/auth/google/login?next=%2Freview-requests%2Factive-old"
     );
 }
 
@@ -8393,7 +8092,7 @@ async fn shadow_http_reports_codex_review_request_detail_200_as_status_only() {
             "schema_version": 1,
             "request": {
                 "method": "GET",
-                "path": "/codex-review-requests/active-old",
+                "path": "/review-requests/active-old",
                 "query_string": "",
                 "headers": {}
             },
@@ -8439,7 +8138,7 @@ async fn shadow_http_reports_codex_review_request_detail_404() {
             "schema_version": 1,
             "request": {
                 "method": "GET",
-                "path": "/codex-review-requests/missing",
+                "path": "/review-requests/missing",
                 "query_string": "",
                 "headers": {}
             },
@@ -8482,7 +8181,7 @@ async fn shadow_http_reports_codex_review_request_cancel_as_status_only_without_
             "schema_version": 1,
             "request": {
                 "method": "DELETE",
-                "path": "/codex-review-requests/active-old",
+                "path": "/review-requests/active-old",
                 "query_string": "",
                 "headers": {}
             },
@@ -8505,7 +8204,7 @@ async fn shadow_http_reports_codex_review_request_cancel_as_status_only_without_
     assert_eq!(payload["predicted_body_sha256"], Value::Null);
     assert_eq!(payload["body_sha256_match"], Value::Null);
 
-    let (status, detail) = get_json(app, "/codex-review-requests/active-old").await;
+    let (status, detail) = get_json(app, "/review-requests/active-old").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(detail["state"], "completed");
     assert_eq!(detail["is_active"], true);
@@ -8533,7 +8232,7 @@ async fn shadow_http_reports_codex_review_request_create_as_status_only_without_
             "schema_version": 1,
             "request": {
                 "method": "POST",
-                "path": "/codex-review-requests",
+                "path": "/review-requests",
                 "query_string": "",
                 "headers": {},
                 "body_sha256": sha256_hex(b"{\"pr_number\":967}")
@@ -8557,42 +8256,6 @@ async fn shadow_http_reports_codex_review_request_create_as_status_only_without_
     assert_eq!(payload["predicted_body_sha256"], Value::Null);
     assert_eq!(payload["body_sha256_match"], Value::Null);
     assert!(!queue_db.exists());
-}
-
-#[tokio::test]
-async fn shadow_http_reports_pr_review_create_as_status_only_without_writing() {
-    let app = router(AppState::new(AppConfig::default()));
-
-    let (status, payload) = post_json(
-        app,
-        "/__shadow/http",
-        json!({
-            "schema_version": 1,
-            "request": {
-                "method": "POST",
-                "path": "/reviews/pr",
-                "query_string": "",
-                "headers": {},
-                "body_sha256": sha256_hex(b"{\"pr_number\":967}")
-            },
-            "python_response": {
-                "status": 200,
-                "body_sha256": sha256_hex(b"{\"status\":\"posted\"}")
-            }
-        }),
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        payload["support_status"],
-        "implemented_retained_write_status_only"
-    );
-    assert_eq!(payload["comparison"], "status_match");
-    assert_eq!(payload["would_write"], false);
-    assert_eq!(payload["predicted_status"], 200);
-    assert_eq!(payload["predicted_body_sha256"], Value::Null);
-    assert_eq!(payload["body_sha256_match"], Value::Null);
 }
 
 #[tokio::test]
@@ -9225,37 +8888,6 @@ async fn shadow_http_classifies_core_writes_without_side_effects() {
         .as_str()
         .unwrap()
         .contains("never performs retained write side effects"));
-
-    for path in ["/sessions/review", "/sessions/reviewcodex/review"] {
-        let (status, payload) = post_json(
-            app.clone(),
-            "/__shadow/http",
-            json!({
-                "schema_version": 1,
-                "request": {
-                    "method": "POST",
-                    "path": path,
-                    "query_string": "",
-                    "headers": {},
-                    "body_sha256": sha256_hex(b"{\"mode\":\"custom\"}")
-                },
-                "python_response": {
-                    "status": 200,
-                    "body_sha256": sha256_hex(b"{\"status\":\"started\"}")
-                }
-            }),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            payload["support_status"],
-            "implemented_retained_write_status_only"
-        );
-        assert_eq!(payload["comparison"], "status_match");
-        assert_eq!(payload["would_write"], false);
-        assert_eq!(payload["body_sha256_match"], Value::Null);
-    }
 }
 
 #[tokio::test]
@@ -17929,449 +17561,6 @@ async fn runtime_core_restores_codex_session() {
 }
 
 #[tokio::test]
-async fn runtime_core_starts_review_on_existing_codex_session() {
-    if !tmux_available() {
-        return;
-    }
-    let state_file = unique_temp_path();
-    let log_dir = unique_temp_path();
-    let working_dir = unique_short_temp_dir("sm-rust-review-existing-repo");
-    create_git_repo(&working_dir);
-    let tmux_socket = format!(
-        "sm-rust-test-review-existing-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
-
-    let (status, _payload) = post_json(
-        app.clone(),
-        "/sessions",
-        json!({
-            "id": "reviewcodex",
-            "name": "review-codex",
-            "working_dir": working_dir.display().to_string(),
-            "provider": "codex"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, _payload) = post_json(
-        app.clone(),
-        "/sessions",
-        json!({
-            "id": "reviewwatcher",
-            "name": "review-watcher",
-            "working_dir": working_dir.display().to_string(),
-            "provider": "claude"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
-    let session = state["sessions"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|session| session["id"] == "reviewcodex")
-        .unwrap();
-    session["status"] = json!("idle");
-    session["completion_status"] = json!("killed");
-    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
-
-    let (status, payload) = post_json(
-        app.clone(),
-        "/sessions/reviewcodex/review",
-        json!({
-            "mode": "custom",
-            "custom_prompt": "must not dispatch to a retired session"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        payload,
-        json!({ "error": "Session is stopped. Restore it before starting a review." })
-    );
-    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
-    let session = state["sessions"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|session| session["id"] == "reviewcodex")
-        .unwrap();
-    assert_eq!(session["status"], "idle");
-    assert_eq!(session["completion_status"], "killed");
-    assert!(session.get("review_config").is_none() || session["review_config"].is_null());
-    session["completion_status"] = Value::Null;
-    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
-
-    let (status, payload) = post_json(
-        app.clone(),
-        "/sessions/reviewcodex/review",
-        json!({
-            "mode": "custom",
-            "custom_prompt": "inspect retained review route",
-            "wait": 1,
-            "watcher_session_id": "reviewwatcher"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["session_id"], "reviewcodex");
-    assert_eq!(payload["review_mode"], "custom");
-    assert_eq!(payload["status"], "started");
-    assert_eq!(payload["steer_queued"], false);
-    wait_for_output_contains(
-        app.clone(),
-        "reviewcodex",
-        "runtime:/review inspect retained review route",
-    )
-    .await;
-    let (_status, output) = get_json(app.clone(), "/sessions/reviewcodex/output?lines=20").await;
-    assert!(!output["output"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("must not dispatch to a retired session"));
-    wait_for_output_contains(
-        app.clone(),
-        "reviewwatcher",
-        "[sm wait] review-codex is now idle",
-    )
-    .await;
-
-    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
-    let session = state["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|session| session["id"] == "reviewcodex")
-        .unwrap();
-    assert_eq!(session["review_config"]["mode"], "custom");
-    assert_eq!(
-        session["review_config"]["custom_prompt"],
-        "inspect retained review route"
-    );
-    assert_eq!(session["review_config"]["steer_delivered"], false);
-    assert_eq!(session["review_config"]["dispatch_in_progress"], false);
-    assert!(session["review_config"]["dispatch_completed_at"]
-        .as_str()
-        .is_some_and(|value| !value.is_empty()));
-    assert_eq!(session["status"], "running");
-
-    let (status, payload) = post_json(
-        app.clone(),
-        "/sessions/reviewcodex/review",
-        json!({
-            "mode": "custom",
-            "custom_prompt": "inspect retained review route again"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["session_id"], "reviewcodex");
-    assert_eq!(payload["review_mode"], "custom");
-    assert_eq!(payload["status"], "started");
-    wait_for_output_contains(
-        app.clone(),
-        "reviewcodex",
-        "runtime:/review inspect retained review route again",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn runtime_core_existing_review_wait_times_out_while_session_stays_active() {
-    if !tmux_available() {
-        return;
-    }
-    let state_file = unique_temp_path();
-    let log_dir = unique_temp_path();
-    let working_dir = unique_short_temp_dir("sm-rust-review-wait-timeout-repo");
-    create_git_repo(&working_dir);
-    let tmux_socket = format!(
-        "sm-rust-test-review-wait-timeout-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
-
-    let (status, _payload) = post_json(
-        app.clone(),
-        "/sessions",
-        json!({
-            "id": "reviewtimeout",
-            "name": "review-codex-timeout",
-            "working_dir": working_dir.display().to_string(),
-            "provider": "codex"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, _payload) = post_json(
-        app.clone(),
-        "/sessions",
-        json!({
-            "id": "reviewtimeoutwatcher",
-            "name": "review-timeout-watcher",
-            "working_dir": working_dir.display().to_string(),
-            "provider": "claude"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let (status, payload) = post_json(
-        app.clone(),
-        "/sessions/reviewtimeout/review",
-        json!({
-            "mode": "custom",
-            "custom_prompt": "stay active until timeout",
-            "wait": 2,
-            "watcher_session_id": "reviewtimeoutwatcher"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["status"], "started");
-
-    let state_path = state_file.clone();
-    let activity_task = tokio::spawn(async move {
-        for tick in 0..16 {
-            touch_session_activity(&state_path, "reviewtimeout", tick);
-            tokio::time::sleep(Duration::from_millis(150)).await;
-        }
-    });
-
-    wait_for_output_contains(
-        app.clone(),
-        "reviewtimeout",
-        "runtime:/review stay active until timeout",
-    )
-    .await;
-    wait_for_output_contains(
-        app.clone(),
-        "reviewtimeoutwatcher",
-        "[sm wait] Timeout: review-codex-timeout still active after 2s",
-    )
-    .await;
-    activity_task.abort();
-}
-
-#[tokio::test]
-async fn runtime_core_starts_commit_review_with_requested_sha() {
-    if !tmux_available() {
-        return;
-    }
-    let state_file = unique_temp_path();
-    let log_dir = unique_temp_path();
-    let working_dir = unique_short_temp_dir("sm-rust-review-commit-repo");
-    create_git_repo(&working_dir);
-    let commit_sha = create_git_commit(&working_dir, "review-target.txt", "review target\n");
-    let tmux_socket = format!(
-        "sm-rust-test-review-commit-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
-
-    let (status, _payload) = post_json(
-        app.clone(),
-        "/sessions",
-        json!({
-            "id": "reviewcommit",
-            "name": "review-commit",
-            "working_dir": working_dir.display().to_string(),
-            "provider": "codex"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let (status, payload) = post_json(
-        app.clone(),
-        "/sessions/reviewcommit/review",
-        json!({
-            "mode": "commit",
-            "commit_sha": commit_sha
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["session_id"], "reviewcommit");
-    assert_eq!(payload["review_mode"], "commit");
-    assert_eq!(payload["commit_sha"], commit_sha);
-    assert_eq!(payload["status"], "started");
-    wait_for_output_contains(
-        app.clone(),
-        "reviewcommit",
-        &format!("runtime:{commit_sha}"),
-    )
-    .await;
-
-    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
-    let session = state["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|session| session["id"] == "reviewcommit")
-        .unwrap();
-    assert_eq!(session["review_config"]["mode"], "commit");
-    assert_eq!(session["review_config"]["commit_sha"], commit_sha);
-}
-
-#[tokio::test]
-async fn runtime_core_rejects_review_when_session_is_busy() {
-    if !tmux_available() {
-        return;
-    }
-    let state_file = unique_temp_path();
-    let log_dir = unique_temp_path();
-    let working_dir = unique_short_temp_dir("sm-rust-review-busy-repo");
-    create_git_repo(&working_dir);
-    let tmux_socket = format!(
-        "sm-rust-test-review-busy-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let app = runtime_app_with_codex_composer(&state_file, &log_dir, &tmux_socket);
-
-    let (status, _payload) = post_json(
-        app.clone(),
-        "/sessions",
-        json!({
-            "id": "reviewbusy",
-            "name": "review-busy",
-            "working_dir": working_dir.display().to_string(),
-            "provider": "codex"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
-    let session = state["sessions"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|session| session["id"] == "reviewbusy")
-        .unwrap()
-        .as_object_mut()
-        .unwrap();
-    session.insert(
-        "last_tool_call".to_owned(),
-        Value::String("2026-06-14T04:00:00Z".to_owned()),
-    );
-    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
-
-    let (status, payload) = post_json(
-        app.clone(),
-        "/sessions/reviewbusy/review",
-        json!({
-            "mode": "custom",
-            "custom_prompt": "should not be delivered"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        payload,
-        json!({
-            "error": "Session is busy. Wait for current work to complete or use sm clear first."
-        })
-    );
-    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
-    let session = state["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|session| session["id"] == "reviewbusy")
-        .unwrap();
-    assert!(session.get("review_config").is_none() || session["review_config"].is_null());
-
-    let mut state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
-    let session = state["sessions"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|session| session["id"] == "reviewbusy")
-        .unwrap()
-        .as_object_mut()
-        .unwrap();
-    session.insert(
-        "parent_session_id".to_owned(),
-        Value::String("reviewparent".to_owned()),
-    );
-    session.insert(
-        "review_config".to_owned(),
-        json!({
-            "mode": "custom",
-            "dispatch_in_progress": true,
-            "dispatch_completed_at": null
-        }),
-    );
-    fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
-
-    let (status, payload) = post_json(
-        app.clone(),
-        "/sessions/reviewbusy/clear",
-        json!({ "prompt": "reset stale review dispatch" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        payload,
-        json!({ "status": "cleared", "session_id": "reviewbusy" })
-    );
-    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
-    let session = state["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|session| session["id"] == "reviewbusy")
-        .unwrap();
-    assert_eq!(session["review_config"]["dispatch_in_progress"], false);
-    assert!(session["review_config"]["dispatch_completed_at"]
-        .as_str()
-        .is_some_and(|value| !value.is_empty()));
-
-    let (status, payload) = post_json(
-        app.clone(),
-        "/sessions/reviewbusy/review",
-        json!({
-            "mode": "custom",
-            "custom_prompt": "review after stale dispatch clear"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["session_id"], "reviewbusy");
-    assert_eq!(payload["status"], "started");
-    wait_for_output_contains(
-        app.clone(),
-        "reviewbusy",
-        "runtime:/review review after stale dispatch clear",
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn runtime_core_delayed_initial_codex_binding_updates_session_chain() {
     if !tmux_available() {
         return;
@@ -18575,122 +17764,6 @@ async fn runtime_core_clear_rebinds_plain_codex_provider_session_chain() {
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
     assert_eq!(provider_session_ids, vec!["new-thread", "old-thread"]);
-}
-
-#[tokio::test]
-async fn runtime_core_spawns_codex_review_child() {
-    if !tmux_available() {
-        return;
-    }
-    let state_file = unique_temp_path();
-    let log_dir = unique_temp_path();
-    let working_dir = unique_short_temp_dir("sm-rust-review-spawn-repo");
-    create_git_repo(&working_dir);
-    let tmux_socket = format!(
-        "sm-rust-test-review-spawn-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
-
-    let (status, _payload) = post_json(
-        app.clone(),
-        "/sessions",
-        json!({
-            "id": "reviewparent",
-            "name": "review-parent",
-            "working_dir": working_dir.display().to_string(),
-            "provider": "claude"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let (status, payload) = post_json(
-        app.clone(),
-        "/sessions/review",
-        json!({
-            "parent_session_id": "reviewparent",
-            "mode": "custom",
-            "custom_prompt": "inspect spawned child",
-            "name": "spawned-review"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(payload["name"], "spawned-review");
-    assert_eq!(payload["friendly_name"], "spawned-review");
-    assert_eq!(payload["review_mode"], "custom");
-    assert_eq!(payload["status"], "started");
-    let child_id = payload["session_id"].as_str().unwrap();
-    wait_for_output_contains(
-        app.clone(),
-        child_id,
-        "runtime:/review inspect spawned child",
-    )
-    .await;
-
-    let (status, child) = get_json(app, &format!("/sessions/{child_id}")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(child["provider"], "codex");
-    assert_eq!(child["parent_session_id"], "reviewparent");
-}
-
-#[tokio::test]
-async fn runtime_core_spawn_review_rejects_invalid_requested_name() {
-    if !tmux_available() {
-        return;
-    }
-    let state_file = unique_temp_path();
-    let log_dir = unique_temp_path();
-    let working_dir = unique_short_temp_dir("sm-rust-review-bad-name-repo");
-    create_git_repo(&working_dir);
-    let tmux_socket = format!(
-        "sm-rust-test-review-bad-name-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
-    let _tmux_guard = TestTmuxSocket(tmux_socket.clone());
-    let app = runtime_app(&state_file, &log_dir, &tmux_socket);
-
-    let (status, _payload) = post_json(
-        app.clone(),
-        "/sessions",
-        json!({
-            "id": "reviewparent",
-            "name": "review-parent",
-            "working_dir": working_dir.display().to_string(),
-            "provider": "claude"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let (status, payload) = post_json(
-        app.clone(),
-        "/sessions/review",
-        json!({
-            "parent_session_id": "reviewparent",
-            "mode": "custom",
-            "custom_prompt": "should not spawn",
-            "name": "bad\n/clear"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        payload["detail"],
-        "Invalid name: Name must be alphanumeric with - or _ only (no spaces)"
-    );
-    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
-    assert_eq!(state["sessions"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -22147,69 +21220,6 @@ fn unique_short_temp_dir(prefix: &str) -> PathBuf {
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ))
-}
-
-fn create_git_repo(path: &PathBuf) {
-    fs::create_dir_all(path).unwrap();
-    let status = Command::new("git")
-        .args(["init"])
-        .current_dir(path)
-        .status()
-        .unwrap();
-    assert!(status.success());
-}
-
-fn create_git_commit(path: &PathBuf, file_name: &str, contents: &str) -> String {
-    let status = Command::new("git")
-        .args(["config", "user.email", "sm-rust-test@example.invalid"])
-        .current_dir(path)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let status = Command::new("git")
-        .args(["config", "user.name", "SM Rust Test"])
-        .current_dir(path)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    fs::write(path.join(file_name), contents).unwrap();
-    let status = Command::new("git")
-        .args(["add", file_name])
-        .current_dir(path)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let status = Command::new("git")
-        .args(["commit", "-m", "add review target"])
-        .current_dir(path)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(path)
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    String::from_utf8_lossy(&output.stdout).trim().to_owned()
-}
-
-fn touch_session_activity(state_file: &PathBuf, session_id: &str, tick: usize) {
-    let mut state: Value = serde_json::from_str(&fs::read_to_string(state_file).unwrap()).unwrap();
-    let Some(session) = state["sessions"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|session| session["id"] == session_id)
-        .and_then(Value::as_object_mut)
-    else {
-        return;
-    };
-    session.insert(
-        "last_activity".to_owned(),
-        Value::String(format!("2026-06-14T04:00:{:02}Z", tick % 60)),
-    );
-    fs::write(state_file, serde_json::to_string_pretty(&state).unwrap()).unwrap();
 }
 
 fn runtime_app(state_file: &Path, log_dir: &Path, tmux_socket: &str) -> axum::Router {

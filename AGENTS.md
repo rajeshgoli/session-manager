@@ -1,6 +1,6 @@
 # Working in this repo
 
-I am Rajesh, I own the repo and am the only human on it. I work with many repos and use agents to do my work. This repo is session manager, which provides core primitives that agents use to run my workflows. My agents use session manager to talk to each other (sm send), schedule tasks and manage device contention (sm queue), request reviews (sm request-codex-review) etc. I use session manager to give me an overview of what's going on with agents, spawn them as needed, track what the agent is doing on the go. This is THE way I know agents are doing what they're supposed to be doing.  
+I am Rajesh, I own the repo and am the only human on it. I work with many repos and use agents to do my work. This repo is session manager, which provides core primitives that agents use to run my workflows. My agents use session manager to talk to each other (sm send), schedule tasks and manage device contention (sm queue), request reviews (sm request-review) etc. I use session manager to give me an overview of what's going on with agents, spawn them as needed, track what the agent is doing on the go. This is THE way I know agents are doing what they're supposed to be doing.
 
 This file is the whole standing contract. Read all of it.
 
@@ -8,7 +8,7 @@ This file is the whole standing contract. Read all of it.
 
 ## 1. Writing for me
 
-**Define every term before you use it.** Name a phase, gate, structure, or abbreviation and define it in plain words at first use. Never assume a term from an earlier document survived in my memory — I may have read it, but very likely I did not memorise it. When terms predate this repo, I usually made a call on those names. sm send, sm queue run, sm request-codex-review etc., are examples of concepts that have precise meaning and I understand them. When you mean one of these, don't use a generic term. Any abbreviations for decisions or tickets made in the recent past are likely not remembered by me. T1a, Ruling R1, D1b etc., mean nothing to me. An unparseable sentence means I ask you questions and waste tokens and wall time.
+**Define every term before you use it.** Name a phase, gate, structure, or abbreviation and define it in plain words at first use. Never assume a term from an earlier document survived in my memory — I may have read it, but very likely I did not memorise it. When terms predate this repo, I usually made a call on those names. sm send, sm queue run, sm request-review etc., are examples of concepts that have precise meaning and I understand them. When you mean one of these, don't use a generic term. Any abbreviations for decisions or tickets made in the recent past are likely not remembered by me. T1a, Ruling R1, D1b etc., mean nothing to me. An unparseable sentence means I ask you questions and waste tokens and wall time.
 
 **Write in executive style.** Conclusion first, then the justification. Active sentences -- I did X, not X has been completed. Assume I was looking at something else a minute ago. Two ideas to help write: one, write for someone tired, reading at 2 a.m., fresh to the thread. Second, write for an intelligent outsider, who understands trading and technology, but not this repo's shorthands.
 
@@ -127,7 +127,7 @@ results not yet pushed), run `sm worktree keep --reason "<why>"`.
  9. If there are process learnings of things that all future workers on this repo need to know, write them down in `docs/product/lessons.md`. Note the bar to writing here should be high. You're costing tokens on every agent that follows you. Default to not writing if you're in doubt.
     
 ## 4. Review loop
-Request a review with `sm request-codex-review <pr-number>`. Treat the response as registration only, then go idle — do not poll. If Session Manager cannot take the request, post `@codex review` as a PR comment, check back after five minutes, again after five more. If codex hasn't acknowledged your review after 10 minutes with 👀 smiley, you can re-post the request. If nothing has landed after 20 minutes, you can re-post the review request.
+Request a review with `sm request-review <pr-number>`. Treat the response as registration only, then go idle — do not poll. sm chooses the reviewer, moves to another when one fails, and wakes you with `[sm review]` when a review is on the PR. If sm refuses the request, or wakes you saying no reviewer could take it, tell me and stand by. Do not post `@codex review` yourself.
 
 Before acting on a review, confirm it belongs to your current request and was posted after your latest push. A review existing is not enough on its own.
 

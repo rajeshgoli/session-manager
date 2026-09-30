@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use sm_server::{config::AppConfig, mobile_devices};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -87,9 +87,8 @@ enum Command {
     ListDevices(ListDevicesArgs),
     #[command(name = "remove-device")]
     RemoveDevice(RemoveDeviceArgs),
-    Review(ReviewArgs),
-    #[command(name = "request-codex-review")]
-    RequestCodexReview(RequestCodexReviewArgs),
+    #[command(name = "request-review")]
+    RequestReview(RequestReviewArgs),
     #[command(name = "subagent-start")]
     SubagentStart(EmptyArgs),
     #[command(name = "subagent-stop")]
@@ -753,44 +752,7 @@ struct RemoveDeviceArgs {
 }
 
 #[derive(Args)]
-struct ReviewArgs {
-    session: Option<String>,
-    #[arg(long)]
-    base: Option<String>,
-    #[arg(long)]
-    uncommitted: bool,
-    #[arg(long)]
-    commit: Option<String>,
-    #[arg(long)]
-    custom: Option<String>,
-    #[arg(long)]
-    new: bool,
-    #[arg(long)]
-    name: Option<String>,
-    #[arg(long, value_name = "SECONDS")]
-    wait: Option<u64>,
-    #[arg(long)]
-    model: Option<String>,
-    #[arg(long)]
-    working_dir: Option<String>,
-    #[arg(long)]
-    steer: Option<String>,
-    #[arg(long)]
-    pr: Option<u64>,
-    #[arg(long)]
-    repo: Option<String>,
-}
-
-#[derive(Debug)]
-struct ReviewModeSelection {
-    mode: &'static str,
-    base_branch: Option<String>,
-    commit_sha: Option<String>,
-    custom_prompt: Option<String>,
-}
-
-#[derive(Args)]
-struct RequestCodexReviewArgs {
+struct RequestReviewArgs {
     #[arg(value_name = "PR_NUMBER")]
     action_or_pr: Option<String>,
     #[arg(long, global = true)]
@@ -812,11 +774,11 @@ struct RequestCodexReviewArgs {
     #[arg(long = "retry-interval", global = true, default_value_t = 1200)]
     retry_interval_seconds: i64,
     #[command(subcommand)]
-    command: Option<RequestCodexReviewCommand>,
+    command: Option<RequestReviewCommand>,
 }
 
 #[derive(Subcommand)]
-enum RequestCodexReviewCommand {
+enum RequestReviewCommand {
     List,
     Status { request_id: Option<String> },
     Cancel { request_id: Option<String> },
@@ -874,6 +836,11 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    let removed_command = concat!("request-codex-", "review");
+    if std::env::args().nth(1).as_deref() == Some(removed_command) {
+        eprintln!("error: unrecognized subcommand '{removed_command}'\n\ntip: use 'sm request-review' instead");
+        process::exit(2);
+    }
     let cli = Cli::parse();
     let command = cli.command;
     let command = match command {
@@ -1330,8 +1297,7 @@ fn run() -> Result<()> {
         Command::SubagentStop(_) => run_subagent_stop(&client)?,
         Command::Subagents(args) => print_subagents(&client, &args.session_id)?,
         Command::Queue(args) => run_queue(&client, args)?,
-        Command::Review(args) => run_review(&client, args)?,
-        Command::RequestCodexReview(args) => run_request_codex_review(&client, args)?,
+        Command::RequestReview(args) => run_request_codex_review(&client, args)?,
         Command::Watch(args) => run_watch(&api_url, args)?,
         Command::Doc(args) => doc::run_doc(&client, args)?,
         Command::MergeHold(args) => merge_holds::run(&client, args)?,
@@ -2119,304 +2085,44 @@ fn run_queue_cancel(client: &ApiClient, args: QueueCancelArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_review(client: &ApiClient, args: ReviewArgs) -> Result<()> {
-    if let Some(pr_number) = args.pr {
-        return run_review_pr(client, &args, pr_number);
-    }
-
-    let selection = review_mode_selection(&args)?;
-    let parent_session_id = optional_current_session_id();
-    let wait = effective_review_wait(args.wait, parent_session_id.as_deref());
-
-    if args.new {
-        let parent_session_id = parent_session_id.ok_or_else(|| {
-            anyhow!("Error: --new requires session context (CLAUDE_SESSION_MANAGER_ID must be set)")
-        })?;
-        let payload = review_spawn_payload(
-            &parent_session_id,
-            &selection,
-            args.steer.as_deref(),
-            args.name.as_deref(),
-            wait,
-            args.model.as_deref(),
-            args.working_dir.as_deref(),
-        );
-        let response = client.post_json("/sessions/review", payload)?;
-        bail_review_error(&response)?;
-
-        let child_id = response["session_id"].as_str().unwrap_or("unknown");
-        let child_name = response["friendly_name"]
-            .as_str()
-            .or_else(|| response["name"].as_str())
-            .unwrap_or(child_id);
-        println!(
-            "Review started on {child_name} ({child_id}) — mode={}",
-            selection.mode
-        );
-        if let Some(wait) = wait {
-            println!("  Watching for completion (timeout={wait}s)");
-        }
-        return Ok(());
-    }
-
-    let session = args
-        .session
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("Error: Must specify a session or use --new"))?;
-    let session_id = lookup_identifier(client, session)?
-        .ok_or_else(|| anyhow!("Error: Session '{session}' not found"))?;
-    let session_info =
-        client.get_json(&format!("/sessions/{}", encode_path_segment(&session_id)))?;
-    let payload = review_existing_payload(
-        &selection,
-        args.steer.as_deref(),
-        wait,
-        parent_session_id.as_deref(),
-    );
-    let response = client.post_json(
-        &format!("/sessions/{}/review", encode_path_segment(&session_id)),
-        payload,
-    )?;
-    bail_review_error(&response)?;
-
-    let session_name = session_info["friendly_name"]
-        .as_str()
-        .or_else(|| session_info["name"].as_str())
-        .unwrap_or(&session_id);
-    println!(
-        "Review started on {session_name} ({session_id}) — mode={}",
-        selection.mode
-    );
-    if let Some(steer) = trimmed_string(args.steer.as_deref()) {
-        let preview = steer.chars().take(60).collect::<String>();
-        println!("  Steer queued: {preview}...");
-    }
-    if let Some(wait) = wait {
-        println!("  Watching for completion (timeout={wait}s)");
-    }
-    Ok(())
-}
-
-fn run_review_pr(client: &ApiClient, args: &ReviewArgs, pr_number: u64) -> Result<()> {
-    if args
-        .session
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty())
-        || args.new
-    {
-        bail!("Error: --pr is mutually exclusive with session/--new");
-    }
-    if !review_tui_mode_names(args).is_empty() {
-        bail!("Error: --pr is mutually exclusive with --base/--uncommitted/--commit/--custom");
-    }
-
-    let parent_session_id = optional_current_session_id();
-    let wait = effective_review_wait(args.wait, parent_session_id.as_deref());
-    let payload = review_pr_payload(
-        pr_number,
-        args.repo.as_deref(),
-        args.steer.as_deref(),
-        wait,
-        parent_session_id.as_deref(),
-    );
-    let response = client.post_json("/reviews/pr", payload)?;
-    bail_review_error(&response)?;
-
-    let resolved_repo = response["repo"]
-        .as_str()
-        .map(ToOwned::to_owned)
-        .or_else(|| trimmed_string(args.repo.as_deref()))
-        .unwrap_or_else(|| "unknown".to_owned());
-    println!("Posted @codex review on PR #{pr_number} ({resolved_repo})");
-    if response["server_polling"].as_bool().unwrap_or(false) {
-        if let Some(wait) = wait {
-            println!("  Server polling for completion (timeout={wait}s)");
-        }
-    }
-    Ok(())
-}
-
-fn review_mode_selection(args: &ReviewArgs) -> Result<ReviewModeSelection> {
-    let modes = review_tui_mode_names(args);
-    if modes.is_empty() {
-        bail!("Error: Must specify one of --base, --uncommitted, --commit, --custom, or --pr");
-    }
-    if modes.len() > 1 {
-        bail!(
-            "Error: Modes are mutually exclusive. Got: {}",
-            modes.join(", ")
-        );
-    }
-
-    match modes[0] {
-        "base" => Ok(ReviewModeSelection {
-            mode: "branch",
-            base_branch: trimmed_string(args.base.as_deref()),
-            commit_sha: None,
-            custom_prompt: None,
-        }),
-        "uncommitted" => Ok(ReviewModeSelection {
-            mode: "uncommitted",
-            base_branch: None,
-            commit_sha: None,
-            custom_prompt: None,
-        }),
-        "commit" => Ok(ReviewModeSelection {
-            mode: "commit",
-            base_branch: None,
-            commit_sha: trimmed_string(args.commit.as_deref()),
-            custom_prompt: None,
-        }),
-        "custom" => Ok(ReviewModeSelection {
-            mode: "custom",
-            base_branch: None,
-            commit_sha: None,
-            custom_prompt: trimmed_string(args.custom.as_deref()),
-        }),
-        _ => unreachable!("review_tui_mode_names returned an unknown mode"),
-    }
-}
-
-fn review_tui_mode_names(args: &ReviewArgs) -> Vec<&'static str> {
-    let mut modes = Vec::new();
-    if trimmed_string(args.base.as_deref()).is_some() {
-        modes.push("base");
-    }
-    if args.uncommitted {
-        modes.push("uncommitted");
-    }
-    if trimmed_string(args.commit.as_deref()).is_some() {
-        modes.push("commit");
-    }
-    if trimmed_string(args.custom.as_deref()).is_some() {
-        modes.push("custom");
-    }
-    modes
-}
-
-fn effective_review_wait(
-    explicit_wait: Option<u64>,
-    parent_session_id: Option<&str>,
-) -> Option<u64> {
-    explicit_wait.or_else(|| parent_session_id.map(|_| 600))
-}
-
-fn review_existing_payload(
-    selection: &ReviewModeSelection,
-    steer: Option<&str>,
-    wait: Option<u64>,
-    watcher_session_id: Option<&str>,
-) -> Value {
-    let mut payload = review_mode_payload(selection);
-    insert_trimmed(&mut payload, "steer", steer);
-    insert_u64(&mut payload, "wait", wait);
-    insert_trimmed(&mut payload, "watcher_session_id", watcher_session_id);
-    Value::Object(payload)
-}
-
-fn review_spawn_payload(
-    parent_session_id: &str,
-    selection: &ReviewModeSelection,
-    steer: Option<&str>,
-    name: Option<&str>,
-    wait: Option<u64>,
-    model: Option<&str>,
-    working_dir: Option<&str>,
-) -> Value {
-    let mut payload = review_mode_payload(selection);
-    payload.insert(
-        "parent_session_id".to_owned(),
-        Value::String(parent_session_id.to_owned()),
-    );
-    insert_trimmed(&mut payload, "steer", steer);
-    insert_trimmed(&mut payload, "name", name);
-    insert_u64(&mut payload, "wait", wait);
-    insert_trimmed(&mut payload, "model", model);
-    insert_trimmed(&mut payload, "working_dir", working_dir);
-    Value::Object(payload)
-}
-
-fn review_pr_payload(
-    pr_number: u64,
-    repo: Option<&str>,
-    steer: Option<&str>,
-    wait: Option<u64>,
-    caller_session_id: Option<&str>,
-) -> Value {
-    let mut payload = Map::new();
-    payload.insert("pr_number".to_owned(), json!(pr_number));
-    insert_trimmed(&mut payload, "repo", repo);
-    insert_trimmed(&mut payload, "steer", steer);
-    insert_u64(&mut payload, "wait", wait);
-    insert_trimmed(&mut payload, "caller_session_id", caller_session_id);
-    Value::Object(payload)
-}
-
-fn review_mode_payload(selection: &ReviewModeSelection) -> Map<String, Value> {
-    let mut payload = Map::new();
-    payload.insert("mode".to_owned(), Value::String(selection.mode.to_owned()));
-    insert_trimmed(
-        &mut payload,
-        "base_branch",
-        selection.base_branch.as_deref(),
-    );
-    insert_trimmed(&mut payload, "commit_sha", selection.commit_sha.as_deref());
-    insert_trimmed(
-        &mut payload,
-        "custom_prompt",
-        selection.custom_prompt.as_deref(),
-    );
-    payload
-}
-
-fn insert_trimmed(payload: &mut Map<String, Value>, key: &str, value: Option<&str>) {
-    if let Some(value) = trimmed_string(value) {
-        payload.insert(key.to_owned(), Value::String(value));
-    }
-}
-
-fn insert_u64(payload: &mut Map<String, Value>, key: &str, value: Option<u64>) {
-    if let Some(value) = value {
-        payload.insert(key.to_owned(), json!(value));
-    }
-}
-
-fn bail_review_error(payload: &Value) -> Result<()> {
-    if let Some(error) = payload["error"]
-        .as_str()
-        .or_else(|| payload["detail"].as_str())
-    {
-        bail!("Error: {error}");
-    }
-    Ok(())
-}
-
-fn run_request_codex_review(client: &ApiClient, mut args: RequestCodexReviewArgs) -> Result<()> {
+fn run_request_codex_review(client: &ApiClient, mut args: RequestReviewArgs) -> Result<()> {
     match args.command.take() {
-        Some(RequestCodexReviewCommand::List) => run_request_codex_review_list(client, args),
-        Some(RequestCodexReviewCommand::Status { request_id }) => {
+        Some(RequestReviewCommand::List) => run_request_codex_review_list(client, args),
+        Some(RequestReviewCommand::Status { request_id }) => {
             run_request_codex_review_status(client, args, request_id)
         }
-        Some(RequestCodexReviewCommand::Cancel { request_id }) => {
+        Some(RequestReviewCommand::Cancel { request_id }) => {
             run_request_codex_review_cancel(client, args, request_id)
         }
         None => run_request_codex_review_create(client, args),
     }
 }
 
-fn run_request_codex_review_create(client: &ApiClient, args: RequestCodexReviewArgs) -> Result<()> {
-    let action_or_pr = args
-        .action_or_pr
+fn run_request_codex_review_create(client: &ApiClient, args: RequestReviewArgs) -> Result<()> {
+    let pr_number = match args.action_or_pr.as_deref() {
+        Some(value) => value
+            .parse::<i64>()
+            .map_err(|_| anyhow!("PR must be a number"))?,
+        None => {
+            let output = process::Command::new("gh")
+                .args(["pr", "view", "--json", "number", "--jq", ".number"])
+                .output()?;
+            if !output.status.success() {
+                bail!("No open PR for this branch. Pass the PR number.");
+            }
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| anyhow!("No open PR for this branch. Pass the PR number."))?
+        }
+    };
+    if args
+        .steer
         .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("first argument must be a PR number, list, status, or cancel"))?;
-    let pr_number = action_or_pr
-        .parse::<i64>()
-        .map_err(|_| anyhow!("first argument must be a PR number, list, status, or cancel"))?;
+        .is_some_and(|steer| steer.chars().count() > 2000)
+    {
+        bail!("--steer must be at most 2,000 characters");
+    }
     let current_session_id = optional_current_session_id();
     let effective_notify = args
         .notify
@@ -2447,21 +2153,18 @@ fn run_request_codex_review_create(client: &ApiClient, args: RequestCodexReviewA
         args.poll_interval_seconds,
         args.retry_interval_seconds,
     );
-    let response = client.post_json("/codex-review-requests", payload)?;
-    println!("Review requested for PR #{pr_number}, will sm send you when review arrives.");
+    let response = client.post_json("/review-requests", payload)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
+    let head = response["requested_head_sha"].as_str().unwrap_or("unknown");
+    println!(
+        "Review requested for PR #{pr_number} at {}. sm wakes you when it lands.",
+        &head[..head.len().min(7)]
+    );
     if let Some(warning) = response["claim_warning"].as_str() {
         eprintln!("{warning}");
-    }
-    println!(
-        "  Request: {} -> {}",
-        response["id"].as_str().unwrap_or("unknown"),
-        response["notify_name"]
-            .as_str()
-            .or_else(|| response["notify_session_id"].as_str())
-            .unwrap_or(&effective_notify)
-    );
-    if let Some(head_sha) = response["requested_head_sha"].as_str() {
-        println!("  Head: {head_sha}");
     }
     if let Some(ask) = handoff_ask(&response) {
         println!("{ask}");
@@ -2477,7 +2180,7 @@ fn handoff_ask(response: &Value) -> Option<&str> {
         .filter(|ask| !ask.trim().is_empty())
 }
 
-fn run_request_codex_review_list(client: &ApiClient, args: RequestCodexReviewArgs) -> Result<()> {
+fn run_request_codex_review_list(client: &ApiClient, args: RequestReviewArgs) -> Result<()> {
     let path = codex_review_requests_list_path(&args, args.inactive || args.all)?;
     let payload = client.get_json(&path)?;
     let requests = payload["requests"].as_array().cloned().unwrap_or_default();
@@ -2491,7 +2194,7 @@ fn run_request_codex_review_list(client: &ApiClient, args: RequestCodexReviewArg
 
 fn run_request_codex_review_status(
     client: &ApiClient,
-    args: RequestCodexReviewArgs,
+    args: RequestReviewArgs,
     request_id: Option<String>,
 ) -> Result<()> {
     let payload = if let Some(request_id) = request_id
@@ -2500,7 +2203,7 @@ fn run_request_codex_review_status(
         .filter(|value| !value.is_empty())
     {
         client.get_json(&format!(
-            "/codex-review-requests/{}",
+            "/review-requests/{}",
             encode_path_segment(request_id)
         ))?
     } else {
@@ -2524,7 +2227,7 @@ fn run_request_codex_review_status(
 
 fn run_request_codex_review_cancel(
     client: &ApiClient,
-    args: RequestCodexReviewArgs,
+    args: RequestReviewArgs,
     request_id: Option<String>,
 ) -> Result<()> {
     let request_id = request_id
@@ -2533,7 +2236,7 @@ fn run_request_codex_review_cancel(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("request ID required for cancel"))?;
     let payload = client.delete_json(
-        &format!("/codex-review-requests/{}", encode_path_segment(request_id)),
+        &format!("/review-requests/{}", encode_path_segment(request_id)),
         json!({}),
     )?;
     if args.json {
@@ -2548,13 +2251,13 @@ fn run_request_codex_review_cancel(
 }
 
 fn codex_review_requests_list_path(
-    args: &RequestCodexReviewArgs,
+    args: &RequestReviewArgs,
     include_inactive: bool,
 ) -> Result<String> {
     let mut query = Vec::new();
     let status_without_id = matches!(
         &args.command,
-        Some(RequestCodexReviewCommand::Status { request_id: None })
+        Some(RequestReviewCommand::Status { request_id: None })
     );
     let effective_notify = args
         .notify
@@ -2590,9 +2293,9 @@ fn codex_review_requests_list_path(
         query.push("include_inactive=true".to_owned());
     }
     Ok(if query.is_empty() {
-        "/codex-review-requests".to_owned()
+        "/review-requests".to_owned()
     } else {
-        format!("/codex-review-requests?{}", query.join("&"))
+        format!("/review-requests?{}", query.join("&"))
     })
 }
 
@@ -7556,154 +7259,10 @@ mod tests {
     }
 
     #[test]
-    fn review_cli_parses_retained_modes() {
-        let existing_cli = Cli::try_parse_from([
-            "sm",
-            "review",
-            "session-one",
-            "--base",
-            "main",
-            "--wait",
-            "12",
-            "--steer",
-            "focus on auth",
-        ])
-        .unwrap();
-        let Command::Review(existing_args) = existing_cli.command else {
-            panic!("expected review command");
-        };
-        assert_eq!(existing_args.session.as_deref(), Some("session-one"));
-        assert_eq!(existing_args.base.as_deref(), Some("main"));
-        assert_eq!(existing_args.wait, Some(12));
-        assert_eq!(existing_args.steer.as_deref(), Some("focus on auth"));
-
-        let new_cli = Cli::try_parse_from([
-            "sm",
-            "review",
-            "--new",
-            "--custom",
-            "check the auth path",
-            "--name",
-            "reviewer",
-            "--model",
-            "gpt-5.4",
-            "--working-dir",
-            "/tmp/project",
-        ])
-        .unwrap();
-        let Command::Review(new_args) = new_cli.command else {
-            panic!("expected review command");
-        };
-        assert!(new_args.new);
-        assert_eq!(new_args.custom.as_deref(), Some("check the auth path"));
-        assert_eq!(new_args.name.as_deref(), Some("reviewer"));
-        assert_eq!(new_args.model.as_deref(), Some("gpt-5.4"));
-        assert_eq!(new_args.working_dir.as_deref(), Some("/tmp/project"));
-
-        let pr_cli = Cli::try_parse_from([
-            "sm",
-            "review",
-            "--pr",
-            "972",
-            "--repo",
-            "rajeshgoli/session-manager",
-            "--wait",
-            "600",
-            "--steer",
-            "focus on recovery",
-        ])
-        .unwrap();
-        let Command::Review(pr_args) = pr_cli.command else {
-            panic!("expected review command");
-        };
-        assert_eq!(pr_args.pr, Some(972));
-        assert_eq!(pr_args.repo.as_deref(), Some("rajeshgoli/session-manager"));
-        assert_eq!(pr_args.wait, Some(600));
-        assert_eq!(pr_args.steer.as_deref(), Some("focus on recovery"));
-    }
-
-    #[test]
-    fn review_mode_selection_preserves_python_validation() {
-        let mut args = default_review_args();
-        let error = review_mode_selection(&args).unwrap_err().to_string();
-        assert!(error.contains(
-            "Error: Must specify one of --base, --uncommitted, --commit, --custom, or --pr"
-        ));
-
-        args.base = Some("main".to_owned());
-        args.uncommitted = true;
-        let error = review_mode_selection(&args).unwrap_err().to_string();
-        assert_eq!(
-            error,
-            "Error: Modes are mutually exclusive. Got: base, uncommitted"
-        );
-
-        args.uncommitted = false;
-        let selection = review_mode_selection(&args).unwrap();
-        assert_eq!(selection.mode, "branch");
-        assert_eq!(selection.base_branch.as_deref(), Some("main"));
-        assert!(selection.commit_sha.is_none());
-        assert!(selection.custom_prompt.is_none());
-    }
-
-    #[test]
-    fn review_payloads_preserve_python_fields() {
-        let mut args = default_review_args();
-        args.custom = Some("  inspect auth carefully  ".to_owned());
-        let selection = review_mode_selection(&args).unwrap();
-        let existing = review_existing_payload(
-            &selection,
-            Some("  focus on auth  "),
-            Some(600),
-            Some("parent001"),
-        );
-        assert_eq!(existing["mode"], "custom");
-        assert_eq!(existing["custom_prompt"], "inspect auth carefully");
-        assert_eq!(existing["steer"], "focus on auth");
-        assert_eq!(existing["wait"], 600);
-        assert_eq!(existing["watcher_session_id"], "parent001");
-        assert!(existing["base_branch"].is_null());
-
-        let mut base_args = default_review_args();
-        base_args.base = Some(" main ".to_owned());
-        let base_selection = review_mode_selection(&base_args).unwrap();
-        let spawn = review_spawn_payload(
-            "parent001",
-            &base_selection,
-            Some(" steer "),
-            Some(" reviewer "),
-            Some(60),
-            Some(" gpt-5.4 "),
-            Some(" /tmp/project "),
-        );
-        assert_eq!(spawn["parent_session_id"], "parent001");
-        assert_eq!(spawn["mode"], "branch");
-        assert_eq!(spawn["base_branch"], "main");
-        assert_eq!(spawn["steer"], "steer");
-        assert_eq!(spawn["name"], "reviewer");
-        assert_eq!(spawn["wait"], 60);
-        assert_eq!(spawn["model"], "gpt-5.4");
-        assert_eq!(spawn["working_dir"], "/tmp/project");
-
-        let pr = review_pr_payload(
-            972,
-            Some(" rajeshgoli/session-manager "),
-            Some(" focus on recovery "),
-            Some(600),
-            Some("parent001"),
-        );
-        assert_eq!(pr["pr_number"], 972);
-        assert_eq!(pr["repo"], "rajeshgoli/session-manager");
-        assert_eq!(pr["steer"], "focus on recovery");
-        assert_eq!(pr["wait"], 600);
-        assert_eq!(pr["caller_session_id"], "parent001");
-    }
-
-    #[test]
     fn request_codex_review_cli_parses_retained_subcommands() {
         let create_cli = Cli::try_parse_from([
             "sm",
-            "request-codex-review",
+            "request-review",
             "967",
             "--notify",
             "notify123",
@@ -7717,8 +7276,8 @@ mod tests {
             "900",
         ])
         .unwrap();
-        let Command::RequestCodexReview(create_args) = create_cli.command else {
-            panic!("expected request-codex-review command");
+        let Command::RequestReview(create_args) = create_cli.command else {
+            panic!("expected request-review command");
         };
         assert_eq!(create_args.action_or_pr.as_deref(), Some("967"));
         assert_eq!(create_args.notify.as_deref(), Some("notify123"));
@@ -7731,16 +7290,15 @@ mod tests {
         assert_eq!(create_args.retry_interval_seconds, 900);
         assert!(create_args.command.is_none());
 
-        let default_create_cli =
-            Cli::try_parse_from(["sm", "request-codex-review", "967"]).unwrap();
-        let Command::RequestCodexReview(default_create_args) = default_create_cli.command else {
-            panic!("expected request-codex-review command");
+        let default_create_cli = Cli::try_parse_from(["sm", "request-review", "967"]).unwrap();
+        let Command::RequestReview(default_create_args) = default_create_cli.command else {
+            panic!("expected request-review command");
         };
         assert_eq!(default_create_args.retry_interval_seconds, 1200);
 
         let list_cli = Cli::try_parse_from([
             "sm",
-            "request-codex-review",
+            "request-review",
             "list",
             "--notify",
             "notify123",
@@ -7752,8 +7310,8 @@ mod tests {
             "--json",
         ])
         .unwrap();
-        let Command::RequestCodexReview(list_args) = list_cli.command else {
-            panic!("expected request-codex-review command");
+        let Command::RequestReview(list_args) = list_cli.command else {
+            panic!("expected request-review command");
         };
         assert_eq!(list_args.notify.as_deref(), Some("notify123"));
         assert_eq!(
@@ -7765,27 +7323,25 @@ mod tests {
         assert!(list_args.json);
         assert!(matches!(
             list_args.command,
-            Some(RequestCodexReviewCommand::List)
+            Some(RequestReviewCommand::List)
         ));
 
         let status_cli =
-            Cli::try_parse_from(["sm", "request-codex-review", "--all", "status", "req123"])
-                .unwrap();
-        let Command::RequestCodexReview(status_args) = status_cli.command else {
-            panic!("expected request-codex-review command");
+            Cli::try_parse_from(["sm", "request-review", "--all", "status", "req123"]).unwrap();
+        let Command::RequestReview(status_args) = status_cli.command else {
+            panic!("expected request-review command");
         };
         assert!(status_args.all);
-        let Some(RequestCodexReviewCommand::Status { request_id }) = status_args.command else {
+        let Some(RequestReviewCommand::Status { request_id }) = status_args.command else {
             panic!("expected status subcommand");
         };
         assert_eq!(request_id.as_deref(), Some("req123"));
 
-        let cancel_cli =
-            Cli::try_parse_from(["sm", "request-codex-review", "cancel", "req456"]).unwrap();
-        let Command::RequestCodexReview(cancel_args) = cancel_cli.command else {
-            panic!("expected request-codex-review command");
+        let cancel_cli = Cli::try_parse_from(["sm", "request-review", "cancel", "req456"]).unwrap();
+        let Command::RequestReview(cancel_args) = cancel_cli.command else {
+            panic!("expected request-review command");
         };
-        let Some(RequestCodexReviewCommand::Cancel { request_id }) = cancel_args.command else {
+        let Some(RequestReviewCommand::Cancel { request_id }) = cancel_args.command else {
             panic!("expected cancel subcommand");
         };
         assert_eq!(request_id.as_deref(), Some("req456"));
@@ -7797,7 +7353,7 @@ mod tests {
         let _env = EnvRestore::new(&["SESSION_MANAGER_ID", "CLAUDE_SESSION_MANAGER_ID"]);
         env::set_var("SESSION_MANAGER_ID", "session one");
 
-        let args = RequestCodexReviewArgs {
+        let args = RequestReviewArgs {
             action_or_pr: None,
             notify: None,
             repo: Some("rajeshgoli/session-manager".to_owned()),
@@ -7808,14 +7364,14 @@ mod tests {
             pr_number: Some(964),
             poll_interval_seconds: 30,
             retry_interval_seconds: 600,
-            command: Some(RequestCodexReviewCommand::List),
+            command: Some(RequestReviewCommand::List),
         };
         assert_eq!(
             codex_review_requests_list_path(&args, false).unwrap(),
-            "/codex-review-requests?notify_target=session%20one&repo=rajeshgoli%2Fsession-manager&pr_number=964"
+            "/review-requests?notify_target=session%20one&repo=rajeshgoli%2Fsession-manager&pr_number=964"
         );
 
-        let all_args = RequestCodexReviewArgs {
+        let all_args = RequestReviewArgs {
             action_or_pr: None,
             notify: None,
             repo: None,
@@ -7826,14 +7382,14 @@ mod tests {
             pr_number: None,
             poll_interval_seconds: 30,
             retry_interval_seconds: 600,
-            command: Some(RequestCodexReviewCommand::List),
+            command: Some(RequestReviewCommand::List),
         };
         assert_eq!(
             codex_review_requests_list_path(&all_args, true).unwrap(),
-            "/codex-review-requests?include_inactive=true"
+            "/review-requests?include_inactive=true"
         );
 
-        let status_args = RequestCodexReviewArgs {
+        let status_args = RequestReviewArgs {
             action_or_pr: None,
             notify: None,
             repo: Some("rajeshgoli/session-manager".to_owned()),
@@ -7844,11 +7400,11 @@ mod tests {
             pr_number: Some(964),
             poll_interval_seconds: 30,
             retry_interval_seconds: 600,
-            command: Some(RequestCodexReviewCommand::Status { request_id: None }),
+            command: Some(RequestReviewCommand::Status { request_id: None }),
         };
         assert_eq!(
             codex_review_requests_list_path(&status_args, true).unwrap(),
-            "/codex-review-requests?repo=rajeshgoli%2Fsession-manager&pr_number=964&include_inactive=true"
+            "/review-requests?repo=rajeshgoli%2Fsession-manager&pr_number=964&include_inactive=true"
         );
     }
 
@@ -7876,24 +7432,6 @@ mod tests {
         assert!(fallback_payload["repo"].is_null());
         assert!(fallback_payload["steer"].is_null());
         assert!(fallback_payload["requester_session_id"].is_null());
-    }
-
-    fn default_review_args() -> ReviewArgs {
-        ReviewArgs {
-            session: None,
-            base: None,
-            uncommitted: false,
-            commit: None,
-            custom: None,
-            new: false,
-            name: None,
-            wait: None,
-            model: None,
-            working_dir: None,
-            steer: None,
-            pr: None,
-            repo: None,
-        }
     }
 
     #[test]

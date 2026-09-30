@@ -32,10 +32,7 @@ use crate::queue::{
 };
 use crate::{
     btw::BtwStore,
-    config::{
-        path_is_under_home, test_isolation_root_from_environment, CodexReviewConfig,
-        ContextMonitorConfig,
-    },
+    config::{path_is_under_home, test_isolation_root_from_environment, ContextMonitorConfig},
     runtime::{
         RestoreTmuxLivenessOutcome, RestoreTmuxTeardownOutcome, TmuxRuntime, TmuxSessionSpec,
     },
@@ -1514,7 +1511,6 @@ impl SessionStore {
         if !credential_rotation_has_fresh_idle_proof(&rotations[rotation_index], &session)
             || active_reparent_request_for_session(&state, session_id)?.is_some()
             || handoff_fences_delivery_raw(raw_session)
-            || review_dispatch_in_progress(raw_session)
             || !self.credential_rotation_queue_is_drained(session_id)?
             || self.credential_rotation_has_active_btw(session_id)?
             || session_runtime.session_has_attached_clients(&rotation.tmux_session)?
@@ -4923,200 +4919,6 @@ impl SessionStore {
         }))
     }
 
-    pub fn start_review_with_runtime(
-        &self,
-        session_id: &str,
-        request: StartReviewRequest,
-        runtime: &TmuxRuntime,
-        timing: &CodexReviewConfig,
-    ) -> Result<CoreReviewOutcome> {
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let Some(session) = session_object_mut(sessions, session_id) else {
-            return Ok(CoreReviewOutcome::NotFound);
-        };
-        if raw_session_is_stopped(session) {
-            return Ok(CoreReviewOutcome::Error(
-                "Session is stopped. Restore it before starting a review.".to_owned(),
-            ));
-        }
-
-        let provider = json_text(session.get("provider")).unwrap_or_else(default_provider);
-        if !matches!(provider.as_str(), "codex" | "codex-fork" | "codex-app") {
-            return Ok(CoreReviewOutcome::Error(
-                "Review requires a Codex session (provider=codex, codex-fork, or codex-app)"
-                    .to_owned(),
-            ));
-        }
-        if provider == "codex-app" {
-            return Ok(CoreReviewOutcome::Error(
-                "Rust core review does not support codex-app review/start yet".to_owned(),
-            ));
-        }
-
-        let mode = normalized_review_mode(&request.mode);
-        if !matches!(
-            mode.as_str(),
-            "branch" | "uncommitted" | "commit" | "custom"
-        ) {
-            return Ok(CoreReviewOutcome::Error(format!(
-                "Unsupported review mode: {mode}"
-            )));
-        }
-        let status = json_text(session.get("status")).unwrap_or_else(|| "running".to_owned());
-        if review_session_is_busy(session, &status) {
-            return Ok(CoreReviewOutcome::Error(
-                "Session is busy. Wait for current work to complete or use sm clear first."
-                    .to_owned(),
-            ));
-        }
-
-        let node = json_text(session.get("node")).unwrap_or_else(default_node);
-        ensure_runtime_local_node(&node)?;
-        let tmux_session = json_text(session.get("tmux_session"))
-            .ok_or_else(|| anyhow::anyhow!("session {session_id} missing tmux_session"))?;
-        let session_socket_name = json_text(session.get("tmux_socket_name"));
-        let session_runtime = runtime.for_socket_name(session_socket_name.as_deref());
-        if !session_runtime.session_exists(&tmux_session)? {
-            return Ok(CoreReviewOutcome::Error(
-                "Failed to send review sequence to tmux".to_owned(),
-            ));
-        }
-        let working_dir = json_text(session.get("working_dir")).unwrap_or_else(|| ".".to_owned());
-        let working_path = expand_home(&working_dir);
-
-        if !git_command_success(&working_path, ["rev-parse", "--git-dir"])? {
-            return Ok(CoreReviewOutcome::Error(format!(
-                "Working directory is not a git repo: {working_dir}"
-            )));
-        }
-
-        let branch_position = if mode == "branch" {
-            match request
-                .base_branch
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                Some(base_branch) => match git_branch_position(&working_path, base_branch)? {
-                    Some(position) => Some(position),
-                    None => {
-                        let branches = git_branch_list(&working_path)?;
-                        return Ok(CoreReviewOutcome::Error(format!(
-                            "Branch '{base_branch}' not found. Available: {}",
-                            branches.join(", ")
-                        )));
-                    }
-                },
-                None => None,
-            }
-        } else {
-            None
-        };
-        if mode == "commit" {
-            if let Some(commit_sha) = request
-                .commit_sha
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                if !git_commit_exists(&working_path, commit_sha)? {
-                    return Ok(CoreReviewOutcome::Error(format!(
-                        "Commit '{commit_sha}' not found"
-                    )));
-                }
-            }
-        }
-
-        let now = now_rfc3339();
-        session.insert(
-            "review_config".to_owned(),
-            review_config_value(&mode, &request),
-        );
-        session.insert("last_tool_call".to_owned(), Value::String(now.clone()));
-        self.write_raw_json_value(&state)?;
-
-        let delivered = match session_runtime.send_review_sequence(
-            &tmux_session,
-            &mode,
-            request.base_branch.as_deref(),
-            request.commit_sha.as_deref(),
-            request.custom_prompt.as_deref(),
-            branch_position,
-            timing,
-        ) {
-            Ok(delivered) => delivered,
-            Err(error) => {
-                let mut state = self.load_raw_json_value()?;
-                let sessions = ensure_sessions_array_mut(&mut state)?;
-                if let Some(session) = session_object_mut(sessions, session_id) {
-                    let now = now_rfc3339();
-                    mark_review_dispatch_completed(session, &now);
-                    self.write_raw_json_value(&state)?;
-                }
-                return Err(error);
-            }
-        };
-        if !delivered {
-            let mut state = self.load_raw_json_value()?;
-            let sessions = ensure_sessions_array_mut(&mut state)?;
-            if let Some(session) = session_object_mut(sessions, session_id) {
-                let now = now_rfc3339();
-                mark_review_dispatch_completed(session, &now);
-                self.write_raw_json_value(&state)?;
-            }
-            return Ok(CoreReviewOutcome::Error(
-                "Failed to send review sequence to tmux".to_owned(),
-            ));
-        }
-
-        let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let Some(session) = session_object_mut(sessions, session_id) else {
-            return Ok(CoreReviewOutcome::NotFound);
-        };
-        let now = now_rfc3339();
-        mark_review_dispatch_completed(session, &now);
-        session.insert("status".to_owned(), Value::String("running".to_owned()));
-        session.insert("last_activity".to_owned(), Value::String(now));
-        self.write_raw_json_value(&state)?;
-
-        Ok(CoreReviewOutcome::Started(CoreReviewResult {
-            session_id: session_id.to_owned(),
-            review_mode: mode,
-            base_branch: request.base_branch,
-            commit_sha: request.commit_sha,
-            status: "started".to_owned(),
-            steer_queued: request
-                .steer_text
-                .as_deref()
-                .map(str::trim)
-                .is_some_and(|value| !value.is_empty()),
-            tmux_session,
-            tmux_socket_name: session_socket_name,
-            steer_text: request.steer_text,
-        }))
-    }
-
-    pub fn mark_review_steer_delivered(&self, session_id: &str) -> Result<bool> {
-        let _guard = self.write_guard()?;
-        let mut state = self.load_raw_json_value()?;
-        let sessions = ensure_sessions_array_mut(&mut state)?;
-        let Some(session) = session_object_mut(sessions, session_id) else {
-            return Ok(false);
-        };
-        let Some(review_config) = session
-            .get_mut("review_config")
-            .and_then(Value::as_object_mut)
-        else {
-            return Ok(false);
-        };
-        review_config.insert("steer_delivered".to_owned(), Value::Bool(true));
-        self.write_raw_json_value(&state)?;
-        Ok(true)
-    }
-
     pub fn drain_runtime_pending_messages_for_session(
         &self,
         session_id: &str,
@@ -8492,7 +8294,6 @@ impl SessionStore {
             telegram_root_msg_id: None,
             current_task: None,
             git_remote_url: None,
-            review_config: None,
             parent_session_id: request.parent_session_id.clone(),
             session_credential_sha256: None,
             last_handoff_path: None,
@@ -9392,51 +9193,6 @@ pub struct CreateCoreSessionRequest {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct StartReviewRequest {
-    #[serde(default = "default_review_mode")]
-    pub mode: String,
-    #[serde(default)]
-    pub base_branch: Option<String>,
-    #[serde(default)]
-    pub commit_sha: Option<String>,
-    #[serde(default)]
-    pub custom_prompt: Option<String>,
-    #[serde(default, alias = "steer")]
-    pub steer_text: Option<String>,
-    #[serde(default)]
-    pub wait: Option<u64>,
-    #[serde(default)]
-    pub watcher_session_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct SpawnReviewRequest {
-    pub parent_session_id: String,
-    #[serde(default = "default_review_mode")]
-    pub mode: String,
-    #[serde(default)]
-    pub base_branch: Option<String>,
-    #[serde(default)]
-    pub commit_sha: Option<String>,
-    #[serde(default)]
-    pub custom_prompt: Option<String>,
-    #[serde(default, alias = "steer")]
-    pub steer_text: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub wait: Option<u64>,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub working_dir: Option<String>,
-}
-
-fn default_review_mode() -> String {
-    "branch".to_owned()
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct SendCoreInputRequest {
     pub text: String,
     #[serde(default = "default_delivery_mode")]
@@ -9718,29 +9474,6 @@ pub struct CoreInputBatchResponse {
     pub failure_count: usize,
     pub delivery_mode: String,
     pub results: Vec<CoreInputBatchResult>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct CoreReviewResult {
-    pub session_id: String,
-    pub review_mode: String,
-    pub base_branch: Option<String>,
-    pub commit_sha: Option<String>,
-    pub status: String,
-    pub steer_queued: bool,
-    #[serde(skip)]
-    pub tmux_session: String,
-    #[serde(skip)]
-    pub tmux_socket_name: Option<String>,
-    #[serde(skip)]
-    pub steer_text: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub enum CoreReviewOutcome {
-    Started(CoreReviewResult),
-    NotFound,
-    Error(String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -10750,132 +10483,6 @@ fn format_send_input_text_raw(
         ),
         Some(sender_name),
     )
-}
-
-fn normalized_review_mode(mode: &str) -> String {
-    let mode = mode.trim();
-    if mode.is_empty() {
-        "branch".to_owned()
-    } else {
-        mode.to_owned()
-    }
-}
-
-fn review_config_value(mode: &str, request: &StartReviewRequest) -> Value {
-    json!({
-        "mode": mode,
-        "base_branch": trimmed_value(request.base_branch.as_deref()),
-        "commit_sha": trimmed_value(request.commit_sha.as_deref()),
-        "custom_prompt": trimmed_value(request.custom_prompt.as_deref()),
-        "steer_text": trimmed_value(request.steer_text.as_deref()),
-        "steer_delivered": false,
-        "dispatch_in_progress": true,
-        "dispatch_completed_at": null,
-        "pr_number": null,
-        "pr_repo": null,
-        "pr_comment_id": null
-    })
-}
-
-fn review_session_is_busy(session: &Map<String, Value>, status: &str) -> bool {
-    if review_dispatch_in_progress(session) {
-        return true;
-    }
-    if normalized_status(status) != "running" {
-        return false;
-    }
-    let Some(last_tool_call) = json_text(session.get("last_tool_call"))
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-    else {
-        return false;
-    };
-    !review_dispatch_completed_after(session, &last_tool_call)
-}
-
-fn review_dispatch_in_progress(session: &Map<String, Value>) -> bool {
-    session
-        .get("review_config")
-        .and_then(Value::as_object)
-        .and_then(|config| config.get("dispatch_in_progress"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
-fn review_dispatch_completed_after(session: &Map<String, Value>, last_tool_call: &str) -> bool {
-    session
-        .get("review_config")
-        .and_then(Value::as_object)
-        .and_then(|config| config.get("dispatch_completed_at"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some_and(|completed_at| completed_at >= last_tool_call)
-}
-
-fn mark_review_dispatch_completed(session: &mut Map<String, Value>, completed_at: &str) {
-    if let Some(config) = session
-        .get_mut("review_config")
-        .and_then(Value::as_object_mut)
-    {
-        config.insert("dispatch_in_progress".to_owned(), Value::Bool(false));
-        config.insert(
-            "dispatch_completed_at".to_owned(),
-            Value::String(completed_at.to_owned()),
-        );
-    }
-}
-
-fn trimmed_value(value: Option<&str>) -> Value {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| Value::String(value.to_owned()))
-        .unwrap_or(Value::Null)
-}
-
-fn git_command_success<const N: usize>(working_path: &Path, args: [&str; N]) -> Result<bool> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(working_path)
-        .output()
-        .with_context(|| format!("failed to run git in {}", working_path.display()))?;
-    Ok(output.status.success())
-}
-
-fn git_commit_exists(working_path: &Path, commit_sha: &str) -> Result<bool> {
-    let commit_ref = format!("{commit_sha}^{{commit}}");
-    let output = Command::new("git")
-        .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
-        .arg(commit_ref)
-        .current_dir(working_path)
-        .output()
-        .with_context(|| format!("failed to verify git commit in {}", working_path.display()))?;
-    Ok(output.status.success())
-}
-
-fn git_branch_position(working_path: &Path, branch: &str) -> Result<Option<usize>> {
-    Ok(git_branch_list(working_path)?
-        .iter()
-        .position(|candidate| candidate == branch))
-}
-
-fn git_branch_list(working_path: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .args(["branch", "--list"])
-        .current_dir(working_path)
-        .output()
-        .with_context(|| format!("failed to list git branches in {}", working_path.display()))?;
-    if !output.status.success() {
-        anyhow::bail!("Failed to list git branches");
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let branch = line.trim().trim_start_matches("* ").trim();
-            (!branch.is_empty()).then(|| branch.to_owned())
-        })
-        .collect())
 }
 
 fn pending_message_from_metadata(
@@ -12523,7 +12130,6 @@ fn reset_session_after_clear(session: &mut Map<String, Value>, now: &str) {
     session.insert("terminal_provenance".to_owned(), Value::Null);
     session.insert("retirement_intent".to_owned(), Value::Null);
     session.insert("last_activity".to_owned(), Value::String(now.to_owned()));
-    mark_review_dispatch_completed(session, now);
 }
 
 fn mark_session_followup_activity(session: &mut Map<String, Value>, now: &str) {
@@ -15879,8 +15485,6 @@ pub struct SessionRecord {
     #[serde(default)]
     pub git_remote_url: Option<String>,
     #[serde(default)]
-    pub review_config: Option<Value>,
-    #[serde(default)]
     pub parent_session_id: Option<String>,
     #[serde(default)]
     pub session_credential_sha256: Option<String>,
@@ -19153,7 +18757,6 @@ sleep 30
             telegram_root_msg_id: None,
             current_task: None,
             git_remote_url: None,
-            review_config: None,
             parent_session_id: None,
             session_credential_sha256: None,
             last_handoff_path: None,

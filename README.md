@@ -319,8 +319,7 @@ sm all
 | `sm turn-complete` | Mark a turn boundary |
 | `sm queue list/status/run/cancel` | Manage retained queue jobs |
 | `sm watch` | Agent dashboard with queue ages, hold reasons, and live job logs |
-| `sm review` | Run local synchronous PR review flows |
-| `sm request-codex-review` | Request async Codex review tracking |
+| `sm request-review [PR]` | Request and track a PR review; defaults to the current branch's PR |
 | `sm device enroll <name>` | Enroll a Mac certificate for Chrome sign-in |
 | `sm device repair-key-access <name>` | Repair Chrome signing access and the prompt name for an existing Mac key |
 | `sm enroll-device` | Enroll an Android app device certificate |
@@ -508,7 +507,7 @@ backup, restore, freeze/drain, fixture, shadow, and canary evidence.
 | `/queue-jobs` | GET/POST | Queue job list/create |
 | `/queue-jobs/{id-or-label}` | GET/DELETE | Queue job detail/cancel (unique exact label or ID) |
 | `/session-obligations` | GET | Pending job/review results and sm-tracked PR history, keyed by session ID |
-| `/codex-review-requests` | GET/POST | Codex review watch list/create |
+| `/review-requests` | GET/POST | Review request list/create |
 | `/nodes` | GET | Node registry projection |
 
 Full docs are available from the running service at `http://127.0.0.1:8420/docs`
@@ -653,4 +652,4 @@ stale/unknown indication on request failure rather than treating failure as empt
 An obligation ends when the job finishes or the review watch becomes inactive;
 this API does not represent unread completion messages. It makes no GitHub calls.
 For individual review records and timestamps, use
-`GET /codex-review-requests?include_inactive=true&repo=OWNER/REPO&pr_number=N`.
+`GET /review-requests?include_inactive=true&repo=OWNER/REPO&pr_number=N`.

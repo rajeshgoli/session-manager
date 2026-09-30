@@ -514,14 +514,26 @@ fn notice_user_id(state: &AppState, human: Option<&str>) -> String {
 }
 
 fn message_notice(state: &AppState, message: &OwnerMessage) -> NewNotice {
-    NewNotice::message(
+    let mut notice = NewNotice::message(
         &notice_user_id(state, Some(&message.human)),
         &message.sender_session_id,
         &message.sender_session_name,
         &message.id,
         &message.title,
         message.blocking,
-    )
+    );
+    if message.blocking
+        && message.title.starts_with("PR #")
+        && message.title.ends_with(" has no reviewer")
+    {
+        let pr = message.title.trim_end_matches(" has no reviewer");
+        notice.title = format!(
+            "No reviewer could take {pr} ({})",
+            message.sender_session_name
+        );
+        notice.body = "Tap to choose.".to_owned();
+    }
+    notice
 }
 
 fn review_notice(state: &AppState, doc: &OwnerDoc, publish: &OwnerDocPublish) -> NewNotice {

@@ -563,6 +563,19 @@ impl OwnerMessageStore {
         get_message_conn(&conn, id)
     }
 
+    /// Clear a blocking review notice when its request receives a reviewer.
+    pub fn mark_handled_by_delivery_key(&self, key: &str) -> Result<()> {
+        let conn = self.open_write()?;
+        let now = now_rfc3339();
+        conn.execute(
+            "UPDATE owner_messages SET handled_at = IFNULL(handled_at, ?2), \
+               first_viewed_at = IFNULL(first_viewed_at, ?2) WHERE id = (\
+               SELECT message_id FROM owner_message_delivery_keys WHERE key = ?1)",
+            params![key, now],
+        )?;
+        Ok(())
+    }
+
     /// Messages the obligations projection needs: every message created at
     /// or after `since`, plus older blocking messages nobody has answered.
     /// Each comes with whether it has a reply. Newest first.

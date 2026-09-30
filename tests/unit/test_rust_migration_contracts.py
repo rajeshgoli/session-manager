@@ -75,27 +75,14 @@ def test_manifest_preserves_mobile_kill_route_while_retiring_cli_alias():
     assert cli_kill.command == ("kill", "--help")
 
 
-def test_manifest_retains_local_and_durable_codex_review_cli_surfaces():
+def test_manifest_retains_review_request_cli_surfaces():
     manifest = ContractManifest.load()
     checks = {check.id: check for check in manifest.checks}
 
-    review = checks["cli.review_help"]
-    assert review.classification == "retained"
-    assert review.target == "python_and_rust"
-    assert review.command == ("review", "--help")
-    assert review.expected_output_contains_all == (
-        "--base",
-        "--uncommitted",
-        "--commit",
-        "--custom",
-        "--new",
-        "--pr",
-    )
-
     durable = checks["cli.request_codex_review_help"]
     assert durable.classification == "retained"
-    assert durable.target == "python_and_rust"
-    assert durable.command == ("request-codex-review", "--help")
+    assert durable.target == "rust_only"
+    assert durable.command == ("request-review", "--help")
     assert "--notify" in durable.expected_output_contains_all
     assert "--steer" in durable.expected_output_contains_all
     assert "--poll-interval" in durable.expected_output_contains_all
@@ -108,8 +95,8 @@ def test_manifest_retains_local_and_durable_codex_review_cli_surfaces():
     }.items():
         check = checks[check_id]
         assert check.classification == "retained"
-        assert check.target == "python_and_rust"
-        assert check.command == ("request-codex-review", subcommand, "--help")
+        assert check.target == "rust_only"
+        assert check.command == ("request-review", subcommand, "--help")
 
 
 def test_manifest_covers_core_retained_cli_help_surfaces():
@@ -146,11 +133,6 @@ def test_manifest_covers_core_retained_cli_help_surfaces():
         "cli.queue_list_help",
         "cli.queue_status_help",
         "cli.queue_cancel_help",
-        "cli.review_help",
-        "cli.request_codex_review_help",
-        "cli.request_codex_review_list_help",
-        "cli.request_codex_review_status_help",
-        "cli.request_codex_review_cancel_help",
         "cli.claude_help",
         "cli.codex_help",
         "cli.codex_app_help",
@@ -407,36 +389,6 @@ def test_manifest_uses_dedicated_notify_child_for_stop_notification_fixture():
     assert "fixture:child_session_id" not in notify.preconditions
     expectations = {expectation.path: expectation for expectation in notify.expected_json}
     assert expectations["/session_id"].equals == "{notify_child_session_id}"
-
-
-def test_manifest_covers_rust_core_review_fixture_checks():
-    manifest = ContractManifest.load()
-    checks = {check.id: check for check in manifest.checks}
-
-    existing = checks["http.rust_core_review_existing_fixture"]
-    assert existing.classification == "retained"
-    assert existing.target == "rust_only"
-    assert existing.safety == "mutating"
-    assert existing.method == "POST"
-    assert existing.path == "/sessions/{session_id}/review"
-    assert existing.body["mode"] == "custom"
-    assert "session_id" in existing.preconditions
-    assert "mutating_opt_in" in existing.preconditions
-    expectations = {expectation.path: expectation for expectation in existing.expected_json}
-    assert expectations["/error"].equals.startswith("Review requires a Codex session")
-
-    spawned = checks["http.rust_core_spawn_review_fixture"]
-    assert spawned.classification == "retained"
-    assert spawned.target == "rust_only"
-    assert spawned.safety == "mutating"
-    assert spawned.method == "POST"
-    assert spawned.path == "/sessions/review"
-    assert spawned.body["parent_session_id"] == "{session_id}"
-    assert spawned.body["mode"] == "custom"
-    assert "session_id" in spawned.preconditions
-    assert "mutating_opt_in" in spawned.preconditions
-    expectations = {expectation.path: expectation for expectation in spawned.expected_json}
-    assert expectations["/error"].equals == "Failed to send review sequence to tmux"
 
 
 def test_manifest_covers_rust_queue_writer_fixture_checks():
@@ -1259,7 +1211,9 @@ def test_manifest_covers_implemented_detail_http_surfaces():
     for check_id in required_ids:
         check = checks[check_id]
         assert check.classification == "retained"
-        assert check.target == "python_and_rust"
+        assert check.target == (
+            "rust_only" if check_id == "http.codex_review_request_detail" else "python_and_rust"
+        )
         assert check.safety == "read_only"
         assert check.method == "GET"
         assert check.expected_status == (200,)
@@ -1273,7 +1227,7 @@ def test_manifest_covers_implemented_detail_http_surfaces():
     )
 
     codex_review = checks["http.codex_review_request_detail"]
-    assert codex_review.path == "/codex-review-requests/{codex_review_request_id}"
+    assert codex_review.path == "/review-requests/{codex_review_request_id}"
     assert "fixture:codex_review_request_id" in codex_review.preconditions
     assert any(
         expectation.path == "/id" and expectation.equals == "{codex_review_request_id}"
@@ -1810,21 +1764,21 @@ def test_json_expectations_support_absent_equals_and_contains():
 
 def test_cli_check_requires_all_expected_output_tokens():
     check = ContractCheck(
-        id="cli.review",
+        id="cli.request_review",
         surface="cli",
         classification="retained",
         target="python_and_rust",
         safety="read_only",
-        command=("review", "--help"),
+        command=("request-review", "--help"),
         expected_exit=(0,),
-        expected_output_contains_all=("--base", "--pr"),
+        expected_output_contains_all=("--steer", "--pr"),
         preconditions=("sm_cli",),
         source="test",
     )
     completed = subprocess.CompletedProcess(
-        args=["sm", "review", "--help"],
+        args=["sm", "request-review", "--help"],
         returncode=0,
-        stdout="usage: sm review --base\n",
+        stdout="usage: sm request-review --steer\n",
         stderr="",
     )
 
