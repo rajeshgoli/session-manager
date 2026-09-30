@@ -95,6 +95,8 @@ Phase 1 (service untouched on any failure; nothing writes the registered path)
   take the restart lock (fixed path under ~/.local/share/claude-sessions)
   --update only: fast-forward the checkout to origin/main, then exec the
          updated script, which keeps the lock (sm#1533)
+  any other build: fetch origin/main and refuse unless HEAD contains it,
+         unless --allow-behind-main (sm#1751)
   fingerprint the source: HEAD plus tracked working-tree contents
   record /health and session count (a healthy server must yield a baseline)
   preflight: cutover executable, config readable, local-env readable,
@@ -139,6 +141,22 @@ takes the lock, and refuses to stop the service if either has changed by the
 end of phase 1. The lock is at a fixed path under the home directory, not under
 `$TMPDIR`, because agent sandboxes give sessions their own `TMPDIR`, and two
 restarts with different lock paths exclude nothing.
+
+### Every build must contain main
+
+There is one live service, and agents restart it from their own ticket
+worktrees to check their work live. A branch cut before someone else's merge
+then removes that merged feature from production for everyone: on 2026-09-29 a
+restart from an older ticket worktree took the just-merged browser terminal
+away mid-validation, and a later restart from a stale deployed checkout did the
+same (sm#1751). So any restart that builds first fetches `origin/main` under the
+lock and refuses, before building, unless `HEAD` contains it; the error lists the
+missing commits. A branch that is behind merges or rebases first. `--update`
+skips the second fetch because its `HEAD` is the `origin/main` it just fetched,
+and `--skip-build`/`--adopt` skip the check because they deploy a binary that
+already exists. A failed fetch or a non-git source also refuses.
+`--allow-behind-main` (or `SM_ALLOW_BEHIND_MAIN=1`) overrides it, for a
+deliberate rollback or an unreachable `origin`, with a warning.
 
 ### The service must not run out of the build directory
 
