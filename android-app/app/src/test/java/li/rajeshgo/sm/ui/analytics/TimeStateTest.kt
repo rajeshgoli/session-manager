@@ -43,6 +43,8 @@ class TimeStateTest {
         assertEquals("1 h", timeDuration(3_590))
         assertEquals("45 s", timeDuration(45))
         assertEquals("34%", timeShare(2_640, 7_860))
+        assertEquals("<1%", timeShare(30, 7_860))
+        assertEquals("0%", timeShare(0, 7_860))
     }
 
     @Test fun bucketsLargestFirstWithToolKindsUnderTools() {

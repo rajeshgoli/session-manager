@@ -45,7 +45,11 @@ fun timeDuration(seconds: Long): String {
     }
 }
 
-fun timeShare(part: Long, whole: Long): String = if (whole > 0) "${Math.round(100.0 * part / whole)}%" else "0%"
+/** Share of `whole`; a non-zero part that rounds to nothing shows as "<1%" so it doesn't read as absent. */
+fun timeShare(part: Long, whole: Long): String {
+    val percent = if (whole > 0) Math.round(100.0 * part / whole) else 0L
+    return if (percent == 0L && part > 0) "<1%" else "$percent%"
+}
 
 private fun plural(count: Int, one: String) = "$count ${if (count == 1) one else "${one}s"}"
 
