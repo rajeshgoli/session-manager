@@ -4134,8 +4134,9 @@ async fn create_client_session(
         parent_session_id: None,
         node: None,
         initial_message: payload.initial_message,
-        model: payload.model,
-        reasoning_effort: payload.reasoning_effort,
+        // Absent or blank leaves the choice to the provider (sm#1718).
+        model: crate::config::trimmed(&payload.model),
+        reasoning_effort: crate::config::trimmed(&payload.reasoning_effort),
         wait: None,
         spawn_prompt_source: payload.spawn_prompt_source,
         spawn_brief: None,
