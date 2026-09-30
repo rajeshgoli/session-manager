@@ -167,8 +167,9 @@ pub fn valid_computer_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 
-/// Enroll only a new name. Keeping revoked names reserved prevents an old
-/// certificate from becoming valid again when a replacement device is enrolled.
+/// Enroll a new name, or retry for the same active owner/key after a lost
+/// response or failed local import. Revoked names stay reserved so an old
+/// certificate cannot become valid again through replacement enrollment.
 pub fn enroll_computer(config: &AppConfig, user_id: &str, name: &str, csr: &str) -> Result<String> {
     if !valid_computer_name(name) {
         bail!("Device name must match [a-z0-9-]{{1,32}}");
@@ -188,11 +189,15 @@ pub fn enroll_computer(config: &AppConfig, user_id: &str, name: &str, csr: &str)
     let mut connection = open_device_db(&mobile_device_db_path(config))?;
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let exists: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM mobile_device_enrollments WHERE common_name = ? OR device_id = ? OR device_name = ?)",
+    let matches: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM mobile_device_enrollments WHERE common_name = ? OR device_id = ? OR device_name = ?",
         params![name, name, name], |row| row.get(0),
     )?;
-    if exists {
+    let same_device: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mobile_device_enrollments WHERE user_id = ? AND device_id = ? AND common_name = ? AND public_key_pem = ? AND kind = 'computer' AND revoked_at IS NULL)",
+        params![user_id, name, name, public_key.trim()], |row| row.get(0),
+    )?;
+    if matches > 0 && !(matches == 1 && same_device) {
         bail!("Device name is already registered (including revoked devices)");
     }
     if config
@@ -205,17 +210,24 @@ pub fn enroll_computer(config: &AppConfig, user_id: &str, name: &str, csr: &str)
     }
     let certificate = sign_csr_with_openssl(&ca_cert, &ca_key, csr, name)?;
     let chain = build_certificate_chain_pem(&certificate, &ca_cert)?;
-    transaction.execute(
-        "INSERT INTO mobile_device_enrollments (user_id, device_id, device_name, public_key_pem, common_name, paired_at, kind) VALUES (?, ?, ?, ?, ?, ?, 'computer')",
-        params![user_id, name, name, public_key, name, local_timestamp()],
-    )?;
+    if !same_device {
+        transaction.execute(
+            "INSERT INTO mobile_device_enrollments (user_id, device_id, device_name, public_key_pem, common_name, paired_at, kind) VALUES (?, ?, ?, ?, ?, ?, 'computer')",
+            params![user_id, name, name, public_key.trim(), name, local_timestamp()],
+        )?;
+    }
     transaction.commit()?;
     let result =
         ensure_cloudflare_mobile_device_ca(&config.cloudflare_access, &ca_cert).and_then(|()| {
             sync_device_common_name(&config.cloudflare_access, name, DevicePolicyAction::Allow)
         });
     if let Err(error) = result {
-        revoke_device(&mobile_device_db_path(config), user_id, name)?;
+        if !same_device {
+            // No certificate was returned. A failed edge update must not
+            // permanently consume the name; an absent row still fails closed.
+            connection.execute("DELETE FROM mobile_device_enrollments WHERE user_id = ? AND device_id = ? AND public_key_pem = ?",
+                params![user_id, name, public_key.trim()])?;
+        }
         return Err(error);
     }
     Ok(chain)
@@ -229,8 +241,8 @@ pub fn record_active_device_use(db_path: &Path, user_id: &str, common_name: &str
     }
     let connection = open_device_db(db_path)?;
     Ok(connection.execute(
-        "UPDATE mobile_device_enrollments SET last_seen_at = ? WHERE user_id = ? AND common_name = ? AND revoked_at IS NULL",
-        params![local_timestamp(), user_id, common_name],
+        "UPDATE mobile_device_enrollments SET last_seen_at = ? WHERE user_id = ? AND common_name = ? AND revoked_at IS NULL AND NOT EXISTS (SELECT 1 FROM mobile_device_enrollments AS other WHERE other.common_name = ? AND other.user_id <> ?)",
+        params![local_timestamp(), user_id, common_name, common_name, user_id],
     )? > 0)
 }
 
@@ -721,6 +733,7 @@ fn open_device_db(db_path: &Path) -> Result<Connection> {
     }
     let connection = Connection::open(db_path)
         .with_context(|| format!("failed to open mobile device DB {}", db_path.display()))?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
     migrate_device_db(&connection)?;
     Ok(connection)
 }
@@ -771,16 +784,22 @@ fn migrate_device_db(connection: &Connection) -> Result<()> {
             "#,
         )
         .context("failed to migrate mobile device enrollment DB")?;
-    let has_kind = connection
-        .prepare("PRAGMA table_info(mobile_device_enrollments)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .iter()
-        .any(|name| name == "kind");
-    if !has_kind {
-        connection.execute_batch(
+    let has_kind = || -> rusqlite::Result<bool> {
+        Ok(connection
+            .prepare("PRAGMA table_info(mobile_device_enrollments)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "kind"))
+    };
+    if !has_kind()? {
+        let result = connection.execute_batch(
             "ALTER TABLE mobile_device_enrollments ADD COLUMN kind TEXT NOT NULL DEFAULT 'phone';",
-        )?;
+        );
+        // A concurrent first request may have completed this migration.
+        if !has_kind()? {
+            result?;
+        }
     }
     Ok(())
 }
@@ -865,6 +884,13 @@ fn complete_pairing_registration(
     )?;
     if computer_name {
         bail!("Device name is reserved by a computer enrollment");
+    }
+    let other_owner: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mobile_device_enrollments WHERE common_name = ? AND user_id <> ?)",
+        params![device_id, registration.user_id], |row| row.get(0),
+    )?;
+    if other_owner {
+        bail!("Device common name is already registered to another user");
     }
     transaction
         .execute(
@@ -1944,11 +1970,27 @@ mod tests {
         assert!(device.last_seen_at.is_none());
         assert!(!record_active_device_use(&db, "stranger", "phone").unwrap());
         assert!(record_active_device_use(&db, "owner", "phone").unwrap());
+        let other_pairing = create_pairing_registration(&db, "guest", 15).unwrap();
+        assert!(complete_pairing_registration(
+            &db,
+            &other_pairing.token,
+            "phone",
+            "Other phone",
+            "key",
+            None
+        )
+        .is_err());
         assert!(list_active_devices_for_users(&db, &users).unwrap()[0]
             .last_seen_at
             .is_some());
         revoke_device(&db, "owner", "phone").unwrap();
         assert!(!record_active_device_use(&db, "owner", "phone").unwrap());
+        // Legacy duplicate names must never turn another user's certificate
+        // into the owner's browser identity, even after one copy is revoked.
+        let connection = open_device_db(&db).unwrap();
+        connection.execute("INSERT INTO mobile_device_enrollments (user_id, device_id, device_name, public_key_pem, common_name, paired_at) VALUES ('guest', 'duplicate', 'Guest phone', 'key', 'phone', '2026-01-01')", []).unwrap();
+        assert!(!record_active_device_use(&db, "guest", "phone").unwrap());
+        drop(connection);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2004,6 +2046,7 @@ mod tests {
         .unwrap()
         .remove(0);
         assert_eq!(device.kind, "computer");
+        assert!(enroll_computer(&config, "owner", "macbook", &csr).is_ok());
         assert!(enroll_computer(&config, "other", "macbook", &csr).is_err());
         revoke_device(&mobile_device_db_path(&config), "owner", "macbook").unwrap();
         assert!(enroll_computer(&config, "owner", "macbook", &csr).is_err());
