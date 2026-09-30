@@ -240,7 +240,7 @@
 <tr><td>GLM-5.2, 2-bit experts</td><td>large MoE</td><td>204 GB</td><td>n/a</td><td>does not fit beside anything</td><!--BENCHGLM--></tr>
 </tbody>
 </table>
-<!--BENCHPROSE-->
+<p><b>Speed is not yet measured, and the attempt to measure it is itself evidence.</b> I queued a throughput benchmark (a background job that measures how fast each model reads and writes with one and with four agents). It waited 3.5 hours for a slot. When it started at 16:29, only 104 GB was reclaimable because queue jobs held 160 GB, so its own safety check refused to load even Qwen. That is the contention this design is about, on an ordinary Wednesday afternoon. The benchmark reruns tonight in the overnight quiet window, and its numbers go into the next revision.</p>
 
 <h3>How it works</h3>
 <figure>
@@ -310,7 +310,7 @@
 
 <h3>Risks I cannot close from here</h3>
 <ul>
-<li><b>Prompt size.</b> If the slim profile still sends more than 30K tokens, each new agent waits ⟨bench⟩ before its first word, and every compaction pays it again. The fallback is opencode, at the cost in the harness table.</li>
+<li><b>Prompt size.</b> If the slim profile still sends more than 30K tokens, each new agent spends a long time reading its prompt before its first word, and every compaction pays that again. Tonight's benchmark measures how long. The fallback is opencode, at the cost in the harness table.</li>
 <li><b>Permission mode.</b> Claude Code's auto mode may consult Anthropic's servers to classify actions. If it will not run against a local endpoint, local agents use <code>acceptEdits</code> with a command allowlist, which is stricter.</li>
 <li><b>Instruction following.</b> Weaker models ignore standing rules more often (naming themselves, going idle, not polling). Local agents get a short dedicated brief addendum, and the bake-off scores rule-following explicitly.</li>
 </ul>
@@ -485,7 +485,8 @@ error: model minimax-m2.5 is not loaded; loaded: qwen3-coder-next</code></pre>
 <h4>I.3 First-prompt size</h4>
 <p>From the first assistant message with usage in each of the 39 most recent Claude transcripts across all projects: input + cache creation + cache read. Minimum 34,473, median 84,241, maximum 95,791 tokens.</p>
 <h4>I.4 Model throughput</h4>
-<!--BENCHAPPENDIX-->
+<p><b>Method.</b> A Python script sends streaming <code>/v1/chat/completions</code> requests to LM Studio with the model loaded at 131,072 tokens of context and 4 parallel seats. It measures: time to first token and decode speed for a short prompt; prefill speed for a cold 30K-token prompt; the same 30K prompt again with a changed tail, to test whether LM Studio reuses the cached prefix; a cold 60K prompt; aggregate decode speed with 2 and 4 simultaneous 8K-token requests; and 4 simultaneous 30K-token requests. It also records the physical memory footprint of LM Studio's processes after load and after each concurrency step. Before loading, it refuses unless reclaimable memory (free + inactive + speculative + purgeable pages) is at least the weights plus 40 GB, so that it cannot push queue jobs into swap. It runs as an <code>sm queue</code> background job.</p>
+<p><b>Status.</b> First run, 2026-09-30 16:29: refused to load either model (104 GB reclaimable against 125 GB needed for Qwen; 109 GB against 169 GB for MiniMax). The rerun is scheduled for the overnight window, and this subsection will carry its numbers.</p>
 
 <h3 id="j">J. Requirement trace</h3>
 <table>
