@@ -813,7 +813,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <li><code>POST /client/board/start</code> and <code>POST /client/sessions</code> leave out <code>model</code> or <code>reasoning_effort</code> when either is <code>null</code>, so the provider chooses.</li>
 <li>The phone already calls <code>start-options</code>, so it picks up the settings with no app change.</li>
 </ul>
-<p><b>Migration.</b> On first read with no stored <code>new_agent</code>, seed the provider, model and effort from <code>board.start_defaults</code> if that config block is present. The cleanup ticket (E, ticket 10) removes the config key.</p>
+<p><b>Migration.</b> On first read with no stored <code>new_agent</code>, seed the provider, model and effort from <code>board.start_defaults</code> if that config block is present. The cleanup ticket (#1727) removes the config key.</p>
 
 <h4>D5. Queue limits that change without a restart</h4>
 <p>Today the queue runner copies the limits from config once at startup (<code>main.rs:156</code>). HTTP code rebuilds them from config on each call (<code>queue_admission_policy</code>, <code>http.rs:7485</code>).</p>
@@ -896,7 +896,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
   <ul>
   <li>CPU is an amber line and GPU a cyan line.</li>
   <li>Memory in use is a green area, using #1714's definition once the recorder stores it.</li>
-  <li>The queue's share of memory, CPU and GPU is stacked darker when the series carries it. Ticket 7 adds per-bucket <code>queue_memory_avg</code>, <code>queue_cpu_avg</code> and <code>queue_gpu_avg</code> to <code>/client/utilization/series</code> from the samples #1714 records.</li>
+  <li>The queue's share of memory, CPU and GPU is stacked darker when the series carries it. #1723 adds per-bucket <code>queue_memory_avg</code>, <code>queue_cpu_avg</code> and <code>queue_gpu_avg</code> to <code>/client/utilization/series</code> from the samples #1714 records.</li>
   <li>Memory pressure is red shading.</li>
   <li>Waiting jobs are slate bars.</li>
   <li>Hovering shows the values for that bucket.</li>
@@ -1058,21 +1058,21 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 </ul>
 
 <h3>E. Tickets</h3>
-<p>Eleven tickets. Each is sized for one agent. Web tickets 6 to 9 edit separate page modules. Each adds one route line to <code>app.js</code>, so their merges are serialised but do not overlap in substance.</p>
+<p>Eleven tickets. Each is sized for one agent. Web tickets #1722 to #1725 edit separate page modules. Each adds one route line to <code>app.js</code>, so their merges are serialised but do not overlap in substance.</p>
 <table>
-<thead><tr><th>#</th><th>Ticket</th><th>Covers</th><th>Starts after</th><th>Tier</th></tr></thead>
+<thead><tr><th>Issue</th><th>Ticket</th><th>Covers</th><th>Starts after</th><th>Tier</th></tr></thead>
 <tbody>
-<tr><td>1</td><td>Browser access to owner routes; <code>remote_control</code> in watch state; <code>POST /client/sessions</code></td><td>D3</td><td>—</td><td>Mid</td></tr>
-<tr><td>2</td><td>Owner settings store, start options from settings, and live queue limits</td><td>D4, D5</td><td>—</td><td>Mid</td></tr>
-<tr><td>3</td><td>Ticket clock on the board payload</td><td>D7</td><td>—</td><td>Mid</td></tr>
-<tr><td>4</td><td>Web shell: tokens, themes, rail, top bar, palette, panel, Agents page, agent panel, New agent popover</td><td>D1, D2, D6.1, D6.2, D6.5 (New agent)</td><td>1</td><td>Mid</td></tr>
-<tr><td>5</td><td>Browser terminal: ticket, WebSocket login, terminal page</td><td>D6.3, D8</td><td>4</td><td>Mid</td></tr>
-<tr><td>6</td><td>Board page and Start popover</td><td>D6.4, D6.5</td><td>2, 3, 4</td><td>Mid</td></tr>
-<tr><td>7</td><td>Queue page, Mac chart (with queue share series), quiet-job detection and job usage route, job panel, Analytics</td><td>D6.6, D6.8 (Analytics)</td><td>4, #1714</td><td>Mid</td></tr>
-<tr><td>8</td><td>Inbox two-pane, reader frame, back bar, History, Guestbook</td><td>D6.7, D6.8</td><td>4</td><td>Mid</td></tr>
-<tr><td>9</td><td>Settings page</td><td>D6.9</td><td>2, 4</td><td>Mid</td></tr>
-<tr><td>11</td><td>Device certificates for computers: browser device rule, common-name identity, <code>sm device enroll</code>, device list in Settings</td><td>D8b</td><td>1 (list UI after 9)</td><td>Mid</td></tr>
-<tr><td>10</td><td>Cleanup: remove browser-hostname branches of the old watch and board pages, delete the dead <code>web/sm-watch</code> app, drop the <code>board.start_defaults</code> config key, move this spec to <code>docs/specs/</code></td><td>—</td><td>5–9</td><td>Low</td></tr>
+<tr><td>#1717</td><td>Browser access to owner routes; <code>remote_control</code> in watch state; <code>POST /client/sessions</code></td><td>D3</td><td>—</td><td>Mid</td></tr>
+<tr><td>#1718</td><td>Owner settings store, start options from settings, and live queue limits</td><td>D4, D5</td><td>—</td><td>Mid</td></tr>
+<tr><td>#1719</td><td>Ticket clock on the board payload</td><td>D7</td><td>—</td><td>Mid</td></tr>
+<tr><td>#1720</td><td>Web shell: tokens, themes, rail, top bar, palette, panel, Agents page, agent panel, New agent popover</td><td>D1, D2, D6.1, D6.2, D6.5 (New agent)</td><td>#1717</td><td>Mid</td></tr>
+<tr><td>#1721</td><td>Browser terminal: ticket, WebSocket login, terminal page</td><td>D6.3, D8</td><td>#1720</td><td>Mid</td></tr>
+<tr><td>#1722</td><td>Board page and Start popover</td><td>D6.4, D6.5</td><td>#1718, #1719, #1720</td><td>Mid</td></tr>
+<tr><td>#1723</td><td>Queue page, Mac chart (with queue share series), quiet-job detection and job usage route, job panel, Analytics</td><td>D6.6, D6.8 (Analytics)</td><td>#1720, #1714</td><td>Mid</td></tr>
+<tr><td>#1724</td><td>Inbox two-pane, reader frame, back bar, History, Guestbook</td><td>D6.7, D6.8</td><td>#1720</td><td>Mid</td></tr>
+<tr><td>#1725</td><td>Settings page</td><td>D6.9</td><td>#1718, #1720</td><td>Mid</td></tr>
+<tr><td>#1726</td><td>Device certificates for computers: browser device rule, common-name identity, <code>sm device enroll</code>, device list in Settings</td><td>D8b</td><td>#1717</td><td>Mid</td></tr>
+<tr><td>#1727</td><td>Cleanup: remove browser-hostname branches of the old watch and board pages, delete the dead <code>web/sm-watch</code> app, drop the <code>board.start_defaults</code> config key, move this spec to <code>docs/specs/</code></td><td>—</td><td>#1721–#1726</td><td>Low</td></tr>
 </tbody>
 </table>
 
