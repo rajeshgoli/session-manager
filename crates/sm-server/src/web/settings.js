@@ -44,22 +44,26 @@ function Field({ label, initial, save, onDraft, type = 'text', options, hint, pl
   const [error, setError] = useState(false);
   const saved = useRef(initial ?? '');
   const current = useRef(value);
+  const pendingWrites = useRef(0);
   useEffect(() => {
     // Refresh a pristine field after an earlier save finishes while navigating.
-    if (current.current === saved.current) {
+    if (current.current === saved.current && !pendingWrites.current) {
       const next = initial ?? '';
       current.current = next; saved.current = next; setValue(next);
     }
   }, [initial]);
   const change = next => { current.current = next; setValue(next); setStatus(''); onDraft?.(next); };
   const commit = async next => {
-    if (next === saved.current) return;
+    if (next === saved.current && !pendingWrites.current) return;
+    pendingWrites.current++;
     setStatus('Saving…'); setError(false);
     try {
       await save(next);
       saved.current = next;
       if (current.current === next) setStatus('Saved');
-    } catch (e) { setError(true); setStatus(e.message); }
+    } catch (e) {
+      if (current.current === next) { setError(true); setStatus(e.message); }
+    } finally { pendingWrites.current--; }
   };
   const attrs = { class: 'inp', value, placeholder, min, max, step, list,
     onInput: e => change(type === 'checkbox' ? e.target.checked : e.target.value),
@@ -131,13 +135,13 @@ function Appearance() {
 }
 
 function NewAgents({ data, write }) {
-  const [draft, setDraft] = useState(data);
+  const [draft, setDraft] = useState({});
   const [board] = useResource('/client/board');
   const [claude] = useResource('/client/session-models?provider=claude');
   const [codex] = useResource('/client/session-models?provider=codex-fork');
   const patch = (key, value) => setDraft(prev => ({ ...prev, [key]: value }));
   const save = body => write('/client/settings', { new_agent: body });
-  const sample = sampleTicket(board.data), rendered = preview(draft, sample);
+  const sample = sampleTicket(board.data), rendered = preview({ ...data, ...draft }, sample);
   return html`<h2>Defaults</h2><p class="sub">Shared with the phone. Changes save when you leave a field.</p>
     <${Field} label="Default agent" initial=${data.provider} options=${[['claude', 'Claude'], ['codex-fork', 'Codex']]}
       save=${value => save({ provider: value })} />

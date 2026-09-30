@@ -75,3 +75,17 @@ test('queue reset clears override and invalid slot counts cannot be submitted', 
   for (const value of ['-1', '17', '1.5', 'word']) assert.throws(() => parse(value));
   assert.throws(() => h.evaluate('shortNames')('owner/repo = a\nowner/repo = b'));
 });
+
+test('reverting to the old value while a save is pending still submits the revert', async () => {
+  const h = harness(), calls = [], finishes = [];
+  const props = { initial: 'old', save: value => { calls.push(value); return new Promise(resolve => finishes.push(resolve)); } };
+  h.input(h.render(props)).onInput({ target: { value: 'new' } });
+  const first = h.input(h.render(props)).onBlur();
+  h.input(h.render(props)).onInput({ target: { value: 'old' } });
+  const second = h.input(h.render(props)).onBlur();
+  assert.deepEqual(calls, ['new', 'old']);
+  finishes[0](); await first;
+  finishes[1](); await second;
+  assert.match(h.text(h.render(props)), /Saved/);
+  assert.equal(h.input(h.render(props)).value, 'old');
+});
