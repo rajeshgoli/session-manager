@@ -18,7 +18,6 @@ pub mod google_auth;
 pub mod guestbook;
 pub mod handoff;
 pub mod http;
-pub mod mobile_analytics;
 pub mod mobile_devices;
 pub mod owner_doc_render;
 pub mod owner_docs;

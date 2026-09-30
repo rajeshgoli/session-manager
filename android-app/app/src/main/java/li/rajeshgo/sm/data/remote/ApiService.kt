@@ -33,6 +33,9 @@ interface ApiService {
     @GET("client/host-status")
     suspend fun getHostStatus(): li.rajeshgo.sm.data.model.HostStatus
 
+    @GET("client/analytics/spend")
+    suspend fun getAnalyticsSpend(@Query("provider") provider: String?, @Query("range") range: String): li.rajeshgo.sm.data.model.SpendReport
+
     @GET("client/queue")
     suspend fun getQueue(): li.rajeshgo.sm.data.model.QueueOverview
 

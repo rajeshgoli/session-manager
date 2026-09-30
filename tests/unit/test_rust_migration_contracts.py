@@ -844,7 +844,7 @@ def test_mvp_rehearsal_resolves_mobile_shadow_paths(monkeypatch):
 
     step = _resolve_shadow_compare_paths(
         python_base_url="http://python.test",
-        base_paths=("/health", "/client/analytics/summary"),
+        base_paths=("/health",),
         timeout_seconds=0.5,
     )
 
@@ -852,7 +852,6 @@ def test_mvp_rehearsal_resolves_mobile_shadow_paths(monkeypatch):
     assert step["session_id"] == "mobile-session"
     assert step["paths"] == [
         "/health",
-        "/client/analytics/summary",
         "/client/sessions/mobile-session",
         "/sessions/mobile-session/attach-descriptor",
     ]

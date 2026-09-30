@@ -218,11 +218,13 @@ fun WatchScreen(
             return@LaunchedEffect
         }
         if (state.sessions.isEmpty() && state.loading) return@LaunchedEffect
+        filter = "all"
+        query = open.sessionId.orEmpty()
         val session = state.sessions.firstOrNull { it.id == open.sessionId }
         if (session != null) {
             viewModel.expandSession(session)
         } else {
-            toast = open.title.ifBlank { "That agent is no longer listed" }
+            open.sessionId?.let { id -> viewModel.openHistoricalSession(id) { toast = it } }
         }
         onFollowOpenConsumed()
     }

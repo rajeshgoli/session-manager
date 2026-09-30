@@ -255,6 +255,10 @@ class SessionManagerRepository(
         executeReadRequest(baseUrl, token) { it.getSessionModels(provider, workingDir).models }
     }
 
+    suspend fun fetchSession(baseUrl: String, token: String, sessionId: String): ClientSession = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getClientSession(sessionId) }
+    }
+
     suspend fun fetchSessions(baseUrl: String, token: String): List<ClientSession> = withContext(Dispatchers.IO) {
         coroutineScope {
             val sessions = async { executeReadRequest(baseUrl, token) { it.getClientSessions().sessions } }
@@ -360,6 +364,10 @@ class SessionManagerRepository(
             onUpdate(current)
         }
         return current
+    }
+
+    suspend fun fetchAnalyticsSpend(baseUrl: String, token: String, provider: String?, range: String): li.rajeshgo.sm.data.model.SpendReport = withContext(Dispatchers.IO) {
+        executeReadRequest(baseUrl, token) { it.getAnalyticsSpend(provider, range) }
     }
 
     suspend fun fetchQueue(baseUrl: String, token: String): li.rajeshgo.sm.data.model.QueueOverview = withContext(Dispatchers.IO) {
