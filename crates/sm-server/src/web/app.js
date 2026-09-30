@@ -41,13 +41,18 @@ function pageFor(path) {
 
 function readLocation() {
   const params = new URLSearchParams(location.search);
-  return { path: location.pathname, open: params.get('open') };
+  const open = params.get('open');
+  return { path: location.pathname, open: params.get('panel') || (open?.includes(':') ? open : null) };
 }
 
 function urlFor(path, open) {
   const params = new URLSearchParams(path === location.pathname ? location.search : '');
-  if (open) params.set('open', open);
-  else params.delete('open');
+  // History reserves `open` for its ticket filter. Keep panel state separate
+  // there, while still accepting old `?open=ticket:…` links on arrival.
+  const key = path === '/history' ? 'panel' : 'open';
+  params.delete('panel');
+  if (key === 'open' || params.get('open')?.includes(':')) params.delete('open');
+  if (open) params.set(key, open);
   // Keep panel links readable: `?open=agent:65203ac8`.
   const query = params.toString().replace(/%3A/gi, ':');
   return `${path}${query ? `?${query}` : ''}`;
