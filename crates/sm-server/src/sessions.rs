@@ -50,6 +50,8 @@ use crate::{
 mod handoff_store;
 #[path = "handoff/transfer.rs"]
 mod handoff_transfer;
+#[path = "owner_settings/store.rs"]
+mod owner_settings_store;
 use crate::handoff::policy::HandoffDefaults;
 use handoff_store::{handoff_session_ref, handoff_view_for_record};
 pub use handoff_store::{HandoffPolicyOutcome, ReviewAsk};

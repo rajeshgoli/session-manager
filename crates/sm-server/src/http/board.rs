@@ -15,6 +15,7 @@ use crate::board::{
 };
 use crate::owner_docs::{doc_readable_path, OwnerDocState, OwnerDocStore};
 use crate::owner_messages::{derive_message_state, message_reader_path, OwnerMessageState};
+use crate::owner_settings::{NewAgentSettings, OwnerSettings, Ticket};
 
 /// `gh api graphql` for the board.
 #[derive(Debug)]
@@ -313,7 +314,7 @@ pub(super) fn board_payload(
             events: &events,
             repos: &repos,
             unseen: &unseen,
-            start_defaults: serde_json::to_value(&state.config.board.start_defaults)?,
+            start_defaults: start_defaults(state)?,
             lane_filter,
             now,
             clocks: &clocks,
@@ -877,17 +878,62 @@ pub(super) struct StartOptionsQuery {
     number: i64,
 }
 
+fn new_agent_settings(state: &AppState) -> anyhow::Result<NewAgentSettings> {
+    let settings = state
+        .session_store
+        .owner_settings(state.config.board.start_defaults.as_ref())?;
+    Ok(OwnerSettings::from_effective(&settings)?.new_agent)
+}
+
+/// The board payload's `start_defaults`, from owner settings. A provider
+/// default effort is left out rather than sent as null: the phone reads the
+/// field as a string and falls back to its own default when it is absent.
+fn start_defaults(state: &AppState) -> anyhow::Result<Value> {
+    let settings = new_agent_settings(state)?;
+    let defaults = settings.provider_defaults();
+    let mut value = json!({ "provider": settings.provider, "model": defaults.model });
+    if let Some(effort) = &defaults.effort {
+        value["reasoning_effort"] = json!(effort);
+    }
+    Ok(value)
+}
+
+/// What Start fills in (spec 1710 appendix D4): the checkout, and the
+/// provider, model, effort, name and first message from owner settings. A
+/// null model or effort leaves the choice to the provider.
 fn start_options_payload(state: &AppState, key: &Key) -> Result<Value, ApiError> {
     let input = board_store(state).input(&outside(state)?)?;
     let item = input
         .items
         .get(key)
         .ok_or(ApiError::NotFound("Ticket not on the board"))?;
-    Ok(json!({
-        "working_dir": checkout(&state.config, &key.0)?,
-        "name": format!("{}-{}", key.0.rsplit('/').next().unwrap_or(&key.0), key.1).chars().take(32).collect::<String>(),
-        "brief": format!("Work ticket #{} in {}: {}\n{}\n\nYou already hold the claim on #{}. Run `sm ticket {} --setup-worktree` and work in the worktree it prints, then follow this repo's CLAUDE.md.", key.1, key.0, item.title, item.url, key.1, key.1),
-    }))
+    let settings = new_agent_settings(state)?;
+    Ok(start_options_json(
+        &settings,
+        Ticket {
+            repo: &key.0,
+            number: key.1,
+            title: &item.title,
+            url: &item.url,
+        },
+        checkout(&state.config, &key.0)?,
+    ))
+}
+
+pub(super) fn start_options_json(
+    settings: &NewAgentSettings,
+    ticket: Ticket<'_>,
+    working_dir: String,
+) -> Value {
+    let defaults = settings.provider_defaults();
+    json!({
+        "working_dir": working_dir,
+        "name": settings.agent_name(ticket),
+        "brief": settings.brief(ticket),
+        "provider": settings.provider,
+        "model": defaults.model,
+        "reasoning_effort": defaults.effort,
+    })
 }
 
 pub(super) async fn start_options(
@@ -1012,8 +1058,9 @@ async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, Api
             name: Some(name.clone()),
             working_dir: options["working_dir"].as_str().map(str::to_owned),
             provider: Some(payload.provider),
-            model: payload.model,
-            reasoning_effort: payload.reasoning_effort,
+            // Absent or blank leaves the choice to the provider.
+            model: crate::config::trimmed(&payload.model),
+            reasoning_effort: crate::config::trimmed(&payload.reasoning_effort),
             initial_message: Some(
                 trimmed(&payload.brief)
                     .unwrap_or_else(|| options["brief"].as_str().unwrap_or_default().to_owned()),

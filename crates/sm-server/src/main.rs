@@ -12,9 +12,10 @@ use sm_server::{
     activity_ledger::ActivityRecorder,
     config::AppConfig,
     http::{router, AppState},
-    queue::{QueueAdmissionPolicy, QueueRecoverySummary, RetainedQueueStore},
+    owner_settings,
+    queue::{QueueRecoverySummary, RetainedQueueStore},
     queue_authority::{QueueAuthorityServer, QueueAuthorityServiceIdentity},
-    sessions::expand_home,
+    sessions::{expand_home, SessionStore},
     studio_ssh,
     usage_identity::IdentityPoller,
 };
@@ -153,23 +154,16 @@ async fn main() -> Result<()> {
     if config.rust_core.runtime_enabled {
         let message_queue_db_path = expand_home(&config.sm_send.db_path);
         let cancel_grace_seconds = config.queue_runner.cancel_grace_seconds;
-        let admission_policy = QueueAdmissionPolicy {
-            max_running_jobs: config.queue_runner.max_running_jobs,
-            perf_cooldown_seconds: config.queue_runner.perf_cooldown_seconds,
-            tests_max_concurrent: config.queue_runner.types.tests.max_concurrent,
-            perf_max_concurrent: config.queue_runner.types.perf.max_concurrent,
-            background_max_concurrent: config.queue_runner.types.background.max_concurrent,
-            service_max_concurrent: config
-                .queue_runner
-                .types
-                .service
-                .as_ref()
-                .map_or(0, |service| service.max_concurrent),
-            memory_min_free_bytes: config.queue_runner.memory.min_free_bytes,
-            resource_retry_interval_seconds: config.queue_runner.memory.retry_interval_seconds,
-            process_reserve: config.queue_runner.processes.reserve,
-            job_process_limit: config.queue_runner.processes.job_max,
-        };
+        // Stored owner limits apply from the first pass; `PUT /client/settings`
+        // changes the shared policy after that (sm#1718).
+        let settings = SessionStore::new(expand_home(&config.paths.state_file))
+            .owner_settings(None)
+            .unwrap_or_else(|error| {
+                eprintln!("owner settings unreadable, using config queue limits: {error:#}");
+                owner_settings::defaults()
+            });
+        let admission_policy = owner_settings::queue_admission_policy(&config, &settings);
+        sm_server::queue::set_live_queue_admission_policy(&queue_state_dir, admission_policy);
         sm_server::queue::spawn_host_memory_guard(
             queue_state_dir.clone(),
             cancel_grace_seconds,
