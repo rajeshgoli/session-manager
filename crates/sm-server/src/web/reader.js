@@ -1,6 +1,6 @@
 // Same-origin document reader; the document keeps its existing review sheet.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, registerPanel, closePanel, openPanel, bus } from './ui.js';
+import { html, registerPanel, closePanel, openPanel, bus, typingIn } from './ui.js';
 
 export function shellName(path = location.pathname) {
   return ({ '/': 'Agents', '/inbox': 'Inbox', '/board': 'Board', '/history': 'History', '/history/agents': 'History', '/guestbook': 'Guestbook', '/queue': 'Queue' })[path] || 'sm';
@@ -48,10 +48,10 @@ export function Reader({ id, controls, onBack = closePanel }) {
     } catch (e) { setError('Unable to open this reader.'); }
   };
   const shortcut = (e) => {
-    if (e.key === 'e' && e.target.ownerDocument !== document && !e.metaKey && !e.ctrlKey && !e.altKey && !e.target.closest('input,textarea,select,[contenteditable]')) {
+    if (e.key === 'e' && e.target.ownerDocument !== document && !e.metaKey && !e.ctrlKey && !e.altKey && !typingIn(e)) {
       e.preventDefault(); bus.emit('inbox-done');
     }
-    if (e.key === 'f' && !e.metaKey && !e.ctrlKey && !e.altKey && !e.target.closest('input,textarea,select,[contenteditable]')) {
+    if (e.key === 'f' && !e.metaKey && !e.ctrlKey && !e.altKey && !typingIn(e)) {
       e.preventDefault(); fullScreen(frame.current?.contentWindow.location.href || current);
     }
   };
