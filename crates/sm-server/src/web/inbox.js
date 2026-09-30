@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { html, api, config, bus, usePoll, openPanel, closePanel, registerPanel, Seg, toast } from './ui.js';
+import { html, api, config, bus, usePoll, openPanel, closePanel, registerPanel, Seg, toast, typingIn } from './ui.js';
 import { Reader } from './reader.js';
 export function safeThreadHtml(source) {
   const doc = new DOMParser().parseFromString(source, 'text/html');
@@ -39,7 +39,7 @@ export function InboxPage({ openRef }) {
   };
   useEffect(() => {
     const key = e => {
-      if (e.key === 'e' && !e.metaKey && !e.ctrlKey && !e.altKey && !e.target.closest('input,textarea,select,[contenteditable]')) { e.preventDefault(); done(); }
+      if (e.key === 'e' && !e.metaKey && !e.ctrlKey && !e.altKey && !typingIn(e)) { e.preventDefault(); done(); }
     };
     document.addEventListener('keydown', key);
     const off = bus.on('inbox-done', done);

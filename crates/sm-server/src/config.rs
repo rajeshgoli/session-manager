@@ -1886,34 +1886,10 @@ pub struct BoardConfig {
     /// Where Start runs a new agent, per `owner/name`.
     #[serde(default)]
     pub checkouts: BTreeMap<String, String>,
-    /// Seeds owner settings' `new_agent` on first read when present
-    /// (sm#1718); owner settings are what Start fills in.
-    #[serde(default)]
-    pub start_defaults: Option<BoardStartDefaults>,
     /// Minutes a live holder idles, with nothing running or waited on,
     /// before its ticket's clock turns stalled (sm#1710, D7).
     #[serde(default = "default_board_stall_minutes")]
     pub stall_minutes: u32,
-}
-
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
-pub struct BoardStartDefaults {
-    #[serde(default = "default_board_start_provider")]
-    pub provider: String,
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default = "default_board_start_effort")]
-    pub reasoning_effort: String,
-}
-
-impl Default for BoardStartDefaults {
-    fn default() -> Self {
-        Self {
-            provider: default_board_start_provider(),
-            model: None,
-            reasoning_effort: default_board_start_effort(),
-        }
-    }
 }
 
 impl Default for BoardConfig {
@@ -1922,7 +1898,6 @@ impl Default for BoardConfig {
             repos: Vec::new(),
             sync_interval_seconds: default_board_sync_interval_seconds(),
             checkouts: BTreeMap::new(),
-            start_defaults: None,
             stall_minutes: default_board_stall_minutes(),
         }
     }
@@ -1959,14 +1934,6 @@ fn default_board_sync_interval_seconds() -> u64 {
 
 fn default_board_stall_minutes() -> u32 {
     15
-}
-
-fn default_board_start_provider() -> String {
-    "claude".to_owned()
-}
-
-fn default_board_start_effort() -> String {
-    "high".to_owned()
 }
 
 /// `web_watch`: the browser watch at `/` and `/watch` (sm#1452).

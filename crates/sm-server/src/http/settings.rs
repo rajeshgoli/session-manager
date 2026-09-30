@@ -14,13 +14,9 @@ pub(super) async fn get_settings(
 ) -> Result<Json<Value>, ApiError> {
     board::owner_guard(&state, &headers, peer_addr, "GET", &uri, false)?;
     let config_limits = terminal_config_limits(&state);
-    let settings = tokio::task::spawn_blocking(move || {
-        state
-            .session_store
-            .owner_settings(state.config.board.start_defaults.as_ref())
-    })
-    .await
-    .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
+    let settings = tokio::task::spawn_blocking(move || state.session_store.owner_settings())
+        .await
+        .map_err(|error| ApiError::from(anyhow::anyhow!(error)))??;
     Ok(Json(with_config_limits(settings, config_limits)))
 }
 

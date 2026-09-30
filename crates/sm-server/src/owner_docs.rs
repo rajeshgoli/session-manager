@@ -1915,39 +1915,15 @@ h2.lbl {{ margin: 18px 0 4px; font-weight: 400; }}
 </head>
 <body>
 <div class="wrap">
-<nav class="top"><a class="brand" href="/">sm</a>{inbox}{watch}{board}{history}{guestbook}<span class="sp"></span>{status}</nav>
+<nav class="top"><a class="brand" href="/">sm</a>{inbox}{watch}{history}{guestbook}<span class="sp"></span>{status}</nav>
 {body}
 </div>
-<script>
-(() => {{
-  const badge = document.getElementById('board-badge');
-  async function update() {{
-    if (document.hidden) return;
-    try {{
-      const response = await fetch('/client/board/badge', {{credentials:'same-origin'}});
-      if (!response.ok) return;
-      const value = await response.json();
-      badge.textContent = String(value.count || '');
-      badge.hidden = !value.count;
-    }} catch (_) {{}}
-  }}
-  window.addEventListener('sm-board-seen', update);
-  window.addEventListener('focus', update);
-  setInterval(update, 30000);
-  update();
-}})();
-</script>
 </body>
 </html>
 "#,
         title = escape_html(title),
         inbox = tab("inbox", "/inbox", "Inbox"),
         watch = tab("watch", "/", "Watch"),
-        board = tab(
-            "board",
-            "/board",
-            "Board<span id=board-badge class=chip hidden></span>"
-        ),
         history = tab("history", "/history", "History"),
         guestbook = tab("guestbook", "/guestbook", "Guestbook"),
     )

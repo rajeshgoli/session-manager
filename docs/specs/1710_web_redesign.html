@@ -719,7 +719,7 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 </tbody>
 </table>
 <ul>
-<li><b>Hostname rule.</b> A request whose Cloudflare Access application is Browser (<code>request_cloudflare_access_application</code>, <code>http.rs:13287</code>), or a loopback request with no Access headers, gets the shell. Every other hostname, including the phone app's hostname, keeps today's page at each path. The app's reader loads <code>/inbox</code>, <code>/history</code> and <code>/guestbook</code> and must keep working.</li>
+<li><b>Hostname rule.</b> A request whose Cloudflare Access application is Browser (<code>request_cloudflare_access_application</code>, <code>http.rs:13287</code>), or a loopback request with no Access headers, gets the shell. Every other hostname, including the phone app's hostname, keeps today's page at <code>/</code>, <code>/watch</code>, <code>/inbox</code>, <code>/history</code> and <code>/guestbook</code>; the app's reader loads those and must keep working. <code>/board</code>, <code>/queue</code>, <code>/analytics…</code>, <code>/settings</code> and <code>/terminal/{session_id}</code> answer 404 there, because the phone shows its own Board and Queue tabs.</li>
 <li>Every <code>?format=json</code> response and every <code>Accept: application/json</code> response is unchanged on all hostnames.</li>
 <li>The shell uses today's read guard, <code>ensure_owner_page_read_allowed</code> (<code>http.rs:14534</code>).</li>
 <li>Panel state lives in the query string, so any panel can be linked: <code>?open=agent:{session_id}</code>, <code>job:{job_id}</code>, <code>doc:{reader path}</code>, <code>thread:{session_id}</code>, or <code>ticket:{owner/repo}#{n}</code>.</li>
@@ -813,7 +813,6 @@ You already hold the claim on {ticket}. Run `sm ticket {number} --setup-worktree
 <li><code>POST /client/board/start</code> and <code>POST /client/sessions</code> leave out <code>model</code> or <code>reasoning_effort</code> when either is <code>null</code>, so the provider chooses.</li>
 <li>The phone already calls <code>start-options</code>, so it picks up the settings with no app change.</li>
 </ul>
-<p><b>Migration.</b> On first read with no stored <code>new_agent</code>, seed the provider, model and effort from <code>board.start_defaults</code> if that config block is present. The cleanup ticket (#1727) removes the config key.</p>
 
 <h4>D5. Queue limits that change without a restart</h4>
 <p>Today the queue runner copies the limits from config once at startup (<code>main.rs:156</code>). HTTP code rebuilds them from config on each call (<code>queue_admission_policy</code>, <code>http.rs:7485</code>).</p>
