@@ -29,13 +29,17 @@ pub const WITHDRAWN_TEXT: &str =
 const DEFAULT_THRESHOLD_PERCENT: f64 = 35.0;
 const DEFAULT_REVIEW_FLOOR_PERCENT: f64 = 20.0;
 const DEFAULT_REMINDER_PERCENT: f64 = 50.0;
-const DEFAULT_FIELDS: [&str; 6] = [
+const CODEX_THRESHOLD_PERCENT: f64 = 80.0;
+const CODEX_REMINDER_PERCENT: f64 = 90.0;
+const CODEX_REVIEW_FLOOR_PERCENT: f64 = 50.0;
+const DEFAULT_FIELDS: [&str; 7] = [
     "providers",
     "threshold_percent",
     "ask_on_codex_review",
     "ask_on_doc_review",
     "review_floor_percent",
     "reminder_percent",
+    "provider_thresholds",
 ];
 
 /// The default policy (Appendix B). Starting values apply until the first
@@ -43,12 +47,31 @@ const DEFAULT_FIELDS: [&str; 6] = [
 #[derive(Debug, Clone, PartialEq)]
 pub struct HandoffDefaults {
     pub providers: BTreeMap<String, bool>,
+    pub provider_thresholds: BTreeMap<String, ProviderThresholds>,
+    pub window_tokens: BTreeMap<String, i64>,
     pub threshold_percent: f64,
     pub ask_on_codex_review: bool,
     pub ask_on_doc_review: bool,
     pub review_floor_percent: f64,
     pub reminder_percent: f64,
     pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderThresholds {
+    pub threshold_percent: f64,
+    pub reminder_percent: f64,
+    pub review_floor_percent: f64,
+}
+
+impl ProviderThresholds {
+    fn to_json(&self) -> Value {
+        json!({
+            "threshold_percent": percent_json(self.threshold_percent),
+            "reminder_percent": percent_json(self.reminder_percent),
+            "review_floor_percent": percent_json(self.review_floor_percent),
+        })
+    }
 }
 
 impl Default for HandoffDefaults {
@@ -58,6 +81,28 @@ impl Default for HandoffDefaults {
                 ("claude".to_owned(), true),
                 ("codex-fork".to_owned(), false),
                 ("codex-app".to_owned(), false),
+            ]),
+            provider_thresholds: BTreeMap::from([
+                (
+                    "claude".to_owned(),
+                    ProviderThresholds {
+                        threshold_percent: DEFAULT_THRESHOLD_PERCENT,
+                        reminder_percent: DEFAULT_REMINDER_PERCENT,
+                        review_floor_percent: DEFAULT_REVIEW_FLOOR_PERCENT,
+                    },
+                ),
+                (
+                    "codex-fork".to_owned(),
+                    ProviderThresholds {
+                        threshold_percent: CODEX_THRESHOLD_PERCENT,
+                        reminder_percent: CODEX_REMINDER_PERCENT,
+                        review_floor_percent: CODEX_REVIEW_FLOOR_PERCENT,
+                    },
+                ),
+            ]),
+            window_tokens: BTreeMap::from([
+                ("claude".to_owned(), 1_000_000),
+                ("codex-fork".to_owned(), 258_400),
             ]),
             threshold_percent: DEFAULT_THRESHOLD_PERCENT,
             ask_on_codex_review: true,
@@ -86,6 +131,23 @@ impl HandoffDefaults {
                 defaults = merged;
             }
         }
+        if let Some(thresholds) = stored.get("provider_thresholds") {
+            if let Ok(merged) = defaults.merged(&json!({ "provider_thresholds": thresholds })) {
+                defaults = merged;
+            }
+        }
+        if let Some(windows) = stored.get("window_tokens").and_then(Value::as_object) {
+            for (provider, tokens) in windows {
+                if let Some(tokens) = tokens.as_i64().filter(|tokens| *tokens > 0) {
+                    defaults.window_tokens.insert(provider.clone(), tokens);
+                }
+            }
+        }
+        // Legacy stored flat fields predate provider thresholds. Their values
+        // belong to Claude; Codex keeps its own starting values.
+        if !stored.contains_key("provider_thresholds") {
+            defaults.sync_claude_thresholds();
+        }
         defaults.updated_at = stored
             .get("updated_at")
             .and_then(Value::as_str)
@@ -100,6 +162,11 @@ impl HandoffDefaults {
             .as_object()
             .ok_or_else(|| "body must be a JSON object".to_owned())?;
         let mut next = self.clone();
+        let explicit_claude = patch
+            .get("provider_thresholds")
+            .and_then(Value::as_object)
+            .and_then(|providers| providers.get("claude"))
+            .and_then(Value::as_object);
         for (key, value) in patch {
             match key.as_str() {
                 "providers" => {
@@ -114,16 +181,61 @@ impl HandoffDefaults {
                     }
                 }
                 "threshold_percent" => {
-                    next.threshold_percent = percent_field(key, value, false)?;
+                    let parsed = percent_field(key, value, false)?;
+                    if !explicit_claude.is_some_and(|fields| fields.contains_key(key)) {
+                        next.threshold_percent = parsed;
+                        next.sync_claude_thresholds();
+                    }
                 }
                 "review_floor_percent" => {
-                    next.review_floor_percent = percent_field(key, value, true)?;
+                    let parsed = percent_field(key, value, true)?;
+                    if !explicit_claude.is_some_and(|fields| fields.contains_key(key)) {
+                        next.review_floor_percent = parsed;
+                        next.sync_claude_thresholds();
+                    }
                 }
                 "reminder_percent" => {
-                    next.reminder_percent = percent_field(key, value, false)?;
+                    let parsed = percent_field(key, value, false)?;
+                    if !explicit_claude.is_some_and(|fields| fields.contains_key(key)) {
+                        next.reminder_percent = parsed;
+                        next.sync_claude_thresholds();
+                    }
+                }
+                "provider_thresholds" => {
+                    let providers = value
+                        .as_object()
+                        .ok_or_else(|| "provider_thresholds must be an object".to_owned())?;
+                    for (provider, fields) in providers {
+                        let fields = fields.as_object().ok_or_else(|| {
+                            format!("provider_thresholds.{provider} must be an object")
+                        })?;
+                        let mut thresholds = next.thresholds(provider);
+                        for (field, value) in fields {
+                            let name = format!("provider_thresholds.{provider}.{field}");
+                            match field.as_str() {
+                                "threshold_percent" => {
+                                    thresholds.threshold_percent =
+                                        percent_field(&name, value, false)?
+                                }
+                                "reminder_percent" => {
+                                    thresholds.reminder_percent =
+                                        percent_field(&name, value, false)?
+                                }
+                                "review_floor_percent" => {
+                                    thresholds.review_floor_percent =
+                                        percent_field(&name, value, true)?
+                                }
+                                _ => return Err(format!("unknown field {name}")),
+                            }
+                        }
+                        next.provider_thresholds
+                            .insert(provider.clone(), thresholds);
+                    }
+                    next.sync_flat_claude();
                 }
                 "ask_on_codex_review" => next.ask_on_codex_review = bool_field(key, value)?,
                 "ask_on_doc_review" => next.ask_on_doc_review = bool_field(key, value)?,
+                "window_tokens" => {}
                 // Read-only; echoing a GET body back is harmless.
                 "updated_at" => {}
                 other => return Err(format!("unknown field {other}")),
@@ -136,9 +248,37 @@ impl HandoffDefaults {
         self.providers.get(provider).copied().unwrap_or(false)
     }
 
+    pub fn thresholds(&self, provider: &str) -> ProviderThresholds {
+        self.provider_thresholds
+            .get(provider)
+            .cloned()
+            .unwrap_or_else(|| self.provider_thresholds["claude"].clone())
+    }
+
+    fn sync_claude_thresholds(&mut self) {
+        self.provider_thresholds.insert(
+            "claude".to_owned(),
+            ProviderThresholds {
+                threshold_percent: self.threshold_percent,
+                reminder_percent: self.reminder_percent,
+                review_floor_percent: self.review_floor_percent,
+            },
+        );
+    }
+
+    fn sync_flat_claude(&mut self) {
+        let claude = self.thresholds("claude");
+        self.threshold_percent = claude.threshold_percent;
+        self.reminder_percent = claude.reminder_percent;
+        self.review_floor_percent = claude.review_floor_percent;
+    }
+
     pub fn to_json(&self) -> Value {
         json!({
             "providers": self.providers,
+            "provider_thresholds": self.provider_thresholds.iter().map(|(key, value)|
+                (key.clone(), value.to_json())).collect::<BTreeMap<_, _>>(),
+            "window_tokens": self.window_tokens,
             "threshold_percent": percent_json(self.threshold_percent),
             "ask_on_codex_review": self.ask_on_codex_review,
             "ask_on_doc_review": self.ask_on_doc_review,
@@ -288,16 +428,31 @@ pub fn effective_policy(
     override_: Option<&HandoffOverride>,
     has_gauge: bool,
 ) -> EffectivePolicy {
+    effective_policy_with_ticket(defaults, provider, override_, None, has_gauge)
+}
+
+pub fn effective_policy_with_ticket(
+    defaults: &HandoffDefaults,
+    provider: &str,
+    override_: Option<&HandoffOverride>,
+    ticket: Option<&HandoffOverride>,
+    has_gauge: bool,
+) -> EffectivePolicy {
+    let thresholds = defaults.thresholds(provider);
     let enabled = override_
         .and_then(|value| value.enabled)
+        .or_else(|| ticket.and_then(|value| value.enabled))
         .unwrap_or_else(|| defaults.provider_enabled(provider));
     let threshold_percent = override_
         .and_then(|value| value.threshold_percent)
-        .unwrap_or(defaults.threshold_percent);
+        .or_else(|| ticket.and_then(|value| value.threshold_percent))
+        .unwrap_or(thresholds.threshold_percent);
     let reminder_percent =
-        (defaults.reminder_percent > threshold_percent).then_some(defaults.reminder_percent);
+        (thresholds.reminder_percent > threshold_percent).then_some(thresholds.reminder_percent);
     let source = if override_.is_some_and(HandoffOverride::is_active) {
         "override"
+    } else if ticket.is_some_and(HandoffOverride::is_active) {
+        "ticket"
     } else {
         "default"
     };
@@ -644,8 +799,8 @@ mod tests {
         let o = over(Some(true), None);
         let fork_on = effective_policy(&defaults, "codex-fork", Some(&o), true);
         assert!(fork_on.enabled);
-        assert_eq!(fork_on.threshold_percent, 35.0);
-        assert_eq!(fork_on.reminder_percent, Some(50.0));
+        assert_eq!(fork_on.threshold_percent, 80.0);
+        assert_eq!(fork_on.reminder_percent, Some(90.0));
 
         let app_on = effective_policy(&defaults, "codex-app", Some(&o), false);
         assert!(app_on.enabled);
@@ -725,6 +880,64 @@ mod tests {
             HandoffDefaults::default().to_json()["threshold_percent"],
             json!(35)
         );
+    }
+
+    #[test]
+    fn legacy_flat_thresholds_migrate_only_to_claude_and_flat_put_stays_compatible() {
+        let old =
+            json!({"threshold_percent": 42, "reminder_percent": 55, "review_floor_percent": 12});
+        let defaults = HandoffDefaults::from_stored(Some(&old));
+        assert_eq!(defaults.thresholds("claude").threshold_percent, 42.0);
+        assert_eq!(defaults.thresholds("codex-fork").threshold_percent, 80.0);
+        let updated = defaults.merged(&json!({"threshold_percent": 37})).unwrap();
+        assert_eq!(
+            updated.to_json()["provider_thresholds"]["claude"]["threshold_percent"],
+            37
+        );
+        assert_eq!(
+            updated.to_json()["provider_thresholds"]["codex-fork"]["threshold_percent"],
+            80
+        );
+        let provider_update = updated
+            .merged(&json!({"provider_thresholds": {"codex-fork": {"threshold_percent": 75}}}))
+            .unwrap();
+        assert_eq!(provider_update.threshold_percent, 37.0);
+        assert_eq!(
+            provider_update.thresholds("codex-fork").threshold_percent,
+            75.0
+        );
+        assert_eq!(
+            HandoffDefaults::from_stored(Some(&provider_update.to_json())),
+            provider_update
+        );
+        let full_body = json!({
+            "threshold_percent": 37,
+            "provider_thresholds": {"claude": {"threshold_percent": 31}}
+        });
+        let explicit = provider_update.merged(&full_body).unwrap();
+        assert_eq!(explicit.threshold_percent, 31.0);
+        assert_eq!(explicit.thresholds("claude").threshold_percent, 31.0);
+    }
+
+    #[test]
+    fn ticket_fields_fill_only_unset_agent_fields() {
+        let defaults = HandoffDefaults::default();
+        let ticket = over(Some(true), Some(30.0));
+        let agent = over(None, Some(45.0));
+        let policy = effective_policy_with_ticket(
+            &defaults,
+            "codex-fork",
+            Some(&agent),
+            Some(&ticket),
+            true,
+        );
+        assert!(policy.enabled);
+        assert_eq!(policy.threshold_percent, 45.0);
+        assert_eq!(policy.source, "override");
+        let inherited =
+            effective_policy_with_ticket(&defaults, "codex-fork", None, Some(&ticket), true);
+        assert_eq!(inherited.threshold_percent, 30.0);
+        assert_eq!(inherited.source, "ticket");
     }
 
     #[test]

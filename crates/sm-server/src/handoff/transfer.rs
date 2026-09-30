@@ -277,6 +277,9 @@ impl SessionStore {
             Value::String(predecessor_id.to_owned()),
         );
         for (key, value) in inherited {
+            if key == policy::OVERRIDE_KEY && successor.contains_key(key) {
+                continue;
+            }
             successor.insert(key.to_owned(), value);
         }
         replace_text_field(
@@ -1047,6 +1050,43 @@ mod tests {
             HandoffPhase::Done
         );
         assert!(store.pending_handoff_work().unwrap().is_empty());
+    }
+
+    #[test]
+    fn successor_inherits_agent_override_unless_it_already_has_one() {
+        let inherited_store = store("override-inheritance", "idle");
+        let mut state = inherited_store.load_raw_json_value().unwrap();
+        let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+        session_object_mut(sessions, "pred0001").unwrap().insert(
+            policy::OVERRIDE_KEY.into(),
+            json!({"enabled": true, "threshold_percent": 30}),
+        );
+        inherited_store.write_raw_json_value(&state).unwrap();
+        inherited_store
+            .transfer_handoff_json("pred0001", "succ0001")
+            .unwrap();
+        let state = inherited_store.load_raw_json_value().unwrap();
+        assert_eq!(
+            raw_session_object(&state, "succ0001").unwrap()[policy::OVERRIDE_KEY]
+                ["threshold_percent"],
+            30
+        );
+
+        let store = store("override-preserved", "idle");
+        let mut state = store.load_raw_json_value().unwrap();
+        let sessions = ensure_sessions_array_mut(&mut state).unwrap();
+        session_object_mut(sessions, "succ0001").unwrap().insert(
+            policy::OVERRIDE_KEY.into(),
+            json!({"enabled": false, "threshold_percent": 60}),
+        );
+        store.write_raw_json_value(&state).unwrap();
+        store.transfer_handoff_json("pred0001", "succ0001").unwrap();
+        let state = store.load_raw_json_value().unwrap();
+        assert_eq!(
+            raw_session_object(&state, "succ0001").unwrap()[policy::OVERRIDE_KEY]
+                ["threshold_percent"],
+            60
+        );
     }
 
     #[test]

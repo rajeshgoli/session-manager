@@ -54,6 +54,8 @@ post_usage() {
        | {session_id: $sid,
           used_percentage: .context_window.used_percentage,
           total_input_tokens: (.context_window.total_input_tokens // 0),
+          context_window_tokens: (.context_window.context_window_size // null),
+          model_id: (.model.id // null),
           rate_limits: {
             five_hour: (.rate_limits.five_hour // null),
             seven_day: (.rate_limits.seven_day // null)
