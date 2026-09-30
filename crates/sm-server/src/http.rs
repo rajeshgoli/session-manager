@@ -1802,7 +1802,10 @@ pub fn router(state: AppState) -> Router {
             "/sessions/{session_id}/codex-pending-requests",
             get(session_codex_pending_requests),
         )
-        .route("/client/sessions", get(list_client_sessions))
+        .route(
+            "/client/sessions",
+            get(list_client_sessions).post(create_client_session),
+        )
         .route(
             "/client/sessions/{session_id}/attach-ticket",
             post(create_mobile_attach_ticket),
@@ -2637,17 +2640,24 @@ struct UtilizationHoursQuery {
     hours: Option<i64>,
 }
 
-/// The owner-read checks every `/client/...` read shares.
-fn ensure_client_read(state: &AppState, request: &Request) -> Result<(), ApiError> {
+/// The owner-read checks every `/client/...` read shares, returning the
+/// actor's email. The owner's browser login also passes (spec 1710 D3).
+fn ensure_client_read(state: &AppState, request: &Request) -> Result<Option<String>, ApiError> {
+    if let Some(email) =
+        owner_web_guard(state, request.headers(), request_peer_addr(request), "GET")?
+    {
+        return Ok(Some(email));
+    }
     let access_context = ensure_mobile_cloudflare_access_for_request(state, request)?;
     ensure_public_edge_assertion_for_request(state, request)?;
     ensure_session_read_allowed(state, request)?;
+    let actor_email = request_actor_email(&state.config, request);
     ensure_mobile_cloudflare_access_context_matches_optional_actor(
         state,
         access_context.as_ref(),
-        request_actor_email(&state.config, request).as_deref(),
+        actor_email.as_deref(),
     )?;
-    Ok(())
+    Ok(actor_email)
 }
 
 async fn read_utilization(
@@ -2711,14 +2721,7 @@ async fn client_host_status(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-    ensure_public_edge_assertion_for_request(&state, &request)?;
-    ensure_session_read_allowed(&state, &request)?;
-    ensure_mobile_cloudflare_access_context_matches_optional_actor(
-        &state,
-        access_context.as_ref(),
-        request_actor_email(&state.config, &request).as_deref(),
-    )?;
+    ensure_client_read(&state, &request)?;
     Ok(Json(crate::host_status::snapshot().await))
 }
 
@@ -4069,6 +4072,59 @@ async fn create_session(
     Ok(Json(session_response_with_live_activity(&state, session)))
 }
 
+/// `POST /client/sessions` body: the `POST /sessions` body without
+/// `parent_session_id`, `node` and `wait`. Those fields are ignored if sent.
+#[derive(Debug, Deserialize)]
+struct CreateClientSessionRequest {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    working_dir: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default, alias = "prompt")]
+    initial_message: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    spawn_prompt_source: Option<SpawnBriefSource>,
+}
+
+/// `POST /client/sessions`: the owner starts a top-level agent, for the web's
+/// New agent and Clone (spec 1710 D3). Returns `{id, name}`.
+async fn create_client_session(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    uri: Uri,
+    headers: HeaderMap,
+    Json(payload): Json<CreateClientSessionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    follows::owner_web_or_guard(&state, &headers, peer_addr, "POST", &uri)?;
+    ensure_core_writes_enabled(&state)?;
+    let request = CreateCoreSessionRequest {
+        id: payload.id,
+        name: payload.name,
+        working_dir: payload.working_dir,
+        provider: payload.provider,
+        parent_session_id: None,
+        node: None,
+        initial_message: payload.initial_message,
+        model: payload.model,
+        reasoning_effort: payload.reasoning_effort,
+        wait: None,
+        spawn_prompt_source: payload.spawn_prompt_source,
+        spawn_brief: None,
+    };
+    let session = create_session_from_request(state, request).await?;
+    Ok(Json(
+        json!({ "id": session.id.clone(), "name": session_display_name(session) }),
+    ))
+}
+
 /// `POST /sessions` after auth: a brief given with its source is accepted
 /// durably before the session exists. Assigning a review to a new agent
 /// (sm#1580) starts its agent the same way.
@@ -4761,15 +4817,7 @@ async fn list_client_sessions(
     State(state): State<Arc<AppState>>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-    ensure_public_edge_assertion_for_request(&state, &request)?;
-    ensure_session_read_allowed(&state, &request)?;
-    let actor_email = request_actor_email(&state.config, &request);
-    ensure_mobile_cloudflare_access_context_matches_optional_actor(
-        &state,
-        access_context.as_ref(),
-        actor_email.as_deref(),
-    )?;
+    let actor_email = ensure_client_read(&state, &request)?;
     let sessions = state
         .session_store
         .list_sessions(false)?
@@ -7080,8 +7128,11 @@ async fn cancel_queue_job_with_note(
             detail: format!("note must be at most {MAX_CANCEL_NOTE_CHARS} characters"),
         });
     }
+    let web_owner = owner_web_guard(&state, &headers, Some(peer_addr), "POST")?;
     let actor = request_actor_email_from_parts(&state.config, &headers, Some(peer_addr));
-    let cancelled_by = if actor.is_some_and(|actor| actor != LOCAL_BYPASS_ACTOR) {
+    let cancelled_by = if web_owner.is_some() {
+        Some(format!("{} from the browser", state.config.owner_name))
+    } else if actor.is_some_and(|actor| actor != LOCAL_BYPASS_ACTOR) {
         Some(format!("{} from the sm app", state.config.owner_name))
     } else if let Some(session_id) = header_text(&headers, "x-sm-session-id") {
         Some(
@@ -7107,6 +7158,7 @@ async fn cancel_queue_job_with_note(
         &job_id,
         peer_addr,
         &headers,
+        web_owner.is_some(),
         Some(&Value::Object(detail)),
     )
 }
@@ -7172,7 +7224,7 @@ async fn get_queue_job_log(
     Query(query): Query<QueueJobLogQuery>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
+    ensure_owner_web_or_session_read(&state, &request)?;
     let lines = query.lines.unwrap_or(DEFAULT_QUEUE_LOG_LINES);
     if !(1..=MAX_QUEUE_LOG_LINES).contains(&lines) {
         return Err(ApiError::Status {
@@ -7419,7 +7471,7 @@ async fn cancel_queue_job(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    cancel_queue_job_inner(&state, &job_id, peer_addr, &headers, None)
+    cancel_queue_job_inner(&state, &job_id, peer_addr, &headers, false, None)
 }
 
 fn cancel_queue_job_inner(
@@ -7427,14 +7479,17 @@ fn cancel_queue_job_inner(
     job_id: &str,
     peer_addr: SocketAddr,
     headers: &HeaderMap,
+    web_owner: bool,
     detail: Option<&Value>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_session_allowed_from_parts(
-        &state.config,
-        headers,
-        Some(peer_addr),
-        &format!("/queue-jobs/{job_id}"),
-    )?;
+    if !web_owner {
+        ensure_session_allowed_from_parts(
+            &state.config,
+            headers,
+            Some(peer_addr),
+            &format!("/queue-jobs/{job_id}"),
+        )?;
+    }
     ensure_core_writes_enabled(state)?;
     let queue_state_dir_config = state.config.queue_runner_state_dir();
     let queue_state_dir = expand_home(&queue_state_dir_config.to_string_lossy());
@@ -7597,15 +7652,7 @@ async fn get_client_session(
     Path(session_id): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    let access_context = ensure_mobile_cloudflare_access_for_request(&state, &request)?;
-    ensure_public_edge_assertion_for_request(&state, &request)?;
-    ensure_session_read_allowed(&state, &request)?;
-    let actor_email = request_actor_email(&state.config, &request);
-    ensure_mobile_cloudflare_access_context_matches_optional_actor(
-        &state,
-        access_context.as_ref(),
-        actor_email.as_deref(),
-    )?;
+    let actor_email = ensure_client_read(&state, &request)?;
     let Some(session) = state.session_store.get_session(&session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
@@ -9111,12 +9158,14 @@ async fn create_btw_request(
     headers: HeaderMap,
     Json(payload): Json<CreateBtwHttpRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    ensure_session_allowed_from_parts(
-        &state.config,
-        &headers,
-        Some(peer_addr),
-        &format!("/sessions/{target_identifier}/what"),
-    )?;
+    if owner_web_guard(&state, &headers, Some(peer_addr), "POST")?.is_none() {
+        ensure_session_allowed_from_parts(
+            &state.config,
+            &headers,
+            Some(peer_addr),
+            &format!("/sessions/{target_identifier}/what"),
+        )?;
+    }
     ensure_core_writes_enabled(&state)?;
     let Some(target) = resolve_session_or_registry_role(&state, &target_identifier)? else {
         return Err(ApiError::NotFound("Target session not found"));
@@ -9203,7 +9252,7 @@ async fn get_btw_request(
     Path(request_id): Path<String>,
     request: Request,
 ) -> Result<Json<BtwRequestRecord>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
+    ensure_owner_web_or_session_read(&state, &request)?;
     let Some(record) = btw_store(&state)?.get(&request_id)? else {
         return Err(ApiError::NotFound("sm what request not found"));
     };
@@ -10066,14 +10115,17 @@ async fn retire_session(
     headers: HeaderMap,
     Json(payload): Json<RetireSessionRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    ensure_session_allowed_from_parts(
-        &state.config,
-        &headers,
-        Some(peer_addr),
-        &format!("/sessions/{session_id}/retire"),
-    )?;
+    let web_owner = owner_web_guard(&state, &headers, Some(peer_addr), "POST")?;
+    if web_owner.is_none() {
+        ensure_session_allowed_from_parts(
+            &state.config,
+            &headers,
+            Some(peer_addr),
+            &format!("/sessions/{session_id}/retire"),
+        )?;
+    }
     ensure_core_writes_enabled(&state)?;
-    retire_session_after_auth(state, session_id, peer_addr, headers, payload).await
+    retire_session_after_auth(state, session_id, peer_addr, headers, payload, web_owner).await
 }
 
 async fn retire_session_after_auth(
@@ -10082,6 +10134,7 @@ async fn retire_session_after_auth(
     peer_addr: SocketAddr,
     headers: HeaderMap,
     payload: RetireSessionRequest,
+    web_owner: Option<String>,
 ) -> Result<Json<Value>, ApiError> {
     let requester_session_id = payload
         .requester_session_id
@@ -10095,7 +10148,10 @@ async fn retire_session_after_auth(
         ),
         None => (
             RetireAuthority::operator(
-                request_actor_email_from_parts(&state.config, &headers, Some(peer_addr))
+                web_owner
+                    .or_else(|| {
+                        request_actor_email_from_parts(&state.config, &headers, Some(peer_addr))
+                    })
                     .unwrap_or_else(|| "api_access".to_owned()),
             ),
             None,
@@ -10169,12 +10225,14 @@ async fn restore_session(
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Result<Json<SessionResponse>, ApiError> {
-    ensure_session_allowed_from_parts(
-        &state.config,
-        &headers,
-        Some(peer_addr),
-        &format!("/sessions/{session_id}/restore"),
-    )?;
+    if owner_web_guard(&state, &headers, Some(peer_addr), "POST")?.is_none() {
+        ensure_session_allowed_from_parts(
+            &state.config,
+            &headers,
+            Some(peer_addr),
+            &format!("/sessions/{session_id}/restore"),
+        )?;
+    }
     ensure_core_writes_enabled(&state)?;
     let outcome = if state.config.rust_core.runtime_enabled {
         ensure_core_runtime_session_node_supported(&state, &session_id)?;
@@ -10318,7 +10376,7 @@ async fn get_session_context(
     Path(session_id): Path<String>,
     request: Request,
 ) -> Result<Json<ContextSnapshotResponse>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
+    ensure_owner_web_or_session_read(&state, &request)?;
     match state.session_store.get_context_snapshot(&session_id)? {
         Some(snapshot) => Ok(Json(snapshot)),
         None => Err(ApiError::NotFound("Session not found")),
@@ -10565,7 +10623,7 @@ async fn session_output(
     Query(query): Query<SessionOutputQuery>,
     request: Request,
 ) -> Result<Json<SessionOutputResponse>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
+    ensure_owner_web_or_session_read(&state, &request)?;
     let Some(session) = state.session_store.get_session(&session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
@@ -10614,7 +10672,7 @@ async fn session_tool_calls(
     Query(query): Query<SessionToolCallsQuery>,
     request: Request,
 ) -> Result<Json<ToolCallsResponse>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
+    ensure_owner_web_or_session_read(&state, &request)?;
     let Some(session) = state.session_store.get_session(&session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
     };
@@ -10646,7 +10704,7 @@ async fn session_activity_actions(
     uri: Uri,
     request: Request,
 ) -> Result<Json<CodexActivityActionsResponse>, ApiError> {
-    ensure_session_read_allowed(&state, &request)?;
+    ensure_owner_web_or_session_read(&state, &request)?;
     let query = SessionActivityActionsQuery::parse(uri.query().unwrap_or(""))?;
     let Some(session) = state.session_store.get_session(&session_id)? else {
         return Err(ApiError::NotFound("Session not found"));
@@ -14555,6 +14613,83 @@ fn ensure_owner_page_read_allowed(state: &AppState, request: &Request) -> Result
                 return Ok(());
             }
         }
+    }
+    ensure_session_read_allowed(state, request)
+}
+
+/// Browser access to owner routes (spec 1710 D3). On the browser hostname a
+/// verified Access login by an allowlisted email passes, returning that email.
+/// Writes also need an `Origin` matching the host and no agent session
+/// header, or get 403. Every other request returns `None` and falls through to
+/// the route's own guard, so the phone and agents are unaffected. A present
+/// assertion must verify, as on the owner pages.
+fn owner_web_guard(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_addr: Option<SocketAddr>,
+    method: &str,
+) -> Result<Option<String>, ApiError> {
+    let application = request_hostname(headers).and_then(|hostname| {
+        cloudflare_access_application_for_host(&state.config.cloudflare_access, &hostname)
+    });
+    if application != Some(CloudflareAccessApplication::Browser)
+        || is_local_bypass_request(headers, peer_addr, &state.config)
+    {
+        return Ok(None);
+    }
+    let Some(assertion) = header_text(headers, "cf-access-jwt-assertion") else {
+        return Ok(None);
+    };
+    let context = classify_cloudflare_access_assertion_cached(
+        state,
+        CloudflareAccessApplication::Browser,
+        &assertion,
+    )
+    .map_err(cloudflare_access_error)?;
+    let Some(email) = context
+        .email
+        .filter(|email| allowlisted_google_email(&state.config, email))
+    else {
+        return Ok(None);
+    };
+    if method != "GET" {
+        if [handoff::SESSION_HEADER, "x-sm-session-id"]
+            .into_iter()
+            .any(|name| header_text(headers, name).is_some())
+        {
+            return Err(ApiError::Status {
+                status: StatusCode::FORBIDDEN,
+                detail: "Browser owner actions cannot come from an agent".into(),
+            });
+        }
+        let origin = header_text(headers, "origin");
+        let host =
+            header_text(headers, "x-forwarded-host").or_else(|| header_text(headers, "host"));
+        if !origin
+            .as_deref()
+            .is_some_and(|origin| handoff::origin_matches_host(origin, host.as_deref()))
+        {
+            return Err(ApiError::Status {
+                status: StatusCode::FORBIDDEN,
+                detail: "Origin does not match host".into(),
+            });
+        }
+    }
+    Ok(Some(email.trim().to_ascii_lowercase()))
+}
+
+fn request_peer_addr(request: &Request) -> Option<SocketAddr> {
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|value| value.0)
+}
+
+/// A read the browser owner may make (D3); anything else keeps the SM session
+/// check.
+fn ensure_owner_web_or_session_read(state: &AppState, request: &Request) -> Result<(), ApiError> {
+    if owner_web_guard(state, request.headers(), request_peer_addr(request), "GET")?.is_some() {
+        return Ok(());
     }
     ensure_session_read_allowed(state, request)
 }
@@ -19261,8 +19396,6 @@ mod tests {
         for (method, uri) in [
             (Method::POST, "/sessions"),
             (Method::POST, "/sessions/abc12345/input"),
-            (Method::POST, "/sessions/abc12345/kill"),
-            (Method::POST, "/sessions/abc12345/restore"),
             (Method::DELETE, "/sessions/abc12345"),
             (Method::POST, "/claims"),
             (Method::POST, "/claims/release"),
@@ -19334,6 +19467,320 @@ mod tests {
                 "{method} {uri}: {status}"
             );
         }
+    }
+
+    /// The browser app on `sm.example.com` over a state with one running
+    /// agent, `fork1001`.
+    fn owner_web_app() -> Router {
+        let mut config = google_auth_config();
+        config.cloudflare_access = cloudflare_access_config().cloudflare_access;
+        config.paths.state_file = write_session_state("fork1001", "running");
+        config.rust_core.fixture_writes_enabled = true;
+        let state = AppState::new(config);
+        seed_cloudflare_access_jwks(&state);
+        router(state)
+    }
+
+    fn owner_web_request(
+        method: Method,
+        uri: &str,
+        host: &str,
+        assertion: Option<&str>,
+        extra_headers: &[(&str, &str)],
+        body: &Value,
+    ) -> axum::http::Request<Body> {
+        let mut request = public_request_with_host(method, uri, Body::from(body.to_string()), host);
+        let headers = request.headers_mut();
+        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        if let Some(assertion) = assertion {
+            headers.insert("cf-access-jwt-assertion", assertion.parse().unwrap());
+        }
+        for (name, value) in extra_headers {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        request
+    }
+
+    /// Spec 1710 D3 reads, by group: queue and Mac, analytics, agents, follows.
+    const OWNER_WEB_READS: [&str; 16] = [
+        "/client/queue",
+        "/client/queue/stats",
+        "/client/queue/jobs/job-missing/start-check",
+        "/client/utilization/series",
+        "/client/host-status",
+        "/queue-jobs/job-missing/log",
+        "/client/analytics/spend",
+        "/client/analytics/time",
+        "/client/sessions",
+        "/client/sessions/fork1001",
+        "/sessions/fork1001/output",
+        "/sessions/fork1001/tool-calls",
+        "/sessions/fork1001/activity-actions",
+        "/sessions/fork1001/context",
+        "/btw-requests/btw-missing",
+        "/client/follows",
+    ];
+
+    fn owner_web_writes() -> Vec<(Method, &'static str, Value)> {
+        vec![
+            (
+                Method::POST,
+                "/client/queue/jobs/job-missing/start",
+                json!({}),
+            ),
+            (Method::POST, "/queue-jobs/job-missing/cancel", json!({})),
+            (
+                Method::POST,
+                "/sessions/fork1001/what",
+                json!({"prompt": "status?"}),
+            ),
+            (Method::POST, "/sessions/fork1001/retire", json!({})),
+            // The pre-rename alias shares the retire handler.
+            (Method::POST, "/sessions/fork1001/kill", json!({})),
+            (Method::POST, "/sessions/fork1001/restore", json!({})),
+            (
+                Method::POST,
+                "/client/follows/follow-missing/ack",
+                json!({}),
+            ),
+            (Method::POST, "/sessions/fork1001/follow", json!({})),
+            (Method::DELETE, "/sessions/fork1001/follow", json!({})),
+            (Method::POST, "/queue-jobs/job-missing/follow", json!({})),
+            (Method::DELETE, "/queue-jobs/job-missing/follow", json!({})),
+            (
+                Method::POST,
+                "/client/sessions",
+                json!({"name": "web-agent", "working_dir": "/tmp", "provider": "claude"}),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn owner_web_guard_opens_owner_reads_to_the_browser_login() {
+        let app = owner_web_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let stranger =
+            test_browser_access_assertion("sm-browser-aud", "stranger@example.com", 4_102_444_800);
+        for uri in OWNER_WEB_READS {
+            let (status, body) = browser_host_get(&app, uri, Some(&owner)).await;
+            assert!(
+                !is_auth_denial_status(status.as_u16()),
+                "{uri}: {status} {body}"
+            );
+            // Without the owner's login the route's own guard still applies.
+            for assertion in [Some(stranger.as_str()), None] {
+                let (status, body) = browser_host_get(&app, uri, assertion).await;
+                assert!(
+                    is_auth_denial_status(status.as_u16()),
+                    "{uri}: {status} {body}"
+                );
+            }
+        }
+        // One read per group returns its payload.
+        for uri in [
+            "/client/queue",
+            "/client/analytics/spend",
+            "/client/sessions/fork1001",
+            "/client/follows",
+        ] {
+            let (status, body) = browser_host_get(&app, uri, Some(&owner)).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        }
+        let (_, body) = browser_host_get(&app, "/client/sessions", Some(&owner)).await;
+        assert_eq!(body["sessions"][0]["id"], "fork1001");
+    }
+
+    #[tokio::test]
+    async fn owner_web_guard_refuses_browser_writes_without_origin_or_from_agents() {
+        let app = owner_web_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let good_origin = ("origin", "https://sm.example.com");
+        for (method, uri, body) in owner_web_writes() {
+            for (headers, detail) in [
+                (vec![], "Origin does not match host"),
+                (
+                    vec![("origin", "https://evil.example.com")],
+                    "Origin does not match host",
+                ),
+                (
+                    vec![good_origin, ("x-sm-session", "abc12345")],
+                    "Browser owner actions cannot come from an agent",
+                ),
+                (
+                    vec![good_origin, ("x-sm-session-id", "abc12345")],
+                    "Browser owner actions cannot come from an agent",
+                ),
+            ] {
+                let request = owner_web_request(
+                    method.clone(),
+                    uri,
+                    "sm.example.com",
+                    Some(&owner),
+                    &headers,
+                    &body,
+                );
+                let (status, response) =
+                    response_json(app.clone().oneshot(request).await.unwrap()).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri} {headers:?}");
+                assert_eq!(response["detail"], detail, "{method} {uri} {headers:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_web_guard_passes_browser_writes_from_the_page() {
+        let app = owner_web_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        let origin = [("origin", "https://sm.example.com")];
+        // Past the guard, each route reports its own refusal: a missing target,
+        // or the queue runtime this test server does not run.
+        for (method, uri, expected) in [
+            (
+                Method::POST,
+                "/client/queue/jobs/job-missing/start",
+                StatusCode::CONFLICT,
+            ),
+            (
+                Method::POST,
+                "/queue-jobs/job-missing/cancel",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::POST,
+                "/sessions/missing1/restore",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Method::POST,
+                "/client/follows/follow-missing/ack",
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let request = owner_web_request(
+                method.clone(),
+                uri,
+                "sm.example.com",
+                Some(&owner),
+                &origin,
+                &json!({}),
+            );
+            let (status, body) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+            assert_eq!(status, expected, "{method} {uri}: {body}");
+        }
+        let request = owner_web_request(
+            Method::POST,
+            "/client/sessions",
+            "sm.example.com",
+            Some(&owner),
+            &origin,
+            &json!({"name": "web-agent", "working_dir": "/tmp", "provider": "claude",
+                    "parent_session_id": "fork1001", "node": "elsewhere", "wait": 30}),
+        );
+        let (status, body) = response_json(app.clone().oneshot(request).await.unwrap()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["name"], "web-agent");
+        let id = body["id"].as_str().unwrap().to_owned();
+        assert_eq!(body.as_object().unwrap().len(), 2, "{body}");
+        let (_, session) =
+            browser_host_get(&app, &format!("/client/sessions/{id}"), Some(&owner)).await;
+        assert_eq!(session["parent_session_id"], Value::Null, "{session}");
+    }
+
+    /// The phone's hostname ignores the browser login: its own checks apply.
+    #[tokio::test]
+    async fn owner_web_guard_leaves_the_app_hostname_alone() {
+        let app = owner_web_app();
+        let owner =
+            test_browser_access_assertion("sm-browser-aud", "rajeshgoli@gmail.com", 4_102_444_800);
+        for (method, uri) in [
+            (Method::GET, "/client/queue"),
+            (Method::GET, "/client/sessions"),
+            (Method::POST, "/sessions/missing1/restore"),
+        ] {
+            let request = owner_web_request(
+                method.clone(),
+                uri,
+                "sm-app.example.com",
+                Some(&owner),
+                &[("origin", "https://sm-app.example.com")],
+                &json!({}),
+            );
+            let status = app.clone().oneshot(request).await.unwrap().status();
+            assert!(
+                is_auth_denial_status(status.as_u16()),
+                "{method} {uri}: {status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_state_carries_remote_control_link() {
+        let state_file = write_session_state("rclive01", "running");
+        let mut fixture: Value = serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+        let template = fixture["sessions"][0].clone();
+        let mut sessions = Vec::new();
+        for (id, status) in [
+            ("rclive01", "running"),
+            ("rcnone01", "running"),
+            ("rcstop01", "stopped"),
+        ] {
+            let mut session = template.clone();
+            session["id"] = json!(id);
+            session["name"] = json!(format!("claude-{id}"));
+            session["tmux_session"] = json!(format!("claude-{id}"));
+            session["provider"] = json!("claude");
+            session["status"] = json!(status);
+            sessions.push(session);
+        }
+        fixture["sessions"] = json!(sessions);
+        fs::write(&state_file, serde_json::to_vec(&fixture).unwrap()).unwrap();
+        let dir = crate::config::test_isolation_root_from_environment()
+            .unwrap()
+            .unwrap()
+            .join("claude")
+            .join("sessions");
+        fs::create_dir_all(&dir).unwrap();
+        for id in ["rclive01", "rcstop01"] {
+            fs::write(
+                dir.join(format!("{id}.json")),
+                json!({"pid": process::id(), "bridgeSessionId": format!("session_{id}"),
+                       "tmux": format!("claude-{id}:@1.%1")})
+                .to_string(),
+            )
+            .unwrap();
+        }
+        crate::claude_remote_control::clear_cache_for_test();
+        let mut config = AppConfig::default();
+        config.paths.state_file = state_file;
+        let app = router(AppState::new(config));
+        let response = app
+            .oneshot(local_request(
+                Method::GET,
+                "/watch/state?stopped=1",
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let (status, body) = response_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let links: BTreeMap<&str, &Value> = body["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|session| (session["id"].as_str().unwrap(), &session["remote_control"]))
+            .collect();
+        assert_eq!(
+            links["rclive01"],
+            &json!({"provider": "claude", "url": "https://claude.ai/code/session_rclive01"})
+        );
+        assert_eq!(links["rcnone01"], &Value::Null);
+        assert_eq!(links["rcstop01"], &Value::Null);
     }
 
     #[tokio::test]

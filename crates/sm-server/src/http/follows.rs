@@ -52,6 +52,20 @@ pub(super) fn owner_guard(
     Ok(follow_owner_id(&state.config, actor.as_deref()))
 }
 
+/// `owner_guard`, also accepting the owner's browser login (spec 1710 D3).
+pub(super) fn owner_web_or_guard(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_addr: SocketAddr,
+    method: &str,
+    uri: &Uri,
+) -> Result<String, ApiError> {
+    if let Some(email) = super::owner_web_guard(state, headers, Some(peer_addr), method)? {
+        return Ok(follow_owner_id(&state.config, Some(&email)));
+    }
+    owner_guard(state, headers, peer_addr, method, uri)
+}
+
 pub(super) fn follow_owner_id(config: &AppConfig, actor: Option<&str>) -> String {
     match actor {
         Some(actor) if actor != LOCAL_BYPASS_ACTOR => actor.trim().to_ascii_lowercase(),
@@ -216,7 +230,7 @@ pub(super) async fn follow_session(
     Path(identifier): Path<String>,
     Json(payload): Json<FollowSessionRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let user_id = owner_guard(&state, &headers, peer_addr, "POST", &uri)?;
+    let user_id = owner_web_or_guard(&state, &headers, peer_addr, "POST", &uri)?;
     ensure_core_writes_enabled(&state)?;
     let session = resolve_session_or_registry_role(&state, &identifier)?
         .ok_or(ApiError::NotFound("Session not found"))?;
@@ -303,7 +317,7 @@ pub(super) async fn unfollow_session(
     headers: HeaderMap,
     Path(identifier): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let user_id = owner_guard(&state, &headers, peer_addr, "DELETE", &uri)?;
+    let user_id = owner_web_or_guard(&state, &headers, peer_addr, "DELETE", &uri)?;
     let session_id = resolve_session_or_registry_role(&state, &identifier)?
         .map(|session| session.id)
         .unwrap_or(identifier);
@@ -328,7 +342,7 @@ pub(super) async fn follow_queue_job(
     headers: HeaderMap,
     Path(identifier): Path<String>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
-    let user_id = owner_guard(&state, &headers, peer_addr, "POST", &uri)?;
+    let user_id = owner_web_or_guard(&state, &headers, peer_addr, "POST", &uri)?;
     let job =
         RetainedQueueStore::resolve_queue_job_from_path(&queue_runner_db_path(&state), &identifier)
             .map_err(queue_lookup_error)?
@@ -380,7 +394,7 @@ pub(super) async fn unfollow_queue_job(
     headers: HeaderMap,
     Path(identifier): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let user_id = owner_guard(&state, &headers, peer_addr, "DELETE", &uri)?;
+    let user_id = owner_web_or_guard(&state, &headers, peer_addr, "DELETE", &uri)?;
     let job_id =
         RetainedQueueStore::resolve_queue_job_from_path(&queue_runner_db_path(&state), &identifier)
             .ok()
@@ -402,7 +416,7 @@ pub(super) async fn list_follows(
     uri: Uri,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    let user_id = owner_guard(&state, &headers, peer_addr, "GET", &uri)?;
+    let user_id = owner_web_or_guard(&state, &headers, peer_addr, "GET", &uri)?;
     let follows = push_store(&state)
         .list_for_owner(&user_id, OffsetDateTime::now_utc())?
         .iter()
@@ -422,7 +436,7 @@ pub(super) async fn ack_follow(
     headers: HeaderMap,
     Path(follow_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    let user_id = owner_guard(&state, &headers, peer_addr, "POST", &uri)?;
+    let user_id = owner_web_or_guard(&state, &headers, peer_addr, "POST", &uri)?;
     if push_store(&state).ack(&user_id, &follow_id, OffsetDateTime::now_utc())? {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -896,7 +910,7 @@ pub(super) async fn queue_job_start_check(
     headers: HeaderMap,
     Path(identifier): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    owner_guard(&state, &headers, peer_addr, "GET", &uri)?;
+    owner_web_or_guard(&state, &headers, peer_addr, "GET", &uri)?;
     let job =
         RetainedQueueStore::resolve_queue_job_from_path(&queue_runner_db_path(&state), &identifier)
             .map_err(queue_lookup_error)?
@@ -930,12 +944,14 @@ pub(super) async fn force_start_queue_job(
     headers: HeaderMap,
     Path(identifier): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    owner_guard(&state, &headers, peer_addr, "POST", &uri)?;
-    if authenticated_user(&headers, &state.config).is_none() {
-        return Err(ApiError::Status {
-            status: StatusCode::FORBIDDEN,
-            detail: "Start now is for the owner, signed in to the sm app".to_owned(),
-        });
+    if owner_web_guard(&state, &headers, Some(peer_addr), "POST")?.is_none() {
+        owner_guard(&state, &headers, peer_addr, "POST", &uri)?;
+        if authenticated_user(&headers, &state.config).is_none() {
+            return Err(ApiError::Status {
+                status: StatusCode::FORBIDDEN,
+                detail: "Start now is for the owner, signed in to the sm app".to_owned(),
+            });
+        }
     }
     if !state.config.rust_core.runtime_enabled {
         return Err(conflict("the queue runtime is off on this server"));
