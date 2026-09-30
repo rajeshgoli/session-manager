@@ -108,6 +108,27 @@ def test_rust_service_cutover_render_plist_uses_rust_binary_and_config(tmp_path)
     assert plist["WorkingDirectory"] == str(REPO_ROOT)
 
 
+def test_rust_service_cutover_runs_from_the_checkout_that_holds_the_binary(tmp_path):
+    """A restart invoked from a ticket worktree against the production binary must
+    not move the service's working directory or PATH into that worktree."""
+    config = tmp_path / "config.yaml"
+    config.write_text("server:\n  port: 18420\n", encoding="utf-8")
+    deployed = tmp_path / "prod"
+    binary = deployed / ".local" / "bin" / "sm-server"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+
+    result = run_script("render-plist", "--config", str(config), "--binary", str(binary))
+
+    assert result.returncode == 0, result.stderr
+    plist = plistlib.loads(result.stdout.encode("utf-8"))
+    assert plist["WorkingDirectory"] == str(deployed)
+    path = plist["EnvironmentVariables"]["PATH"].split(":")
+    assert path[0] == str(deployed / ".local" / "bin")
+    assert not any(entry.startswith(str(REPO_ROOT) + "/") for entry in path), path
+
+
 def test_rust_service_cutover_persistently_disables_retired_python_service():
     script = SCRIPT.read_text(encoding="utf-8")
 

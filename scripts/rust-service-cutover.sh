@@ -266,6 +266,7 @@ require_no_python_labels() {
 print_plan() {
   echo "Rust Session Manager service cutover plan"
   echo "repo_root: $REPO_ROOT"
+  echo "deploy_root: $(deploy_root)"
   echo "launch_domain: $DOMAIN"
   echo "rust_label: $RUST_LABEL"
   echo "rust_plist: $PLIST_DST"
@@ -301,7 +302,19 @@ print_plan() {
   fi
 }
 
+# The checkout the installed binary belongs to, not the one this script runs
+# from: a restart invoked from a ticket worktree must not move the service's
+# working directory or PATH into a directory that is deleted when the ticket ends.
+deploy_root() {
+  case "$BINARY" in
+    */.local/bin/*) printf '%s\n' "${BINARY%/.local/bin/*}" ;;
+    *) printf '%s\n' "$REPO_ROOT" ;;
+  esac
+}
+
 render_plist() {
+  local root
+  root="$(deploy_root)"
   cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -322,7 +335,7 @@ $(while IFS= read -r arg; do printf '        <string>%s</string>\n' "$(xml_text 
     <true/>
 
     <key>WorkingDirectory</key>
-    <string>$(xml_text "$REPO_ROOT")</string>
+    <string>$(xml_text "$root")</string>
 
     <key>StandardOutPath</key>
     <string>$(xml_text "$LOG_DIR/rust-launchd.out.log")</string>
@@ -333,7 +346,7 @@ $(while IFS= read -r arg; do printf '        <string>%s</string>\n' "$(xml_text 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>$(xml_text "$REPO_ROOT/.local/bin:$REPO_ROOT/target/release:$REPO_ROOT/target/debug:$REPO_ROOT/venv/bin:/Users/rajesh/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")</string>
+        <string>$(xml_text "$root/.local/bin:$root/target/release:$root/target/debug:$root/venv/bin:/Users/rajesh/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")</string>
     </dict>
 
     <key>ThrottleInterval</key>
