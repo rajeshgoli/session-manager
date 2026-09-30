@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import {
   html, api, usePoll, useNow, useShared, config, age, duration, limitText, clock, ordinal,
-  basename, homeRelative, providerLabel, Ring, Icon, Popover, Seg,
+  basename, homeRelative, providerLabel, Ring, Icon, Popover, Seg, Toggle, Links,
   openPanel, openItem, navigate, newAgent, toast, registerPanel, submissionId, stored, store,
 } from './ui.js';
 
@@ -219,7 +219,7 @@ function AgentCard({ agent, ball, depth, selected }) {
   const linked = claudeLink(agent);
   const live = agent.state !== 'stopped';
   const cls = ['card', selected && 'sel', faded && 'faded', depth && 'child'].filter(Boolean).join(' ');
-  return html`<div class=${cls} style=${depth > 1 ? `margin-left:${depth * 18}px` : ''} role="button" tabindex="0"
+  return html`<div class=${cls} data-open-ref=${`agent:${agent.id}`} style=${depth > 1 ? `margin-left:${depth * 18}px` : ''} role="button" tabindex="0"
     onClick=${() => openPanel(`agent:${agent.id}`)}
     onKeyDown=${(event) => event.key === 'Enter' && openPanel(`agent:${agent.id}`)}>
     <${Ring} percent=${agent.context_percent} />
@@ -271,6 +271,10 @@ export function AgentPanel({ id, controls }) {
       <span class="s">${parts.join(' · ')}</span>
     </div>
     <${AgentActions} agent=${agent} />
+    <${Links} ticket=${(agent.claims || []).find(item => item.kind === 'ticket')}
+      prs=${(agent.claims || []).filter(item => item.kind === 'pr')}
+      jobs=${agent.jobs || []} thread=${agent.thread}
+      docs=${agent.docs || []} />
     <div class="tabs" role="tablist">
       ${[['work', 'Work'], ['activity', 'Activity'], ['summary', 'Summary']].map(
         ([key, label]) => html`<button type="button" role="tab" aria-selected=${tab === key}
@@ -361,8 +365,8 @@ function HandoffPopover({ id, onClose }) {
   return html`<${Popover} onClose=${onClose}>
     <h2>Context handoff</h2>
     ${policy
-      ? html`<label class="check"><input type="checkbox" checked=${policy.enabled}
-            onChange=${(event) => write({ enabled: event.target.checked })} /> Hand off automatically</label>
+      ? html`<label class="check"><${Toggle} label="Hand off automatically" checked=${policy.enabled}
+            onChange=${enabled => write({ enabled })} /> Hand off automatically</label>
           <div class="fld"><span class="l">Threshold (%)</span>
             <input class="inp num" type="number" min="1" max="100" step="1" style="width:6rem"
               value=${policy.threshold_percent} onChange=${threshold} /></div>

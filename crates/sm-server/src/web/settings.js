@@ -1,6 +1,6 @@
 // Owner preferences shared with the phone, except the browser's theme.
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { html, api, config, Seg } from './ui.js';
+import { html, api, config, Seg, Toggle } from './ui.js';
 import { DevicesList } from './devices.js';
 
 const SECTIONS = [
@@ -71,7 +71,8 @@ function Field({ label, initial, save, onDraft, type = 'text', options, hint, pl
     onBlur: () => commit(current.current) };
   return html`<div class="settings-field">
     <label><span>${label}</span>
-      ${type === 'textarea' ? html`<textarea ...${attrs} rows="4" />` : options
+      ${type === 'checkbox' ? html`<${Toggle} label=${label} checked=${!!value} onChange=${next => { change(next); commit(next); }} />`
+        : type === 'textarea' ? html`<textarea ...${attrs} rows="4" />` : options
         ? html`<select ...${attrs} onChange=${e => change(e.target.value)}>${options.map(([v, text]) => html`<option value=${v}>${text}</option>`)}</select>`
         : html`<input ...${attrs} type=${type} checked=${type === 'checkbox' ? !!value : undefined} />`}
     </label>
@@ -141,11 +142,22 @@ export function SettingsPage() {
 
 function Appearance() {
   const [theme, setTheme] = useState(() => { try { return localStorage.getItem('sm-theme') || 'system'; } catch { return 'system'; } });
+  const [textSize, setTextSize] = useState(() => {
+    try { const size = Number(localStorage.getItem('sm-text-size')); return Number.isInteger(size) && size >= 13 && size <= 19 ? size : 15; }
+    catch { return 15; }
+  });
   const [status, setStatus] = useState('');
   const choose = value => { setTheme(value); document.documentElement.dataset.theme = value;
     try { localStorage.setItem('sm-theme', value); setStatus('Saved'); } catch { setStatus('Applied until reload; browser storage is unavailable.'); } };
+  const chooseSize = size => { setTextSize(size); document.documentElement.style.fontSize = `${size}px`;
+    try { localStorage.setItem('sm-text-size', String(size)); setStatus('Saved'); } catch { setStatus('Applied until reload; browser storage is unavailable.'); } };
   return html`<h2>Appearance</h2><${Seg} label="Theme" value=${theme} onChange=${choose}
     options=${['system', 'light', 'dark'].map(value => ({ value, label: value[0].toUpperCase() + value.slice(1) }))} />
+    <div class="text-size-setting"><label for="sm-text-size">Text size</label>
+      <input id="sm-text-size" type="range" min="13" max="19" step="1" value=${textSize}
+        onInput=${event => chooseSize(Number(event.target.value))} />
+      <output for="sm-text-size">${textSize} px</output>
+      <button class="btn sm" type="button" onClick=${() => chooseSize(15)}>Reset</button></div>
     <p class="sub">Saved in this browser only.</p><p role="status" class="saved">${status}</p>`;
 }
 
