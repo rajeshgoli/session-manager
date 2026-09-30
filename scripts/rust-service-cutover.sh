@@ -25,7 +25,10 @@ BINARY="$REPO_ROOT/.local/bin/sm-server"
 RUST_LABEL="com.rajeshgoli.session-manager-rust"
 PYTHON_LABELS=("com.rajeshgoli.session-manager" "com.claude.session-manager")
 PLIST_DST="$HOME/Library/LaunchAgents/$RUST_LABEL.plist"
-LOG_DIR="$REPO_ROOT/logs"
+# Outside every checkout: launchd reopens these paths on every respawn and does
+# not create missing parents, so a log dir inside a worktree that is later
+# deleted can keep the service from coming back.
+LOG_DIR="$HOME/.local/share/claude-sessions/launchd-logs"
 DOMAIN="gui/$(id -u)"
 
 _resolve_path() {
@@ -71,7 +74,7 @@ Options:
   --binary PATH        Rust sm-server binary (default: .local/bin/sm-server)
   --label LABEL        Rust launchd label (default: $RUST_LABEL)
   --plist PATH         Rust plist destination (default: ~/Library/LaunchAgents/<label>.plist)
-  --log-dir PATH       Rust launchd stdout/stderr directory (default: logs/)
+  --log-dir PATH       Rust launchd stdout/stderr directory (default: ~/.local/share/claude-sessions/launchd-logs)
 
 First canary shape:
   cargo build -p sm-server --release
@@ -263,6 +266,7 @@ require_no_python_labels() {
 print_plan() {
   echo "Rust Session Manager service cutover plan"
   echo "repo_root: $REPO_ROOT"
+  echo "deploy_root: $(deploy_root)"
   echo "launch_domain: $DOMAIN"
   echo "rust_label: $RUST_LABEL"
   echo "rust_plist: $PLIST_DST"
@@ -298,7 +302,19 @@ print_plan() {
   fi
 }
 
+# The checkout the installed binary belongs to, not the one this script runs
+# from: a restart invoked from a ticket worktree must not move the service's
+# working directory or PATH into a directory that is deleted when the ticket ends.
+deploy_root() {
+  case "$BINARY" in
+    */.local/bin/*) printf '%s\n' "${BINARY%/.local/bin/*}" ;;
+    *) printf '%s\n' "$REPO_ROOT" ;;
+  esac
+}
+
 render_plist() {
+  local root
+  root="$(deploy_root)"
   cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -319,7 +335,7 @@ $(while IFS= read -r arg; do printf '        <string>%s</string>\n' "$(xml_text 
     <true/>
 
     <key>WorkingDirectory</key>
-    <string>$(xml_text "$REPO_ROOT")</string>
+    <string>$(xml_text "$root")</string>
 
     <key>StandardOutPath</key>
     <string>$(xml_text "$LOG_DIR/rust-launchd.out.log")</string>
@@ -330,7 +346,7 @@ $(while IFS= read -r arg; do printf '        <string>%s</string>\n' "$(xml_text 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>$(xml_text "$REPO_ROOT/.local/bin:$REPO_ROOT/target/release:$REPO_ROOT/target/debug:$REPO_ROOT/venv/bin:/Users/rajesh/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")</string>
+        <string>$(xml_text "$root/.local/bin:$root/target/release:$root/target/debug:$root/venv/bin:/Users/rajesh/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")</string>
     </dict>
 
     <key>ThrottleInterval</key>

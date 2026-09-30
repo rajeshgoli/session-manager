@@ -103,8 +103,8 @@ Write/load the Rust launchd plist and start Rust on the service port:
 The helper writes:
 
 - plist: `~/Library/LaunchAgents/com.rajeshgoli.session-manager-rust.plist`
-- stdout: `logs/rust-launchd.out.log`
-- stderr: `logs/rust-launchd.err.log`
+- stdout: `~/.local/share/claude-sessions/launchd-logs/rust-launchd.out.log`
+- stderr: `~/.local/share/claude-sessions/launchd-logs/rust-launchd.err.log`
 
 `start-rust` refuses to proceed while any known Python Session Manager launchd
 label is still loaded, even if Rust could bind the configured host/port.
