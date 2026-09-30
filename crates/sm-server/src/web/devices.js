@@ -55,7 +55,7 @@ export function DevicesList() {
         </div>` : html`<button type="button" class="btn sm danger" disabled=${busy} onClick=${() => { setError(null); setAsking(key(device)); }}>Revoke</button>`}
       </li>`)}</ul>
       <div class="device-enroll"><h3>Add a computer</h3>
-        <p>On that computer, run <code>sm device enroll &lt;name&gt;</code>, using a unique name such as <code>macbook</code> or <code>studio</code>.
+        <p>On that computer, run <code>sm device enroll ${'<name>'}</code>, using a unique name such as <code>macbook</code> or <code>studio</code>.
           Open the address printed by the command in Chrome. Email sign-in remains available.</p></div>
     `}
   </section>`;
