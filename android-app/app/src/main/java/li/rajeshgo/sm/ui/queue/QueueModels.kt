@@ -77,11 +77,18 @@ fun jobAgentLabel(job: SessionJob): String =
 
 fun jobTitle(job: SessionJob): String = job.label.ifBlank { job.id }
 
-/** "tests · 4m of 15m". */
+/** "tests · 4m of 15m · 12G · cpu 25% · gpu 3%"; use is the job's share of the whole Mac. */
 fun runningLine(job: SessionJob, now: OffsetDateTime): String {
     val elapsed = secondsBetween(job.startedAt, now)?.let(::shortDuration) ?: "-"
     val limit = job.timeoutSeconds?.let(::shortDuration)
-    return listOfNotNull(job.type, if (limit != null) "$elapsed of $limit" else elapsed).joinToString(" · ")
+    val usage = job.usage
+    return listOfNotNull(
+        job.type,
+        if (limit != null) "$elapsed of $limit" else elapsed,
+        usage?.memoryBytes?.let { "${gib(it)}G" },
+        usage?.cpuPercent?.let { "cpu ${it.roundToLong()}%" },
+        usage?.gpuPercent?.takeIf { it >= 0.5 }?.let { "gpu ${it.roundToLong()}%" },
+    ).joinToString(" · ")
 }
 
 /** Elapsed share of the job's time limit, 0..1. */
@@ -145,7 +152,27 @@ fun meterBand(fraction: Double): Meter = when {
     else -> Meter.LOW
 }
 
-data class MeterRow(val label: String, val fraction: Double?, val value: String, val warning: String? = null)
+/**
+ * One live bar. [fraction] is the whole Mac's use; [queueFraction] is the part
+ * running queue jobs account for, drawn darker inside it, and [queueValue]
+ * names it as a share of what is used.
+ */
+data class MeterRow(
+    val label: String,
+    val fraction: Double?,
+    val value: String,
+    val warning: String? = null,
+    val queueFraction: Double? = null,
+    val queueValue: String? = null,
+)
+
+/** The queue's part of a reading, both as a fraction of the bar and as "queue 43%" of what is used. */
+private fun queuePart(queue: Double?, used: Double?, whole: Double): Pair<Double?, String?> {
+    if (queue == null || used == null || whole <= 0) return null to null
+    val capped = queue.coerceIn(0.0, used)
+    val share = if (used > 0) (capped / used * 100).roundToLong() else 0L
+    return capped / whole to "queue $share%"
+}
 
 /** MEM / CPU / GPU rows for the live bar; empty when the host is unavailable. */
 fun meterRows(host: HostStatus?): List<MeterRow> {
@@ -155,10 +182,13 @@ fun meterRows(host: HostStatus?): List<MeterRow> {
     val memFraction = if (total != null && used != null && total > 0) used.toDouble() / total else null
     val memValue = if (total != null && used != null) "${gib(used)}/${gib(total)}G" else "-"
     val pressure = host.memoryPressure?.takeIf { it != "Normal" }
+    val (memQueue, memQueueValue) = queuePart(host.queueMemoryBytes?.toDouble(), used?.toDouble(), total?.toDouble() ?: 0.0)
+    val (cpuQueue, cpuQueueValue) = queuePart(host.queueCpuPercent, host.cpuPercent, 100.0)
+    val (gpuQueue, gpuQueueValue) = queuePart(host.queueGpuPercent, host.gpuPercent, 100.0)
     return listOf(
-        MeterRow("MEM", memFraction, memValue, pressure),
-        MeterRow("CPU", host.cpuPercent?.div(100.0), host.cpuPercent?.let { "${it.roundToLong()}%" } ?: "-"),
-        MeterRow("GPU", host.gpuPercent?.div(100.0), host.gpuPercent?.let { "${it.roundToLong()}%" } ?: "-"),
+        MeterRow("MEM", memFraction, memValue, pressure, memQueue, memQueueValue),
+        MeterRow("CPU", host.cpuPercent?.div(100.0), host.cpuPercent?.let { "${it.roundToLong()}%" } ?: "-", null, cpuQueue, cpuQueueValue),
+        MeterRow("GPU", host.gpuPercent?.div(100.0), host.gpuPercent?.let { "${it.roundToLong()}%" } ?: "-", null, gpuQueue, gpuQueueValue),
     )
 }
 

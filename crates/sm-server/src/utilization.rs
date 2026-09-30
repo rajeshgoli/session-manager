@@ -58,9 +58,18 @@ pub struct HostSample {
     /// Running and pending counts, in [`JOB_TYPES`] order.
     pub running: [i64; 4],
     pub pending: [i64; 4],
+    /// Share of the host used by running queue jobs (sm#1714): summed
+    /// physical footprint, and CPU and GPU busy percent of the whole machine
+    /// over the last interval. Never above the host's own figure.
+    pub queue_mem_bytes: Option<i64>,
+    pub queue_cpu_pct: Option<f64>,
+    pub queue_gpu_pct: Option<f64>,
+    /// App memory counting compressed pages at full size, the scale process
+    /// footprints use; the queue's footprint is a share of this. Not stored.
+    pub mem_app_uncompressed_bytes: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct JobSample {
     pub job_id: String,
     pub job_type: String,
@@ -69,13 +78,31 @@ pub struct JobSample {
     pub rss_bytes: Option<i64>,
     pub cpu_seconds_total: Option<f64>,
     pub process_count: Option<i64>,
+    /// Physical footprint, Activity Monitor's per-process Memory (sm#1714).
+    pub footprint_bytes: Option<i64>,
+    /// GPU time of the group's live processes; drops when one exits.
+    pub gpu_seconds_total: Option<f64>,
+}
+
+/// A running job's live use of the machine, as percent of the whole host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct JobUsage {
+    pub memory_bytes: Option<i64>,
+    pub cpu_percent: Option<f64>,
+    pub gpu_percent: Option<f64>,
 }
 
 static LATEST: RwLock<Option<HostSample>> = RwLock::new(None);
+static LATEST_JOBS: RwLock<Option<(i64, HashMap<String, JobUsage>)>> = RwLock::new(None);
 
 /// The newest sample the recorder wrote, if it is running.
 pub fn latest_host_sample() -> Option<HostSample> {
     LATEST.read().ok().and_then(|latest| latest.clone())
+}
+
+/// Each running job's use in the newest sample, with that sample's time.
+pub fn latest_job_usage() -> Option<(i64, HashMap<String, JobUsage>)> {
+    LATEST_JOBS.read().ok().and_then(|latest| latest.clone())
 }
 
 pub fn init_schema(conn: &Connection) -> Result<()> {
@@ -120,6 +147,30 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS job_samples_by_job ON job_samples (job_id, sampled_at_ms);
         "#,
     )?;
+    // Columns added after the first release (sm#1714).
+    for (table, column, kind) in [
+        ("host_samples", "queue_mem_bytes", "INTEGER"),
+        ("host_samples", "queue_cpu_pct", "REAL"),
+        ("host_samples", "queue_gpu_pct", "REAL"),
+        ("job_samples", "footprint_bytes", "INTEGER"),
+        ("job_samples", "gpu_seconds_total", "REAL"),
+    ] {
+        let exists: Option<i64> = conn
+            .query_row(
+                &format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"),
+                [column],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+            if column == "queue_mem_bytes" {
+                // Older rows counted the file cache as used; blank them so
+                // charts never mix the two definitions.
+                conn.execute_batch("UPDATE host_samples SET mem_used_bytes = NULL")?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -165,9 +216,10 @@ pub fn write_sample(conn: &mut Connection, host: &HostSample, jobs: &[JobSample]
             mem_speculative_bytes, mem_active_bytes, mem_inactive_bytes, mem_wired_bytes,
             mem_compressed_bytes, pressure_level, load_1m,
             running_perf, running_tests, running_background, running_service,
-            pending_perf, pending_tests, pending_background, pending_service
+            pending_perf, pending_tests, pending_background, pending_service,
+            queue_mem_bytes, queue_cpu_pct, queue_gpu_pct
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                  ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+                  ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
         "#,
         params![
             host.sampled_at_ms,
@@ -193,6 +245,9 @@ pub fn write_sample(conn: &mut Connection, host: &HostSample, jobs: &[JobSample]
             host.pending[1],
             host.pending[2],
             host.pending[3],
+            host.queue_mem_bytes,
+            host.queue_cpu_pct,
+            host.queue_gpu_pct,
         ],
     )?;
     {
@@ -200,8 +255,9 @@ pub fn write_sample(conn: &mut Connection, host: &HostSample, jobs: &[JobSample]
             r#"
             INSERT OR REPLACE INTO job_samples (
                 sampled_at_ms, job_id, job_type, state, holding_reason,
-                rss_bytes, cpu_seconds_total, process_count
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                rss_bytes, cpu_seconds_total, process_count,
+                footprint_bytes, gpu_seconds_total
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             "#,
         )?;
         for job in jobs
@@ -217,6 +273,8 @@ pub fn write_sample(conn: &mut Connection, host: &HostSample, jobs: &[JobSample]
                 job.rss_bytes,
                 job.cpu_seconds_total,
                 job.process_count,
+                job.footprint_bytes,
+                job.gpu_seconds_total,
             ])?;
         }
     }
@@ -266,10 +324,16 @@ pub struct VmPages {
     pub inactive: i64,
     pub wired: i64,
     pub compressed: i64,
+    /// Anonymous (app) pages, and the purgeable ones among them.
+    pub internal: i64,
+    pub purgeable: i64,
+    /// Pages held in the compressor, counted uncompressed.
+    pub compressor_stored: i64,
 }
 
-/// Fill the memory fields: `used` counts as `top` does (total − free −
-/// speculative), `available` is the kernel's own free percentage.
+/// Fill the memory fields: `used` counts as Activity Monitor does (app
+/// memory, wired and compressed, leaving out the file cache the kernel frees
+/// on demand; sm#1714), `available` is the kernel's own free percentage.
 pub fn apply_memory(
     sample: &mut HostSample,
     total: Option<i64>,
@@ -286,42 +350,180 @@ pub fn apply_memory(
         sample.mem_wired_bytes = bytes(pages.wired);
         sample.mem_compressed_bytes = bytes(pages.compressed);
         sample.mem_used_bytes = total.and_then(|total| {
-            let unused = sample
-                .mem_free_bytes?
-                .checked_add(sample.mem_speculative_bytes?)?;
-            Some(total.saturating_sub(unused).max(0))
+            let app = pages.internal.saturating_sub(pages.purgeable).max(0);
+            let used = bytes(
+                app.checked_add(pages.wired)?
+                    .checked_add(pages.compressed)?,
+            )?;
+            Some(used.clamp(0, total))
         });
+        sample.mem_app_uncompressed_bytes = pages
+            .internal
+            .checked_add(pages.compressor_stored)
+            .and_then(bytes);
     }
     sample.mem_available_bytes = total
         .zip(memorystatus_level.filter(|level| (0..=100).contains(level)))
         .map(|(total, level)| total / 100 * level);
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct GroupUsage {
     pub rss_bytes: i64,
     pub cpu_seconds: f64,
     pub processes: i64,
+    pub pids: Vec<i32>,
+    /// Filled for running jobs' groups only; `None` when no member could be read.
+    pub footprint_bytes: Option<i64>,
+    pub gpu_ns: u64,
 }
 
-/// Sum `ps -axo pgid=,rss=,time=` output by process group.
+/// Sum `ps -axo pid=,pgid=,rss=,time=` output by process group.
 pub fn parse_process_groups(text: &str) -> HashMap<i64, GroupUsage> {
     let mut groups: HashMap<i64, GroupUsage> = HashMap::new();
     for line in text.lines() {
         let mut fields = line.split_whitespace();
-        let (Some(pgid), Some(rss), Some(time)) = (fields.next(), fields.next(), fields.next())
+        let (Some(pid), Some(pgid), Some(rss), Some(time)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
         else {
             continue;
         };
-        let (Ok(pgid), Ok(rss_kib)) = (pgid.parse::<i64>(), rss.parse::<i64>()) else {
+        let (Ok(pid), Ok(pgid), Ok(rss_kib)) =
+            (pid.parse::<i32>(), pgid.parse::<i64>(), rss.parse::<i64>())
+        else {
             continue;
         };
         let entry = groups.entry(pgid).or_default();
         entry.rss_bytes = entry.rss_bytes.saturating_add(rss_kib.saturating_mul(1024));
         entry.cpu_seconds += parse_cpu_time(time).unwrap_or(0.0);
         entry.processes += 1;
+        entry.pids.push(pid);
     }
     groups
+}
+
+/// Cumulative GPU nanoseconds per process from `ioreg -r -c AGXAccelerator
+/// -l`: each GPU client lists its creator pid and per-queue
+/// `accumulatedGPUTime`. Activity Monitor's % GPU column reads the same.
+pub fn parse_gpu_time_by_pid(ioreg: &str) -> HashMap<i32, u64> {
+    let mut by_pid: HashMap<i32, u64> = HashMap::new();
+    for client in ioreg.split("+-o ").skip(1) {
+        let Some(pid) = client
+            .split_once("\"IOUserClientCreator\" = \"pid ")
+            .and_then(|(_, rest)| rest.split(',').next())
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let total: u64 = client
+            .split("\"accumulatedGPUTime\"=")
+            .skip(1)
+            .filter_map(|rest| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse::<u64>().ok()
+            })
+            .fold(0, u64::saturating_add);
+        let entry = by_pid.entry(pid).or_default();
+        *entry = entry.saturating_add(total);
+    }
+    by_pid
+}
+
+/// Counters from one sample, kept to turn the next sample's totals into rates.
+#[derive(Debug, Clone, Default)]
+pub struct UsageCounters {
+    pub at_ms: i64,
+    pub job_cpu_seconds: HashMap<String, f64>,
+    pub pid_gpu_ns: HashMap<i32, u64>,
+}
+
+/// Each running job's live use as percent of the whole machine, from the
+/// counters now and at the previous sample. A job or process not seen last
+/// time has no rate yet; counters that fell (a process exited) count as zero.
+pub fn job_usage(
+    jobs: &[ActiveQueueJob],
+    groups: &HashMap<i64, GroupUsage>,
+    previous: Option<&UsageCounters>,
+    current: &UsageCounters,
+    logical_cpus: Option<i64>,
+) -> HashMap<String, JobUsage> {
+    let elapsed_ms = previous.map(|previous| current.at_ms - previous.at_ms);
+    let elapsed_ms = elapsed_ms.filter(|elapsed| *elapsed > 0);
+    let mut usage = HashMap::new();
+    for job in jobs.iter().filter(|job| job.state == "running") {
+        let Some(group) = job.process_group_id.and_then(|pgid| groups.get(&pgid)) else {
+            continue;
+        };
+        let cpu_percent = previous
+            .zip(elapsed_ms)
+            .zip(logical_cpus.filter(|cpus| *cpus > 0))
+            .and_then(|((previous, elapsed), cpus)| {
+                let before = previous.job_cpu_seconds.get(&job.id)?;
+                let now = current.job_cpu_seconds.get(&job.id)?;
+                let busy = (now - before).max(0.0);
+                Some((busy * 1000.0 / elapsed as f64 / cpus as f64 * 100.0).clamp(0.0, 100.0))
+            });
+        let gpu_percent = previous.zip(elapsed_ms).map(|(previous, elapsed)| {
+            let busy_ns: u64 = group
+                .pids
+                .iter()
+                .filter_map(|pid| {
+                    let before = previous.pid_gpu_ns.get(pid)?;
+                    let now = current.pid_gpu_ns.get(pid)?;
+                    Some(now.saturating_sub(*before))
+                })
+                .sum();
+            (busy_ns as f64 / (elapsed as f64 * 1_000_000.0) * 100.0).clamp(0.0, 100.0)
+        });
+        usage.insert(
+            job.id.clone(),
+            JobUsage {
+                memory_bytes: group.footprint_bytes,
+                cpu_percent,
+                gpu_percent,
+            },
+        );
+    }
+    usage
+}
+
+/// The queue's share on the host sample: sums over running jobs, never above
+/// the host's own reading (the two are measured differently). A footprint
+/// counts compressed memory at full size while `used` counts it compressed,
+/// so memory is the queue's fraction of app memory, both at full size,
+/// applied to `used`.
+pub fn apply_queue_share(
+    sample: &mut HostSample,
+    usage: &HashMap<String, JobUsage>,
+    running: bool,
+) {
+    fn sum<T: std::iter::Sum<T>>(values: impl Iterator<Item = Option<T>>) -> Option<T> {
+        let mut values = values.flatten().peekable();
+        values.peek().is_some().then(|| values.sum())
+    }
+    fn cap<T: PartialOrd>(value: Option<T>, host: Option<T>) -> Option<T> {
+        match (value, host) {
+            (Some(value), Some(host)) if value > host => Some(host),
+            (value, _) => value,
+        }
+    }
+    let memory = sum(usage.values().map(|job| job.memory_bytes)).map(|footprint| {
+        match (sample.mem_used_bytes, sample.mem_app_uncompressed_bytes) {
+            (Some(used), Some(app)) if app > 0 => {
+                (used as f64 * (footprint as f64 / app as f64).min(1.0)) as i64
+            }
+            _ => footprint,
+        }
+    });
+    let cpu = sum(usage.values().map(|job| job.cpu_percent));
+    let gpu = sum(usage.values().map(|job| job.gpu_percent));
+    // With nothing running the queue's share is a known zero.
+    sample.queue_mem_bytes = cap(
+        if running { memory } else { Some(0) },
+        sample.mem_used_bytes,
+    );
+    sample.queue_cpu_pct = cap(if running { cpu } else { Some(0.0) }, sample.cpu_busy_pct);
+    sample.queue_gpu_pct = cap(if running { gpu } else { Some(0.0) }, sample.gpu_busy_pct);
 }
 
 /// `ps` CPU time: `[D-][[H:]M:]S[.frac]`; macOS prints minutes past 60.
@@ -353,6 +555,8 @@ pub fn job_samples(jobs: &[ActiveQueueJob], groups: &HashMap<i64, GroupUsage>) -
                 rss_bytes: usage.map(|usage| usage.rss_bytes),
                 cpu_seconds_total: usage.map(|usage| usage.cpu_seconds),
                 process_count: usage.map(|usage| usage.processes),
+                footprint_bytes: usage.and_then(|usage| usage.footprint_bytes),
+                gpu_seconds_total: usage.map(|usage| usage.gpu_ns as f64 / 1e9),
             }
         })
         .collect()
@@ -434,7 +638,18 @@ mod mac {
             inactive: i64::from(info.inactive_count),
             wired: i64::from(info.wire_count),
             compressed: i64::from(info.compressor_page_count),
+            internal: i64::from(info.internal_page_count),
+            purgeable: i64::from(info.purgeable_count),
+            compressor_stored: i64::try_from(info.total_uncompressed_pages_in_compressor).ok()?,
         })
+    }
+
+    /// Physical footprint of one process; `None` once it has exited.
+    pub fn phys_footprint(pid: i32) -> Option<i64> {
+        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+        let status =
+            unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, info.as_mut_ptr().cast()) };
+        (status == 0).then(|| unsafe { info.assume_init() }.ri_phys_footprint as i64)
     }
 
     /// Integer sysctl of 4 or 8 bytes.
@@ -462,6 +677,24 @@ mod mac {
         let mut loads = [0f64; 3];
         (unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) } >= 1).then_some(loads[0])
     }
+}
+
+/// Memory used right now, counted as the recorder counts it; for the
+/// on-demand reading when the recorder is not running.
+pub fn memory_used_now() -> Option<i64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut sample = HostSample::default();
+        apply_memory(
+            &mut sample,
+            mac::sysctl_i64("hw.memsize"),
+            mac::vm_pages(),
+            None,
+        );
+        sample.mem_used_bytes
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 
 /// Longest a sampling command may run; a hung `ioreg` or `ps` must not stall
@@ -512,13 +745,15 @@ struct Recorder {
     settings: RecorderSettings,
     conn: Option<Connection>,
     previous_ticks: Option<CpuTicks>,
+    previous_counters: Option<UsageCounters>,
     last_prune: Option<Instant>,
     last_write_warning: Option<Instant>,
 }
 
 impl Recorder {
+    /// The host sample, plus cumulative GPU time per process.
     #[cfg(target_os = "macos")]
-    fn measure_host(&mut self, now_ms: i64) -> HostSample {
+    fn measure_host(&mut self, now_ms: i64) -> (HostSample, HashMap<i32, u64>) {
         let mut sample = HostSample {
             sampled_at_ms: now_ms,
             interval_ms: self.settings.interval.as_millis() as i64,
@@ -538,39 +773,90 @@ impl Recorder {
         );
         sample.pressure_level = mac::sysctl_i64("kern.memorystatus_vm_pressure_level");
         sample.load_1m = mac::load_1m();
-        sample.gpu_busy_pct = run(
-            "/usr/sbin/ioreg",
-            &["-r", "-c", "AGXAccelerator", "-d", "1"],
-        )
-        .as_deref()
-        .and_then(crate::host_status::gpu_percent);
-        sample
+        // `-l` also lists the GPU clients, for per-job GPU time (sm#1714).
+        let ioreg = run("/usr/sbin/ioreg", &["-r", "-c", "AGXAccelerator", "-l"]);
+        sample.gpu_busy_pct = ioreg.as_deref().and_then(crate::host_status::gpu_percent);
+        let gpu_by_pid = ioreg
+            .as_deref()
+            .map(parse_gpu_time_by_pid)
+            .unwrap_or_default();
+        (sample, gpu_by_pid)
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn measure_host(&mut self, now_ms: i64) -> HostSample {
-        HostSample {
+    fn measure_host(&mut self, now_ms: i64) -> (HostSample, HashMap<i32, u64>) {
+        let sample = HostSample {
             sampled_at_ms: now_ms,
             interval_ms: self.settings.interval.as_millis() as i64,
             ..HostSample::default()
-        }
+        };
+        (sample, HashMap::new())
     }
 
     fn tick(&mut self) -> Result<()> {
         let now_ms = (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64;
-        let mut host = self.measure_host(now_ms);
+        let (mut host, gpu_by_pid) = self.measure_host(now_ms);
         let jobs = active_queue_jobs_for_sampling(&self.settings.queue_db_path)?;
         count_jobs(&mut host, &jobs);
-        let groups = if jobs.iter().any(|job| job.state == "running") {
-            run("/bin/ps", &["-axo", "pgid=,rss=,time="])
+        let any_running = jobs.iter().any(|job| job.state == "running");
+        let mut groups = if any_running {
+            run("/bin/ps", &["-axo", "pid=,pgid=,rss=,time="])
                 .map(|text| parse_process_groups(&text))
                 .unwrap_or_default()
         } else {
             HashMap::new()
         };
+        let running_groups: Vec<i64> = jobs
+            .iter()
+            .filter(|job| job.state == "running")
+            .filter_map(|job| job.process_group_id)
+            .collect();
+        for pgid in running_groups {
+            let Some(group) = groups.get_mut(&pgid) else {
+                continue;
+            };
+            #[cfg(target_os = "macos")]
+            {
+                let mut footprints = group
+                    .pids
+                    .iter()
+                    .filter_map(|pid| mac::phys_footprint(*pid))
+                    .peekable();
+                group.footprint_bytes = footprints.peek().is_some().then(|| footprints.sum());
+            }
+            group.gpu_ns = group
+                .pids
+                .iter()
+                .filter_map(|pid| gpu_by_pid.get(pid))
+                .fold(0, |total, ns| total.saturating_add(*ns));
+        }
         let job_rows = job_samples(&jobs, &groups);
+        let counters = UsageCounters {
+            at_ms: now_ms,
+            job_cpu_seconds: job_rows
+                .iter()
+                .filter_map(|row| Some((row.job_id.clone(), row.cpu_seconds_total?)))
+                .collect(),
+            pid_gpu_ns: gpu_by_pid,
+        };
+        #[cfg(target_os = "macos")]
+        let logical_cpus = mac::sysctl_i64("hw.logicalcpu");
+        #[cfg(not(target_os = "macos"))]
+        let logical_cpus = None;
+        let usage = job_usage(
+            &jobs,
+            &groups,
+            self.previous_counters.as_ref(),
+            &counters,
+            logical_cpus,
+        );
+        self.previous_counters = Some(counters);
+        apply_queue_share(&mut host, &usage, any_running);
         if let Ok(mut latest) = LATEST.write() {
             *latest = Some(host.clone());
+        }
+        if let Ok(mut latest) = LATEST_JOBS.write() {
+            *latest = Some((now_ms, usage));
         }
         if self.conn.is_none() {
             self.conn = Some(open_for_write(&self.settings.db_path)?);
@@ -611,6 +897,7 @@ pub fn spawn_recorder(settings: RecorderSettings) {
             settings,
             conn: None,
             previous_ticks: None,
+            previous_counters: None,
             last_prune: None,
             last_write_warning: None,
         }));
@@ -1048,6 +1335,7 @@ mod tests {
             rss_bytes: None,
             cpu_seconds_total: None,
             process_count: None,
+            ..JobSample::default()
         }
     }
 
@@ -1096,23 +1384,27 @@ mod tests {
     }
 
     #[test]
-    fn memory_used_matches_top_and_available_follows_the_kernel_level() {
-        // Readings from the studio on 2026-09-28: top said 87G used, level 96.
+    fn memory_used_matches_activity_monitor_and_available_follows_the_kernel_level() {
+        // Readings from the studio on 2026-09-29: Activity Monitor said 140G
+        // used while `top` said 231G (the rest was file cache).
         let mut sample = HostSample::default();
         let pages = VmPages {
             page_size: 16384,
-            free: 10_776_647,
-            speculative: 243_532,
-            active: 2_157_904,
-            inactive: 2_947_511,
-            wired: 481_756,
-            compressed: 92_928,
+            free: 1_525_978,
+            speculative: 35_864,
+            active: 6_124_720,
+            inactive: 6_189_574,
+            wired: 552_283,
+            compressed: 2_272_059,
+            internal: 6_349_615,
+            purgeable: 30_616,
+            compressor_stored: 6_407_394,
         };
         apply_memory(&mut sample, Some(274_877_906_944), Some(pages), Some(96));
         let used_gib = sample.mem_used_bytes.unwrap() as f64 / GIB as f64;
-        assert!((87.0..89.0).contains(&used_gib), "{used_gib}");
+        assert!((139.0..141.0).contains(&used_gib), "{used_gib}");
         assert_eq!(sample.mem_available_bytes, Some(274_877_906_944 / 100 * 96));
-        assert_eq!(sample.mem_wired_bytes, Some(481_756 * 16384));
+        assert_eq!(sample.mem_wired_bytes, Some(552_283 * 16384));
         let mut missing = HostSample::default();
         apply_memory(&mut missing, None, None, Some(120));
         assert_eq!(missing.mem_used_bytes, None);
@@ -1121,14 +1413,148 @@ mod tests {
 
     #[test]
     fn process_groups_sum_rss_cpu_time_and_count() {
-        let text = " 42 1024 1:02.50\n 7 9000 0:00.01\n 42 2048 910:10.11\n bad line\n 42 x 0:01\n";
+        let text = " 100 42 1024 1:02.50\n 7 7 9000 0:00.01\n 101 42 2048 910:10.11\n bad line\n 102 42 x 0:01\n";
         let groups = parse_process_groups(text);
-        let group = groups[&42];
+        let group = &groups[&42];
+        assert_eq!(group.pids, vec![100, 101]);
         assert_eq!(group.rss_bytes, 3072 * 1024);
         assert_eq!(group.processes, 2);
         assert!((group.cpu_seconds - (62.5 + 910.0 * 60.0 + 10.11)).abs() < 1e-6);
         assert_eq!(parse_cpu_time("1-02:03:04"), Some(86_400.0 + 7384.0));
         assert_eq!(parse_cpu_time("nope"), None);
+    }
+
+    #[test]
+    fn gpu_time_is_summed_per_client_pid() {
+        let text = r#"+-o AGXAcceleratorG15X  <class AGXAccelerator>
+  |   "PerformanceStatistics" = {"Device Utilization %"=12}
+  +-o AGXDeviceUserClient  <class AGXDeviceUserClient>
+  |   {
+  |     "AppUsage" = ({"API"="Metal","lastSubmittedTime"=5,"accumulatedGPUTime"=1000},{"API"="Metal","accumulatedGPUTime"=24})
+  |     "IOUserClientCreator" = "pid 396, WindowServer"
+  |   }
+  +-o AGXDeviceUserClient  <class AGXDeviceUserClient>
+  |   {
+  |     "AppUsage" = ()
+  |     "IOUserClientCreator" = "pid 404, runningboardd"
+  |   }
+  +-o AGXDeviceUserClient  <class AGXDeviceUserClient>
+  |   {
+  |     "AppUsage" = ({"API"="Metal","accumulatedGPUTime"=6})
+  |     "IOUserClientCreator" = "pid 396, WindowServer"
+  |   }
+"#;
+        let by_pid = parse_gpu_time_by_pid(text);
+        assert_eq!(by_pid[&396], 1030);
+        assert_eq!(by_pid[&404], 0);
+        assert_eq!(by_pid.len(), 2);
+    }
+
+    #[test]
+    fn job_usage_turns_counters_into_whole_machine_shares() {
+        let running = |id: &str, pgid: i64| ActiveQueueJob {
+            id: id.into(),
+            job_type: "background".into(),
+            state: "running".into(),
+            holding_reason: None,
+            process_group_id: Some(pgid),
+        };
+        let jobs = vec![running("a", 10), running("b", 20), running("c", 30)];
+        let mut groups =
+            parse_process_groups(" 11 10 0 0:30.00\n 12 10 0 0:00.00\n 21 20 0 0:05.00\n");
+        groups.get_mut(&10).unwrap().footprint_bytes = Some(40 * GIB);
+        let previous = UsageCounters {
+            at_ms: 0,
+            job_cpu_seconds: [("a".to_string(), 10.0), ("b".to_string(), 9.0)].into(),
+            pid_gpu_ns: [(11, 1_000_000_000), (21, 0)].into(),
+        };
+        let current = UsageCounters {
+            at_ms: 5000,
+            // a: 20 CPU-seconds in 5 s on 16 cores is 25% of the machine.
+            // b: its counter fell (a child exited), so it reads zero.
+            job_cpu_seconds: [("a".to_string(), 30.0), ("b".to_string(), 5.0)].into(),
+            // pid 11 ran 2.5 s of GPU work in 5 s; pid 12 is new, no rate yet.
+            pid_gpu_ns: [(11, 3_500_000_000), (12, 9_000_000_000), (21, 0)].into(),
+        };
+        let usage = job_usage(&jobs, &groups, Some(&previous), &current, Some(16));
+        assert_eq!(usage["a"].memory_bytes, Some(40 * GIB));
+        assert_eq!(usage["a"].cpu_percent, Some(25.0));
+        assert_eq!(usage["a"].gpu_percent, Some(50.0));
+        assert_eq!(usage["b"].cpu_percent, Some(0.0));
+        assert_eq!(usage["b"].memory_bytes, None);
+        assert!(!usage.contains_key("c"), "no processes, no row");
+        let first = job_usage(&jobs, &groups, None, &current, Some(16));
+        assert_eq!(first["a"].cpu_percent, None);
+        assert_eq!(first["a"].gpu_percent, None);
+
+        let mut sample = HostSample {
+            mem_used_bytes: Some(30 * GIB),
+            cpu_busy_pct: Some(80.0),
+            gpu_busy_pct: Some(10.0),
+            ..HostSample::default()
+        };
+        apply_queue_share(&mut sample, &usage, true);
+        assert_eq!(
+            sample.queue_mem_bytes,
+            Some(30 * GIB),
+            "capped at host used"
+        );
+        // 40G of footprint out of 160G of app memory at full size: a quarter of used.
+        sample.mem_app_uncompressed_bytes = Some(160 * GIB);
+        apply_queue_share(&mut sample, &usage, true);
+        assert_eq!(sample.queue_mem_bytes, Some(30 * GIB / 4));
+        assert_eq!(sample.queue_cpu_pct, Some(25.0));
+        assert_eq!(sample.queue_gpu_pct, Some(10.0), "capped at host GPU");
+        apply_queue_share(&mut sample, &HashMap::new(), false);
+        assert_eq!(sample.queue_mem_bytes, Some(0));
+        apply_queue_share(&mut sample, &HashMap::new(), true);
+        assert_eq!(sample.queue_mem_bytes, None, "running but unmeasured");
+    }
+
+    #[test]
+    fn schema_upgrade_adds_queue_columns_to_an_existing_db() {
+        let (_dir, path, mut conn) = temp_db();
+        write_sample(&mut conn, &host(500, Some(10.0), 10 * GIB, 1), &[]).unwrap();
+        drop(conn);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE host_samples DROP COLUMN queue_mem_bytes;
+                 ALTER TABLE job_samples DROP COLUMN footprint_bytes;",
+            )
+            .unwrap();
+        }
+        let mut conn = open_for_write(&path).unwrap();
+        let mut host = host(1_000, Some(10.0), 10 * GIB, 1);
+        host.queue_mem_bytes = Some(GIB);
+        let job = JobSample {
+            job_id: "a".into(),
+            job_type: "tests".into(),
+            state: "running".into(),
+            footprint_bytes: Some(7),
+            ..JobSample::default()
+        };
+        write_sample(&mut conn, &host, &[job]).unwrap();
+        let stored: (i64, i64) = conn
+            .query_row(
+                "SELECT h.queue_mem_bytes, j.footprint_bytes FROM host_samples h JOIN job_samples j USING (sampled_at_ms)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (GIB, 7));
+        let used: Vec<Option<i64>> = conn
+            .prepare("SELECT mem_used_bytes FROM host_samples ORDER BY sampled_at_ms")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            used,
+            vec![None, Some(100 * GIB)],
+            "old definition blanked once"
+        );
     }
 
     #[test]
@@ -1156,7 +1582,7 @@ mod tests {
                 process_group_id: Some(99),
             },
         ];
-        let groups = parse_process_groups(" 42 10 0:01.00\n");
+        let groups = parse_process_groups(" 43 42 10 0:01.00\n");
         let rows = job_samples(&jobs, &groups);
         assert_eq!(rows[0].rss_bytes, Some(10 * 1024));
         assert_eq!(rows[0].holding_reason, None);
@@ -1280,6 +1706,7 @@ mod tests {
                     rss_bytes: Some((job + 1) * GIB + index),
                     cpu_seconds_total: Some((index * 5 * (job + 1)) as f64),
                     process_count: Some(3),
+                    ..JobSample::default()
                 })
                 .collect();
             write_sample(
@@ -1383,6 +1810,7 @@ mod tests {
             },
             conn: None,
             previous_ticks: None,
+            previous_counters: None,
             last_prune: None,
             last_write_warning: None,
         };
@@ -1405,13 +1833,10 @@ mod tests {
             );
         });
         part("ioreg", &mut || {
-            let _ = run(
-                "/usr/sbin/ioreg",
-                &["-r", "-c", "AGXAccelerator", "-d", "1"],
-            );
+            let _ = run("/usr/sbin/ioreg", &["-r", "-c", "AGXAccelerator", "-l"]);
         });
         part("ps", &mut || {
-            let _ = run("/bin/ps", &["-axo", "pgid=,rss=,time="]);
+            let _ = run("/bin/ps", &["-axo", "pid=,pgid=,rss=,time="]);
         });
         let first = mac::cpu_ticks().unwrap();
         std::thread::sleep(Duration::from_millis(200));
@@ -1423,7 +1848,7 @@ mod tests {
         let (cpu_start, wall_start) = (cpu_seconds(), Instant::now());
         for _ in 0..samples {
             recorder.tick().unwrap();
-            let listing = run("/bin/ps", &["-axo", "pgid=,rss=,time="]).unwrap();
+            let listing = run("/bin/ps", &["-axo", "pid=,pgid=,rss=,time="]).unwrap();
             assert!(!parse_process_groups(&listing).is_empty());
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -1439,6 +1864,45 @@ mod tests {
             latest.pressure_level
         );
         assert!(cpu_ms < 50.0, "{cpu_ms} ms CPU per sample");
+    }
+
+    /// Live check of the queue share: `SM_PROBE_QUEUE_DB=<copy of
+    /// queue_runner.db> cargo test ... live_queue_share -- --ignored --nocapture`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn live_queue_share() {
+        let dir = TempDir::new();
+        let mut recorder = Recorder {
+            settings: RecorderSettings {
+                db_path: dir.0.join("utilization.db"),
+                queue_db_path: std::env::var("SM_PROBE_QUEUE_DB").unwrap().into(),
+                interval: Duration::from_secs(5),
+                retention_days: 1,
+            },
+            conn: None,
+            previous_ticks: None,
+            previous_counters: None,
+            last_prune: None,
+            last_write_warning: None,
+        };
+        recorder.tick().unwrap();
+        std::thread::sleep(Duration::from_secs(5));
+        recorder.tick().unwrap();
+        let host = latest_host_sample().unwrap();
+        let gib = |bytes: Option<i64>| bytes.map(|bytes| bytes as f64 / GIB as f64);
+        println!(
+            "used {:?} GiB, queue {:?} GiB; cpu {:?}% queue {:?}%; gpu {:?}% queue {:?}%",
+            gib(host.mem_used_bytes),
+            gib(host.queue_mem_bytes),
+            host.cpu_busy_pct,
+            host.queue_cpu_pct,
+            host.gpu_busy_pct,
+            host.queue_gpu_pct
+        );
+        for (job, usage) in latest_job_usage().unwrap().1 {
+            println!("{job}: {:?} GiB {usage:?}", gib(usage.memory_bytes));
+        }
     }
 
     #[test]

@@ -6962,14 +6962,18 @@ async fn client_queue(
     let mut running: Vec<&QueueJobRecord> =
         active.iter().filter(|job| job.state == "running").collect();
     running.sort_by_key(|job| (job.started_at.clone(), job.id.clone()));
+    // Live use per running job, while the recorder's newest sample is fresh (sm#1714).
+    let job_usage = crate::utilization::latest_job_usage()
+        .filter(|(at_ms, _)| (now.unix_timestamp_nanos() / 1_000_000) as i64 - at_ms < 30_000)
+        .map(|(_, usage)| usage)
+        .unwrap_or_default();
     let mut running_json = Vec::with_capacity(running.len());
     for job in &running {
-        running_json.push(queue_job_response_named(
-            &state,
-            (*job).clone(),
-            &active,
-            &names,
-        )?);
+        let mut value = queue_job_response_named(&state, (*job).clone(), &active, &names)?;
+        if let (Some(usage), Some(object)) = (job_usage.get(&job.id), value.as_object_mut()) {
+            object.insert("usage".into(), json!(usage));
+        }
+        running_json.push(value);
     }
 
     let mut queued_json = Vec::new();

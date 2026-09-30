@@ -54,6 +54,8 @@ class QueueModelsTest {
     @Test
     fun rowLinesMatchTheMockup() {
         assertEquals("perf · 4m of 15m", runningLine(job("running"), now))
+        val used = job("running").copy(usage = li.rajeshgo.sm.data.model.JobUsage(memoryBytes = 12L * 1024 * 1024 * 1024, cpuPercent = 25.4, gpuPercent = 0.1))
+        assertEquals("perf · 4m of 15m · 12G · cpu 25%", runningLine(used, now))
         assertEquals(4f / 15f, runningProgress(job("running"), now), 0.001f)
         assertEquals("perf · waiting 3m · gives up in 2m", queuedLine(job("pending"), now))
         assertEquals("perf · waiting 6m · giving up", queuedLine(job("pending"), now.plusMinutes(3)))
@@ -88,6 +90,19 @@ class QueueModelsTest {
         assertEquals(Meter.MID, meterBand(0.60))
         assertEquals(Meter.HIGH, meterBand(0.86))
         assertTrue(meterRows(HostStatus(available = false)).isEmpty())
+        assertEquals(null, rows[0].queueFraction)
+        val shared = meterRows(
+            HostStatus(
+                available = true, memoryTotalBytes = 256 * gib, memoryUsedBytes = 140 * gib, cpuPercent = 50.0, gpuPercent = 4.0,
+                queueMemoryBytes = 70 * gib, queueCpuPercent = 40.0, queueGpuPercent = 9.0,
+            ),
+        )
+        assertEquals(70.0 / 256, shared[0].queueFraction!!, 1e-9)
+        assertEquals("queue 50%", shared[0].queueValue)
+        assertEquals(0.4, shared[1].queueFraction!!, 1e-9)
+        assertEquals("queue 80%", shared[1].queueValue)
+        // A queue reading above the host's own is capped at it.
+        assertEquals("queue 100%", shared[2].queueValue)
     }
 
     @Test

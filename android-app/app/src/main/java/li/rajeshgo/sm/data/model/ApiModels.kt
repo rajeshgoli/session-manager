@@ -557,6 +557,8 @@ data class SessionJob(
     @SerialName("wait_deadline_at") val waitDeadlineAt: String? = null,
     @SerialName("ended_reason") val endedReason: String? = null,
     @SerialName("ended_summary") val endedSummary: String? = null,
+    /** Live use while running (sm#1714). */
+    val usage: JobUsage? = null,
 ) {
     fun isAwaitedBy(sessionId: String): Boolean =
         (notifySessionId?.takeIf(String::isNotBlank) ?: requesterSessionId) == sessionId
@@ -577,6 +579,18 @@ data class HostStatus(
     @SerialName("gpu_percent") val gpuPercent: Double? = null,
     @SerialName("memory_available_bytes") val memoryAvailableBytes: Long? = null,
     val source: String? = null,
+    // The running queue jobs' part of each figure (sm#1714); absent from older servers.
+    @SerialName("queue_memory_bytes") val queueMemoryBytes: Long? = null,
+    @SerialName("queue_cpu_percent") val queueCpuPercent: Double? = null,
+    @SerialName("queue_gpu_percent") val queueGpuPercent: Double? = null,
+)
+
+/** A running queue job's live use, as share of the whole Mac (sm#1714). */
+@Serializable
+data class JobUsage(
+    @SerialName("memory_bytes") val memoryBytes: Long? = null,
+    @SerialName("cpu_percent") val cpuPercent: Double? = null,
+    @SerialName("gpu_percent") val gpuPercent: Double? = null,
 )
 
 /** `GET /client/queue/jobs/{id}/start-check`: what Start now overrides (sm#1627). */
