@@ -408,7 +408,7 @@ pub(crate) fn board_lines(payload: &Value, now: OffsetDateTime) -> Vec<String> {
         lines.push(format!(
             "  {} needs you · {} all parts done · {} ready · {} in progress · {} blocked · {} done · longest chain {}: {}",
             counts["needs_you"],
-            counts["close_ready"],
+            counts["close_ready"].as_u64().unwrap_or(0),
             counts["ready"],
             counts["in_progress"],
             counts["blocked"],

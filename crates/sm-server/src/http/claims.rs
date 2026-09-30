@@ -215,7 +215,9 @@ async fn run_explicit_claim(
     state: &Arc<AppState>,
     request: ClaimRequest,
 ) -> Result<ClaimResult, ApiError> {
-    run_explicit_claim_checked(state, request, false, false).await
+    run_explicit_claim_checked(state, request, false, false)
+        .await
+        .map(|(result, _)| result)
 }
 
 async fn run_explicit_claim_checked(
@@ -223,7 +225,7 @@ async fn run_explicit_claim_checked(
     request: ClaimRequest,
     check_board: bool,
     start_blocked: bool,
-) -> Result<ClaimResult, ApiError> {
+) -> Result<(ClaimResult, bool), ApiError> {
     if request.tickets.len() + 1 > MAX_ALIASES_PER_QUERY {
         return Err(bad_request("too many --ticket numbers"));
     }
@@ -231,7 +233,7 @@ async fn run_explicit_claim_checked(
     numbers.extend(request.tickets.iter().copied());
     let fetched = fetch_for_claim(state, &request.repo, numbers).await;
     let worker_state = state.clone();
-    tokio::task::spawn_blocking(move || -> Result<ClaimResult, ApiError> {
+    tokio::task::spawn_blocking(move || -> Result<(ClaimResult, bool), ApiError> {
         let _board_guard = if check_board {
             Some(
                 worker_state
@@ -242,15 +244,21 @@ async fn run_explicit_claim_checked(
         } else {
             None
         };
-        if check_board {
+        let started_early = if check_board {
             super::board::validate_start(
                 &worker_state,
                 &(request.repo.clone(), request.number),
                 start_blocked,
-            )?;
-        }
+            )?
+            .started_early
+        } else {
+            false
+        };
         let sessions = session_directory(&worker_state)?;
-        Ok(work_claim_store(&worker_state).claim_explicit(&request, fetched, &sessions)?)
+        Ok((
+            work_claim_store(&worker_state).claim_explicit(&request, fetched, &sessions)?,
+            started_early,
+        ))
     })
     .await
     .map_err(|error| anyhow::anyhow!("claim task failed: {error}"))?
@@ -459,6 +467,7 @@ pub(super) fn record_implicit_pr_claim(
 pub(super) struct SpawnTicketReservation {
     pub claim_id: String,
     pub notes: Vec<String>,
+    pub started_early: bool,
 }
 
 pub(super) struct SpawnTicket<'a> {
@@ -504,13 +513,14 @@ pub(super) async fn reserve_spawn_ticket(
         tickets: Vec::new(),
         reserve: true,
     };
-    let result =
+    let (result, started_early) =
         run_explicit_claim_checked(state, request, spawn.check_board, spawn.start_blocked).await?;
     deliver_claim_notices(state, &result.notified);
     match result.outcome {
         ClaimOutcome::Claimed { claim, notes, .. } => Ok(SpawnTicketReservation {
             claim_id: claim.id,
             notes,
+            started_early,
         }),
         ClaimOutcome::AlreadyHeld { .. } => Err(ApiError::Status {
             status: StatusCode::CONFLICT,

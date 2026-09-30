@@ -144,6 +144,7 @@ impl BoardLinks {
         }
 
         let messages = super::messages::owner_message_store(state);
+        let sessions = claims::session_directory(state)?;
         let replies = messages.all_replies()?;
         let replied: BTreeSet<String> = replies
             .iter()
@@ -160,7 +161,15 @@ impl BoardLinks {
                 "key": format!("agent:{}", message.sender_session_id), "needs_you": false, "count": 0,
             }));
             thread["count"] = json!(thread["count"].as_u64().unwrap_or(0) + 1);
-            if message.blocking && message.handled_at.is_none() && !replied.contains(&message.id) {
+            let sender_ended = sessions
+                .get(&message.sender_session_id)
+                .is_none_or(|session| session.state == crate::work_claims::HolderState::Retired);
+            if crate::owner_messages::derive_message_state(
+                &message,
+                replied.contains(&message.id),
+                sender_ended,
+            ) == crate::owner_messages::OwnerMessageState::NeedsYou
+            {
                 thread["needs_you"] = json!(true);
             }
         }

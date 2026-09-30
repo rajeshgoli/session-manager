@@ -1111,11 +1111,16 @@ pub(super) async fn client_close(
 }
 
 /// Called again under the board lock immediately before reserving the claim.
+pub(super) struct StartValidation {
+    pub lanes: Vec<i64>,
+    pub started_early: bool,
+}
+
 pub(super) fn validate_start(
     state: &AppState,
     key: &Key,
     start_blocked: bool,
-) -> Result<Vec<i64>, ApiError> {
+) -> Result<StartValidation, ApiError> {
     let (board, input) =
         board_store(state).board(&outside(state)?, time::OffsetDateTime::now_utc())?;
     let item = input
@@ -1170,7 +1175,10 @@ pub(super) fn validate_start(
         .filter(|lane| lane.contains(key))
         .map(|lane| lane.lane.id)
         .collect();
-    Ok(lanes)
+    Ok(StartValidation {
+        lanes,
+        started_early: facts.state == crate::board::model::TicketState::Blocked,
+    })
 }
 
 async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, ApiError> {
@@ -1180,10 +1188,10 @@ async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, Api
     let key = ticket_key(&payload.repo, payload.number)?;
     let checked_key = key.clone();
     let (options, lanes) = blocking(&state, move |state| {
-        let lanes = validate_start(state, &checked_key, payload.start_blocked)?;
+        let validation = validate_start(state, &checked_key, payload.start_blocked)?;
         Ok((
-            start_options_payload(state, &checked_key, payload.start_blocked)?,
-            lanes,
+            start_options_payload(state, &checked_key, false)?,
+            validation.lanes,
         ))
     })
     .await?;
@@ -1200,6 +1208,22 @@ async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, Api
         },
         other => other,
     })?;
+    let options = if reservation.started_early {
+        let early_key = key.clone();
+        match blocking(&state, move |state| {
+            start_options_payload(state, &early_key, true)
+        })
+        .await
+        {
+            Ok(options) => options,
+            Err(error) => {
+                claims::finish_spawn_ticket(&state, &reservation, false);
+                return Err(error);
+            }
+        }
+    } else {
+        options
+    };
     let created = create_session_from_request(
         state.clone(),
         CreateCoreSessionRequest {
@@ -1211,7 +1235,7 @@ async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, Api
             model: crate::config::trimmed(&payload.model),
             reasoning_effort: crate::config::trimmed(&payload.reasoning_effort),
             initial_message: Some(match trimmed(&payload.brief) {
-                Some(brief) if payload.start_blocked => format!(
+                Some(brief) if reservation.started_early => format!(
                     "{brief}\n\n{}",
                     options["early_start_paragraph"]
                         .as_str()
@@ -1230,7 +1254,7 @@ async fn start(state: Arc<AppState>, payload: StartRequest) -> Result<Value, Api
     .await;
     claims::finish_spawn_ticket(&state, &reservation, created.is_ok());
     let session = created?;
-    if payload.start_blocked {
+    if reservation.started_early {
         board_store(&state).record_started_early(&key, time::OffsetDateTime::now_utc())?;
     }
     // Session creation is committed. A reporting failure must not invite a duplicate Start.

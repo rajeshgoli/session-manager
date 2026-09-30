@@ -1205,6 +1205,17 @@ async fn blocked_ticket_starts_only_with_early_start_flag_and_brief() {
 }
 
 #[tokio::test]
+async fn early_start_flag_on_ready_ticket_does_not_mark_it_early() {
+    let f = start_fixture();
+    add_goal(&f).await;
+    let mut body = start_body(2);
+    body["start_blocked"] = json!(true);
+    let (status, started) = owner_request(&f, "POST", "/client/board/start", Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{started}");
+    assert_eq!(f.ticket(2).await["started_early"], false);
+}
+
+#[tokio::test]
 async fn close_requires_finished_container() {
     let f = start_fixture();
     add_goal(&f).await;

@@ -6,12 +6,40 @@ type Cache = BTreeMap<(String, i64), (Instant, Value)>;
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 
 fn markdown_html(source: &str) -> String {
-    use pulldown_cmark::{Event, Options, Parser};
-    let events = Parser::new_ext(source, Options::all())
-        .filter(|event| !matches!(event, Event::Html(_) | Event::InlineHtml(_)));
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    let mut unsafe_link = Vec::new();
+    let events = Parser::new_ext(source, Options::all()).filter_map(|event| match &event {
+        Event::Html(_) | Event::InlineHtml(_) => None,
+        Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. }) => {
+            let safe = safe_markdown_destination(dest_url);
+            unsafe_link.push(!safe);
+            safe.then_some(event)
+        }
+        Event::End(TagEnd::Link | TagEnd::Image) => {
+            (!unsafe_link.pop().unwrap_or(false)).then_some(event)
+        }
+        _ => Some(event),
+    });
     let mut html = String::new();
     pulldown_cmark::html::push_html(&mut html, events);
     html
+}
+
+fn safe_markdown_destination(destination: &str) -> bool {
+    if destination.chars().any(char::is_control) || destination.trim() != destination {
+        return false;
+    }
+    let before_path = destination
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    match before_path.split_once(':') {
+        None => true,
+        Some((scheme, _)) => matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "http" | "https" | "mailto"
+        ),
+    }
 }
 
 fn github_error(error: String) -> ApiError {
@@ -149,5 +177,16 @@ mod tests {
         let html = markdown_html("hello <script>alert(1)</script> **world**");
         assert!(!html.contains("<script>"));
         assert!(html.contains("<strong>world</strong>"));
+    }
+
+    #[test]
+    fn github_markdown_drops_unsafe_link_targets() {
+        let html = markdown_html(
+            "[open](javascript:alert(1)) [safe](https://example.com) ![x](data:text/html,evil)",
+        );
+        assert!(!html.contains("javascript:"));
+        assert!(!html.contains("data:"));
+        assert!(html.contains("href=\"https://example.com\""));
+        assert!(html.contains("open"));
     }
 }
