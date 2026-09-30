@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1716 — Tell the agent when its queue job goes quiet</title>
+<!--
+  House format for owner-facing design documents.
+
+  Provenance: the stylesheet is lifted verbatim from
+  docs/working/359_sweep_and_toward_pivot.html, which the owner named as the best of the
+  lot and the standard for this repo. It lives here rather than there because docs/working
+  is deleted at arc close, and a standard that points at an ephemeral file stops existing.
+
+  Structure, per AGENTS.md section 1:
+    - The memo is the owner's entire decision surface, 6-9 printed pages. If a decision is
+      not in the memo, he will not make it.
+    - A FAQ *inside* the memo carries what changed between revisions. It counts against the
+      same page budget.
+    - Appendices are unlimited and must be exhaustive enough that an implementing agent
+      cannot come back with a blocking question.
+    - Present tense throughout. No tombstones. Define every term before using it.
+    - Charts inline wherever one beats a paragraph. Keep the file self-contained: embed
+      images as data URIs, no external stylesheets or scripts.
+    - The memo-dark-mode block at the end of this file adds a screen-only dark theme with
+      a fixed toggle (remembered per browser via localStorage). Keep it at the end of any
+      new memo; print always uses the light palette.
+    - Print stops at the appendix divider by default (memo-print-scope rule in the print
+      block): the memo is what the owner reads on paper. The on-screen "Print: memo only /
+      all" toggle sets <html data-print="all"> for the rare full print.
+-->
+<style>
+:root {
+    --ink:        #0b0b0b;
+    --ink-2:      #52514e;
+    --ink-3:      #8a8880;
+    --surface:    #fcfcfb;
+    --surface-2:  #f4f3f0;
+    --rule:       #e2e1dc;
+    --blue:       #2a78d6;   /* price / entries */
+    --orange:     #eb6834;   /* sweep rungs / attention */
+    --red:        #e34948;   /* stops, death levels */
+    --green:      #008300;   /* targets, recovery */
+    --violet:     #4a3aa7;   /* toward-pivot accents */
+  }
+  html { background: var(--surface); }
+  body {
+    margin: 0 auto; padding: 2.5rem 1.25rem 6rem;
+    max-width: 50rem;
+    color: var(--ink); background: var(--surface);
+    font-family: Georgia, 'Times New Roman', serif;
+    font-size: 1.02rem; line-height: 1.55;
+    -webkit-print-color-adjust: exact; print-color-adjust: exact;
+  }
+  h1, h2, h3, h4, .sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  h1 { font-size: 1.55rem; line-height: 1.25; margin: 0 0 .25rem; }
+  h2 { font-size: 1.22rem; margin: 2.4rem 0 .6rem; border-bottom: 2px solid var(--ink); padding-bottom: .25rem; }
+  h3 { font-size: 1.02rem; margin: 1.6rem 0 .4rem; }
+  h4 { font-size: .95rem; margin: 1.2rem 0 .3rem; }
+  p { margin: .55rem 0; }
+  .meta { color: var(--ink-2); font-size: .88rem; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; margin-bottom: 1.6rem; }
+  .meta b { color: var(--ink); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .88em; background: var(--surface-2); padding: .05em .3em; border-radius: 3px; }
+  pre { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .7rem .9rem; overflow-x: auto; font-size: .82rem; line-height: 1.45; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: .8rem 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .86rem; }
+  th { text-align: left; border-bottom: 2px solid var(--ink); padding: .3rem .5rem; vertical-align: bottom; }
+  td { border-bottom: 1px solid var(--rule); padding: .3rem .5rem; vertical-align: top; }
+  tr:last-child td { border-bottom: 1px solid var(--ink-3); }
+  figure { margin: 1.4rem 0; }
+  figcaption { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .84rem; color: var(--ink-2); margin-top: .45rem; line-height: 1.45; }
+  svg, img { max-width: 100%; height: auto; display: block; }
+  .vocab { background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .8rem 1rem; font-size: .92rem; }
+  .vocab dt { font-weight: 700; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; margin-top: .5rem; }
+  .vocab dd { margin: .1rem 0 0 0; }
+  .callout { border-left: 4px solid var(--blue); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .ruling { border-left: 4px solid var(--green); background: var(--surface-2); padding: .6rem .9rem; margin: .9rem 0; font-size: .95rem; }
+  .appendix-divider { margin: 3.5rem 0 2rem; border: none; border-top: 4px double var(--ink); }
+  .toc { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; font-size: .88rem; column-count: 2; column-gap: 2rem; background: var(--surface-2); border: 1px solid var(--rule); border-radius: 6px; padding: .9rem 1.2rem; }
+  .toc a { color: var(--blue); text-decoration: none; }
+  .toc div { break-inside: avoid; margin: .18rem 0; }
+  a { color: var(--blue); }
+  @media print {
+    /* memo-print-scope: printing stops at the appendix divider. To print appendices too,
+       set <html data-print="all"> (the on-screen "Print: memo only / all" toggle does this). */
+    :root:not([data-print="all"]) .appendix-divider,
+    :root:not([data-print="all"]) .appendix-divider ~ * { display: none !important; }
+    body { font-size: 10.5pt; max-width: none; padding: 0; }
+    h2, h3, h4 { break-after: avoid; }
+    /* memo-print-breaks: `break-inside: avoid` is a trap on anything that can
+       grow past one page — a decision table, a long code block, a ruling. The
+       browser obeys by moving the element to a fresh page, blanking the rest of
+       the current one, and then splits it anyway because it still does not fit.
+       So prose and tables break in place, with orphans/widows holding at least
+       two lines either side of the break, and a table's <thead> repeating on
+       the continuation page. Put the header row in <thead> for that to work. */
+    table { break-inside: auto; }
+    thead { display: table-header-group; }
+    p, li, dd, td, th, pre, .callout, .ruling, .vocab { orphans: 2; widows: 2; }
+    /* Figures keep the avoid: half a diagram on each page is unreadable, and
+       moving a whole figure to its own page is right where a table's move is
+       wrong. A diagram taller than a page still needs capping, but the cap
+       depends on the figure's own layout, so it belongs in the document: give
+       that figure's diagram a print `max-height` a little under the page. */
+    figure { break-inside: avoid; }
+    .toc { column-count: 2; }
+    a { color: var(--ink); text-decoration: none; }
+  }
+</style>
+
+<h1>1716 — Tell the agent when its queue job goes quiet</h1>
+<p class="sans"><small>Author: Claude Opus 5.5 <code>923f2479</code> (sm-1716) · Ticket #1716 · Fits the web redesign memo, <code>docs/working/1710_web_redesign.html</code> (#1710)</small></p>
+
+<h2>Memo</h2>
+
+<p><b>Recommendation.</b> When a running queue job goes <b>quiet</b> (20 minutes with no CPU, no GPU and no new log output), sm sends one <code>[sm queue]</code> message to the agent that queued it. The message says how much memory the job holds, which slot it occupies, how many jobs wait behind it, and what its log said last. The agent decides: cancel it, or do nothing because the pause is expected. Service jobs never get this message.</p>
+
+<p>This uses the same "quiet" that the web redesign (#1710) already turns red on the Board and the Queue page, so the page and the alert always agree. It also changes two things in the approved 1710 memo. First, sm now tells the agent instead of only marking the job. Second, the 1710 memo measures CPU in a way that marks busy training jobs as quiet, and this memo corrects the measurement. Section 3 explains the flaw.</p>
+
+<div class="vocab">
+<dl>
+<dt>Queue job</dt><dd>A command an agent submitted with <code>sm queue run</code>. It has a type (tests, perf, background or service), a label, an ID and a log file.</dd>
+<dt>Slot</dt><dd>The queue runs a limited number of jobs of each type at once: 6 tests, 1 perf, 2 background, 2 service. A running job holds one slot of its type until it exits.</dd>
+<dt>The job's agent</dt><dd>The session that receives the job's completion wake (the job's <i>notify target</i>). Usually the agent that queued it.</dd>
+<dt>Memory held</dt><dd>The job's memory as Activity Monitor shows it ("footprint"), summed over all its processes. #1714 records it every 5 seconds.</dd>
+<dt>Quiet</dt><dd>Defined in section 2. In one line: for 20 minutes, the job has used no CPU, no GPU and written nothing to its log.</dd>
+</dl>
+</div>
+
+<h3>1. What happened on 29 September</h3>
+
+<p>Three training jobs from fractal-algo-rust tickets #1854 and #1856 stopped working between 3:52 and 4:26 pm, but their processes did not exit. The two #1854 probes had crashed: each log ends in a Python <code>FileNotFoundError</code> traceback, written at 3:53 and 4:19 pm. Something in the process kept it alive after the crash. Together the three held about 148 GB, and the two #1854 probes held <b>both background slots</b>. Six to eight background jobs waited behind them while the Mac sat 15–30% busy. Someone noticed and cancelled all three by hand at 5:53 pm, 1½ to 2 hours later. Five of the waiting jobs started within three seconds of the cancel.</p>
+
+<figure>
+<svg viewBox="0 0 760 246" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Three queue jobs on 29 September: CPU use, quiet stretches, and the background backlog"><style>.lab{font:600 12px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink)}.sub{font:11px -apple-system,Helvetica,Arial,sans-serif;fill:var(--ink-2)}.note{font:11px -apple-system,Helvetica,Arial,sans-serif;fill:var(--red)}.mem{font:600 11px -apple-system,Helvetica,Arial,sans-serif;fill:#fff}.busy{fill:var(--green)}.idle{fill:var(--ink-3);opacity:.45}.quiet{fill:var(--red)}.alert{fill:var(--red)}.wait{fill:none;stroke:var(--orange);stroke-width:2}.axis{stroke:var(--ink-3)}.grid{stroke:var(--rule)}.cancel{stroke:var(--ink);stroke-dasharray:3 3}</style><text x="142" y="41" text-anchor="end" class="lab">1856-pilot-mac</text><text x="142" y="53" text-anchor="end" class="sub">tests</text><path d="M318.7,24 l-5,-7 h10 z" class="alert"/><text x="326.7" y="23" class="note">alert 4:12</text><rect x="176.7" y="30" width="49.8" height="20" class="busy"/><rect x="226.6" y="30" width="0.6" height="20" class="idle"/><rect x="226.9" y="30" width="12.9" height="20" class="busy"/><rect x="239.8" y="30" width="78.6" height="20" class="idle"/><rect x="318.4" y="30" width="397.1" height="20" class="quiet"/><text x="711.5" y="44" text-anchor="end" class="mem">48 GB</text><text x="142" y="75" text-anchor="end" class="lab">1854-es-with</text><text x="142" y="87" text-anchor="end" class="sub">background</text><path d="M353.3,58 l-5,-7 h10 z" class="alert"/><text x="361.3" y="57" class="note">alert 4:21</text><rect x="228.9" y="64" width="0.6" height="20" class="idle"/><rect x="229.2" y="64" width="45.4" height="20" class="busy"/><rect x="274.6" y="64" width="78.4" height="20" class="idle"/><rect x="353.0" y="64" width="360.5" height="20" class="quiet"/><text x="709.5" y="78" text-anchor="end" class="mem">50 GB</text><text x="142" y="109" text-anchor="end" class="lab">1854-es-without</text><text x="142" y="121" text-anchor="end" class="sub">background</text><path d="M447.7,92 l-5,-7 h10 z" class="alert"/><text x="455.7" y="91" class="note">alert 4:45</text><rect x="331.3" y="98" width="37.5" height="20" class="busy"/><rect x="368.9" y="98" width="78.5" height="20" class="idle"/><rect x="447.4" y="98" width="266.1" height="20" class="quiet"/><text x="709.5" y="112" text-anchor="end" class="mem">50 GB</text><polyline points="150.0,167.8 153.9,167.8 157.9,167.8 161.8,167.8 165.7,163.2 169.7,167.8 173.6,167.8 177.5,167.8 181.5,167.8 185.4,167.8 189.3,167.8 193.3,167.8 197.2,167.8 201.1,167.8 205.1,167.8 209.0,167.8 212.9,163.2 216.9,163.2 220.8,163.2 224.7,163.2 228.7,167.8 232.6,167.8 236.5,172.4 240.5,172.4 244.4,167.8 248.3,167.8 252.3,167.8 256.2,167.8 260.1,167.8 264.1,167.8 268.0,167.8 271.9,167.8 275.9,167.8 279.8,167.8 283.7,167.8 287.7,167.8 291.6,167.8 295.5,167.8 299.5,167.8 303.4,167.8 307.3,167.8 311.3,167.8 315.2,167.8 319.1,167.8 323.1,167.8 327.0,167.8 330.9,167.8 334.9,172.4 338.8,172.4 342.7,172.4 346.7,172.4 350.6,172.4 354.5,172.4 358.5,172.4 362.4,172.4 366.3,172.4 370.3,172.4 374.2,172.4 378.1,167.8 382.1,167.8 386.0,167.8 389.9,167.8 393.9,167.8 397.8,167.8 401.7,172.4 405.7,172.4 409.6,172.4 413.5,167.8 417.5,167.8 421.4,167.8 425.3,167.8 429.3,167.8 433.2,167.8 437.1,172.4 441.1,172.4 445.0,172.4 448.9,172.4 452.9,167.8 456.8,167.8 460.7,167.8 464.7,172.4 468.6,172.4 472.5,172.4 476.5,172.4 480.4,172.4 484.3,172.4 488.3,172.4 492.2,172.4 496.1,172.4 500.1,172.4 504.0,167.8 507.9,167.8 511.9,167.8 515.8,172.4 519.7,172.4 523.7,172.4 527.6,172.4 531.5,172.4 535.5,172.4 539.4,172.4 543.3,172.4 547.3,172.4 551.2,172.4 555.1,172.4 559.1,172.4 563.0,172.4 566.9,172.4 570.9,172.4 574.8,172.4 578.7,172.4 582.7,172.4 586.6,172.4 590.5,172.4 594.5,172.4 598.4,172.4 602.3,172.4 606.3,167.8 610.2,167.8 614.1,167.8 618.1,167.8 622.0,172.4 625.9,172.4 629.9,172.4 633.8,172.4 637.7,172.4 641.7,172.4 645.6,172.4 649.5,172.4 653.5,172.4 657.4,172.4 661.3,172.4 665.3,172.4 669.2,167.8 673.1,172.4 677.1,172.4 681.0,172.4 684.9,172.4 688.9,172.4 692.8,172.4 696.7,172.4 700.7,172.4 704.6,172.4 708.5,172.4 712.5,172.4 716.4,195.4 720.3,177.0 724.3,172.4 728.2,172.4 732.1,172.4 736.1,172.4" class="wait"/><line x1="150" x2="740" y1="200" y2="200" class="axis"/><text x="142" y="181.0" text-anchor="end" class="lab">background waiting</text><text x="445.0" y="167.4" class="note">6 jobs waiting</text><line x1="150.0" x2="150.0" y1="16" y2="200" class="grid"/><text x="150.0" y="216" text-anchor="middle" class="sub">3:30 pm</text><line x1="268.0" x2="268.0" y1="16" y2="200" class="grid"/><text x="268.0" y="216" text-anchor="middle" class="sub">4:00 pm</text><line x1="386.0" x2="386.0" y1="16" y2="200" class="grid"/><text x="386.0" y="216" text-anchor="middle" class="sub">4:30 pm</text><line x1="504.0" x2="504.0" y1="16" y2="200" class="grid"/><text x="504.0" y="216" text-anchor="middle" class="sub">5:00 pm</text><line x1="622.0" x2="622.0" y1="16" y2="200" class="grid"/><text x="622.0" y="216" text-anchor="middle" class="sub">5:30 pm</text><line x1="740.0" x2="740.0" y1="16" y2="200" class="grid"/><text x="740.0" y="216" text-anchor="middle" class="sub">6:00 pm</text><line x1="712.5" x2="712.5" y1="16" y2="200" class="cancel"/><text x="708.5" y="14" text-anchor="end" class="note">cancelled by hand 5:53</text><rect x="150" y="225" width="12" height="9" class="busy"/><text x="166" y="234" class="sub">using CPU</text><rect x="240" y="225" width="12" height="9" class="idle"/><text x="256" y="234" class="sub">idle, under 20 min</text><rect x="375" y="225" width="12" height="9" class="quiet"/><text x="391" y="234" class="sub">quiet (idle 20 min or more)</text></svg>
+<figcaption><b>The three jobs, from utilization data.</b> Each bar is a job's running time: green while it uses CPU, grey once it has been idle for under 20 minutes, red once it is quiet. The triangles mark when this memo's alert would have reached each job's agent: 4:12, 4:21 and 4:45 pm, between 68 and 101 minutes before the manual cancel. The orange line counts background jobs waiting for a slot. It falls when the cancel frees both background slots.</figcaption>
+</figure>
+
+<p>The cost was the slots, not only the memory. A background slot is the scarcest thing the queue has, and a hung job holds one until its time limit, which is up to 8 hours. The agent that queued the job is the only one who can tell a hang from an expected pause. Right now nothing tells that agent anything until the job exits.</p>
+
+<h3>2. What the agent receives</h3>
+
+<p>Here is the message 1854-engineer would have received at 4:21 pm. It goes to the same session and through the same delivery as the job's completion wake:</p>
+
+<pre style="white-space:pre-wrap">[sm queue] 1854-es-with has been quiet for 20m: no CPU, GPU or log output since 4:01 pm.
+It holds 50.3 GB of memory and one of 2 background slots; 6 background jobs are waiting for a slot.
+Last log lines:
+  File ".../pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+  FileNotFoundError: [Errno 2] No such file or directory: '/Users/rajesh/artifacts/1701_pooled_nocross/run/…/reaction-result-7195.json'
+If it is hung, cancel it: sm queue cancel job_4489b0dcd0d9. If this is expected, do nothing; sm will not ask about this job again for 2 hours.
+Log: ~/.local/share/claude-sessions/queue-runner/logs/job_4489b0dcd0d9.log. ID: job_4489b0dcd0d9</pre>
+
+<p>The last log lines matter most here. The traceback tells the agent in one read that the job crashed, and it needs no investigation to act. The agent does not have to reply. <code>sm queue status</code> on the job also shows "Quiet since 4:01 pm" for as long as the job stays quiet.</p>
+
+<p><b>The definition.</b> sm records every running job every 5 seconds. A job is <b>quiet</b> when, in <i>each</i> 5-second step for the last 20 minutes, all three of these hold:</p>
+<ul>
+<li>its processes gained less than 0.05 seconds of CPU time, which is under 1% of one core;</li>
+<li>its GPU time did not grow;</li>
+<li>its log file did not grow.</li>
+</ul>
+<p>If any step shows activity, the 20 minutes start over. A job's alert is sent once, when the job first becomes quiet. It can only be sent again after the job has shown activity and then gone quiet again, and no sooner than 2 hours after the previous alert.</p>
+
+<table>
+<thead><tr><th style="width:26%">Job (real, from the last 23 hours)</th><th>What it was doing</th><th style="width:22%">Result</th></tr></thead>
+<tbody>
+<tr><td>1854-es-with, 1854-es-without, 1856-pilot-mac</td><td>Crashed or stalled with their processes still alive, holding 48–50 GB each.</td><td><b>Quiet → alert</b> at 4:21, 4:45 and 4:12 pm</td></tr>
+<tr><td>1805-structure-chart-v15-r2</td><td>A chart server queued as a <i>background</i> job instead of a service. It idled 81 minutes at 1.3 GB while up to 3 background jobs waited.</td><td><b>Quiet → alert.</b> Correct: it held a background slot it did not use.</td></tr>
+<tr><td>1818-pod-probe-2</td><td>Waiting on a rented remote GPU for about 21 minutes, with 1 background job waiting behind it.</td><td><b>Probably an alert.</b> An expected wait, but it holds a local slot. The agent ignores the alert.</td></tr>
+<tr><td>1848 stock-purchase job</td><td>Downloads one market at a time. It used 1.3 seconds of CPU in 86 minutes, but it wakes briefly every few minutes and writes a log line per market.</td><td><b>Not quiet.</b></td></tr>
+<tr><td>1844-lane-c-rest-5m</td><td>Busy training. It starts worker processes that finish and exit every few minutes.</td><td><b>Not quiet</b> (section 3).</td></tr>
+<tr><td>Any service job</td><td>Services wait for requests by design.</td><td><b>Never alerted.</b> Still marked quiet on the Queue page.</td></tr>
+</tbody>
+</table>
+
+<p>Over the 23 hours of recorded history (332 jobs), this rule produces at most 5 alerts. Four are the jobs above that really were stuck or idle; the fifth is the remote-GPU probe, which was waiting as expected. It produces no alerts on jobs that were working.</p>
+
+<h3>3. Why the 1710 measurement changes</h3>
+
+<p>The 1710 memo calls a job quiet when its CPU time at the end of a 20-minute window is less than 1% of a core above its CPU time at the start. That comparison is wrong for jobs that start child processes. sm reads CPU time only from processes that are alive at the moment of the sample. When a worker process exits, its CPU time leaves the total. A training job that runs a wave of workers can therefore show <i>less</i> total CPU at the end of a busy window than at the start. Over the same 23 hours, the start-to-end rule marks <b>164 stretches on 20 jobs</b> as quiet, and almost all of those jobs were busy and succeeded. Checking each 5-second step, and counting a drop as zero, marks 5.</p>
+
+<p>The fix moves quiet detection out of the Queue-page ticket (#1723) and into the server, as part of this ticket. That way the alert, <code>sm queue status</code>, the Queue page and the Board's ticket clock (#1719) all read one value. The 1710 memo's appendix D6.6 is updated in the same pull request to point here.</p>
+
+<h3>Decisions</h3>
+
+<table>
+<thead><tr><th style="width:24%">Question</th><th>Recommendation</th><th style="width:30%">Why, in one line</th></tr></thead>
+<tbody>
+<tr><td>1. Should sm message the job's agent when a job goes quiet? (1710 said: mark only, no alert.)</td><td><b>Yes: one <code>[sm queue]</code> message to the job's agent.</b> sm still never cancels a job itself.</td><td>The agent is the only one who knows whether the pause is expected. Nobody watches the Board for 2 hours.</td></tr>
+<tr><td>2. Alert only when the job holds 8 GB or more, as the ticket proposed?</td><td><b>No. Alert on every quiet job.</b> The memory it holds goes in the message.</td><td>The slot costs as much as the memory. The 1.3 GB chart server blocked a background slot for 81 minutes. History shows 5 alerts a day without the memory gate, so there is little noise to filter.</td></tr>
+<tr><td>3. How long before a job counts as quiet?</td><td><b>20 minutes</b>, the same as the 1710 red marker. The ticket proposed 15.</td><td>The alert and the red marker then appear together. At 15 and at 20 minutes, history flags the same jobs.</td></tr>
+<tr><td>4. Should jobs be able to opt out, e.g. <code>sm queue run --idle-ok</code>?</td><td><b>Service jobs never alert. Add no flag</b> until a false alert shows up.</td><td>Services are the only type that waits by design. The one expected wait in history cost its agent a single message.</td></tr>
+<tr><td>5. How often can one job alert?</td><td><b>Once per quiet stretch, and at most once every 2 hours per job.</b> The agent does not reply.</td><td>A job that wakes briefly and then goes quiet again cannot turn into a stream of messages.</td></tr>
+<tr><td>6. Should you also get a phone message?</td><td><b>No.</b> You see the job red on the Board and the Queue page. If the job's agent has ended, the alert waits in its inbox, as the completion wake does.</td><td>You asked to be messaged only on events you name. The agent is the one who acts.</td></tr>
+</tbody>
+</table>
+
+<h3>What ships, and in what order</h3>
+<p>One ticket, #1716, for a mid-tier agent (Opus 1M, high effort). It adds the log-size reading to the 5-second recorder, the quiet detector, the alert, the quiet line in <code>sm queue status</code> and <code>sm queue list</code>, and the quiet fields that the web Queue page reads. #1723 (the web Queue page) then only draws the job red, and it starts after #1716. #1719 (ticket clock, already in progress) already ships its "job quiet" rule only once those fields exist, so it needs no change.</p>
+
+<h3>FAQ — what changed since the last revision</h3>
+<p>This is the first revision.</p>
+
+<hr class="appendix-divider">
+<h2>Appendices</h2>
+
+<div class="toc">
+<div><a href="#a">A. Quiet: exact rule</a></div>
+<div><a href="#b">B. The alert</a></div>
+<div><a href="#c">C. Where quiet shows</a></div>
+<div><a href="#d">D. Config</a></div>
+<div><a href="#e">E. Changes to the 1710 memo</a></div>
+<div><a href="#f">F. Ticket, order and checks</a></div>
+<div><a href="#g">G. Requirement trace</a></div>
+<div><a href="#z">Z. FAQ</a></div>
+</div>
+
+<h3 id="a">A. Quiet: exact rule</h3>
+
+<p><b>Inputs.</b> The utilization recorder (<code>crates/sm-server/src/utilization.rs</code>) already writes one <code>job_samples</code> row per running job every 5 seconds, carrying <code>cpu_seconds_total</code> and <code>gpu_seconds_total</code> summed over the job's process group. Add one nullable column:</p>
+<pre>ALTER TABLE job_samples ADD COLUMN log_bytes INTEGER;  -- size of queue_jobs.log_path at the sample; NULL if it cannot be read</pre>
+<p>Add it with the same <code>ensure_column</code> pattern the table already uses for <code>gpu_seconds_total</code>. Rows written before the column exists have NULL.</p>
+
+<p><b>Steps.</b> For two consecutive running samples <i>p</i> and <i>c</i> of the same job, let <i>Δt</i> be <code>(c.sampled_at_ms − p.sampled_at_ms) / 1000</code>. The step is <b>active</b> if any of these hold:</p>
+<ol>
+<li><i>Δt</i> &gt; 60. A gap in sampling, such as a server restart, restarts the clock. This is the conservative choice.</li>
+<li><code>p.cpu_seconds_total</code> or <code>c.cpu_seconds_total</code> is NULL (unknown counts as active).</li>
+<li><code>max(0, c.cpu − p.cpu) ≥ 0.01 × Δt</code>. A drop, which means a process exited, counts as 0. This matches how <code>job_usage</code> already floors a drop at zero.</li>
+<li>Both GPU values are non-NULL and <code>c.gpu &gt; p.gpu</code>. If either is NULL, GPU counts as no growth.</li>
+<li>Both <code>log_bytes</code> values are non-NULL and differ. Growth or truncation both count. If either is NULL, the log counts as no growth.</li>
+</ol>
+<p>Otherwise the step is <b>idle</b>.</p>
+
+<p><b>quiet_since.</b> Let <i>last_active</i> be <code>c.sampled_at_ms</code> of the job's most recent active step. If the job has no active step, use the job's first running sample. Let <i>latest</i> be the job's most recent sample. Then:</p>
+<pre>quiet_since = last_active   if latest − last_active ≥ quiet_minutes × 60 000 and the job is running
+            = null          otherwise</pre>
+<p><code>quiet_since</code> is therefore the moment activity stopped, not the moment the job crossed 20 minutes. "Quiet for 24m" means <code>now − quiet_since</code>. It is never shown below 20m. Service jobs get <code>quiet_since</code> too, because the Queue page marks them. They are only excluded from the alert.</p>
+
+<p><b>Determinism.</b> <code>quiet_since</code> must equal the value computed from <code>job_samples</code> rows alone, so a server restart cannot change it except by the gap rule. The detector may keep per-job state in memory. It must seed that state at startup from each running job's samples since <code>started_at</code>.</p>
+
+<p><b>Evaluation.</b> Run the detector once per recorder tick, after that tick's <code>job_samples</code> rows are written. A job that leaves the running state has <code>quiet_since = null</code>.</p>
+
+<p><b>Worked example</b> (1854-es-with, <code>job_4489b0dcd0d9</code>). The log last grows at 3:53 pm. The last active step (a CPU blip) ends at 4:01:41 pm, so <code>quiet_since</code> is 4:01:41 pm and becomes non-null at the first sample 20 minutes later, 4:21:41 pm. The alert goes then. At 5:00 pm the job reads "quiet 58m". The memo's chart is generated from the same rule over the live <code>utilization.db</code>.</p>
+
+<h3 id="b">B. The alert</h3>
+
+<p><b>When.</b> On the tick where a job's <code>quiet_since</code> changes from null to a value, send the alert if all of these hold:</p>
+<ul>
+<li>the job type is not <code>service</code>;</li>
+<li><code>queue_jobs.quiet_alerted_at</code> is null or at least <code>quiet_alert_repeat_minutes</code> (default 120) ago;</li>
+<li>the job has a non-empty <code>notify_session_id</code>.</li>
+</ul>
+
+<p><b>Persisted shape.</b> Add <code>queue_jobs.quiet_alerted_at TEXT</code> (RFC 3339 UTC, nullable) with <code>ensure_column</code>. Set it when the message is enqueued. The 2-hour limit survives restarts because the value is on disk.</p>
+
+<p><b>Delivery.</b> Use <code>RetainedQueueStore::enqueue_message_once_with_metadata</code>, as the owner-forced requeue notice in <code>queue.rs</code> does. Pass message id <code>queue-quiet-{job_id}-{quiet_since_ms}</code>, the target <code>notify_session_id</code>, mode <code>"sequential"</code>, and <code>message_category: "queue-completion"</code>. The once-only id guarantees at most one message per quiet stretch even if the tick runs twice. Also append the first line of the message to the job's log file, prefixed with a blank line. The requeue notice already writes to the log this way.</p>
+
+<p><b>Text.</b> Exactly this template. Braces are fields; the square brackets mark an optional clause.</p>
+<pre style="white-space:pre-wrap">[sm queue] {label} has been quiet for {quiet_age}: no CPU, GPU or log output since {quiet_since_local}.
+It holds {memory} of memory and one of {limit} {type} slots[; {waiting} {type} jobs are waiting for a slot].
+Last log lines:
+{tail}
+If it is hung, cancel it: sm queue cancel {id}. If this is expected, do nothing; sm will not ask about this job again for {repeat}.
+Log: {log_path}. ID: {id}</pre>
+<table>
+<thead><tr><th style="width:22%">Field</th><th>Value</th></tr></thead>
+<tbody>
+<tr><td>label</td><td>The job label. Use the ID if the label is blank, as the other queue notices do.</td></tr>
+<tr><td>quiet_age</td><td><code>now − quiet_since</code>, written as <code>20m</code>, <code>1h 05m</code>. Minutes are floored.</td></tr>
+<tr><td>quiet_since_local</td><td>Server local time, <code>h:mm am/pm</code>, e.g. <code>3:52 pm</code>.</td></tr>
+<tr><td>memory</td><td>The latest sample's <code>footprint_bytes</code> formatted with the existing <code>memory_amount_text</code>. If footprint is NULL, use <code>rss_bytes</code>; if both are NULL, write <code>an unknown amount</code>.</td></tr>
+<tr><td>limit</td><td>The live <code>max_concurrent</code> for the job's type.</td></tr>
+<tr><td>waiting</td><td>Pending jobs of the same type at the tick. Omit the whole bracketed clause when it is 0.</td></tr>
+<tr><td>tail</td><td>The last 3 non-empty lines of the log. Read at most the final 64 KiB. Indent each line 2 spaces and cut it to 200 characters with <code>…</code>. If the log is unreadable or empty, write <code>  (log is empty)</code>.</td></tr>
+<tr><td>repeat</td><td><code>quiet_alert_repeat_minutes</code> formatted as <code>2 hours</code>, <code>90 minutes</code>.</td></tr>
+</tbody>
+</table>
+
+<h3 id="c">C. Where quiet shows</h3>
+<ul>
+<li><b><code>sm queue status &lt;job&gt;</code></b>: when <code>quiet_since</code> is set, add the line <code>Quiet since {h:mm am/pm} ({age}): no CPU, GPU or log output. Holding {memory}.</code> If <code>quiet_alerted_at</code> is set, add <code>Agent told at {h:mm am/pm}.</code></li>
+<li><b><code>sm queue list</code></b>: running rows with <code>quiet_since</code> set get the suffix <code>quiet {age}</code>.</li>
+<li><b><code>GET /client/queue</code></b>: each running job gains <code>cpu_seconds</code> and <code>gpu_seconds</code> (latest sample totals), <code>footprint_bytes</code>, <code>log_updated_at</code> (the time of the last step whose log size changed, RFC 3339, or null), <code>quiet_since</code> (RFC 3339 or null), and <code>quiet_alerted_at</code>. These are the fields 1710 D6.6 names, plus <code>footprint_bytes</code> and <code>quiet_alerted_at</code>. The Queue page's "holding 50 GB" text reads <code>footprint_bytes</code>.</li>
+<li><b>Board ticket clock</b> (#1719, rule 3a): reads <code>quiet_since</code> from the same server value. Nothing to change in #1719.</li>
+</ul>
+
+<h3 id="d">D. Config</h3>
+<pre>queue_runner:
+  quiet_minutes: 20               # 0 turns off quiet detection and the alert
+  quiet_alert_repeat_minutes: 120</pre>
+<p>Both keys are read at startup, and both are optional with these defaults. <code>quiet_minutes</code> is the key 1710 D6.6 already names.</p>
+
+<h3 id="e">E. Changes to the 1710 memo (same pull request)</h3>
+<ul>
+<li>Memo, "This job has run an hour on almost no CPU" section: the bullet "sm does not cancel quiet jobs or send an alert about them. It marks them." becomes "sm does not cancel quiet jobs. It marks them and sends the job's agent one message (#1716)."</li>
+<li>Appendix D6.6, <i>Quiet jobs</i>: replace the start-to-end CPU definition with a pointer to this memo's appendix A. Keep the rendering rules there (red from <code>quiet_since</code>, job panel, Ask agent suggestion). The "low CPU" note keeps its meaning, but CPU is now summed step by step with drops counted as 0. Delete "The server sends no alert; it only marks the job."</li>
+<li>Appendix E, ticket #1723: its scope drops "quiet-job detection", and its dependencies add #1716.</li>
+<li>Appendix F, "Quiet jobs turn red": the detection tests move to #1716. #1723 keeps a rendering test.</li>
+</ul>
+
+<h3 id="f">F. Ticket, order and checks</h3>
+<p><b>#1716</b>, Mid tier (Opus 1M, high). Files: <code>utilization.rs</code> (log size, detector), <code>queue.rs</code> (column, alert, status and list text), the <code>/client/queue</code> route, and the CLI's queue status rendering. On landing, run <code>sm board after 1723 1716</code> and <code>sm board under 1716 1710</code>. The implementing PR moves this memo to <code>docs/specs/</code>.</p>
+<p><b>Tests</b> (<code>scripts/test-rust-isolated.sh</code>):</p>
+<ol>
+<li>Step rule: a CPU drop is idle; CPU growth of 0.05 s in 5 s is active and 0.04 s is idle; GPU growth is active; log growth and truncation are active; a gap over 60 s is active; NULL CPU is active; NULL GPU or log is not.</li>
+<li><code>quiet_since</code>: null at 19m59s idle and set at 20m. It equals the last active sample time and goes back to null after any active step.</li>
+<li>Replay fixture: the recorded samples of <code>job_4489b0dcd0d9</code> (with <code>log_bytes</code> synthesised flat after 3:53 pm) produce exactly one alert at the first sample ≥ 20 minutes after the last active step. The <code>job_cc4c866663f3</code> samples (busy, with worker exits) produce none.</li>
+<li>Alert gating: a service job gets <code>quiet_since</code> and no message. A second quiet stretch within 120 minutes gets no message, and one after 120 minutes does. Running the tick twice enqueues one message.</li>
+<li>Restart: rebuilding detector state from <code>job_samples</code> gives the same <code>quiet_since</code>, and a persisted <code>quiet_alerted_at</code> still blocks a repeat.</li>
+<li>Text: the section 2 example renders exactly from its inputs. A zero waiting count omits the clause. An empty log gives <code>(log is empty)</code>.</li>
+</ol>
+<p><b>Live check.</b> Queue a background job running <code>python3 -c "import time; print('x', flush=True); time.sleep(3600)"</code> with <code>quiet_minutes</code> set to 2 on a scratch server. Confirm one message arrives about 2 minutes after start, that <code>sm queue status</code> shows the quiet line, and that cancelling the job clears it.</p>
+
+<h3 id="g">G. Requirement trace</h3>
+<table>
+<thead><tr><th>Memo requirement</th><th>Appendix</th><th>Test</th></tr></thead>
+<tbody>
+<tr><td>Quiet: 20 min, no CPU, GPU or log growth, checked each step</td><td>A</td><td>F.1, F.2, F.3</td></tr>
+<tr><td>One message to the job's agent, same delivery as completion</td><td>B</td><td>F.4</td></tr>
+<tr><td>Message carries memory, slot, waiting count, log tail, cancel command</td><td>B text</td><td>F.6</td></tr>
+<tr><td>Service jobs never alerted</td><td>B</td><td>F.4</td></tr>
+<tr><td>Once per stretch, at most every 2 hours</td><td>B</td><td>F.4, F.5</td></tr>
+<tr><td>No owner message</td><td>B (no owner target)</td><td>Not tested: behaviour is absence</td></tr>
+<tr><td><code>sm queue status</code> and list show quiet</td><td>C</td><td>Live check</td></tr>
+<tr><td>Web page and Board read one server value</td><td>C, E</td><td>#1723 rendering test</td></tr>
+<tr><td>Ticket's 8 GB gate and 15-minute window</td><td colspan="2">Dropped: decisions 2 and 3</td></tr>
+</tbody>
+</table>
+
+<h3 id="z">Z. FAQ</h3>
+<p><b>Why not cancel quiet jobs automatically?</b> An expected wait, such as the remote-GPU probe, looks the same as a hang. Only the agent knows which it is. The job's own time limit is still the backstop.</p>
+<p><b>Why not detect "the log ends in a traceback" directly?</b> A traceback only covers Python crashes, and some jobs write their output to their own files instead of the queue log (1856-pilot-mac did). The quiet rule catches both cases. The log tail in the message lets the agent see a traceback when there is one.</p>
+<p><b>Why does log output count, when #1714 records only CPU and GPU?</b> Network-bound jobs use almost no CPU but write steadily. The 1848 purchase job is the example. The log keeps those jobs from being called quiet, and costs one file-size read per job every 5 seconds.</p>
+<p><b>Why count a process-count change or a CPU drop as idle rather than active?</b> A drop only tells sm that some process exited; it says nothing about work now. Counting drops as zero matches <code>job_usage</code>. A busy job still shows positive steps around the drop, so it is never quiet. The replay of <code>job_cc4c866663f3</code> confirms this.</p>
+<p><b>Why 5 alerts, not 4, in the history count?</b> The remote-GPU probe (<code>job_0a3e1fc1a082</code>) is flagged by the CPU and GPU rule alone. Whether its log grew during the 21 minutes is not recorded, so the log rule might have held it back. The memo counts it as an alert to stay conservative.</p>
+<p><b>Data used.</b> <code>utilization.db</code> <code>job_samples</code> and <code>host_samples</code>, 28 September 6:59 pm to 29 September 6:17 pm (Pacific time), 332 jobs. Job records and logs come from <code>queue-runner/queue_runner.db</code> and <code>queue-runner/logs/</code>. The chart and counts come from scripts that read those files directly.</p>
+
+
+<!-- memo-dark-mode: screen-only dark theme + toggle. Print always uses the light palette.
+     The block is self-contained and appended to every memo that uses the house tokens;
+     it only overrides custom properties, so the original stylesheet stays untouched. -->
+<style id="memo-dark-style">
+  :root[data-theme="dark"] {
+    --ink: #e6e4de; --ink-2: #b1afa7; --ink-3: #83817a; --ink2: #b1afa7;
+    --surface: #1b1b19; --surface-2: #262622; --surface2: #262622;
+    --rule: #3b3b37;
+    --blue: #6db1f7; --orange: #f5885a; --red: #f37c7b;
+    --green: #5cc95c; --violet: #a89bf0;
+  }
+  #memo-theme-toggle, #memo-print-toggle {
+    position: fixed; top: .8rem; right: .8rem; z-index: 10;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    font-size: .78rem; line-height: 1;
+    color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: .45em .9em; cursor: pointer;
+  }
+  #memo-print-toggle { right: 6.2rem; }
+  #memo-theme-toggle:hover, #memo-print-toggle:hover { color: var(--ink); border-color: var(--ink-3); }
+  @media print {
+    #memo-theme-toggle, #memo-print-toggle { display: none; }
+    :root[data-theme="dark"] {
+      --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a8880; --ink2: #52514e;
+      --surface: #fcfcfb; --surface-2: #f4f3f0; --surface2: #f4f3f0;
+      --rule: #e2e1dc;
+      --blue: #2a78d6; --orange: #eb6834; --red: #e34948;
+      --green: #008300; --violet: #4a3aa7;
+    }
+  }
+</style>
+<script>
+(function () {
+  var root = document.documentElement;
+  var KEY = 'memo-theme';
+  var saved = null;
+  try { saved = localStorage.getItem(KEY); } catch (e) {}
+  if (saved === 'dark') root.setAttribute('data-theme', 'dark');
+  var btn = document.createElement('button');
+  btn.id = 'memo-theme-toggle';
+  btn.type = 'button';
+  function label() {
+    btn.textContent = root.getAttribute('data-theme') === 'dark' ? '☀︎ Light' : '☾ Dark';
+  }
+  btn.onclick = function () {
+    var dark = root.getAttribute('data-theme') === 'dark';
+    if (dark) { root.removeAttribute('data-theme'); } else { root.setAttribute('data-theme', 'dark'); }
+    try { localStorage.setItem(KEY, dark ? 'light' : 'dark'); } catch (e) {}
+    label();
+  };
+  label();
+  document.body.appendChild(btn);
+  var pbtn = document.createElement('button');
+  pbtn.id = 'memo-print-toggle';
+  pbtn.type = 'button';
+  function plabel() {
+    pbtn.textContent = root.getAttribute('data-print') === 'all' ? '⎙ Print: all' : '⎙ Print: memo only';
+  }
+  pbtn.onclick = function () {
+    if (root.getAttribute('data-print') === 'all') { root.removeAttribute('data-print'); } else { root.setAttribute('data-print', 'all'); }
+    plabel();
+  };
+  plabel();
+  document.body.appendChild(pbtn);
+})();
+</script>
