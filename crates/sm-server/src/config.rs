@@ -884,6 +884,9 @@ pub struct CloudflareAccessConfig {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CloudflareAccessApplicationConfig {
+    /// Attach the enrolled-device Service Auth policy to the browser app.
+    #[serde(default)]
+    pub device_policy: bool,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]

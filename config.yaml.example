@@ -180,6 +180,8 @@ cloudflare_access:
   node_policy_id: ""
   browser:
     enabled: false
+    # Attach the existing device policy during enrollment; email login remains.
+    device_policy: true
     app_id: ""
     hostname: "sm.example.com"
     jwt_audience: ""

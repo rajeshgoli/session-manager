@@ -1,0 +1,21 @@
+/* Device list inherits the shell's light/dark tokens. */
+.device-settings { min-width: 0; }
+.device-settings h3 { font-size: 13px; font-weight: 650; margin: 0 0 8px; }
+.device-settings p { margin: 0 0 12px; }
+.device-sign-in { padding-bottom: 12px; }
+.device-list { list-style: none; margin: 0; padding: 0; }
+.device-list > li { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.device-description { display: flex; flex-direction: column; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
+.device-description > span { color: var(--ink-2); font-size: 12px; }
+.device-list > li > button { flex-shrink: 0; }
+.device-confirm { display: flex; flex-direction: column; gap: 6px; color: var(--ink-2); max-width: 22rem; }
+.device-confirm > div { display: flex; flex-wrap: wrap; gap: 6px; }
+.device-error { color: var(--red); overflow-wrap: anywhere; }
+.device-enroll { margin-top: 20px; color: var(--ink-2); max-width: 40rem; }
+.device-enroll h3 { color: var(--ink); }
+.device-enroll code { overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .device-list > li { flex-wrap: wrap; gap: 8px; }
+  .device-description { flex: 1; min-width: 10rem; }
+  .device-confirm { flex-basis: 100%; }
+}

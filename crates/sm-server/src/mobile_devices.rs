@@ -32,6 +32,11 @@ use crate::{
     sessions::expand_home,
 };
 
+// The server owns enrollment and policy writes. Keep a retry's storage and
+// edge update together; separately serialize policy writes from phones/revokes.
+static COMPUTER_ENROLLMENT_LOCK: Mutex<()> = Mutex::new(());
+static DEVICE_POLICY_UPDATE_LOCK: Mutex<()> = Mutex::new(());
+
 const EMPTY_DEVICE_COMMON_NAME: &str = "__sm_no_enrolled_mobile_devices__";
 const MAX_UNKNOWN_PAIRING_ATTEMPTS: u32 = 25;
 const PAIRING_PATH_PREFIX: &str = "/client/mobile-terminal/enroll";
@@ -45,6 +50,8 @@ pub struct DeviceEnrollment {
     pub common_name: String,
     pub paired_at: String,
     pub revoked_at: Option<String>,
+    pub kind: String,
+    pub last_seen_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +164,106 @@ pub fn active_device_exists(db_path: &Path, user_id: &str, device_id: &str) -> R
     Ok(active_device_public_key(db_path, user_id, device_id)?.is_some())
 }
 
+pub fn valid_computer_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+}
+
+/// Enroll a new name, or retry for the same active owner/key after a lost
+/// response or failed local import. Revoked names stay reserved so an old
+/// certificate cannot become valid again through replacement enrollment.
+pub fn enroll_computer(config: &AppConfig, user_id: &str, name: &str, csr: &str) -> Result<String> {
+    enroll_computer_with_sync(config, user_id, name, csr, |ca_cert| {
+        ensure_cloudflare_mobile_device_ca(&config.cloudflare_access, ca_cert)?;
+        sync_device_common_name(&config.cloudflare_access, name, DevicePolicyAction::Allow)
+    })
+}
+
+fn enroll_computer_with_sync(
+    config: &AppConfig,
+    user_id: &str,
+    name: &str,
+    csr: &str,
+    sync: impl FnOnce(&Path) -> Result<()>,
+) -> Result<String> {
+    let _enrollment = COMPUTER_ENROLLMENT_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Computer enrollment lock is unavailable"))?;
+    if !config.cloudflare_access.browser.enabled || !config.cloudflare_access.browser.device_policy
+    {
+        bail!("Enable cloudflare_access.browser.enabled and browser.device_policy before enrolling a computer");
+    }
+    ensure_device_policy_sync_configured(&config.cloudflare_access)?;
+    if !valid_computer_name(name) {
+        bail!("Device name must match [a-z0-9-]{{1,32}}");
+    }
+    let public_key = extract_public_key_from_csr_with_openssl(csr)?;
+    validate_mobile_terminal_proof_public_key(&public_key)?;
+    let ca_cert = expand_home(&config.mobile_terminal.device_ca_cert_path);
+    let ca_key = expand_home(&config.mobile_terminal.device_ca_key_path);
+    // Use the installed CA; never silently create a different trust root.
+    if !ca_cert.is_file() || !ca_key.is_file() {
+        bail!("Device CA is not configured");
+    }
+    let mut connection = open_device_db(&mobile_device_db_path(config))?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let matches: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM mobile_device_enrollments WHERE common_name = ? OR device_id = ? OR device_name = ?",
+        params![name, name, name], |row| row.get(0),
+    )?;
+    let same_device: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mobile_device_enrollments WHERE user_id = ? AND device_id = ? AND common_name = ? AND public_key_pem = ? AND kind = 'computer' AND revoked_at IS NULL)",
+        params![user_id, name, name, public_key.trim()], |row| row.get(0),
+    )?;
+    if matches > 0 && !(matches == 1 && same_device) {
+        bail!("Device name is already registered (including revoked devices)");
+    }
+    if config
+        .mobile_terminal
+        .allowed_users
+        .values()
+        .any(|user| user.registered_device_keys.iter().any(|key| key.id == name))
+    {
+        bail!("Device name is already registered");
+    }
+    let certificate = sign_csr_with_openssl(&ca_cert, &ca_key, csr, name)?;
+    let chain = build_certificate_chain_pem(&certificate, &ca_cert)?;
+    if !same_device {
+        transaction.execute(
+            "INSERT INTO mobile_device_enrollments (user_id, device_id, device_name, public_key_pem, common_name, paired_at, kind) VALUES (?, ?, ?, ?, ?, ?, 'computer')",
+            params![user_id, name, name, public_key.trim(), name, local_timestamp()],
+        )?;
+    }
+    transaction.commit()?;
+    if let Err(error) = sync(&ca_cert) {
+        if !same_device {
+            // No certificate was returned. A failed edge update must not
+            // permanently consume the name; an absent row still fails closed.
+            connection.execute("DELETE FROM mobile_device_enrollments WHERE user_id = ? AND device_id = ? AND public_key_pem = ?",
+                params![user_id, name, public_key.trim()])?;
+        }
+        return Err(error);
+    }
+    Ok(chain)
+}
+
+/// Match the certificate's common name, not a caller-provided device id.
+/// Updating only active rows makes authorization and last use one DB operation.
+pub fn record_active_device_use(db_path: &Path, user_id: &str, common_name: &str) -> Result<bool> {
+    if !db_path.exists() {
+        return Ok(false);
+    }
+    let connection = open_device_db(db_path)?;
+    Ok(connection.execute(
+        "UPDATE mobile_device_enrollments SET last_seen_at = ? WHERE user_id = ? AND common_name = ? AND revoked_at IS NULL AND NOT EXISTS (SELECT 1 FROM mobile_device_enrollments AS other WHERE other.common_name = ? AND other.user_id <> ?)",
+        params![local_timestamp(), user_id, common_name, common_name, user_id],
+    )? > 0)
+}
+
 pub fn device_exists(db_path: &Path, user_id: &str, device_id: &str) -> Result<bool> {
     if !db_path.exists() {
         return Ok(false);
@@ -188,7 +295,7 @@ pub fn list_active_devices_for_users(
     let mut statement = connection
         .prepare(
             r#"
-            SELECT user_id, device_id, device_name, public_key_pem, common_name, paired_at, revoked_at
+            SELECT user_id, device_id, device_name, public_key_pem, common_name, paired_at, revoked_at, kind, last_seen_at
             FROM mobile_device_enrollments
             WHERE revoked_at IS NULL
             ORDER BY user_id, device_id
@@ -205,6 +312,8 @@ pub fn list_active_devices_for_users(
                 common_name: row.get(4)?,
                 paired_at: row.get(5)?,
                 revoked_at: row.get(6)?,
+                kind: row.get(7)?,
+                last_seen_at: row.get(8)?,
             })
         })
         .context("failed to query mobile device enrollments")?;
@@ -642,6 +751,7 @@ fn open_device_db(db_path: &Path) -> Result<Connection> {
     }
     let connection = Connection::open(db_path)
         .with_context(|| format!("failed to open mobile device DB {}", db_path.display()))?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
     migrate_device_db(&connection)?;
     Ok(connection)
 }
@@ -692,6 +802,23 @@ fn migrate_device_db(connection: &Connection) -> Result<()> {
             "#,
         )
         .context("failed to migrate mobile device enrollment DB")?;
+    let has_kind = || -> rusqlite::Result<bool> {
+        Ok(connection
+            .prepare("PRAGMA table_info(mobile_device_enrollments)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|name| name == "kind"))
+    };
+    if !has_kind()? {
+        let result = connection.execute_batch(
+            "ALTER TABLE mobile_device_enrollments ADD COLUMN kind TEXT NOT NULL DEFAULT 'phone';",
+        );
+        // A concurrent first request may have completed this migration.
+        if !has_kind()? {
+            result?;
+        }
+    }
     Ok(())
 }
 
@@ -769,6 +896,20 @@ fn complete_pairing_registration(
             params![now, token],
         )
         .context("failed to mark pairing used")?;
+    let computer_name: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mobile_device_enrollments WHERE kind = 'computer' AND (common_name = ? OR device_name = ?))",
+        params![device_id, device_name], |row| row.get(0),
+    )?;
+    if computer_name {
+        bail!("Device name is reserved by a computer enrollment");
+    }
+    let other_owner: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM mobile_device_enrollments WHERE common_name = ? AND user_id <> ?)",
+        params![device_id, registration.user_id], |row| row.get(0),
+    )?;
+    if other_owner {
+        bail!("Device common name is already registered to another user");
+    }
     transaction
         .execute(
             r#"
@@ -915,7 +1056,14 @@ fn ensure_cloudflare_mobile_device_ca(
     let Some(request) = DeviceCaTrustRequest::from_config(config, ca_cert_path)? else {
         return Ok(());
     };
-    request.execute()
+    request.execute()?;
+    if config.browser.enabled && config.browser.device_policy {
+        let mut browser_request = request;
+        browser_request.hostname = trimmed(&config.browser.hostname)
+            .context("browser.device_policy requires browser.hostname")?;
+        browser_request.execute()?;
+    }
+    Ok(())
 }
 
 pub fn sync_device_common_name(
@@ -931,13 +1079,79 @@ pub fn sync_device_common_name(
         }
         return Ok(());
     };
-    request.execute()
+    request.execute()?;
+    if action == DevicePolicyAction::Allow && config.browser.enabled && config.browser.device_policy
+    {
+        attach_browser_device_policy(config)?;
+    }
+    Ok(())
+}
+
+/// Reuse the same policy id so revocation updates both applications. Preserve
+/// all existing application settings and interactive policies, including email.
+fn attach_browser_device_policy(config: &CloudflareAccessConfig) -> Result<()> {
+    let account = trimmed(&config.account_id).context("Device policy requires account_id")?;
+    let token = trimmed(&config.api_token).context("Device policy requires api_token")?;
+    let app = trimmed(&config.browser.app_id).context("Device policy requires browser.app_id")?;
+    let policy = trimmed(&config.mobile_device_policy_id)
+        .context("Device policy requires mobile_device_policy_id")?;
+    let url = format!("https://api.cloudflare.com/client/v4/accounts/{account}/access/apps/{app}");
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let response = cloudflare_get(&agent, &url, &token)?;
+    let mut application = response
+        .get("result")
+        .cloned()
+        .context("Cloudflare application response missing result")?;
+    attach_policy_to_application(&mut application, &policy)?;
+    cloudflare_put(&agent, &url, &token, application)?;
+    Ok(())
+}
+
+fn attach_policy_to_application(application: &mut Value, policy_id: &str) -> Result<()> {
+    let object = application
+        .as_object_mut()
+        .context("Cloudflare application is not an object")?;
+    let policies = object
+        .get_mut("policies")
+        .and_then(Value::as_array_mut)
+        .context(
+            "Cloudflare application response missing policies; refusing to replace email access",
+        )?;
+    policies.retain(|policy| policy.get("id").and_then(Value::as_str) != Some(policy_id));
+    policies.insert(0, json!({ "id": policy_id, "precedence": 1 }));
+    for (index, policy) in policies.iter_mut().enumerate() {
+        let id = policy
+            .get("id")
+            .and_then(Value::as_str)
+            .context("Application policy has no id; refusing to change existing access")?;
+        // Reference existing reusable policies, rather than sending an inline
+        // policy definition together with its id (mutually exclusive in the API).
+        *policy = json!({ "id": id, "precedence": index + 1 });
+    }
+    for key in ["id", "aud", "created_at", "updated_at"] {
+        object.remove(key);
+    }
+    Ok(())
 }
 
 /// A configured mobile device policy means Cloudflare Access admits only the
 /// common names listed in it. Enrolling without the credentials to add the new
 /// device would succeed locally and then be refused at the edge on every request.
 fn ensure_device_policy_sync_configured(config: &CloudflareAccessConfig) -> Result<()> {
+    if config.browser.enabled && config.browser.device_policy {
+        for (key, value) in [
+            ("browser.app_id", &config.browser.app_id),
+            ("browser.hostname", &config.browser.hostname),
+            ("mobile_device_policy_id", &config.mobile_device_policy_id),
+        ] {
+            if trimmed(value).is_none() {
+                bail!("browser.device_policy requires cloudflare_access.{key}");
+            }
+        }
+    }
     if trimmed(&config.mobile_device_policy_id).is_none() {
         return Ok(());
     }
@@ -989,12 +1203,15 @@ impl DeviceCaTrustRequest {
         let Some(api_token) = trimmed(&config.api_token) else {
             return Ok(None);
         };
-        let Some(hostname) = trimmed(&config.mobile_app.hostname) else {
+        let app = if config.mobile_app.enabled {
+            &config.mobile_app
+        } else if config.browser.enabled && config.browser.device_policy {
+            &config.browser
+        } else {
             return Ok(None);
         };
-        if !config.mobile_app.enabled {
-            return Ok(None);
-        }
+        let hostname =
+            trimmed(&app.hostname).context("Device CA trust requires an application hostname")?;
         let ca_cert_pem = fs::read_to_string(ca_cert_path).with_context(|| {
             format!(
                 "failed to read device CA certificate {}",
@@ -1148,6 +1365,9 @@ impl DevicePolicyRequest {
     }
 
     fn execute(&self) -> Result<()> {
+        let _policy_update = DEVICE_POLICY_UPDATE_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Device policy update lock is unavailable"))?;
         if self.common_name.is_empty() {
             bail!("Cloudflare mobile device policy sync requires a non-empty common name");
         }
@@ -1725,6 +1945,200 @@ mod tests {
         ecdsa::SigningKey,
         pkcs8::{EncodePublicKey, LineEnding},
     };
+
+    #[test]
+    fn browser_certificate_policy_preserves_email_and_settings() {
+        let mut application = json!({ "id": "app", "aud": "aud", "domain": "sm.example.com", "session_duration": "24h",
+            "policies": [{ "id": "email", "decision": "allow", "include": [{"email": {"email": "owner@example.com"}}], "precedence": 1 }] });
+        attach_policy_to_application(&mut application, "devices").unwrap();
+        assert_eq!(application["policies"][0]["id"], "devices");
+        assert_eq!(application["policies"][1]["id"], "email");
+        assert_eq!(
+            application["policies"][1],
+            json!({ "id": "email", "precedence": 2 })
+        );
+        assert_eq!(application["session_duration"], "24h");
+        attach_policy_to_application(&mut application, "devices").unwrap();
+        assert_eq!(application["policies"].as_array().unwrap().len(), 2);
+        assert!(attach_policy_to_application(&mut json!({}), "devices").is_err());
+    }
+
+    #[test]
+    fn browser_certificate_names_and_last_use() {
+        for name in ["macbook", "studio-1", "a", "0123"] {
+            assert!(valid_computer_name(name));
+        }
+        for name in [
+            "",
+            "Macbook",
+            "a b",
+            "a/b",
+            "a_b",
+            "abcdefghijklmnopqrstuvwxyz1234567",
+        ] {
+            assert!(!valid_computer_name(name));
+        }
+        let dir = temporary_dir("sm-browser-device-test").unwrap();
+        let db = dir.join("devices.db");
+        let pairing = create_pairing_registration(&db, "owner", 15).unwrap();
+        complete_pairing_registration(&db, &pairing.token, "phone", "Phone", "public-key", None)
+            .unwrap();
+        let users = BTreeSet::from(["owner".into()]);
+        let device = list_active_devices_for_users(&db, &users)
+            .unwrap()
+            .remove(0);
+        assert_eq!(device.kind, "phone");
+        assert!(device.last_seen_at.is_none());
+        assert!(!record_active_device_use(&db, "stranger", "phone").unwrap());
+        assert!(record_active_device_use(&db, "owner", "phone").unwrap());
+        let other_pairing = create_pairing_registration(&db, "guest", 15).unwrap();
+        assert!(complete_pairing_registration(
+            &db,
+            &other_pairing.token,
+            "phone",
+            "Other phone",
+            "key",
+            None
+        )
+        .is_err());
+        assert!(list_active_devices_for_users(&db, &users).unwrap()[0]
+            .last_seen_at
+            .is_some());
+        revoke_device(&db, "owner", "phone").unwrap();
+        assert!(!record_active_device_use(&db, "owner", "phone").unwrap());
+        // Legacy duplicate names must never turn another user's certificate
+        // into the owner's browser identity, even after one copy is revoked.
+        let connection = open_device_db(&db).unwrap();
+        connection.execute("INSERT INTO mobile_device_enrollments (user_id, device_id, device_name, public_key_pem, common_name, paired_at) VALUES ('guest', 'duplicate', 'Guest phone', 'key', 'phone', '2026-01-01')", []).unwrap();
+        assert!(!record_active_device_use(&db, "guest", "phone").unwrap());
+        drop(connection);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn browser_certificate_signing_and_unique_names() {
+        // Exercise signing and storage without contacting Cloudflare. Keep all
+        // production configuration validation enabled.
+        fn enroll_computer(
+            config: &AppConfig,
+            user: &str,
+            name: &str,
+            csr: &str,
+        ) -> Result<String> {
+            enroll_computer_with_sync(config, user, name, csr, |_| Ok(()))
+        }
+        let dir = temporary_dir("sm-computer-enroll-test").unwrap();
+        let mut config = AppConfig::default();
+        config.mobile_terminal.device_enrollment_db_path =
+            dir.join("devices.db").to_string_lossy().into_owned();
+        config.mobile_terminal.device_ca_cert_path =
+            dir.join("ca.pem").to_string_lossy().into_owned();
+        config.mobile_terminal.device_ca_key_path =
+            dir.join("ca.key").to_string_lossy().into_owned();
+        ensure_device_ca(
+            Path::new(&config.mobile_terminal.device_ca_cert_path),
+            Path::new(&config.mobile_terminal.device_ca_key_path),
+        )
+        .unwrap();
+        let csr_path = dir.join("device.csr");
+        assert!(Command::new("openssl")
+            .args([
+                "req",
+                "-new",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:prime256v1",
+                "-nodes",
+                "-subj",
+                "/CN=untrusted-csr-name",
+                "-keyout"
+            ])
+            .arg(dir.join("device.key"))
+            .arg("-out")
+            .arg(&csr_path)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let csr = fs::read_to_string(csr_path).unwrap();
+        // Disabled browser/policy must not consume a name or even open the DB.
+        for (enabled, device_policy) in [(false, false), (false, true), (true, false)] {
+            config.cloudflare_access.browser.enabled = enabled;
+            config.cloudflare_access.browser.device_policy = device_policy;
+            let error = super::enroll_computer(&config, "owner", "macbook", &csr).unwrap_err();
+            assert!(error.to_string().contains("browser.enabled"));
+            assert!(!mobile_device_db_path(&config).exists());
+        }
+        config.cloudflare_access.browser.enabled = true;
+        config.cloudflare_access.browser.device_policy = true;
+        assert!(super::enroll_computer(&config, "owner", "macbook", &csr).is_err());
+        assert!(!mobile_device_db_path(&config).exists());
+        config.cloudflare_access.browser.app_id = Some("app".into());
+        config.cloudflare_access.browser.hostname = Some("sm.example.com".into());
+        config.cloudflare_access.mobile_device_policy_id = Some("policy".into());
+        config.cloudflare_access.account_id = Some("account".into());
+        config.cloudflare_access.api_token = Some("test-token".into());
+        let chain = enroll_computer(&config, "owner", "macbook", &csr).unwrap();
+        fs::write(dir.join("device.pem"), chain).unwrap();
+        let output = Command::new("openssl")
+            .args(["x509", "-noout", "-subject", "-in"])
+            .arg(dir.join("device.pem"))
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("macbook"));
+        let device = list_active_devices_for_users(
+            &mobile_device_db_path(&config),
+            &BTreeSet::from(["owner".into()]),
+        )
+        .unwrap()
+        .remove(0);
+        assert_eq!(device.kind, "computer");
+        assert!(enroll_computer(&config, "owner", "macbook", &csr).is_ok());
+        assert!(enroll_computer(&config, "other", "macbook", &csr).is_err());
+        revoke_device(&mobile_device_db_path(&config), "owner", "macbook").unwrap();
+        assert!(enroll_computer(&config, "owner", "macbook", &csr).is_err());
+        let pairing =
+            create_pairing_registration(&mobile_device_db_path(&config), "owner", 15).unwrap();
+        assert!(complete_pairing_registration(
+            &mobile_device_db_path(&config),
+            &pairing.token,
+            "macbook",
+            "Phone",
+            "key",
+            None
+        )
+        .is_err());
+        assert!(enroll_computer(&config, "owner", "studio", "invalid CSR").is_err());
+
+        // A failed first enrollment must not erase a concurrent retry that
+        // succeeds. Hold the first edge update while starting the retry.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (retry_tx, retry_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let first_config = &config;
+            let first_csr = &csr;
+            let first = scope.spawn(move || {
+                enroll_computer_with_sync(first_config, "owner", "retry", first_csr, |_| {
+                    entered_tx.send(()).unwrap();
+                    // Without enrollment serialization, the retry completes here
+                    // and the failing first request then deletes its shared row.
+                    let _ = retry_rx.recv_timeout(std::time::Duration::from_secs(1));
+                    bail!("simulated edge failure")
+                })
+            });
+            entered_rx.recv().unwrap();
+            let second = scope.spawn(|| {
+                let result = enroll_computer_with_sync(&config, "owner", "retry", &csr, |_| Ok(()));
+                let _ = retry_tx.send(());
+                result
+            });
+            assert!(first.join().unwrap().is_err());
+            assert!(second.join().unwrap().is_ok());
+        });
+        assert!(active_device_exists(&mobile_device_db_path(&config), "owner", "retry").unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn enrollment_db_round_trip_and_revoke() {

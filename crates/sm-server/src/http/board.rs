@@ -624,14 +624,10 @@ pub(super) fn owner_guard(
             &assertion,
         )
         .map_err(cloudflare_access_error)?;
-        let email = context
-            .email
-            .as_deref()
-            .filter(|email| allowlisted_google_email(&state.config, email))
-            .ok_or_else(|| ApiError::Status {
-                status: StatusCode::UNAUTHORIZED,
-                detail: "Owner login required".into(),
-            })?;
+        let email = browser_owner_email(state, &context)?.ok_or_else(|| ApiError::Status {
+            status: StatusCode::UNAUTHORIZED,
+            detail: "Owner login required".into(),
+        })?;
         if method != "GET" {
             if header_text(headers, handoff::SESSION_HEADER).is_some() {
                 return Err(ApiError::Status {
@@ -652,7 +648,7 @@ pub(super) fn owner_guard(
                 });
             }
         }
-        return Ok(follows::follow_owner_id(&state.config, Some(email)));
+        return Ok(follows::follow_owner_id(&state.config, Some(&email)));
     }
     let owner = follows::owner_guard(state, headers, peer_addr, method, uri)?;
     if signed_write && authenticated_user(headers, &state.config).is_none() {

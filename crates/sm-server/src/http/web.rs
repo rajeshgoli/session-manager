@@ -43,6 +43,8 @@ const ASSETS: &[Asset] = &[
     asset!("analytics.js", JS),
     asset!("queue.css", "text/css; charset=utf-8"),
     asset!("settings.js", JS),
+    asset!("devices.js", JS),
+    asset!("devices.css", "text/css; charset=utf-8"),
     asset!("terminal.js", JS),
     asset!("vendor/xterm.js", JS),
     asset!("vendor/addon-fit.js", JS),
