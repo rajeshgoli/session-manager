@@ -1,5 +1,5 @@
 // Board (1710 D6.4). The server owns ticket states, ordering and clock rules.
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { html, api, usePoll, stored, store, Seg, Popover, openItem, openPanel, navigate, setShared, age } from './ui.js';
 import { TicketStart } from './board-start.js';
 
@@ -37,10 +37,13 @@ function Clock({ ticket, end, hours }) {
     </span><span class=${`ball ${BALL_TONE[clock.ball] || 'muted'}`}>${clock.text}</span>
   </button>`;
 }
+export const canStart = (ticket) => ticket.state === 'ready' && !(ticket.warnings || []).includes('merged_not_closed');
+
 function TicketRow({ ticket, end, hours, onStart, compact = false }) {
   return html`<div class=${`board-ticket ${compact ? 'compact' : ''}`}>
     <button class="ticket-title" onClick=${() => ticketLink(ticket)}><span class="mono">#${ticket.number}</span> ${ticket.title}</button>
-    ${ticket.state === 'ready' ? html`<button class="btn sm pri" onClick=${() => onStart(ticket)}>Start</button>` : null}
+    ${canStart(ticket) ? html`<button class="btn sm pri" onClick=${() => onStart(ticket)}>Start</button>` : null}
+    ${(ticket.warnings || []).includes('merged_not_closed') ? html`<span class="sub">PR merged · close this ticket on GitHub.</span>` : null}
     <${Clock} ticket=${ticket} end=${end} hours=${hours} />
     ${!ticket.clock && ticket.state !== 'ready' ? html`<span class="sub">${ticket.state.replaceAll('_', ' ')}${ticket.holder ? ` · ${ticket.holder.name}` : ''}</span>` : null}
   </div>`;
@@ -101,16 +104,33 @@ export function BoardPage() {
   const [busy, setBusy] = useState(false);
   const [adding, setAdding] = useState(false);
   const [starting, setStarting] = useState(null);
+  const refreshTimer = useRef(null);
+  useEffect(() => () => clearTimeout(refreshTimer.current), []);
   useEffect(() => {
     if (!data) return;
     // Acknowledge each rendered snapshot, never an unseen poll result.
-    api('/client/board/seen', { method: 'POST' }).then(() => api('/client/board/badge'))
-      .then((badge) => setShared('board_badge', badge)).catch((e) => setActionError(e.message));
+    const acknowledge = () => {
+      if (document.hidden) return;
+      api('/client/board/seen', { method: 'POST' }).then(() => api('/client/board/badge'))
+        .then((badge) => setShared('board_badge', badge)).catch((e) => setActionError(e.message));
+    };
+    acknowledge();
+    document.addEventListener('visibilitychange', acknowledge);
+    return () => document.removeEventListener('visibilitychange', acknowledge);
   }, [data]);
   const mutate = async (path, method, body) => {
     if (busy) return false;
     setBusy(true); setActionError(null);
-    try { await api(path, { method, body }); await reload(); return true; }
+    try {
+      await api(path, { method, body });
+      await reload();
+      if (path === '/client/board/refresh') {
+        // The 202 response queues a GitHub pass; it does not contain its result.
+        clearTimeout(refreshTimer.current);
+        refreshTimer.current = setTimeout(reload, 2000);
+      }
+      return true;
+    }
     catch (e) { setActionError(e.message); return false; }
     finally { setBusy(false); }
   };

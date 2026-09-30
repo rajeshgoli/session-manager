@@ -16,7 +16,7 @@ function load(path) {
 const board = load(`${root}/board.js`);
 await board.link((name, parent) => load(name === 'preact' ? `${root}/vendor/preact.module.js` : name === 'preact/hooks' ? `${root}/vendor/hooks.module.js` : name === 'htm' ? `${root}/vendor/htm.module.js` : resolve(dirname(parent.identifier), name)));
 await board.evaluate();
-const { groupTickets, clockSegments, BALL_TONE } = board.namespace;
+const { groupTickets, clockSegments, BALL_TONE, canStart } = board.namespace;
 const { startBody, providerDefaults } = modules.get(`${root}/board-start.js`).namespace;
 test('rows preserve every actionable ticket and fold only blocked/done', () => {
   const states = ['needs_you', 'ready', 'in_progress', 'blocked', 'done'];
@@ -53,4 +53,10 @@ test('Start uses rendered name and brief and omits provider-default model/effort
   const codex = providerDefaults(settings, 'codex-fork');
   assert.deepEqual(codex, { provider: 'codex-fork', model: 'astra', reasoning_effort: 'high' });
   assert.deepEqual(providerDefaults(settings, 'claude'), { provider: 'claude', model: null, reasoning_effort: null });
+});
+
+test('merged-but-open ready tickets cannot offer Start', () => {
+  assert.equal(canStart({ state: 'ready', warnings: ['merged_not_closed'] }), false);
+  assert.equal(canStart({ state: 'ready', warnings: [] }), true);
+  assert.equal(canStart({ state: 'in_progress' }), false);
 });
